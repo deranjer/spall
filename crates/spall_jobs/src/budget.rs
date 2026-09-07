@@ -66,10 +66,16 @@ impl Priority {
 pub struct LaneBudget {
     /// Maximum jobs waiting in the lane's queue (not yet dispatched).
     pub max_queued_jobs: u32,
-    /// Maximum total `cost_bytes` of queued jobs.
+    /// Maximum total `cost_bytes` retained by queued, running, and completed
+    /// jobs in this lane. The historical field name is retained for source
+    /// compatibility with the T04 configuration API.
     pub max_queued_bytes: u64,
     /// Maximum jobs of this lane running concurrently.
     pub max_in_flight: u32,
+    /// Maximum results held pending validation/installation. This gives callers
+    /// that stop draining completions explicit backpressure instead of allowing
+    /// completed outputs to grow without bound.
+    pub max_completed_jobs: u32,
 }
 
 impl LaneBudget {
@@ -78,6 +84,7 @@ impl LaneBudget {
             max_queued_jobs,
             max_queued_bytes,
             max_in_flight,
+            max_completed_jobs: max_queued_jobs,
         }
     }
 }
@@ -126,6 +133,7 @@ pub struct LanePressure {
     pub in_flight_jobs: u32,
     pub in_flight_bytes: u64,
     pub completed_waiting_install: u32,
+    pub completed_bytes: u64,
     /// Submissions rejected on this lane since the scheduler was created.
     pub rejected: u64,
 }

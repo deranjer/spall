@@ -57,8 +57,11 @@ pub struct JobRequest<T> {
     pub lane: Lane,
     pub priority: Priority,
     pub token: JobToken,
-    /// Declared cost of the job's retained inputs, in bytes, charged against the
-    /// lane's byte budget while queued and running. Use `0` if not tracked.
+    /// Conservative declared maximum bytes retained by this job. The scheduler
+    /// charges it once through each lifecycle stage — queued, running, then
+    /// completed pending installation — so a caller that does not drain results
+    /// cannot exceed the configured lane budget. Use `0` only for work whose
+    /// retained inputs and output are deliberately not accounted for.
     pub cost_bytes: u64,
     run: BoxedRun<T>,
 }
@@ -247,6 +250,7 @@ struct CompletedJob<T> {
     id: JobId,
     lane: Lane,
     token: JobToken,
+    cost_bytes: u64,
     output: T,
 }
 
@@ -336,15 +340,15 @@ impl<T> Scheduler<T> {
             });
         }
 
-        let queued_bytes: u64 = queue.iter().map(|j| j.cost_bytes).sum();
+        let retained_bytes = self.lane_retained_bytes(lane);
         if request.cost_bytes > budget.max_queued_bytes
-            || queued_bytes + request.cost_bytes > budget.max_queued_bytes
+            || retained_bytes + request.cost_bytes > budget.max_queued_bytes
         {
             self.rejected[lane.index()] += 1;
             return Err(Rejected {
                 reason: SubmitReason::ByteLimit {
                     lane,
-                    queued: queued_bytes,
+                    queued: retained_bytes,
                     needed: request.cost_bytes,
                     limit: budget.max_queued_bytes,
                 },
@@ -396,8 +400,15 @@ impl<T> Scheduler<T> {
         let mut out = Vec::new();
         for lane in Lane::ALL {
             let budget = self.config.lane(lane);
+            let completed = self.completed.iter().filter(|job| job.lane == lane).count() as u32;
             let in_flight = self.running.values().filter(|job| job.lane == lane).count() as u32;
-            let mut slots = budget.max_in_flight.saturating_sub(in_flight);
+            let completed_capacity = budget
+                .max_completed_jobs
+                .saturating_sub(completed.saturating_add(in_flight));
+            let mut slots = budget
+                .max_in_flight
+                .saturating_sub(in_flight)
+                .min(completed_capacity);
 
             while slots > 0 {
                 let queue = &mut self.queues[lane.index()];
@@ -440,6 +451,25 @@ impl<T> Scheduler<T> {
         best
     }
 
+    fn lane_retained_bytes(&self, lane: Lane) -> u64 {
+        self.queues[lane.index()]
+            .iter()
+            .map(|job| job.cost_bytes)
+            .chain(
+                self.running
+                    .values()
+                    .filter(move |job| job.lane == lane)
+                    .map(|job| job.cost_bytes),
+            )
+            .chain(
+                self.completed
+                    .iter()
+                    .filter(move |job| job.lane == lane)
+                    .map(|job| job.cost_bytes),
+            )
+            .sum()
+    }
+
     /// Record a job's output. Accepts completions in any order. If the job was
     /// cancelled or superseded by a world reload the output is dropped; an
     /// unknown id is ignored.
@@ -454,6 +484,7 @@ impl<T> Scheduler<T> {
             id,
             lane: job.lane,
             token: job.token,
+            cost_bytes: job.cost_bytes,
             output,
         });
     }
@@ -553,6 +584,7 @@ impl<T> Scheduler<T> {
                 in_flight_jobs: 0,
                 in_flight_bytes: 0,
                 completed_waiting_install: 0,
+                completed_bytes: 0,
                 rejected: self.rejected[lane.index()],
             };
         }
@@ -562,7 +594,9 @@ impl<T> Scheduler<T> {
             lane.in_flight_bytes += job.cost_bytes;
         }
         for job in &self.completed {
-            pressure.lane_mut(job.lane).completed_waiting_install += 1;
+            let lane = pressure.lane_mut(job.lane);
+            lane.completed_waiting_install += 1;
+            lane.completed_bytes += job.cost_bytes;
         }
         pressure
     }
@@ -829,6 +863,90 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn byte_budget_charges_each_job_once_through_running_and_completion() {
+        let config = SchedulerConfig::uniform(LaneBudget::new(2, 100, 1));
+        let mut sched: Scheduler<u64> = Scheduler::with_generation(config, Generation(1));
+        sched
+            .submit(
+                JobRequest::new(
+                    Lane::Topology,
+                    Priority::NORMAL,
+                    token_reading(Generation(1), 0, 1),
+                    || 1,
+                )
+                .with_cost_bytes(100),
+            )
+            .unwrap();
+        let dispatch = sched.dispatch().pop().unwrap();
+        assert_eq!(sched.pressure().lane(Lane::Topology).in_flight_bytes, 100);
+
+        // Dispatching moves the same charge from queued to running; it must not
+        // open a second 100-byte admission slot.
+        let rejected = sched
+            .submit(
+                JobRequest::new(
+                    Lane::Topology,
+                    Priority::NORMAL,
+                    token_reading(Generation(1), 1, 1),
+                    || 2,
+                )
+                .with_cost_bytes(100),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            rejected.reason,
+            SubmitReason::ByteLimit {
+                queued: 100,
+                needed: 100,
+                limit: 100,
+                ..
+            }
+        ));
+
+        sched.apply(dispatch.run());
+        let pressure = sched.pressure().lane(Lane::Topology);
+        assert_eq!(pressure.in_flight_bytes, 0);
+        assert_eq!(pressure.completed_bytes, 100);
+        assert_eq!(pressure.completed_waiting_install, 1);
+    }
+
+    #[test]
+    fn completed_result_limit_backpressures_dispatch_until_install_drains_it() {
+        let config = SchedulerConfig::uniform(LaneBudget {
+            max_queued_jobs: 2,
+            max_queued_bytes: 100,
+            max_in_flight: 1,
+            max_completed_jobs: 1,
+        });
+        let mut sched: Scheduler<u64> = Scheduler::with_generation(config, Generation(1));
+        sched
+            .submit(JobRequest::new(
+                Lane::Visual,
+                Priority::NORMAL,
+                token_reading(Generation(1), 0, 1),
+                || 1,
+            ))
+            .unwrap();
+        let first = sched.dispatch().pop().unwrap();
+        sched.apply(first.run());
+        sched
+            .submit(JobRequest::new(
+                Lane::Visual,
+                Priority::NORMAL,
+                token_reading(Generation(1), 1, 1),
+                || 2,
+            ))
+            .unwrap();
+
+        assert!(
+            sched.dispatch().is_empty(),
+            "completed output holds the lane until installation"
+        );
+        sched.install(&MapWorld::new(Generation(1)));
+        assert_eq!(sched.dispatch().len(), 1, "install frees the result slot");
     }
 
     #[test]

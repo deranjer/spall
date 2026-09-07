@@ -86,7 +86,12 @@ impl<T: Send + 'static> ThreadJobPool<T> {
 
     /// Validate and take the results that have completed so far.
     pub fn install<W: WorldView + ?Sized>(&self, world: &W) -> InstallOutcome<T> {
-        self.lock_scheduler().install(world)
+        let outcome = self.lock_scheduler().install(world);
+        // Installation releases completed-result capacity. Pump immediately so
+        // work that was held behind that bound does not require an unrelated
+        // later submission to start.
+        self.pump();
+        outcome
     }
 
     /// `true` while any job is queued or running.
@@ -290,6 +295,41 @@ mod tests {
         let world = MapWorld::new(Generation(1)); // no bricks resident -> all stale
         let outcome = scheduler_install(scheduler, &world);
         assert_eq!(outcome.installed.len() + outcome.discarded.len(), executed);
+    }
+
+    #[test]
+    fn install_pumps_work_released_by_completed_result_backpressure() {
+        let config = SchedulerConfig::uniform(LaneBudget {
+            max_queued_jobs: 2,
+            max_queued_bytes: 1 << 20,
+            max_in_flight: 1,
+            max_completed_jobs: 1,
+        });
+        let pool = ThreadJobPool::<u64>::with_generation(config, Generation(1), 1);
+        let ran = Arc::new(AtomicUsize::new(0));
+        for brick in 0..2 {
+            let ran_for_job = Arc::clone(&ran);
+            pool.submit(JobRequest::new(
+                Lane::Topology,
+                Priority::NORMAL,
+                token(brick),
+                move || {
+                    ran_for_job.fetch_add(1, Ordering::SeqCst);
+                    brick as u64
+                },
+            ))
+            .unwrap();
+            if brick == 0 {
+                wait_until(|| ran.load(Ordering::SeqCst) == 1 && !pool.has_active_jobs());
+            }
+        }
+
+        // The second job is queued while the first completion fills the one
+        // result slot. Draining that result must wake the worker itself.
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        pool.install(&MapWorld::new(Generation(1)));
+        wait_until(|| ran.load(Ordering::SeqCst) == 2);
+        let _ = pool.shutdown();
     }
 
     fn scheduler_install(mut scheduler: Scheduler<u64>, world: &MapWorld) -> InstallOutcome<u64> {
