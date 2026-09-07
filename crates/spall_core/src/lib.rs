@@ -1,4 +1,28 @@
-//! Shared process-contract types. Gameplay IDs and protocol records arrive in T01.
+//! Foundation types shared across the engine: integer coordinates, stable ids
+//! and monotonic counters, materials and the world material manifest, fixed
+//! cell sizes and brush/pose units, plus the T00 process-lifecycle records.
+//!
+//! Everything here is data and pure logic. No GPU, window, network, or
+//! filesystem dependency belongs in this crate beyond the JSONL process log
+//! from T00.
+
+pub mod coord;
+pub mod ids;
+pub mod material;
+pub mod units;
+
+pub use coord::{BRICK_EDGE, BrickCoord, CELLS_PER_BRICK, CoordOverflow, GlobalCell, LocalCell};
+pub use ids::{
+    EntityId, IdAllocator, IdError, JournalSeq, Revision, Tick, TransactionId, VolumeId, WorldId,
+};
+pub use material::{
+    MAX_MATERIALS, ManifestError, MaterialDef, MaterialFlags, MaterialId, MaterialManifest,
+    RenderProps, SimProps,
+};
+pub use units::{
+    BRUSH_FRACTION_BITS, BRUSH_UNIT, BrushError, BrushPoint, CellSizeCode, MAX_BRUSH_RADIUS_CELLS,
+    NonFinitePose, Pose, QUAT_SCALE, QuantizedQuat, SphereBrush, ZeroQuaternion,
+};
 
 use serde::{Deserialize, Serialize};
 use std::{

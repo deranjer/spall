@@ -100,3 +100,60 @@ Provisional per-client steady-state egress target: <=256 KiB/s, measured includi
 Budget example: 200 relevant bodies x 48 encoded bytes x 20 Hz = 192,000 bytes/s before framing, topology, player records, and retransmission. Therefore not all bodies can receive 20 Hz updates continuously. Prioritize players, imminent contacts, nearby moving bodies, and recently changed structures; send distant/sleeping bodies less frequently with periodic keyframes.
 
 Never discard committed topology to meet the motion budget. Drop superseded unsent motion snapshots; cap cosmetic events; throttle expensive actions; repair or disconnect a client whose reliable backlog exceeds the bounded window. Record backlog bytes and age. The stress gate must show that the queue drains after a blast and a new player can join while the server continues running.
+
+## T01 wire encoding decisions (implemented)
+
+`spall_core` and `spall_protocol` implement the record families above. The
+following are now fixed and must be reused, not re-derived, by dependent tasks.
+`spall_protocol` version-0 headers use `WIRE_SCHEMA_VERSION = 1` and
+`PROTOCOL_VERSION = 1`.
+
+**Endianness.** Every canonical hash pre-image and every frame header field is
+little-endian, fixed width. Canonical sequences carry a `u32` LE length prefix;
+blobs carry a `u32` LE byte-length prefix. `f32`/`f64` are encoded from their
+IEEE-754 bit pattern after a finiteness check; `-0.0` is normalized to `0.0`.
+
+**Framing.** A reliable/datagram record is `u16 LE schema version` `||`
+`u16 LE wire tag` `||` postcard body. Decoding refuses input longer than the
+channel limit before parsing, then requires the tag/schema to match the
+expected record type and rejects trailing bytes. `Record::validate` then
+enforces counts, ranges, and float finiteness; `TopologyTransaction` also has
+`validate_against(&MaterialManifest)` for unknown-material rejection.
+
+**Wire tags.** `InputFrame=1`, `ActionRequest=2`, `ActionStatus=3`,
+`TopologyTransaction=4`, `MotionSnapshot=5`, `BaselineBegin=6`, `BaselinePart=7`,
+`BaselineEnd=8`, `BaselineAck=9`, `RepairRequest=10`, `DurableThrough=11`,
+`Handshake=12`. Discriminants are permanent; new families take new numbers.
+
+**Sort orders for the canonical topology hash.** Volumes ascending by
+`VolumeId`; bricks ascending by `(z, y, x)`; authoritative layers ascending by
+numeric layer `kind`. Owner is encoded as `0,u64=0` for terrain or `1,u64=EntityId`
+for a body. Domain-separated with the ASCII tag `spall.topology.v1`; the content
+manifest hash uses `spall.manifest.v1`. BLAKE3 over the resulting bytes is the
+result. Reordering the inputs does not change the digest.
+
+**Brush fixed-point units.** Brush centre and radius are expressed in the
+target volume's local cell space with 8 fractional bits: `1` unit = `1/256`
+cell (`BRUSH_UNIT = 256`). A sphere removes a cell when the squared distance
+from the brush centre to the cell centre is `<=` the squared radius, computed
+in `i128` so no in-range input overflows. Maximum radius is 256 cells.
+
+**Pose quantization.** Translation is transmitted as three IEEE-754 `f64`
+metres and only finiteness is enforced (authority positions are `f64`; they are
+not lossily quantized). Orientation is a unit quaternion quantized to four
+`i16` components with scale `32767`; the decoder renormalizes and rejects a
+zero-magnitude quaternion.
+
+**Session and stream sequencing.** `SessionId` is a `u64`: high 32 bits are the
+connection slot, low 32 bits a generation. `SessionRegistry::open` bumps the
+generation on every (re)connect, so a reconnect produces a strictly newer
+session and `accept` rejects any record stamped with an older generation.
+`SequenceGate` accepts strictly increasing per-stream `u64` sequence numbers,
+reports the size of any skipped gap, and rejects duplicates and regressions;
+gaps in global `TransactionId`s on a filtered stream are expected.
+
+**Size limits.** 64 KiB per control record (header included), 1 MiB per bulk
+part, 64 MiB per assembled transfer, 256 KiB max decompressed material-only
+brick record (64 KiB actual payload), 1100 B per datagram payload. Count
+ceilings: 3 redundant inputs per frame, 4096 transaction ops / refs, 8192
+baseline regions, 4096 baseline parts.

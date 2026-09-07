@@ -1,10 +1,12 @@
-# T00 dependency record
+# Dependency record
 
 `Cargo.lock` is committed and was generated with Rust 1.96.1 on Windows
 (`x86_64-pc-windows-msvc`). The project itself has no declared license yet.
 The versions and license strings below were verified from the locked registry
-manifests on 2026-09-06. Cargo may select compatible patch releases only by
-updating `Cargo.lock`; this record names the releases actually locked now.
+manifests. Cargo may select compatible patch releases only by updating
+`Cargo.lock`; this record names the releases actually locked now.
+
+## T00 — build and process harness (verified 2026-09-06)
 
 | Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T00 |
 | --- | ---: | --- | --- | --- |
@@ -24,6 +26,26 @@ Only the client package imports wgpu/winit. `sandbox-client` requires the
 package's active graph GPU/window-free. The server currently records the
 requested listen address but deliberately does not bind it: QUIC transport,
 authentication, and multiplayer start in T09.
+
+## T01 — IDs, schemas, canonical encoding (verified 2026-09-06)
+
+Added for `spall_protocol`. Both are pure-Rust and build GPU/window/network-free.
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T01 |
+| --- | ---: | --- | --- | --- |
+| blake3 | 1.8.7 | default features (`std`, portable SIMD; no `rayon`/C fallbacks) | `CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception` | canonical topology + content-manifest hashing |
+| postcard | 1.1.3 | `use-std` (+ default `heapless`) | `MIT OR Apache-2.0` | versioned DTO wire body encode/decode |
+
+Transitive crates newly locked by these: `arrayvec 0.7.8`, `constant_time_eq
+0.4.2`, `cpufeatures 0.3.1`, `cobs 0.3.0`, `hash32 0.2.1`, `heapless 0.7.17`,
+`byteorder 1.5.0`, `spin 0.9.9`, `critical-section 1.2.0`, `embedded-io`,
+`stable_deref_trait 1.2.1` (all `MIT`/`MIT OR Apache-2.0` family). `blake3`
+pulls a `cc` build of its SIMD assembly; the reference host already has the
+MSVC C++ tools recorded below.
+
+`spall_protocol` contains only DTOs and pure codec/hash logic — no transport,
+async, or simulation. `spall_net` (T09) will add Quinn on top of these
+records; `spall_store` (T16) reuses the canonical little-endian encoding.
 
 ## Verified Windows prerequisites
 

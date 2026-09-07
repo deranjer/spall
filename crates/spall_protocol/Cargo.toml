@@ -1,0 +1,15 @@
+[package]
+name = "spall_protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3.workspace = true
+postcard.workspace = true
+serde.workspace = true
+spall_core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
