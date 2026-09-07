@@ -74,7 +74,7 @@ pub struct LaneBudget {
     pub max_in_flight: u32,
     /// Maximum results held pending validation/installation. This gives callers
     /// that stop draining completions explicit backpressure instead of allowing
-    /// completed outputs to grow without bound.
+    /// completed outputs to grow without bound. Zero disables dispatch on the lane.
     pub max_completed_jobs: u32,
 }
 

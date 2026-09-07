@@ -342,7 +342,7 @@ impl<T> Scheduler<T> {
 
         let retained_bytes = self.lane_retained_bytes(lane);
         if request.cost_bytes > budget.max_queued_bytes
-            || retained_bytes + request.cost_bytes > budget.max_queued_bytes
+            || request.cost_bytes > budget.max_queued_bytes.saturating_sub(retained_bytes)
         {
             self.rejected[lane.index()] += 1;
             return Err(Rejected {
@@ -947,6 +947,41 @@ mod tests {
         );
         sched.install(&MapWorld::new(Generation(1)));
         assert_eq!(sched.dispatch().len(), 1, "install frees the result slot");
+    }
+
+    #[test]
+    fn byte_budget_does_not_wrap_at_u64_max() {
+        let config = SchedulerConfig::uniform(LaneBudget::new(2, u64::MAX, 1));
+        let mut sched: Scheduler<u64> = Scheduler::with_generation(config, Generation(1));
+        sched
+            .submit(
+                JobRequest::new(
+                    Lane::Visual,
+                    Priority::NORMAL,
+                    token_reading(Generation(1), 0, 1),
+                    || 0,
+                )
+                .with_cost_bytes(u64::MAX),
+            )
+            .unwrap();
+        let _running = sched.dispatch();
+        assert!(
+            sched
+                .submit(
+                    JobRequest::new(
+                        Lane::Visual,
+                        Priority::NORMAL,
+                        token_reading(Generation(1), 1, 1),
+                        || 0
+                    )
+                    .with_cost_bytes(1)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            sched.pressure().lane(Lane::Visual).in_flight_bytes,
+            u64::MAX
+        );
     }
 
     #[test]
