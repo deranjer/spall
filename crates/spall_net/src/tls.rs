@@ -13,11 +13,11 @@
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use ring::rand::{SecureRandom, SystemRandom};
 use rustls::DigitallySignedStruct;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use crate::config::TransportConfig;
@@ -259,7 +259,11 @@ mod tests {
         other.0[31] ^= 1;
         assert!(!t.verify(&other));
         // Distinct generations differ.
-        assert!(!JoinToken::generate().unwrap().verify(&JoinToken::generate().unwrap()));
+        assert!(
+            !JoinToken::generate()
+                .unwrap()
+                .verify(&JoinToken::generate().unwrap())
+        );
     }
 
     #[test]

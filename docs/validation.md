@@ -156,3 +156,9 @@ Define actual radius, height, concurrent active regions, topology metadata size,
 A task passes when its own acceptance evidence exists and its integration dependencies still work. A gate passes only when all its required behaviors pass on the documented workload. Skipped GPU tests, untested crash paths, placeholder transport, and unsolved giant-collapse limits must remain visible as unfinished work.
 
 G1/G2 are architecture decision points. Strong review is needed for structural graph correctness, collision representation, replication atomicity, and temporal lighting. Smaller agents can implement frozen interfaces and small fixtures effectively; they should not decide these cross-system tradeoffs independently.
+
+### T09 review regression coverage
+
+`cargo test -p spall_net` includes `separate_process_transport`: one OS server process, two OS client processes, and two OS UDP proxy processes, with packet loss and forwarding delay. Each client checks reliable replies, bulk parts and motion datagrams. Every child is supervised under a 30-second whole-run deadline and killed/reaped on failure. The ignored `process_role` test is its child entry point, invoked by the parent; it is not an omitted scenario. `cargo xtask net-check` remains the faster in-process measurement command and is labelled accordingly.
+
+The transport regressions also exercise constructor validation through postcard, 1 MiB bulk payloads, negotiated limits, QUIC establishment timeouts, decoded-message loss/reorder, duplicate/overflow sequences, bounded bulk part metadata, liveness-owner shutdown, and delayed-proxy cancellation. Application-byte metrics use connection counters (control/datagram/bulk frame bytes observed at the sampling point, excluding QUIC overhead and authentication), not message counts. Wire-byte metrics come from Quinn. Neither harness is a destruction/replication/G1 feasibility result.

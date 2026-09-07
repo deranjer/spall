@@ -70,6 +70,8 @@ impl Default for TransportCheckParams {
 /// Per-client result.
 #[derive(Debug, Clone)]
 pub struct ClientOutcome {
+    pub app_bytes_sent: u64,
+    pub app_bytes_recv: u64,
     pub session: String,
     pub connected: bool,
     pub records_sent: u64,
@@ -144,6 +146,7 @@ pub async fn run_transport_check(params: TransportCheckParams) -> Result<Transpo
 }
 
 async fn run_inner(params: TransportCheckParams) -> Result<TransportCheckReport> {
+    let mut tasks = TaskScope::default();
     let identity = DevIdentity::generate()?;
     let token = JoinToken::generate()?;
     let fingerprint = identity.fingerprint();
@@ -168,13 +171,18 @@ async fn run_inner(params: TransportCheckParams) -> Result<TransportCheckReport>
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let accept_conns = server_conns.clone();
     let accept_stop = stop_rx.clone();
-    let accept_task = tokio::spawn(async move {
+    let accept_task = tasks.spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         for _ in 0..accept_cfg.clients {
             match accept_server.accept().await {
                 Ok(conn) => {
                     let conn = Arc::new(conn);
                     accept_conns.lock().await.push(conn.clone());
-                    spawn_server_side(conn, accept_cfg.clone(), accept_stop.clone());
+                    connections.spawn(run_server_connection(
+                        conn,
+                        accept_cfg.clone(),
+                        accept_stop.clone(),
+                    ));
                 }
                 Err(e) => {
                     tracing::warn!("harness server accept failed: {e}");
@@ -182,6 +190,7 @@ async fn run_inner(params: TransportCheckParams) -> Result<TransportCheckReport>
                 }
             }
         }
+        while connections.join_next().await.is_some() {}
     });
 
     // Clients.
@@ -202,9 +211,11 @@ async fn run_inner(params: TransportCheckParams) -> Result<TransportCheckReport>
         };
         let cfg = params.clone();
         let stop_rx = stop_rx.clone();
-        client_tasks.push(tokio::spawn(async move {
-            run_client(i, target, fingerprint, token, cfg, stop_rx).await
-        }));
+        client_tasks.push(
+            tasks.spawn(
+                async move { run_client(i, target, fingerprint, token, cfg, stop_rx).await },
+            ),
+        );
     }
 
     let mut clients = Vec::new();
@@ -253,10 +264,8 @@ async fn run_inner(params: TransportCheckParams) -> Result<TransportCheckReport>
         };
         server_side + clients.iter().map(|c| c.dedup_dropped).sum::<u64>()
     };
-    let app_bytes_sent = clients
-        .iter()
-        .map(|c| c.records_sent + c.datagrams_sent)
-        .sum();
+    let app_bytes_sent = clients.iter().map(|c| c.app_bytes_sent).sum();
+    let app_bytes_recv = clients.iter().map(|c| c.app_bytes_recv).sum();
 
     Ok(TransportCheckReport {
         clients_connected,
@@ -265,7 +274,7 @@ async fn run_inner(params: TransportCheckParams) -> Result<TransportCheckReport>
         bulk_parts_delivered,
         dedup_dropped,
         app_bytes_sent,
-        app_bytes_recv: control_records_echoed,
+        app_bytes_recv,
         transport_bytes_sent,
         transport_bytes_recv,
         clients,
@@ -273,18 +282,19 @@ async fn run_inner(params: TransportCheckParams) -> Result<TransportCheckReport>
     })
 }
 
-fn spawn_server_side(
+pub async fn run_server_connection(
     conn: Arc<Connection>,
     params: TransportCheckParams,
     stop: watch::Receiver<bool>,
 ) {
+    let mut tasks = TaskScope::default();
     // Liveness.
-    tokio::spawn(conn.clone().run_liveness(stop.clone()));
+    tasks.spawn(conn.clone().run_liveness(stop.clone()));
 
     // Control echo.
     {
         let conn = conn.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Ok(Some(record)) = conn.recv_record().await {
                 let reply = match record {
                     WireRecord::ActionRequest(req) => WireRecord::ActionStatus(ActionStatus {
@@ -308,7 +318,7 @@ fn spawn_server_side(
     {
         let conn = conn.clone();
         let ack = AtomicU64::new(0);
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Ok(Some(DatagramRecord::Input(frame))) = conn.recv_datagram().await {
                 let seq = ack.fetch_add(1, Ordering::Relaxed);
                 let snap = MotionSnapshot {
@@ -335,7 +345,7 @@ fn spawn_server_side(
     // Optional bulk push.
     if params.run_bulk_transfer {
         let conn = conn.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             if let Ok(mut bulk) = conn.open_bulk().await {
                 for i in 0..3u32 {
                     let part = spall_protocol::BaselinePart {
@@ -352,11 +362,12 @@ fn spawn_server_side(
             }
         });
     }
+    conn.closed().await;
 }
 
 type ClientResult = Result<(ClientOutcome, u64, u64)>;
 
-async fn run_client(
+pub async fn run_client(
     index: usize,
     target: SocketAddr,
     fingerprint: crate::tls::Fingerprint,
@@ -364,6 +375,7 @@ async fn run_client(
     params: TransportCheckParams,
     stop: watch::Receiver<bool>,
 ) -> ClientResult {
+    let mut tasks = TaskScope::default();
     let conn = match connect(
         target,
         fingerprint,
@@ -378,6 +390,8 @@ async fn run_client(
             tracing::warn!("harness client {index} could not connect: {e}");
             return Ok((
                 ClientOutcome {
+                    app_bytes_sent: 0,
+                    app_bytes_recv: 0,
                     session: format!("client{index}:unconnected"),
                     connected: false,
                     records_sent: 0,
@@ -392,13 +406,13 @@ async fn run_client(
             ));
         }
     };
-    tokio::spawn(conn.clone().run_liveness(stop));
+    tasks.spawn(conn.clone().run_liveness(stop));
 
     // Reader task: count reliable echoes until we have all of them.
     let want = params.records_per_client as u64;
     let reader = {
         let conn = conn.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut got = 0u64;
             while got < want {
                 match conn.recv_record().await {
@@ -414,7 +428,7 @@ async fn run_client(
     // Bulk receiver.
     let bulk_reader = if params.run_bulk_transfer {
         let conn = conn.clone();
-        Some(tokio::spawn(async move {
+        Some(tasks.spawn(async move {
             match conn.accept_bulk().await {
                 Ok(bulk) => bulk
                     .collect_parts()
@@ -432,7 +446,7 @@ async fn run_client(
     let dgram_reader = {
         let conn = conn.clone();
         let want = params.datagrams_per_client as u64;
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut got = 0u64;
             while got < want {
                 match tokio::time::timeout(Duration::from_millis(800), conn.recv_datagram()).await {
@@ -514,6 +528,8 @@ async fn run_client(
 
     Ok((
         ClientOutcome {
+            app_bytes_sent: stats.app_bytes_sent,
+            app_bytes_recv: stats.app_bytes_recv,
             session: conn.session().to_string(),
             connected: true,
             records_sent,
@@ -526,4 +542,27 @@ async fn run_client(
         tstats.udp_tx.bytes,
         tstats.udp_rx.bytes,
     ))
+}
+
+/// Dropping a harness scope aborts all children, including early error/timeout
+/// paths. A JoinHandle timeout alone would detach the child instead.
+#[derive(Default)]
+struct TaskScope(Vec<tokio::task::AbortHandle>);
+impl TaskScope {
+    fn spawn<F>(&mut self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let task = tokio::spawn(future);
+        self.0.push(task.abort_handle());
+        task
+    }
+}
+impl Drop for TaskScope {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }

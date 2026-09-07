@@ -389,3 +389,153 @@ async fn packet_loss_recovers_reliable_records_and_shutdown_never_deadlocks() {
         .sum();
     assert!(forwarded > dropped, "most packets still went through");
 }
+
+async fn pair(
+    server_cfg: TransportConfig,
+    client_cfg: TransportConfig,
+) -> (Arc<NetServer>, Connection, Connection) {
+    let identity = DevIdentity::generate().unwrap();
+    let token = JoinToken::generate().unwrap();
+    let server = Arc::new(
+        NetServer::bind(
+            loopback(),
+            &identity,
+            token,
+            demo_handshake(HARNESS_MANIFEST_TAG),
+            server_cfg,
+        )
+        .await
+        .unwrap(),
+    );
+    let s = server.clone();
+    let accepting = tokio::spawn(async move { s.accept().await.unwrap() });
+    let client = connect(
+        server.local_addr().unwrap(),
+        identity.fingerprint(),
+        token,
+        demo_handshake(HARNESS_MANIFEST_TAG),
+        client_cfg,
+    )
+    .await
+    .unwrap();
+    (server, accepting.await.unwrap(), client)
+}
+
+#[tokio::test]
+async fn negotiated_limits_are_installed_on_both_ends() {
+    let mut client_cfg = TransportConfig::for_tests();
+    client_cfg.limits.max_control_record = 2048;
+    client_cfg.limits.max_bulk_part = 8192;
+    client_cfg.limits.max_assembled_transfer = 16384;
+    client_cfg.limits.max_datagram_payload = 512;
+    let (server, accepted, client) = pair(TransportConfig::for_tests(), client_cfg).await;
+    assert_eq!(accepted.limits(), client_cfg.limits);
+    assert_eq!(client.limits(), client_cfg.limits);
+    server.close();
+}
+
+#[tokio::test]
+async fn handshake_deadline_includes_quic_establishment() {
+    let sink = tokio::net::UdpSocket::bind(loopback()).await.unwrap();
+    let identity = DevIdentity::generate().unwrap();
+    let mut cfg = TransportConfig::for_tests();
+    cfg.handshake_timeout = Duration::from_millis(80);
+    let start = std::time::Instant::now();
+    let result = connect(
+        sink.local_addr().unwrap(),
+        identity.fingerprint(),
+        JoinToken::generate().unwrap(),
+        demo_handshake(HARNESS_MANIFEST_TAG),
+        cfg,
+    )
+    .await;
+    assert!(matches!(result, Err(TransportError::Timeout(_))));
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn full_one_mib_bulk_payload_round_trips() {
+    let cfg = TransportConfig::for_tests();
+    let (server, accepted, client) = pair(cfg, cfg).await;
+    let sender = tokio::spawn(async move {
+        let payload = vec![42; spall_protocol::limits::MAX_BULK_PART];
+        let part = spall_protocol::BaselinePart {
+            transfer_id: spall_protocol::TransferId(1),
+            part_index: 0,
+            part_hash: spall_protocol::Hash32::of(&payload),
+            payload,
+        };
+        let mut bulk = client.open_bulk().await.unwrap();
+        bulk.send_part(&part).await.unwrap();
+        bulk.finish().unwrap();
+        client
+    });
+    let parts = tokio::time::timeout(Duration::from_secs(5), async {
+        accepted
+            .accept_bulk()
+            .await
+            .unwrap()
+            .collect_parts()
+            .await
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        parts[0].payload.len(),
+        spall_protocol::limits::MAX_BULK_PART
+    );
+    let client = sender.await.unwrap();
+    client.close("done");
+    server.close();
+}
+
+#[tokio::test]
+async fn liveness_stops_when_its_owner_disappears() {
+    let cfg = TransportConfig::for_tests();
+    let (server, accepted, client) = pair(cfg, cfg).await;
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(Arc::new(accepted).run_liveness(rx));
+    drop(stop);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    client.close("done");
+    server.close();
+}
+
+#[tokio::test]
+async fn decoded_records_exercise_application_faults_independently_of_quic() {
+    use spall_net::fault::{AppFaultPlan, FaultChannel};
+    let cfg = TransportConfig::for_tests();
+    let (server, accepted, client) = pair(cfg, cfg).await;
+    let plan = AppFaultPlan {
+        seed: 42,
+        drop_ratio: 0.2,
+        duplicate_ratio: 0.3,
+        max_delay_ticks: 8,
+        reorder: true,
+    };
+    let mut fault = FaultChannel::new(plan);
+    let mut replay = FaultChannel::new(plan);
+    for seq in 1..=64 {
+        let record = spall_net::WireRecord::DurableThrough(spall_protocol::DurableThrough {
+            journal_seq: spall_core::JournalSeq(seq),
+        });
+        client.send_record(record).await.unwrap();
+        let decoded = accepted.recv_record().await.unwrap().unwrap();
+        fault.push(decoded.clone());
+        replay.push(decoded);
+    }
+    assert_eq!(fault.flush(), replay.flush());
+    let stats = fault.stats();
+    assert!(stats.dropped > 0 && stats.duplicated > 0 && stats.max_reorder_distance > 0);
+    assert_eq!(
+        stats.delivered,
+        stats.pushed - stats.dropped + stats.duplicated
+    );
+    assert!(client.stats().app_bytes_sent > client.stats().records_sent);
+    client.close("done");
+    server.close();
+}

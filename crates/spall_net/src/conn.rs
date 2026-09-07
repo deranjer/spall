@@ -80,6 +80,7 @@ struct CtrlRecv {
 /// An authenticated connection. Cheap to wrap in an `Arc`; every method takes
 /// `&self` so a heartbeat task and a receive loop can share one.
 pub struct Connection {
+    pub(crate) session_lease: Option<crate::endpoint::SessionLease>,
     quic: quinn::Connection,
     cfg: TransportConfig,
     role: Role,
@@ -127,6 +128,7 @@ impl Connection {
             ));
         }
         Ok(Self {
+            session_lease: None,
             quic,
             cfg,
             role,
@@ -155,6 +157,10 @@ impl Connection {
         self.role
     }
 
+    pub fn limits(&self) -> crate::config::TransportLimits {
+        self.cfg.limits
+    }
+
     /// The peer's address.
     pub fn peer_addr(&self) -> std::net::SocketAddr {
         self.quic.remote_address()
@@ -180,13 +186,19 @@ impl Connection {
     /// Sends one reliable record on the control stream, returning its assigned
     /// per-stream sequence number.
     pub async fn send_record(&self, record: WireRecord) -> Result<u64> {
-        let seq = self.out_seq.fetch_add(1, Ordering::Relaxed);
+        // Assign sequence numbers in the same critical section as stream writes.
+        let mut send = self.ctrl_send.lock().await;
+        let seq = self
+            .out_seq
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+                seq.checked_add(1)
+            })
+            .map_err(|_| TransportError::Connect("control sequence exhausted".into()))?;
         let bytes = NetMessage::Record { seq, record }
             .encode(self.cfg.limits.max_control_record)
             .map_err(|e| {
                 TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
             })?;
-        let mut send = self.ctrl_send.lock().await;
         write_framed(&mut send, &bytes, self.cfg.limits.max_control_record).await?;
         self.stats.records_sent.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -200,8 +212,8 @@ impl Connection {
     /// `Ok(None)` means the peer sent `Bye` or finished the stream.
     pub async fn recv_record(&self) -> Result<Option<WireRecord>> {
         loop {
+            let mut recv = self.ctrl_recv.lock().await;
             let raw = {
-                let mut recv = self.ctrl_recv.lock().await;
                 match read_framed(&mut recv.stream, self.cfg.limits.max_control_record).await? {
                     Some(bytes) => bytes,
                     None => return Ok(None),
@@ -217,7 +229,7 @@ impl Connection {
             self.touch().await;
             match msg {
                 NetMessage::Heartbeat { seq } => {
-                    self.ctrl_recv.lock().await.peer_heartbeat_seq = seq;
+                    recv.peer_heartbeat_seq = seq;
                 }
                 NetMessage::Bye { .. } => return Ok(None),
                 NetMessage::Record { seq, record } => {
@@ -303,6 +315,14 @@ impl Connection {
             self.stats
                 .app_bytes_recv
                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            if bytes.len() > self.cfg.limits.max_datagram_payload {
+                return Err(TransportError::Frame(
+                    crate::framing::FrameError::Oversize {
+                        declared: bytes.len(),
+                        limit: self.cfg.limits.max_datagram_payload,
+                    },
+                ));
+            }
             if bytes.len() < 8 {
                 // Too short to carry our envelope; ignore rather than trust it.
                 continue;
@@ -310,6 +330,12 @@ impl Connection {
             let seq = u64::from_le_bytes(bytes[..8].try_into().unwrap());
             let framed = &bytes[8..];
             let record = decode_datagram_record(framed)?;
+            if let DatagramRecord::Input(frame) = &record
+                && frame.session != self.session
+            {
+                self.stats.dedup_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             self.touch().await;
             match self.dgram_dedup.lock().await.admit(seq) {
                 DedupVerdict::Accept { .. } => {
@@ -335,6 +361,7 @@ impl Connection {
             .await
             .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
         Ok(BulkSend {
+            stats: self.stats.clone(),
             stream: send,
             cap: self.cfg.limits.max_bulk_part,
             _open: guard,
@@ -368,6 +395,7 @@ impl Connection {
             .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
         let guard = self.reserve_bulk()?;
         Ok(BulkRecv {
+            stats: self.stats.clone(),
             stream: recv,
             cap: self.cfg.limits.max_bulk_part,
             assembled_cap: self.cfg.limits.max_assembled_transfer,
@@ -398,29 +426,49 @@ impl Connection {
         let mut beat = tokio::time::interval(self.cfg.heartbeat_interval);
         beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            if *stop.borrow() || !self.is_alive() {
+                break;
+            }
             tokio::select! {
+                _ = self.quic.closed() => break,
                 _ = beat.tick() => {
+                    if self.since_last_seen().await > self.cfg.idle_timeout {
+                        self.quic.close(1u32.into(), b"idle timeout");
+                        break;
+                    }
                     let seq = self.out_seq.load(Ordering::Relaxed);
                     let beat_msg = NetMessage::Heartbeat { seq };
                     let bytes = match beat_msg.encode(self.cfg.limits.max_control_record) {
                         Ok(b) => b,
                         Err(_) => break,
                     };
-                    let sent = {
+                    let write = async {
                         let mut s = self.ctrl_send.lock().await;
                         write_framed(&mut s, &bytes, self.cfg.limits.max_control_record).await
                     };
+                    let sent = tokio::select! {
+                        result = tokio::time::timeout(self.cfg.heartbeat_interval, write) => result,
+                        _ = stop.changed() => {
+                            self.quic.close(0u32.into(), b"liveness stopped during write");
+                            break;
+                        }
+                    };
+                    // A canceled partial frame cannot safely resume on this stream.
+                    let sent = match sent { Ok(value) => value, Err(_) => {
+                        self.quic.close(1u32.into(), b"heartbeat write timeout"); break;
+                    }};
                     if sent.is_err() {
                         break;
                     }
                     self.stats.heartbeats_sent.fetch_add(1, Ordering::Relaxed);
+                    self.stats.app_bytes_sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     if self.since_last_seen().await > self.cfg.idle_timeout {
                         self.quic.close(1u32.into(), b"idle timeout");
                         break;
                     }
                 }
-                _ = stop.changed() => {
-                    if *stop.borrow() {
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
                         break;
                     }
                 }
@@ -490,6 +538,7 @@ impl Drop for BulkGuard {
 
 /// An outbound bulk stream for baseline parts.
 pub struct BulkSend {
+    stats: Arc<ConnStats>,
     stream: quinn::SendStream,
     cap: usize,
     _open: BulkGuard,
@@ -499,10 +548,26 @@ impl BulkSend {
     /// Writes one framed record (expected: `BaselinePart`), bounded by
     /// `max_bulk_part`.
     pub async fn send_part(&mut self, record: &spall_protocol::BaselinePart) -> Result<()> {
-        let framed = spall_protocol::encode_control(record).map_err(|e| {
+        if record.payload.len() > self.cap {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::WriteOversize {
+                    actual: record.payload.len(),
+                    limit: self.cap,
+                },
+            ));
+        }
+        let framed = spall_protocol::encode_bulk(record).map_err(|e| {
             TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
         })?;
-        write_framed(&mut self.stream, &framed, self.cap).await?;
+        write_framed(
+            &mut self.stream,
+            &framed,
+            self.cap + spall_protocol::codec::BULK_FRAME_OVERHEAD,
+        )
+        .await?;
+        self.stats
+            .app_bytes_sent
+            .fetch_add(framed.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -517,6 +582,7 @@ impl BulkSend {
 
 /// An inbound bulk stream, with an assembled-size ceiling.
 pub struct BulkRecv {
+    stats: Arc<ConnStats>,
     stream: quinn::RecvStream,
     cap: usize,
     assembled_cap: usize,
@@ -532,7 +598,15 @@ impl BulkRecv {
         let mut assembled = 0usize;
         let mut transfer = None;
         let mut next_part_index = 0u32;
-        while let Some(bytes) = read_framed(&mut self.stream, self.cap).await? {
+        while let Some(bytes) = read_framed(
+            &mut self.stream,
+            self.cap + spall_protocol::codec::BULK_FRAME_OVERHEAD,
+        )
+        .await?
+        {
+            self.stats
+                .app_bytes_recv
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             if parts.len() >= spall_protocol::limits::MAX_BASELINE_PARTS {
                 return Err(TransportError::Frame(
                     crate::framing::FrameError::BulkPartCount {
@@ -540,7 +614,18 @@ impl BulkRecv {
                     },
                 ));
             }
-            assembled = assembled.saturating_add(bytes.len());
+            let part = spall_protocol::decode_bulk(&bytes).map_err(|e| {
+                TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
+            })?;
+            if part.payload.len() > self.cap {
+                return Err(TransportError::Frame(
+                    crate::framing::FrameError::Oversize {
+                        declared: part.payload.len(),
+                        limit: self.cap,
+                    },
+                ));
+            }
+            assembled = assembled.saturating_add(part.payload.len());
             if assembled > self.assembled_cap {
                 return Err(TransportError::Frame(
                     crate::framing::FrameError::Oversize {
@@ -549,10 +634,6 @@ impl BulkRecv {
                     },
                 ));
             }
-            let part: spall_protocol::BaselinePart = spall_protocol::decode_control(&bytes)
-                .map_err(|e| {
-                    TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
-                })?;
             if let Some(expected) = transfer {
                 if part.transfer_id != expected {
                     return Err(TransportError::Frame(
@@ -577,7 +658,7 @@ impl BulkRecv {
                     },
                 ));
             }
-            next_part_index = next_part_index.checked_add(1).ok_or_else(|| {
+            next_part_index = next_part_index.checked_add(1).ok_or({
                 TransportError::Frame(crate::framing::FrameError::BulkPartCount {
                     limit: spall_protocol::limits::MAX_BASELINE_PARTS,
                 })

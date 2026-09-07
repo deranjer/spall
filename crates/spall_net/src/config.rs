@@ -50,6 +50,11 @@ pub struct TransportConfig {
     pub idle_timeout: Duration,
     /// QUIC keep-alive PING interval. Kept below `idle_timeout`.
     pub keep_alive_interval: Duration,
+    /// Maximum caller-owned `NetServer::accept` operations that may be waiting
+    /// for QUIC establishment or authentication at one time.
+    pub max_pending_authentications: u32,
+    /// Live server Connection objects; dropping one releases its reusable slot.
+    pub max_connections: u32,
 }
 
 impl Default for TransportConfig {
@@ -60,6 +65,8 @@ impl Default for TransportConfig {
             heartbeat_interval: Duration::from_millis(500),
             idle_timeout: Duration::from_secs(10),
             keep_alive_interval: Duration::from_secs(2),
+            max_pending_authentications: 32,
+            max_connections: 128,
         }
     }
 }
@@ -73,6 +80,8 @@ impl TransportConfig {
             heartbeat_interval: Duration::from_millis(100),
             idle_timeout: Duration::from_secs(6),
             keep_alive_interval: Duration::from_millis(500),
+            max_pending_authentications: 8,
+            max_connections: 32,
         }
     }
 }

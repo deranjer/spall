@@ -98,7 +98,7 @@ pub struct UdpProxy {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-const MAX_DATAGRAM: usize = 2048;
+const MAX_DATAGRAM: usize = 65535;
 
 impl UdpProxy {
     /// Binds a loopback socket and starts relaying to `upstream`.
@@ -160,6 +160,8 @@ impl Drop for UdpProxy {
     }
 }
 
+// Both directions and every delayed packet belong to this one task. Dropping
+// or aborting it drops the queue and sockets; no detached sends survive shutdown.
 async fn relay_loop(
     listen: Arc<UdpSocket>,
     upstream_addr: SocketAddr,
@@ -167,137 +169,102 @@ async fn relay_loop(
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
 ) {
-    // One upstream socket, and the most recent client address. QUIC on
-    // loopback keeps a stable 4-tuple per connection; a second client gets its
-    // own proxy in the harness.
+    const MAX_PENDING_PACKETS: usize = 1024;
+    const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
     let upstream = match UdpSocket::bind("127.0.0.1:0").await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            tracing::warn!("proxy upstream bind failed: {e}");
-            return;
-        }
+        Ok(s) => s,
+        Err(_) => return,
     };
     if upstream.connect(upstream_addr).await.is_err() {
         return;
     }
-
-    let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let mut client = None;
     let mut c2s_rng = SplitMix64::new(plan.seed ^ 0xC2C2_C2C2);
-    let s2c_rng = Arc::new(Mutex::new(SplitMix64::new(plan.seed ^ 0x5252_5252)));
-
-    // Server -> client pump.
-    let s2c = {
-        let listen = listen.clone();
-        let upstream = upstream.clone();
-        let client_addr = client_addr.clone();
-        let counters = counters.clone();
-        let stop = stop.clone();
-        let s2c_rng = s2c_rng.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; MAX_DATAGRAM];
-            while !stop.load(Ordering::SeqCst) {
-                let n =
-                    match tokio::time::timeout(Duration::from_millis(200), upstream.recv(&mut buf))
-                        .await
-                    {
-                        Ok(Ok(n)) => n,
-                        Ok(Err(_)) => break,
-                        Err(_) => continue,
-                    };
-                let Some(dst) = *client_addr.lock().await else {
-                    continue;
-                };
-                let drop = s2c_rng.lock().await.next_f64() < plan.loss_ratio;
-                if drop {
-                    counters.s2c_dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                let dup = plan.duplicate_ratio > 0.0
-                    && s2c_rng.lock().await.next_f64() < plan.duplicate_ratio;
-                let packet = buf[..n].to_vec();
-                counters.s2c_forwarded.fetch_add(1, Ordering::Relaxed);
-                spawn_send(
-                    listen.clone(),
-                    packet.clone(),
-                    dst,
-                    sample_delay(&plan, &s2c_rng).await,
-                );
-                if dup {
-                    spawn_send(
-                        listen.clone(),
-                        packet,
-                        dst,
-                        sample_delay(&plan, &s2c_rng).await,
-                    );
-                }
-            }
-        })
-    };
-
-    // Client -> server pump.
-    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut s2c_rng = SplitMix64::new(plan.seed ^ 0x5252_5252);
+    let mut cbuf = vec![0; MAX_DATAGRAM];
+    let mut sbuf = vec![0; MAX_DATAGRAM];
+    // Instant and insertion order preserve deterministic ordering for equal deadlines.
+    let mut queue = std::collections::BTreeMap::new();
+    let mut queued_bytes = 0usize;
+    let mut order = 0u64;
     while !stop.load(Ordering::SeqCst) {
-        let (n, from) = match tokio::time::timeout(
-            Duration::from_millis(200),
-            listen.recv_from(&mut buf),
-        )
-        .await
-        {
-            Ok(Ok(v)) => v,
-            Ok(Err(_)) => break,
-            Err(_) => continue,
+        let due = queue
+            .first_key_value()
+            .map(|((time, _), _)| *time)
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_millis(20));
+        let incoming = tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(20)) => { continue; }
+            _ = tokio::time::sleep_until(due) => {
+                if let Some((_, (toward_server, dst, packet))) = queue.pop_first() {
+                    let packet: Vec<u8> = packet;
+                    queued_bytes -= packet.len();
+                    let sent = if toward_server { upstream.send(&packet).await }
+                        else { listen.send_to(&packet, dst).await };
+                    let counter = match (toward_server, sent.is_ok()) {
+                        (true, true) => &counters.c2s_forwarded,
+                        (true, false) => &counters.c2s_dropped,
+                        (false, true) => &counters.s2c_forwarded,
+                        (false, false) => &counters.s2c_dropped,
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+            value = listen.recv_from(&mut cbuf) => {
+                let Ok((n, from)) = value else { break; };
+                // One client per relay: unrelated traffic cannot redirect replies.
+                if client.is_some_and(|known| known != from) { continue; }
+                client = Some(from);
+                (true, upstream_addr, cbuf[..n].to_vec())
+            }
+            value = upstream.recv(&mut sbuf) => {
+                let Ok(n) = value else { break; };
+                let Some(dst) = client else { continue; };
+                (false, dst, sbuf[..n].to_vec())
+            }
         };
-        *client_addr.lock().await = Some(from);
-        if c2s_rng.next_f64() < plan.loss_ratio {
-            counters.c2s_dropped.fetch_add(1, Ordering::Relaxed);
+        let (toward_server, dst, packet) = incoming;
+        let rng = if toward_server {
+            &mut c2s_rng
+        } else {
+            &mut s2c_rng
+        };
+        let dropped = if toward_server {
+            &counters.c2s_dropped
+        } else {
+            &counters.s2c_dropped
+        };
+        if rng.next_f64() < plan.loss_ratio {
+            dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        let dup = plan.duplicate_ratio > 0.0 && c2s_rng.next_f64() < plan.duplicate_ratio;
-        let delay = plan.delay + jitter(&mut c2s_rng, plan.jitter);
-        let packet = buf[..n].to_vec();
-        counters.c2s_forwarded.fetch_add(1, Ordering::Relaxed);
-        spawn_send_connected(upstream.clone(), packet.clone(), delay);
-        if dup {
-            let d = plan.delay + jitter(&mut c2s_rng, plan.jitter);
-            spawn_send_connected(upstream.clone(), packet, d);
+        let copies = if rng.next_f64() < plan.duplicate_ratio {
+            2
+        } else {
+            1
+        };
+        for _ in 0..copies {
+            if queue.len() >= MAX_PENDING_PACKETS || packet.len() > MAX_PENDING_BYTES - queued_bytes
+            {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let delay = plan.delay.saturating_add(jitter(rng, plan.jitter));
+            let Some(due) = tokio::time::Instant::now().checked_add(delay) else {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            queued_bytes += packet.len();
+            queue.insert((due, order), (toward_server, dst, packet.clone()));
+            order = order.wrapping_add(1);
         }
     }
-
-    s2c.abort();
-    let _ = s2c.await;
-}
-
-async fn sample_delay(plan: &PacketFaultPlan, rng: &Arc<Mutex<SplitMix64>>) -> Duration {
-    let mut guard = rng.lock().await;
-    plan.delay + jitter(&mut guard, plan.jitter)
 }
 
 fn jitter(rng: &mut SplitMix64, max: Duration) -> Duration {
-    if max.is_zero() {
-        return Duration::ZERO;
-    }
-    let micros = rng.next_u64() % (max.as_micros() as u64 + 1);
-    Duration::from_micros(micros)
+    let max_micros = max.as_micros().min((u64::MAX - 1) as u128) as u64;
+    Duration::from_micros(rng.next_u64() % (max_micros + 1))
 }
-
-fn spawn_send(sock: Arc<UdpSocket>, packet: Vec<u8>, dst: SocketAddr, delay: Duration) {
-    tokio::spawn(async move {
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        let _ = sock.send_to(&packet, dst).await;
-    });
-}
-
-fn spawn_send_connected(sock: Arc<UdpSocket>, packet: Vec<u8>, delay: Duration) {
-    tokio::spawn(async move {
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        let _ = sock.send(&packet).await;
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +334,34 @@ mod tests {
         assert_eq!(a.c2s_dropped, b.c2s_dropped);
         assert!(a.c2s_dropped > 0 && a.c2s_forwarded > 0);
         assert_eq!(a.c2s_forwarded + a.c2s_dropped, 40);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_cancels_delayed_packets_and_releases_the_socket() {
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let plan = PacketFaultPlan {
+            delay: Duration::from_millis(250),
+            ..PacketFaultPlan::transparent(9)
+        };
+        let proxy = UdpProxy::spawn(sink.local_addr().unwrap(), plan)
+            .await
+            .unwrap();
+        let address = proxy.local_addr();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(b"must never arrive", address).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        proxy.shutdown().await;
+        let _rebound = UdpSocket::bind(address).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), sink.recv(&mut [0; 64]))
+                .await
+                .is_err()
+        );
+        assert_eq!(proxy.stats().c2s_forwarded, 0);
     }
 }
