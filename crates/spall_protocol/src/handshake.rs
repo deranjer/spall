@@ -77,6 +77,17 @@ impl Record for Handshake {
     const TAG: WireTag = WireTag::Handshake;
 
     fn validate(&self) -> Result<(), RecordError> {
+        if self.limits.max_control_record == 0
+            || self.limits.max_bulk_part == 0
+            || self.limits.max_assembled_transfer == 0
+            || self.limits.max_datagram_payload == 0
+            || !self.limits.within(NegotiatedLimits::DEFAULT)
+        {
+            return Err(RecordError::OutOfRange {
+                field: "Handshake.limits",
+                detail: "limits must be non-zero and within protocol ceilings",
+            });
+        }
         // At most one entry per known cell-size code.
         limits::check_count("Handshake.cell_size_codes", self.cell_size_codes.len(), 8)
             .map_err(RecordError::Size)?;
@@ -117,6 +128,7 @@ pub enum Incompatibility {
 /// created. `Ok(())` means the connection may proceed.
 pub fn check_compatible(client: &Handshake, server: &Handshake) -> Result<(), Incompatibility> {
     client.validate().map_err(Incompatibility::Invalid)?;
+    server.validate().map_err(Incompatibility::Invalid)?;
 
     if client.protocol_version != server.protocol_version {
         return Err(Incompatibility::ProtocolVersion {
@@ -146,6 +158,12 @@ pub fn check_compatible(client: &Handshake, server: &Handshake) -> Result<(), In
         return Err(Incompatibility::TickRate {
             client: client.server_tick_hz,
             server: server.server_tick_hz,
+        });
+    }
+    if client.motion_snapshot_hz != server.motion_snapshot_hz {
+        return Err(Incompatibility::TickRate {
+            client: client.motion_snapshot_hz,
+            server: server.motion_snapshot_hz,
         });
     }
     let server_codes: std::collections::BTreeSet<u8> =
@@ -230,8 +248,23 @@ mod tests {
         );
 
         let mut c = server.clone();
-        c.limits.max_control_record = NegotiatedLimits::DEFAULT.max_control_record + 1;
-        assert_eq!(check_compatible(&c, &server), Err(Incompatibility::Limits));
+        c.limits.max_control_record /= 2;
+        assert_eq!(check_compatible(&server, &c), Err(Incompatibility::Limits));
+        c.limits.max_control_record = 0;
+        assert!(matches!(
+            check_compatible(&c, &server),
+            Err(Incompatibility::Invalid(_))
+        ));
+        assert!(matches!(
+            check_compatible(&server, &c),
+            Err(Incompatibility::Invalid(_))
+        ));
+        c = server.clone();
+        c.motion_snapshot_hz += 1;
+        assert!(matches!(
+            check_compatible(&c, &server),
+            Err(Incompatibility::TickRate { .. })
+        ));
     }
 
     #[test]

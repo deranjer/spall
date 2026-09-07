@@ -30,7 +30,10 @@ pub use canonical::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, CanonicalWriter, Hash32,
     canonical_topology_hash, content_manifest_hash,
 };
-pub use codec::{CodecError, decode_control, decode_datagram, encode_control, encode_datagram};
+pub use codec::{
+    CodecError, decode_bulk, decode_control, decode_datagram, decode_topology, encode_bulk,
+    encode_control, encode_datagram,
+};
 pub use handshake::{
     AlgorithmVersions, Handshake, Incompatibility, NegotiatedLimits, PROTOCOL_VERSION,
     check_compatible,

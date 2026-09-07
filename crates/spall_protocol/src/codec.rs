@@ -14,11 +14,35 @@
 //! that decodes structurally but violates a count/range/finiteness rule is
 //! rejected.
 
-use crate::limits::{MAX_CONTROL_RECORD, MAX_DATAGRAM_PAYLOAD, SizeLimitError};
+use crate::limits::{MAX_BULK_PART, MAX_CONTROL_RECORD, MAX_DATAGRAM_PAYLOAD, SizeLimitError};
 use crate::records::{Record, RecordError, WireTag};
 
 /// Header length in bytes: `u16` schema version + `u16` tag.
 pub const HEADER_LEN: usize = 4;
+
+/// Worst-case postcard metadata: transfer u64 (10), index u32 (5), hash (32),
+/// payload length u64 (10), plus the protocol header. Payload bytes are capped
+/// separately by BaselinePart::validate.
+pub const BULK_FRAME_OVERHEAD: usize = HEADER_LEN + 10 + 5 + 32 + 10;
+
+pub fn encode_bulk(record: &crate::BaselinePart) -> Result<Vec<u8>, CodecError> {
+    encode(record, MAX_BULK_PART + BULK_FRAME_OVERHEAD, "bulk part")
+}
+
+pub fn decode_bulk(bytes: &[u8]) -> Result<crate::BaselinePart, CodecError> {
+    decode(bytes, MAX_BULK_PART + BULK_FRAME_OVERHEAD)
+}
+
+/// World consumers must validate material references before applying a record.
+/// Generic decode_control only checks structural validity, without a registry.
+pub fn decode_topology(
+    bytes: &[u8],
+    manifest: &spall_core::MaterialManifest,
+) -> Result<crate::TopologyTransaction, CodecError> {
+    let record: crate::TopologyTransaction = decode_control(bytes)?;
+    record.validate_against(manifest)?;
+    Ok(record)
+}
 
 /// Failure encoding or decoding a framed record.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -132,6 +156,38 @@ mod tests {
         SnapshotSeq,
     };
     use spall_core::{EntityId, JournalSeq, Pose, QuantizedQuat, Revision, Tick};
+
+    #[test]
+    fn maximum_bulk_payload_round_trips_with_metadata() {
+        let payload = vec![17; MAX_BULK_PART];
+        let part = crate::BaselinePart {
+            transfer_id: crate::TransferId(u64::MAX),
+            part_index: 0,
+            part_hash: crate::Hash32::of(&payload),
+            payload,
+        };
+        assert!(encode_control(&part).is_err());
+        let bytes = encode_bulk(&part).unwrap();
+        assert_eq!(decode_bulk(&bytes).unwrap(), part);
+        assert!(decode_bulk(&vec![0; MAX_BULK_PART + BULK_FRAME_OVERHEAD + 1]).is_err());
+    }
+
+    #[test]
+    fn postcard_cannot_construct_an_invalid_brush() {
+        #[derive(serde::Serialize)]
+        struct RawBrush {
+            centre: spall_core::BrushPoint,
+            radius_units: i64,
+        }
+        for radius in [-1, 256 * 256 + 1, i64::MAX] {
+            let bytes = postcard::to_stdvec(&RawBrush {
+                centre: spall_core::BrushPoint::from_units(0, 0, 0),
+                radius_units: radius,
+            })
+            .unwrap();
+            assert!(postcard::from_bytes::<spall_core::SphereBrush>(&bytes).is_err());
+        }
+    }
 
     #[test]
     fn control_record_round_trips() {
