@@ -241,7 +241,9 @@ mod tests {
     const FLAT_TERRAIN_DIGEST: &str =
         "630925223666650e47a724ba9686efd7787eb5868581518eb25c1f8c64c24d88";
     const HOLLOW_TOWER_DIGEST: &str =
-        "4d8327645e596ae0456c87ea968a0d8484b233b589a815311706c46c2b5b55e6";
+        // T02 review corrected per-brick revision allocation to (z,y,x).
+        // Geometry/content is unchanged; the digest also includes revisions.
+        "e164e7dc4ef3565cfc181de28442875ff6dc91f0321dfd69fb0e0a483f382933";
     const BRIDGE_DIGEST: &str = "70905cb1ba1414ca3eef09912281e3ddfa94cb23fbe1ff9f69fb15b22b856ab8";
     const SLOPE_DIGEST: &str = "30023f777e4a2c0cc1f0515785581b6d4cd95dd3d304a8e7bdc51e1d50ec5862";
 }

@@ -157,3 +157,7 @@ part, 64 MiB per assembled transfer, 256 KiB max decompressed material-only
 brick record (64 KiB actual payload), 1100 B per datagram payload. Count
 ceilings: 3 redundant inputs per frame, 4096 transaction ops / refs, 8192
 baseline regions, 4096 baseline parts.
+
+### T01 review clarifications
+
+A `CellRun` addresses contiguous +X cells in the volume's cell coordinates with fixed Y/Z; `start.x + len - 1` must fit i64. Sphere and material-manifest deserialization uses the same validation as their checked constructors. Generic structural decoding does not know a world's material registry: world application must use `decode_topology(bytes, manifest)` or call `validate_against` before mutation. Baseline bulk payloads may use the full 1 MiB; `encode_bulk`/`decode_bulk` reserve additional bounded bytes for protocol and postcard metadata. Control records retain their independent 64 KiB cap. Negotiated limits must be nonzero and within protocol ceilings, and both simulation and snapshot rates must match.

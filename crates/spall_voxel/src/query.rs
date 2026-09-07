@@ -105,7 +105,7 @@ impl RayConfig {
     /// A normalised ray crosses at most `|dx| + |dy| + |dz| <= sqrt(3) < 2`
     /// grid planes per unit length, so `2 * distance + 8` always suffices.
     pub fn new(max_distance: f64) -> Self {
-        let steps = (max_distance.max(0.0) * 2.0).ceil() as u64 + 8;
+        let steps = ((max_distance.max(0.0) * 2.0).ceil() as u64).saturating_add(8);
         Self {
             max_distance,
             max_steps: steps.min(u64::from(u32::MAX)) as u32,
@@ -343,6 +343,9 @@ fn sample_cell(volume: &Volume, cell: [i64; 3]) -> CellSample {
         // Outside a bounded volume there is simply no geometry: traversable.
         Err(AccessError::OutOfBounds { .. }) => CellSample::Empty,
         Err(AccessError::BadCellIndex(_)) => unreachable!("GlobalCell::split always yields 0..32"),
+        Err(AccessError::RevisionExhausted { .. }) => {
+            unreachable!("sampling does not allocate revisions")
+        }
     }
 }
 
@@ -366,6 +369,12 @@ mod tests {
     use spall_core::{BrickCoord, CellSizeCode, Revision, VolumeId};
 
     const STONE: MaterialId = MaterialId(1);
+
+    #[test]
+    fn huge_ranges_saturate_the_step_budget_without_overflow() {
+        assert_eq!(RayConfig::new(f64::MAX).max_steps, u32::MAX);
+        assert_eq!(RayConfig::new(f64::INFINITY).max_steps, u32::MAX);
+    }
 
     fn down_ray(y: f64) -> Ray {
         Ray::new(DVec3::new(0.5, y, 0.5), DVec3::new(0.0, -1.0, 0.0))
