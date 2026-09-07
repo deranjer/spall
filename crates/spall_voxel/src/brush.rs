@@ -58,7 +58,12 @@ impl EditPlan {
             for y in min[1]..=max[1] {
                 for x in min[0]..=max[0] {
                     let (cx, cy, cz) = cell_centre_units(x, y, z);
-                    if brush.contains_cell_centre(cx, cy, cz) {
+                    let dx = cx - i128::from(brush.centre.x);
+                    let dy = cy - i128::from(brush.centre.y);
+                    let dz = cz - i128::from(brush.centre.z);
+                    // Bounding-box candidates are close to the fixed-point
+                    // centre even at i64 extrema; keep their centres widened.
+                    if dx * dx + dy * dy + dz * dz <= i128::from(brush.radius_units()).pow(2) {
                         plan.set(GlobalCell::new(x, y, z), material);
                     }
                 }
@@ -76,11 +81,11 @@ fn normalise_box(a: GlobalCell, b: GlobalCell) -> (GlobalCell, GlobalCell) {
 }
 
 /// Fixed-point coordinate of the centre of integer cell `(x, y, z)`.
-fn cell_centre_units(x: i64, y: i64, z: i64) -> (i64, i64, i64) {
+fn cell_centre_units(x: i64, y: i64, z: i64) -> (i128, i128, i128) {
     (
-        x.saturating_mul(BRUSH_UNIT).saturating_add(HALF_CELL_UNITS),
-        y.saturating_mul(BRUSH_UNIT).saturating_add(HALF_CELL_UNITS),
-        z.saturating_mul(BRUSH_UNIT).saturating_add(HALF_CELL_UNITS),
+        i128::from(x) * i128::from(BRUSH_UNIT) + i128::from(HALF_CELL_UNITS),
+        i128::from(y) * i128::from(BRUSH_UNIT) + i128::from(HALF_CELL_UNITS),
+        i128::from(z) * i128::from(BRUSH_UNIT) + i128::from(HALF_CELL_UNITS),
     )
 }
 
@@ -132,6 +137,19 @@ mod tests {
     use spall_core::{BrickCoord, CellSizeCode, Revision};
 
     const STONE: MaterialId = MaterialId(1);
+
+    #[test]
+    fn extreme_brush_centres_do_not_saturate_cells_into_the_sphere() {
+        // No cell centre lies at i64::MAX or MIN in fixed-point space.
+        for x in [i64::MAX, i64::MIN] {
+            let brush = SphereBrush::new(BrushPoint::from_units(x, 128, 128), 0).unwrap();
+            assert!(
+                EditPlan::sphere(VolumeId::new(1).unwrap(), brush, STONE)
+                    .writes
+                    .is_empty()
+            );
+        }
+    }
 
     fn vol(id: u64) -> Volume {
         Volume::new(VolumeId::new(id).unwrap(), CellSizeCode::Quarter)
@@ -221,7 +239,7 @@ mod tests {
             for y in -12..=10 {
                 for x in -6..=16 {
                     let (cx, cy, cz) = cell_centre_units(x, y, z);
-                    if brush.contains_cell_centre(cx, cy, cz) {
+                    if brush.contains_cell_centre(cx as i64, cy as i64, cz as i64) {
                         expected.insert((x, y, z));
                     }
                 }
