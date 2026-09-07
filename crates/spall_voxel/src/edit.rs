@@ -87,6 +87,7 @@ pub enum EditError {
 impl From<AccessError> for EditError {
     fn from(value: AccessError) -> Self {
         match value {
+            AccessError::RevisionExhausted { .. } => Self::RevisionExhausted,
             AccessError::OutOfBounds { coord } => Self::OutOfBounds { coord },
             AccessError::BadCellIndex(_) => {
                 unreachable!("edit writes use LocalCell, which is always in range")
@@ -236,7 +237,7 @@ mod tests {
         let rec = &outcome.bricks[0];
         assert!(rec.existed_before);
         assert_eq!(rec.before_revision, Revision(4));
-        assert_eq!(rec.after_revision, Revision(1));
+        assert_eq!(rec.after_revision, Revision(5));
         assert_eq!(rec.cells_changed, 1);
     }
 
