@@ -1,0 +1,4 @@
+# Rust build outputs and per-run artifacts/worktrees.
+/target/
+**/target/
+/.local/

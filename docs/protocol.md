@@ -1,0 +1,102 @@
+# Multiplayer, persistence, and recovery contract
+
+This is a proposed version-1 contract. T01 turns these records into tested DTOs before dependent tasks use them. User requirements: multiplayer and full-world destruction are essential.
+
+## Authority and transport
+
+The server owns world edits, support/fracture decisions, body identity, physics, and persistent state. Clients send input and action requests. Local play starts the same server with loopback transport; it does not bypass validation or transaction creation.
+
+Use Quinn reliable streams and datagrams. One reliable ordered control/topology stream per client keeps initial event ordering simple. Separate bounded bulk streams carry baselines; bulk work must not starve control and motion. Limit concurrent bulk streams to four initially, with application priority and byte budgets. QUIC congestion control alone is not game traffic prioritization.
+
+Datagrams carry player inputs and body/player motion. Each payload fits `min(1100, connection.max_datagram_size())` bytes after our envelope; recalculate when path limits change. Fail the connection setup clearly if required datagrams are unavailable. Larger records are split into independently useful snapshots, not IP-fragmented giant packets. Reliable application records use explicit length framing and checked decoding.
+
+Handshake includes protocol version, exact content manifest hash, world ID, generator version, supported algorithms, server tick rate, cell-size codes, session identity, and negotiated limits. Reject incompatibility before creating a player. For development use server certificate fingerprint pinning and a session join token; do not disable TLS verification globally. Dedicated Internet hosting is direct-address initially; QUIC does not provide NAT traversal, a relay, matchmaking, or account identity. Those need an explicit later platform choice.
+
+## Minimal record families
+
+| Record | Required fields and meaning |
+| --- | --- |
+| InputFrame | session/player, input sequence, intended server tick estimate, movement axes, view direction, held buttons; include up to three recent frames redundantly |
+| ActionRequest | unique request ID, input sequence, action/tool type, aim, claimed target; server validates all claims |
+| ActionStatus | request ID, queued/rejected/committed status, reason or TransactionId; queued is not committed |
+| TopologyTransaction | TransactionId, server tick, connection stream sequence, algorithm version, dependencies, before/after revisions, ordered operations, canonical result hashes |
+| MotionSnapshot | server tick, snapshot sequence, acknowledged input sequence, body/player ID, topology revision, pose, velocity, angular velocity, sleeping flag |
+| BaselineBegin/Part/End | transfer ID, interest epoch, checkpoint tick, journal cursor, world/content versions, byte counts, part hashes, region/volume manifest |
+| BaselineAck | transfer ID, verified manifest hash and installed cursor |
+| RepairRequest | object/brick key, expected/current revision and hash; rate-limited |
+| DurableThrough | highest contiguous journal sequence flushed to durable storage; distinct from simulation commit |
+
+Never serialize Rapier handles, ECS entities, pointers, platform-sized integers, or raw Rust structs. DTOs use explicit numeric sizes, tags, units, and bounds. Version the wire schema independently of the world save schema. Protocol mismatch is initially a clear rejection, not speculative compatibility code.
+
+Limits start at 64 KiB per control record, 1 MiB per bulk part, 64 MiB per assembled transfer, and 256 KiB maximum decompressed data per material-only brick record (actual material payload is 64 KiB). Validate counts before allocation and decompress with output bounds. A multi-volume transaction can span staged bulk parts; its visible commit marker is small. Larger regions are split into multiple dependency-complete transfers. Each connection has bounded staging memory and a timeout.
+
+## Exact geometry, approximate motion
+
+Use a hybrid representation for topology changes:
+
+- Replicate compact deterministic local integer brush operations when the client's source revision matches exactly.
+- Encode explicit cell/material runs for irregular changes and repairs.
+- The server chooses split membership, child IDs, ownership transfer, and resulting transforms. A split uses canonical source-cell ranges or a baseline blob, not a client rerun of floating-point physics or support heuristics.
+- Use the smaller valid encoding, bounded by staging limits. Do not send full modified chunks every frame as the default.
+
+Physics is not lockstep. Do not promise identical trajectories from running the same inputs on every machine. Rapier's determinism guarantees have conditions, and whole-engine determinism requires more than selecting a physics feature. [Rapier determinism documentation](https://rapier.rs/docs/user_guides/rust/determinism/).
+
+Canonical topology hashes include sorted volume IDs, cell-size codes, brick coordinates, authoritative layer bytes, ownership, and revisions. Exclude motion, render caches, and library allocation order. Specify little-endian encodings and stable sorting in T01; BLAKE3 over the canonical bytes defines the result. Hashes detect divergence; baselines repair it.
+
+## Transaction application
+
+1. Server constructs a complete transaction against specific input revisions. All source changes, children, mass/pose metadata, and required server collision updates are ready before commit.
+2. Server commits once at a tick boundary and journals the complete authoritative result. Repeated ActionRequest IDs return the existing status and cannot perform another cut.
+3. Client stages all parts and checks source revisions, IDs, length limits, and hashes. It applies operations in the encoded order into a candidate replica.
+4. Publish the candidate only when the whole transaction validates. Retain the previous consistent replica while dependencies or derived client collision data are pending. Local visual feedback may show a pending action but must not change authoritative replica geometry.
+5. Duplicate transactions are ignored using session/stream sequencing and IDs. Unexpected source revisions trigger bounded repair, not guessed replay. A failed candidate cannot partly replace live state.
+
+A motion snapshot may arrive before its body's creation or refer to a newer topology revision. Keep at most one newest pending snapshot per unknown body for a short bounded window; apply only after the required topology arrives. Ignore snapshots older than the installed revision or last applied tick. Destruction/tombstone messages prevent late packets from resurrecting bodies. IDs are not reused.
+
+Filtered replication uses per-connection stream sequences; gaps in global TransactionIds are normal. If a cross-region transaction affects a subscribed object and an unsubscribed dependency, first supply a complete dependency baseline or an authoritative post-transaction replacement for the subscribed view. Never ask a client to replay a brush over geometry it has not received. Large bodies are relevant if their bounds intersect interest, even if their centres are far away.
+
+## Prediction and interpolation
+
+Server consumes at most one validated input frame per player/tick. Reject invalid values, excessive look/movement rates, excessive lead/lag, and duplicates. Reuse recent held movement briefly on loss; clear it after a 250 ms silence timeout. Edge-triggered tool actions use reliable deduplicated ActionRequests.
+
+The local client keeps a bounded input/state history, predicts capsule movement, and replays unacknowledged inputs after an authoritative correction. Collision topology changes invalidate affected history: restore the authoritative player state and rebuild prediction against a known revision. Do not replay movement blindly through geometry that no longer exists.
+
+Render remote motion initially about 100 ms behind the latest estimated server time. Interpolate known states; extrapolate for at most 100 ms and then hold, with visible-lag metrics. Never derive authoritative destruction from that extrapolated pose. The server owns pushing/crushing outcomes. Cosmetic particles can be predicted and discarded freely.
+
+No rewind of destructible world history for competitive lag compensation in v1. Server-time hit validation is an explicit latency tradeoff. PvP-grade historical voxel/body hit testing is a separate feature, not an assumed property of player prediction.
+
+## Late join, interest changes, and reconnect
+
+1. Capture an immutable, dependency-complete regional snapshot at tick T and journal cursor J. Include relevant terrain, modified-air tombstones, body geometry/poses, authoritative material/bond layers, and required manifest entries.
+2. Continue simulation. Retain subsequent relevant transactions in a bounded catch-up queue while sending compressed, hashed baseline parts on bulk streams.
+3. Client validates and installs the baseline atomically, then applies subsequent topology records in order to a declared barrier cursor. Motion samples are held until their topology exists.
+4. Server sends a current motion keyframe for those objects. Permit player interaction only when local collision neighborhoods and the barrier are ready.
+5. If the client cannot catch up within memory/time limits, cancel the transfer and create a fresher snapshot. Apply a retry limit and clear diagnostic. Do not require replaying all edits since world creation or permanently disable late join after heavy destruction.
+
+Interest re-entry follows the same protocol. Unsubscribing evicts only the replica view, not the persistent entity. Reconnect uses a new session generation; old queued inputs and packets are invalid. Cached content may be reused only after matching world/manifest/revision hashes.
+
+## Persistence
+
+Use SQLite transactions through one I/O writer. Store metadata, versioned compressed brick payloads, volume/body records, spatial references, checkpoints, and an ordered authoritative journal. Configure and verify `journal_mode=WAL` and `synchronous=FULL` on the writer in T16. Group pending journal records into a database transaction, and acknowledge durability only after its successful commit. Keep the database on local storage. SQLite permits one WAL writer at a time and distinguishes commit durability from checkpointing. [SQLite WAL documentation](https://sqlite.org/wal.html).
+
+An engine checkpoint is a coherent saved simulation snapshot. A SQLite WAL checkpoint transfers database WAL pages; these are different operations. Bound reader transaction lifetimes and schedule database checkpoint work off the simulation thread. Include WAL size and flush/checkpoint latency in persistence metrics. T00 must select a released SQLite build with applicable upstream WAL fixes, including when using rusqlite's bundled library.
+
+Required world metadata: schema version, WorldId, seed, generator version, material manifest/hash, cell-size codes, next-ID counters, checkpoint tick/cursor, and structural algorithm versions. Body records store stable IDs, voxel geometry references, pose/velocity, sleep state, damage/bond state, and mass inputs. No physics library internals are the primary save format.
+
+Initially checkpoint the bounded scene from one immutable tick snapshot every 30 seconds and on clean shutdown; journal topology transactions between checkpoints. Journal periodic body pose batches at 20 Hz. Each topology journal transaction also contains the participant body states required at that transaction, so geometry edits to moving bodies recover with the correct ownership/frame even if earlier motion batches are missing.
+
+Group disk flushes with a target interval <=100 ms, then emit DurableThrough. A simulation commit may precede durability. A crash can lose the unflushed suffix and rewind motion to the latest durable pose batch; this is the explicit initial durability model. Clean shutdown waits for a final checkpoint/flush. Never tell an automation that a save succeeded before durable acknowledgement. If the storage queue exceeds its limit or disk writes fail, stop accepting persistent edits and return an error; do not silently continue an unsavable world.
+
+Checkpoint publication records all brick/body data and its journal cursor in one DB transaction. Recovery loads the latest complete checkpoint and replays the durable ordered journal suffix. Ignore no interior corrupt record: report corruption and offer the previous valid checkpoint as an explicit recovery choice. A crash must not leave the terrain removed without the corresponding child body.
+
+Retire journal records only after a newer durable checkpoint covers them and no snapshot transfer needs them. Cap retention; lagging joins get a fresh baseline. Persist modified-air bricks explicitly so procedural regeneration cannot restore mined blocks. Initial baselines transfer authoritative terrain rather than trusting client-side generation to be bit-identical.
+
+Use versioned DTO migrations with fixture worlds before changing save formats. Unknown newer schemas are rejected without modifying the database. Back up/migrate into a separate database and validate before replacement.
+
+## Network budget and overload behavior
+
+Provisional per-client steady-state egress target: <=256 KiB/s, measured including topology and motion; baseline transfer has a separate capped 1 MiB/s budget. At eight clients this is already about 16.8 Mbit/s server steady egress before overhead. Track both directions and actual transport bytes.
+
+Budget example: 200 relevant bodies x 48 encoded bytes x 20 Hz = 192,000 bytes/s before framing, topology, player records, and retransmission. Therefore not all bodies can receive 20 Hz updates continuously. Prioritize players, imminent contacts, nearby moving bodies, and recently changed structures; send distant/sleeping bodies less frequently with periodic keyframes.
+
+Never discard committed topology to meet the motion budget. Drop superseded unsent motion snapshots; cap cosmetic events; throttle expensive actions; repair or disconnect a client whose reliable backlog exceeds the bounded window. Record backlog bytes and age. The stress gate must show that the queue drains after a blast and a new player can join while the server continues running.

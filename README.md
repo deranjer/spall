@@ -1,10 +1,18 @@
-# Custom voxel engine: implementation handoff
+# Spall: custom voxel engine
 
 Planning baseline: 2026-09-06. This repository currently contains specifications, not an implemented engine. Commands in these documents are requirements for future tooling.
 
 Build a custom engine for one survival/building game: Minecraft/Vintage Story-style world interaction, detailed voxel materials and Teardown-inspired lighting, **full-world destruction and multiplayer from the foundation**. No editor, menus, or UI framework is required. A render window, direct controls, command-line tools, and automated scenarios are required.
 
 User requirements are full-world destruction and multiplayer. The remaining numbers below are proposed engineering defaults, not confirmed product requirements or measured performance.
+
+## Engine and game boundary
+
+Spall is the engine. Keep one repository and Cargo workspace, with engine libraries under `crates/spall_*`, a shipped playable example package `sandbox` under `examples/sandbox`, and build tooling under `tools/xtask`. The actual survival game can later live under `games/survival`; do not scaffold it before it is needed.
+
+The engine provides voxel simulation, destruction, rendering, physics, replication, persistence, and client/server runtime hosts. The sandbox supplies its material catalog, tool rules, scenes, and thin `sandbox-server` / `sandbox-client` binaries. Games depend on Spall; engine crates must never import sandbox or survival-game code. Add a small statically linked rules interface when real game behavior first requires it. No dynamic plugin system or generic framework is needed.
+
+Earlier `ve_*` design names are now `spall_*`; the former `ve_game` role belongs to the sandbox example's game-rules module (`sandbox_game` in this plan), not an engine crate. The example is built and tested with the engine and gradually becomes the networked destruction sandbox described below.
 
 ## Recommended stack
 
