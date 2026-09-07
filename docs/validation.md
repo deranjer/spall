@@ -1,14 +1,17 @@
 # Validation and operating contract
 
-These commands and fixtures are **planned interfaces**. T00 implements only
+These commands and fixtures are **planned interfaces**. T00 implements
 `cargo xtask check`, the bounded GPU-free portion of `cargo xtask smoke`, and
 the offline clear-window capability smoke (`cargo xtask smoke --graphical`).
-`session`, `scenario`, `capture`, `bench`, and `crash-test` now return an
-explicit unavailable-capability result until their listed tasks are delivered.
-The server has process readiness only in T00: it records but does not bind
-`--listen`; transport, authentication, and the documented connected-client
-command remain T09 work. All numerical limits are provisional acceptance
-targets. None is a measured result.
+T09 adds `cargo xtask net-check`: an in-process QUIC transport harness (one
+server, N authenticated headless clients, an optional opaque UDP loss proxy,
+every channel exercised, bounded teardown) that writes `summary.json`,
+`net.jsonl`, and `metrics.json`. `session`, `scenario`, `capture`, `bench`, and
+`crash-test` still return an explicit unavailable-capability result until their
+listed tasks are delivered. The `sandbox-server` host still records but does not
+bind `--listen`; wiring `spall_net` into the host and the documented
+connected-client command is T10. All numerical limits are provisional
+acceptance targets. None is a measured result.
 
 ## Agent operation without an editor
 
@@ -18,6 +21,10 @@ Use Cargo aliases so `cargo xtask` runs the xtask package. The orchestrator laun
 # Build, lint, and CPU checks. Implemented first in T00.
 cargo xtask check
 cargo xtask smoke --ticks 60
+
+# T09: QUIC transport + fault harness, in-process, no GPU. Real loopback QUIC
+# through an opaque UDP loss proxy; reliable records must survive the loss.
+cargo xtask net-check --clients 2 --loss-percent 2 --output .local/runs/net
 
 # Dedicated server, bounded automation run, no window/GPU dependency.
 cargo run -p sandbox --bin sandbox-server -- --world .local/worlds/dev --seed 42 --listen 127.0.0.1:5000 --ticks 3600 --log-json .local/runs/server.jsonl

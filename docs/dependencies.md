@@ -56,6 +56,35 @@ among workspace crates, matching the `docs/architecture.md` dependency graph.
 An optional `oracle` feature exposes the crate's dense reference model to
 later foundation tasks (T03+) without copying it.
 
+## T09 — transport and fault harness (verified 2026-09-07)
+
+New crate `crates/spall_net` (the QUIC transport adapter). It is the only place
+Quinn, rustls, and Tokio appear. `tools/xtask` gains `spall_net` + a minimal
+`tokio` runtime for the `cargo xtask net-check` harness command. Dependency
+direction matches `docs/architecture.md`: `spall_net -> spall_protocol`
+(`-> spall_core`); no dependency on `spall_voxel`/`spall_sim`.
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T09 |
+| --- | ---: | --- | --- | --- |
+| quinn | 0.11.11 | `default-features = false`, `runtime-tokio`, `rustls-ring`, `log` | `Apache-2.0 OR MIT` | QUIC endpoints, reliable streams, datagrams |
+| rustls | 0.23.44 | `default-features = false`, `ring`, `std`, `tls12` | `Apache-2.0 OR ISC OR MIT` | TLS 1.3 configs + custom fingerprint-pinning verifier |
+| rcgen | 0.13.2 | `default-features = false`, `ring` | `MIT OR Apache-2.0` | self-signed development server certificate |
+| tokio | 1.53.1 | `spall_net`: `rt`,`rt-multi-thread`,`net`,`time`,`sync`,`macros`,`io-util`; `xtask`: `rt-multi-thread`,`time`,`macros` | `MIT` | async transport/IO runtime only (no simulation) |
+
+Transitive crates newly locked: `quinn-proto 0.11.17`, `quinn-udp 0.5.15`,
+`rustls-webpki 0.103.15`, `rustls-pki-types 1.15.1`, `ring 0.17.14`,
+`untrusted 0.9.0`, `socket2 0.6.5`, `mio 1.2.3`, `lru-slab`, `rustc-hash`,
+`getrandom 0.2.17` + `wasi`, `rand`/`rand_core`/`rand_pcg` (rcgen),
+`yasna 0.5.2` + `time 0.3.55` (`deranged`, `num-conv`, `powerfmt`,
+`time-core`), `chacha20 0.10.2`, `subtle`, `zeroize`, `tinyvec`,
+`tokio-macros 2.7.2` — all `MIT` / `Apache-2.0` / `ISC` family (`ring` is
+`ISC AND MIT AND OpenSSL`). `ring` ships prebuilt MSVC assembly; no extra
+Windows toolchain beyond the VS 2022 C++ tools already recorded below.
+
+`spall_net` is transport only: no `zstd` yet (compression / bounded
+decompression of brick payloads arrives with `spall_store` in T16). The T09
+malformed-input tests bound the declared-length and assembled-transfer paths.
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,

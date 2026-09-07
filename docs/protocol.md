@@ -157,3 +157,45 @@ part, 64 MiB per assembled transfer, 256 KiB max decompressed material-only
 brick record (64 KiB actual payload), 1100 B per datagram payload. Count
 ceilings: 3 redundant inputs per frame, 4096 transaction ops / refs, 8192
 baseline regions, 4096 baseline parts.
+
+## T09 transport adapter (implemented)
+
+`crates/spall_net` layers Quinn/QUIC on the T01 records. It owns transport only:
+no simulation, storage, or rendering. ALPN is `spall/1`; TLS is 1.3-only.
+
+**Sessions.** Development uses server-certificate **fingerprint pinning**
+(BLAKE3 of the certificate DER, carried out of band) plus a per-run 32-byte
+**join token** (constant-time compared). A wrong certificate fails the QUIC/TLS
+handshake (`TransportError::Connect`); a wrong token or an incompatible
+`Handshake` fails after TLS with a distinct `AuthReject::{BadToken,
+Incompatible(field)}` sent back to the client before the connection is torn
+down. Authentication is a `spall_net`-local `ClientHello { token, handshake }` /
+`ServerAuthReply` exchange at the head of the control stream — not a frozen wire
+record — after which the same stream carries `NetMessage`s.
+
+**Channels.** One reliable ordered **control stream** per connection carries
+`NetMessage` envelopes: `Heartbeat { seq }`, `Record { seq, <T01 frame> }`, or
+`Bye`. The inner record keeps the exact `schema | tag | body` frame; the
+envelope adds a per-stream `u64` sequence. **Bulk streams** are capped at four
+per connection and carry length-framed `BaselinePart` records with the per-part
+and assembled-transfer ceilings enforced during read. **Datagrams** carry
+`InputFrame` / `MotionSnapshot` only, prefixed with a `u64` sequence, capped at
+`min(1100, connection.max_datagram_size())`; a connection whose peer cannot
+carry datagrams is rejected at setup.
+
+**Liveness.** QUIC keep-alive plus an application `Heartbeat` on the control
+stream every `heartbeat_interval`; a connection with no inbound control traffic
+for `idle_timeout` is closed. Defaults: 500 ms / 10 s (2 s QUIC keep-alive).
+
+**Deduplication.** Per-stream sequence gates (`spall_protocol::SequenceGate`):
+the control stream is strict (any replay dropped); datagrams tolerate a bounded
+reorder window so a late-but-new motion sample is still delivered while an exact
+replay is dropped.
+
+**Fault tooling.** Two independent mechanisms, both deterministic from a seed:
+`FaultChannel` delays / drops / reorders *decoded application messages* on a
+logical clock (for tests that must not depend on QUIC's own recovery); `UdpProxy`
+drops / delays / reorders *opaque encrypted datagrams* between client and server
+without parsing a QUIC header (for real retransmission / congestion behaviour).
+`cargo xtask net-check` runs one server + N clients through per-client proxies
+and writes `summary.json` / `net.jsonl` / `metrics.json`.
