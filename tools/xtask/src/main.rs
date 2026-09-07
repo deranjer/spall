@@ -2,7 +2,7 @@ mod netcheck;
 mod process;
 
 use clap::{Args, Parser, Subcommand};
-use process::{ProcessFailure, wait_for_server};
+use process::{ProcessFailure, run_bounded, wait_for_server};
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
@@ -34,12 +34,32 @@ enum CommandKind {
     Session(UnavailableArgs),
     /// Planned for T10+ (needs replication + scenario fixtures).
     Scenario(UnavailableArgs),
-    /// Planned for T05+ and requires a supported GPU.
-    Capture(UnavailableArgs),
+    /// Render the T05 acceptance shapes offscreen (shaded + normal + depth
+    /// PNGs). Exit 3 means no GPU/capture capability.
+    Capture(CaptureArgs),
     /// Planned for later performance gates.
     Bench(UnavailableArgs),
     /// Planned for T16.
     CrashTest(UnavailableArgs),
+}
+
+#[derive(Debug, Args)]
+struct CaptureArgs {
+    /// Output directory. If omitted a unique directory under .local/runs is created.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    #[arg(long, default_value_t = 1280)]
+    width: u32,
+    #[arg(long, default_value_t = 720)]
+    height: u32,
+    /// `greedy` (default) or `culled`.
+    #[arg(long, default_value = "greedy")]
+    strategy: String,
+    /// Render only the named acceptance shape.
+    #[arg(long)]
+    only: Option<String>,
+    #[arg(long, default_value_t = 120_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]
+    timeout_ms: u64,
 }
 
 #[derive(Debug, Args)]
@@ -117,7 +137,7 @@ fn run(cli: Cli) -> Result<(), XtaskError> {
         CommandKind::Scenario(_) => {
             unavailable("scenario", "T10 replication and scenario fixtures")
         }
-        CommandKind::Capture(_) => unavailable("capture", "T05 renderer capture"),
+        CommandKind::Capture(args) => capture(args),
         CommandKind::Bench(_) => unavailable("bench", "G1/G2 measurement work"),
         CommandKind::CrashTest(_) => unavailable("crash-test", "T16 persistence"),
     }
@@ -312,6 +332,60 @@ fn graphical_smoke(output: &Path, timeout: Duration) -> Result<(), XtaskError> {
     Ok(())
 }
 
+fn capture(args: CaptureArgs) -> Result<(), XtaskError> {
+    if !matches!(args.strategy.as_str(), "greedy" | "culled") {
+        eprintln!("xtask: --strategy must be `greedy` or `culled`");
+        return Err(XtaskError::Capability("invalid capture strategy".into()));
+    }
+    let output = args
+        .output
+        .unwrap_or_else(|| unique_output_named("t05-capture"));
+    std::fs::create_dir_all(&output).map_err(|source| XtaskError::Output {
+        path: output.display().to_string(),
+        source,
+    })?;
+
+    run_cargo(&[
+        "build",
+        "-p",
+        "sandbox",
+        "--features",
+        "client",
+        "--bin",
+        "sandbox-capture",
+    ])?;
+
+    let mut command = Command::new(sandbox_binary("sandbox-capture"));
+    command.args([
+        "--out",
+        &output.display().to_string(),
+        "--width",
+        &args.width.to_string(),
+        "--height",
+        &args.height.to_string(),
+        "--strategy",
+        &args.strategy,
+    ]);
+    if let Some(only) = &args.only {
+        command.args(["--only", only]);
+    }
+
+    match run_bounded(command, Duration::from_millis(args.timeout_ms)) {
+        Ok(status) if status.success() => {
+            println!("capture written: {}", output.display());
+            Ok(())
+        }
+        Ok(status) if status.code() == Some(3) => Err(XtaskError::Capability(
+            "renderer capture needs a working GPU/driver".into(),
+        )),
+        Ok(status) => Err(XtaskError::Cargo(
+            vec!["sandbox-capture".into()],
+            status.code().unwrap_or(1),
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn sandbox_binary(name: &str) -> PathBuf {
     let executable = if cfg!(windows) {
         format!("{name}.exe")
@@ -328,13 +402,17 @@ fn sandbox_binary(name: &str) -> PathBuf {
 }
 
 fn unique_output() -> PathBuf {
+    unique_output_named("smoke")
+}
+
+fn unique_output_named(prefix: &str) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock precedes Unix epoch")
         .as_millis();
     workspace_root()
         .join(".local/runs")
-        .join(format!("smoke-{millis}-{}", std::process::id()))
+        .join(format!("{prefix}-{millis}-{}", std::process::id()))
 }
 
 fn write_summary(output: &Path, summary: &SmokeSummary<'_>) -> Result<(), XtaskError> {

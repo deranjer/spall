@@ -6,6 +6,8 @@ members = [
     "crates/spall_jobs",
     "crates/spall_structure",
     "crates/spall_net",
+    "crates/spall_mesh",
+    "crates/spall_render",
     "crates/spall_server",
     "crates/spall_client",
     "examples/sandbox",
@@ -33,13 +35,18 @@ serde_json = "1.0.145"
 spall_core = { path = "crates/spall_core" }
 spall_jobs = { path = "crates/spall_jobs" }
 spall_net = { path = "crates/spall_net" }
+spall_mesh = { path = "crates/spall_mesh" }
 spall_protocol = { path = "crates/spall_protocol" }
+spall_render = { path = "crates/spall_render" }
 spall_structure = { path = "crates/spall_structure" }
 spall_voxel = { path = "crates/spall_voxel" }
 thiserror = "2.0.17"
 tokio = { version = "1.52.3", default-features = false }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+bytemuck = { version = "1.23", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+pollster = "0.4.0"
 wgpu = "24.0.5"
 winit = "0.30.12"
 

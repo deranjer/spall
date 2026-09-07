@@ -139,6 +139,42 @@ Windows toolchain beyond the VS 2022 C++ tools already recorded below.
 decompression of brick payloads arrives with `spall_store` in T16). The T09
 malformed-input tests bound the declared-length and assembled-transfer paths.
 
+## T05 — visible voxel baseline (verified 2026-09-07)
+
+Two new crates. `spall_mesh` (CPU surface generation) adds **no new external
+dependency**: it depends on `spall_voxel`, `spall_jobs` (the `JobToken` /
+`WorldView` / `Staleness` used to invalidate a mesh when a halo brick arrives),
+`glam` (vertex/winding math), `blake3` (mesh digest) and `thiserror` — all
+already locked. `Cargo.lock` gains only the `spall_mesh` node.
+
+`spall_render` (wgpu resources, one opaque pipeline, offscreen capture) matches
+the `docs/architecture.md` edge `spall_render -> spall_mesh, spall_core`. It
+reuses `wgpu` / `glam` / `pollster` (already locked for T00's client) and adds:
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T05 |
+| --- | ---: | --- | --- | --- |
+| bytemuck | 1.25.2 | `derive`; default features | `MIT OR Apache-2.0 OR Zlib` | zero-copy vertex / uniform / palette upload |
+| image | 0.25.10 | `default-features = false`, `png` only | `MIT OR Apache-2.0` | PNG encode/decode for capture output and tests |
+
+`pollster` is promoted from a `spall_client`-local dependency to a workspace
+dependency (same locked `0.4.0`) and now also gates `spall_render`'s headless
+`request_adapter` / `request_device`. `wgpu 24.0.5`'s deprecated
+`Mat4::look_to_rh` / `Mat4::perspective_rh` (glam) and `ImageCopy*` (wgpu) names
+are avoided: the renderer uses `glam::camera::rh::{view::look_to_mat4,
+proj::directx::perspective}` and `wgpu::TexelCopy{Texture,Buffer}Info` /
+`TexelCopyBufferLayout`.
+
+`spall_render` is only reachable through the `sandbox/client` feature (the new
+`sandbox-capture` binary, built by `cargo xtask capture`). Building
+`sandbox-server` still leaves the server package GPU/window-free. `tools/xtask`
+gains no dependency: it shells out to the built `sandbox-capture` binary the
+same way it launches `sandbox-server` / `sandbox-client`.
+
+Transitive crates newly locked by `image` with only the `png` feature:
+`png 0.18.1`, `fdeflate 0.3.7`, `byteorder-lite 0.1.0`, `moxcms 0.8.1`,
+`pxfm 0.1.30` (`miniz_oxide` is already present via wgpu) — all
+`MIT`/`MIT OR Apache-2.0`/`Zlib`.
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,

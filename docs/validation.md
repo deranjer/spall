@@ -6,12 +6,18 @@ the offline clear-window capability smoke (`cargo xtask smoke --graphical`).
 T09 adds `cargo xtask net-check`: an in-process QUIC transport harness (one
 server, N authenticated headless clients, an optional opaque UDP loss proxy,
 every channel exercised, bounded teardown) that writes `summary.json`,
-`net.jsonl`, and `metrics.json`. `session`, `scenario`, `capture`, `bench`, and
-`crash-test` still return an explicit unavailable-capability result until their
-listed tasks are delivered. The `sandbox-server` host still records but does not
-bind `--listen`; wiring `spall_net` into the host and the documented
-connected-client command is T10. All numerical limits are provisional
-acceptance targets. None is a measured result.
+`net.jsonl`, and `metrics.json`.
+T05 implements `cargo xtask capture`: offscreen greedy-meshed renders of the
+acceptance shapes (cube, tunnel, checkerboard, negative coordinates, adjacent
+bricks, rotated hollow volume) to a shaded PNG plus normal and depth debug
+images, with a `summary.json`; it exits 3 when no GPU adapter is available.
+Scene/camera fixture files and the lighting-quality capture stay T12/T13.
+`session`, `scenario`, `bench`, and `crash-test` still return an explicit
+unavailable-capability result until their listed tasks are delivered. The
+`sandbox-server` host still records but does not bind `--listen`; wiring
+`spall_net` into the host and the documented connected-client command is T10.
+All numerical limits are provisional acceptance targets. None is a measured
+result.
 
 ## Agent operation without an editor
 
@@ -41,7 +47,10 @@ cargo xtask scenario --name destruction-network --clients 2 --headless-clients -
 # Packet impairment means encrypted UDP packets through the test proxy.
 cargo xtask scenario --name late-join-collapse --clients 3 --headless-clients --rtt-ms 100 --jitter-ms 20 --loss-percent 2 --output .local/runs/join
 
-# Offscreen GPU rendering still requires a supported GPU/driver.
+# T05: offscreen renders of the acceptance shapes (shaded + normal + depth PNGs
+# and a summary.json). Needs a supported GPU/driver; exit 3 otherwise.
+cargo xtask capture --output .local/runs/t05-capture --width 1280 --height 720 --strategy greedy
+# T12/T13 extend capture with named lighting scenes and camera fixture files:
 cargo xtask capture --scene colored-room --camera fixtures/cameras/colored-room.toml --size 1920x1080 --frames 120 --output .local/runs/lighting
 
 # Release build, named fixture, fixed workload; emits machine-readable metrics.
