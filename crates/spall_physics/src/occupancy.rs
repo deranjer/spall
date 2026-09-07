@@ -131,6 +131,50 @@ impl OccupancyGrid {
         .map(Some)
     }
 
+    /// Builds a grid directly from a caller-supplied solid mask and per-cell
+    /// material, both in canonical `x + dims.x * (y + dims.y * z)` order. Grid
+    /// cell `(0, 0, 0)` maps to `origin`. `solid` and `material` must each hold
+    /// exactly `dims.x * dims.y * dims.z` entries, and that product must not
+    /// exceed [`MAX_GRID_CELLS`].
+    ///
+    /// This is the constructor for a *derived* occupancy — e.g. a deterministic
+    /// coarse-downsample of another grid — that is not a straight read of a
+    /// [`Volume`] region.
+    pub fn from_solid_mask(
+        origin: GlobalCell,
+        dims: [u32; 3],
+        solid: Vec<bool>,
+        material: Vec<MaterialId>,
+    ) -> Result<Self, ExtractError> {
+        if dims.contains(&0) {
+            return Err(ExtractError::EmptyExtent([
+                dims[0] as i64,
+                dims[1] as i64,
+                dims[2] as i64,
+            ]));
+        }
+        let cells = dims[0] as u128 * dims[1] as u128 * dims[2] as u128;
+        if cells > MAX_GRID_CELLS {
+            return Err(ExtractError::TooLarge {
+                cells,
+                limit: MAX_GRID_CELLS,
+            });
+        }
+        if solid.len() as u128 != cells || material.len() as u128 != cells {
+            return Err(ExtractError::EmptyExtent([
+                solid.len() as i64,
+                material.len() as i64,
+                cells as i64,
+            ]));
+        }
+        Ok(Self {
+            origin,
+            dims,
+            solid,
+            material,
+        })
+    }
+
     #[inline]
     fn linear(dims: [u32; 3], x: u32, y: u32, z: u32) -> usize {
         (x + dims[0] * (y + dims[1] * z)) as usize
@@ -244,6 +288,33 @@ mod tests {
             OccupancyGrid::from_region(&v, GlobalCell::new(0, 0, 0), GlobalCell::new(40, 1, 1))
                 .unwrap_err();
         assert!(matches!(err, ExtractError::Unresident(_)));
+    }
+
+    #[test]
+    fn from_solid_mask_round_trips_and_checks_lengths() {
+        let dims = [2u32, 2, 2];
+        let mut solid = vec![false; 8];
+        solid[0] = true;
+        solid[7] = true;
+        let material = vec![MaterialId(3); 8];
+        let grid = OccupancyGrid::from_solid_mask(GlobalCell::new(-4, 0, 9), dims, solid, material)
+            .unwrap();
+        assert_eq!(grid.origin(), GlobalCell::new(-4, 0, 9));
+        assert_eq!(grid.solid_count(), 2);
+        assert!(grid.is_solid(0, 0, 0));
+        assert!(grid.is_solid(1, 1, 1));
+        assert_eq!(grid.material(0, 0, 0), Some(MaterialId(3)));
+
+        // Wrong mask length is rejected, not silently truncated.
+        assert!(
+            OccupancyGrid::from_solid_mask(
+                GlobalCell::new(0, 0, 0),
+                [2, 2, 2],
+                vec![false; 4],
+                vec![MaterialId::AIR; 8],
+            )
+            .is_err()
+        );
     }
 
     #[test]

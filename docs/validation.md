@@ -11,6 +11,13 @@ T06 adds one offline measurement binary,
 `cargo run --release -p spall_physics --bin collision-bench`, which runs the
 voxel-collision feasibility scenarios and writes `collision-feasibility.json`;
 it is not wired into `cargo xtask bench`.
+T08 adds one offline authoritative-edit binary,
+`cargo run -p spall_sim --features scenario --bin sim-scenario`, which drives the
+in-process `Simulation` through the terrain-split, rotated-moving-body cut,
+conflict-convergence, and no-second-impulse scenarios and writes `summary.json`.
+It runs the authoritative edit/split/collider-swap path only; the multi-process
+`session` / `scenario` commands stay unavailable until transport (T09) and
+replication (T10).
 `session`, `scenario`, `capture`, `bench`, and `crash-test` still return an
 explicit unavailable-capability result until their listed tasks are delivered.
 The `sandbox-server` host still records but does not bind `--listen`; wiring

@@ -13,7 +13,7 @@ spall_jobs    -> spall_core                     bounded scheduling, result token
 spall_mesh    -> spall_voxel                    surface generation, no GPU
 spall_structure -> spall_voxel, spall_jobs      connectivity, support, split plans
 spall_physics -> spall_voxel                    Rapier adapter, collision builds
-spall_sim     -> spall_structure, spall_physics    authoritative state and tick order
+spall_sim     -> spall_structure, spall_physics, spall_jobs, spall_protocol   authoritative state and tick order
 spall_protocol -> spall_core                   explicit DTOs and codecs only
 spall_net     -> spall_protocol                 Quinn transport adapter (Tokio; T09)
 spall_store   -> spall_protocol                 checkpoint/journal bytes and indexes
@@ -24,7 +24,7 @@ sandbox (example) -> spall_server, spall_client   game rules and executable entr
 xtask                                    process/scenario/build orchestration
 ```
 
-spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
+spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The graph edge is refined from `spall_sim -> spall_structure, spall_physics` to add `-> spall_jobs, spall_protocol` (T08): staging is submitted to a `spall_jobs::Scheduler` and re-validated through a `JobToken` like any other off-tick result, and every commit emits a `spall_protocol::TopologyTransaction`. Both new targets are foundation crates (`-> spall_core`); no cycle is introduced. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
 
 Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
 in-process `cargo xtask net-check` transport harness. Add `games/survival` only
@@ -90,6 +90,8 @@ An edit plan records before/after brick data, revisions, ownership changes, supp
 Conflict rule: jobs may overlap in preparation, but commits revalidate every read dependency. Conflicting older work retries or is recomputed in request order. After repeated conflicts, serialize the affected region through a bounded queue to guarantee progress. Moving-body edits are defined in the body-local frame sampled when the server accepts the action; at commit they apply to that same material location if the topology preconditions still hold.
 
 Physics must never collide with a deleted wall or fall through a newly built wall after the authoritative transaction commits. Renderer uploads may lag briefly, but staging keeps an old consistent replica visible until its transaction can be presented. Expose revision lag and prioritize local collision/render updates.
+
+T08 outcome (`spall_sim`): the whole path above is implemented for the all-resident G1 case. An accepted `EditIntent` is staged off-tick against an immutable snapshot (`stage_edit`) — deterministic brush plan, dry-run `EditOutcome`, `spall_structure` re-classification, and a `JobToken` over every brick read — then committed atomically at a tick boundary (`commit`). A stale token at commit means an earlier commit that tick touched a shared brick; the intent is recomputed and retried in request order, and a region that keeps losing that race is routed through a bounded serial queue (one commit per tick) so it still progresses. On commit the brush is applied to the live volume, every unsupported component (terrain) or every non-largest component (a free dynamic body) is copied into a new body **at its exact split-instant world location** with mass from the fine voxel grid and velocity `v_parent + omega_parent x (r_child_com - r_parent_com)` plus a one-time explosion impulse, and every affected collider is rebuilt in the same tick. A repeated `RequestId` returns the existing `ActionStatus` and can never cut twice or apply a second impulse. The collider budget from `docs/collision-decision.md` (`B = 4096` merged boxes, then a conservative same-resolution coarsen) is enforced here. Terrain-to-body and body-to-body transfer do **not** re-centre the child onto its COM: keeping the child's cells and transform identical to the parent's is the exact preservation the architecture requires, and `spall_physics` carries the off-origin COM. No replication, persistence, player movement, or contact-to-intent conversion is in T08.
 
 ## Structural connectivity and collapse
 

@@ -7,6 +7,7 @@ members = [
     "crates/spall_structure",
     "crates/spall_net",
     "crates/spall_physics",
+    "crates/spall_sim",
     "crates/spall_server",
     "crates/spall_client",
     "examples/sandbox",
@@ -37,6 +38,7 @@ spall_jobs = { path = "crates/spall_jobs" }
 spall_net = { path = "crates/spall_net" }
 spall_physics = { path = "crates/spall_physics" }
 spall_protocol = { path = "crates/spall_protocol" }
+spall_sim = { path = "crates/spall_sim" }
 spall_structure = { path = "crates/spall_structure" }
 spall_voxel = { path = "crates/spall_voxel" }
 thiserror = "2.0.17"

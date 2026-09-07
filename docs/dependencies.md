@@ -177,6 +177,38 @@ position/energy tolerances instead), `parallel` (rayon), `simd8`,
 cross-check. The `collision-bench` binary and the `#[cfg(test)]` feasibility
 scenarios are the only consumers; no server loop drives physics yet (T08).
 
+## T08 — authoritative edit and body transfer (verified 2026-09-07)
+
+`spall_sim` adds **no new external dependency**. It depends on `spall_structure`
+(support graph, split membership, conservation ledger), `spall_physics`
+(collider builds, `PhysicsWorld`, analytic mass), `spall_jobs`
+(`Scheduler` / `JobToken` / `WorldView` for bounded staging and commit-time
+re-validation), `spall_protocol` (`TopologyTransaction` / `MotionSnapshot` DTOs
+and the canonical hash), `spall_voxel`, `spall_core`, `glam` (already locked in
+T03 — used for the child-velocity cross product and pose math), and `thiserror`.
+`Cargo.lock` gains only the `spall_sim` package node.
+
+The `docs/architecture.md` dependency graph is refined from
+`spall_sim -> spall_structure, spall_physics` to add `-> spall_jobs, spall_protocol`
+(both `-> spall_core` foundation crates; no cycle). Rationale: staging is a
+bounded off-tick job re-validated through the same `JobToken` mechanism every
+other derived result uses, and `spall_sim` owns the authoritative-state → wire
+record conversion (`docs/architecture.md`).
+
+An optional `scenario` feature enables `serde` / `serde_json` (already locked)
+for the offline `sim-scenario` binary; the library and its tests do not pull
+them. Dev-dependencies enable `spall_structure/oracle` (dense BFS support
+reference for the conservation cross-check) and `spall_voxel/oracle`. No GPU,
+window, network, async, or filesystem code enters `spall_sim` (the scenario
+binary writes a `summary.json` under `.local/`, like `collision-bench`).
+
+Two additive, non-breaking methods were added to `spall_physics` for the T08
+integration (no contract or signature change to existing items):
+`OccupancyGrid::from_solid_mask` (build a grid from a caller-supplied solid
+mask — used by the coarse-fracture fallback) and
+`PhysicsWorld::set_body_pose` / `set_body_velocity` (spawn a split child at its
+parent's transform and inherited velocity).
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,

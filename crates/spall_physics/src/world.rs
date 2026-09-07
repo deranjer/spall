@@ -310,6 +310,36 @@ impl PhysicsWorld {
         worst
     }
 
+    /// Sets a body's world pose. `rotation` is a quaternion `[x, y, z, w]`
+    /// (renormalised by Rapier). Used by the authoritative sim (T08) to spawn a
+    /// split child at its parent's transform so world geometry is unchanged at
+    /// the split instant.
+    pub fn set_body_pose(&mut self, id: BodyId, translation_m: [f32; 3], rotation: [f32; 4]) {
+        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        rb.set_translation(
+            Vector::new(translation_m[0], translation_m[1], translation_m[2]),
+            true,
+        );
+        rb.set_rotation(
+            Rotation::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]),
+            true,
+        );
+    }
+
+    /// Sets a body's linear and angular velocity, m/s and rad/s. Used to hand a
+    /// split child its inherited velocity.
+    pub fn set_body_velocity(&mut self, id: BodyId, linvel_m_s: [f32; 3], angvel_rad_s: [f32; 3]) {
+        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        rb.set_linvel(
+            Vector::new(linvel_m_s[0], linvel_m_s[1], linvel_m_s[2]),
+            true,
+        );
+        rb.set_angvel(
+            Vector::new(angvel_rad_s[0], angvel_rad_s[1], angvel_rad_s[2]),
+            true,
+        );
+    }
+
     /// Mass properties Rapier derived for a body's collider: `(mass_kg, local
     /// centre of mass in metres, principal inertia diagonal)`.
     pub fn derived_mass_properties(&self, id: BodyId) -> (f32, [f32; 3], [f32; 3]) {
