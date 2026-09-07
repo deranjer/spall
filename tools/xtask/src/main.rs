@@ -321,6 +321,9 @@ fn sandbox_binary(name: &str) -> PathBuf {
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target"));
+    // Cargo runs from workspace_root(), so relative overrides use that same
+    // base even when this executable was launched from another directory.
+    let target = workspace_root().join(target);
     target.join("debug").join(executable)
 }
 

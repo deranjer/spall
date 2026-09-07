@@ -75,6 +75,8 @@ pub enum Sample {
 pub enum AccessError {
     #[error("brick {coord:?} is outside the volume bounds")]
     OutOfBounds { coord: BrickCoord },
+    #[error("brick {coord:?} has revision u64::MAX, leaving no later revision for edits")]
+    RevisionExhausted { coord: BrickCoord },
     #[error("linear cell index {0} is out of range 0..32768")]
     BadCellIndex(u32),
 }
@@ -140,9 +142,18 @@ impl Volume {
         }
     }
 
-    /// Installs a resident brick. Fails if `coord` is outside the bounds.
+    /// Installs a resident brick and advances the volume revision high-water
+    /// mark past its revision. A brick at `u64::MAX` is rejected because no
+    /// subsequent edit can receive a strictly newer revision.
     pub fn insert_brick(&mut self, coord: BrickCoord, brick: Brick) -> Result<(), AccessError> {
         self.check_bounds(coord)?;
+        let next_after_brick = brick
+            .revision()
+            .checked_next()
+            .map_err(|_| AccessError::RevisionExhausted { coord })?;
+        if next_after_brick > self.next_revision {
+            self.next_revision = next_after_brick;
+        }
         self.bricks
             .insert((coord.x, coord.y, coord.z), BrickSlot::Resident(brick));
         Ok(())
@@ -186,6 +197,11 @@ impl Volume {
         let value = self.next_revision;
         self.next_revision = self.next_revision.checked_next()?;
         Ok(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_revision_for_test(&mut self, revision: Revision) {
+        self.next_revision = revision;
     }
 
     /// Full state of the brick that owns `coord`.
@@ -347,5 +363,28 @@ mod tests {
             Err(AccessError::BadCellIndex(32_768))
         );
         assert!(v.sample_local(BrickCoord::new(0, 0, 0), 32_767).is_ok());
+    }
+
+    #[test]
+    fn installing_a_brick_advances_the_edit_revision_high_water_mark() {
+        let mut v = vol();
+        v.insert_brick(
+            BrickCoord::new(0, 0, 0),
+            Brick::uniform(MaterialId(2), Revision(4)),
+        )
+        .unwrap();
+        assert_eq!(v.next_revision(), Revision(5));
+    }
+
+    #[test]
+    fn installing_an_exhausted_brick_is_rejected_without_mutation() {
+        let mut v = vol();
+        let coord = BrickCoord::new(0, 0, 0);
+        assert_eq!(
+            v.insert_brick(coord, Brick::uniform(MaterialId(2), Revision(u64::MAX))),
+            Err(AccessError::RevisionExhausted { coord })
+        );
+        assert_eq!(v.brick_state(coord).unwrap(), BrickState::Absent);
+        assert_eq!(v.next_revision(), Revision(1));
     }
 }
