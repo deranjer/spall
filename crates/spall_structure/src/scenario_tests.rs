@@ -702,6 +702,58 @@ fn the_analysis_token_tracks_the_brick_revisions_it_read() {
 }
 
 #[test]
+fn boundary_dependency_states_invalidate_when_their_meaning_changes() {
+    let boundary = spall_core::BrickCoord::new(1, 0, 0);
+
+    // An all-resident analysis may classify an absent neighbour as empty, but
+    // it still read that absence. If a brick subsequently arrives there, the
+    // unsupported split can no longer be installed.
+    let mut absent = terrain();
+    fill(
+        &mut absent,
+        GlobalCell::new(31, 10, 0),
+        GlobalCell::new(31, 10, 0),
+        STONE,
+    );
+    let absent_index = build(&absent, 0);
+    let mut absent_world = world_for(&absent, Generation(1), TopologyEpoch::START);
+    assert_eq!(absent_index.validate(&absent_world), Staleness::Fresh);
+    absent_world.set_brick(absent.id(), boundary, Revision(7));
+    assert!(matches!(
+        absent_index.validate(&absent_world),
+        Staleness::BrickRevision {
+            expected: spall_jobs::DepState::Absent,
+            current: spall_jobs::BrickStatus::Resident(Revision(7)),
+            ..
+        }
+    ));
+
+    // Failed is a distinct state: it leaves the component Unknown, remains
+    // valid while the same failure persists, and becomes stale after a retry.
+    let mut failed = terrain();
+    fill(
+        &mut failed,
+        GlobalCell::new(31, 10, 0),
+        GlobalCell::new(31, 10, 0),
+        STONE,
+    );
+    failed.mark_failed(boundary).unwrap();
+    let failed_index = build(&failed, 0);
+    let mut failed_world = world_for(&failed, Generation(1), TopologyEpoch::START);
+    failed_world.fail_brick(failed.id(), boundary);
+    assert_eq!(failed_index.validate(&failed_world), Staleness::Fresh);
+    failed_world.set_brick(failed.id(), boundary, Revision(8));
+    assert!(matches!(
+        failed_index.validate(&failed_world),
+        Staleness::BrickRevision {
+            expected: spall_jobs::DepState::Failed,
+            current: spall_jobs::BrickStatus::Resident(Revision(8)),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn apply_edit_refreshes_the_token_to_the_post_edit_revisions() {
     let mut v = terrain();
     fill(

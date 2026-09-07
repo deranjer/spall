@@ -151,8 +151,9 @@ impl StructureIndex {
     }
 
     /// The read-dependency token for the current graph: every labelled brick at
-    /// the revision it was read, plus every absent neighbour that bounds an
-    /// unresolved component as an *absent* sentinel.
+    /// the revision it was read, plus every absent or failed neighbour observed
+    /// while assembling a boundary component. These sentinels cover both
+    /// streamed unknowns and all-resident empty-space assumptions.
     pub fn token(&self) -> JobToken {
         let mut token = JobToken::new(self.generation, self.topology_epoch);
         for (brick, revision) in self.graph.read_revisions() {
@@ -160,6 +161,9 @@ impl StructureIndex {
         }
         for brick in self.graph.absent_dependencies() {
             token = token.reading_absent(self.volume, brick);
+        }
+        for brick in self.graph.failed_dependencies() {
+            token = token.reading_failed(self.volume, brick);
         }
         token
     }

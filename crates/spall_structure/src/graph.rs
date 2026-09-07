@@ -163,9 +163,12 @@ pub struct SupportGraph {
     labels: BTreeMap<(i64, i64, i64), BrickLabels>,
     /// Revision each labelled brick was read at (feeds the job token).
     brick_revision: BTreeMap<(i64, i64, i64), Revision>,
-    /// Neighbour bricks probed during assembly that were absent or failed and
-    /// bound an unresolved component.
+    /// Neighbour bricks probed during assembly that were absent. This includes
+    /// all-resident empty-space assumptions so a later load invalidates a
+    /// completed analysis.
     absent_neighbours: BTreeSet<(i64, i64, i64)>,
+    /// Neighbour bricks probed during assembly whose load had failed.
+    failed_neighbours: BTreeSet<(i64, i64, i64)>,
     nodes: Vec<NodeData>,
     node_of: BTreeMap<NodeOrder, usize>,
     adj: Vec<BTreeSet<usize>>,
@@ -191,6 +194,7 @@ impl SupportGraph {
             labels: BTreeMap::new(),
             brick_revision: BTreeMap::new(),
             absent_neighbours: BTreeSet::new(),
+            failed_neighbours: BTreeSet::new(),
             nodes: Vec::new(),
             node_of: BTreeMap::new(),
             adj: Vec::new(),
@@ -247,11 +251,24 @@ impl SupportGraph {
         out.into_iter()
     }
 
-    /// Neighbour bricks that were absent during assembly and bound an unresolved
-    /// component, in canonical `(z, y, x)` order.
+    /// Neighbour bricks that were absent during assembly, in canonical `(z, y,
+    /// x)` order. In `AllResident` mode they were read as known empty space;
+    /// in `Streamed` mode they are also unresolved support dependencies.
     pub fn absent_dependencies(&self) -> impl Iterator<Item = BrickCoord> + '_ {
         let mut out: Vec<BrickCoord> = self
             .absent_neighbours
+            .iter()
+            .map(|&(x, y, z)| BrickCoord::new(x, y, z))
+            .collect();
+        out.sort_by_key(|c| c.sort_key());
+        out.into_iter()
+    }
+
+    /// Neighbour bricks whose load had failed during assembly, in canonical
+    /// `(z, y, x)` order.
+    pub fn failed_dependencies(&self) -> impl Iterator<Item = BrickCoord> + '_ {
+        let mut out: Vec<BrickCoord> = self
+            .failed_neighbours
             .iter()
             .map(|&(x, y, z)| BrickCoord::new(x, y, z))
             .collect();
@@ -348,6 +365,7 @@ impl SupportGraph {
         self.node_of.clear();
         self.adj.clear();
         self.absent_neighbours.clear();
+        self.failed_neighbours.clear();
         self.components.clear();
         self.node_component.clear();
         self.stashed = None;
@@ -366,9 +384,6 @@ impl SupportGraph {
             let labels = self.labels[&(coord.x, coord.y, coord.z)].clone();
             for local in labels.components() {
                 let (anchored, unresolved) = self.node_attributes(volume, *coord, &labels, local);
-                for c in &unresolved {
-                    self.absent_neighbours.insert((c.x, c.y, c.z));
-                }
                 let node = self.nodes.len();
                 let key = NodeKey {
                     brick: *coord,
@@ -402,7 +417,7 @@ impl SupportGraph {
 
     /// Anchored flag and unresolved-neighbour list for one node.
     fn node_attributes(
-        &self,
+        &mut self,
         volume: &Volume,
         coord: BrickCoord,
         labels: &BrickLabels,
@@ -453,11 +468,18 @@ impl SupportGraph {
                 // Resident but not in the label map: no solid cell, so it can
                 // carry no connectivity.
                 Ok(BrickState::Resident { .. }) => {}
-                // A failed load is always an unresolved dependency.
-                Ok(BrickState::Failed) => unresolved.push(neighbour),
+                // A failed load is always an unresolved dependency and must be
+                // preserved in the exact read-dependency token.
+                Ok(BrickState::Failed) => {
+                    self.failed_neighbours
+                        .insert((neighbour.x, neighbour.y, neighbour.z));
+                    unresolved.push(neighbour);
+                }
                 // Absent: unknown only when the world is streamed; under
                 // `AllResident` the caller guarantees this is empty space.
                 Ok(BrickState::Absent) => {
+                    self.absent_neighbours
+                        .insert((neighbour.x, neighbour.y, neighbour.z));
                     if self.residency == ResidencyMode::Streamed {
                         unresolved.push(neighbour);
                     }
@@ -741,7 +763,7 @@ mod tests {
             "the -X face borders the failed brick"
         );
         assert_eq!(
-            g.absent_dependencies().collect::<Vec<_>>(),
+            g.failed_dependencies().collect::<Vec<_>>(),
             vec![BrickCoord::new(-1, 0, 0)]
         );
     }
