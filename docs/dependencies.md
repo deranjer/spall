@@ -92,6 +92,25 @@ exposes an in-memory `WorldView` double (`spall_jobs::testkit::MapWorld`)
 for T05 / T07 result-validation tests. No GPU, window, network, async, or
 filesystem code enters `spall_jobs`.
 
+## T07 — support graph and split plans (verified 2026-09-07)
+
+`spall_structure` adds **no new external dependency**. It depends on
+`spall_voxel` (brick snapshots, `Volume`, `EditOutcome`), `spall_jobs`
+(`JobToken` / `WorldView` / `Staleness` / `Generation` / `TopologyEpoch` for
+result re-validation), and `thiserror` (already locked). `Cargo.lock` gains
+only the `spall_structure` package node.
+
+The `docs/architecture.md` dependency graph is refined from
+`spall_structure -> spall_voxel` to `spall_structure -> spall_voxel, spall_jobs`.
+Rationale: a completed structural analysis is an off-tick job result and must
+be discarded when its input brick revisions move, so it carries the same
+`spall_jobs::JobToken` mechanism every other background result uses rather than
+a parallel one. Both are `-> spall_core` foundation crates; no cycle is
+introduced. An optional `oracle` feature exposes the crate's dense flood-fill
+reference model (mirroring `spall_voxel`'s `oracle` feature). Dev-dependencies
+enable `spall_jobs/testkit` and `spall_voxel/oracle` for the scenario tests. No
+GPU, window, network, async, or filesystem code enters `spall_structure`.
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,

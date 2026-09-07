@@ -45,6 +45,10 @@ pub enum DepState {
     /// The brick was treated as absent — a missing-neighbour sentinel. Any
     /// resident data arriving later invalidates the result.
     Absent,
+    /// A load had failed. Keeping this distinct from [`Absent`](Self::Absent)
+    /// makes a result valid while the same failure is still in force, while any
+    /// retry, successful load, or eviction invalidates it.
+    Failed,
 }
 
 /// One entry in a job's read-dependency set.
@@ -108,6 +112,16 @@ impl JobToken {
         self
     }
 
+    /// Records that the job observed a failed load for `volume`/`brick`.
+    #[must_use]
+    pub fn reading_failed(mut self, volume: VolumeId, brick: BrickCoord) -> Self {
+        self.put(ReadDep {
+            brick: BrickRef::new(volume, brick),
+            state: DepState::Failed,
+        });
+        self
+    }
+
     fn put(&mut self, dep: ReadDep) {
         match self
             .reads
@@ -156,6 +170,7 @@ impl JobToken {
             let ok = match (dep.state, current) {
                 (DepState::Revision(expected), BrickStatus::Resident(actual)) => expected == actual,
                 (DepState::Absent, BrickStatus::Absent) => true,
+                (DepState::Failed, BrickStatus::Failed) => true,
                 _ => false,
             };
             if !ok {

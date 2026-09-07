@@ -1,0 +1,23 @@
+[package]
+name = "spall_structure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# Exposes the dense flood-fill reference model so downstream tasks (T08 sim,
+# T22 material strength) can cross-check the incremental graph without copying
+# it. Always compiled for this crate's own tests.
+oracle = []
+
+[dependencies]
+spall_core.workspace = true
+spall_jobs.workspace = true
+spall_voxel.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Tests reuse the voxel dense oracle and the job-scheduler world-view double
+# rather than rebuilding either.
+spall_jobs = { workspace = true, features = ["testkit"] }
+spall_voxel = { workspace = true, features = ["oracle"] }
