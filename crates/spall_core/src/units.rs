@@ -86,9 +86,24 @@ impl BrushPoint {
 /// A sphere brush: fixed-point centre and non-negative fixed-point radius, both
 /// in [`BRUSH_UNIT`] units of the target volume's cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawSphereBrush")]
 pub struct SphereBrush {
     pub centre: BrushPoint,
     radius_units: i64,
+}
+
+#[derive(Deserialize)]
+struct RawSphereBrush {
+    centre: BrushPoint,
+    radius_units: i64,
+}
+
+impl TryFrom<RawSphereBrush> for SphereBrush {
+    type Error = BrushError;
+
+    fn try_from(raw: RawSphereBrush) -> Result<Self, Self::Error> {
+        Self::new(raw.centre, raw.radius_units)
+    }
 }
 
 /// Error building a brush from untrusted input.
