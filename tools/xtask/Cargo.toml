@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+ctrlc = "3.5.2"
+serde.workspace = true
+serde_json.workspace = true
+spall_core = { path = "../../crates/spall_core" }
+spall_net = { path = "../../crates/spall_net" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }

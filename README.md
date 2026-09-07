@@ -1,6 +1,8 @@
 # Spall: custom voxel engine
 
-Planning baseline: 2026-09-06. This repository currently contains specifications, not an implemented engine. Commands in these documents are requirements for future tooling.
+Planning baseline: 2026-09-06. T00 implements the Rust workspace, headless server process, basic render window, and build/lifecycle harness. The architecture below describes the engine we are building; it does not imply that destruction, gameplay, or replication already works. See [validation](docs/validation.md) for implemented commands and future acceptance gates.
+
+Run `cargo xtask check` for formatting, lint, and tests; `cargo xtask smoke` for a bounded server lifecycle; or `cargo xtask smoke --graphical` to include real window presentation and resize. Run the window directly with `cargo run -p sandbox --features client --bin sandbox-client -- --offline`.
 
 Build a custom engine for one survival/building game: Minecraft/Vintage Story-style world interaction, detailed voxel materials and Teardown-inspired lighting, **full-world destruction and multiplayer from the foundation**. No editor, menus, or UI framework is required. A render window, direct controls, command-line tools, and automated scenarios are required.
 

@@ -100,3 +100,113 @@ Provisional per-client steady-state egress target: <=256 KiB/s, measured includi
 Budget example: 200 relevant bodies x 48 encoded bytes x 20 Hz = 192,000 bytes/s before framing, topology, player records, and retransmission. Therefore not all bodies can receive 20 Hz updates continuously. Prioritize players, imminent contacts, nearby moving bodies, and recently changed structures; send distant/sleeping bodies less frequently with periodic keyframes.
 
 Never discard committed topology to meet the motion budget. Drop superseded unsent motion snapshots; cap cosmetic events; throttle expensive actions; repair or disconnect a client whose reliable backlog exceeds the bounded window. Record backlog bytes and age. The stress gate must show that the queue drains after a blast and a new player can join while the server continues running.
+
+## T01 wire encoding decisions (implemented)
+
+`spall_core` and `spall_protocol` implement the record families above. The
+following are now fixed and must be reused, not re-derived, by dependent tasks.
+`spall_protocol` version-0 headers use `WIRE_SCHEMA_VERSION = 1` and
+`PROTOCOL_VERSION = 1`.
+
+**Endianness.** Every canonical hash pre-image and every frame header field is
+little-endian, fixed width. Canonical sequences carry a `u32` LE length prefix;
+blobs carry a `u32` LE byte-length prefix. `f32`/`f64` are encoded from their
+IEEE-754 bit pattern after a finiteness check; `-0.0` is normalized to `0.0`.
+
+**Framing.** A reliable/datagram record is `u16 LE schema version` `||`
+`u16 LE wire tag` `||` postcard body. Decoding refuses input longer than the
+channel limit before parsing, then requires the tag/schema to match the
+expected record type and rejects trailing bytes. `Record::validate` then
+enforces counts, ranges, and float finiteness; `TopologyTransaction` also has
+`validate_against(&MaterialManifest)` for unknown-material rejection.
+
+**Wire tags.** `InputFrame=1`, `ActionRequest=2`, `ActionStatus=3`,
+`TopologyTransaction=4`, `MotionSnapshot=5`, `BaselineBegin=6`, `BaselinePart=7`,
+`BaselineEnd=8`, `BaselineAck=9`, `RepairRequest=10`, `DurableThrough=11`,
+`Handshake=12`. Discriminants are permanent; new families take new numbers.
+
+**Sort orders for the canonical topology hash.** Volumes ascending by
+`VolumeId`; bricks ascending by `(z, y, x)`; authoritative layers ascending by
+numeric layer `kind`. Owner is encoded as `0,u64=0` for terrain or `1,u64=EntityId`
+for a body. Domain-separated with the ASCII tag `spall.topology.v1`; the content
+manifest hash uses `spall.manifest.v1`. BLAKE3 over the resulting bytes is the
+result. Reordering the inputs does not change the digest.
+
+**Brush fixed-point units.** Brush centre and radius are expressed in the
+target volume's local cell space with 8 fractional bits: `1` unit = `1/256`
+cell (`BRUSH_UNIT = 256`). A sphere removes a cell when the squared distance
+from the brush centre to the cell centre is `<=` the squared radius, computed
+in `i128` so no in-range input overflows. Maximum radius is 256 cells.
+
+**Pose quantization.** Translation is transmitted as three IEEE-754 `f64`
+metres and only finiteness is enforced (authority positions are `f64`; they are
+not lossily quantized). Orientation is a unit quaternion quantized to four
+`i16` components with scale `32767`; the decoder renormalizes and rejects a
+zero-magnitude quaternion.
+
+**Session and stream sequencing.** `SessionId` is a `u64`: high 32 bits are the
+connection slot, low 32 bits a generation. `SessionRegistry::open` bumps the
+generation on every (re)connect, so a reconnect produces a strictly newer
+session and `accept` rejects any record stamped with an older generation.
+`SequenceGate` accepts strictly increasing per-stream `u64` sequence numbers,
+reports the size of any skipped gap, and rejects duplicates and regressions;
+gaps in global `TransactionId`s on a filtered stream are expected.
+
+**Size limits.** 64 KiB per control record (header included), 1 MiB per bulk
+part, 64 MiB per assembled transfer, 256 KiB max decompressed material-only
+brick record (64 KiB actual payload), 1100 B per datagram payload. Count
+ceilings: 3 redundant inputs per frame, 4096 transaction ops / refs, 8192
+baseline regions, 4096 baseline parts.
+
+## T09 transport adapter (implemented)
+
+`crates/spall_net` layers Quinn/QUIC on the T01 records. It owns transport only:
+no simulation, storage, or rendering. ALPN is `spall/1`; TLS is 1.3-only.
+
+**Sessions.** Development uses server-certificate **fingerprint pinning**
+(BLAKE3 of the certificate DER, carried out of band) plus a per-run 32-byte
+**join token** (constant-time compared). A wrong certificate fails the QUIC/TLS
+handshake (`TransportError::Connect`); a wrong token or an incompatible
+`Handshake` fails after TLS with a distinct `AuthReject::{BadToken,
+Incompatible(field)}` sent back to the client before the connection is torn
+down. Authentication is a `spall_net`-local `ClientHello { token, handshake }` /
+`ServerAuthReply` exchange at the head of the control stream — not a frozen wire
+record — after which the same stream carries `NetMessage`s.
+
+**Channels.** One reliable ordered **control stream** per connection carries
+`NetMessage` envelopes: `Heartbeat { seq }`, `Record { seq, <T01 frame> }`, or
+`Bye`. The inner record keeps the exact `schema | tag | body` frame; the
+envelope adds a per-stream `u64` sequence. **Bulk streams** are capped at four
+per connection and carry length-framed `BaselinePart` records with the per-part
+and assembled-transfer ceilings enforced during read. **Datagrams** carry
+`InputFrame` / `MotionSnapshot` only, prefixed with a `u64` sequence, capped at
+`min(1100, connection.max_datagram_size())`; a connection whose peer cannot
+carry datagrams is rejected at setup.
+
+**Liveness.** QUIC keep-alive plus an application `Heartbeat` on the control
+stream every `heartbeat_interval`; a connection with no inbound control traffic
+for `idle_timeout` is closed. Defaults: 500 ms / 10 s (2 s QUIC keep-alive).
+
+**Deduplication.** Per-stream sequence gates (`spall_protocol::SequenceGate`):
+the control stream is strict (any replay dropped); datagrams tolerate a bounded
+reorder window so a late-but-new motion sample is still delivered while an exact
+replay is dropped.
+
+**Fault tooling.** Two independent mechanisms, both deterministic from a seed:
+`FaultChannel` delays / drops / reorders *decoded application messages* on a
+logical clock (for tests that must not depend on QUIC's own recovery); `UdpProxy`
+drops / delays / reorders *opaque encrypted datagrams* between client and server
+without parsing a QUIC header (for real retransmission / congestion behaviour).
+`cargo xtask net-check` runs one server + N clients through per-client proxies
+and writes `summary.json` / `net.jsonl` / `metrics.json`.
+### T01 review clarifications
+
+A `CellRun` addresses contiguous +X cells in the volume's cell coordinates with fixed Y/Z; `start.x + len - 1` must fit i64. Sphere and material-manifest deserialization uses the same validation as their checked constructors. Generic structural decoding does not know a world's material registry: world application must use `decode_topology(bytes, manifest)` or call `validate_against` before mutation. Baseline bulk payloads may use the full 1 MiB; `encode_bulk`/`decode_bulk` reserve additional bounded bytes for protocol and postcard metadata. Control records retain their independent 64 KiB cap. Negotiated limits must be nonzero and within protocol ceilings, and both simulation and snapshot rates must match.
+
+### T09 review bounds and ownership
+
+Authentication limits apply to QUIC establishment plus the application exchange. Callers may run concurrent `accept` operations, capped by `max_pending_authentications`; waiting for the first incoming connection is not an authentication timeout. Live server Connection objects hold bounded reusable slots (`max_connections`); dropping one releases its slot, and reuse increments its generation without wrapping. A client binds the unspecified address in the target's IP family for LAN reachability. The server echoes the accepted nonzero limits; both ends enforce them and the client validates the response session and compatibility.
+
+The datagram cap includes the 8-byte transport sequence and the inner protocol frame. Bulk caps count payload bytes, with bounded metadata overhead added to framing. `collect_parts` handles one ordered transfer per stream, with indices starting at zero, one transfer ID, at most 4096 parts, and verified part hashes. Compression is not implemented at this stage; received payload bytes are never decompressed in T09.
+
+Hosts must own and run one `Connection::run_liveness` future plus their receive pumps. It exits on connection close or stop-channel closure; stalled heartbeat writes close the connection. Canceling a partially completed stream read/write requires closing that connection, not retrying from a guessed frame boundary. The harness owns its child tasks and aborts them on early errors/timeouts. UDP proxy delays use a single owned queue (1024 packets and 2 MiB maximum); excess packets are dropped and queued sends cannot survive shutdown.

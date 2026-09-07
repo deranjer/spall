@@ -1,6 +1,17 @@
 # Validation and operating contract
 
-These commands and fixtures are **planned interfaces**, not working tools yet. T00 begins implementing them; later tasks add their scenarios. All numerical limits are provisional acceptance targets. None is a measured result.
+These commands and fixtures are **planned interfaces**. T00 implements
+`cargo xtask check`, the bounded GPU-free portion of `cargo xtask smoke`, and
+the offline clear-window capability smoke (`cargo xtask smoke --graphical`).
+T09 adds `cargo xtask net-check`: an in-process QUIC transport harness (one
+server, N authenticated headless clients, an optional opaque UDP loss proxy,
+every channel exercised, bounded teardown) that writes `summary.json`,
+`net.jsonl`, and `metrics.json`. `session`, `scenario`, `capture`, `bench`, and
+`crash-test` still return an explicit unavailable-capability result until their
+listed tasks are delivered. The `sandbox-server` host still records but does not
+bind `--listen`; wiring `spall_net` into the host and the documented
+connected-client command is T10. All numerical limits are provisional
+acceptance targets. None is a measured result.
 
 ## Agent operation without an editor
 
@@ -10,6 +21,10 @@ Use Cargo aliases so `cargo xtask` runs the xtask package. The orchestrator laun
 # Build, lint, and CPU checks. Implemented first in T00.
 cargo xtask check
 cargo xtask smoke --ticks 60
+
+# T09: QUIC transport + fault harness, in-process, no GPU. Real loopback QUIC
+# through an opaque UDP loss proxy; reliable records must survive the loss.
+cargo xtask net-check --clients 2 --loss-percent 2 --output .local/runs/net
 
 # Dedicated server, bounded automation run, no window/GPU dependency.
 cargo run -p sandbox --bin sandbox-server -- --world .local/worlds/dev --seed 42 --listen 127.0.0.1:5000 --ticks 3600 --log-json .local/runs/server.jsonl
@@ -141,3 +156,9 @@ Define actual radius, height, concurrent active regions, topology metadata size,
 A task passes when its own acceptance evidence exists and its integration dependencies still work. A gate passes only when all its required behaviors pass on the documented workload. Skipped GPU tests, untested crash paths, placeholder transport, and unsolved giant-collapse limits must remain visible as unfinished work.
 
 G1/G2 are architecture decision points. Strong review is needed for structural graph correctness, collision representation, replication atomicity, and temporal lighting. Smaller agents can implement frozen interfaces and small fixtures effectively; they should not decide these cross-system tradeoffs independently.
+
+### T09 review regression coverage
+
+`cargo test -p spall_net` includes `separate_process_transport`: one OS server process, two OS client processes, and two OS UDP proxy processes, with packet loss and forwarding delay. Each client checks reliable replies, bulk parts and motion datagrams. Every child is supervised under a 30-second whole-run deadline and killed/reaped on failure. The ignored `process_role` test is its child entry point, invoked by the parent; it is not an omitted scenario. `cargo xtask net-check` remains the faster in-process measurement command and is labelled accordingly.
+
+The transport regressions also exercise constructor validation through postcard, 1 MiB bulk payloads, negotiated limits, QUIC establishment timeouts, decoded-message loss/reorder, duplicate/overflow sequences, bounded bulk part metadata, liveness-owner shutdown, and delayed-proxy cancellation. Application-byte metrics use connection counters (control/datagram/bulk frame bytes observed at the sampling point, excluding QUIC overhead and authentication), not message counts. Wire-byte metrics come from Quinn. Neither harness is a destruction/replication/G1 feasibility result.

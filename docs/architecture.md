@@ -15,7 +15,7 @@ spall_structure -> spall_voxel                  connectivity, support, split pla
 spall_physics -> spall_voxel                    Rapier adapter, collision builds
 spall_sim     -> spall_structure, spall_physics    authoritative state and tick order
 spall_protocol -> spall_core                   explicit DTOs and codecs only
-spall_net     -> spall_protocol                 Quinn transport adapter
+spall_net     -> spall_protocol                 Quinn transport adapter (Tokio; T09)
 spall_store   -> spall_protocol                 checkpoint/journal bytes and indexes
 spall_render  -> spall_mesh, spall_core            wgpu resources and render passes
 spall_server  -> spall_sim, spall_net, spall_store, spall_jobs
@@ -26,7 +26,9 @@ xtask                                    process/scenario/build orchestration
 
 spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
 
-Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration. Add `games/survival` only when actual survival work begins.
+Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
+in-process `cargo xtask net-check` transport harness. Add `games/survival` only
+when actual survival work begins.
 
 ## Coordinates, identity, and materials
 

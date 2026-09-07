@@ -1,0 +1,24 @@
+[package]
+name = "spall_net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Spall QUIC transport adapter: TLS-pinned dev sessions, framed reliable records, motion datagrams, and a deterministic fault harness."
+
+[dependencies]
+blake3.workspace = true
+postcard.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+rustls.workspace = true
+serde.workspace = true
+spall_core.workspace = true
+spall_protocol.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util", "test-util"] }
