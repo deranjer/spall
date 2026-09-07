@@ -1,0 +1,25 @@
+[package]
+name = "sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sandbox-server"
+path = "src/bin/sandbox-server.rs"
+
+[[bin]]
+name = "sandbox-client"
+path = "src/bin/sandbox-client.rs"
+required-features = ["client"]
+
+[features]
+default = []
+client = ["dep:spall_client"]
+
+[dependencies]
+clap.workspace = true
+spall_client = { path = "../../crates/spall_client", optional = true }
+spall_server = { path = "../../crates/spall_server" }
+tracing.workspace = true
+tracing-subscriber.workspace = true

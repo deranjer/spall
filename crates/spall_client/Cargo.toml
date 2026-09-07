@@ -1,0 +1,12 @@
+[package]
+name = "spall_client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+spall_core = { path = "../spall_core" }
+thiserror.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+pollster = "0.4.0"

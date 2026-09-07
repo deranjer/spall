@@ -1,0 +1,9 @@
+[package]
+name = "spall_server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+spall_core = { path = "../spall_core" }
+thiserror.workspace = true

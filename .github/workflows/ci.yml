@@ -1,0 +1,14 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  foundation:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - run: cargo xtask check
+      - run: cargo xtask smoke --ticks 60 --output .local/runs/ci-smoke

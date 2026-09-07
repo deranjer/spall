@@ -1,6 +1,14 @@
 # Validation and operating contract
 
-These commands and fixtures are **planned interfaces**, not working tools yet. T00 begins implementing them; later tasks add their scenarios. All numerical limits are provisional acceptance targets. None is a measured result.
+These commands and fixtures are **planned interfaces**. T00 implements only
+`cargo xtask check`, the bounded GPU-free portion of `cargo xtask smoke`, and
+the offline clear-window capability smoke (`cargo xtask smoke --graphical`).
+`session`, `scenario`, `capture`, `bench`, and `crash-test` now return an
+explicit unavailable-capability result until their listed tasks are delivered.
+The server has process readiness only in T00: it records but does not bind
+`--listen`; transport, authentication, and the documented connected-client
+command remain T09 work. All numerical limits are provisional acceptance
+targets. None is a measured result.
 
 ## Agent operation without an editor
 

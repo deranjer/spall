@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/spall_core",
+    "crates/spall_server",
+    "crates/spall_client",
+    "examples/sandbox",
+    "tools/xtask",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+repository = "https://github.com/deranjer/spall"
+
+[workspace.dependencies]
+clap = { version = "4.5.53", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+wgpu = "24.0.5"
+winit = "0.30.12"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+debug = 1
