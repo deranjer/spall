@@ -1923,6 +1923,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "spall_structure"
+version = "0.1.0"
+dependencies = [
+ "spall_core",
+ "spall_jobs",
+ "spall_voxel",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "spall_voxel"
 version = "0.1.0"
 dependencies = [

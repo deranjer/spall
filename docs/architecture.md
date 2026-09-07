@@ -11,7 +11,7 @@ spall_core       IDs, coordinates, ticks, units, material definitions
 spall_voxel   -> spall_core                     storage, sampling, edits, queries
 spall_jobs    -> spall_core                     bounded scheduling, result tokens
 spall_mesh    -> spall_voxel                    surface generation, no GPU
-spall_structure -> spall_voxel                  connectivity, support, split plans
+spall_structure -> spall_voxel, spall_jobs      connectivity, support, split plans
 spall_physics -> spall_voxel                    Rapier adapter, collision builds
 spall_sim     -> spall_structure, spall_physics    authoritative state and tick order
 spall_protocol -> spall_core                   explicit DTOs and codecs only
@@ -100,6 +100,8 @@ Use six-face connectivity; corner/edge contact does not create a bond. Do not as
 5. Stage every unsupported component for conversion into a dynamic voxel volume. A component may cross many bricks; do not make one body per brick.
 
 Graph metadata for unloaded regions must remain available or be loaded before resolving support. Geometry requests follow graph dependencies. Unknown support means pending analysis. It never means air or a permanent anchor. Searches are incremental, time/byte budgeted, and resumable. Large edits wait for analysis rather than publishing a partly evaluated structure.
+
+`spall_structure` (T07) implements the all-resident G1 case. It depends on `spall_jobs` so a completed analysis carries a `JobToken` over the exact brick revisions it read (plus *absent* sentinels for unresident dependencies), and a consumer discards a stale analysis exactly as it would any other off-tick job result. A build takes an explicit residency mode: `AllResident` treats an absent neighbour brick as empty space and only a *failed* brick load as Unknown; `Streamed` (T18) treats any absent neighbour as Unknown. A brick outside the volume's declared bounds is always a hard world edge, never Unknown.
 
 Splitting has a conservation ledger: source occupied cells = retained cells + child cells + explicitly destroyed cells. Use sorted canonical cell ranges for membership. For mixed materials compute mass, centre of mass, and inertia from voxel density and size, including each cube's own inertia and offsets. Child linear velocity inherits parent velocity plus angular velocity cross the centre offset; angular velocity inherits the parent value before impulses. Apply declared explosion impulses once on the server.
 

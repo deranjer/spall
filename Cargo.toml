@@ -4,6 +4,7 @@ members = [
     "crates/spall_protocol",
     "crates/spall_voxel",
     "crates/spall_jobs",
+    "crates/spall_structure",
     "crates/spall_server",
     "crates/spall_client",
     "examples/sandbox",
@@ -27,6 +28,7 @@ serde_json = "1.0.145"
 spall_core = { path = "crates/spall_core" }
 spall_jobs = { path = "crates/spall_jobs" }
 spall_protocol = { path = "crates/spall_protocol" }
+spall_structure = { path = "crates/spall_structure" }
 spall_voxel = { path = "crates/spall_voxel" }
 thiserror = "2.0.17"
 tracing = "0.1.41"
