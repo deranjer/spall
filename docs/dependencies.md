@@ -47,6 +47,15 @@ MSVC C++ tools recorded below.
 async, or simulation. `spall_net` (T09) will add Quinn on top of these
 records; `spall_store` (T16) reuses the canonical little-endian encoding.
 
+## T02 — brick storage and revisioned edits (verified 2026-09-06)
+
+`spall_voxel` adds no new external dependency. It reuses `blake3` (already
+locked for T01) for its representation-independent brick content hash and
+`thiserror` for typed access/edit errors; it depends only on `spall_core`
+among workspace crates, matching the `docs/architecture.md` dependency graph.
+An optional `oracle` feature exposes the crate's dense reference model to
+later foundation tasks (T03+) without copying it.
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,

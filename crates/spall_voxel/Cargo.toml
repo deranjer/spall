@@ -1,0 +1,15 @@
+[package]
+name = "spall_voxel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# Exposes the dense reference model so later foundation tasks (T03+) can reuse
+# it as a test oracle without copying it.
+oracle = []
+
+[dependencies]
+blake3.workspace = true
+spall_core.workspace = true
+thiserror.workspace = true

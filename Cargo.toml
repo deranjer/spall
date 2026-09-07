@@ -2,6 +2,7 @@
 members = [
     "crates/spall_core",
     "crates/spall_protocol",
+    "crates/spall_voxel",
     "crates/spall_server",
     "crates/spall_client",
     "examples/sandbox",
@@ -23,6 +24,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 spall_core = { path = "crates/spall_core" }
 spall_protocol = { path = "crates/spall_protocol" }
+spall_voxel = { path = "crates/spall_voxel" }
 thiserror = "2.0.17"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
