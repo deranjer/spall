@@ -1,0 +1,22 @@
+[package]
+name = "spall_physics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints.clippy]
+# The feasibility harness has a few functions with many measured knobs.
+too_many_arguments = "allow"
+
+[dependencies]
+rapier3d.workspace = true
+spall_core.workspace = true
+spall_voxel.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+spall_voxel = { workspace = true, features = ["oracle"] }
+
+[[bin]]
+name = "collision-bench"
+path = "src/bin/collision_bench.rs"

@@ -6,12 +6,17 @@ the offline clear-window capability smoke (`cargo xtask smoke --graphical`).
 T09 adds `cargo xtask net-check`: an in-process QUIC transport harness (one
 server, N authenticated headless clients, an optional opaque UDP loss proxy,
 every channel exercised, bounded teardown) that writes `summary.json`,
-`net.jsonl`, and `metrics.json`. `session`, `scenario`, `capture`, `bench`, and
-`crash-test` still return an explicit unavailable-capability result until their
-listed tasks are delivered. The `sandbox-server` host still records but does not
-bind `--listen`; wiring `spall_net` into the host and the documented
-connected-client command is T10. All numerical limits are provisional
-acceptance targets. None is a measured result.
+`net.jsonl`, and `metrics.json`.
+T06 adds one offline measurement binary,
+`cargo run --release -p spall_physics --bin collision-bench`, which runs the
+voxel-collision feasibility scenarios and writes `collision-feasibility.json`;
+it is not wired into `cargo xtask bench`.
+`session`, `scenario`, `capture`, `bench`, and `crash-test` still return an
+explicit unavailable-capability result until their listed tasks are delivered.
+The `sandbox-server` host still records but does not bind `--listen`; wiring
+`spall_net` into the host and the documented connected-client command is T10.
+All numerical limits are provisional acceptance targets. None is a measured
+result.
 
 ## Agent operation without an editor
 

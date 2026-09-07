@@ -139,6 +139,44 @@ Windows toolchain beyond the VS 2022 C++ tools already recorded below.
 decompression of brick payloads arrives with `spall_store` in T16). The T09
 malformed-input tests bound the declared-length and assembled-transfer paths.
 
+## T06 — editable voxel collision feasibility (verified 2026-09-07)
+
+`spall_physics` adds the physics solver named in `README.md`. It is the only
+crate that depends on `rapier3d`; Rapier/parry types never leave the
+`spall_physics::world` and `::collider` modules (callers address bodies by an
+opaque `BodyId`). Dependency direction matches `docs/architecture.md`:
+`spall_physics -> spall_voxel` (`-> spall_core`); no `spall_jobs` /
+`spall_structure` / GPU / window / network edge.
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T06 |
+| --- | ---: | --- | --- | --- |
+| rapier3d | 0.35.3 | default (`dim3` + `f32` + `std`) | `Apache-2.0` | rigid-body solver, compound + voxel colliders, CCD, contact manifolds |
+
+`rapier3d 0.35` moved its public math to **glam** (via the `glamx` wrapper):
+`Vector` = `glam::Vec3`, `Rotation` = `glam::Quat`, `Pose` = `glamx::Pose3`,
+`IVector` = `glam::IVec3`. `PhysicsPipeline::step` takes a `&mut BroadPhaseBvh`
+(aliased `DefaultBroadPhase`). This is the released `0.35.3` surface, not the
+`master`-branch docs.
+
+Transitive crates newly locked (all `Apache-2.0` or `MIT OR Apache-2.0`
+family; `wide` is `Zlib OR Apache-2.0 OR MIT`): `parry3d 0.30.2`,
+`nalgebra 0.35.0`, `nalgebra-macros`, `simba 0.10.2`, `glamx 0.3.0`,
+`glam 0.30.10` / `0.31.1` / `0.32.1` (older majors pulled by parry/rapier/glamx,
+coexisting with the workspace's `glam 0.33.6`), `approx`, `wide`, `safe_arch`,
+`matrixmultiply`, `rawpointer`, `libm`, `typenum`, `num-complex`,
+`num-rational`, `num-bigint`, `num-integer`, `num-derive`, `num-traits`,
+`ordered-float`, `spade`, `rstar`, `robust`, `heapless` (already present via
+postcard), `hash32`, `hashbrown`, `foldhash`, `allocator-api2`, `ena`,
+`downcast-rs`, `either`, `profiling-procmacros`. `nalgebra`/`simba` compile a
+`build.rs`; no C toolchain beyond the MSVC tools already recorded is needed.
+
+`rapier3d` features **available but not enabled**: `enhanced-determinism`
+(libm-forced math for cross-platform reproducibility — physics tests use
+position/energy tolerances instead), `parallel` (rayon), `simd8`,
+`serde-serialize`. A dev-dependency enables `spall_voxel/oracle` for the mass
+cross-check. The `collision-bench` binary and the `#[cfg(test)]` feasibility
+scenarios are the only consumers; no server loop drives physics yet (T08).
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,
