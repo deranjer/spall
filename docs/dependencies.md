@@ -74,6 +74,24 @@ validation stays server-side — so `f64` math here is fine. Integer brush
 plans (`brush.rs`) use only `spall_core`'s fixed-point predicate and stay
 fully deterministic.
 
+## T04 — bounded job scheduling (verified 2026-09-06)
+
+`spall_jobs` adds **no new external dependency**. It depends only on
+`spall_core` (coordinate / id / revision types reused in job tokens) and
+`thiserror` (already locked) for its `SubmitReason` / `CounterExhausted`
+errors. `Cargo.lock` gains only the `spall_jobs` package node.
+
+The scheduler is executor-agnostic and deterministic: it never spawns a
+thread. `ThreadJobPool` is a thin wrapper that runs jobs on `std::thread`
+workers — standard library only, no `rayon` yet. `README.md` names a Rayon
+pool for jobs; T04 deliberately keeps the mechanism (bounded queues,
+priority order, token re-validation, generation invalidation, clean
+shutdown) independent of the worker backend, so a Rayon adapter can be
+added later without reworking the policy. An optional `testkit` feature
+exposes an in-memory `WorldView` double (`spall_jobs::testkit::MapWorld`)
+for T05 / T07 result-validation tests. No GPU, window, network, async, or
+filesystem code enters `spall_jobs`.
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,
