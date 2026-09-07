@@ -1895,6 +1895,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spall_jobs"
+version = "0.1.0"
+dependencies = [
+ "spall_core",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "spall_protocol"
 version = "0.1.0"
 dependencies = [
