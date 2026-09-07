@@ -125,8 +125,22 @@ pub const MAX_MATERIALS: usize = 4096;
 /// A validated set of materials for one world. Construct with
 /// [`MaterialManifest::validated`]; the constructor is the only way in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawMaterialManifest")]
 pub struct MaterialManifest {
     entries: Vec<MaterialDef>,
+}
+
+#[derive(Deserialize)]
+struct RawMaterialManifest {
+    entries: Vec<MaterialDef>,
+}
+
+impl TryFrom<RawMaterialManifest> for MaterialManifest {
+    type Error = ManifestError;
+
+    fn try_from(raw: RawMaterialManifest) -> Result<Self, Self::Error> {
+        Self::validated(raw.entries)
+    }
 }
 
 impl MaterialManifest {
@@ -372,6 +386,20 @@ mod tests {
     fn unknown_material_id_is_none_not_air() {
         let manifest = MaterialManifest::validated(vec![air(), stone(1, "stone")]).unwrap();
         assert!(manifest.get(MaterialId(999)).is_none());
+    }
+
+    #[test]
+    fn deserialization_cannot_bypass_manifest_validation() {
+        for entries in [vec![stone(2, "b"), stone(1, "a")], vec![air(), air()]] {
+            let value = serde_json::json!({ "entries": entries });
+            assert!(serde_json::from_value::<MaterialManifest>(value).is_err());
+        }
+        let manifest = MaterialManifest::validated(vec![air(), stone(1, "stone")]).unwrap();
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MaterialManifest>(&json).unwrap(),
+            manifest
+        );
     }
 
     #[test]

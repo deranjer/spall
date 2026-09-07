@@ -301,7 +301,8 @@ pub enum TopologyOp {
         brush: SphereBrush,
         material: MaterialId,
     },
-    /// Explicit run of cells set to one material (irregular changes, repairs).
+    /// Contiguous +X run in the volume's cell coordinates, with fixed Y/Z.
+    /// The last X coordinate is `start.x + len - 1` and must fit `i64`.
     CellRun {
         volume: VolumeId,
         start: GlobalCell,
@@ -363,6 +364,17 @@ impl Record for TopologyTransaction {
             return Err(RecordError::Inconsistent("transaction has no operations"));
         }
         for op in &self.ops {
+            if let TopologyOp::CellRun { start, len, .. } = op
+                && start
+                    .x
+                    .checked_add(i64::from(*len).saturating_sub(1))
+                    .is_none()
+            {
+                return Err(RecordError::OutOfRange {
+                    field: "TopologyOp.CellRun.start",
+                    detail: "last +X cell must fit i64",
+                });
+            }
             if let TopologyOp::CellRun { len, .. } = op
                 && (*len == 0 || *len > MAX_CELL_RUN_LEN)
             {
@@ -690,6 +702,18 @@ mod tests {
         });
         assert!(matches!(tx.validate(), Err(RecordError::OutOfRange { .. })));
 
+        tx.ops[0] = TopologyOp::CellRun {
+            volume: VolumeId::new(1).unwrap(),
+            start: GlobalCell::new(i64::MAX, 0, 0),
+            len: 2,
+            material: MaterialId(1),
+        };
+        assert!(matches!(tx.validate(), Err(RecordError::OutOfRange { .. })));
+        if let TopologyOp::CellRun { len, .. } = &mut tx.ops[0] {
+            *len = 1;
+        }
+        assert!(tx.validate().is_ok());
+
         tx.ops[0] = TopologyOp::IntegerBrush {
             volume: VolumeId::new(1).unwrap(),
             brush: SphereBrush::new(BrushPoint::from_cells(0, 0, 0).unwrap(), 256).unwrap(),
@@ -741,6 +765,11 @@ mod tests {
             tx.validate_against(&manifest),
             Err(RecordError::UnknownMaterial(9))
         );
+        let bytes = crate::encode_control(&tx).unwrap();
+        assert!(matches!(
+            crate::decode_topology(&bytes, &manifest),
+            Err(crate::CodecError::Invalid(RecordError::UnknownMaterial(9)))
+        ));
     }
 
     #[test]
