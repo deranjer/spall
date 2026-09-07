@@ -11,14 +11,13 @@
 //! * [`JoinToken`] is a per-run shared secret checked after the TLS handshake.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::DigitallySignedStruct;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use crate::config::TransportConfig;
@@ -56,22 +55,13 @@ impl std::fmt::Debug for Fingerprint {
 pub struct JoinToken(pub [u8; 32]);
 
 impl JoinToken {
-    /// Derives a fresh token from process entropy. Development-grade: enough to
-    /// keep an unrelated process off the port, not a hardened secret.
-    pub fn generate() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&nanos.to_le_bytes());
-        hasher.update(&std::process::id().to_le_bytes());
-        hasher.update(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-        hasher.update(&(&COUNTER as *const _ as usize).to_le_bytes());
+    /// Draws a fresh token from the operating system CSPRNG.
+    pub fn generate() -> Result<Self> {
         let mut out = [0u8; 32];
-        hasher.finalize_xof().fill(&mut out);
-        Self(out)
+        SystemRandom::new()
+            .fill(&mut out)
+            .map_err(|_| TransportError::Tls("operating-system CSPRNG unavailable".into()))?;
+        Ok(Self(out))
     }
 
     /// Constant-time equality: the comparison time does not depend on where the
@@ -263,13 +253,13 @@ mod tests {
 
     #[test]
     fn join_token_verify_is_value_based() {
-        let t = JoinToken::generate();
+        let t = JoinToken::generate().unwrap();
         assert!(t.verify(&t));
         let mut other = t;
         other.0[31] ^= 1;
         assert!(!t.verify(&other));
         // Distinct generations differ.
-        assert!(!JoinToken::generate().verify(&JoinToken::generate()));
+        assert!(!JoinToken::generate().unwrap().verify(&JoinToken::generate().unwrap()));
     }
 
     #[test]

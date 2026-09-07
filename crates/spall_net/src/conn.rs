@@ -530,7 +530,16 @@ impl BulkRecv {
     pub async fn collect_parts(mut self) -> Result<Vec<spall_protocol::BaselinePart>> {
         let mut parts = Vec::new();
         let mut assembled = 0usize;
+        let mut transfer = None;
+        let mut next_part_index = 0u32;
         while let Some(bytes) = read_framed(&mut self.stream, self.cap).await? {
+            if parts.len() >= spall_protocol::limits::MAX_BASELINE_PARTS {
+                return Err(TransportError::Frame(
+                    crate::framing::FrameError::BulkPartCount {
+                        limit: spall_protocol::limits::MAX_BASELINE_PARTS,
+                    },
+                ));
+            }
             assembled = assembled.saturating_add(bytes.len());
             if assembled > self.assembled_cap {
                 return Err(TransportError::Frame(
@@ -544,6 +553,35 @@ impl BulkRecv {
                 .map_err(|e| {
                     TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
                 })?;
+            if let Some(expected) = transfer {
+                if part.transfer_id != expected {
+                    return Err(TransportError::Frame(
+                        crate::framing::FrameError::TransferMismatch,
+                    ));
+                }
+            } else {
+                transfer = Some(part.transfer_id);
+            }
+            if part.part_index != next_part_index {
+                return Err(TransportError::Frame(
+                    crate::framing::FrameError::PartOrder {
+                        expected: next_part_index,
+                        found: part.part_index,
+                    },
+                ));
+            }
+            if part.part_hash != spall_protocol::Hash32::of(&part.payload) {
+                return Err(TransportError::Frame(
+                    crate::framing::FrameError::PartHashMismatch {
+                        index: part.part_index,
+                    },
+                ));
+            }
+            next_part_index = next_part_index.checked_add(1).ok_or_else(|| {
+                TransportError::Frame(crate::framing::FrameError::BulkPartCount {
+                    limit: spall_protocol::limits::MAX_BASELINE_PARTS,
+                })
+            })?;
             parts.push(part);
         }
         Ok(parts)

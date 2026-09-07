@@ -81,7 +81,7 @@ impl StreamDeduper {
             SeqVerdict::Duplicate => {
                 let hw = self.gate.high_water().unwrap_or(0);
                 let within_window = self.reorder_window > 0
-                    && seq + self.reorder_window >= hw
+                    && seq >= hw.saturating_sub(self.reorder_window)
                     && !self.recent.contains(&seq);
                 if within_window {
                     self.remember(seq);
@@ -130,5 +130,13 @@ mod tests {
         assert_eq!(d.admit(11), DedupVerdict::Duplicate);
         // Far below the window: treated as a replay.
         assert_eq!(d.admit(1), DedupVerdict::Duplicate);
+    }
+
+    #[test]
+    fn windowed_gate_handles_sequences_near_u64_max_without_overflow() {
+        let mut d = StreamDeduper::with_window(256);
+        assert_eq!(d.admit(u64::MAX), DedupVerdict::Accept { gap: u64::MAX });
+        assert_eq!(d.admit(u64::MAX - 1), DedupVerdict::Accept { gap: 0 });
+        assert_eq!(d.admit(u64::MAX - 1), DedupVerdict::Duplicate);
     }
 }

@@ -10,6 +10,7 @@ blake3.workspace = true
 postcard.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
+ring.workspace = true
 rustls.workspace = true
 serde.workspace = true
 spall_core.workspace = true

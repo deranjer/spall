@@ -145,7 +145,7 @@ pub async fn run_transport_check(params: TransportCheckParams) -> Result<Transpo
 
 async fn run_inner(params: TransportCheckParams) -> Result<TransportCheckReport> {
     let identity = DevIdentity::generate()?;
-    let token = JoinToken::generate();
+    let token = JoinToken::generate()?;
     let fingerprint = identity.fingerprint();
 
     let server = Arc::new(
@@ -341,8 +341,8 @@ fn spawn_server_side(
                     let part = spall_protocol::BaselinePart {
                         transfer_id: spall_protocol::TransferId(1),
                         part_index: i,
-                        part_hash: Hash32::of(b"spall-net-harness-baseline-part"),
                         payload: vec![i as u8 + 1; 512],
+                        part_hash: Hash32::of(&vec![i as u8 + 1; 512]),
                     };
                     if bulk.send_part(&part).await.is_err() {
                         return;

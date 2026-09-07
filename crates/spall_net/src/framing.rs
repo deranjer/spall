@@ -29,6 +29,18 @@ pub enum FrameError {
     /// The stream ended in the middle of a frame.
     #[error("stream ended mid-frame after {got} of {want} bytes")]
     Incomplete { got: usize, want: usize },
+    /// A bulk transfer exceeded its fixed protocol count ceiling.
+    #[error("bulk transfer contains more than {limit} parts")]
+    BulkPartCount { limit: usize },
+    /// Parts in a bulk stream must belong to one transfer.
+    #[error("bulk stream mixes transfer ids")]
+    TransferMismatch,
+    /// Parts in a bulk stream must be contiguous and ordered.
+    #[error("bulk part index {found} is not the expected {expected}")]
+    PartOrder { expected: u32, found: u32 },
+    /// The declared per-part content hash did not match the payload.
+    #[error("bulk part {index} hash does not match its payload")]
+    PartHashMismatch { index: u32 },
     /// The underlying QUIC stream errored.
     #[error("quic stream: {0}")]
     Stream(String),

@@ -57,7 +57,7 @@ async fn server_and_two_clients_authenticate_and_exchange_records() {
 
 async fn spawn_server() -> (Arc<NetServer>, SocketAddr, DevIdentity, JoinToken) {
     let identity = DevIdentity::generate().unwrap();
-    let token = JoinToken::generate();
+    let token = JoinToken::generate().unwrap();
     let server = Arc::new(
         NetServer::bind(
             loopback(),
@@ -168,7 +168,7 @@ async fn malformed_length_and_oversized_transfer_stay_bounded() {
     cfg.limits.max_assembled_transfer = 8192;
 
     let identity = DevIdentity::generate().unwrap();
-    let token = JoinToken::generate();
+    let token = JoinToken::generate().unwrap();
     let server = Arc::new(
         NetServer::bind(
             loopback(),
@@ -219,8 +219,8 @@ async fn malformed_length_and_oversized_transfer_stay_bounded() {
             let part = spall_net::spall_protocol::BaselinePart {
                 transfer_id: spall_net::spall_protocol::TransferId(1),
                 part_index: i,
-                part_hash: spall_net::spall_protocol::Hash32::of(b"p"),
                 payload: vec![7u8; 3000],
+                part_hash: spall_net::spall_protocol::Hash32::of(&vec![7u8; 3000]),
             };
             // Some sends may fail once the peer resets the stream; that is fine.
             let _ = bulk.send_part(&part).await;
@@ -254,6 +254,86 @@ async fn malformed_length_and_oversized_transfer_stay_bounded() {
     assert!(matches!(
         got,
         Some(spall_net::WireRecord::DurableThrough(_))
+    ));
+
+    client.close("done");
+    server.close();
+}
+
+/// Bulk streams reject inconsistent transfer metadata and the protocol's fixed
+/// part-count ceiling before retaining an unbounded vector of tiny parts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_transfer_metadata_and_part_count_are_bounded() {
+    let (server, addr, identity, token) = spawn_server().await;
+    let s = server.clone();
+    let server_conn = tokio::spawn(async move { s.accept().await.unwrap() });
+    let client = connect(
+        addr,
+        identity.fingerprint(),
+        token,
+        demo_handshake(HARNESS_MANIFEST_TAG),
+        TransportConfig::for_tests(),
+    )
+    .await
+    .unwrap();
+    let server_conn = server_conn.await.unwrap();
+
+    // A skipped part index cannot be interpreted as a complete transfer.
+    let mut inconsistent = client.open_bulk().await.unwrap();
+    for index in [0, 2] {
+        let payload = vec![index as u8 + 1];
+        inconsistent
+            .send_part(&spall_net::spall_protocol::BaselinePart {
+                transfer_id: spall_net::spall_protocol::TransferId(7),
+                part_index: index,
+                part_hash: spall_net::spall_protocol::Hash32::of(&payload),
+                payload,
+            })
+            .await
+            .unwrap();
+    }
+    inconsistent.finish().unwrap();
+    let err = server_conn
+        .accept_bulk()
+        .await
+        .unwrap()
+        .collect_parts()
+        .await
+        .expect_err("skipped bulk part index is rejected");
+    assert!(matches!(
+        err,
+        TransportError::Frame(FrameError::PartOrder {
+            expected: 1,
+            found: 2
+        })
+    ));
+
+    // The count ceiling is distinct from the assembled-byte ceiling: all of
+    // these parts are one byte and remain far below 64 MiB.
+    let mut many = client.open_bulk().await.unwrap();
+    for index in 0..=spall_net::spall_protocol::limits::MAX_BASELINE_PARTS as u32 {
+        let payload = vec![1];
+        many.send_part(&spall_net::spall_protocol::BaselinePart {
+            transfer_id: spall_net::spall_protocol::TransferId(8),
+            part_index: index,
+            part_hash: spall_net::spall_protocol::Hash32::of(&payload),
+            payload,
+        })
+        .await
+        .unwrap();
+    }
+    many.finish().unwrap();
+    let err = server_conn
+        .accept_bulk()
+        .await
+        .unwrap()
+        .collect_parts()
+        .await
+        .expect_err("more than MAX_BASELINE_PARTS is rejected");
+    assert!(matches!(
+        err,
+        TransportError::Frame(FrameError::BulkPartCount { limit })
+            if limit == spall_net::spall_protocol::limits::MAX_BASELINE_PARTS
     ));
 
     client.close("done");
