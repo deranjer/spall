@@ -5,9 +5,9 @@
 //! channel, and tears everything down under a hard deadline. Writes the
 //! standard evidence files (`summary.json`, `net.jsonl`, `metrics.json`).
 //!
-//! Separate-process bots that drive the *real* `sandbox-server` protocol arrive
-//! with T10, when the server host speaks it; this command exercises the
-//! `spall_net` transport itself.
+//! `cargo test -p spall_net` separately exercises real server/client/proxy
+//! processes. Sandbox-host replication remains T10; this command measures
+//! the `spall_net` transport itself.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -181,7 +181,7 @@ pub fn run(args: NetCheckArgs, unique_output: impl FnOnce() -> PathBuf) -> Resul
         packets_dropped,
         transport_bytes_sent: report.transport_bytes_sent,
         transport_bytes_recv: report.transport_bytes_recv,
-        note: "in-process QUIC transport check; separate-process protocol bots land with T10",
+        note: "in-process QUIC transport check; separate-process acceptance runs in cargo test -p spall_net",
     };
     write_summary(&output, &summary)?;
     write_metrics(&output, &report)?;
