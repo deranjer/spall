@@ -7,8 +7,13 @@ rust-version.workspace = true
 [dependencies]
 spall_core = { path = "../spall_core" }
 spall_protocol = { path = "../spall_protocol" }
+spall_net = { path = "../spall_net" }
 spall_voxel = { path = "../spall_voxel" }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
+tracing.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 pollster = "0.4.0"

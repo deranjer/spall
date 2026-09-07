@@ -115,38 +115,8 @@ pub fn flat_terrain_setup() -> WorldSetup {
 /// - beam:   `x 4..20`, `z 1..2`, `y 8..9`
 pub fn bridged_terrain_setup() -> WorldSetup {
     let id = VolumeId::new(1).unwrap();
-    let mut v = Volume::new(id, CellSizeCode::Quarter);
-    v.apply_edit(&box_plan(
-        id,
-        GlobalCell::new(0, 0, 0),
-        GlobalCell::new(23, 1, 3),
-        STONE,
-    ))
-    .unwrap();
-    v.apply_edit(&box_plan(
-        id,
-        GlobalCell::new(10, 2, 1),
-        GlobalCell::new(11, 7, 2),
-        STONE,
-    ))
-    .unwrap();
-    v.apply_edit(&box_plan(
-        id,
-        GlobalCell::new(4, 8, 1),
-        GlobalCell::new(20, 9, 2),
-        STONE,
-    ))
-    .unwrap();
-    v.apply_edit(&box_plan(
-        id,
-        GlobalCell::new(0, 10, 0),
-        GlobalCell::new(23, 15, 3),
-        MaterialId::AIR,
-    ))
-    .unwrap();
-
     WorldSetup {
-        terrain: v,
+        terrain: spall_voxel::fixtures::bridge_scene(id),
         terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(23, 15, 3)),
         materials: stone_manifest(),
         anchor: AnchorPlane::at(0),

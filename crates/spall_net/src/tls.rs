@@ -42,6 +42,24 @@ impl Fingerprint {
         }
         s
     }
+
+    /// Parses the 64-character lowercase/uppercase hex written by [`Self::to_hex`].
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        Some(Self(parse_hex32(hex)?))
+    }
+}
+
+/// Parses exactly 32 bytes of hex (64 chars, whitespace trimmed).
+fn parse_hex32(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 impl std::fmt::Debug for Fingerprint {
@@ -62,6 +80,21 @@ impl JoinToken {
             .fill(&mut out)
             .map_err(|_| TransportError::Tls("operating-system CSPRNG unavailable".into()))?;
         Ok(Self(out))
+    }
+
+    /// Lowercase hex of the 32 secret bytes. Only for writing a per-run token
+    /// file consumed by a client on the same machine; never log this.
+    pub fn to_hex(self) -> String {
+        let mut s = String::with_capacity(64);
+        for b in self.0 {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// Parses a token file written by [`Self::to_hex`].
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        Some(Self(parse_hex32(hex)?))
     }
 
     /// Constant-time equality: the comparison time does not depend on where the

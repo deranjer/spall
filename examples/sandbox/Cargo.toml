@@ -21,6 +21,7 @@ client = ["dep:spall_client"]
 clap.workspace = true
 spall_client = { path = "../../crates/spall_client", optional = true }
 spall_core = { path = "../../crates/spall_core" }
+spall_net = { path = "../../crates/spall_net" }
 spall_server = { path = "../../crates/spall_server" }
 spall_sim = { path = "../../crates/spall_sim" }
 tracing.workspace = true
