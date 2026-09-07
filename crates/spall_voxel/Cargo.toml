@@ -11,5 +11,6 @@ oracle = []
 
 [dependencies]
 blake3.workspace = true
+glam.workspace = true
 spall_core.workspace = true
 thiserror.workspace = true

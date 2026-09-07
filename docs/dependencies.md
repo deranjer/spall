@@ -56,6 +56,24 @@ among workspace crates, matching the `docs/architecture.md` dependency graph.
 An optional `oracle` feature exposes the crate's dense reference model to
 later foundation tasks (T03+) without copying it.
 
+## T03 — fixture worlds, rays, and integer brushes (verified 2026-09-06)
+
+`spall_voxel` gains one new external dependency for its ray/transform math.
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T03 |
+| --- | ---: | --- | --- | --- |
+| glam | 0.33.6 | `f64` (adds `DVec3` / `DQuat`); default `std` | `MIT OR Apache-2.0` | rigid volume↔world transforms and DDA ray math |
+
+`glam` is the math library named in `README.md`; T03 is the first task that
+needs real vector / quaternion rotation (world-space rays against a rigidly
+posed volume). With the `f64` + default `std` features it is pure-Rust with
+**no transitive dependencies**; no GPU, window, or async code enters
+`spall_voxel`. Ray results are explicitly
+*not* required to be bit-identical across machines — authoritative hit
+validation stays server-side — so `f64` math here is fine. Integer brush
+plans (`brush.rs`) use only `spall_core`'s fixed-point predicate and stay
+fully deterministic.
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,

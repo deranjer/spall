@@ -679,6 +679,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.33.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21fef0953c54fd3de2f44b743fbf77e044c81a25faee03636dfccc0d35135e23"
+
+[[package]]
 name = "glow"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1913,6 +1919,7 @@ name = "spall_voxel"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "glam",
  "spall_core",
  "thiserror 2.0.20",
 ]
