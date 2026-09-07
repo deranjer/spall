@@ -42,6 +42,7 @@ pub mod fixtures;
 pub mod intent;
 pub mod journal;
 pub mod registry;
+pub mod replication;
 pub mod schedule;
 pub mod sim;
 pub mod stage;
@@ -57,6 +58,9 @@ pub use commit::{CommitError, CommitOutcome, Committed};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
 pub use journal::{JournalEntry, JournalSink};
 pub use registry::IdRegistry;
+pub use replication::{
+    MotionPublisher, ReplicationError, action_statuses, committed_transactions, repair_ops,
+};
 pub use schedule::{EditPipeline, RegionKey, TickReport};
 pub use sim::{Simulation, SimulationConfig, TickError};
 pub use stage::{StageError, StagedEdit, stage_edit};

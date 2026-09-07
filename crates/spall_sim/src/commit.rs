@@ -82,6 +82,8 @@ pub enum CommitError {
     Ids(#[from] spall_core::IdError),
     #[error("emitted transaction DTO is invalid: {0}")]
     Record(#[from] RecordError),
+    #[error("commit cannot be encoded for replication: {0}")]
+    Replication(#[from] crate::replication::ReplicationError),
 }
 
 /// Commits `staged` into `world`, appending a journal entry on success.
@@ -157,8 +159,11 @@ pub fn commit(
         parent.volume.apply_edit(&staged.plan)?
     };
 
-    // 5. Build every child from the post-cut parent (components are still solid).
+    // 5. Build every child from the post-cut parent (components are still solid),
+    //    and capture the canonical cell-run ops a replica needs to reconstruct
+    //    the child without any structural code (`docs/protocol.md`).
     let mut children: Vec<ChildBody> = Vec::new();
+    let mut child_fill_ops: Vec<Vec<spall_protocol::TopologyOp>> = Vec::new();
     {
         let parent_vol = world
             .volume_ref(vid)
@@ -173,6 +178,9 @@ pub fn commit(
                 &|m: MaterialId| world.density(m),
                 0,
             )?;
+            child_fill_ops.push(crate::replication::child_fill_ops(
+                *child_vid, membership, parent_vol,
+            ));
             children.push(child);
         }
     }
@@ -293,18 +301,34 @@ pub fn commit(
         })
         .collect();
 
+    // Self-describing op list: the brush, then for each child a `SplitOff`
+    // marker followed by the canonical cell runs that fill it, then the runs
+    // that remove every detached cell from the source. A replica applies these
+    // in order to reproduce the exact committed geometry.
     let mut ops = vec![TopologyOp::IntegerBrush {
         volume: vid,
         brush: staged.brush,
         material: staged.kind.write_material(),
     }];
-    for ((entity, child_vid), _) in child_ids.iter().zip(&staged.memberships) {
+    for (((entity, child_vid), _), fill) in child_ids
+        .iter()
+        .zip(&staged.memberships)
+        .zip(&child_fill_ops)
+    {
         ops.push(TopologyOp::SplitOff {
             source: vid,
             child: *child_vid,
             child_entity: *entity,
         });
+        ops.extend(fill.iter().cloned());
     }
+    if staged.splits() {
+        ops.extend(crate::replication::source_removal_ops(
+            vid,
+            &staged.memberships,
+        ));
+    }
+    crate::replication::check_op_budget(ops.len())?;
 
     let mut result_hashes = vec![VolumeHash {
         volume: vid,
