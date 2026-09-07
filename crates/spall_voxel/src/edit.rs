@@ -126,15 +126,19 @@ impl Volume {
                 BrickState::Absent | BrickState::Resident { .. } => {}
             }
         }
-        // Enough revisions left for every touched brick? The last one handed
-        // out would be `next_revision + needed - 1`.
+        // Enough revisions left for every touched brick? `next_revision` is
+        // the first revision to hand out and must itself advance after every
+        // assignment. Check that final advance before removing or modifying a
+        // brick, so exhaustion leaves the entire volume intact.
         let needed = by_brick.len() as u64;
-        if needed > 0 && self.next_revision().get().checked_add(needed - 1).is_none() {
+        if needed > 0 && self.next_revision().get().checked_add(needed).is_none() {
             return Err(EditError::RevisionExhausted);
         }
 
         let mut records = Vec::with_capacity(by_brick.len());
-        for ((x, y, z), writes) in by_brick {
+        let mut ordered_writes: Vec<_> = by_brick.into_iter().collect();
+        ordered_writes.sort_by_key(|((x, y, z), _)| (*z, *y, *x));
+        for ((x, y, z), writes) in ordered_writes {
             let coord = BrickCoord::new(x, y, z);
 
             let (mut brick, existed_before) = match self.take_resident(coord) {
@@ -291,5 +295,44 @@ mod tests {
             v.apply_edit(&plan),
             Err(EditError::OutOfBounds { .. })
         ));
+    }
+
+    #[test]
+    fn exhausted_revision_counter_rejects_without_removing_a_resident_brick() {
+        let mut v = vol();
+        let coord = BrickCoord::new(0, 0, 0);
+        v.insert_brick(coord, Brick::uniform(MaterialId(7), Revision(12)))
+            .unwrap();
+        v.set_next_revision_for_test(Revision(u64::MAX));
+
+        let mut plan = EditPlan::new(v.id());
+        plan.set(GlobalCell::new(0, 0, 0), MaterialId(3));
+        assert_eq!(v.apply_edit(&plan), Err(EditError::RevisionExhausted));
+
+        assert_eq!(v.brick_revision(coord).unwrap(), Some(Revision(12)));
+        assert_eq!(
+            v.sample(GlobalCell::new(0, 0, 0)).unwrap(),
+            Sample::Filled(MaterialId(7))
+        );
+    }
+
+    #[test]
+    fn outcome_records_use_documented_zyx_canonical_order() {
+        let mut v = vol();
+        let mut plan = EditPlan::new(v.id());
+        // BTreeMap's native tuple order would put the second write first
+        // because x=0. Canonical transaction order is (z, y, x).
+        plan.set(GlobalCell::new(32, 0, 0), MaterialId(1));
+        plan.set(GlobalCell::new(0, 0, 32), MaterialId(2));
+
+        let outcome = v.apply_edit(&plan).unwrap();
+        assert_eq!(
+            outcome
+                .bricks
+                .iter()
+                .map(|record| record.coord)
+                .collect::<Vec<_>>(),
+            vec![BrickCoord::new(1, 0, 0), BrickCoord::new(0, 0, 1)]
+        );
     }
 }

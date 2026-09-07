@@ -188,6 +188,11 @@ impl Volume {
         Ok(value)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_next_revision_for_test(&mut self, revision: Revision) {
+        self.next_revision = revision;
+    }
+
     /// Full state of the brick that owns `coord`.
     pub fn brick_state(&self, coord: BrickCoord) -> Result<BrickState, AccessError> {
         self.check_bounds(coord)?;
