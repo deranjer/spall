@@ -1,3 +1,4 @@
+mod netcheck;
 mod process;
 
 use clap::{Args, Parser, Subcommand};
@@ -26,9 +27,12 @@ enum CommandKind {
     Check,
     /// Build sandbox binaries and supervise one bounded GPU-free server.
     Smoke(SmokeArgs),
-    /// Planned for T09+.
+    /// T09 transport harness: one QUIC server, N headless clients, an opt UDP
+    /// loss proxy, every channel exercised, bounded teardown.
+    NetCheck(netcheck::NetCheckArgs),
+    /// Planned for T10+ (needs replication + scenario fixtures).
     Session(UnavailableArgs),
-    /// Planned for T09+.
+    /// Planned for T10+ (needs replication + scenario fixtures).
     Scenario(UnavailableArgs),
     /// Planned for T05+ and requires a supported GPU.
     Capture(UnavailableArgs),
@@ -73,6 +77,8 @@ enum XtaskError {
     },
     #[error(transparent)]
     Process(#[from] ProcessFailure),
+    #[error(transparent)]
+    Jsonl(#[from] spall_core::JsonlError),
     #[error("graphical capability unavailable: {0}")]
     Capability(String),
 }
@@ -106,8 +112,11 @@ fn run(cli: Cli) -> Result<(), XtaskError> {
     match cli.command {
         CommandKind::Check => check(),
         CommandKind::Smoke(args) => smoke(args),
-        CommandKind::Session(_) => unavailable("session", "T09 transport and T10 replication"),
-        CommandKind::Scenario(_) => unavailable("scenario", "T09 transport and scenario fixtures"),
+        CommandKind::NetCheck(args) => netcheck::run(args, unique_output),
+        CommandKind::Session(_) => unavailable("session", "T10 replication and scenario fixtures"),
+        CommandKind::Scenario(_) => {
+            unavailable("scenario", "T10 replication and scenario fixtures")
+        }
         CommandKind::Capture(_) => unavailable("capture", "T05 renderer capture"),
         CommandKind::Bench(_) => unavailable("bench", "G1/G2 measurement work"),
         CommandKind::CrashTest(_) => unavailable("crash-test", "T16 persistence"),
