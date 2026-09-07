@@ -9,12 +9,22 @@
 //! sampling keeps *absent*, *failed*, *empty*, and *filled* distinct.
 //! [`edit::EditPlan`] / [`volume::Volume::apply_edit`] provide transactional
 //! copy-on-write edits with before/after revision and content-hash records and
-//! modified-air tombstones. T02 is the storage mechanism only — no server loop
-//! drives it yet.
+//! modified-air tombstones.
+//!
+//! T03 adds read-side queries and brush plans on top of that storage:
+//! [`query`] — a 3D DDA ray traversal over a volume, in local cell space or
+//! against a rigidly [`transform`]ed volume; [`brush`] — deterministic box and
+//! integer-sphere [`EditPlan`] generators; and [`fixtures`] — small,
+//! digest-pinned terrain / structure volumes reused by later tasks. No server
+//! loop drives any of this yet.
 
 pub mod accounting;
 pub mod brick;
+pub mod brush;
 pub mod edit;
+pub mod fixtures;
+pub mod query;
+pub mod transform;
 pub mod volume;
 
 #[cfg(any(test, feature = "oracle"))]
@@ -26,4 +36,8 @@ mod random_parity;
 pub use accounting::MemoryReport;
 pub use brick::{Brick, BrickHash, BrickSnapshot, DENSE_LAYER_BYTES, LayerKind};
 pub use edit::{BrickRevisionRecord, CellEdit, EditError, EditOutcome, EditPlan};
+pub use query::{
+    Face, MissReason, Ray, RayConfig, RayError, RayHit, RayOutcome, cast_ray, cast_ray_world,
+};
+pub use transform::RigidXform;
 pub use volume::{AccessError, BrickBounds, BrickState, Residency, Sample, Volume};
