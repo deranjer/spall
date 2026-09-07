@@ -728,6 +728,34 @@ fn boundary_dependency_states_invalidate_when_their_meaning_changes() {
         }
     ));
 
+    // A resident uniform-air neighbour is a distinct read state: a later edit
+    // can turn it into a support path, so its revision must be in the token.
+    let mut empty = terrain();
+    fill(
+        &mut empty,
+        GlobalCell::new(31, 10, 0),
+        GlobalCell::new(31, 10, 0),
+        STONE,
+    );
+    empty
+        .insert_brick(
+            boundary,
+            spall_voxel::Brick::uniform(MaterialId::AIR, Revision(6)),
+        )
+        .unwrap();
+    let empty_index = build(&empty, 0);
+    let mut empty_world = world_for(&empty, Generation(1), TopologyEpoch::START);
+    assert_eq!(empty_index.validate(&empty_world), Staleness::Fresh);
+    empty_world.set_brick(empty.id(), boundary, Revision(9));
+    assert!(matches!(
+        empty_index.validate(&empty_world),
+        Staleness::BrickRevision {
+            expected: spall_jobs::DepState::Revision(Revision(6)),
+            current: spall_jobs::BrickStatus::Resident(Revision(9)),
+            ..
+        }
+    ));
+
     // Failed is a distinct state: it leaves the component Unknown, remains
     // valid while the same failure persists, and becomes stale after a retry.
     let mut failed = terrain();
