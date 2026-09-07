@@ -342,22 +342,38 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
             // Drain everything the clients have sent since the last tick.
             let mut repairs: Vec<(SessionId, RepairRequest)> = Vec::new();
+            let mut saw_client_work = false;
             while let Ok(msg) = inbound_rx.try_recv() {
                 match msg {
                     Inbound::Action(session, req) => {
-                        if let Some(intent) = intent_from_request(session, &req) {
-                            let _ = sim.submit(intent);
-                        } else {
-                            reject(
-                                &clients_for_sim,
-                                session,
-                                req.request_id,
-                                "unsupported target",
-                            );
-                            rejected_total += 1;
+                        saw_client_work = true;
+                        match intent_from_request(session, &req) {
+                            Some(intent) => {
+                                if let Err(e) = sim.submit(intent) {
+                                    reject(
+                                        &clients_for_sim,
+                                        session,
+                                        req.request_id,
+                                        &e.to_string(),
+                                    );
+                                    rejected_total += 1;
+                                }
+                            }
+                            None => {
+                                reject(
+                                    &clients_for_sim,
+                                    session,
+                                    req.request_id,
+                                    "unsupported target",
+                                );
+                                rejected_total += 1;
+                            }
                         }
                     }
-                    Inbound::Repair(session, req) => repairs.push((session, req)),
+                    Inbound::Repair(session, req) => {
+                        saw_client_work = true;
+                        repairs.push((session, req));
+                    }
                     Inbound::Gone => {}
                 }
             }
@@ -394,7 +410,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
-            if sim.is_idle() {
+            // Quiesce only after the pipeline is drained *and* no client has
+            // sent anything for `quiescence` ticks — a late scripted action from
+            // one client keeps the run alive for the others.
+            if sim.is_idle() && !saw_client_work && report.committed.is_empty() {
                 idle_streak += 1;
             } else {
                 idle_streak = 0;

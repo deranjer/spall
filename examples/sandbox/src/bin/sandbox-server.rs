@@ -6,9 +6,11 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 #[derive(Debug, Parser)]
 #[command(name = "sandbox-server", about = "GPU-free Spall sandbox server host")]
 struct Args {
-    #[arg(long)]
+    /// Reserved for the T16 on-disk world; unused by the T00 loop and the T10
+    /// built-in scene.
+    #[arg(long, default_value = ".local/worlds/dev")]
     world: PathBuf,
-    #[arg(long)]
+    #[arg(long, default_value_t = 0)]
     seed: u64,
     #[arg(long)]
     listen: SocketAddr,

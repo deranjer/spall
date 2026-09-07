@@ -209,6 +209,34 @@ mask — used by the coarse-fracture fallback) and
 `PhysicsWorld::set_body_pose` / `set_body_velocity` (spawn a split child at its
 parent's transform and inherited velocity).
 
+## T10 — replica transactions and motion (verified 2026-09-07)
+
+**No new external dependency.** The T10 crates only add workspace-internal path
+edges and reuse already-locked crates:
+
+- `spall_sim` gains a `replication` module (no new deps).
+- `spall_client` adds path deps `spall_protocol`, `spall_net`, `spall_voxel`
+  and enables `tokio` (`rt`, `rt-multi-thread`, `net`, `time`, `sync`, `macros`)
+  + `serde` / `serde_json` for the headless replication client and its JSON
+  summary. `spall_sim` is a **dev-dependency** only (the phase-B acceptance test
+  drives a real authoritative `Simulation`; it is not a runtime edge in the
+  `docs/architecture.md` graph). A `[dev-dependencies]` cycle
+  `spall_client -> spall_sim -> ... -> spall_client`? No: `spall_sim` does not
+  depend on `spall_client`.
+- `spall_server` adds path deps `spall_protocol`, `spall_net`, `spall_sim`,
+  `spall_voxel` and the same `tokio` feature set, plus `serde` / `serde_json` /
+  `tracing`. `spall_client` is a **dev-dependency** for the in-process
+  server↔client session test.
+- `examples/sandbox` adds a non-optional `spall_net` path dep so
+  `sandbox-server --serve` / `sandbox-client --connect` can read per-run
+  credential files.
+- `tools/xtask` adds no dep: `cargo xtask session` / `scenario` reuse the
+  already-present `spall_net` (`UdpProxy`), `tokio`, and `serde_json`.
+
+`Cargo.lock` gains only the new package nodes; every external version is
+unchanged from T06 (`rapier3d` stack) and T09 (`quinn` / `rustls` / `tokio`
+stack).
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,

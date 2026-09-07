@@ -1,0 +1,11 @@
+{
+  "name": "destruction-network",
+  "description": "Two headless clients. Client 0 fires two overlapping cuts on the load-bearing column in the same tick (concurrent contention on one region); client 1 excavates a separate floor brick. Run with --loss-percent to drop/reorder encrypted packets. All clients and the server must converge to one topology hash.",
+  "server_ticks": 300,
+  "clients": 2,
+  "cuts": [
+    { "client": 0, "at_tick": 4, "cell": [10, 4, 1], "radius": 2 },
+    { "client": 0, "at_tick": 4, "cell": [11, 5, 2], "radius": 2 },
+    { "client": 1, "at_tick": 8, "cell": [3, 1, 1],  "radius": 1 }
+  ]
+}

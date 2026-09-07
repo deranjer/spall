@@ -1,5 +1,6 @@
 mod netcheck;
 mod process;
+mod session;
 
 use clap::{Args, Parser, Subcommand};
 use process::{ProcessFailure, wait_for_server};
@@ -30,10 +31,12 @@ enum CommandKind {
     /// T09 transport harness: one QUIC server, N headless clients, an opt UDP
     /// loss proxy, every channel exercised, bounded teardown.
     NetCheck(netcheck::NetCheckArgs),
-    /// Planned for T10+ (needs replication + scenario fixtures).
-    Session(UnavailableArgs),
-    /// Planned for T10+ (needs replication + scenario fixtures).
-    Scenario(UnavailableArgs),
+    /// T10 replication harness: one `sandbox-server --serve`, N
+    /// `sandbox-client --connect`, real QUIC, converge-to-one-hash check.
+    Session(session::SessionArgs),
+    /// T10 replication harness against a named built-in scenario
+    /// (`fixtures/scenarios/<name>.json`).
+    Scenario(session::ScenarioArgs),
     /// Planned for T05+ and requires a supported GPU.
     Capture(UnavailableArgs),
     /// Planned for later performance gates.
@@ -113,10 +116,8 @@ fn run(cli: Cli) -> Result<(), XtaskError> {
         CommandKind::Check => check(),
         CommandKind::Smoke(args) => smoke(args),
         CommandKind::NetCheck(args) => netcheck::run(args, unique_output),
-        CommandKind::Session(_) => unavailable("session", "T10 replication and scenario fixtures"),
-        CommandKind::Scenario(_) => {
-            unavailable("scenario", "T10 replication and scenario fixtures")
-        }
+        CommandKind::Session(args) => session::run_session(args, || unique_run_dir("session")),
+        CommandKind::Scenario(args) => session::run_scenario(args, || unique_run_dir("scenario")),
         CommandKind::Capture(_) => unavailable("capture", "T05 renderer capture"),
         CommandKind::Bench(_) => unavailable("bench", "G1/G2 measurement work"),
         CommandKind::CrashTest(_) => unavailable("crash-test", "T16 persistence"),
@@ -328,13 +329,17 @@ fn sandbox_binary(name: &str) -> PathBuf {
 }
 
 fn unique_output() -> PathBuf {
+    unique_run_dir("smoke")
+}
+
+fn unique_run_dir(prefix: &str) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock precedes Unix epoch")
         .as_millis();
     workspace_root()
         .join(".local/runs")
-        .join(format!("smoke-{millis}-{}", std::process::id()))
+        .join(format!("{prefix}-{millis}-{}", std::process::id()))
 }
 
 fn write_summary(output: &Path, summary: &SmokeSummary<'_>) -> Result<(), XtaskError> {

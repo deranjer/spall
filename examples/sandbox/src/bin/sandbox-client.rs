@@ -36,6 +36,10 @@ struct Args {
     /// Scripted cut: `TICK:X,Y,Z:RADIUS` in terrain cell coordinates. Repeatable.
     #[arg(long = "cut", value_parser = parse_cut)]
     cuts: Vec<Cut>,
+    /// This client's index in a multi-client session; namespaces request ids so
+    /// two clients never collide on the server's idempotency ledger.
+    #[arg(long, default_value_t = 0)]
+    client_index: u64,
     /// Stop once the observed server tick reaches this (0 = only on close).
     #[arg(long, default_value_t = 0)]
     run_ticks: u64,
@@ -133,13 +137,14 @@ fn run_replication(args: Args) -> ExitCode {
         }
     };
 
+    let id_base = (args.client_index << 40) | 1;
     let script: Vec<ScriptedAction> = args
         .cuts
         .iter()
         .enumerate()
         .map(|(i, c)| ScriptedAction {
             at_tick: c.tick,
-            request: cut_request(i as u64 + 1, i as u64, c.cell, c.radius),
+            request: cut_request(id_base + i as u64, i as u64, c.cell, c.radius),
         })
         .collect();
 
