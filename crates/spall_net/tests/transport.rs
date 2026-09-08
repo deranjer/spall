@@ -682,3 +682,159 @@ async fn decoded_records_exercise_application_faults_independently_of_quic() {
     client.close("done");
     server.close();
 }
+
+/// Short timers for exercising the idle watchdog without a multi-second wait.
+fn watchdog_probe_cfg() -> TransportConfig {
+    let mut cfg = TransportConfig::for_tests();
+    cfg.idle_timeout = Duration::from_secs(2);
+    cfg.heartbeat_interval = Duration::from_millis(100);
+    cfg.keep_alive_interval = Duration::from_millis(500);
+    cfg
+}
+
+fn input_datagram(
+    session: spall_net::spall_protocol::SessionId,
+    seq: u64,
+) -> spall_net::spall_protocol::InputFrame {
+    spall_net::spall_protocol::InputFrame {
+        session,
+        player: spall_core::EntityId::new(1).unwrap(),
+        input_seq: spall_net::spall_protocol::InputSeq(seq),
+        intended_tick: spall_core::Tick(seq),
+        movement: [0.0; 3],
+        view_dir: [0.0, 0.0, 1.0],
+        buttons: 0,
+        recent: vec![],
+    }
+}
+
+/// ENG-53: a peer that keeps sending valid input datagrams but stops its control
+/// heartbeat must still trip the idle watchdog. Datagrams refresh `last_seen`
+/// but not the control-only stamp `run_liveness` checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn datagram_flood_without_control_heartbeats_still_times_out() {
+    let cfg = watchdog_probe_cfg();
+    let (server, accepted, client) = pair(cfg, cfg).await;
+    let start = std::time::Instant::now();
+    let accepted = Arc::new(accepted);
+    let session = accepted.session();
+
+    // The server drains datagrams (so each valid one calls `touch()`) and runs
+    // the watchdog. It never receives a control record or heartbeat.
+    let drain = {
+        let c = accepted.clone();
+        tokio::spawn(async move { while let Ok(Some(_)) = c.recv_datagram().await {} })
+    };
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let watchdog = tokio::spawn(accepted.clone().run_liveness(stop_rx));
+
+    // The client sends only datagrams -- never a control record or heartbeat.
+    let flood = tokio::spawn(async move {
+        let mut seq = 0u64;
+        while client
+            .send_datagram(seq, &input_datagram(session, seq))
+            .await
+            .is_ok()
+        {
+            seq += 1;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(6), watchdog)
+        .await
+        .expect("the idle watchdog closed the connection")
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(!accepted.is_alive(), "idle watchdog closed the connection");
+    assert!(
+        accepted.stats().datagrams_recv > 0,
+        "datagrams really were flowing while the control stream stayed silent"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "not closed before idle_timeout: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "closed at roughly idle_timeout, not far later: {elapsed:?}"
+    );
+
+    flood.abort();
+    drain.abort();
+    server.close();
+}
+
+/// ENG-53: with a normal control heartbeat on both ends, the same datagram flood
+/// leaves the connection healthy well past `idle_timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_heartbeats_keep_the_connection_alive_under_datagram_flood() {
+    let cfg = watchdog_probe_cfg();
+    let (server, accepted, client) = pair(cfg, cfg).await;
+    let accepted = Arc::new(accepted);
+    let client = Arc::new(client);
+    let session = accepted.session();
+
+    // Both ends run the watchdog (so both send heartbeats) and consume the
+    // control stream (so those heartbeats are read and refresh the stamp).
+    let (_stop_s, rx_s) = tokio::sync::watch::channel(false);
+    let (_stop_c, rx_c) = tokio::sync::watch::channel(false);
+    let live_s = tokio::spawn(accepted.clone().run_liveness(rx_s));
+    let _live_c = tokio::spawn(client.clone().run_liveness(rx_c));
+    let _rd_s = {
+        let c = accepted.clone();
+        tokio::spawn(async move {
+            let _ = c.recv_record().await;
+        })
+    };
+    let _rd_c = {
+        let c = client.clone();
+        tokio::spawn(async move {
+            let _ = c.recv_record().await;
+        })
+    };
+    let _drain = {
+        let c = accepted.clone();
+        tokio::spawn(async move { while let Ok(Some(_)) = c.recv_datagram().await {} })
+    };
+
+    let flood = {
+        let c = client.clone();
+        tokio::spawn(async move {
+            let mut seq = 0u64;
+            while c
+                .send_datagram(seq, &input_datagram(session, seq))
+                .await
+                .is_ok()
+            {
+                seq += 1;
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+    };
+
+    // Twice the idle timeout with nothing but datagrams + heartbeats.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    assert!(
+        accepted.is_alive(),
+        "control heartbeats kept the server side alive"
+    );
+    assert!(
+        client.is_alive(),
+        "control heartbeats kept the client side alive"
+    );
+    assert!(
+        !live_s.is_finished(),
+        "the server watchdog is still running past idle_timeout"
+    );
+    assert!(
+        accepted.stats().datagrams_recv > 0,
+        "datagrams were flowing throughout"
+    );
+
+    flood.abort();
+    client.close("done");
+    server.close();
+}
