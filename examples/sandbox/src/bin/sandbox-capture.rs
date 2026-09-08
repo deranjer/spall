@@ -84,7 +84,18 @@ fn view_dir() -> Vec3 {
     Vec3::new(0.8, 0.55, 1.0)
 }
 
-fn build_scene(shape: &AcceptanceShape, strategy: MeshStrategy) -> (Scene, spall_mesh::MeshStats) {
+/// Viewport aspect (width / height) for the requested capture size. The render
+/// target is filled with whatever `--width`/`--height` ask for, so the camera
+/// projection has to match or the PNG is geometrically distorted.
+fn capture_aspect(width: u32, height: u32) -> f32 {
+    width.max(1) as f32 / height.max(1) as f32
+}
+
+fn build_scene(
+    shape: &AcceptanceShape,
+    strategy: MeshStrategy,
+    aspect: f32,
+) -> (Scene, spall_mesh::MeshStats) {
     let vm = mesh_shape(&shape.volume, strategy);
     let stats = vm.stats;
 
@@ -99,7 +110,7 @@ fn build_scene(shape: &AcceptanceShape, strategy: MeshStrategy) -> (Scene, spall
     let model = Mat4::from_translation(centre) * rot * Mat4::from_translation(-centre);
 
     let mut scene = Scene::new(spall_render::Camera {
-        aspect: 16.0 / 9.0,
+        aspect,
         fov_y: 55_f32.to_radians(),
         ..Default::default()
     });
@@ -142,10 +153,11 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
         ..Default::default()
     };
 
+    let aspect = capture_aspect(args.width, args.height);
     let mut summaries = Vec::new();
     let (mut adapter, mut backend) = (String::new(), String::new());
     for shape in &shapes {
-        let (scene, stats) = build_scene(shape, strategy);
+        let (scene, stats) = build_scene(shape, strategy, aspect);
         let out_dir = args.out.join(shape.name);
         let report = capture_scene(&ctx, &scene, &out_dir, &opts)?;
         adapter = report.adapter.clone();
@@ -227,6 +239,108 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("sandbox-capture: {error}");
             ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::Vec3;
+    use spall_render::Camera;
+
+    /// Project a world point to pixel coordinates for a `width`x`height` target.
+    fn to_pixels(cam: &Camera, width: u32, height: u32, p: Vec3) -> (f32, f32) {
+        let clip = cam.view_projection() * p.extend(1.0);
+        let ndc = clip.truncate() / clip.w;
+        let px = (ndc.x * 0.5 + 0.5) * width as f32;
+        let py = (1.0 - (ndc.y * 0.5 + 0.5)) * height as f32;
+        (px, py)
+    }
+
+    /// Ratio of the on-screen pixel length of equal world-space steps along the
+    /// camera's right and up axes. A geometrically faithful capture renders a
+    /// world-space square as a pixel square, so this is ~1.0.
+    fn right_over_up_pixel_ratio(width: u32, height: u32, aspect: f32) -> f32 {
+        let shapes = acceptance_shapes();
+        let cube = shapes
+            .iter()
+            .find(|s| s.name == "cube")
+            .expect("cube shape");
+        let (scene, _) = build_scene(cube, MeshStrategy::Greedy, aspect);
+        let cam = &scene.camera;
+        let bounds = scene.world_bounds().expect("framed bounds");
+        let centre = (bounds.min + bounds.max) * 0.5;
+        let step = ((bounds.max - bounds.min) * 0.5).length() * 0.25;
+
+        let origin = to_pixels(cam, width, height, centre);
+        let right = to_pixels(cam, width, height, centre + cam.right() * step);
+        let up = to_pixels(cam, width, height, centre + cam.up() * step);
+        let dx = (right.0 - origin.0).hypot(right.1 - origin.1);
+        let dy = (up.0 - origin.0).hypot(up.1 - origin.1);
+        dx / dy
+    }
+
+    #[test]
+    fn capture_aspect_follows_the_requested_dimensions() {
+        assert!((capture_aspect(1280, 720) - 16.0 / 9.0).abs() < 1e-6);
+        assert!((capture_aspect(240, 240) - 1.0).abs() < 1e-6);
+        assert!((capture_aspect(320, 240) - 4.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn square_target_keeps_world_proportions() {
+        let ratio = right_over_up_pixel_ratio(240, 240, capture_aspect(240, 240));
+        assert!(
+            (ratio - 1.0).abs() < 0.03,
+            "square capture distorted, right/up pixel ratio {ratio}"
+        );
+    }
+
+    #[test]
+    fn four_by_three_target_keeps_world_proportions() {
+        let ratio = right_over_up_pixel_ratio(320, 240, capture_aspect(320, 240));
+        assert!(
+            (ratio - 1.0).abs() < 0.03,
+            "4:3 capture distorted, right/up pixel ratio {ratio}"
+        );
+    }
+
+    #[test]
+    fn a_fixed_16_9_projection_distorts_a_4_3_target() {
+        // Regression witness: the old hard-coded `aspect: 16.0 / 9.0` squashes a
+        // 4:3 capture horizontally to (4/3) / (16/9) = 0.75 of its true width.
+        let ratio = right_over_up_pixel_ratio(320, 240, 16.0 / 9.0);
+        assert!(
+            (ratio - 0.75).abs() < 0.03,
+            "expected the mismatched projection to squash to ~0.75, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn the_framed_shape_stays_inside_the_view() {
+        for (w, h) in [(240u32, 240u32), (320, 240), (240, 320)] {
+            let shapes = acceptance_shapes();
+            let cube = shapes.iter().find(|s| s.name == "cube").unwrap();
+            let (scene, _) = build_scene(cube, MeshStrategy::Greedy, capture_aspect(w, h));
+            let cam = &scene.camera;
+            let item = &scene.items[0];
+            let (mut max_x, mut max_y) = (0.0f32, 0.0f32);
+            for v in &item.mesh.vertices {
+                let world = item.model.transform_point3(Vec3::from_array(v.position));
+                let clip = cam.view_projection() * world.extend(1.0);
+                let ndc = clip.truncate() / clip.w;
+                max_x = max_x.max(ndc.x.abs());
+                max_y = max_y.max(ndc.y.abs());
+            }
+            assert!(
+                max_x <= 1.0 && max_y <= 1.0,
+                "{w}x{h}: shape clipped, ndc extent ({max_x}, {max_y})"
+            );
+            assert!(
+                max_y > 0.5,
+                "{w}x{h}: shape not framed, ndc y extent {max_y}"
+            );
         }
     }
 }
