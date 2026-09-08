@@ -72,6 +72,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         seed: 0,
         catch_up_cap: DEFAULT_CATCH_UP_CAP,
         max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
+        save_faults: None,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 
