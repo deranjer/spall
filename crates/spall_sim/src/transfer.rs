@@ -22,8 +22,19 @@ use spall_structure::ComponentMembership;
 use spall_voxel::{Brick, EditPlan, Sample, Volume};
 
 use crate::body::BodyPose;
-use crate::collider::{ColliderPlan, plan_collider};
+use crate::collider::{ColliderInfeasible, ColliderPlan, plan_collider};
 use crate::intent::ExplosionImpulse;
+
+/// Why [`plan_child`] could not produce an installable child body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PlanChildError {
+    /// The child volume's occupancy could not be extracted.
+    #[error(transparent)]
+    Occupancy(#[from] spall_physics::ExtractError),
+    /// The child is too fragmented / large for an exact active collider.
+    #[error(transparent)]
+    Collider(#[from] ColliderInfeasible),
+}
 
 /// The parent's kinematic state at the split instant, in world space.
 #[derive(Debug, Clone, Copy)]
@@ -115,7 +126,7 @@ pub fn plan_child(
     child_id: VolumeId,
     density: &impl Fn(MaterialId) -> f64,
     collider_region_pad_cells: i64,
-) -> Result<ChildBody, spall_physics::ExtractError> {
+) -> Result<ChildBody, PlanChildError> {
     let volume = build_child_volume(parent_volume, membership, child_id);
     let grid =
         OccupancyGrid::from_volume(&volume)?.expect("a split component always has a solid cell");
@@ -145,7 +156,7 @@ pub fn plan_child(
     // The child body reproduces the parent's transform exactly.
     let pose = BodyPose::new(q, parent.pose.translation_m);
 
-    let collider_plan = plan_collider(&grid);
+    let collider_plan = plan_collider(&grid)?;
     let region = padded_region(&grid, collider_region_pad_cells);
 
     Ok(ChildBody {
