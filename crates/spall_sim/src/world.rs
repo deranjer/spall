@@ -16,6 +16,7 @@ use spall_core::{
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
     BodyKind as PhysBodyKind, BodySpec, OccupancyGrid, PhysicsConfig, PhysicsWorld,
+    analytic_mass_properties,
 };
 use spall_protocol::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
@@ -46,6 +47,8 @@ pub enum WorldError {
     Ids(#[from] spall_core::IdError),
     #[error("occupancy extraction failed: {0}")]
     Occupancy(#[from] spall_physics::ExtractError),
+    #[error("no exact active collider for the body: {0}")]
+    Collider(#[from] crate::collider::ColliderInfeasible),
     #[error("edit during replay failed: {0}")]
     Edit(#[from] spall_voxel::EditError),
 }
@@ -120,7 +123,7 @@ impl SimWorld {
         let terrain_volume_id = registry.allocate_volume()?; // volume 1 == terrain
 
         let grid = OccupancyGrid::from_volume(&setup.terrain)?.ok_or(WorldError::EmptyTerrain)?;
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         let cell_m = setup.terrain.cell_size().metres() as f32;
 
         let mut physics = PhysicsWorld::new(setup.physics);
@@ -130,6 +133,8 @@ impl SimWorld {
             grid: plan.grid,
             cell_m,
             density_kg_m3: 1.0,
+            // Terrain is immovable: mass properties never enter the solver.
+            mass_properties: None,
             translation_m: grid_origin_translation(&grid, cell_m),
             linvel_m_s: [0.0; 3],
         });
@@ -311,8 +316,14 @@ impl SimWorld {
         let volume = build(volume_id);
 
         let grid = OccupancyGrid::from_volume(&volume)?.ok_or(WorldError::EmptyBody)?;
-        let plan = plan_collider(&grid);
-        let cell_m = volume.cell_size().metres() as f32;
+        let plan = plan_collider(&grid)?;
+        let cell_size_m = volume.cell_size().metres();
+        let cell_m = cell_size_m as f32;
+        // Mass / COM / inertia from the exact fine grid at the requested bulk
+        // density, so a coarsened collision shape cannot inflate the mass.
+        let mass_properties =
+            analytic_mass_properties(&grid, cell_size_m, |_| f64::from(density_kg_m3))
+                .to_body_properties();
         let trans = [
             pose.translation_m[0] as f32,
             pose.translation_m[1] as f32,
@@ -329,6 +340,7 @@ impl SimWorld {
             grid: plan.grid.clone(),
             cell_m,
             density_kg_m3: density_kg_m3.max(f32::MIN_POSITIVE),
+            mass_properties: Some(mass_properties),
             translation_m: trans,
             linvel_m_s: linvel,
         });
@@ -408,8 +420,14 @@ impl SimWorld {
     /// replication/journalling until then.
     pub fn insert_restored_body(&mut self, spec: RestoredBody) -> Result<EntityId, WorldError> {
         let grid = OccupancyGrid::from_volume(&spec.volume)?.ok_or(WorldError::EmptyBody)?;
-        let plan = plan_collider(&grid);
-        let cell_m = spec.volume.cell_size().metres() as f32;
+        let plan = plan_collider(&grid)?;
+        let cell_size_m = spec.volume.cell_size().metres();
+        let cell_m = cell_size_m as f32;
+        // Re-derive the exact mass properties from the persisted fine material
+        // grid, so a restored body carries the same mass / shifted COM / inertia
+        // it had before the save — never the collision shape's.
+        let mass_properties =
+            analytic_mass_properties(&grid, cell_size_m, |m| self.density(m)).to_body_properties();
         let trans = [
             spec.pose.translation_m[0] as f32,
             spec.pose.translation_m[1] as f32,
@@ -432,6 +450,7 @@ impl SimWorld {
             grid: plan.grid.clone(),
             cell_m,
             density_kg_m3: spec.density_kg_m3.max(f32::MIN_POSITIVE),
+            mass_properties: Some(mass_properties),
             translation_m: trans,
             linvel_m_s: linvel,
         });
@@ -648,12 +667,22 @@ impl SimWorld {
             return Err(WorldError::UnknownVolume(volume));
         };
         let phys = body.phys;
+        let is_dynamic = body.kind == BodyKind::Dynamic;
+        let cell_size_m = body.volume.cell_size().metres();
         let Some(grid) = OccupancyGrid::from_volume(&body.volume)? else {
             return Ok(());
         };
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         self.physics
             .rebuild_collider(phys, &plan.grid, plan.representation);
+        if is_dynamic {
+            // The geometry changed: reinstall mass / COM / inertia from the new
+            // fine material grid so the solver tracks it (and never the coarse
+            // collider).
+            let mass_properties = analytic_mass_properties(&grid, cell_size_m, |m| self.density(m))
+                .to_body_properties();
+            self.physics.set_mass_properties(phys, mass_properties);
+        }
         if let Some(body) = self.volume_body_mut(volume) {
             body.collider_revision += 1;
             body.coarsen_k = plan.coarsen_k;

@@ -33,13 +33,24 @@ CI runs the same scenarios at `--small` size as `spall_physics` tests, asserting
 behaviour only (settles, finite, interior preserved, mass/COM/inertia match,
 compound stops a 60 m/s CCD projectile).
 
+**Build / rebuild timing method (ENG-40).** Every build and rebuild figure below
+is the **complete** occupancy → collider cost, not the final-wrap sub-interval:
+the native path's solid-index extraction and allocation, the compound path's
+greedy decomposition over the whole grid and every per-part cuboid/isometry
+allocation, the Rapier shape construction, and — for a rebuild — the old
+collider's removal and the new collider's reinsertion under the body. The
+wrap-only component is retained (`ColliderBuild::wrap`,
+`RepresentationReport::multibrick_wrap`) and reported separately. The 64-brick
+build is sampled `build_iters` times (64 at gate size) for percentiles.
+
 | Metric | Native voxels | Merged cuboids |
 | --- | ---: | ---: |
 | 64-brick connected body (128³-cell region, hollow) — primitives | 1 | 6 |
-| … one-shot collider build | 15.1 ms | **7.8 µs** |
+| … complete occupancy→collider build, p50 / p99 (n=64) | 16.1 ms / 18.1 ms | **1.57 ms / 1.86 ms** |
+| … of which the final Rapier shape wrapping (p50) | 15.0 ms | 1.5 µs |
 | … estimated collider memory | ~8 MiB (dense upper bound) | ~0.6 KiB |
-| Collider rebuild after an edit (hollow tower), p50 / p99 | 224 µs / 229 µs | **1.5 µs / 2.5 µs** |
-| Debris settle (256 pieces on a floor), step time p95 / p99 | 3.70 ms / 6.41 ms | **0.13 ms / 0.18 ms** |
+| Collider rebuild after a bounded edit (hollow tower — remove + decompose + wrap + reinsert), p50 / p99 (n=60) | 224 µs / 241 µs | **6.1 µs / 8.1 µs** |
+| Debris settle (256 pieces on a floor), step time p95 / p99 | 3.81 ms / 6.97 ms | **0.13 ms / 0.18 ms** |
 | Debris settle — all pieces finite, at rest, asleep | yes | yes |
 | Editable-collider sleep/wake — settled asleep, woke on an in-place collider rebuild, re-slept, woke on a blast impulse, travelled ~1.7 m, left the floor and re-collided, re-slept, stable throughout | yes | yes |
 | Hollow building drop — settles, interior clearance kept | yes, 1.0 m | yes, 1.0 m |
@@ -73,10 +84,18 @@ the whole cycle. Both representations pass. CI asserts this at `--small` size in
 `spall_physics` builds **merged-cuboid compounds** for both static terrain and
 dynamic detached bodies. Rationale, in order of weight:
 
-1. **Editability.** A cut rebuilds the collider in ~1.5 µs versus ~224 µs, and a
-   fresh large body in ~8 µs versus ~15 ms. The authoritative edit path (T08)
-   rebuilds a body's collider on every accepted topology transaction; the
-   compound cost disappears into the tick, the voxel-shape cost does not.
+1. **Editability.** Measured as complete occupancy → collider cost (ENG-40): a
+   bounded edit rebuilds the compound collider in **~6.1 µs** versus **~224 µs**
+   for the voxel shape — ~37× faster — and a full fresh 64-brick body builds in
+   **~1.57 ms** versus **~16.1 ms** — ~10× faster, at ~10,000× less resident
+   geometry. The greedy decomposition itself dominates the compound build (the
+   Rapier wrapping is only ~1.5 µs of the 1.57 ms), so the compound's build edge
+   over the voxel shape is one order of magnitude, not the ~1900× the earlier
+   wrap-only figure implied; for the common case — a bounded edit over a body's
+   collider region — it is roughly two orders. The authoritative edit path (T08)
+   rebuilds a body's collider on every accepted topology transaction; ~6 µs
+   disappears into the 16.7 ms tick, ~224 µs is a far larger bite. The fresh
+   large-body build is a spawn-time cost, not a per-tick cost.
 2. **Continuous collision detection.** `parry`'s `Voxels` shape gained no CCD
    benefit in testing — a fast body tunnels a 0.5 m wall above ~20 m/s — whereas
    the cuboid compound stops a 220 m/s projectile. Fast damaging bodies (T19,
@@ -89,29 +108,84 @@ dynamic detached bodies. Rationale, in order of weight:
 Native concave triangle meshes for dynamic solids remain prohibited, per the
 architecture.
 
-## Known limitation and the coarse-fracture policy
+**Gate status (after the ENG-40 complete-timing re-measurement): pass, decision
+unchanged.** Correcting the build/rebuild timers to cover the whole occupancy →
+collider path shrinks the compound's build-cost advantage from ~1900× to ~10×
+(fresh body) and its rebuild advantage from ~150× to ~37× (bounded edit), and
+exposes the greedy decomposition (~1.57 ms for the 64-brick body) as the real
+compound build cost. Both figures still sit an order of magnitude under the
+voxel-shape path, the bounded-edit rebuild the tick actually runs is ~6 µs, and
+memory, per-step cost, CCD, and exact hollow interiors are all still decisively
+in the compound's favour. No acceptance scenario regressed.
+
+## Fragmented bodies: the exact active-collider policy (ENG-42)
 
 The greedy decomposition degenerates to **one box per cell** on highly
 fragmented occupancy: a 3-D checkerboard of 2048 isolated cells produces 2048
-compound parts. Thin diagonal filaments and single-voxel speckle do the same.
-Unbounded, this defeats the performance argument for a badly-shaped body.
+compound parts; thin diagonal filaments, single-voxel speckle, and fine
+lattices do the same. Unbounded, this defeats the performance argument for a
+badly-shaped body.
 
-Deterministic mitigation, to be enforced by `spall_sim` when it owns collider
-builds (T08) and measured at the scale gate:
+The **superseded** T08 mitigation was to OR-downsample the body's grid by an
+integer factor `k` (2, then 4) and re-inflate it — a coarse cell solid iff any
+covered fine cell is solid — and, if `k = 4` still overflowed, to "build it
+anyway". For an **active** body (terrain, dynamic solids: openings must block,
+deleted cells must stop colliding) this is inexact collision: it seals fine-grid
+air passages, keeps removed cells collidable, and — via "build it anyway" —
+never actually enforces the cap. That bypasses a failed feasibility gate with
+approximate topology, which the architecture forbids. **It has been removed.**
+There is no coarsen / OR-downsample / "build it anyway" path in
+`spall_sim::collider::plan_collider`.
 
-- **Primitive budget per body:** `B = 4096` merged boxes (provisional).
-- **When `greedy_boxes(grid).len() > B`:** build the collider from a
-  **coarsened** occupancy instead — downsample the body's own grid by an integer
-  factor `k` (2, then 4) where a coarse cell is solid iff **any** covered fine
-  cell is solid. This is conservative: it only ever *adds* collision volume
-  inside the body's own footprint, never removes gameplay matter, and the fine
-  voxel grid remains the authoritative geometry. Record `k` in the body's
-  collider revision so replication and persistence agree on what was built.
-- **Never** silently drop parts or fall back to a convex hull.
+The replacement is a **total deterministic exact policy** (a *representation*
+fallback — geometry is never approximated):
+
+- **Primitive budget per body:** `B = 4096` merged boxes (provisional). This now
+  selects the *representation*, never the geometry.
+- **`greedy_boxes(fine).len() <= B`** — build the merged-cuboid compound from the
+  exact fine grid (the common case; cheap rebuild, working CCD).
+- **`greedy_boxes(fine).len() > B`** — build the exact
+  `Representation::NativeVoxels` shape (`parry` `Voxels`) over the **identical
+  fine solid set**: one primitive, every air passage and every solid cell
+  preserved bit-for-bit. No coarsening, no inflation, no dropped mass. The cost
+  is a heavier collider rebuild and the weaker CCD of the voxel shape for that
+  one body.
+- **Feasibility ceiling for the native fallback:**
+  `MAX_ACTIVE_COLLIDER_CELLS = 1 << 17 = 131 072` fine cells (~50³). A full
+  native voxel collider rebuild scales ~linearly with total grid cells —
+  measured in release on a maximally fragmented connected lattice
+  (`spall_sim::collider::tests::sweep_native_rebuild_cost`):
+
+  | fine cells | greedy boxes | native full rebuild (release) |
+  | ---: | ---: | ---: |
+  | 13 824 (24³) | 3 457 | 0.55 ms |
+  | 32 768 (32³) | 8 193 | 1.3 ms |
+  | 110 592 (48³) | 27 649 | **4.5 ms** |
+  | 262 144 (64³) | 65 537 | 10.4 ms |
+  | 438 976 (76³) | 109 745 | 18.0 ms |
+  | 884 736 (96³) | 221 185 | 36.3 ms |
+
+  An active body rebuilds its whole collider on every accepted edit, so at the
+  ceiling a worst-case rebuild is ~5 ms — about a third of the 16.7 ms tick,
+  leaving room for structure analysis, the commit, and other bodies. A body that
+  is **both** over the primitive budget **and** larger than this ceiling has no
+  exact per-tick-editable representation; `plan_collider` returns
+  `ColliderInfeasible::TooLarge` and the spawn / commit / restore **fails**. The
+  feasibility gate stays *failed* rather than serving inexact collision.
+  Within-budget simple bodies (a solid slab is one greedy box) are unaffected by
+  the cell ceiling — the compound rebuild cost is bounded by the box count, not
+  the cell count.
+- **Never** silently drop parts, coarsen, inflate, or fall back to a convex hull.
+
+`coarsen_k` in the collider plan / persisted body is now always `1`; it is
+retained only so the save format is unchanged and can be dropped by a future
+revision.
 
 If a future workload shows fragmentation is common rather than pathological, the
-fallback to re-evaluate is `parry`'s incremental voxel edits (`Voxels`
-per-cell mutation) rather than a full voxel-shape rebuild — not measured here.
+next thing to evaluate is `parry`'s **incremental** voxel edits (`Voxels`
+per-cell mutation) so an active body's rebuild cost stops scaling with its whole
+cell count — which would let `MAX_ACTIVE_COLLIDER_CELLS` rise. Not implemented
+here.
 
 ## What this does not settle
 

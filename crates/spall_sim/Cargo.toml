@@ -29,6 +29,7 @@ scenario = ["dep:serde", "dep:serde_json"]
 [dev-dependencies]
 glam = { workspace = true }
 spall_core = { workspace = true }
+spall_physics = { workspace = true }
 spall_protocol = { workspace = true }
 spall_structure = { workspace = true, features = ["oracle"] }
 spall_voxel = { workspace = true, features = ["oracle"] }
