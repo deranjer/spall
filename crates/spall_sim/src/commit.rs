@@ -31,7 +31,7 @@
 
 use spall_core::{BrickCoord, MaterialId, Revision, Tick, VolumeId};
 use spall_jobs::Staleness;
-use spall_physics::{BodyKind as PhysBodyKind, BodySpec, OccupancyGrid};
+use spall_physics::{BodyKind as PhysBodyKind, BodySpec, OccupancyGrid, analytic_mass_properties};
 use spall_protocol::{
     ActionOutcome, ActionStatus, BrickRevision, CanonicalOwner, ControlSeq, InputSeq,
     MotionSnapshot, Record, RecordError, SnapshotSeq, TopologyOp, TopologyTransaction, TransferId,
@@ -92,12 +92,23 @@ pub enum CommitError {
     Edit(#[from] EditError),
     #[error("occupancy extraction failed: {0}")]
     Occupancy(#[from] spall_physics::ExtractError),
+    #[error("no exact active collider for the body: {0}")]
+    Collider(#[from] crate::collider::ColliderInfeasible),
     #[error("id space exhausted: {0}")]
     Ids(#[from] spall_core::IdError),
     #[error("emitted transaction DTO is invalid: {0}")]
     Record(#[from] RecordError),
     #[error("commit cannot be encoded for replication: {0}")]
     Replication(#[from] crate::replication::ReplicationError),
+}
+
+impl From<crate::transfer::PlanChildError> for CommitError {
+    fn from(e: crate::transfer::PlanChildError) -> Self {
+        match e {
+            crate::transfer::PlanChildError::Occupancy(x) => CommitError::Occupancy(x),
+            crate::transfer::PlanChildError::Collider(x) => CommitError::Collider(x),
+        }
+    }
 }
 
 /// Commits `staged` into `world`, appending a journal entry on success.
@@ -134,7 +145,16 @@ pub fn commit(
         }
     } else {
         let st = world.physics().body_state(parent_phys);
-        let (_, local_com, _) = world.physics().derived_mass_properties(parent_phys);
+        let (_, grid_local_com, _) = world.physics().derived_mass_properties(parent_phys);
+        // `derived_mass_properties` is in the collider shape's grid-local frame;
+        // shift it by the body-local grid-origin offset to get the body-frame
+        // centre of mass the world-space COM is built from (`ENG-55`).
+        let com_offset = world.physics().collider_offset_m(parent_phys);
+        let local_com = [
+            grid_local_com[0] + com_offset[0],
+            grid_local_com[1] + com_offset[1],
+            grid_local_com[2] + com_offset[2],
+        ];
         let pose = BodyPose::new(
             glam::DQuat::from_xyzw(
                 f64::from(st.rotation[0]),
@@ -215,9 +235,26 @@ pub fn commit(
         None
     };
 
-    // 7. Plan the parent collider rebuild from the candidate's final geometry.
-    let parent_rebuild =
-        OccupancyGrid::from_volume(&parent_candidate)?.map(|grid| plan_collider(&grid));
+    // 7. Plan the parent collider rebuild from the candidate's final geometry,
+    //    plus the mass / COM / inertia to reinstall from its post-cut fine
+    //    material grid (a dynamic parent lost mass to the cut / to its children;
+    //    a terrain parent has no solver mass) (`ENG-41`). A fragmented parent
+    //    with no exact active collider fails the commit here, before publish
+    //    (`ENG-42`).
+    let parent_rebuild = match OccupancyGrid::from_volume(&parent_candidate)? {
+        Some(grid) => {
+            let plan = plan_collider(&grid)?;
+            let mass_properties = (!parent_is_terrain).then(|| {
+                analytic_mass_properties(&grid, cell_size.metres(), |m| world.density(m))
+                    .to_body_properties()
+            });
+            Some((plan, mass_properties))
+        }
+        None => None,
+    };
+    // The cut cleared the parent's last solid cell: its ownership is retired on
+    // publish (`ENG-56`). A retired body emits no participant snapshot.
+    let parent_emptied = !parent_is_terrain && parent_rebuild.is_none();
 
     // 8. Reserve the transaction id and journal sequence.
     let transaction_id = reg.allocate_transaction()?;
@@ -314,6 +351,7 @@ pub fn commit(
     let participants = candidate_participant_snapshots(
         world,
         parent_is_terrain,
+        parent_emptied,
         parent_entity,
         &parent_candidate,
         &children,
@@ -329,25 +367,39 @@ pub fn commit(
         parent.volume = parent_candidate;
     }
 
-    if let Some(plan) = parent_rebuild {
-        world
-            .physics_mut()
-            .rebuild_collider(parent_phys, &plan.grid, plan.representation);
-        if let Some(parent) = world.volume_body_mut(vid) {
-            parent.collider_revision += 1;
-            parent.coarsen_k = plan.coarsen_k;
+    match parent_rebuild {
+        Some((plan, mass_properties)) => {
+            world
+                .physics_mut()
+                .rebuild_collider(parent_phys, &plan.grid, plan.representation);
+            if let Some(mass_properties) = mass_properties {
+                world
+                    .physics_mut()
+                    .set_mass_properties(parent_phys, mass_properties);
+            }
+            if let Some(parent) = world.volume_body_mut(vid) {
+                parent.collider_revision += 1;
+                parent.coarsen_k = plan.coarsen_k;
+            }
+        }
+        None => {
+            // The cut cleared the parent's last solid cell. Retire its
+            // ownership atomically with the edit (`ENG-56`): a detached body
+            // and its physics handle are removed; terrain loses its collider.
+            // Nothing keeps colliding with the obsolete solid shape, and the
+            // transaction's cell-removal ops already carry the emptying for
+            // replicas and for journal replay.
+            world.retire_empty_volume(vid);
         }
     }
 
+    // 8. Install every child body and its collider. Mass / COM / inertia come
+    //    from the child's fine material grid (`child.mass_properties`), installed
+    //    into the body independently of the collision shape, so coarse collider
+    //    inflation cannot change the physical mass.
     let mut child_entities = Vec::new();
     for child in children {
         let child_cell_m = child.volume.cell_size().metres() as f32;
-        let cube_m3 = f64::from(child_cell_m).powi(3);
-        let representative_density = if child.cell_count > 0 && cube_m3 > 0.0 {
-            (child.mass_kg / (child.cell_count as f64 * cube_m3)) as f32
-        } else {
-            1.0
-        };
         let rot = child.pose.rotation;
         let rot_xyzw = [rot.x as f32, rot.y as f32, rot.z as f32, rot.w as f32];
         let trans = child.pose.translation_m.map(|v| v as f32);
@@ -359,7 +411,8 @@ pub fn commit(
             representation: child.collider_plan.representation,
             grid: child.collider_plan.grid.clone(),
             cell_m: child_cell_m,
-            density_kg_m3: representative_density.max(f32::MIN_POSITIVE),
+            density_kg_m3: 1.0,
+            mass_properties: Some(child.mass_properties),
             translation_m: trans,
             linvel_m_s: linvel,
         });
@@ -411,6 +464,7 @@ pub fn commit(
 fn candidate_participant_snapshots(
     world: &SimWorld,
     parent_is_terrain: bool,
+    parent_emptied: bool,
     parent_entity: Option<spall_core::EntityId>,
     parent_candidate: &Volume,
     children: &[ChildBody],
@@ -418,7 +472,10 @@ fn candidate_participant_snapshots(
     journal_seq: spall_core::JournalSeq,
 ) -> Vec<MotionSnapshot> {
     let mut out = Vec::new();
+    // A parent whose last cell this transaction removed is retired on publish
+    // (`ENG-56`): it no longer exists, so it carries no motion snapshot.
     if !parent_is_terrain
+        && !parent_emptied
         && let Some(entity) = parent_entity
         && let Some(parent) = world.body(entity)
     {

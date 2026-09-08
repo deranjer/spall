@@ -47,6 +47,8 @@ pub enum WorldError {
     Ids(#[from] spall_core::IdError),
     #[error("occupancy extraction failed: {0}")]
     Occupancy(#[from] spall_physics::ExtractError),
+    #[error("no exact active collider for the body: {0}")]
+    Collider(#[from] crate::collider::ColliderInfeasible),
     #[error("edit during replay failed: {0}")]
     Edit(#[from] spall_voxel::EditError),
     #[error("journal replay precondition failed: {0}")]
@@ -125,7 +127,7 @@ impl SimWorld {
         let terrain_volume_id = registry.allocate_volume()?; // volume 1 == terrain
 
         let grid = OccupancyGrid::from_volume(&setup.terrain)?.ok_or(WorldError::EmptyTerrain)?;
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         let cell_m = setup.terrain.cell_size().metres() as f32;
 
         let mut physics = PhysicsWorld::new(setup.physics);
@@ -135,7 +137,12 @@ impl SimWorld {
             grid: plan.grid,
             cell_m,
             density_kg_m3: 1.0,
-            translation_m: grid_origin_translation(&grid, cell_m),
+            // Terrain is immovable: mass properties never enter the solver.
+            mass_properties: None,
+            // Identity pose: `PhysicsWorld` carries the tight grid's origin as a
+            // body-local collider offset, so the terrain body stays at the world
+            // origin like its `BodyPose::identity()` (`ENG-55`).
+            translation_m: [0.0; 3],
             linvel_m_s: [0.0; 3],
         });
 
@@ -316,8 +323,14 @@ impl SimWorld {
         let volume = build(volume_id);
 
         let grid = OccupancyGrid::from_volume(&volume)?.ok_or(WorldError::EmptyBody)?;
-        let plan = plan_collider(&grid);
-        let cell_m = volume.cell_size().metres() as f32;
+        let plan = plan_collider(&grid)?;
+        let cell_size_m = volume.cell_size().metres();
+        let cell_m = cell_size_m as f32;
+        // Mass / COM / inertia from the exact fine grid at the requested bulk
+        // density, so a coarsened collision shape cannot inflate the mass.
+        let mass_properties =
+            analytic_mass_properties(&grid, cell_size_m, |_| f64::from(density_kg_m3))
+                .to_body_properties();
         let trans = [
             pose.translation_m[0] as f32,
             pose.translation_m[1] as f32,
@@ -334,6 +347,7 @@ impl SimWorld {
             grid: plan.grid.clone(),
             cell_m,
             density_kg_m3: density_kg_m3.max(f32::MIN_POSITIVE),
+            mass_properties: Some(mass_properties),
             translation_m: trans,
             linvel_m_s: linvel,
         });
@@ -386,6 +400,31 @@ impl SimWorld {
         entity
     }
 
+    /// Retires the ownership of `volume` because its authoritative geometry
+    /// became empty (`ENG-56`), atomically with the edit that emptied it:
+    ///
+    /// * a **detached body** is dropped from the world — its physics rigid body
+    ///   and collider are removed, and it is no longer enumerable, targetable by
+    ///   a raycast, or published in a motion batch;
+    /// * **terrain** keeps its (now empty) record but loses its physical
+    ///   collider, so nothing rests on or tunnels the obsolete solid shape.
+    ///
+    /// Idempotent; a no-op for an unknown volume.
+    pub fn retire_empty_volume(&mut self, volume: VolumeId) {
+        if volume == self.terrain.volume_id {
+            self.physics.remove_collider(self.terrain.phys);
+            self.terrain.collider_revision += 1;
+            return;
+        }
+        let Some(&entity) = self.volume_owner.get(&volume.get()) else {
+            return;
+        };
+        if let Some(body) = self.bodies.remove(&entity) {
+            self.physics.retire_body(body.phys);
+        }
+        self.volume_owner.remove(&volume.get());
+    }
+
     // --- save recovery (T16) ------------------------------------------------
     //
     // These reinstate authoritative state from persisted records without
@@ -413,8 +452,14 @@ impl SimWorld {
     /// replication/journalling until then.
     pub fn insert_restored_body(&mut self, spec: RestoredBody) -> Result<EntityId, WorldError> {
         let grid = OccupancyGrid::from_volume(&spec.volume)?.ok_or(WorldError::EmptyBody)?;
-        let plan = plan_collider(&grid);
-        let cell_m = spec.volume.cell_size().metres() as f32;
+        let plan = plan_collider(&grid)?;
+        let cell_size_m = spec.volume.cell_size().metres();
+        let cell_m = cell_size_m as f32;
+        // Re-derive the exact mass properties from the persisted fine material
+        // grid, so a restored body carries the same mass / shifted COM / inertia
+        // it had before the save — never the collision shape's.
+        let mass_properties =
+            analytic_mass_properties(&grid, cell_size_m, |m| self.density(m)).to_body_properties();
         let trans = [
             spec.pose.translation_m[0] as f32,
             spec.pose.translation_m[1] as f32,
@@ -437,6 +482,7 @@ impl SimWorld {
             grid: plan.grid.clone(),
             cell_m,
             density_kg_m3: spec.density_kg_m3.max(f32::MIN_POSITIVE),
+            mass_properties: Some(mass_properties),
             translation_m: trans,
             linvel_m_s: linvel,
         });
@@ -680,7 +726,7 @@ impl SimWorld {
         }
         flush(self, group.take(), &mut touched, &mut new_children)?;
 
-        for vid in touched {
+        for &vid in &touched {
             self.rebuild_volume_collider(vid)?;
         }
 
@@ -702,6 +748,16 @@ impl SimWorld {
         }
 
         self.check_replay_results(tx)?;
+
+        // Retire any volume this transaction cleared to empty, now that its
+        // verified post-state has been checked against the record. This mirrors
+        // the live commit path so a recovered world has the same set of live
+        // bodies and colliders (`ENG-56`).
+        for vid in touched {
+            if self.volume_ref(vid).is_some_and(|v| solid_cells(v) == 0) {
+                self.retire_empty_volume(vid);
+            }
+        }
         Ok(())
     }
 
@@ -782,18 +838,30 @@ impl SimWorld {
     }
 
     /// Rebuilds one volume's collider from its current geometry (recovery and
-    /// post-replay). No-op if the volume has no solid cell left.
+    /// post-replay). No-op if the volume has no solid cell left — an emptied
+    /// volume is retired by [`Self::retire_empty_volume`] once the replay's
+    /// result checks have run (`ENG-56`).
     pub fn rebuild_volume_collider(&mut self, volume: VolumeId) -> Result<(), WorldError> {
         let Some(body) = self.volume_body(volume) else {
             return Err(WorldError::UnknownVolume(volume));
         };
         let phys = body.phys;
+        let is_dynamic = body.kind == BodyKind::Dynamic;
+        let cell_size_m = body.volume.cell_size().metres();
         let Some(grid) = OccupancyGrid::from_volume(&body.volume)? else {
             return Ok(());
         };
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         self.physics
             .rebuild_collider(phys, &plan.grid, plan.representation);
+        if is_dynamic {
+            // The geometry changed: reinstall mass / COM / inertia from the new
+            // fine material grid so the solver tracks it (and never the coarse
+            // collider).
+            let mass_properties = analytic_mass_properties(&grid, cell_size_m, |m| self.density(m))
+                .to_body_properties();
+            self.physics.set_mass_properties(phys, mass_properties);
+        }
         if let Some(body) = self.volume_body_mut(volume) {
             body.collider_revision += 1;
             body.coarsen_k = plan.coarsen_k;
@@ -937,17 +1005,6 @@ pub fn canonical_volume_for(volume: &Volume, owner: CanonicalOwner) -> Canonical
 /// candidate can compute its result hashes before publishing.
 pub fn volume_topology_hash_for(volume: &Volume, owner: CanonicalOwner) -> Hash32 {
     canonical_topology_hash(&[canonical_volume_for(volume, owner)])
-}
-
-/// The world translation that places a body-local grid whose cell `(0,0,0)`
-/// corner is at global cell `grid.origin()` and whose transform is identity.
-pub fn grid_origin_translation(grid: &OccupancyGrid, cell_m: f32) -> [f32; 3] {
-    let o = grid.origin();
-    [
-        o.x as f32 * cell_m,
-        o.y as f32 * cell_m,
-        o.z as f32 * cell_m,
-    ]
 }
 
 /// Count of solid cells in a volume (walks every resident brick).

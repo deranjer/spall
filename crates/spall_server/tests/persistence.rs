@@ -1097,3 +1097,75 @@ fn detail_cell_body_split_replay_uses_the_source_cell_size() {
         );
     }
 }
+
+/// ENG-56: a dynamic body whose last cell is cut away is retired atomically with
+/// the commit — and a checkpoint + journal-suffix recovery must reach the same
+/// state, with no resurrected empty body.
+#[test]
+fn an_emptied_body_stays_retired_across_save_and_restart() {
+    let s = Scratch::new("eng56_retire");
+
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    // A one-cell dynamic body resting on the floor, live at checkpoint time.
+    let body = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(1),
+            BodyPose::new(DQuat::IDENTITY, [4.0, 0.5, 4.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    for _ in 0..60 {
+        sim.step_physics_only();
+    }
+
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        assert_eq!(sim.world().body_count(), 1, "the body is in the checkpoint");
+
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Body(body),
+            brush_cell(0, 0, 0, 1),
+        ))
+        .unwrap();
+        sim.run_until_idle(12).unwrap();
+        assert!(
+            sim.committed(RequestId(1)).is_some(),
+            "the emptying cut commits"
+        );
+        assert_eq!(
+            sim.world().body_count(),
+            0,
+            "the live world retired the emptied body"
+        );
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1, "one emptying transaction journalled");
+        w.append_journal(&records).unwrap();
+    }
+
+    let want_hash = sim.world().world_hash();
+
+    let (restored, _) = recover_restore(&s.db());
+    assert_eq!(
+        restored.world().body_count(),
+        0,
+        "recovery replays the emptying transaction and the body stays retired"
+    );
+    assert!(
+        restored.world().bodies().next().is_none(),
+        "no resurrected empty body after restart"
+    );
+    assert_eq!(
+        restored.world().world_hash(),
+        want_hash,
+        "recovered geometry matches the live world after the retirement"
+    );
+}
