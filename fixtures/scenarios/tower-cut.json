@@ -1,0 +1,9 @@
+{
+  "name": "tower-cut",
+  "description": "One client cuts the single column that holds up the bridge beam; the beam must detach as one body and the replica must match the server hash.",
+  "server_ticks": 240,
+  "clients": 1,
+  "cuts": [
+    { "client": 0, "at_tick": 4, "cell": [10, 4, 1], "radius": 2 }
+  ]
+}

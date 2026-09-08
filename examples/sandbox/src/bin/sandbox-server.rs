@@ -1,13 +1,16 @@
 use clap::Parser;
-use spall_server::ServerConfig;
+use spall_net::{JoinToken, TransportConfig};
+use spall_server::{Scene, ServeConfig, ServerConfig};
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 
 #[derive(Debug, Parser)]
 #[command(name = "sandbox-server", about = "GPU-free Spall sandbox server host")]
 struct Args {
-    #[arg(long)]
+    /// Reserved for the T16 on-disk world; unused by the T00 loop and the T10
+    /// built-in scene.
+    #[arg(long, default_value = ".local/worlds/dev")]
     world: PathBuf,
-    #[arg(long)]
+    #[arg(long, default_value_t = 0)]
     seed: u64,
     #[arg(long)]
     listen: SocketAddr,
@@ -17,14 +20,45 @@ struct Args {
     log_json: PathBuf,
     #[arg(long, default_value_t = 0)]
     ready_delay_ms: u64,
-    /// Harness-only failure injection. Networking and gameplay are not implemented in T00.
+    /// Harness-only failure injection for the T00 bounded loop.
     #[arg(long, hide = true)]
     fail_after_tick: Option<u64>,
+
+    // --- T10 networked replication host ---
+    /// Run the authoritative replication host instead of the T00 bounded loop.
+    /// Requires --join-token-file.
+    #[arg(long)]
+    serve: bool,
+    /// Per-run join secret (hex), shared with clients out of band.
+    #[arg(long)]
+    join_token_file: Option<PathBuf>,
+    /// Write the server certificate fingerprint (hex) here for clients.
+    #[arg(long)]
+    fingerprint_out: Option<PathBuf>,
+    /// Write the OS-resolved bound ip:port here once listening.
+    #[arg(long)]
+    addr_out: Option<PathBuf>,
+    /// Write the machine-readable run summary here.
+    #[arg(long)]
+    summary_json: Option<PathBuf>,
+    /// Wait for this many clients before the tick loop starts.
+    #[arg(long, default_value_t = 1)]
+    min_clients: usize,
+    #[arg(long, default_value_t = 8)]
+    max_clients: usize,
+    /// Real-time 60 Hz pacing (needed for interactive / networked clients).
+    #[arg(long)]
+    paced: bool,
 }
 
 fn main() -> ExitCode {
     sandbox::init_tracing();
     let args = Args::parse();
+
+    if args.serve {
+        return run_serve(args);
+    }
+
     let config = ServerConfig {
         world: args.world,
         seed: args.seed,
@@ -36,6 +70,61 @@ fn main() -> ExitCode {
     };
     match spall_server::run(&config) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("sandbox-server: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_serve(args: Args) -> ExitCode {
+    let Some(token_file) = args.join_token_file else {
+        eprintln!("sandbox-server: --serve requires --join-token-file");
+        return ExitCode::from(2);
+    };
+    let token = match std::fs::read_to_string(&token_file)
+        .ok()
+        .and_then(|s| JoinToken::from_hex(s.trim()))
+    {
+        Some(t) => t,
+        None => {
+            eprintln!("sandbox-server: could not read a 64-hex join token from {token_file:?}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let config = ServeConfig {
+        listen: args.listen,
+        scene: Scene::BridgeCut,
+        join_token: token,
+        max_ticks: args.ticks,
+        quiescence_ticks: 45,
+        min_clients: args.min_clients,
+        max_clients: args.max_clients,
+        startup_timeout: Duration::from_secs(30),
+        paced: args.paced,
+        log_json: args.log_json,
+        summary_json: args.summary_json,
+        fingerprint_out: args.fingerprint_out,
+        addr_out: args.addr_out,
+        transport: TransportConfig::default(),
+    };
+    match spall_server::serve(config) {
+        Ok(summary) => {
+            println!(
+                "sandbox-server: {} ticks={} clients={} committed={} hash={}",
+                summary.result,
+                summary.ticks_run,
+                summary.clients_connected,
+                summary.transactions_committed,
+                summary.final_world_hash
+            );
+            if summary.result == "passed" {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
         Err(error) => {
             eprintln!("sandbox-server: {error}");
             ExitCode::from(1)

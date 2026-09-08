@@ -6,6 +6,8 @@ members = [
     "crates/spall_jobs",
     "crates/spall_structure",
     "crates/spall_net",
+    "crates/spall_physics",
+    "crates/spall_sim",
     "crates/spall_server",
     "crates/spall_client",
     "examples/sandbox",
@@ -25,6 +27,7 @@ clap = { version = "4.5.53", features = ["derive"] }
 glam = { version = "0.33.6", features = ["f64"] }
 postcard = { version = "1.1.3", features = ["use-std"] }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rapier3d = "0.35.3"
 rcgen = { version = "0.13.2", default-features = false, features = ["ring"] }
 ring = "0.17.14"
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
@@ -33,7 +36,9 @@ serde_json = "1.0.145"
 spall_core = { path = "crates/spall_core" }
 spall_jobs = { path = "crates/spall_jobs" }
 spall_net = { path = "crates/spall_net" }
+spall_physics = { path = "crates/spall_physics" }
 spall_protocol = { path = "crates/spall_protocol" }
+spall_sim = { path = "crates/spall_sim" }
 spall_structure = { path = "crates/spall_structure" }
 spall_voxel = { path = "crates/spall_voxel" }
 thiserror = "2.0.17"
