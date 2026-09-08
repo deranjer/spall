@@ -1,0 +1,14 @@
+[package]
+name = "spall_jobs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# Exposes an in-memory `WorldView` double so later tasks (T05 meshing, T07
+# structure) can test result validation without rebuilding one.
+testkit = []
+
+[dependencies]
+spall_core.workspace = true
+thiserror.workspace = true

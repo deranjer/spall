@@ -712,6 +712,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.33.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21fef0953c54fd3de2f44b743fbf77e044c81a25faee03636dfccc0d35135e23"
+
+[[package]]
 name = "glow"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2110,6 +2116,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spall_jobs"
+version = "0.1.0"
+dependencies = [
+ "spall_core",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "spall_net"
 version = "0.1.0"
 dependencies = [
@@ -2149,10 +2163,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "spall_structure"
+version = "0.1.0"
+dependencies = [
+ "spall_core",
+ "spall_jobs",
+ "spall_voxel",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "spall_voxel"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "glam",
  "spall_core",
  "thiserror 2.0.20",
 ]
@@ -3210,3 +3235,4 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+

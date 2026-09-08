@@ -56,6 +56,60 @@ among workspace crates, matching the `docs/architecture.md` dependency graph.
 An optional `oracle` feature exposes the crate's dense reference model to
 later foundation tasks (T03+) without copying it.
 
+## T03 — fixture worlds, rays, and integer brushes (verified 2026-09-06)
+
+`spall_voxel` gains one new external dependency for its ray/transform math.
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T03 |
+| --- | ---: | --- | --- | --- |
+| glam | 0.33.6 | `f64` (adds `DVec3` / `DQuat`); default `std` | `MIT OR Apache-2.0` | rigid volume↔world transforms and DDA ray math |
+
+`glam` is the math library named in `README.md`; T03 is the first task that
+needs real vector / quaternion rotation (world-space rays against a rigidly
+posed volume). With the `f64` + default `std` features it is pure-Rust with
+**no transitive dependencies**; no GPU, window, or async code enters
+`spall_voxel`. Ray results are explicitly
+*not* required to be bit-identical across machines — authoritative hit
+validation stays server-side — so `f64` math here is fine. Integer brush
+plans (`brush.rs`) use only `spall_core`'s fixed-point predicate and stay
+fully deterministic.
+
+## T04 — bounded job scheduling (verified 2026-09-06)
+
+`spall_jobs` adds **no new external dependency**. It depends only on
+`spall_core` (coordinate / id / revision types reused in job tokens) and
+`thiserror` (already locked) for its `SubmitReason` / `CounterExhausted`
+errors. `Cargo.lock` gains only the `spall_jobs` package node.
+
+The scheduler is executor-agnostic and deterministic: it never spawns a
+thread. `ThreadJobPool` is a thin wrapper that runs jobs on `std::thread`
+workers — standard library only, no `rayon` yet. `README.md` names a Rayon
+pool for jobs; T04 deliberately keeps the mechanism (bounded queues,
+priority order, token re-validation, generation invalidation, clean
+shutdown) independent of the worker backend, so a Rayon adapter can be
+added later without reworking the policy. An optional `testkit` feature
+exposes an in-memory `WorldView` double (`spall_jobs::testkit::MapWorld`)
+for T05 / T07 result-validation tests. No GPU, window, network, async, or
+filesystem code enters `spall_jobs`.
+
+## T07 — support graph and split plans (verified 2026-09-07)
+
+`spall_structure` adds **no new external dependency**. It depends on
+`spall_voxel` (brick snapshots, `Volume`, `EditOutcome`), `spall_jobs`
+(`JobToken` / `WorldView` / `Staleness` / `Generation` / `TopologyEpoch` for
+result re-validation), and `thiserror` (already locked). `Cargo.lock` gains
+only the `spall_structure` package node.
+
+The `docs/architecture.md` dependency graph is refined from
+`spall_structure -> spall_voxel` to `spall_structure -> spall_voxel, spall_jobs`.
+Rationale: a completed structural analysis is an off-tick job result and must
+be discarded when its input brick revisions move, so it carries the same
+`spall_jobs::JobToken` mechanism every other background result uses rather than
+a parallel one. Both are `-> spall_core` foundation crates; no cycle is
+introduced. An optional `oracle` feature exposes the crate's dense flood-fill
+reference model (mirroring `spall_voxel`'s `oracle` feature). Dev-dependencies
+enable `spall_jobs/testkit` and `spall_voxel/oracle` for the scenario tests. No
+GPU, window, network, async, or filesystem code enters `spall_structure`.
 ## T09 — transport and fault harness (verified 2026-09-07)
 
 New crate `crates/spall_net` (the QUIC transport adapter). It is the only place
