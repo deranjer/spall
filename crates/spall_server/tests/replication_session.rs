@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use spall_client::{ClientNetConfig, ScriptedAction, cut_request, run_replication_client};
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
-use spall_server::{Scene, ServeConfig, serve};
+use spall_server::{Scene, ServeConfig, ServeError, serve};
+use spall_store::FaultPlan;
 
 fn unique_dir(tag: &str) -> PathBuf {
     let base = std::env::temp_dir().join(format!(
@@ -70,6 +71,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         seed: 0,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        save_faults: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -166,6 +168,7 @@ fn server_persists_and_recovers_across_a_restart() {
         seed: 9,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        save_faults: None,
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {
@@ -231,4 +234,91 @@ fn server_persists_and_recovers_across_a_restart() {
         second.transactions_committed, 0,
         "run 2 did not replay or re-run the cut"
     );
+}
+
+/// ENG-35: a disk fault on the clean-shutdown checkpoint must fail the run,
+/// through the host — not the Writer API. Run `serve` with `--save`, cut the
+/// column, and arm a one-shot checkpoint-commit disk fault on the world
+/// writer. The initial checkpoint is published before the fault is armed, so
+/// the fault lands squarely on the clean-shutdown checkpoint. `serve` must
+/// return an error whose message names the final checkpoint, the JSONL log
+/// must record a `Failed` server event, and the database file must survive
+/// as a diagnostic artifact.
+#[test]
+fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
+    let dir = unique_dir("shutdown_fault");
+    let token = JoinToken::generate().unwrap();
+    let save = dir.join("world.db");
+    let log_json = dir.join("server.jsonl");
+    let fp_path = dir.join("fp");
+    let addr_path = dir.join("addr");
+
+    let cfg = ServeConfig {
+        listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        scene: Scene::BridgeCut,
+        join_token: token,
+        max_ticks: 200,
+        quiescence_ticks: 20,
+        min_clients: 1,
+        max_clients: 2,
+        startup_timeout: Duration::from_secs(20),
+        paced: true,
+        log_json: log_json.clone(),
+        summary_json: None,
+        fingerprint_out: Some(fp_path.clone()),
+        addr_out: Some(addr_path.clone()),
+        transport: TransportConfig::for_tests(),
+        save: Some(save.clone()),
+        // No periodic checkpoints: the only checkpoint after setup is the
+        // clean-shutdown one, so the one-shot fault cannot be consumed early.
+        checkpoint_interval_ticks: 0,
+        seed: 9,
+        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        save_faults: Some(FaultPlan::disk_fail_checkpoint()),
+    };
+
+    let server_thread = std::thread::spawn(move || serve(cfg));
+
+    let fp_hex = wait_for_file(&fp_path, Duration::from_secs(15));
+    let addr_str = wait_for_file(&addr_path, Duration::from_secs(15));
+    let client_cfg = ClientNetConfig {
+        connect_addr: addr_str.parse().unwrap(),
+        server_fingerprint: Fingerprint::from_hex(&fp_hex).unwrap(),
+        join_token: token,
+        script: vec![ScriptedAction {
+            at_tick: 4,
+            request: cut_request(1, 0, [10, 4, 1], 2),
+        }],
+        late_join: false,
+        run_ticks: 0,
+        idle_grace: Duration::from_millis(500),
+        overall_timeout: Duration::from_secs(25),
+        log_json: dir.join("client.jsonl"),
+        summary_json: None,
+        transport: TransportConfig::for_tests(),
+    };
+    let _ = run_replication_client(client_cfg).expect("client run");
+
+    let outcome = server_thread.join().expect("server thread");
+    let err = match outcome {
+        Ok(summary) => panic!(
+            "shutdown checkpoint disk fault reported a passed save: {:?}",
+            summary.result
+        ),
+        Err(ServeError::Runtime(msg)) => msg,
+        Err(other) => panic!("expected a runtime failure, got {other:?}"),
+    };
+    assert!(
+        err.contains("final checkpoint"),
+        "error should name the final checkpoint, got: {err}"
+    );
+
+    // Diagnostics preserved: the failure is on the record and the DB survives.
+    let log = std::fs::read_to_string(&log_json).unwrap();
+    assert!(
+        log.contains("\"event\":\"failed\"") && log.contains("result=failed"),
+        "server log records the failed shutdown: {log}"
+    );
+    assert!(save.exists(), "the world database is kept for inspection");
 }

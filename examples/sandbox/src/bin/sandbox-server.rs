@@ -136,6 +136,7 @@ fn run_serve(args: Args) -> ExitCode {
         seed: args.seed,
         catch_up_cap: args.catch_up_cap,
         max_join_retries: args.max_join_retries,
+        save_faults: None,
     };
     match spall_server::serve(config) {
         Ok(summary) => {

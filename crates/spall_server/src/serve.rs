@@ -123,6 +123,10 @@ pub struct ServeConfig {
     /// T17: bounded late-join transfer restarts before the client is dropped
     /// with an explicit failure (connected clients keep running).
     pub max_join_retries: u32,
+    /// Test-only. A fault plan armed on the world [`Writer`] *after* initial
+    /// recovery / first checkpoint, so an injected disk fault lands on a
+    /// periodic or clean-shutdown durable write. `None` in production.
+    pub save_faults: Option<spall_store::FaultPlan>,
 }
 
 impl ServeConfig {
@@ -148,6 +152,7 @@ impl ServeConfig {
             seed: 0,
             catch_up_cap: DEFAULT_CATCH_UP_CAP,
             max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
+            save_faults: None,
         }
     }
 }
@@ -400,6 +405,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let scene = config.scene;
     let clients_for_sim = clients.clone();
     let save = config.save.clone();
+    let save_faults = config.save_faults.clone();
     let checkpoint_interval = config.checkpoint_interval_ticks;
     let catch_up_cap = config.catch_up_cap.max(1);
     let max_join_retries = config.max_join_retries;
@@ -420,6 +426,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     return SimResult::error(format!("persistence setup failed: {e}"), 0);
                 }
             };
+        // Test-only: arm the writer only now, so recovery and the first
+        // checkpoint are unaffected and the fault falls on a later durable
+        // write (periodic or clean-shutdown).
+        if let (Some(writer), Some(faults)) = (store.as_mut(), save_faults) {
+            writer.set_faults(faults);
+        }
         let mut journal_records_written: u64 = 0;
 
         let mut motion = MotionPublisher::new(60, 20);
@@ -552,26 +564,42 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
         broadcast(&clients_for_sim, Outbound::Shutdown);
 
-        // Clean-shutdown checkpoint: flush the journal tail, publish a final
-        // checkpoint, and prune to the last two.
+        // Clean-shutdown durability: flush the journal tail, publish a final
+        // checkpoint, then prune to the last two. The flush and the checkpoint
+        // MUST both commit before this run reports a passed save — a disk-full
+        // or I/O error here means the final body motion / checkpoint never
+        // reached disk, and silently returning success would strand an
+        // unsavable world. Every counter below is still reported so the failing
+        // summary keeps its diagnostics.
         let mut persist_bytes_per_write = 0.0;
         let mut persist_commit_bytes_per_sec = 0.0;
+        let mut shutdown_error: Option<String> = None;
         if let Some(writer) = store.as_mut() {
-            if let Ok(n) = flush_journal(writer, &sim, &mut durable_seq) {
-                journal_records_written += n;
+            match flush_journal(writer, &sim, &mut durable_seq) {
+                Ok(n) => journal_records_written += n,
+                Err(e) => {
+                    shutdown_error = Some(format!("final journal flush failed: {e}"));
+                }
             }
-            if publish_checkpoint(writer, &sim, &persist_cfg, durable_seq).is_ok() {
-                checkpoints_published += 1;
+            if shutdown_error.is_none() {
+                match publish_checkpoint(writer, &sim, &persist_cfg, durable_seq) {
+                    Ok(()) => checkpoints_published += 1,
+                    Err(e) => shutdown_error = Some(format!("final checkpoint failed: {e}")),
+                }
             }
-            let _ = writer.retain(2);
+            if shutdown_error.is_none()
+                && let Err(e) = writer.retain(2)
+            {
+                shutdown_error = Some(format!("final checkpoint retain failed: {e}"));
+            }
             let m = writer.metrics();
             persist_bytes_per_write = m.bytes_per_journal_write();
             persist_commit_bytes_per_sec = m.commit_bytes_per_sec();
         }
 
         SimResult {
-            ok: true,
-            error: None,
+            ok: shutdown_error.is_none(),
+            error: shutdown_error,
             ticks_run,
             committed_total,
             rejected_total,
