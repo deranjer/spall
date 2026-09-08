@@ -6,9 +6,13 @@
 //! accepts clients, and broadcasts committed topology transactions plus 20 Hz
 //! motion snapshots.
 
+pub mod baseline;
 pub mod persist;
 pub mod serve;
 
+pub use baseline::{
+    BaselineError, BaselineTransfer, capture_transfer, chunk_payload, world_baseline,
+};
 pub use persist::{
     CrashSuiteReport, PersistConfig, PersistError, ScenarioResult, capture, journal_records,
     restore, run_crash_suite,
