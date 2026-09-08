@@ -173,13 +173,20 @@ pub fn acceptance_shapes() -> Vec<AcceptanceShape> {
 }
 
 /// Mesh a fixture volume at generation 1 / epoch 0 with the given strategy.
+///
+/// Fixture volumes are small and dense, so meshing never hits the work budget
+/// or a coordinate overflow; the `Result` is unwrapped here.
 pub fn mesh_shape(volume: &Volume, strategy: MeshStrategy) -> VolumeMesh {
     build_volume_mesh(
         volume,
         Generation(1),
         TopologyEpoch::START,
-        MeshOptions { strategy },
+        MeshOptions {
+            strategy,
+            ..MeshOptions::default()
+        },
     )
+    .expect("fixture volumes mesh within budget")
 }
 
 #[cfg(test)]
