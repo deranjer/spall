@@ -559,13 +559,21 @@ fn building_drop(rep: Representation, steps: u32) -> (PercentileSummary, f64, bo
     let building = fixtures::hollow_building(vid(2));
     let grid = OccupancyGrid::from_volume(&building).unwrap().unwrap();
     let dims = grid.dims();
+    // The collider honours the grid origin as a body-local offset, so place the
+    // body so the building's solid cells still drop from just above the slab.
+    let origin = grid.origin();
+    let cell = fixtures::CELL_M;
     let id = world.add_body(BodySpec {
         kind: BodyKind::Dynamic { ccd: false },
         representation: rep,
         grid,
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
-        translation_m: [6.5, 1.3, 6.5],
+        translation_m: [
+            6.5 - origin.x as f32 * cell,
+            1.3 - origin.y as f32 * cell,
+            6.5 - origin.z as f32 * cell,
+        ],
         linvel_m_s: [0.0; 3],
     });
 

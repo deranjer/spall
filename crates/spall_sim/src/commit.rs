@@ -134,7 +134,16 @@ pub fn commit(
         }
     } else {
         let st = world.physics().body_state(parent_phys);
-        let (_, local_com, _) = world.physics().derived_mass_properties(parent_phys);
+        let (_, grid_local_com, _) = world.physics().derived_mass_properties(parent_phys);
+        // `derived_mass_properties` is in the collider shape's grid-local frame;
+        // shift it by the body-local grid-origin offset to get the body-frame
+        // centre of mass the world-space COM is built from (`ENG-55`).
+        let com_offset = world.physics().collider_offset_m(parent_phys);
+        let local_com = [
+            grid_local_com[0] + com_offset[0],
+            grid_local_com[1] + com_offset[1],
+            grid_local_com[2] + com_offset[2],
+        ];
         let pose = BodyPose::new(
             glam::DQuat::from_xyzw(
                 f64::from(st.rotation[0]),

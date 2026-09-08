@@ -135,7 +135,10 @@ impl SimWorld {
             grid: plan.grid,
             cell_m,
             density_kg_m3: 1.0,
-            translation_m: grid_origin_translation(&grid, cell_m),
+            // Identity pose: `PhysicsWorld` carries the tight grid's origin as a
+            // body-local collider offset, so the terrain body stays at the world
+            // origin like its `BodyPose::identity()` (`ENG-55`).
+            translation_m: [0.0; 3],
             linvel_m_s: [0.0; 3],
         });
 
@@ -937,17 +940,6 @@ pub fn canonical_volume_for(volume: &Volume, owner: CanonicalOwner) -> Canonical
 /// candidate can compute its result hashes before publishing.
 pub fn volume_topology_hash_for(volume: &Volume, owner: CanonicalOwner) -> Hash32 {
     canonical_topology_hash(&[canonical_volume_for(volume, owner)])
-}
-
-/// The world translation that places a body-local grid whose cell `(0,0,0)`
-/// corner is at global cell `grid.origin()` and whose transform is identity.
-pub fn grid_origin_translation(grid: &OccupancyGrid, cell_m: f32) -> [f32; 3] {
-    let o = grid.origin();
-    [
-        o.x as f32 * cell_m,
-        o.y as f32 * cell_m,
-        o.z as f32 * cell_m,
-    ]
 }
 
 /// Count of solid cells in a volume (walks every resident brick).
