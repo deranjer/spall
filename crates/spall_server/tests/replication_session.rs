@@ -68,6 +68,8 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         save: None,
         checkpoint_interval_ticks: 0,
         seed: 0,
+        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -86,6 +88,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
             at_tick: 4,
             request: cut_request(1, 0, [10, 4, 1], 2),
         }],
+        late_join: false,
         run_ticks: 0,
         idle_grace: Duration::from_millis(500),
         overall_timeout: Duration::from_secs(25),
@@ -161,6 +164,8 @@ fn server_persists_and_recovers_across_a_restart() {
         save: Some(save.clone()),
         checkpoint_interval_ticks: 0,
         seed: 9,
+        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {
@@ -177,6 +182,7 @@ fn server_persists_and_recovers_across_a_restart() {
             server_fingerprint: Fingerprint::from_hex(&fp_hex).unwrap(),
             join_token: token,
             script,
+            late_join: false,
             run_ticks: 0,
             idle_grace: Duration::from_millis(500),
             overall_timeout: Duration::from_secs(25),

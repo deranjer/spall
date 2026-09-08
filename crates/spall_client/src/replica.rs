@@ -190,6 +190,181 @@ impl ReplicaWorld {
         }
     }
 
+    /// An empty replica with no terrain yet — [`Self::install_baseline_world`]
+    /// must run before any query. Used by the late-join client, which receives
+    /// its whole world over a bulk transfer instead of a fixed scene.
+    pub fn empty(config: ReplicaConfig) -> Self {
+        let placeholder = VolumeId::new(1).expect("1 is a valid volume id");
+        Self {
+            config,
+            terrain_id: placeholder,
+            volumes: BTreeMap::new(),
+            owner: BTreeMap::new(),
+            bodies: BTreeMap::new(),
+            volume_of_entity: BTreeMap::new(),
+            tombstoned: BTreeSet::new(),
+            applied_tx: BTreeSet::new(),
+            control_gate: SequenceGate::new(),
+            pending_snapshots: BTreeMap::new(),
+            now_tick: 0,
+        }
+    }
+
+    /// Builds a replica directly from a decoded late-join baseline.
+    pub fn from_baseline_world(
+        world: &spall_protocol::BaselineWorld,
+        config: ReplicaConfig,
+    ) -> Result<Self, String> {
+        let mut replica = Self::empty(config);
+        replica.install_baseline_world(world)?;
+        Ok(replica)
+    }
+
+    /// Installs a full late-join baseline atomically (`docs/protocol.md` "Late
+    /// join" step 3: "Client validates and installs the baseline atomically").
+    /// Every prior volume, body, tombstone, and applied-transaction record is
+    /// dropped and replaced by `world`'s geometry — every brick at its
+    /// authoritative revision, so [`Self::world_hash`] equals the server's
+    /// `world_hash()` at the snapshot tick with no follow-up repair. `now_tick`
+    /// advances to the snapshot tick so the catch-up barrier and the
+    /// pending-snapshot window are anchored correctly.
+    pub fn install_baseline_world(
+        &mut self,
+        world: &spall_protocol::BaselineWorld,
+    ) -> Result<(), String> {
+        use spall_protocol::{BaselineCells, BaselineOwner};
+
+        world.validate().map_err(|e| e.to_string())?;
+
+        let mut volumes = BTreeMap::new();
+        let mut owner = BTreeMap::new();
+        let mut bodies = BTreeMap::new();
+        let mut volume_of_entity = BTreeMap::new();
+        let mut terrain_id = None;
+
+        for bv in &world.volumes {
+            let vid = bv.volume_id;
+            let cs = CellSizeCode::from_u8(bv.cell_size_code).ok_or_else(|| {
+                format!(
+                    "baseline volume {vid} has unknown cell-size code {}",
+                    bv.cell_size_code
+                )
+            })?;
+            let mut volume = match bv.bounds {
+                Some([mn, mx]) => {
+                    let bb = spall_voxel::BrickBounds::new(
+                        BrickCoord::new(mn[0], mn[1], mn[2]),
+                        BrickCoord::new(mx[0], mx[1], mx[2]),
+                    )
+                    .ok_or_else(|| format!("baseline volume {vid} has inverted bounds"))?;
+                    Volume::bounded(vid, cs, bb)
+                }
+                None => Volume::new(vid, cs),
+            };
+            for bb in &bv.bricks {
+                let cells: Vec<MaterialId> = match &bb.cells {
+                    BaselineCells::Uniform(id) => {
+                        vec![MaterialId(*id); spall_core::CELLS_PER_BRICK]
+                    }
+                    BaselineCells::Dense(raw) => {
+                        if raw.len() != spall_core::CELLS_PER_BRICK {
+                            return Err(format!(
+                                "baseline brick in {vid} has {} cells, expected {}",
+                                raw.len(),
+                                spall_core::CELLS_PER_BRICK
+                            ));
+                        }
+                        raw.iter().copied().map(MaterialId).collect()
+                    }
+                };
+                let brick = Brick::restored(&cells, Revision(bb.revision), bb.edited);
+                volume
+                    .insert_brick(
+                        BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                        brick,
+                    )
+                    .map_err(|e| format!("baseline brick insert into {vid} failed: {e}"))?;
+            }
+            match bv.owner {
+                BaselineOwner::Terrain => {
+                    owner.insert(vid.get(), CanonicalOwner::Terrain);
+                    terrain_id = Some(vid);
+                }
+                BaselineOwner::Body(entity) => {
+                    owner.insert(vid.get(), CanonicalOwner::Body(entity));
+                    volume_of_entity.insert(entity.get(), vid.get());
+                    bodies.insert(
+                        entity.get(),
+                        ReplicaBody {
+                            entity,
+                            volume_id: vid,
+                            track: MotionTrack::default(),
+                        },
+                    );
+                }
+            }
+            volumes.insert(vid.get(), volume);
+        }
+        let terrain_id = terrain_id.ok_or("baseline has no terrain volume")?;
+
+        self.terrain_id = terrain_id;
+        self.volumes = volumes;
+        self.owner = owner;
+        self.bodies = bodies;
+        self.volume_of_entity = volume_of_entity;
+        self.tombstoned = BTreeSet::new();
+        self.applied_tx = BTreeSet::new();
+        self.control_gate = SequenceGate::new();
+        self.pending_snapshots = BTreeMap::new();
+        self.now_tick = world.checkpoint_tick;
+        Ok(())
+    }
+
+    /// Merges a targeted baseline patch into the live replica — a hash repair
+    /// (`docs/protocol.md`: "hash repairs"). Each named brick of each named
+    /// volume is overwritten at its **authoritative revision**, so a brick that
+    /// diverged client-side (or a `RepairRequest` answer) is restored to exact
+    /// parity, revision included — something a `CellRun` replay cannot do
+    /// because it would re-stamp the replica's own next revision.
+    ///
+    /// The patch may only touch volumes the replica already holds; re-adding a
+    /// missing body is a full re-baseline, not a patch.
+    pub fn apply_baseline_patch(
+        &mut self,
+        world: &spall_protocol::BaselineWorld,
+    ) -> Result<(), String> {
+        use spall_protocol::BaselineCells;
+
+        world.validate().map_err(|e| e.to_string())?;
+        for bv in &world.volumes {
+            let vid = bv.volume_id;
+            let volume = self.volumes.get_mut(&vid.get()).ok_or_else(|| {
+                format!("repair patch names volume {vid} the replica does not hold")
+            })?;
+            for bb in &bv.bricks {
+                let cells: Vec<MaterialId> = match &bb.cells {
+                    BaselineCells::Uniform(id) => {
+                        vec![MaterialId(*id); spall_core::CELLS_PER_BRICK]
+                    }
+                    BaselineCells::Dense(raw) => {
+                        if raw.len() != spall_core::CELLS_PER_BRICK {
+                            return Err(format!("repair brick has {} cells", raw.len()));
+                        }
+                        raw.iter().copied().map(MaterialId).collect()
+                    }
+                };
+                let brick = Brick::restored(&cells, Revision(bb.revision), bb.edited);
+                volume
+                    .insert_brick(
+                        BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                        brick,
+                    )
+                    .map_err(|e| format!("repair brick insert into {vid} failed: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Adds a body that exists in the baseline scene.
     pub fn install_body(&mut self, entity: EntityId, volume: Volume) {
         let vid = volume.id();
@@ -835,6 +1010,85 @@ mod tests {
         assert!(replica.ingest_snapshot(&snap));
         let pose = replica.interpolated_pose(ghost, 5.0).unwrap();
         assert_eq!(pose.translation_m, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn install_baseline_world_replaces_prior_state_and_leaves_transactions_appliable() {
+        use spall_protocol::{
+            BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume, BaselineWorld,
+        };
+
+        // Start from a fixed scene, then install a completely different world.
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        replica.apply_transaction(&TopologyTransaction {
+            transaction_id: TransactionId::new(1).unwrap(),
+            server_tick: spall_core::Tick(1),
+            control_seq: spall_protocol::ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: VolumeId::new(1).unwrap(),
+                start: GlobalCell::new(0, 0, 0),
+                len: 1,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![],
+        });
+
+        let world = BaselineWorld {
+            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            checkpoint_tick: 500,
+            volumes: vec![BaselineVolume {
+                volume_id: VolumeId::new(7).unwrap(),
+                cell_size_code: CellSizeCode::Quarter.to_u8(),
+                owner: BaselineOwner::Terrain,
+                bounds: None,
+                bricks: vec![BaselineBrick {
+                    coord: [0, 0, 0],
+                    revision: 12,
+                    edited: false,
+                    cells: BaselineCells::Uniform(MaterialId(1).0),
+                }],
+            }],
+        };
+        replica.install_baseline_world(&world).unwrap();
+
+        assert_eq!(replica.terrain_id, VolumeId::new(7).unwrap());
+        assert_eq!(replica.body_ids().count(), 0);
+        assert!(!replica.has_applied(TransactionId::new(1).unwrap()));
+        assert_eq!(replica.now_tick, 500);
+        // Reinstalling the same baseline is idempotent.
+        let hash = replica.world_hash();
+        replica.install_baseline_world(&world).unwrap();
+        assert_eq!(replica.world_hash(), hash);
+
+        // A fresh transaction against the installed terrain still applies.
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(2).unwrap(),
+            server_tick: spall_core::Tick(501),
+            control_seq: spall_protocol::ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![spall_protocol::BrickRevision {
+                volume: VolumeId::new(7).unwrap(),
+                coord: BrickCoord::new(0, 0, 0),
+                revision: Revision(12),
+            }],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: VolumeId::new(7).unwrap(),
+                start: GlobalCell::new(0, 0, 0),
+                len: 4,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![],
+        };
+        assert!(matches!(
+            replica.apply_transaction(&tx),
+            ApplyOutcome::Published { .. }
+        ));
     }
 
     #[test]

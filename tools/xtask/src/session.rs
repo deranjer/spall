@@ -139,10 +139,22 @@ struct Scenario {
     clients: u64,
     #[serde(default)]
     cuts: Vec<CutSpec>,
+    /// T17: client indices that pull a full late-join baseline over a bulk
+    /// transfer instead of installing the fixed scene.
+    #[serde(default)]
+    late_join_clients: Vec<u64>,
+    /// T17: how long a late-join client waits before connecting, so it arrives
+    /// after the early clients have started cutting.
+    #[serde(default = "default_late_delay")]
+    late_join_connect_delay_ms: u64,
 }
 
 fn one() -> u64 {
     1
+}
+
+fn default_late_delay() -> u64 {
+    900
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,6 +184,10 @@ struct ClientSummary {
     transactions_rejected: u64,
     motion_snapshots: u64,
     final_world_hash: String,
+    #[serde(default)]
+    late_join: bool,
+    #[serde(default)]
+    baseline_bricks: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -247,6 +263,16 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     let server_summary_path = output.join("server.summary.json");
     let _ = fs::remove_file(&server_summary_path);
 
+    // Late joiners must connect *after* the tick loop is running, so they are
+    // not counted toward `min_clients` — the run starts once the early clients
+    // are up and cutting.
+    let late_count = scenario
+        .late_join_clients
+        .iter()
+        .filter(|i| **i < clients)
+        .count() as u64;
+    let min_clients = clients.saturating_sub(late_count).max(1);
+
     // Spawn the server.
     let mut server_cmd = Command::new(sandbox_binary("sandbox-server"));
     server_cmd.args([
@@ -266,7 +292,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         "--ticks",
         &server_ticks.to_string(),
         "--min-clients",
-        &clients.to_string(),
+        &min_clients.to_string(),
         "--max-clients",
         &clients.to_string(),
         "--paced",
@@ -348,6 +374,13 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 ),
             ]);
         }
+        if scenario.late_join_clients.contains(&i) {
+            c.args([
+                "--late-join",
+                "--connect-delay-ms",
+                &scenario.late_join_connect_delay_ms.to_string(),
+            ]);
+        }
         hide_console(&mut c);
         let child = c.spawn().map_err(|source| XtaskError::Output {
             path: format!("sandbox-client{i} (spawn)"),
@@ -398,10 +431,14 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         match summary {
             Some(c) => {
                 let hash_ok = c.final_world_hash == agreed;
+                // A late joiner that caught up entirely from the baseline (no
+                // cuts after it joined) is still a pass.
+                let progressed =
+                    c.transactions_applied >= 1 || (c.late_join && c.baseline_bricks > 0);
                 all_match &= exit_ok
                     && c.result == "passed"
                     && hash_ok
-                    && c.transactions_applied >= 1
+                    && progressed
                     && c.transactions_rejected == 0;
                 rows.push(ClientRow {
                     index: i as u64,

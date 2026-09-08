@@ -43,6 +43,15 @@ struct Args {
     /// Stop once the observed server tick reaches this (0 = only on close).
     #[arg(long, default_value_t = 0)]
     run_ticks: u64,
+    /// T17: request a full late-join baseline over a bulk transfer instead of
+    /// installing the fixed scene — the replica reaches the server's current
+    /// topology with no edit replay.
+    #[arg(long)]
+    late_join: bool,
+    /// T17: wait this long after the process starts before connecting, so a
+    /// harness can stagger a late joiner behind an already-running client.
+    #[arg(long, default_value_t = 0)]
+    connect_delay_ms: u64,
     #[arg(long)]
     summary_json: Option<PathBuf>,
     /// Whole-session deadline.
@@ -137,6 +146,10 @@ fn run_replication(args: Args) -> ExitCode {
         }
     };
 
+    if args.connect_delay_ms > 0 {
+        std::thread::sleep(Duration::from_millis(args.connect_delay_ms));
+    }
+
     let id_base = (args.client_index << 40) | 1;
     let script: Vec<ScriptedAction> = args
         .cuts
@@ -153,6 +166,7 @@ fn run_replication(args: Args) -> ExitCode {
         server_fingerprint: fingerprint,
         join_token: token,
         script,
+        late_join: args.late_join,
         run_ticks: args.run_ticks,
         idle_grace: Duration::from_millis(500),
         overall_timeout: Duration::from_millis(args.timeout_ms),

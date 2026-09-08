@@ -27,14 +27,19 @@ use spall_core::{
     JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole, SphereBrush, VolumeId,
 };
 use spall_net::{
-    DatagramRecord, Fingerprint, JoinToken, TransportConfig, TransportError, WireRecord, connect,
+    Connection, DatagramRecord, Fingerprint, JoinToken, TransportConfig, TransportError,
+    WireRecord, connect,
 };
 use spall_protocol::{
-    ActionKind, ActionRequest, AlgorithmVersions, ClaimedTarget, Handshake, Hash32, InputSeq,
-    NegotiatedLimits, PROTOCOL_VERSION, RequestId,
+    ActionKind, ActionRequest, AlgorithmVersions, BaselineAck, BaselineWorld, ClaimedTarget,
+    Handshake, Hash32, InputSeq, NegotiatedLimits, PROTOCOL_VERSION, RequestId, TransferId,
 };
 
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
+
+/// `BaselineAck.transfer_id` a late-join replica sends to request a baseline
+/// (mirrors `spall_server::serve::BASELINE_REQUEST_SENTINEL`).
+const BASELINE_REQUEST_SENTINEL: TransferId = TransferId(0);
 
 /// Content-manifest tag; must match [`spall_server`]'s `T10_CONTENT_TAG`.
 pub const T10_CONTENT_TAG: &[u8] = b"spall-t10-bridge-v1";
@@ -89,6 +94,10 @@ pub struct ClientNetConfig {
     pub server_fingerprint: Fingerprint,
     pub join_token: JoinToken,
     pub script: Vec<ScriptedAction>,
+    /// T17: request a full late-join baseline over a bulk transfer instead of
+    /// installing the fixed `bridge_scene`. The replica reaches the server's
+    /// current topology hash with no edit replay from world creation.
+    pub late_join: bool,
     /// Stop once the observed server tick reaches this (0 = only stop on close).
     pub run_ticks: u64,
     /// Stop after this long with no new record once at least one has arrived.
@@ -115,6 +124,12 @@ pub struct ClientSummary {
     pub final_world_hash: String,
     pub total_solid_cells: u64,
     pub body_count: usize,
+    /// T17: whether this run installed a late-join baseline transfer.
+    pub late_join: bool,
+    /// T17: resident bricks in the installed baseline (`0` unless `late_join`).
+    pub baseline_bricks: u64,
+    /// T17: hash-repair baseline patches applied mid-session.
+    pub repairs_applied: u64,
 }
 
 /// Anything that stops a client run before it can report.
@@ -128,6 +143,8 @@ pub enum ClientNetError {
     Io(#[from] std::io::Error),
     #[error("tokio runtime: {0}")]
     Runtime(String),
+    #[error("late-join baseline: {0}")]
+    Baseline(String),
 }
 
 /// Connects, replicates, scripts, and reports. Builds its own Tokio runtime.
@@ -166,6 +183,92 @@ struct Counters {
     motion: AtomicU64,
     actions: AtomicU64,
     last_tick: AtomicU64,
+    /// Hash-repair baseline patches applied mid-session (T17).
+    patches: AtomicU64,
+    /// Resident bricks in the installed late-join baseline (T17).
+    baseline_bricks: AtomicU64,
+}
+
+/// Receives one baseline transfer whose `BaselineBegin` has already been read:
+/// accepts the bulk stream, reassembles + decodes the payload, then consumes
+/// records until `BaselineEnd`. Returns the decoded world, or `None` on any
+/// transport / decode failure.
+async fn receive_baseline_body(conn: &Connection) -> Option<BaselineWorld> {
+    let parts = conn.accept_bulk().await.ok()?.collect_parts().await.ok()?;
+    let mut bytes = Vec::new();
+    for part in &parts {
+        bytes.extend_from_slice(&part.payload);
+    }
+    let world = BaselineWorld::decode(&bytes).ok()?;
+    // Drain until BaselineEnd (nothing else is interleaved for this client
+    // while a transfer is in flight — the server writes it as one unit).
+    loop {
+        match conn.recv_record().await {
+            Ok(Some(WireRecord::BaselineEnd(end))) => {
+                if end.assembled_hash != Hash32::of(&world.encode()) {
+                    return None;
+                }
+                return Some(world);
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+/// The initial late-join handshake: ask for a baseline, install it, confirm it.
+async fn perform_late_join(
+    conn: &Connection,
+    replica: &Mutex<ReplicaWorld>,
+    counters: &Counters,
+) -> Result<(), ClientNetError> {
+    conn.send_record(WireRecord::BaselineAck(BaselineAck {
+        transfer_id: BASELINE_REQUEST_SENTINEL,
+        verified_manifest_hash: Hash32::ZERO,
+        installed_cursor: spall_core::JournalSeq(0),
+    }))
+    .await
+    .map_err(ClientNetError::Transport)?;
+
+    // Wait for BaselineBegin, skipping any stray pre-baseline records.
+    let begin = loop {
+        match conn.recv_record().await {
+            Ok(Some(WireRecord::BaselineBegin(b))) => break b,
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => {
+                return Err(ClientNetError::Baseline(
+                    "connection closed before the baseline arrived".into(),
+                ));
+            }
+        }
+    };
+    let Some(world) = receive_baseline_body(conn).await else {
+        return Err(ClientNetError::Baseline(
+            "transfer failed to assemble / verify".into(),
+        ));
+    };
+
+    {
+        let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .install_baseline_world(&world)
+            .map_err(ClientNetError::Baseline)?;
+    }
+    counters
+        .baseline_bricks
+        .store(world.brick_count() as u64, Ordering::Relaxed);
+    counters
+        .last_tick
+        .fetch_max(world.checkpoint_tick, Ordering::Relaxed);
+
+    conn.send_record(WireRecord::BaselineAck(BaselineAck {
+        transfer_id: begin.transfer_id,
+        verified_manifest_hash: Hash32::of(&world.encode()),
+        installed_cursor: begin.journal_cursor,
+    }))
+    .await
+    .map_err(ClientNetError::Transport)?;
+    Ok(())
 }
 
 async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetError> {
@@ -201,11 +304,40 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         Some(format!("session={}", conn.session())),
     ))?;
 
-    let replica = Arc::new(Mutex::new(ReplicaWorld::from_baseline(
-        spall_voxel::fixtures::bridge_scene(VolumeId::new(TERRAIN_VOLUME).unwrap()),
-        ReplicaConfig::default(),
-    )));
+    let replica = Arc::new(Mutex::new(if config.late_join {
+        ReplicaWorld::empty(ReplicaConfig::default())
+    } else {
+        ReplicaWorld::from_baseline(
+            spall_voxel::fixtures::bridge_scene(VolumeId::new(TERRAIN_VOLUME).unwrap()),
+            ReplicaConfig::default(),
+        )
+    }));
     let counters = Arc::new(Counters::default());
+
+    // T17: pull a full baseline over a bulk transfer before touching the
+    // replication stream, so the replica starts at the server's current
+    // topology with no edit replay from world creation.
+    if config.late_join {
+        if let Err(e) = perform_late_join(&conn, &replica, &counters).await {
+            log.write(&ProcessRecord::new(
+                ProcessEvent::Failed,
+                ProcessRole::Client,
+                Some(format!("late join failed: {e}")),
+            ))?;
+            let _ = conn.say_bye("late join failed").await;
+            conn.close("late join failed");
+            return Err(e);
+        }
+        log.write(&ProcessRecord::new(
+            ProcessEvent::Ready,
+            ProcessRole::Client,
+            Some(format!(
+                "late-join baseline installed: {} bricks",
+                counters.baseline_bricks.load(Ordering::Relaxed)
+            )),
+        ))?;
+    }
+
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
     let liveness = tokio::spawn(conn.clone().run_liveness(stop_rx.clone()));
@@ -240,6 +372,23 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                 counters.rejected.fetch_add(1, Ordering::Relaxed);
                             }
                             ApplyOutcome::Duplicate => {}
+                        }
+                    }
+                    Ok(Some(WireRecord::BaselineBegin(_))) => {
+                        // A mid-session hash-repair patch: one-brick baseline
+                        // transfer, merged into the live replica.
+                        match receive_baseline_body(&conn).await {
+                            Some(patch) => {
+                                let applied = {
+                                    let mut guard =
+                                        replica.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.apply_baseline_patch(&patch).is_ok()
+                                };
+                                if applied {
+                                    counters.patches.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            None => break,
                         }
                     }
                     Ok(Some(WireRecord::ActionStatus(_))) => {}
@@ -343,9 +492,13 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
     let last_tick = counters.last_tick.load(Ordering::Relaxed);
     let applied = counters.applied.load(Ordering::Relaxed);
+    let baseline_bricks = counters.baseline_bricks.load(Ordering::Relaxed);
+    // A plain late joiner that catches up entirely from the baseline (no cuts
+    // after it joined) still passes; a live client must have applied something.
+    let progressed = applied > 0 || (config.late_join && baseline_bricks > 0);
     let summary = ClientSummary {
         version: 1,
-        result: if applied > 0 { "passed" } else { "failed" }.to_string(),
+        result: if progressed { "passed" } else { "failed" }.to_string(),
         connected: true,
         transactions_applied: applied,
         repair_requests_sent: counters.repairs.load(Ordering::Relaxed),
@@ -356,6 +509,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         final_world_hash: guard.world_hash().to_string(),
         total_solid_cells: guard.total_solid_cells(),
         body_count: guard.body_ids().count(),
+        late_join: config.late_join,
+        baseline_bricks,
+        repairs_applied: counters.patches.load(Ordering::Relaxed),
     };
     drop(guard);
 

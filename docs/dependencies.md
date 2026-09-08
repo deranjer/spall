@@ -265,6 +265,17 @@ verifies both pragmas on open. `blake3` (already locked in T01) provides the
 the journal keeps `spall_protocol` wire records verbatim so the wire schema
 stays versioned independently of the save schema.
 
+## T17 — live late join, repair, reconnect (verified 2026-09-07)
+
+**No new external dependency.** `spall_protocol` gains a `baseline` module (the
+`BaselineWorld` payload; reuses `postcard` / `serde` / `blake3`). `spall_server`
+gains a `baseline` module and the `serve` late-join bridge, and reuses its
+existing `spall_store` path dep only for the crash suite — the late-join
+baseline is built straight from `SimWorld`, not from a `Checkpoint`, so the
+transfer path has no SQLite dependency. `spall_client::net` reuses the
+already-present `spall_net` bulk-stream API. `tools/xtask` and `examples/sandbox`
+add no dependency (new CLI flags only). `Cargo.lock` is unchanged.
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,

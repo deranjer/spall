@@ -19,6 +19,7 @@
 //! * **Sessions** — a `u64` [`session::SessionId`] is `slot << 32 | generation`;
 //!   reconnect bumps the generation and stales the old session.
 
+pub mod baseline;
 pub mod canonical;
 pub mod codec;
 pub mod handshake;
@@ -26,6 +27,10 @@ pub mod limits;
 pub mod records;
 pub mod session;
 
+pub use baseline::{
+    BASELINE_WORLD_SCHEMA, BaselineBrick, BaselineCells, BaselineDecodeError, BaselineOwner,
+    BaselineVolume, BaselineWorld,
+};
 pub use canonical::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, CanonicalWriter, Hash32,
     canonical_topology_hash, content_manifest_hash,
