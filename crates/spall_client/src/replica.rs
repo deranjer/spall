@@ -53,6 +53,16 @@ pub struct ReplicaConfig {
     pub max_extrapolation_s: f64,
     /// Fixed server tick rate, for tick↔time conversion.
     pub server_tick_hz: f64,
+    /// ENG-49: how many `before`-gapped transactions are held awaiting a repair
+    /// patch before the oldest is evicted (the server re-delivers it on the
+    /// control stream, or a fresher baseline supersedes it). Bounds retained
+    /// memory. `docs/protocol.md`: "Retain the previous consistent replica
+    /// while dependencies [...] are pending."
+    pub max_pending_repair_txns: usize,
+    /// ENG-49: a brick repair key that has been requested is not re-requested
+    /// for this many observed server ticks (`docs/protocol.md`: a `before` gap
+    /// "raises a rate-limited `RepairRequest`").
+    pub repair_request_cooldown_ticks: u64,
 }
 
 impl Default for ReplicaConfig {
@@ -62,6 +72,8 @@ impl Default for ReplicaConfig {
             interpolation_delay_s: 0.1,
             max_extrapolation_s: 0.1,
             server_tick_hz: 60.0,
+            max_pending_repair_txns: 64,
+            repair_request_cooldown_ticks: 30,
         }
     }
 }
@@ -160,6 +172,16 @@ pub struct ReplicaWorld {
     /// Newest held snapshot for a body that does not exist yet: entity → (snap,
     /// server tick it was received at).
     pending_snapshots: BTreeMap<u64, (MotionSnapshot, u64)>,
+    /// ENG-49: committed transactions whose `before` revisions did not match
+    /// live state, held (keyed by `TransactionId`) for retry once a repair
+    /// patch or the missing predecessor lands. A `before` gap must never
+    /// silently drop a committed transaction's ops. Bounded by
+    /// `config.max_pending_repair_txns`.
+    pending_repair_txns: BTreeMap<u64, TopologyTransaction>,
+    /// ENG-49: brick repair keys already asked about and not yet resolved →
+    /// the `now_tick` the `RepairRequest` was emitted, so an identical gap
+    /// inside `config.repair_request_cooldown_ticks` is not re-requested.
+    repair_requests_inflight: BTreeMap<(u64, i64, i64, i64), u64>,
     /// Highest server tick the client has observed on any record.
     now_tick: u64,
 }
@@ -186,6 +208,8 @@ impl ReplicaWorld {
             applied_tx: BTreeSet::new(),
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
+            pending_repair_txns: BTreeMap::new(),
+            repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
         }
     }
@@ -206,6 +230,8 @@ impl ReplicaWorld {
             applied_tx: BTreeSet::new(),
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
+            pending_repair_txns: BTreeMap::new(),
+            repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
         }
     }
@@ -316,6 +342,10 @@ impl ReplicaWorld {
         self.applied_tx = BTreeSet::new();
         self.control_gate = SequenceGate::new();
         self.pending_snapshots = BTreeMap::new();
+        // A fresh baseline supersedes any transaction that was held pending a
+        // repair against the old world.
+        self.pending_repair_txns = BTreeMap::new();
+        self.repair_requests_inflight = BTreeMap::new();
         self.now_tick = world.checkpoint_tick;
         Ok(())
     }
@@ -336,11 +366,22 @@ impl ReplicaWorld {
         use spall_protocol::BaselineCells;
 
         world.validate().map_err(|e| e.to_string())?;
+
+        // ENG-49: stage every brick into a clone of each named volume and swap
+        // the clones in only once the whole patch has built. A patch that fails
+        // part-way (unknown volume, malformed brick, out-of-bounds coord) never
+        // half-replaces live state — the repair either restores exact parity or
+        // changes nothing.
+        let mut staged: BTreeMap<u64, Volume> = BTreeMap::new();
         for bv in &world.volumes {
             let vid = bv.volume_id;
-            let volume = self.volumes.get_mut(&vid.get()).ok_or_else(|| {
-                format!("repair patch names volume {vid} the replica does not hold")
-            })?;
+            if let std::collections::btree_map::Entry::Vacant(slot) = staged.entry(vid.get()) {
+                let base = self.volumes.get(&vid.get()).cloned().ok_or_else(|| {
+                    format!("repair patch names volume {vid} the replica does not hold")
+                })?;
+                slot.insert(base);
+            }
+            let volume = staged.get_mut(&vid.get()).expect("just staged");
             for bb in &bv.bricks {
                 let cells: Vec<MaterialId> = match &bb.cells {
                     BaselineCells::Uniform(id) => {
@@ -362,7 +403,53 @@ impl ReplicaWorld {
                     .map_err(|e| format!("repair brick insert into {vid} failed: {e}"))?;
             }
         }
+
+        for (vid, volume) in staged {
+            self.volumes.insert(vid, volume);
+        }
+        // These repair keys are now resolved; a later gap on the same brick may
+        // request again immediately.
+        for bv in &world.volumes {
+            for bb in &bv.bricks {
+                self.repair_requests_inflight.remove(&(
+                    bv.volume_id.get(),
+                    bb.coord[0],
+                    bb.coord[1],
+                    bb.coord[2],
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Re-applies every transaction held pending a repair (see
+    /// [`ApplyOutcome::NeedsRepair`]) whose `before` revisions now match live
+    /// state. Call after [`Self::apply_baseline_patch`] or after delivering a
+    /// missing predecessor transaction. Returns one `(TransactionId,
+    /// ApplyOutcome)` per retried transaction so the caller can forward any
+    /// fresh [`RepairRequest`]s and update its counters. A transaction that
+    /// still gaps stays held (bounded); one that publishes, duplicates, or
+    /// rejects is dropped from the pending set.
+    pub fn retry_pending_repair_txns(&mut self) -> Vec<(TransactionId, ApplyOutcome)> {
+        let ids: Vec<u64> = self.pending_repair_txns.keys().copied().collect();
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(tx) = self.pending_repair_txns.get(&id).cloned() else {
+                continue;
+            };
+            let tid = tx.transaction_id;
+            let outcome = self.apply_transaction(&tx);
+            if !matches!(outcome, ApplyOutcome::NeedsRepair(_)) {
+                self.pending_repair_txns.remove(&id);
+            }
+            out.push((tid, outcome));
+        }
+        out
+    }
+
+    /// Transactions currently held awaiting a repair patch (diagnostics).
+    pub fn pending_repair_txn_count(&self) -> usize {
+        self.pending_repair_txns.len()
     }
 
     /// Adds a body that exists in the baseline scene.
@@ -446,31 +533,59 @@ impl ReplicaWorld {
         //    `before` entry of `Revision::ZERO` means the brick was absent
         //    server-side, so an absent replica brick is a match.
         let mut repairs = Vec::new();
+        let mut ahead = false;
+        let mut exact = 0usize;
         for br in &tx.before {
             let current = self
                 .volumes
                 .get(&br.volume.get())
                 .and_then(|v| v.brick_revision(br.coord).ok().flatten());
-            let matches = match (current, br.revision) {
-                (None, Revision::ZERO) => true,
-                (Some(have), want) => have == want,
-                _ => false,
-            };
-            if !matches {
-                repairs.push(RepairRequest {
-                    key: RepairKey::Brick {
-                        volume: br.volume,
-                        coord: br.coord,
-                    },
-                    expected_revision: br.revision,
-                    current_revision: current.unwrap_or(Revision::ZERO),
-                    expected_hash: Hash32::ZERO,
-                    current_hash: self.volume_hash(br.volume).unwrap_or(Hash32::ZERO),
-                });
+            let have = current.unwrap_or(Revision::ZERO);
+            if have == br.revision {
+                exact += 1;
+                continue; // exact match (incl. absent == Revision::ZERO)
             }
+            if have > br.revision {
+                // ENG-49: the replica is already *past* this transaction on
+                // this brick — a later baseline / repair patch moved it
+                // forward. Replaying the transaction's ops would double-apply.
+                ahead = true;
+                continue;
+            }
+            repairs.push(RepairRequest {
+                key: RepairKey::Brick {
+                    volume: br.volume,
+                    coord: br.coord,
+                },
+                expected_revision: br.revision,
+                current_revision: have,
+                expected_hash: Hash32::ZERO,
+                current_hash: self.volume_hash(br.volume).unwrap_or(Hash32::ZERO),
+            });
+        }
+        if ahead && exact == 0 && repairs.is_empty() {
+            // Every brick this transaction references is *strictly past* it — a
+            // later baseline / repair patch already incorporated the whole
+            // transaction. Record it applied and drop any pending hold so the
+            // replica does not loop re-requesting a repair it cannot use.
+            self.applied_tx.insert(tx.transaction_id.get());
+            self.pending_repair_txns.remove(&tx.transaction_id.get());
+            return ApplyOutcome::Duplicate;
         }
         if !repairs.is_empty() {
-            return ApplyOutcome::NeedsRepair(repairs);
+            // ENG-49: hold the whole transaction for retry once the gap is
+            // healed — a `before` mismatch must never drop a committed
+            // transaction's ops (a multi-brick edit whose other bricks matched
+            // would otherwise be lost). And rate-limit the outbound
+            // `RepairRequest`s: a key already asked about within the cooldown is
+            // not re-requested (`docs/protocol.md`: a `before` gap "raises a
+            // rate-limited `RepairRequest`").
+            self.retain_pending_repair_txn(tx.clone());
+            let fresh: Vec<RepairRequest> = repairs
+                .into_iter()
+                .filter(|r| self.should_request_repair(&r.key))
+                .collect();
+            return ApplyOutcome::NeedsRepair(fresh);
         }
 
         // 2. Replay every op into an isolated candidate.
@@ -528,6 +643,19 @@ impl ReplicaWorld {
             );
         }
         self.applied_tx.insert(tx.transaction_id.get());
+
+        // ENG-49: this transaction is applied — drop it from the pending-repair
+        // hold and clear any repair keys its `before` bricks were blocked on so
+        // a genuine later gap on the same brick can re-request at once.
+        self.pending_repair_txns.remove(&tx.transaction_id.get());
+        for br in &tx.before {
+            self.repair_requests_inflight.remove(&(
+                br.volume.get(),
+                br.coord.x,
+                br.coord.y,
+                br.coord.z,
+            ));
+        }
 
         // 5. Retire any body (including the source) that this left with no
         //    solid cell — a late motion packet can never bring it back.
@@ -651,6 +779,41 @@ impl ReplicaWorld {
         let window = self.config.pending_snapshot_ticks;
         self.pending_snapshots
             .retain(|_, (_, received)| now.saturating_sub(*received) <= window);
+    }
+
+    /// ENG-49: holds `tx` for retry once its `before` gap is repaired, keyed by
+    /// id so a re-sent transaction does not stack. Past
+    /// `config.max_pending_repair_txns` the lowest-id (oldest) hold is evicted;
+    /// the server re-delivers it on the control stream or a fresher baseline
+    /// covers it.
+    fn retain_pending_repair_txn(&mut self, tx: TopologyTransaction) {
+        self.pending_repair_txns.insert(tx.transaction_id.get(), tx);
+        while self.pending_repair_txns.len() > self.config.max_pending_repair_txns {
+            let Some((&oldest, _)) = self.pending_repair_txns.iter().next() else {
+                break;
+            };
+            self.pending_repair_txns.remove(&oldest);
+        }
+    }
+
+    /// ENG-49: `true` if a `RepairRequest` for `key` should be emitted now —
+    /// i.e. it is not already in flight, or its cooldown has elapsed. Records
+    /// the emission tick as a side effect when it returns `true`.
+    fn should_request_repair(&mut self, key: &RepairKey) -> bool {
+        let RepairKey::Brick { volume, coord } = key else {
+            return true;
+        };
+        let k = (volume.get(), coord.x, coord.y, coord.z);
+        let due = match self.repair_requests_inflight.get(&k) {
+            Some(&sent) => {
+                self.now_tick.saturating_sub(sent) >= self.config.repair_request_cooldown_ticks
+            }
+            None => true,
+        };
+        if due {
+            self.repair_requests_inflight.insert(k, self.now_tick);
+        }
+        due
     }
 }
 
@@ -906,6 +1069,86 @@ mod tests {
             other => panic!("expected NeedsRepair, got {other:?}"),
         }
         assert_eq!(replica.world_hash(), before_hash, "state untouched");
+        // ENG-49: the gapped transaction is held for retry, not dropped.
+        assert_eq!(replica.pending_repair_txn_count(), 1);
+    }
+
+    #[test]
+    fn a_repeated_gap_is_rate_limited_and_the_transaction_is_deduped() {
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(4).unwrap(),
+            server_tick: spall_core::Tick(1),
+            control_seq: spall_protocol::ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![spall_protocol::BrickRevision {
+                volume: VolumeId::new(1).unwrap(),
+                coord: BrickCoord::new(0, 0, 0),
+                revision: Revision(999),
+            }],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: VolumeId::new(1).unwrap(),
+                start: GlobalCell::new(0, 0, 0),
+                len: 1,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![],
+        };
+
+        // First delivery asks for the repair.
+        match replica.apply_transaction(&tx) {
+            ApplyOutcome::NeedsRepair(reqs) => assert_eq!(reqs.len(), 1),
+            other => panic!("expected NeedsRepair, got {other:?}"),
+        }
+        // A re-delivery inside the cooldown holds the transaction again but
+        // emits no fresh RepairRequest — the key is already in flight.
+        match replica.apply_transaction(&tx) {
+            ApplyOutcome::NeedsRepair(reqs) => {
+                assert!(reqs.is_empty(), "the repeated gap is rate-limited")
+            }
+            other => panic!("expected NeedsRepair, got {other:?}"),
+        }
+        // The transaction is held exactly once, not stacked per delivery.
+        assert_eq!(replica.pending_repair_txn_count(), 1);
+    }
+
+    #[test]
+    fn the_pending_repair_hold_is_bounded() {
+        let cfg = ReplicaConfig {
+            max_pending_repair_txns: 3,
+            ..ReplicaConfig::default()
+        };
+        let mut replica = ReplicaWorld::from_baseline(terrain(), cfg);
+        for id in 1..=10u64 {
+            let tx = TopologyTransaction {
+                transaction_id: TransactionId::new(id).unwrap(),
+                server_tick: spall_core::Tick(id),
+                control_seq: spall_protocol::ControlSeq(id),
+                algorithm_version: 1,
+                dependencies: vec![],
+                before: vec![spall_protocol::BrickRevision {
+                    volume: VolumeId::new(1).unwrap(),
+                    coord: BrickCoord::new(0, 0, 0),
+                    revision: Revision(999),
+                }],
+                after: vec![],
+                ops: vec![TopologyOp::CellRun {
+                    volume: VolumeId::new(1).unwrap(),
+                    start: GlobalCell::new(0, 0, 0),
+                    len: 1,
+                    material: MaterialId::AIR,
+                }],
+                result_hashes: vec![],
+            };
+            let _ = replica.apply_transaction(&tx);
+        }
+        assert_eq!(
+            replica.pending_repair_txn_count(),
+            3,
+            "the retained-transaction set never grows past its bound"
+        );
     }
 
     #[test]
