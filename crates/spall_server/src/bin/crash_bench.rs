@@ -60,13 +60,16 @@ fn main() -> ExitCode {
         );
     }
     println!(
-        "crash-test {}: {} scenarios, {:.0} bytes/journal-write, {:.0} commit-bytes/s, wal<= {} B",
+        "crash-test {}: {} in-process scenarios, {:.0} bytes/journal-write, {:.0} commit-bytes/s, wal<= {} B",
         report.result,
         report.scenarios.len(),
         report.metrics.bytes_per_journal_write,
         report.metrics.commit_bytes_per_sec,
         report.metrics.max_wal_bytes
     );
+    for note in &report.unrun_here {
+        println!("  NOT covered here: {note}");
+    }
     println!("summary: {}", summary.display());
 
     if report.result == "passed" {

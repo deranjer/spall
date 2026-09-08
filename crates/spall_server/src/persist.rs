@@ -403,6 +403,12 @@ pub struct CrashSuiteReport {
     pub scenarios: Vec<ScenarioResult>,
     pub workload: Workload,
     pub metrics: Metrics,
+    /// Validation this in-process suite does **not** perform, and where it is
+    /// actually exercised. The [`CrashPoint`] scenarios below model only the
+    /// API-visible effect of a crash inside one process (the pending
+    /// transaction still rolls back normally); they are not proof of recovery
+    /// after an abrupt, unclean process kill.
+    pub unrun_here: Vec<String>,
 }
 
 /// Workload the scenarios actually drove.
@@ -450,10 +456,18 @@ fn scripted_bridge_cut() -> Simulation {
     sim
 }
 
-/// Runs the persistence crash-point / disk-fault matrix end-to-end through a
-/// real [`Simulation`] (bridge scene, column cut → beam detaches) and asserts
-/// the durable prefix after recovery. Writes nothing itself; the caller
-/// serialises the returned report to `summary.json`.
+/// Runs the persistence crash-point / disk-fault matrix through a real
+/// [`Simulation`] (bridge scene, column cut → beam detaches) and asserts the
+/// durable prefix after recovery. Writes nothing itself; the caller serialises
+/// the returned report to `summary.json`.
+///
+/// Scope (ENG-51): the [`CrashPoint`] scenarios here run in **one process** and
+/// model the API-visible effect of a crash — the pending SQLite transaction
+/// still rolls back cleanly. Recovery after an abrupt, unclean process kill is
+/// validated separately by the child-process harness
+/// (`cargo test -p spall_store --test abrupt_crash`), reported in `unrun_here`.
+/// The `real_write_failure` scenario below *does* exercise a genuine SQLite
+/// engine write error end to end, including [`crate::Writer`] poisoning via `?`.
 pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport, PersistError> {
     use spall_sim::{SimulationConfig, fixtures};
 
@@ -655,6 +669,43 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         ));
     }
 
+    // 7. A *real* SQLite engine write failure on the journal (not a pre-`COMMIT`
+    //    branch): no durable ack, writer poisoned, nothing recovered.
+    {
+        let db = next_db();
+        let mut w = spall_store::Writer::open(&db)?;
+        w.publish_checkpoint(&checkpoint0)?;
+        w.set_faults(FaultPlan::real_sqlite_write_failure());
+        let failed = matches!(
+            w.append_journal(&journal),
+            Err(spall_store::StoreError::Sqlite(_))
+        );
+        let poisoned = w.is_poisoned();
+        // Poisoned writer refuses all further durable work.
+        let refuses_more = matches!(
+            w.publish_checkpoint(&checkpoint1),
+            Err(spall_store::StoreError::Poisoned(_))
+        );
+        drop(w);
+        let rec = spall_store::recover(&db)?;
+        let (sim, seq) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        scenarios.push(check(
+            "real_write_failure_on_journal",
+            failed
+                && poisoned
+                && refuses_more
+                && rec.journal.is_empty()
+                && rec.corruption.is_empty()
+                && seq == 0
+                && sim.world().body_count() == pre_cut_bodies,
+            format!(
+                "failed={failed}, poisoned={poisoned}, refuses_more={refuses_more}, \
+                 journal_suffix={}, durable_seq={seq}",
+                rec.journal.len()
+            ),
+        ));
+    }
+
     let all_passed = scenarios.iter().all(|s| s.passed);
     Ok(CrashSuiteReport {
         version: 1,
@@ -667,6 +718,12 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
             journal_records: journal.len(),
         },
         metrics,
+        unrun_here: vec![
+            "abrupt-process-death recovery (real, unclean process kill at journal \
+             and checkpoint publication boundaries) — exercised by `cargo test -p \
+             spall_store --test abrupt_crash`, not by this in-process suite"
+                .to_string(),
+        ],
     })
 }
 

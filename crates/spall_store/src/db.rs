@@ -128,6 +128,23 @@ impl Writer {
         }
     }
 
+    /// Arms `query_only` on the connection so the next staged write fails with a
+    /// genuine `rusqlite` engine error (`FaultPlan::real_write_failure`). Called
+    /// just before the durable transaction opens.
+    fn maybe_arm_real_write_failure(&mut self) -> Result<(), StoreError> {
+        if std::mem::take(&mut self.faults.real_write_failure) {
+            self.conn.pragma_update(None, "query_only", "ON")?;
+        }
+        Ok(())
+    }
+
+    /// Best-effort clear of an armed `query_only` after a real-write-failure
+    /// injection. The writer is already poisoned by this point; this only keeps
+    /// a reused connection sane for read-only [`Writer::recover`].
+    fn disarm_real_write_failure(&mut self) {
+        let _ = self.conn.pragma_update(None, "query_only", "OFF");
+    }
+
     /// Highest journal sequence currently stored (`0` if the journal is empty).
     pub fn journal_max_seq(&self) -> Result<u64, StoreError> {
         let v: i64 = self
@@ -180,49 +197,69 @@ impl Writer {
             }
         }
 
-        let mut payload_bytes = 0u64;
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO journal (seq, tick, payload, crc) VALUES (?, ?, ?, ?)",
-            )?;
-            for r in records {
-                let body = dto::encode(&r.payload)?;
-                let crc = crc16(&body);
-                stmt.execute(params![r.seq as i64, r.tick as i64, &body, &crc])?;
-                payload_bytes += body.len() as u64;
+        // Arm a genuine engine write failure (if requested) before the txn opens.
+        self.maybe_arm_real_write_failure()?;
+
+        // The durable step runs against disjoint field borrows so that *any*
+        // failure — a real `rusqlite` error propagated by `?` included — falls
+        // through to `poison` below. Nothing on this path may return `Err`
+        // without poisoning the writer (`docs/protocol.md`: "stop accepting
+        // persistent edits and return an error").
+        let conn = &mut self.conn;
+        let faults = &mut self.faults;
+        let metrics = &mut self.metrics;
+        let outcome = (|| -> Result<u64, StoreError> {
+            let mut payload_bytes = 0u64;
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO journal (seq, tick, payload, crc) VALUES (?, ?, ?, ?)",
+                )?;
+                for r in records {
+                    let body = dto::encode(&r.payload)?;
+                    let crc = crc16(&body);
+                    stmt.execute(params![r.seq as i64, r.tick as i64, &body, &crc])?;
+                    payload_bytes += body.len() as u64;
+                }
+            }
+
+            if faults.take_crash(CrashPoint::BeforeJournalCommit) {
+                drop(tx); // rollback
+                return Err(StoreError::CrashInjected(CrashPoint::BeforeJournalCommit));
+            }
+            if std::mem::take(&mut faults.fail_journal_commit) {
+                drop(tx); // rollback
+                return Err(StoreError::Disk("journal commit failed (injected)".into()));
+            }
+
+            let started = Instant::now();
+            tx.commit()?;
+            metrics.record_commit(started.elapsed());
+            metrics.journal_commits += 1;
+            metrics.journal_records += records.len() as u64;
+            metrics.journal_payload_bytes += payload_bytes;
+
+            let last = records.last().expect("non-empty checked above").seq;
+
+            if faults.take_crash(CrashPoint::AfterJournalCommit) {
+                // The batch *is* durable, but the caller must re-open before any
+                // further durable call — the ack was never delivered.
+                return Err(StoreError::CrashInjected(CrashPoint::AfterJournalCommit));
+            }
+            Ok(last)
+        })();
+
+        self.observe_wal();
+        match outcome {
+            Ok(last) => Ok(DurableThrough {
+                journal_seq: JournalSeq(last),
+            }),
+            Err(e) => {
+                self.disarm_real_write_failure();
+                self.poison(format!("durable journal write failed: {e}"));
+                Err(e)
             }
         }
-
-        if self.faults.take_crash(CrashPoint::BeforeJournalCommit) {
-            drop(tx); // rollback
-            self.poison("crash: BeforeJournalCommit");
-            return Err(StoreError::CrashInjected(CrashPoint::BeforeJournalCommit));
-        }
-        if std::mem::take(&mut self.faults.fail_journal_commit) {
-            drop(tx); // rollback
-            self.poison("disk: journal commit failed");
-            return Err(StoreError::Disk("journal commit failed (injected)".into()));
-        }
-
-        let started = Instant::now();
-        tx.commit()?;
-        self.metrics.record_commit(started.elapsed());
-        self.metrics.journal_commits += 1;
-        self.metrics.journal_records += records.len() as u64;
-        self.metrics.journal_payload_bytes += payload_bytes;
-        self.observe_wal();
-
-        let last = records.last().expect("non-empty checked above").seq;
-
-        if self.faults.take_crash(CrashPoint::AfterJournalCommit) {
-            self.poison("crash: AfterJournalCommit");
-            return Err(StoreError::CrashInjected(CrashPoint::AfterJournalCommit));
-        }
-
-        Ok(DurableThrough {
-            journal_seq: JournalSeq(last),
-        })
     }
 
     /// Writes every body/brick row of `checkpoint`, the world metadata, and the
@@ -240,109 +277,123 @@ impl Writer {
 
         let meta_blob = dto::encode(&checkpoint.meta)?;
         let now_ms = unix_millis();
-        let mut payload_bytes = 0u64;
 
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT OR REPLACE INTO checkpoints \
-             (tick, journal_cursor, world_hash, meta, complete, created_unix_ms) \
-             VALUES (?, ?, ?, ?, 0, ?)",
-            params![
-                checkpoint.tick as i64,
-                checkpoint.journal_cursor as i64,
-                &checkpoint.world_hash[..],
-                &meta_blob,
-                now_ms,
-            ],
-        )?;
-        // A re-published tick starts clean.
-        tx.execute(
-            "DELETE FROM checkpoint_bodies WHERE tick = ?",
-            params![checkpoint.tick as i64],
-        )?;
-        tx.execute(
-            "DELETE FROM checkpoint_bricks WHERE tick = ?",
-            params![checkpoint.tick as i64],
-        )?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO checkpoint_bodies (tick, entity_id, body) VALUES (?, ?, ?)",
-            )?;
-            for body in &checkpoint.bodies {
-                let blob = dto::encode(body)?;
-                payload_bytes += blob.len() as u64;
-                stmt.execute(params![
+        self.maybe_arm_real_write_failure()?;
+
+        // Disjoint field borrows so every failure path — real `rusqlite` errors
+        // propagated by `?` included — poisons the writer below.
+        let conn = &mut self.conn;
+        let faults = &mut self.faults;
+        let metrics = &mut self.metrics;
+        let outcome = (|| -> Result<(), StoreError> {
+            let mut payload_bytes = 0u64;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT OR REPLACE INTO checkpoints \
+                 (tick, journal_cursor, world_hash, meta, complete, created_unix_ms) \
+                 VALUES (?, ?, ?, ?, 0, ?)",
+                params![
                     checkpoint.tick as i64,
-                    body.entity_id as i64,
-                    &blob
-                ])?;
-            }
-        }
-
-        if self.faults.take_crash(CrashPoint::MidCheckpointRows) {
-            drop(tx);
-            self.poison("crash: MidCheckpointRows");
-            return Err(StoreError::CrashInjected(CrashPoint::MidCheckpointRows));
-        }
-
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO checkpoint_bricks \
-                 (tick, volume_id, bx, by, bz, revision, edited, payload) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    checkpoint.journal_cursor as i64,
+                    &checkpoint.world_hash[..],
+                    &meta_blob,
+                    now_ms,
+                ],
             )?;
-            for brick in &checkpoint.bricks {
-                let blob = dto::encode(&brick.payload)?;
-                payload_bytes += blob.len() as u64;
-                stmt.execute(params![
-                    checkpoint.tick as i64,
-                    brick.volume_id as i64,
-                    brick.coord[0],
-                    brick.coord[1],
-                    brick.coord[2],
-                    brick.revision as i64,
-                    brick.edited,
-                    &blob,
-                ])?;
+            // A re-published tick starts clean.
+            tx.execute(
+                "DELETE FROM checkpoint_bodies WHERE tick = ?",
+                params![checkpoint.tick as i64],
+            )?;
+            tx.execute(
+                "DELETE FROM checkpoint_bricks WHERE tick = ?",
+                params![checkpoint.tick as i64],
+            )?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO checkpoint_bodies (tick, entity_id, body) VALUES (?, ?, ?)",
+                )?;
+                for body in &checkpoint.bodies {
+                    let blob = dto::encode(body)?;
+                    payload_bytes += blob.len() as u64;
+                    stmt.execute(params![
+                        checkpoint.tick as i64,
+                        body.entity_id as i64,
+                        &blob
+                    ])?;
+                }
             }
-        }
 
-        tx.execute(
-            "INSERT OR REPLACE INTO world (id, meta) VALUES (1, ?)",
-            params![&meta_blob],
-        )?;
-        tx.execute(
-            "UPDATE checkpoints SET complete = 1 WHERE tick = ?",
-            params![checkpoint.tick as i64],
-        )?;
+            if faults.take_crash(CrashPoint::MidCheckpointRows) {
+                drop(tx);
+                return Err(StoreError::CrashInjected(CrashPoint::MidCheckpointRows));
+            }
 
-        if self.faults.take_crash(CrashPoint::BeforeCheckpointCommit) {
-            drop(tx);
-            self.poison("crash: BeforeCheckpointCommit");
-            return Err(StoreError::CrashInjected(
-                CrashPoint::BeforeCheckpointCommit,
-            ));
-        }
-        if std::mem::take(&mut self.faults.fail_checkpoint_commit) {
-            drop(tx);
-            self.poison("disk: checkpoint commit failed");
-            return Err(StoreError::Disk(
-                "checkpoint commit failed (injected)".into(),
-            ));
-        }
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO checkpoint_bricks \
+                     (tick, volume_id, bx, by, bz, revision, edited, payload) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )?;
+                for brick in &checkpoint.bricks {
+                    let blob = dto::encode(&brick.payload)?;
+                    payload_bytes += blob.len() as u64;
+                    stmt.execute(params![
+                        checkpoint.tick as i64,
+                        brick.volume_id as i64,
+                        brick.coord[0],
+                        brick.coord[1],
+                        brick.coord[2],
+                        brick.revision as i64,
+                        brick.edited,
+                        &blob,
+                    ])?;
+                }
+            }
 
-        let started = Instant::now();
-        tx.commit()?;
-        self.metrics.record_commit(started.elapsed());
-        self.metrics.checkpoint_publishes += 1;
-        self.metrics.checkpoint_payload_bytes += payload_bytes;
+            tx.execute(
+                "INSERT OR REPLACE INTO world (id, meta) VALUES (1, ?)",
+                params![&meta_blob],
+            )?;
+            tx.execute(
+                "UPDATE checkpoints SET complete = 1 WHERE tick = ?",
+                params![checkpoint.tick as i64],
+            )?;
+
+            if faults.take_crash(CrashPoint::BeforeCheckpointCommit) {
+                drop(tx);
+                return Err(StoreError::CrashInjected(
+                    CrashPoint::BeforeCheckpointCommit,
+                ));
+            }
+            if std::mem::take(&mut faults.fail_checkpoint_commit) {
+                drop(tx);
+                return Err(StoreError::Disk(
+                    "checkpoint commit failed (injected)".into(),
+                ));
+            }
+
+            let started = Instant::now();
+            tx.commit()?;
+            metrics.record_commit(started.elapsed());
+            metrics.checkpoint_publishes += 1;
+            metrics.checkpoint_payload_bytes += payload_bytes;
+
+            if faults.take_crash(CrashPoint::AfterCheckpointCommit) {
+                return Err(StoreError::CrashInjected(CrashPoint::AfterCheckpointCommit));
+            }
+            Ok(())
+        })();
+
         self.observe_wal();
-
-        if self.faults.take_crash(CrashPoint::AfterCheckpointCommit) {
-            self.poison("crash: AfterCheckpointCommit");
-            return Err(StoreError::CrashInjected(CrashPoint::AfterCheckpointCommit));
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.disarm_real_write_failure();
+                self.poison(format!("durable checkpoint write failed: {e}"));
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     /// Keeps the newest `keep` complete checkpoints and drops older ones, then

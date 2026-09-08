@@ -501,6 +501,78 @@ fn retain_drops_old_checkpoints_and_covered_journal() {
 }
 
 #[test]
+fn real_sqlite_write_failure_on_journal_poisons_and_reports_no_success() {
+    // A genuine engine-level write error (not a pre-`COMMIT` branch): the
+    // connection is switched to `query_only`, so the staged `INSERT` returns a
+    // real `rusqlite::Error` that propagates through `?`. The writer must poison
+    // and no `DurableThrough` may be produced.
+    let s = Scratch::new("real_io_j");
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+        w.set_faults(FaultPlan::real_sqlite_write_failure());
+        let err = w
+            .append_journal(&[split_record(1, 1), pose_batch(2, 2)])
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected a real rusqlite error, got {err:?}"
+        );
+        assert!(
+            w.is_poisoned(),
+            "a real write failure must poison the writer"
+        );
+        // Every further durable call is refused until re-open.
+        assert!(matches!(
+            w.append_journal(&[split_record(1, 1)]),
+            Err(StoreError::Poisoned(_))
+        ));
+        assert!(matches!(
+            w.publish_checkpoint(&checkpoint(10, 0)),
+            Err(StoreError::Poisoned(_))
+        ));
+    }
+    // Nothing was made durable; the checkpoint at tick 0 still stands alone.
+    let rec = recover(s.db()).unwrap();
+    assert_eq!(rec.durable_through, 0);
+    assert!(rec.journal.is_empty());
+    assert!(
+        rec.corruption.is_empty(),
+        "rolled back cleanly, not corrupt"
+    );
+    assert_eq!(rec.checkpoint.tick, 0);
+
+    // A fresh writer resumes cleanly at seq 1.
+    let mut w = Writer::open(s.db()).unwrap();
+    assert_eq!(w.journal_max_seq().unwrap(), 0);
+    w.append_journal(&[split_record(1, 1)]).unwrap();
+}
+
+#[test]
+fn real_sqlite_write_failure_on_checkpoint_poisons_and_keeps_prior_checkpoint() {
+    let s = Scratch::new("real_io_cp");
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(100, 0)).unwrap();
+        w.append_journal(&[pose_batch(1, 1)]).unwrap();
+        w.set_faults(FaultPlan::real_sqlite_write_failure());
+        let err = w.publish_checkpoint(&checkpoint(200, 1)).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected a real rusqlite error, got {err:?}"
+        );
+        assert!(w.is_poisoned());
+    }
+    let rec = recover(s.db()).unwrap();
+    assert_eq!(
+        rec.checkpoint.tick, 100,
+        "the failed checkpoint never became visible"
+    );
+    assert!(rec.previous_checkpoint.is_none());
+    assert_eq!(rec.durable_through, 1);
+}
+
+#[test]
 fn metrics_expose_bytes_and_commit_rate() {
     let s = Scratch::new("metrics");
     let mut w = Writer::open(s.db()).unwrap();
