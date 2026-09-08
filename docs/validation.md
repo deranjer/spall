@@ -39,6 +39,15 @@ checkpoints on `--checkpoint-interval-ticks` and clean shutdown. `cargo xtask
 crash-test --suite persistence` runs the crash-point / disk-fault matrix
 end-to-end through a real `Simulation` (bridge scene → column cut → beam
 detaches) and writes `summary.json` with the measured bytes/write rate.
+Durable writes go through `spall_server::persist_pipeline::PersistPipeline`: a
+single off-thread `Writer` fed a **bounded** queue of immutable
+snapshots/records, so a disk stall never stalls physics; a full backlog or a
+failed write stops the run rather than continuing an unsavable world. The
+integrator journals periodic 20 Hz body pose batches on a sequence contiguous
+with the topology transactions, so a crash rewinds motion only to the latest
+durable pose batch. `cargo test -p spall_server --test persist_pipeline`
+reports retained-snapshot memory (max queue depth) and flush / checkpoint
+latency.
 T17 adds live late join: `sandbox-client --connect --late-join` pulls a
 dependency-complete `BaselineWorld` over a bulk transfer instead of installing
 the fixed scene, drains the server's bounded catch-up queue, and reaches the

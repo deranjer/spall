@@ -8,6 +8,7 @@
 
 pub mod baseline;
 pub mod persist;
+pub mod persist_pipeline;
 pub mod serve;
 
 pub use baseline::{
@@ -16,7 +17,11 @@ pub use baseline::{
 };
 pub use persist::{
     CrashSuiteReport, PersistConfig, PersistError, ScenarioResult, capture, journal_records,
-    restore, run_crash_suite,
+    pose_batch_record, restore, run_crash_suite,
+};
+pub use persist_pipeline::{
+    DEFAULT_QUEUE_CAPACITY, PersistPipeline, PipelineConfig, PipelineError, PipelineOutcome,
+    PipelineStatus,
 };
 pub use serve::{Scene, ServeConfig, ServeError, ServeSummary, serve};
 

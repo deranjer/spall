@@ -5,12 +5,14 @@
 //! that `spall_store` carries never enters the pure simulation crate
 //! (`docs/architecture.md` "Persistence and recovery").
 //!
-//! What is journalled: committed [`spall_protocol::TopologyTransaction`]s only,
-//! keyed by the simulation's own `JournalSeq`, each carrying its participant
-//! body snapshots. Periodic 20 Hz pose-batch journaling is deferred; a crash
-//! rewinds body motion to the last checkpoint / last topology-transaction
-//! participant state, which `docs/protocol.md` permits ("A crash can lose the
-//! unflushed suffix and rewind motion to the latest durable pose batch").
+//! What is journalled: committed [`spall_protocol::TopologyTransaction`]s, each
+//! keyed by the simulation's own `JournalSeq` and carrying its participant body
+//! snapshots, **plus** periodic 20 Hz body pose batches
+//! ([`pose_batch_record`]) that share the same contiguous sequence space
+//! (ENG-50). A crash loses only the unflushed suffix and rewinds body motion to
+//! the latest durable pose batch, exactly as `docs/protocol.md` permits ("A
+//! crash can lose the unflushed suffix and rewind motion to the latest durable
+//! pose batch").
 
 use glam::DQuat;
 use spall_core::{
@@ -201,6 +203,22 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
             })
         })
         .collect()
+}
+
+/// Builds one periodic 20 Hz pose-batch [`JournalRecord`] (`docs/protocol.md`:
+/// "Journal periodic body pose batches at 20 Hz"). `seq` is an integrator-owned
+/// [`spall_sim::Simulation::reserve_journal_seq`] value, contiguous with the
+/// committed topology transactions.
+pub fn pose_batch_record(
+    seq: u64,
+    tick: u64,
+    snapshots: &[spall_protocol::MotionSnapshot],
+) -> Result<JournalRecord, PersistError> {
+    Ok(JournalRecord {
+        seq,
+        tick,
+        payload: JournalPayload::pose_batch(snapshots)?,
+    })
 }
 
 // --- restore ----------------------------------------------------------
