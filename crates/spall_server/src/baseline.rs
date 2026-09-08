@@ -62,10 +62,7 @@ pub enum BaselineError {
 /// with the current tick.
 pub fn world_baseline(sim: &Simulation) -> BaselineWorld {
     let world = sim.world();
-    let mut volumes = vec![baseline_volume(
-        world.terrain(),
-        BaselineOwner::Terrain,
-    )];
+    let mut volumes = vec![baseline_volume(world.terrain(), BaselineOwner::Terrain)];
     for body in world.bodies() {
         let entity = body.entity.expect("a detached body carries an entity id");
         volumes.push(baseline_volume(body, BaselineOwner::Body(entity)));
@@ -88,7 +85,12 @@ pub fn capture_transfer(
     interest_epoch: InterestEpoch,
     journal_cursor: JournalSeq,
 ) -> Result<BaselineTransfer, BaselineError> {
-    transfer_from_world(world_baseline(sim), transfer_id, interest_epoch, journal_cursor)
+    transfer_from_world(
+        world_baseline(sim),
+        transfer_id,
+        interest_epoch,
+        journal_cursor,
+    )
 }
 
 /// Packages an already-built [`BaselineWorld`] (a full snapshot or a one-brick
@@ -118,11 +120,7 @@ pub fn transfer_from_world(
     debug_assert!(!parts.is_empty());
 
     let assembled_hash = Hash32::of(&payload);
-    let regions: Vec<BaselineRegion> = world
-        .volumes
-        .iter()
-        .filter_map(region_of)
-        .collect();
+    let regions: Vec<BaselineRegion> = world.volumes.iter().filter_map(region_of).collect();
 
     let begin = BaselineBegin {
         transfer_id,
@@ -166,7 +164,9 @@ pub fn chunk_payload(payload: &[u8], transfer_id: TransferId) -> Vec<BaselinePar
 
 /// Reassembles and decodes a received part list (client side helper; also used
 /// by the server-side round-trip test).
-pub fn assemble(parts: &[BaselinePart]) -> Result<BaselineWorld, spall_protocol::BaselineDecodeError> {
+pub fn assemble(
+    parts: &[BaselinePart],
+) -> Result<BaselineWorld, spall_protocol::BaselineDecodeError> {
     let mut bytes = Vec::new();
     for part in parts {
         bytes.extend_from_slice(&part.payload);
@@ -239,7 +239,9 @@ fn baseline_volume(body: &Body, owner: BaselineOwner) -> BaselineVolume {
 }
 
 fn cells_of(snap: &BrickSnapshot) -> BaselineCells {
-    let first = snap.get(LocalCell::from_linear_index(0).expect("0 < 32768")).raw();
+    let first = snap
+        .get(LocalCell::from_linear_index(0).expect("0 < 32768"))
+        .raw();
     let mut uniform = true;
     let mut dense = vec![0u16; CELLS_PER_BRICK];
     for (i, slot) in dense.iter_mut().enumerate() {
@@ -324,19 +326,13 @@ mod tests {
             sim.current_tick().get()
         );
         // One region per volume (terrain + every body).
-        assert_eq!(
-            transfer.begin.regions.len(),
-            sim.world().body_count() + 1
-        );
+        assert_eq!(transfer.begin.regions.len(), sim.world().body_count() + 1);
 
         // Reassembly reproduces the captured world exactly.
         let rebuilt = assemble(&transfer.parts).unwrap();
         assert_eq!(rebuilt, transfer.world);
         assert_eq!(rebuilt.volumes.len(), sim.world().body_count() + 1);
-        assert_eq!(
-            Hash32::of(&rebuilt.encode()),
-            transfer.end.assembled_hash
-        );
+        assert_eq!(Hash32::of(&rebuilt.encode()), transfer.end.assembled_hash);
     }
 
     #[test]

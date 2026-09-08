@@ -93,7 +93,7 @@ Physics must never collide with a deleted wall or fall through a newly built wal
 
 T08 outcome (`spall_sim`): the whole path above is implemented for the all-resident G1 case. An accepted `EditIntent` is staged off-tick against an immutable snapshot (`stage_edit`) — deterministic brush plan, dry-run `EditOutcome`, `spall_structure` re-classification, and a `JobToken` over every brick read — then committed atomically at a tick boundary (`commit`). A stale token at commit means an earlier commit that tick touched a shared brick; the intent is recomputed and retried in request order, and a region that keeps losing that race is routed through a bounded serial queue (one commit per tick) so it still progresses. On commit the brush is applied to the live volume, every unsupported component (terrain) or every non-largest component (a free dynamic body) is copied into a new body **at its exact split-instant world location** with mass from the fine voxel grid and velocity `v_parent + omega_parent x (r_child_com - r_parent_com)` plus a one-time explosion impulse, and every affected collider is rebuilt in the same tick. A repeated `RequestId` returns the existing `ActionStatus` and can never cut twice or apply a second impulse. The collider budget from `docs/collision-decision.md` (`B = 4096` merged boxes, then a conservative same-resolution coarsen) is enforced here. Terrain-to-body and body-to-body transfer do **not** re-centre the child onto its COM: keeping the child's cells and transform identical to the parent's is the exact preservation the architecture requires, and `spall_physics` carries the off-origin COM. No replication, persistence, player movement, or contact-to-intent conversion is in T08.
 
-T10 outcome (`spall_sim` replication surface + `spall_server` / `spall_client`): a committed `TopologyTransaction` is now **self-describing**. `spall_sim::commit` appends, after the `IntegerBrush` op and each `SplitOff`, explicit canonical `+X` `TopologyOp::CellRun`s — one group filling each child volume with its detached cells' materials, then the runs that set those cells to air in the source — so a replica reconstructs an exact split with no `spall_structure` (`docs/protocol.md`: "canonical source-cell ranges ... not a client rerun of ... support heuristics"). A split whose runs would exceed `MAX_TRANSACTION_OPS` fails the commit rather than emitting a transaction a replica cannot fully apply; the baseline-blob path is T17. `spall_sim` also exposes the per-tick server feed (committed transactions, `ActionStatus`, a 20 Hz `MotionPublisher`, a `RepairRequest` → `CellRun` responder). `spall_client::replica::ReplicaWorld` holds the last consistent view as plain `spall_voxel` volumes and applies each transaction **candidate-first**: it checks every `before` brick revision against the live replica (a `Revision::ZERO` entry means "was absent"), replays the ops into an isolated clone, verifies every declared `result_hash`, and only then swaps it in — a `before` gap yields `RepairRequest`s and no mutation, any op or hash failure is rejected whole. The applied-`TransactionId` set is the replay guard; the control `SequenceGate` only tracks the high-water mark so a catch-up delivery of an earlier transaction is still evaluated. An emptied body (source or child) is tombstoned and a late motion packet can never resurrect it. `MotionTrack` holds the two newest accepted states for interpolation and one newest pending snapshot for a body the replica has not created yet (or whose topology revision it has not reached). `spall_server::serve` runs the authoritative `Simulation` on a blocking thread behind a `spall_net` QUIC endpoint and fans committed transactions + `ActionStatus` to every client's reliable control stream in commit order, with motion as datagrams; `spall_client::net` is the headless replica client. Late live join, hash-repair with a full baseline, player prediction, and persistence remain later tasks (T16/T17/T19).
+T10 outcome (`spall_sim` replication surface + `spall_server` / `spall_client`): a committed `TopologyTransaction` is now **self-describing**. `spall_sim::commit` appends, after the `IntegerBrush` op and each `SplitOff`, explicit canonical `+X` `TopologyOp::CellRun`s — one group filling each child volume with its detached cells' materials, then the runs that set those cells to air in the source — so a replica reconstructs an exact split with no `spall_structure` (`docs/protocol.md`: "canonical source-cell ranges ... not a client rerun of ... support heuristics"). A split whose runs would exceed `MAX_TRANSACTION_OPS` fails the commit rather than emitting a transaction a replica cannot fully apply; the baseline-blob path is T17. `spall_sim` also exposes the per-tick server feed (committed transactions, `ActionStatus`, a 20 Hz `MotionPublisher`, a `RepairRequest` → `CellRun` responder). `spall_client::replica::ReplicaWorld` holds the last consistent view as plain `spall_voxel` volumes and applies each transaction **candidate-first**: it checks every `before` brick revision against the live replica (a `Revision::ZERO` entry means "was absent"), replays the ops into an isolated clone, verifies every declared `result_hash`, and only then swaps it in — a `before` gap yields `RepairRequest`s and no mutation, any op or hash failure is rejected whole. The applied-`TransactionId` set is the replay guard; the control `SequenceGate` only tracks the high-water mark so a catch-up delivery of an earlier transaction is still evaluated. An emptied body (source or child) is tombstoned and a late motion packet can never resurrect it. `MotionTrack` holds the two newest accepted states for interpolation and one newest pending snapshot for a body the replica has not created yet (or whose topology revision it has not reached). `spall_server::serve` runs the authoritative `Simulation` on a blocking thread behind a `spall_net` QUIC endpoint and fans committed transactions + `ActionStatus` to every client's reliable control stream in commit order, with motion as datagrams; `spall_client::net` is the headless replica client. Live late join and hash repair land in T17; player prediction remains a later task (T19).
 
 ## Structural connectivity and collapse
 
@@ -207,3 +207,38 @@ checkpoint / last topology-record participant state, which the
 from the transaction's own canonical fill runs and the participant snapshot (no
 `spall_structure` re-run) and resumes the id counters past everything the
 suffix consumed, so a post-restart edit still commits with fresh ids.
+
+## Live late join, repair, reconnect (T17)
+
+`spall_protocol::baseline` adds `BaselineWorld` — a postcard payload carrying
+**authoritative geometry only**: every resident brick of every volume with its
+real revision and material layer, plus the owner (terrain / body). Motion is
+excluded; a `MotionSnapshot` keyframe follows the catch-up barrier. Because the
+payload carries real revisions, a late-join replica reaches the exact canonical
+topology hash with no follow-up edit replay and no repair.
+
+`spall_server::baseline` captures a `BaselineWorld` from the live `SimWorld` at
+the current tick, chunks it into hashed `BaselinePart`s under the 1 MiB
+bulk-part / 64 MiB assembled ceilings, and builds `BaselineBegin` /
+`BaselineEnd` with `journal_cursor = J`. `brick_repair_patch` builds a
+one-brick authoritative patch from a `RepairRequest`.
+
+`spall_server::serve` runs a per-client `LateJoin` bridge alongside the tick
+loop. A joining replica sends a `BaselineAck` sentinel (`transfer_id == 0`); the
+server captures a baseline, streams `BaselineBegin` (control) + parts (a bulk
+stream) + `BaselineEnd` (control), and moves that client to a `Joining` phase
+whose committed transactions are buffered in a bounded catch-up queue instead
+of broadcast. On the client's real `BaselineAck` the queue is flushed in commit
+order, a current motion keyframe for every body follows, and the client goes
+`Live`. Already-connected clients never pause. A catch-up queue past
+`catch_up_cap` cancels the transfer and re-captures a fresher one; after
+`max_join_retries` the joiner is dropped with an explicit goodbye while everyone
+else keeps running. A brick `RepairRequest` is now answered with a one-brick
+authoritative baseline patch (full parity, revision included) — the T10
+`CellRun` reply healed cell content but not revision. Reconnect: `Inbound::Joined`
+tracks the highest session generation per connection slot, and an
+`ActionRequest` / `RepairRequest` from a superseded generation is rejected
+("expired session"). `spall_client::net --late-join` pulls the baseline over
+the bulk transfer before touching the replication stream and applies a
+mid-session `BaselineBegin` as a repair patch. No new external dependency; no
+change to the frozen wire record set (the sentinel reuses `BaselineAck`).

@@ -1,0 +1,16 @@
+{
+  "name": "late-join-collapse",
+  "description": "T17. Clients 0 and 1 keep cutting: client 0 detaches the bridge beam then excavates the floor along +X, client 1 excavates a separate brick. Client 2 is a --late-join replica that connects ~900 ms in, pulls a dependency-complete baseline over a real QUIC bulk transfer, drains the server's catch-up queue, and lands one cut of its own. The server and all three clients must converge to one canonical topology hash; the server must report one completed late join.",
+  "server_ticks": 600,
+  "clients": 3,
+  "late_join_clients": [2],
+  "late_join_connect_delay_ms": 900,
+  "cuts": [
+    { "client": 0, "at_tick": 4,  "cell": [10, 4, 1], "radius": 2 },
+    { "client": 0, "at_tick": 30, "cell": [3, 1, 1],  "radius": 1 },
+    { "client": 0, "at_tick": 60, "cell": [5, 1, 1],  "radius": 1 },
+    { "client": 0, "at_tick": 90, "cell": [7, 1, 1],  "radius": 1 },
+    { "client": 1, "at_tick": 45, "cell": [9, 1, 1],  "radius": 1 },
+    { "client": 2, "at_tick": 120, "cell": [12, 1, 1], "radius": 1 }
+  ]
+}

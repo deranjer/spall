@@ -34,6 +34,16 @@ checkpoints on `--checkpoint-interval-ticks` and clean shutdown. `cargo xtask
 crash-test --suite persistence` runs the crash-point / disk-fault matrix
 end-to-end through a real `Simulation` (bridge scene → column cut → beam
 detaches) and writes `summary.json` with the measured bytes/write rate.
+T17 adds live late join: `sandbox-client --connect --late-join` pulls a
+dependency-complete `BaselineWorld` over a bulk transfer instead of installing
+the fixed scene, drains the server's bounded catch-up queue, and reaches the
+authoritative topology hash with no edit replay. A scenario file may list
+`late_join_clients` (and `late_join_connect_delay_ms`); those clients connect
+after the tick loop is running and are excluded from `--min-clients`. Built-in
+`late-join-collapse` runs one server + two early cutters + one late-join
+replica. Mid-session brick `RepairRequest`s are answered with a one-brick
+authoritative baseline patch (exact revision parity), and a reconnected session
+generation invalidates the prior one server-side.
 `capture` and `bench` still return an explicit unavailable-capability result
 until their listed tasks are delivered. All numerical limits are provisional
 acceptance targets. None is a measured result.
@@ -71,6 +81,10 @@ cargo xtask session --scenario fixtures/scenarios/tower-cut.json --clients 2 --o
 # Named built-in scenario. --loss-percent runs each client behind a UDP proxy
 # that drops/delays/reorders encrypted packets.
 cargo xtask scenario --name destruction-network --loss-percent 5 --output .local/runs/network
+
+# T17: two early cutters plus one --late-join replica that connects mid-collapse,
+# pulls a baseline over a bulk transfer, and catches up to the server hash.
+cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 
 # Offscreen GPU rendering still requires a supported GPU/driver.
 cargo xtask capture --scene colored-room --camera fixtures/cameras/colored-room.toml --size 1920x1080 --frames 120 --output .local/runs/lighting

@@ -212,3 +212,40 @@ Authentication limits apply to QUIC establishment plus the application exchange.
 The datagram cap includes the 8-byte transport sequence and the inner protocol frame. Bulk caps count payload bytes, with bounded metadata overhead added to framing. `collect_parts` handles one ordered transfer per stream, with indices starting at zero, one transfer ID, at most 4096 parts, and verified part hashes. Compression is not implemented at this stage; received payload bytes are never decompressed in T09.
 
 Hosts must own and run one `Connection::run_liveness` future plus their receive pumps. It exits on connection close or stop-channel closure; stalled heartbeat writes close the connection. Canceling a partially completed stream read/write requires closing that connection, not retrying from a guessed frame boundary. The harness owns its child tasks and aborts them on early errors/timeouts. UDP proxy delays use a single owned queue (1024 packets and 2 MiB maximum); excess packets are dropped and queued sends cannot survive shutdown.
+
+## T17 late join, catch-up, and reconnect (implemented)
+
+The baseline transfer body is `spall_protocol::baseline::BaselineWorld`
+(`BASELINE_WORLD_SCHEMA = 1`, versioned independently of the wire and save
+schemas): per volume the `VolumeId`, cell-size code, owner (terrain / body
+entity), optional brick bounds, and every resident brick as
+`{coord, revision, edited, cells}` where `cells` is `Uniform(u16)` or a
+`Dense` vector of exactly `CELLS_PER_BRICK` raw material ids. It carries
+**authoritative geometry only** — the replica reaches the exact canonical
+topology hash from it, so a late join needs no edit replay from world
+creation; current body pose/velocity/sleep arrive as a `MotionSnapshot`
+keyframe once the catch-up barrier is reached. The postcard bytes are split
+into `BaselinePart`s (`part_index` ascending, `part_hash` = BLAKE3 of the
+chunk) under the existing 1 MiB bulk-part / 64 MiB assembled-transfer
+ceilings; reassembly is concatenation in index order and `BaselineEnd`
+carries the BLAKE3 of the whole payload.
+
+A late-join replica signals intent by sending a `BaselineAck` whose
+`transfer_id` is the reserved sentinel `0` (a real transfer id is always
+`>= 1`); no frozen wire record was added. The server then, for that client
+only: captures a `BaselineWorld` at the current tick and journal cursor `J`,
+sends `BaselineBegin` (control) + parts (one bulk stream) + `BaselineEnd`
+(control), and buffers every subsequently committed `TopologyTransaction` in a
+bounded per-client catch-up queue rather than broadcasting it. On the client's
+real `BaselineAck { transfer_id = the assigned id }` the queue is flushed in
+commit order, a motion keyframe follows, and the client rejoins the normal
+broadcast. Other clients are never paused. A catch-up queue past its cap
+cancels the transfer and re-captures a fresher baseline; a bounded number of
+restarts then an explicit disconnect for that client only. A brick
+`RepairRequest` is answered with a one-brick `BaselineWorld` patch delivered
+over the same transfer mechanism — it restores the brick's exact revision as
+well as its cells (the T10 `CellRun` reply could not), and the client merges
+it into the live replica instead of replacing it. Reconnect reuses the
+`spall_net` session slot with an incremented generation; the server tracks the
+highest generation seen per slot and rejects any `ActionRequest` /
+`RepairRequest` stamped with a lower one.

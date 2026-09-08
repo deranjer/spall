@@ -73,10 +73,7 @@ fn a_reassembled_baseline_reproduces_the_server_hash_with_no_replay() {
         server_hash,
         "late-join replica hash equals the server world hash — no edit replay from creation"
     );
-    assert_eq!(
-        replica.total_solid_cells(),
-        sim.world().total_solid_cells()
-    );
+    assert_eq!(replica.total_solid_cells(), sim.world().total_solid_cells());
     assert_eq!(replica.body_ids().count(), sim.world().body_count());
 }
 
@@ -120,7 +117,9 @@ fn a_brick_repair_patch_restores_exact_parity_after_a_client_divergence() {
             }],
         }],
     };
-    replica.apply_baseline_patch(&corrupt).expect("apply corruption");
+    replica
+        .apply_baseline_patch(&corrupt)
+        .expect("apply corruption");
     assert_ne!(
         replica.world_hash(),
         server_hash,

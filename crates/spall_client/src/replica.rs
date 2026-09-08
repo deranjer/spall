@@ -338,13 +338,14 @@ impl ReplicaWorld {
         world.validate().map_err(|e| e.to_string())?;
         for bv in &world.volumes {
             let vid = bv.volume_id;
-            let volume = self
-                .volumes
-                .get_mut(&vid.get())
-                .ok_or_else(|| format!("repair patch names volume {vid} the replica does not hold"))?;
+            let volume = self.volumes.get_mut(&vid.get()).ok_or_else(|| {
+                format!("repair patch names volume {vid} the replica does not hold")
+            })?;
             for bb in &bv.bricks {
                 let cells: Vec<MaterialId> = match &bb.cells {
-                    BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
+                    BaselineCells::Uniform(id) => {
+                        vec![MaterialId(*id); spall_core::CELLS_PER_BRICK]
+                    }
                     BaselineCells::Dense(raw) => {
                         if raw.len() != spall_core::CELLS_PER_BRICK {
                             return Err(format!("repair brick has {} cells", raw.len()));
