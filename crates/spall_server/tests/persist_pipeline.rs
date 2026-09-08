@@ -291,6 +291,8 @@ fn a_moving_body_crash_recovers_its_latest_durable_pose() {
     assert_eq!(recovery.journal.len(), last_seq as usize);
     let (restored, durable_seq) = persist::restore(
         &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
         fixtures::stone_manifest(),
         AnchorPlane::at(0),
         PhysicsConfig::default(),

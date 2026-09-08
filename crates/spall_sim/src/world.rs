@@ -16,6 +16,7 @@ use spall_core::{
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
     BodyKind as PhysBodyKind, BodySpec, OccupancyGrid, PhysicsConfig, PhysicsWorld,
+    analytic_mass_properties,
 };
 use spall_protocol::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
@@ -46,8 +47,14 @@ pub enum WorldError {
     Ids(#[from] spall_core::IdError),
     #[error("occupancy extraction failed: {0}")]
     Occupancy(#[from] spall_physics::ExtractError),
+    #[error("no exact active collider for the body: {0}")]
+    Collider(#[from] crate::collider::ColliderInfeasible),
     #[error("edit during replay failed: {0}")]
     Edit(#[from] spall_voxel::EditError),
+    #[error("journal replay precondition failed: {0}")]
+    ReplayPrecondition(String),
+    #[error("journal replay result hash mismatch: {0}")]
+    ReplayResultHash(String),
 }
 
 /// A detached body being reinstated from a persisted checkpoint record.
@@ -120,7 +127,7 @@ impl SimWorld {
         let terrain_volume_id = registry.allocate_volume()?; // volume 1 == terrain
 
         let grid = OccupancyGrid::from_volume(&setup.terrain)?.ok_or(WorldError::EmptyTerrain)?;
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         let cell_m = setup.terrain.cell_size().metres() as f32;
 
         let mut physics = PhysicsWorld::new(setup.physics);
@@ -130,7 +137,12 @@ impl SimWorld {
             grid: plan.grid,
             cell_m,
             density_kg_m3: 1.0,
-            translation_m: grid_origin_translation(&grid, cell_m),
+            // Terrain is immovable: mass properties never enter the solver.
+            mass_properties: None,
+            // Identity pose: `PhysicsWorld` carries the tight grid's origin as a
+            // body-local collider offset, so the terrain body stays at the world
+            // origin like its `BodyPose::identity()` (`ENG-55`).
+            translation_m: [0.0; 3],
             linvel_m_s: [0.0; 3],
         });
 
@@ -311,8 +323,14 @@ impl SimWorld {
         let volume = build(volume_id);
 
         let grid = OccupancyGrid::from_volume(&volume)?.ok_or(WorldError::EmptyBody)?;
-        let plan = plan_collider(&grid);
-        let cell_m = volume.cell_size().metres() as f32;
+        let plan = plan_collider(&grid)?;
+        let cell_size_m = volume.cell_size().metres();
+        let cell_m = cell_size_m as f32;
+        // Mass / COM / inertia from the exact fine grid at the requested bulk
+        // density, so a coarsened collision shape cannot inflate the mass.
+        let mass_properties =
+            analytic_mass_properties(&grid, cell_size_m, |_| f64::from(density_kg_m3))
+                .to_body_properties();
         let trans = [
             pose.translation_m[0] as f32,
             pose.translation_m[1] as f32,
@@ -329,6 +347,7 @@ impl SimWorld {
             grid: plan.grid.clone(),
             cell_m,
             density_kg_m3: density_kg_m3.max(f32::MIN_POSITIVE),
+            mass_properties: Some(mass_properties),
             translation_m: trans,
             linvel_m_s: linvel,
         });
@@ -381,6 +400,31 @@ impl SimWorld {
         entity
     }
 
+    /// Retires the ownership of `volume` because its authoritative geometry
+    /// became empty (`ENG-56`), atomically with the edit that emptied it:
+    ///
+    /// * a **detached body** is dropped from the world — its physics rigid body
+    ///   and collider are removed, and it is no longer enumerable, targetable by
+    ///   a raycast, or published in a motion batch;
+    /// * **terrain** keeps its (now empty) record but loses its physical
+    ///   collider, so nothing rests on or tunnels the obsolete solid shape.
+    ///
+    /// Idempotent; a no-op for an unknown volume.
+    pub fn retire_empty_volume(&mut self, volume: VolumeId) {
+        if volume == self.terrain.volume_id {
+            self.physics.remove_collider(self.terrain.phys);
+            self.terrain.collider_revision += 1;
+            return;
+        }
+        let Some(&entity) = self.volume_owner.get(&volume.get()) else {
+            return;
+        };
+        if let Some(body) = self.bodies.remove(&entity) {
+            self.physics.retire_body(body.phys);
+        }
+        self.volume_owner.remove(&volume.get());
+    }
+
     // --- save recovery (T16) ------------------------------------------------
     //
     // These reinstate authoritative state from persisted records without
@@ -408,8 +452,14 @@ impl SimWorld {
     /// replication/journalling until then.
     pub fn insert_restored_body(&mut self, spec: RestoredBody) -> Result<EntityId, WorldError> {
         let grid = OccupancyGrid::from_volume(&spec.volume)?.ok_or(WorldError::EmptyBody)?;
-        let plan = plan_collider(&grid);
-        let cell_m = spec.volume.cell_size().metres() as f32;
+        let plan = plan_collider(&grid)?;
+        let cell_size_m = spec.volume.cell_size().metres();
+        let cell_m = cell_size_m as f32;
+        // Re-derive the exact mass properties from the persisted fine material
+        // grid, so a restored body carries the same mass / shifted COM / inertia
+        // it had before the save — never the collision shape's.
+        let mass_properties =
+            analytic_mass_properties(&grid, cell_size_m, |m| self.density(m)).to_body_properties();
         let trans = [
             spec.pose.translation_m[0] as f32,
             spec.pose.translation_m[1] as f32,
@@ -432,6 +482,7 @@ impl SimWorld {
             grid: plan.grid.clone(),
             cell_m,
             density_kg_m3: spec.density_kg_m3.max(f32::MIN_POSITIVE),
+            mass_properties: Some(mass_properties),
             translation_m: trans,
             linvel_m_s: linvel,
         });
@@ -461,9 +512,20 @@ impl SimWorld {
     /// Applies the ops of one journalled [`spall_protocol::TopologyTransaction`]
     /// to the live world during recovery: brush / cell-run writes go to their
     /// named volume, and each `SplitOff` child is built from its canonical fill
-    /// runs and installed as a body using the matching participant snapshot for
-    /// its transform. Colliders of every touched volume are rebuilt. The caller
+    /// runs and installed as a body. The child keeps the **source volume's**
+    /// cell size, the fine-grid material mass (so its Rapier mass, centre of
+    /// mass, and inertia match the live split), and the participant snapshot's
+    /// pose / velocity / sleep. Existing participants — the cut parent of a
+    /// body-to-body split — are advanced to the same transaction frame so
+    /// recovery never pairs a checkpoint-frame parent with split-frame
+    /// children. Colliders of every touched volume are rebuilt; the caller
     /// bumps the id counters past the replayed suffix afterwards.
+    ///
+    /// The transaction's `before` brick revisions are checked against the live
+    /// world *before* any op is applied, and its `after` brick revisions and
+    /// `result_hashes` are checked against the resulting geometry — a decodable
+    /// but semantically wrong record (or a replay defect) is rejected rather
+    /// than silently accepted as authoritative state.
     pub fn replay_transaction(
         &mut self,
         tx: &spall_protocol::TopologyTransaction,
@@ -471,28 +533,39 @@ impl SimWorld {
     ) -> Result<(), WorldError> {
         use spall_protocol::TopologyOp;
 
+        self.check_replay_preconditions(tx)?;
+
         let terrain_cell_size = self.terrain.volume.cell_size();
         let mut touched: Vec<VolumeId> = Vec::new();
+        let mut new_children: Vec<EntityId> = Vec::new();
         let mut split = false;
 
         // Group consecutive same-volume cell writes so each volume is edited
-        // once. A `SplitOff` opens a new child group; its following `CellRun`s
-        // (same child volume) fill it.
+        // once. A `SplitOff` opens a new child group carrying its source volume;
+        // its following `CellRun`s (same child volume) fill it.
         struct Group {
             volume: VolumeId,
             new_child: Option<EntityId>,
+            source: Option<VolumeId>,
             writes: Vec<(GlobalCell, MaterialId)>,
         }
-        let mut group: Option<Group> = None;
         let flush = |world: &mut SimWorld,
                      group: Option<Group>,
-                     touched: &mut Vec<VolumeId>|
+                     touched: &mut Vec<VolumeId>,
+                     new_children: &mut Vec<EntityId>|
          -> Result<(), WorldError> {
             let Some(g) = group else { return Ok(()) };
             if let Some(child_entity) = g.new_child {
                 if g.writes.is_empty() {
                     return Err(WorldError::EmptyBody);
                 }
+                // The child body lives in the source volume's cell frame, not
+                // necessarily the terrain's (a detail-cell body cut is finer).
+                let src_cell_size = g
+                    .source
+                    .and_then(|s| world.volume_ref(s).map(|v| v.cell_size()))
+                    .unwrap_or(terrain_cell_size);
+
                 let mut min = BrickCoord::new(i64::MAX, i64::MAX, i64::MAX);
                 let mut max = BrickCoord::new(i64::MIN, i64::MIN, i64::MIN);
                 for (cell, _) in &g.writes {
@@ -501,7 +574,7 @@ impl SimWorld {
                     max = BrickCoord::new(max.x.max(b.x), max.y.max(b.y), max.z.max(b.z));
                 }
                 let bounds = BrickBounds::new(min, max).expect("min <= max by construction");
-                let mut child = Volume::bounded(g.volume, terrain_cell_size, bounds);
+                let mut child = Volume::bounded(g.volume, src_cell_size, bounds);
                 for bz in min.z..=max.z {
                     for by in min.y..=max.y {
                         for bx in min.x..=max.x {
@@ -546,6 +619,23 @@ impl SimWorld {
                         ),
                     )
                 };
+
+                // Representative density from the fine voxel grid's material
+                // mass, exactly as the live split does (`transfer::plan_child`
+                // + `commit`): mass / (solid-cell count * cell_m^3). Feeding
+                // this through the same collider plan reproduces the live
+                // Rapier mass / COM / inertia; a hard-coded `1.0` made the
+                // recovered body ~2600x too light.
+                let cell_m = src_cell_size.metres();
+                let mp = analytic_mass_properties(&grid, cell_m, |m| world.density(m));
+                let cube_m3 = cell_m.powi(3);
+                let cell_count = g.writes.len() as f64;
+                let density_kg_m3 = if cell_count > 0.0 && cube_m3 > 0.0 {
+                    (mp.mass_kg / (cell_count * cube_m3)) as f32
+                } else {
+                    1.0
+                };
+
                 world.insert_restored_body(RestoredBody {
                     entity: child_entity,
                     volume: child,
@@ -555,8 +645,9 @@ impl SimWorld {
                     sleeping,
                     collider_revision: 1,
                     collider_region: region,
-                    density_kg_m3: 1.0,
+                    density_kg_m3,
                 })?;
+                new_children.push(child_entity);
                 touched.push(g.volume);
             } else {
                 let vol = world
@@ -574,6 +665,7 @@ impl SimWorld {
             Ok(())
         };
 
+        let mut group: Option<Group> = None;
         for op in &tx.ops {
             match op {
                 TopologyOp::IntegerBrush {
@@ -581,7 +673,7 @@ impl SimWorld {
                     brush,
                     material,
                 } => {
-                    flush(self, group.take(), &mut touched)?;
+                    flush(self, group.take(), &mut touched, &mut new_children)?;
                     let vol = self
                         .volume_body_mut(*volume)
                         .ok_or(WorldError::UnknownVolume(*volume))?;
@@ -592,15 +684,16 @@ impl SimWorld {
                     }
                 }
                 TopologyOp::SplitOff {
+                    source,
                     child,
                     child_entity,
-                    ..
                 } => {
-                    flush(self, group.take(), &mut touched)?;
+                    flush(self, group.take(), &mut touched, &mut new_children)?;
                     split = true;
                     group = Some(Group {
                         volume: *child,
                         new_child: Some(*child_entity),
+                        source: Some(*source),
                         writes: Vec::new(),
                     });
                 }
@@ -611,10 +704,11 @@ impl SimWorld {
                     material,
                 } => {
                     if group.as_ref().map(|g| g.volume) != Some(*volume) {
-                        flush(self, group.take(), &mut touched)?;
+                        flush(self, group.take(), &mut touched, &mut new_children)?;
                         group = Some(Group {
                             volume: *volume,
                             new_child: None,
+                            source: None,
                             writes: Vec::new(),
                         });
                     }
@@ -630,30 +724,144 @@ impl SimWorld {
                 }
             }
         }
-        flush(self, group.take(), &mut touched)?;
+        flush(self, group.take(), &mut touched, &mut new_children)?;
 
-        for vid in touched {
+        for &vid in &touched {
             self.rebuild_volume_collider(vid)?;
         }
+
+        // Advance every *existing* participant (notably the cut parent of a
+        // body-to-body split) to the transaction frame. `apply_pose_batch`
+        // skips ids it does not own, so terrain parents and the just-built
+        // children (already posed from their own snapshot) are left alone.
+        let carry: Vec<MotionSnapshot> = participants
+            .iter()
+            .filter(|s| !new_children.contains(&s.body))
+            .cloned()
+            .collect();
+        if !carry.is_empty() {
+            self.apply_pose_batch(&carry);
+        }
+
         if split {
             self.bump_topology_epoch();
+        }
+
+        self.check_replay_results(tx)?;
+
+        // Retire any volume this transaction cleared to empty, now that its
+        // verified post-state has been checked against the record. This mirrors
+        // the live commit path so a recovered world has the same set of live
+        // bodies and colliders (`ENG-56`).
+        for vid in touched {
+            if self.volume_ref(vid).is_some_and(|v| solid_cells(v) == 0) {
+                self.retire_empty_volume(vid);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks a journalled transaction's `before` brick revisions against the
+    /// live world before any op is replayed. A non-resident brick reads as
+    /// [`Revision::ZERO`] — the implicit "before" of an untouched cell.
+    fn check_replay_preconditions(
+        &self,
+        tx: &spall_protocol::TopologyTransaction,
+    ) -> Result<(), WorldError> {
+        for br in &tx.before {
+            let found = self
+                .volume_ref(br.volume)
+                .ok_or_else(|| {
+                    WorldError::ReplayPrecondition(format!(
+                        "transaction {} references unknown volume {}",
+                        tx.transaction_id.get(),
+                        br.volume
+                    ))
+                })?
+                .brick_revision(br.coord)
+                .map_err(|e| {
+                    WorldError::ReplayPrecondition(format!(
+                        "transaction {} brick {:?} in volume {}: {e}",
+                        tx.transaction_id.get(),
+                        br.coord,
+                        br.volume
+                    ))
+                })?
+                .unwrap_or(Revision::ZERO);
+            if found != br.revision {
+                return Err(WorldError::ReplayPrecondition(format!(
+                    "transaction {} expected volume {} brick {:?} at revision {}, live world has {}",
+                    tx.transaction_id.get(),
+                    br.volume,
+                    br.coord,
+                    br.revision.get(),
+                    found.get()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks a journalled transaction's `after` brick revisions and
+    /// `result_hashes` against the geometry the replay just produced.
+    fn check_replay_results(
+        &self,
+        tx: &spall_protocol::TopologyTransaction,
+    ) -> Result<(), WorldError> {
+        for br in &tx.after {
+            let found = self
+                .volume_ref(br.volume)
+                .and_then(|v| v.brick_revision(br.coord).ok().flatten())
+                .unwrap_or(Revision::ZERO);
+            if found != br.revision {
+                return Err(WorldError::ReplayResultHash(format!(
+                    "transaction {} recorded volume {} brick {:?} at revision {} after replay, got {}",
+                    tx.transaction_id.get(),
+                    br.volume,
+                    br.coord,
+                    br.revision.get(),
+                    found.get()
+                )));
+            }
+        }
+        for vh in &tx.result_hashes {
+            let got = self.volume_hash(vh.volume);
+            if got != Some(vh.hash) {
+                return Err(WorldError::ReplayResultHash(format!(
+                    "transaction {} recorded a result hash for volume {} that the replayed geometry does not reproduce",
+                    tx.transaction_id.get(),
+                    vh.volume
+                )));
+            }
         }
         Ok(())
     }
 
     /// Rebuilds one volume's collider from its current geometry (recovery and
-    /// post-replay). No-op if the volume has no solid cell left.
+    /// post-replay). No-op if the volume has no solid cell left — an emptied
+    /// volume is retired by [`Self::retire_empty_volume`] once the replay's
+    /// result checks have run (`ENG-56`).
     pub fn rebuild_volume_collider(&mut self, volume: VolumeId) -> Result<(), WorldError> {
         let Some(body) = self.volume_body(volume) else {
             return Err(WorldError::UnknownVolume(volume));
         };
         let phys = body.phys;
+        let is_dynamic = body.kind == BodyKind::Dynamic;
+        let cell_size_m = body.volume.cell_size().metres();
         let Some(grid) = OccupancyGrid::from_volume(&body.volume)? else {
             return Ok(());
         };
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         self.physics
             .rebuild_collider(phys, &plan.grid, plan.representation);
+        if is_dynamic {
+            // The geometry changed: reinstall mass / COM / inertia from the new
+            // fine material grid so the solver tracks it (and never the coarse
+            // collider).
+            let mass_properties = analytic_mass_properties(&grid, cell_size_m, |m| self.density(m))
+                .to_body_properties();
+            self.physics.set_mass_properties(phys, mass_properties);
+        }
         if let Some(body) = self.volume_body_mut(volume) {
             body.collider_revision += 1;
             body.coarsen_k = plan.coarsen_k;
@@ -703,28 +911,7 @@ impl SimWorld {
                 CanonicalOwner::Body(body.entity.expect("detached body has an entity")),
             )
         };
-        let mut bricks = Vec::new();
-        for coord in v.resident_brick_coords() {
-            let snap = v
-                .snapshot_brick(coord)
-                .ok()
-                .flatten()
-                .expect("coord came from the resident set");
-            bricks.push(CanonicalBrick {
-                coord,
-                revision: snap.revision(),
-                layers: vec![CanonicalLayer {
-                    kind: MATERIAL_LAYER_KIND,
-                    bytes: spall_voxel::BrickHash::to_bytes(snap.content_hash()).to_vec(),
-                }],
-            });
-        }
-        Some(CanonicalVolume {
-            volume_id: volume,
-            cell_size: v.cell_size(),
-            owner,
-            bricks,
-        })
+        Some(canonical_volume_for(v, owner))
     }
 
     /// Canonical topology hash of just `volume`.
@@ -785,15 +972,39 @@ impl WorldView for SimWorld {
     }
 }
 
-/// The world translation that places a body-local grid whose cell `(0,0,0)`
-/// corner is at global cell `grid.origin()` and whose transform is identity.
-pub fn grid_origin_translation(grid: &OccupancyGrid, cell_m: f32) -> [f32; 3] {
-    let o = grid.origin();
-    [
-        o.x as f32 * cell_m,
-        o.y as f32 * cell_m,
-        o.z as f32 * cell_m,
-    ]
+/// Canonical single-volume representation of `volume` under `owner`, for a
+/// volume that may not be installed in the world yet (a commit candidate).
+/// [`SimWorld::canonical_volume`] is this plus the live-world owner lookup.
+pub fn canonical_volume_for(volume: &Volume, owner: CanonicalOwner) -> CanonicalVolume {
+    let mut bricks = Vec::new();
+    for coord in volume.resident_brick_coords() {
+        let snap = volume
+            .snapshot_brick(coord)
+            .ok()
+            .flatten()
+            .expect("coord came from the resident set");
+        bricks.push(CanonicalBrick {
+            coord,
+            revision: snap.revision(),
+            layers: vec![CanonicalLayer {
+                kind: MATERIAL_LAYER_KIND,
+                bytes: spall_voxel::BrickHash::to_bytes(snap.content_hash()).to_vec(),
+            }],
+        });
+    }
+    CanonicalVolume {
+        volume_id: volume.id(),
+        cell_size: volume.cell_size(),
+        owner,
+        bricks,
+    }
+}
+
+/// Canonical topology hash of just `volume` under `owner` — the same value
+/// [`SimWorld::volume_hash`] returns once the volume is installed, so a commit
+/// candidate can compute its result hashes before publishing.
+pub fn volume_topology_hash_for(volume: &Volume, owner: CanonicalOwner) -> Hash32 {
+    canonical_topology_hash(&[canonical_volume_for(volume, owner)])
 }
 
 /// Count of solid cells in a volume (walks every resident brick).

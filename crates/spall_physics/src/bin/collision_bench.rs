@@ -67,7 +67,7 @@ fn main() -> std::process::ExitCode {
     // 60 m/s CCD projectile is a hard failure.
     let ok = [&report.native, &report.compound]
         .iter()
-        .all(|r| r.settle_finite && r.building_interior_clearance_m > 0.5)
+        .all(|r| r.settle_finite && r.building_interior_clearance_m > 0.5 && r.sleep_wake.ok())
         && report.compound.projectile_max_stop_m_s >= 60.0;
     if ok {
         std::process::ExitCode::SUCCESS
@@ -81,10 +81,18 @@ fn print_human(report: &spall_physics::report::FeasibilityReport) {
     for r in [&report.native, &report.compound] {
         eprintln!("--- {} ---", r.representation);
         eprintln!(
-            "  64-brick body: {} primitives, build {:.1} us, ~{} KiB",
+            "  64-brick body: {} primitives, ~{} KiB",
             r.multibrick_primitives,
-            r.multibrick_build_us,
             r.multibrick_est_bytes / 1024
+        );
+        eprintln!(
+            "  64-brick build us (complete)  p50 {:.1} / p95 {:.1} / p99 {:.1} / max {:.1} (n={}); wrap-only p50 {:.1}",
+            r.multibrick_build.p50_us,
+            r.multibrick_build.p95_us,
+            r.multibrick_build.p99_us,
+            r.multibrick_build.max_us,
+            r.multibrick_build.samples,
+            r.multibrick_wrap.p50_us,
         );
         eprintln!(
             "  settle step us  p50 {:.1} / p95 {:.1} / p99 {:.1} (n={})",
@@ -96,6 +104,18 @@ fn print_human(report: &spall_physics::report::FeasibilityReport) {
             r.settle_max_speed,
             r.settle_finite
         );
+        let sw = &r.sleep_wake;
+        eprintln!(
+            "  sleep/wake: slept {}, woke(rebuild) {}, re-slept {}, woke(impulse) {}, travel {:.2} m, re-contact {}, re-slept {}, stable {}",
+            sw.slept,
+            sw.woke_on_rebuild,
+            sw.reslept_after_rebuild,
+            sw.woke_on_impulse,
+            sw.travel_m,
+            sw.recontact,
+            sw.reslept,
+            sw.stable
+        );
         eprintln!(
             "  building step us  p50 {:.1} / p95 {:.1} / p99 {:.1}; settled {}, interior clearance {:.3} m",
             r.building_step.p50_us,
@@ -105,8 +125,12 @@ fn print_human(report: &spall_physics::report::FeasibilityReport) {
             r.building_interior_clearance_m
         );
         eprintln!(
-            "  rebuild us  p50 {:.1} / p95 {:.1} / p99 {:.1} (n={})",
-            r.rebuild.p50_us, r.rebuild.p95_us, r.rebuild.p99_us, r.rebuild.samples
+            "  rebuild us (complete: remove + decompose + wrap + reinsert)  p50 {:.1} / p95 {:.1} / p99 {:.1} / max {:.1} (n={})",
+            r.rebuild.p50_us,
+            r.rebuild.p95_us,
+            r.rebuild.p99_us,
+            r.rebuild.max_us,
+            r.rebuild.samples
         );
         eprintln!(
             "  mass err {:.4}, COM err {:.4} m, inertia err {:.4}, projectile stopped up to {:.0} m/s",

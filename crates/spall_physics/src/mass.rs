@@ -24,6 +24,23 @@ pub struct MassProperties {
     pub inertia_com: [[f64; 3]; 3],
 }
 
+/// The physics-body-facing narrowing of [`MassProperties`]: `f32` mass, centre
+/// of mass, and the full inertia tensor about the centre of mass, ready to
+/// install verbatim into a rigid body **independently of its collision shape**.
+///
+/// The frame is the body-local metre frame the collider is built in — origin at
+/// the `(0, 0, 0)` corner of grid cell `(0, 0, 0)` — so the installed centre of
+/// mass and the collider geometry share one origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BodyMassProperties {
+    /// Total mass, kilograms.
+    pub mass_kg: f32,
+    /// Centre of mass, body-local metres.
+    pub local_com_m: [f32; 3],
+    /// Inertia tensor about the centre of mass, `kg·m²`, row-major (symmetric).
+    pub inertia_com_kg_m2: [[f32; 3]; 3],
+}
+
 impl MassProperties {
     /// The three diagonal entries of [`Self::inertia_com`].
     pub fn principal_diagonal(&self) -> [f64; 3] {
@@ -32,6 +49,34 @@ impl MassProperties {
             self.inertia_com[1][1],
             self.inertia_com[2][2],
         ]
+    }
+
+    /// Narrows to the `f32` [`BodyMassProperties`] the physics body carries. The
+    /// analytic `f64` value stays the reference; this is what the solver
+    /// integrates.
+    pub fn to_body_properties(&self) -> BodyMassProperties {
+        let n = |v: f64| v as f32;
+        BodyMassProperties {
+            mass_kg: n(self.mass_kg),
+            local_com_m: [n(self.com_m[0]), n(self.com_m[1]), n(self.com_m[2])],
+            inertia_com_kg_m2: [
+                [
+                    n(self.inertia_com[0][0]),
+                    n(self.inertia_com[0][1]),
+                    n(self.inertia_com[0][2]),
+                ],
+                [
+                    n(self.inertia_com[1][0]),
+                    n(self.inertia_com[1][1]),
+                    n(self.inertia_com[1][2]),
+                ],
+                [
+                    n(self.inertia_com[2][0]),
+                    n(self.inertia_com[2][1]),
+                    n(self.inertia_com[2][2]),
+                ],
+            ],
+        }
     }
 
     /// Largest absolute per-entry difference between two tensors' plus mass and

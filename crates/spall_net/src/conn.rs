@@ -93,7 +93,13 @@ pub struct Connection {
     ctrl_dedup: Mutex<StreamDeduper>,
     dgram_dedup: Mutex<StreamDeduper>,
 
+    /// Last inbound traffic of any kind (control record, heartbeat, or a valid
+    /// datagram). Informational only.
     last_seen: Mutex<Instant>,
+    /// Last inbound *control-stream* traffic (a decoded `NetMessage`: record,
+    /// heartbeat, or `Bye`). This is what the idle watchdog checks -- datagrams,
+    /// fresh or duplicate, never refresh it.
+    last_control_seen: Mutex<Instant>,
     bulk_open: Arc<AtomicU32>,
 
     stats: Arc<ConnStats>,
@@ -142,6 +148,7 @@ impl Connection {
             ctrl_dedup: Mutex::new(StreamDeduper::strict()),
             dgram_dedup: Mutex::new(StreamDeduper::with_window(256)),
             last_seen: Mutex::new(Instant::now()),
+            last_control_seen: Mutex::new(Instant::now()),
             bulk_open: Arc::new(AtomicU32::new(0)),
             stats: Arc::new(ConnStats::default()),
         })
@@ -226,7 +233,9 @@ impl Connection {
                 NetMessage::decode(&raw, self.cfg.limits.max_control_record).map_err(|e| {
                     TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
                 })?;
-            self.touch().await;
+            // Any decoded control message -- record, heartbeat, or `Bye`, fresh
+            // or a duplicate -- is inbound control progress for the watchdog.
+            self.touch_control().await;
             match msg {
                 NetMessage::Heartbeat { seq } => {
                     recv.peer_heartbeat_seq = seq;
@@ -336,6 +345,8 @@ impl Connection {
                 self.stats.dedup_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            // Datagrams refresh `last_seen` only; they are not control progress,
+            // so they must not keep the idle watchdog (`last_control_seen`) fed.
             self.touch().await;
             match self.dgram_dedup.lock().await.admit(seq) {
                 DedupVerdict::Accept { .. } => {
@@ -368,22 +379,45 @@ impl Connection {
         })
     }
 
-    /// Opens a raw bidirectional stream with no framing wrapper. For callers
+    /// Opens a raw bidirectional stream with no framing wrapper, for callers
     /// that drive their own framed reads (baseline plumbing in later tasks, and
-    /// the malformed-input tests here).
-    pub async fn open_bi_raw(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        self.quic
+    /// the malformed-input tests here). It counts against
+    /// [`TransportConfig::limits`]`.max_bulk_streams` exactly like [`open_bulk`]:
+    /// the returned [`RawBulkStream`] holds the reservation and releases it when
+    /// dropped, on success or error.
+    ///
+    /// [`open_bulk`]: Self::open_bulk
+    pub async fn open_bi_raw(&self) -> Result<RawBulkStream> {
+        let guard = self.reserve_bulk()?;
+        let (send, recv) = self
+            .quic
             .open_bi()
             .await
-            .map_err(|e| TransportError::ConnectionLost(e.to_string()))
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
+        Ok(RawBulkStream {
+            send,
+            recv,
+            _open: guard,
+        })
     }
 
-    /// Accepts a raw bidirectional stream with no framing wrapper.
-    pub async fn accept_bi_raw(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        self.quic
+    /// Accepts a raw bidirectional stream with no framing wrapper, applying the
+    /// same ceiling as [`accept_bulk`]. The returned [`RawBulkStream`] owns the
+    /// reservation and releases it on drop.
+    ///
+    /// [`accept_bulk`]: Self::accept_bulk
+    pub async fn accept_bi_raw(&self) -> Result<RawBulkStream> {
+        let (send, recv) = self
+            .quic
             .accept_bi()
             .await
-            .map_err(|e| TransportError::ConnectionLost(e.to_string()))
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
+        let guard = self.reserve_bulk()?;
+        Ok(RawBulkStream {
+            send,
+            recv,
+            _open: guard,
+        })
     }
 
     /// Accepts the next inbound bulk stream, applying the same ceiling.
@@ -401,6 +435,27 @@ impl Connection {
             assembled_cap: self.cfg.limits.max_assembled_transfer,
             _open: guard,
         })
+    }
+
+    /// Number of live bulk-stream reservations across every entry point
+    /// ([`open_bulk`](Self::open_bulk), [`accept_bulk`](Self::accept_bulk),
+    /// [`open_bi_raw`](Self::open_bi_raw), [`accept_bi_raw`](Self::accept_bi_raw)).
+    /// Exposed for diagnostics and tests; never exceeds
+    /// [`TransportConfig::limits`]`.max_bulk_streams`.
+    pub fn bulk_stream_count(&self) -> u32 {
+        self.bulk_open.load(Ordering::SeqCst)
+    }
+
+    /// Opens a bidirectional stream that deliberately does **not** count against
+    /// the bulk-stream ceiling, so a test can push a peer past the negotiated
+    /// cap on purpose. Gated behind the `test-util` feature; never reachable
+    /// from a production build.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn open_bi_unguarded(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+        self.quic
+            .open_bi()
+            .await
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))
     }
 
     fn reserve_bulk(&self) -> Result<BulkGuard> {
@@ -432,7 +487,7 @@ impl Connection {
             tokio::select! {
                 _ = self.quic.closed() => break,
                 _ = beat.tick() => {
-                    if self.since_last_seen().await > self.cfg.idle_timeout {
+                    if self.since_last_control_seen().await > self.cfg.idle_timeout {
                         self.quic.close(1u32.into(), b"idle timeout");
                         break;
                     }
@@ -462,7 +517,7 @@ impl Connection {
                     }
                     self.stats.heartbeats_sent.fetch_add(1, Ordering::Relaxed);
                     self.stats.app_bytes_sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    if self.since_last_seen().await > self.cfg.idle_timeout {
+                    if self.since_last_control_seen().await > self.cfg.idle_timeout {
                         self.quic.close(1u32.into(), b"idle timeout");
                         break;
                     }
@@ -476,13 +531,31 @@ impl Connection {
         }
     }
 
-    /// Time since the last inbound control traffic of any kind.
+    /// Time since the last inbound traffic of any kind (control or datagram).
+    /// Informational; the idle watchdog uses [`since_last_control_seen`] instead.
+    ///
+    /// [`since_last_control_seen`]: Self::since_last_control_seen
     pub async fn since_last_seen(&self) -> Duration {
         self.last_seen.lock().await.elapsed()
     }
 
+    /// Time since the last inbound *control-stream* traffic (record, heartbeat,
+    /// or `Bye`). Datagram activity, fresh or duplicate, does not advance this,
+    /// so a peer that stops its control heartbeat still trips the idle watchdog.
+    pub async fn since_last_control_seen(&self) -> Duration {
+        self.last_control_seen.lock().await.elapsed()
+    }
+
     async fn touch(&self) {
         *self.last_seen.lock().await = Instant::now();
+    }
+
+    /// Records inbound control-stream progress: refreshes both the general
+    /// liveness stamp and the watchdog's control-only stamp.
+    async fn touch_control(&self) {
+        let now = Instant::now();
+        *self.last_seen.lock().await = now;
+        *self.last_control_seen.lock().await = now;
     }
 
     /// True until the QUIC connection has closed.
@@ -533,6 +606,32 @@ struct BulkGuard(Arc<AtomicU32>);
 impl Drop for BulkGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A raw bidirectional stream pair with no framing wrapper, handed out by
+/// [`Connection::open_bi_raw`] / [`Connection::accept_bi_raw`]. It counts
+/// against the negotiated bulk-stream ceiling; dropping it (on success, error,
+/// or an early bail) releases the reservation, exactly like [`BulkSend`] /
+/// [`BulkRecv`].
+///
+/// The stream halves are only lent out by reference so the reservation guard
+/// cannot be split away from the live streams.
+pub struct RawBulkStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    _open: BulkGuard,
+}
+
+impl RawBulkStream {
+    /// The reliable send half; the caller drives its own framing.
+    pub fn send_mut(&mut self) -> &mut quinn::SendStream {
+        &mut self.send
+    }
+
+    /// The reliable receive half; the caller drives its own framing.
+    pub fn recv_mut(&mut self) -> &mut quinn::RecvStream {
+        &mut self.recv
     }
 }
 

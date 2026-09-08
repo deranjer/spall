@@ -29,9 +29,9 @@ pub mod report;
 pub mod world;
 
 pub use collider::{ColliderBuild, Representation, build_collider};
-pub use mass::{MassProperties, analytic_mass_properties};
+pub use mass::{BodyMassProperties, MassProperties, analytic_mass_properties};
 pub use merge::{BoxSpan, greedy_boxes};
 pub use metrics::{DurationSamples, PercentileSummary};
 pub use occupancy::{ExtractError, OccupancyGrid};
-pub use report::{FeasibilityReport, RepresentationReport, run_feasibility};
+pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_feasibility};
 pub use world::{BodyId, BodyKind, BodySpec, BodyState, PhysicsConfig, PhysicsWorld, StepTiming};
