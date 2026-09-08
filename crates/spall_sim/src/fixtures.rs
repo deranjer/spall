@@ -295,6 +295,51 @@ pub fn dumbbell(s: i64, gap: i64) -> impl FnOnce(VolumeId) -> Volume {
     }
 }
 
+/// A body-local mixed-material "tadpole": a large stone head, a one-cell stone
+/// bridge, and a fused **stone + dirt** block. Cutting the bridge keeps the head
+/// as the parent (the larger component) and detaches the fused block as a single
+/// multi-material child whose centre of mass sits well off its geometric centre
+/// (stone is denser than dirt, so the COM is pulled toward the stone half).
+///
+/// - head:   `x 0..6`, `y 0..6`, `z 0..6`  (216 cells, stone)
+/// - bridge: `x 6..9`, `y 2`, `z 2`        (stone)
+/// - child:  `x 9..17`, `y 0..4`, `z 0..4` — stone `x 9..13`, dirt `x 13..17`
+///   (128 cells)
+pub fn mixed_material_split_body() -> impl FnOnce(VolumeId) -> Volume {
+    move |id| {
+        let mut v = Volume::new(id, CellSizeCode::Quarter);
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(5, 5, 5),
+            STONE,
+        ))
+        .unwrap();
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(6, 2, 2),
+            GlobalCell::new(8, 2, 2),
+            STONE,
+        ))
+        .unwrap();
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(9, 0, 0),
+            GlobalCell::new(12, 3, 3),
+            STONE,
+        ))
+        .unwrap();
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(13, 0, 0),
+            GlobalCell::new(16, 3, 3),
+            DIRT,
+        ))
+        .unwrap();
+        v
+    }
+}
+
 /// A 45° rotation about an oblique axis, as a `DQuat`.
 pub fn oblique_spin() -> DQuat {
     DQuat::from_axis_angle(
