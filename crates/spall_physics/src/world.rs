@@ -138,6 +138,12 @@ struct Entry {
     /// authoritative mass / COM / inertia; a collider rebuild preserves them and
     /// [`PhysicsWorld::set_mass_properties`] replaces them after a geometry edit.
     mass_properties: Option<BodyMassProperties>,
+    /// Set once the body's authoritative volume became empty and it was retired
+    /// (`ENG-56`): its Rapier rigid body and collider have been removed, so it
+    /// no longer collides, steps, or answers queries. The [`BodyId`] index is
+    /// kept so other bodies' ids do not shift; every accessor for it is now a
+    /// guarded no-op.
+    retired: bool,
 }
 
 /// The body-local offset that places a tight occupancy grid's cell `(0, 0, 0)`
@@ -282,6 +288,7 @@ impl PhysicsWorld {
             density: spec.density_kg_m3,
             collider_offset_m: offset,
             mass_properties: spec.mass_properties,
+            retired: false,
         });
         id
     }
@@ -298,6 +305,10 @@ impl PhysicsWorld {
         rep: Representation,
     ) -> Duration {
         let entry = &mut self.entries[id.0 as usize];
+        debug_assert!(!entry.retired, "rebuild_collider on a retired body");
+        if entry.retired {
+            return Duration::ZERO;
+        }
         let (cell_m, density, body, old_collider, mass_properties) = (
             entry.cell_m,
             entry.density,
@@ -349,6 +360,10 @@ impl PhysicsWorld {
     /// be added on top of `props`.
     pub fn set_mass_properties(&mut self, id: BodyId, props: BodyMassProperties) {
         let entry = &mut self.entries[id.0 as usize];
+        debug_assert!(!entry.retired, "set_mass_properties on a retired body");
+        if entry.retired {
+            return;
+        }
         debug_assert!(
             entry.mass_properties.is_some() || entry.density == 0.0,
             "set_mass_properties requires a body added with BodySpec::mass_properties = Some(_)"
@@ -359,6 +374,57 @@ impl PhysicsWorld {
         let rb = &mut self.bodies[body];
         rb.set_additional_mass_properties(rapier_mass_properties(props, offset), true);
         rb.recompute_mass_properties_from_colliders(&self.colliders);
+    }
+
+    /// Retires a body whose authoritative volume became empty (`ENG-56`): its
+    /// Rapier rigid body and attached collider are removed from the simulation
+    /// so it can no longer collide with, rest on, or be swept against by any
+    /// other body, nor be stepped or queried. The [`BodyId`] slot is kept (ids
+    /// are indices — removing one would shift every later id) and marked
+    /// retired; callers must drop the handle. Idempotent.
+    pub fn retire_body(&mut self, id: BodyId) {
+        let entry = &mut self.entries[id.0 as usize];
+        if entry.retired {
+            return;
+        }
+        entry.retired = true;
+        let body = entry.body;
+        self.bodies.remove(
+            body,
+            &mut self.islands,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            true,
+        );
+        // Same hazard as `rebuild_collider`: the CCD solver caches fixed-target
+        // collider handles and only refreshes that cache on a step where a body
+        // is CCD-active, so a collider removed on a quiet step can be
+        // dereferenced later ("No element at index"). Clearing the solver (it
+        // holds nothing else) forces a rescan.
+        self.ccd_solver = CCDSolver::new();
+    }
+
+    /// Whether `id` has been retired by [`Self::retire_body`].
+    pub fn is_retired(&self, id: BodyId) -> bool {
+        self.entries[id.0 as usize].retired
+    }
+
+    /// Removes just a body's attached collider, keeping the rigid body itself.
+    /// Used when a *terrain* ownership's volume becomes empty (`ENG-56`): the
+    /// fixed body stays so a later refill can rebuild a collider on it, but
+    /// nothing collides with the obsolete solid shape in the meantime. A no-op
+    /// on a retired body.
+    pub fn remove_collider(&mut self, id: BodyId) {
+        let entry = &mut self.entries[id.0 as usize];
+        if entry.retired {
+            return;
+        }
+        self.colliders
+            .remove(entry.collider, &mut self.islands, &mut self.bodies, true);
+        // See `retire_body`: drop the CCD fixed-target cache so it cannot keep a
+        // dangling handle to the collider just removed.
+        self.ccd_solver = CCDSolver::new();
     }
 
     /// Advances the world by one fixed step.
@@ -401,9 +467,21 @@ impl PhysicsWorld {
         self.entries[id.0 as usize].representation
     }
 
-    /// Kinematic snapshot of a body.
+    /// Kinematic snapshot of a body. A retired body (its volume became empty)
+    /// has no Rapier body left; it reports an all-zero, non-sleeping state.
     pub fn body_state(&self, id: BodyId) -> BodyState {
         let entry = &self.entries[id.0 as usize];
+        debug_assert!(!entry.retired, "body_state on a retired body");
+        if entry.retired {
+            return BodyState {
+                translation_m: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                linvel_m_s: [0.0; 3],
+                angvel_rad_s: [0.0; 3],
+                sleeping: false,
+                mass_kg: 0.0,
+            };
+        }
         let rb = &self.bodies[entry.body];
         let t = rb.translation();
         let q = rb.rotation();
