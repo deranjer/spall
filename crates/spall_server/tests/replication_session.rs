@@ -71,6 +71,9 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         seed: 0,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        // Fixture scripts cut at arbitrary cells no real aim ray would produce;
+        // the ENG-47 dev-scenario path keeps this plumbing test working.
+        dev_unvalidated_actions: true,
         save_faults: None,
     };
 
@@ -168,6 +171,8 @@ fn server_persists_and_recovers_across_a_restart() {
         seed: 9,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        // See above: arbitrary fixture cuts need the dev-scenario path.
+        dev_unvalidated_actions: true,
         save_faults: None,
     };
 
@@ -275,6 +280,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         seed: 9,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        dev_unvalidated_actions: false,
         save_faults: Some(FaultPlan::disk_fail_checkpoint()),
     };
 

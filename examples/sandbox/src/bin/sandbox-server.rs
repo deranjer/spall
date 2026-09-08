@@ -65,6 +65,11 @@ struct Args {
     /// dropped (connected clients keep running).
     #[arg(long, default_value_t = spall_server::serve::DEFAULT_MAX_JOIN_RETRIES)]
     max_join_retries: u32,
+    /// ENG-47 development-scenario path: skip server-side action-claim
+    /// validation and take each `ActionRequest`'s claimed target/brush verbatim.
+    /// Lets a fixture harness script arbitrary cuts. Never use on a shared host.
+    #[arg(long, hide = true)]
+    dev_unvalidated_actions: bool,
 }
 
 fn main() -> ExitCode {
@@ -136,6 +141,7 @@ fn run_serve(args: Args) -> ExitCode {
         seed: args.seed,
         catch_up_cap: args.catch_up_cap,
         max_join_retries: args.max_join_retries,
+        dev_unvalidated_actions: args.dev_unvalidated_actions,
         save_faults: None,
     };
     match spall_server::serve(config) {

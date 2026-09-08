@@ -942,7 +942,14 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         );
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, seq) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, seq) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "real_write_failure_on_journal",
             failed
