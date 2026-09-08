@@ -93,7 +93,13 @@ pub struct Connection {
     ctrl_dedup: Mutex<StreamDeduper>,
     dgram_dedup: Mutex<StreamDeduper>,
 
+    /// Last inbound traffic of any kind (control record, heartbeat, or a valid
+    /// datagram). Informational only.
     last_seen: Mutex<Instant>,
+    /// Last inbound *control-stream* traffic (a decoded `NetMessage`: record,
+    /// heartbeat, or `Bye`). This is what the idle watchdog checks -- datagrams,
+    /// fresh or duplicate, never refresh it.
+    last_control_seen: Mutex<Instant>,
     bulk_open: Arc<AtomicU32>,
 
     stats: Arc<ConnStats>,
@@ -142,6 +148,7 @@ impl Connection {
             ctrl_dedup: Mutex::new(StreamDeduper::strict()),
             dgram_dedup: Mutex::new(StreamDeduper::with_window(256)),
             last_seen: Mutex::new(Instant::now()),
+            last_control_seen: Mutex::new(Instant::now()),
             bulk_open: Arc::new(AtomicU32::new(0)),
             stats: Arc::new(ConnStats::default()),
         })
@@ -226,7 +233,9 @@ impl Connection {
                 NetMessage::decode(&raw, self.cfg.limits.max_control_record).map_err(|e| {
                     TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
                 })?;
-            self.touch().await;
+            // Any decoded control message -- record, heartbeat, or `Bye`, fresh
+            // or a duplicate -- is inbound control progress for the watchdog.
+            self.touch_control().await;
             match msg {
                 NetMessage::Heartbeat { seq } => {
                     recv.peer_heartbeat_seq = seq;
@@ -336,6 +345,8 @@ impl Connection {
                 self.stats.dedup_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            // Datagrams refresh `last_seen` only; they are not control progress,
+            // so they must not keep the idle watchdog (`last_control_seen`) fed.
             self.touch().await;
             match self.dgram_dedup.lock().await.admit(seq) {
                 DedupVerdict::Accept { .. } => {
@@ -476,7 +487,7 @@ impl Connection {
             tokio::select! {
                 _ = self.quic.closed() => break,
                 _ = beat.tick() => {
-                    if self.since_last_seen().await > self.cfg.idle_timeout {
+                    if self.since_last_control_seen().await > self.cfg.idle_timeout {
                         self.quic.close(1u32.into(), b"idle timeout");
                         break;
                     }
@@ -506,7 +517,7 @@ impl Connection {
                     }
                     self.stats.heartbeats_sent.fetch_add(1, Ordering::Relaxed);
                     self.stats.app_bytes_sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    if self.since_last_seen().await > self.cfg.idle_timeout {
+                    if self.since_last_control_seen().await > self.cfg.idle_timeout {
                         self.quic.close(1u32.into(), b"idle timeout");
                         break;
                     }
@@ -520,13 +531,31 @@ impl Connection {
         }
     }
 
-    /// Time since the last inbound control traffic of any kind.
+    /// Time since the last inbound traffic of any kind (control or datagram).
+    /// Informational; the idle watchdog uses [`since_last_control_seen`] instead.
+    ///
+    /// [`since_last_control_seen`]: Self::since_last_control_seen
     pub async fn since_last_seen(&self) -> Duration {
         self.last_seen.lock().await.elapsed()
     }
 
+    /// Time since the last inbound *control-stream* traffic (record, heartbeat,
+    /// or `Bye`). Datagram activity, fresh or duplicate, does not advance this,
+    /// so a peer that stops its control heartbeat still trips the idle watchdog.
+    pub async fn since_last_control_seen(&self) -> Duration {
+        self.last_control_seen.lock().await.elapsed()
+    }
+
     async fn touch(&self) {
         *self.last_seen.lock().await = Instant::now();
+    }
+
+    /// Records inbound control-stream progress: refreshes both the general
+    /// liveness stamp and the watchdog's control-only stamp.
+    async fn touch_control(&self) {
+        let now = Instant::now();
+        *self.last_seen.lock().await = now;
+        *self.last_control_seen.lock().await = now;
     }
 
     /// True until the QUIC connection has closed.
