@@ -82,4 +82,9 @@ pub enum StoreError {
     Corrupt(String),
     #[error("no complete checkpoint to recover from")]
     NoCheckpoint,
+    #[error(
+        "the database holds complete checkpoint(s) but none could be decoded: {0} \
+         (this is corruption, not an empty database — refusing to treat it as fresh)"
+    )]
+    CheckpointsUnrecoverable(String),
 }
