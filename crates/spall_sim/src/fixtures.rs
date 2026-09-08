@@ -124,6 +124,124 @@ pub fn bridged_terrain_setup() -> WorldSetup {
     }
 }
 
+/// Like [`bridged_terrain_setup`], but the whole scene is translated so its
+/// occupancy's minimum corner is far from the world origin, and the floor sits
+/// **only under the beam's own x-range**. A detached beam whose collider is
+/// mis-placed near body-local zero (`ENG-55`) misses the floor entirely and
+/// free-falls; a correctly offset collider lands the beam on the floor.
+///
+/// - floor:  `x 24..=39`, `z 0..=2`, `y 0..=1`
+/// - column: `x 31`,       `z 1`,     `y 2..=6`
+/// - beam:   `x 24..=39`,  `z 1`,     `y 7..=8`
+pub fn far_bridged_terrain_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    // Resident air envelope first, so later solid writes win.
+    v.apply_edit(&box_plan(
+        id,
+        GlobalCell::new(24, 0, 0),
+        GlobalCell::new(39, 20, 2),
+        MaterialId::AIR,
+    ))
+    .unwrap();
+    v.apply_edit(&box_plan(
+        id,
+        GlobalCell::new(24, 0, 0),
+        GlobalCell::new(39, 1, 2),
+        STONE,
+    ))
+    .unwrap();
+    v.apply_edit(&box_plan(
+        id,
+        GlobalCell::new(31, 2, 1),
+        GlobalCell::new(31, 6, 1),
+        STONE,
+    ))
+    .unwrap();
+    v.apply_edit(&box_plan(
+        id,
+        GlobalCell::new(24, 7, 1),
+        GlobalCell::new(39, 8, 1),
+        STONE,
+    ))
+    .unwrap();
+
+    WorldSetup {
+        terrain: v,
+        terrain_collider_region: (GlobalCell::new(24, 0, 0), GlobalCell::new(39, 20, 2)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
+/// A raised solid stone slab whose occupancy minimum is far from the world
+/// origin: `x 24..=43`, `y 8..=9`, `z 0..=3`, wrapped in a resident air
+/// envelope. The anchor plane is at `y = 8`, so the whole slab is anchored:
+/// erasing its low-x cells leaves the rest supported (nothing detaches — the
+/// non-splitting terrain-edit + collider-rebuild path), while the tight
+/// occupancy origin moves and the rebuilt collider must track it (`ENG-55`).
+pub fn far_raised_block_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    v.apply_edit(&box_plan(
+        id,
+        GlobalCell::new(24, 6, 0),
+        GlobalCell::new(43, 20, 3),
+        MaterialId::AIR,
+    ))
+    .unwrap();
+    v.apply_edit(&box_plan(
+        id,
+        GlobalCell::new(24, 8, 0),
+        GlobalCell::new(43, 9, 3),
+        STONE,
+    ))
+    .unwrap();
+    WorldSetup {
+        terrain: v,
+        terrain_collider_region: (GlobalCell::new(24, 6, 0), GlobalCell::new(43, 20, 3)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(8),
+        physics: PhysicsConfig::default(),
+    }
+}
+
+/// A [`dumbbell`] whose `(0,0,0)`-anchored geometry is shifted so its occupancy
+/// minimum sits at `off` cells from the volume origin. Used to give a moving,
+/// rotating parent body a non-zero occupancy-grid origin before it is cut, so
+/// the split exercises the parent-COM/​collider-origin path (`ENG-55`).
+pub fn offset_dumbbell(s: i64, gap: i64, off: GlobalCell) -> impl FnOnce(VolumeId) -> Volume {
+    move |id| {
+        let mut v = Volume::new(id, CellSizeCode::Quarter);
+        let rx = s + gap;
+        let mid = s / 2;
+        let shift = |a: GlobalCell| GlobalCell::new(a.x + off.x, a.y + off.y, a.z + off.z);
+        v.apply_edit(&box_plan(
+            id,
+            shift(GlobalCell::new(0, 0, 0)),
+            shift(GlobalCell::new(s - 1, s - 1, s - 1)),
+            STONE,
+        ))
+        .unwrap();
+        v.apply_edit(&box_plan(
+            id,
+            shift(GlobalCell::new(rx, 0, 0)),
+            shift(GlobalCell::new(rx + s - 1, s - 1, s - 1)),
+            STONE,
+        ))
+        .unwrap();
+        v.apply_edit(&box_plan(
+            id,
+            shift(GlobalCell::new(s, mid, mid)),
+            shift(GlobalCell::new(rx - 1, mid, mid)),
+            STONE,
+        ))
+        .unwrap();
+        v
+    }
+}
+
 /// A solid stone block, `size` cells on a side, built in a body-local frame with
 /// its `(0,0,0)` corner at the local origin. Used with
 /// [`crate::world::SimWorld::spawn_body`] to stand up a moving/rotating body.
