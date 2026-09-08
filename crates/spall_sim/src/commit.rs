@@ -18,7 +18,7 @@
 
 use spall_core::{BrickCoord, MaterialId, Revision, Tick, VolumeId};
 use spall_jobs::Staleness;
-use spall_physics::{BodyKind as PhysBodyKind, BodySpec, OccupancyGrid};
+use spall_physics::{BodyKind as PhysBodyKind, BodySpec, OccupancyGrid, analytic_mass_properties};
 use spall_protocol::{
     ActionOutcome, ActionStatus, BrickRevision, ControlSeq, InputSeq, MotionSnapshot, Record,
     RecordError, SnapshotSeq, TopologyOp, TopologyTransaction, TransferId, VolumeHash,
@@ -202,31 +202,45 @@ pub fn commit(
         None
     };
 
-    // 7. Rebuild the parent collider from its final geometry.
+    // 7. Rebuild the parent collider from its final geometry, and reinstall its
+    //    mass properties from the post-cut fine material grid (a dynamic parent
+    //    lost mass to the cut / to its children; a terrain parent has no mass).
     let rebuild = {
         let parent = world.volume_body(vid).expect("parent still exists");
-        OccupancyGrid::from_volume(&parent.volume)?.map(|grid| (parent.phys, plan_collider(&grid)))
+        match OccupancyGrid::from_volume(&parent.volume)? {
+            Some(grid) => {
+                let plan = plan_collider(&grid);
+                let mass_properties = (!parent_is_terrain).then(|| {
+                    analytic_mass_properties(&grid, cell_size.metres(), |m| world.density(m))
+                        .to_body_properties()
+                });
+                Some((parent.phys, plan, mass_properties))
+            }
+            None => None,
+        }
     };
-    if let Some((phys, plan)) = rebuild {
+    if let Some((phys, plan, mass_properties)) = rebuild {
         world
             .physics_mut()
             .rebuild_collider(phys, &plan.grid, plan.representation);
+        if let Some(mass_properties) = mass_properties {
+            world
+                .physics_mut()
+                .set_mass_properties(phys, mass_properties);
+        }
         let parent = world.volume_body_mut(vid).expect("parent still exists");
         parent.collider_revision += 1;
         parent.coarsen_k = plan.coarsen_k;
     }
     let _ = parent_region;
 
-    // 8. Install every child body and its collider.
+    // 8. Install every child body and its collider. Mass / COM / inertia come
+    //    from the child's fine material grid (`child.mass_properties`), installed
+    //    into the body independently of the collision shape, so coarse collider
+    //    inflation cannot change the physical mass.
     let mut child_entities = Vec::new();
     for child in children {
         let child_cell_m = child.volume.cell_size().metres() as f32;
-        let cube_m3 = f64::from(child_cell_m).powi(3);
-        let representative_density = if child.cell_count > 0 && cube_m3 > 0.0 {
-            (child.mass_kg / (child.cell_count as f64 * cube_m3)) as f32
-        } else {
-            1.0
-        };
         let rot = child.pose.rotation;
         let rot_xyzw = [rot.x as f32, rot.y as f32, rot.z as f32, rot.w as f32];
         let trans = child.pose.translation_m.map(|v| v as f32);
@@ -238,7 +252,8 @@ pub fn commit(
             representation: child.collider_plan.representation,
             grid: child.collider_plan.grid.clone(),
             cell_m: child_cell_m,
-            density_kg_m3: representative_density.max(f32::MIN_POSITIVE),
+            density_kg_m3: 1.0,
+            mass_properties: Some(child.mass_properties),
             translation_m: trans,
             linvel_m_s: linvel,
         });
