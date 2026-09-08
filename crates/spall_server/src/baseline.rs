@@ -17,7 +17,8 @@
 use spall_core::{BrickCoord, CELLS_PER_BRICK, JournalSeq, LocalCell, Revision, Tick};
 use spall_protocol::{
     BaselineBegin, BaselineBrick, BaselineCells, BaselineEnd, BaselineOwner, BaselinePart,
-    BaselineRegion, BaselineVolume, BaselineWorld, Hash32, InterestEpoch, TransferId, limits,
+    BaselineRegion, BaselineVolume, BaselineWorld, Hash32, InterestEpoch, RepairKey, RepairRequest,
+    TransferId, limits,
 };
 use spall_sim::{Body, Simulation};
 use spall_voxel::BrickSnapshot;
@@ -161,6 +162,43 @@ pub fn assemble(parts: &[BaselinePart]) -> Result<BaselineWorld, spall_protocol:
         bytes.extend_from_slice(&part.payload);
     }
     BaselineWorld::decode(&bytes)
+}
+
+/// A targeted baseline patch for one diverged brick — the authoritative answer
+/// to a brick [`RepairRequest`]. Carries the brick's real revision + material
+/// layer so the replica restores exact parity (revision included), which a
+/// `CellRun` replay cannot (`docs/protocol.md`: "hash repairs"). `None` for a
+/// body repair or a brick the world does not hold.
+pub fn brick_repair_patch(sim: &Simulation, request: &RepairRequest) -> Option<BaselineWorld> {
+    let RepairKey::Brick { volume, coord } = request.key else {
+        return None;
+    };
+    let world = sim.world();
+    let vol = world.volume_ref(volume)?;
+    let snap = vol.snapshot_brick(coord).ok().flatten()?;
+    let owner = match world.volume_body(volume)?.entity {
+        Some(entity) => BaselineOwner::Body(entity),
+        None => BaselineOwner::Terrain,
+    };
+    let bv = BaselineVolume {
+        volume_id: volume,
+        cell_size_code: vol.cell_size().to_u8(),
+        owner,
+        bounds: vol
+            .bounds()
+            .map(|b| [[b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z]]),
+        bricks: vec![BaselineBrick {
+            coord: [coord.x, coord.y, coord.z],
+            revision: snap.revision().get(),
+            edited: snap.is_edited(),
+            cells: cells_of(&snap),
+        }],
+    };
+    Some(BaselineWorld {
+        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        checkpoint_tick: sim.current_tick().get(),
+        volumes: vec![bv],
+    })
 }
 
 fn baseline_volume(body: &Body, owner: BaselineOwner) -> BaselineVolume {
