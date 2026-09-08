@@ -128,13 +128,33 @@ impl Writer {
         }
     }
 
-    /// Highest journal sequence currently stored (`0` if the journal is empty).
+    /// Highest journal sequence currently stored as a row (`0` if the journal
+    /// table is empty).
     pub fn journal_max_seq(&self) -> Result<u64, StoreError> {
         let v: i64 = self
             .conn
             .query_row("SELECT COALESCE(MAX(seq), 0) FROM journal", [], |r| {
                 r.get(0)
             })?;
+        Ok(v as u64)
+    }
+
+    /// Highest journal sequence this database has *ever* owned, surviving row
+    /// pruning: the max of the stored journal rows and every checkpoint's
+    /// journal cursor. Pruning journal rows a durable checkpoint already covers
+    /// (`retain`) can empty the `journal` table, but a checkpoint's cursor can
+    /// never name a sequence that was not journalled, so the next append still
+    /// starts exactly one past the true high-water (ENG-50: contiguous sequence
+    /// ownership across a mid-run prune).
+    pub fn journal_high_water(&self) -> Result<u64, StoreError> {
+        let v: i64 = self.conn.query_row(
+            "SELECT MAX(hw) FROM (\
+                 SELECT COALESCE(MAX(seq), 0) AS hw FROM journal \
+                 UNION ALL \
+                 SELECT COALESCE(MAX(journal_cursor), 0) AS hw FROM checkpoints)",
+            [],
+            |r| r.get(0),
+        )?;
         Ok(v as u64)
     }
 
@@ -159,7 +179,7 @@ impl Writer {
         }
 
         let start = self
-            .journal_max_seq()?
+            .journal_high_water()?
             .checked_add(1)
             .ok_or(StoreError::JournalGap {
                 expected: u64::MAX,
