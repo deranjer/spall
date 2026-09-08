@@ -463,3 +463,109 @@ fn a_mismatched_store_schema_version_is_rejected() {
         persist::PersistError::SchemaMismatch { .. }
     ));
 }
+
+// --- ENG-37: checkpoint + replay hash verification -----------------------
+
+/// A recovery holding a fresh bridge checkpoint plus one durable column-cut
+/// transaction in its journal suffix.
+fn recovery_with_cut_journal(s: &Scratch) -> spall_store::Recovery {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let mut w = Writer::open(s.db()).unwrap();
+    w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+        .unwrap();
+    sim.submit(EditIntent::cut(
+        RequestId(1),
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10, 4, 1, 2),
+    ))
+    .unwrap();
+    sim.run_until_idle(16).unwrap();
+    let records = persist::journal_records(sim.journal().entries()).unwrap();
+    w.append_journal(&records).unwrap();
+    drop(w);
+    spall_store::recover(s.db()).unwrap()
+}
+
+#[test]
+fn review_restore_must_check_checkpoint_hash() {
+    // Decodable row corruption: flip one stored brick's tombstone bit but keep
+    // the saved canonical hash. The rows still decode; recovery must notice the
+    // rebuilt world no longer reproduces `checkpoint.world_hash`.
+    let s = Scratch::new("cp_hash");
+    let mut recovery = recovery_for_meta_tests(&s);
+    recovery.checkpoint.bricks[0].edited = !recovery.checkpoint.bricks[0].edited;
+    assert!(matches!(
+        restore_err(&recovery, &cfg()),
+        persist::PersistError::CheckpointHashMismatch { .. }
+    ));
+}
+
+#[test]
+fn a_swapped_checkpoint_brick_revision_is_rejected() {
+    let s = Scratch::new("cp_rev");
+    let mut recovery = recovery_for_meta_tests(&s);
+    recovery.checkpoint.bricks[0].revision += 7;
+    assert!(matches!(
+        restore_err(&recovery, &cfg()),
+        persist::PersistError::CheckpointHashMismatch { .. }
+    ));
+}
+
+#[test]
+fn a_journal_transaction_with_a_wrong_result_hash_is_rejected() {
+    let s = Scratch::new("replay_hash");
+    let mut recovery = recovery_with_cut_journal(&s);
+    let (mut tx, parts) = recovery.journal[0]
+        .payload
+        .as_topology()
+        .expect("suffix record is a topology transaction")
+        .unwrap();
+    // A replay defect / corrupt row: the transaction claims a result hash the
+    // reconstructed geometry will not reproduce.
+    tx.result_hashes[0].hash = spall_protocol::Hash32::ZERO;
+    recovery.journal[0].payload = spall_store::JournalPayload::topology(&tx, &parts).unwrap();
+    match restore_err(&recovery, &cfg()) {
+        persist::PersistError::World(spall_sim::WorldError::ReplayResultHash(_)) => {}
+        other => panic!("expected ReplayResultHash, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_journal_transaction_with_a_wrong_precondition_is_rejected() {
+    let s = Scratch::new("replay_pre");
+    let mut recovery = recovery_with_cut_journal(&s);
+    let (mut tx, parts) = recovery.journal[0]
+        .payload
+        .as_topology()
+        .expect("suffix record is a topology transaction")
+        .unwrap();
+    assert!(!tx.before.is_empty(), "the column cut records a before-set");
+    tx.before[0].revision = spall_core::Revision(999);
+    recovery.journal[0].payload = spall_store::JournalPayload::topology(&tx, &parts).unwrap();
+    match restore_err(&recovery, &cfg()) {
+        persist::PersistError::World(spall_sim::WorldError::ReplayPrecondition(_)) => {}
+        other => panic!("expected ReplayPrecondition, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_journal_transaction_with_a_stale_algorithm_version_is_rejected() {
+    let s = Scratch::new("replay_algo");
+    let mut recovery = recovery_with_cut_journal(&s);
+    let (mut tx, parts) = recovery.journal[0]
+        .payload
+        .as_topology()
+        .expect("suffix record is a topology transaction")
+        .unwrap();
+    tx.algorithm_version += 100;
+    recovery.journal[0].payload = spall_store::JournalPayload::topology(&tx, &parts).unwrap();
+    match restore_err(&recovery, &cfg()) {
+        persist::PersistError::AlgorithmVersionMismatch {
+            field: "journal transaction.algorithm_version",
+            ..
+        } => {}
+        other => panic!("expected AlgorithmVersionMismatch, got {other:?}"),
+    }
+}
