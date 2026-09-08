@@ -135,6 +135,20 @@ impl Volume {
             .count()
     }
 
+    /// Coordinates of every resident brick, in canonical `(z, y, x)` order.
+    /// Failed slots are excluded.
+    pub fn resident_brick_coords(&self) -> Vec<BrickCoord> {
+        let mut coords: Vec<BrickCoord> = self
+            .bricks
+            .iter()
+            .filter_map(|(&(x, y, z), slot)| {
+                matches!(slot, BrickSlot::Resident(_)).then_some(BrickCoord::new(x, y, z))
+            })
+            .collect();
+        coords.sort_by_key(|c| c.sort_key());
+        coords
+    }
+
     fn check_bounds(&self, coord: BrickCoord) -> Result<(), AccessError> {
         match self.bounds {
             Some(bounds) if !bounds.contains(coord) => Err(AccessError::OutOfBounds { coord }),
