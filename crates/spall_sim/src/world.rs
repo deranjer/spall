@@ -793,28 +793,7 @@ impl SimWorld {
                 CanonicalOwner::Body(body.entity.expect("detached body has an entity")),
             )
         };
-        let mut bricks = Vec::new();
-        for coord in v.resident_brick_coords() {
-            let snap = v
-                .snapshot_brick(coord)
-                .ok()
-                .flatten()
-                .expect("coord came from the resident set");
-            bricks.push(CanonicalBrick {
-                coord,
-                revision: snap.revision(),
-                layers: vec![CanonicalLayer {
-                    kind: MATERIAL_LAYER_KIND,
-                    bytes: spall_voxel::BrickHash::to_bytes(snap.content_hash()).to_vec(),
-                }],
-            });
-        }
-        Some(CanonicalVolume {
-            volume_id: volume,
-            cell_size: v.cell_size(),
-            owner,
-            bricks,
-        })
+        Some(canonical_volume_for(v, owner))
     }
 
     /// Canonical topology hash of just `volume`.
@@ -873,6 +852,41 @@ impl WorldView for SimWorld {
             },
         }
     }
+}
+
+/// Canonical single-volume representation of `volume` under `owner`, for a
+/// volume that may not be installed in the world yet (a commit candidate).
+/// [`SimWorld::canonical_volume`] is this plus the live-world owner lookup.
+pub fn canonical_volume_for(volume: &Volume, owner: CanonicalOwner) -> CanonicalVolume {
+    let mut bricks = Vec::new();
+    for coord in volume.resident_brick_coords() {
+        let snap = volume
+            .snapshot_brick(coord)
+            .ok()
+            .flatten()
+            .expect("coord came from the resident set");
+        bricks.push(CanonicalBrick {
+            coord,
+            revision: snap.revision(),
+            layers: vec![CanonicalLayer {
+                kind: MATERIAL_LAYER_KIND,
+                bytes: spall_voxel::BrickHash::to_bytes(snap.content_hash()).to_vec(),
+            }],
+        });
+    }
+    CanonicalVolume {
+        volume_id: volume.id(),
+        cell_size: volume.cell_size(),
+        owner,
+        bricks,
+    }
+}
+
+/// Canonical topology hash of just `volume` under `owner` — the same value
+/// [`SimWorld::volume_hash`] returns once the volume is installed, so a commit
+/// candidate can compute its result hashes before publishing.
+pub fn volume_topology_hash_for(volume: &Volume, owner: CanonicalOwner) -> Hash32 {
+    canonical_topology_hash(&[canonical_volume_for(volume, owner)])
 }
 
 /// The world translation that places a body-local grid whose cell `(0,0,0)`
