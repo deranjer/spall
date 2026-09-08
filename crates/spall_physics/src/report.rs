@@ -357,6 +357,7 @@ fn debris_settle(
         grid: floor_grid,
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
+        mass_properties: None,
         translation_m: [0.0, 0.0, 0.0],
         linvel_m_s: [0.0; 3],
     });
@@ -378,6 +379,7 @@ fn debris_settle(
             grid,
             cell_m: fixtures::CELL_M,
             density_kg_m3: fixtures::STONE_DENSITY,
+            mass_properties: None,
             translation_m: [
                 2.0 + ix as f32 * 0.9,
                 2.0 + iy as f32 * 0.9,
@@ -444,6 +446,7 @@ fn sleep_wake_cycle(rep: Representation) -> SleepWakeReport {
         grid: floor_grid,
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
+        mass_properties: None,
         translation_m: [0.0, 0.0, 0.0],
         linvel_m_s: [0.0; 3],
     });
@@ -457,6 +460,7 @@ fn sleep_wake_cycle(rep: Representation) -> SleepWakeReport {
         grid: grid.clone(),
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
+        mass_properties: None,
         translation_m: [4.0, 1.2, 4.0],
         linvel_m_s: [0.0; 3],
     });
@@ -550,6 +554,7 @@ fn building_drop(rep: Representation, steps: u32) -> (PercentileSummary, f64, bo
         grid: floor_grid,
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
+        mass_properties: None,
         translation_m: [0.0, 0.0, 0.0],
         linvel_m_s: [0.0; 3],
     });
@@ -569,6 +574,7 @@ fn building_drop(rep: Representation, steps: u32) -> (PercentileSummary, f64, bo
         grid,
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
+        mass_properties: None,
         translation_m: [
             6.5 - origin.x as f32 * cell,
             1.3 - origin.y as f32 * cell,
@@ -629,6 +635,7 @@ fn rebuild_cost(rep: Representation, iters: u32) -> PercentileSummary {
         grid: grid.clone(),
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
+        mass_properties: None,
         translation_m: [0.0, 5.0, 0.0],
         linvel_m_s: [0.0; 3],
     });
@@ -655,6 +662,7 @@ fn mass_agreement(rep: Representation) -> (f64, f64, f64) {
         grid,
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
+        mass_properties: None,
         translation_m: [0.0, 0.0, 0.0],
         linvel_m_s: [0.0; 3],
     });
@@ -714,6 +722,7 @@ fn projectile_stops(rep: Representation, speed: f32) -> bool {
         grid: wall_grid,
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
+        mass_properties: None,
         translation_m: [4.0, 0.0, 0.0],
         linvel_m_s: [0.0; 3],
     });
@@ -726,6 +735,7 @@ fn projectile_stops(rep: Representation, speed: f32) -> bool {
         grid: pellet_grid,
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
+        mass_properties: None,
         translation_m: [0.0, 3.0, 3.0],
         linvel_m_s: [speed, 0.0, 0.0],
     });

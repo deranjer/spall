@@ -17,7 +17,7 @@
 
 use glam::{DQuat, DVec3};
 use spall_core::{BrickCoord, CellSizeCode, EntityId, GlobalCell, MaterialId, Revision, VolumeId};
-use spall_physics::{OccupancyGrid, analytic_mass_properties};
+use spall_physics::{BodyMassProperties, OccupancyGrid, analytic_mass_properties};
 use spall_structure::ComponentMembership;
 use spall_voxel::{Brick, EditPlan, Sample, Volume};
 
@@ -46,6 +46,11 @@ pub struct ChildBody {
     pub angvel_rad_s: [f64; 3],
     pub mass_kg: f64,
     pub com_world_m: [f64; 3],
+    /// Exact mass / COM / inertia from the child's fine material grid, in the
+    /// body-local frame the collider is built in. Installed into the physics
+    /// body verbatim so the solver never derives mass from the (possibly
+    /// coarsened) collision shape.
+    pub mass_properties: BodyMassProperties,
     pub collider_plan: ColliderPlan,
     pub collider_region: (GlobalCell, GlobalCell),
     pub cell_count: u64,
@@ -117,6 +122,7 @@ pub fn plan_child(
 
     let mp = analytic_mass_properties(&grid, cell_m, density);
     let mass_kg = mp.mass_kg;
+    let mass_properties = mp.to_body_properties();
 
     // Child COM in the parent's local metre frame: the child grid's origin (in
     // parent-local cells) scaled to metres — the same body-local offset
@@ -152,6 +158,7 @@ pub fn plan_child(
         angvel_rad_s: angvel.to_array(),
         mass_kg,
         com_world_m: child_com_world.to_array(),
+        mass_properties,
         collider_plan,
         collider_region: region,
         cell_count: membership.cell_count,
