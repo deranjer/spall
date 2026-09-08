@@ -43,7 +43,7 @@ use spall_sim::{
 use spall_store::Writer;
 use spall_structure::AnchorPlane;
 use spall_voxel::{Ray, RayOutcome, cast_ray_world};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::baseline::{self, BaselineTransfer};
 use crate::persist::{self, PersistConfig};
@@ -61,6 +61,47 @@ pub const DEFAULT_CATCH_UP_CAP: usize = 512;
 
 /// Default bounded retry count for late-join transfer restarts.
 pub const DEFAULT_MAX_JOIN_RETRIES: u32 = 3;
+
+// --- ENG-48: minimum safe replication-host queue bounds ----------------------
+//
+// The full per-connection bandwidth / interest budget is T20. These caps only
+// stop a flooding client from stalling the tick loop or a stalled reliable
+// reader from growing host memory without bound. Quinn flow control bounds the
+// wire, not these application allocations.
+
+/// Depth of the shared inbound bridge channel (records buffered between the
+/// connection readers and the sim loop). Past this a reader's `try_send` drops
+/// the surplus `ActionRequest` / `RepairRequest` (both are client-retryable and
+/// rate-limited) so host memory stays flat under a flood.
+pub const INBOUND_CHANNEL_CAP: usize = 4096;
+
+/// Most inbound bridge records the sim loop drains in a single tick. The
+/// remainder waits in the bounded channel for the next tick, so an ingress
+/// burst can never prevent the drain loop from ending.
+pub const MAX_INBOUND_PER_TICK: usize = 1024;
+
+/// Most `ActionRequest`s one session may have admitted in one tick
+/// (`docs/architecture.md`: "Drain bounded input queues; validate client
+/// sequence numbers, permissions, and action limits"). Past this the request
+/// gets an explicit throttled rejection — an actionable retry response — rather
+/// than queueing more work, and every other session keeps its own quota.
+pub const MAX_ACTIONS_PER_CLIENT_PER_TICK: u32 = 4;
+
+/// Most `RepairRequest`s one session may have admitted in one tick
+/// (`docs/protocol.md`: `RepairRequest` is "rate-limited"). Surplus is dropped;
+/// the replica re-requests, itself rate-limited (ENG-49).
+pub const MAX_REPAIRS_PER_CLIENT_PER_TICK: u32 = 8;
+
+/// Most reliable messages (committed topology, `ActionStatus`, baseline
+/// transfers) that may sit unsent in one client's outbound queue before that
+/// client is disconnected and left to re-baseline on reconnect. Committed
+/// topology is never silently discarded to stay under budget
+/// (`docs/protocol.md`: "repair or disconnect a client whose reliable backlog
+/// exceeds the bounded window").
+pub const MAX_RELIABLE_BACKLOG: usize = 2048;
+
+/// Byte ceiling on that same per-client reliable queue.
+pub const MAX_RELIABLE_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
 
 /// Content-manifest tag both ends of a T10 session agree on out of band. Real
 /// manifest negotiation is T16/T17; this keeps the handshake honest meanwhile.
@@ -197,6 +238,12 @@ pub struct ServeSummary {
     pub expired_actions_rejected: u64,
     /// T17: total baseline bulk payload bytes pushed this run.
     pub baseline_bytes_sent: u64,
+    /// ENG-48: `ActionRequest`s bounced with a throttled rejection because their
+    /// session exceeded [`MAX_ACTIONS_PER_CLIENT_PER_TICK`] this tick.
+    pub inbound_actions_throttled: u64,
+    /// ENG-48: `RepairRequest`s dropped because their session exceeded
+    /// [`MAX_REPAIRS_PER_CLIENT_PER_TICK`] this tick.
+    pub inbound_repairs_throttled: u64,
 }
 
 /// Anything that stops a [`serve`] run.
@@ -273,7 +320,157 @@ enum Outbound {
     Shutdown,
 }
 
-type ClientMap = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Outbound>>>>;
+type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
+
+/// A bounded per-client outbound queue (ENG-48).
+///
+/// * Reliable traffic — committed [`TopologyTransaction`]s, [`ActionStatus`],
+///   baseline transfers, the shutdown marker — is FIFO and counted against
+///   [`MAX_RELIABLE_BACKLOG`] / [`MAX_RELIABLE_BACKLOG_BYTES`]. A stalled
+///   reliable reader that blows either bound is disconnected (and re-baselines
+///   on reconnect); the backlog already accepted is still flushed, so committed
+///   topology is never silently discarded to stay under budget.
+/// * Motion is lossy: only the newest unsent batch is retained, so a slow
+///   reader accumulates no stale motion (`docs/protocol.md`: "Drop superseded
+///   unsent motion snapshots").
+#[derive(Default)]
+struct OutboundQueue {
+    reliable: VecDeque<Outbound>,
+    reliable_bytes: usize,
+    motion: Option<Arc<Vec<MotionSnapshot>>>,
+    /// Set once a reliable push blew the bound. The writer flushes what is
+    /// already queued, says goodbye, and exits.
+    overflowed: bool,
+}
+
+/// The reliable backlog blew [`MAX_RELIABLE_BACKLOG`] /
+/// [`MAX_RELIABLE_BACKLOG_BYTES`]; the caller must drop this client from the
+/// fan-out set.
+#[derive(Debug)]
+struct OutboundOverflow;
+
+impl OutboundQueue {
+    fn push(&mut self, msg: Outbound) -> Result<(), OutboundOverflow> {
+        match msg {
+            // Lossy: keep only the newest unsent batch.
+            Outbound::Motion(snaps) => {
+                self.motion = Some(snaps);
+                Ok(())
+            }
+            // The shutdown marker always goes through — it ends the stream.
+            Outbound::Shutdown => {
+                self.reliable.push_back(Outbound::Shutdown);
+                Ok(())
+            }
+            reliable => {
+                if self.overflowed {
+                    return Err(OutboundOverflow);
+                }
+                let add = reliable_msg_bytes(&reliable);
+                if self.reliable.len() >= MAX_RELIABLE_BACKLOG
+                    || self.reliable_bytes.saturating_add(add) > MAX_RELIABLE_BACKLOG_BYTES
+                {
+                    // Do not enqueue and do not discard the accepted backlog:
+                    // the writer still flushes it, then the connection closes
+                    // and the client re-baselines.
+                    self.overflowed = true;
+                    return Err(OutboundOverflow);
+                }
+                self.reliable_bytes += add;
+                self.reliable.push_back(reliable);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Rough serialized size of one reliable outbound message, for the byte cap.
+fn reliable_msg_bytes(msg: &Outbound) -> usize {
+    match msg {
+        Outbound::Transaction(tx) => {
+            128 + tx.ops.len() * 48
+                + tx.before.len() * 24
+                + tx.after.len() * 24
+                + tx.dependencies.len() * 16
+                + tx.result_hashes.len() * 40
+        }
+        Outbound::Status(_) => 96,
+        Outbound::Baseline(t) => 64 + t.payload_bytes(),
+        Outbound::Motion(_) | Outbound::Shutdown => 0,
+    }
+}
+
+/// What one [`OutboundHandle::take`] pass handed the writer.
+struct OutboundBatch {
+    reliable: Vec<Outbound>,
+    motion: Option<Arc<Vec<MotionSnapshot>>>,
+    overflowed: bool,
+}
+
+impl OutboundBatch {
+    fn is_empty(&self) -> bool {
+        self.reliable.is_empty() && self.motion.is_none()
+    }
+}
+
+/// A cloneable handle: the sim bridge enqueues through it, the client's writer
+/// task drains it.
+#[derive(Clone)]
+struct OutboundHandle {
+    inner: Arc<OutboundShared>,
+}
+
+struct OutboundShared {
+    queue: Mutex<OutboundQueue>,
+    wake: Notify,
+}
+
+impl OutboundHandle {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(OutboundShared {
+                queue: Mutex::new(OutboundQueue::default()),
+                wake: Notify::new(),
+            }),
+        }
+    }
+
+    /// Enqueues one message and wakes the writer. `Err(OutboundOverflow)` means
+    /// the reliable backlog blew its bound and the caller must drop this client
+    /// from the fan-out set (its writer is now draining-then-closing).
+    fn push(&self, msg: Outbound) -> Result<(), OutboundOverflow> {
+        let res = {
+            let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.push(msg)
+        };
+        self.inner.wake.notify_one();
+        res
+    }
+
+    /// Takes everything queued in one pass.
+    fn take(&self) -> OutboundBatch {
+        let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        OutboundBatch {
+            reliable: q.reliable.drain(..).collect(),
+            motion: q.motion.take(),
+            overflowed: q.overflowed,
+        }
+    }
+
+    /// Current queued reliable bytes (test-only introspection of the byte cap).
+    #[cfg(test)]
+    fn reliable_bytes(&self) -> usize {
+        self.inner
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reliable_bytes
+    }
+
+    async fn woken(&self) {
+        self.inner.wake.notified().await;
+    }
+}
 
 async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let mut log = JsonlLog::create(&config.log_json)?;
@@ -324,7 +521,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     ))?;
 
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Inbound>();
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
 
@@ -358,15 +555,15 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
                 connected += 1;
                 let _ = count_tx.send(connected);
-                let (out_tx, out_rx) = mpsc::unbounded_channel::<Outbound>();
+                let handle = OutboundHandle::new();
                 clients
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(conn.session().raw(), out_tx);
+                    .insert(conn.session().raw(), handle.clone());
                 tokio::spawn(serve_conn(
                     conn,
                     inbound_tx.clone(),
-                    out_rx,
+                    handle,
                     clients.clone(),
                     stop_rx.clone(),
                 ));
@@ -438,6 +635,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut motion = MotionPublisher::new(60, 20);
         let mut committed_total = 0u64;
         let mut rejected_total = 0u64;
+        // ENG-48: `ActionRequest`s / `RepairRequest`s that exceeded a session's
+        // per-tick admission quota and were bounced with a retry response
+        // (actions) or dropped (repairs).
+        let mut actions_throttled = 0u64;
+        let mut repairs_throttled = 0u64;
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
         let tick_dt = Duration::from_nanos(1_000_000_000 / 60);
@@ -448,10 +650,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         for _ in 0..max_ticks {
             let started = std::time::Instant::now();
 
-            // Drain everything the clients have sent since the last tick.
+            // ENG-48: drain a bounded slice of what the clients have sent since
+            // the last tick, with a per-session admission quota so one flooding
+            // client can neither stall this loop nor starve the others. The
+            // surplus stays in the bounded channel for the next tick.
             let mut repairs: Vec<(SessionId, RepairRequest)> = Vec::new();
             let mut saw_client_work = false;
-            while let Ok(msg) = inbound_rx.try_recv() {
+            let mut actions_admitted: HashMap<u64, u32> = HashMap::new();
+            let mut repairs_admitted: HashMap<u64, u32> = HashMap::new();
+            let mut drained = 0usize;
+            while drained < MAX_INBOUND_PER_TICK {
+                let Ok(msg) = inbound_rx.try_recv() else {
+                    break;
+                };
+                drained += 1;
                 match msg {
                     Inbound::Joined(session) => lj.on_joined(session),
                     Inbound::Action(session, req) => {
@@ -460,6 +672,21 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             reject(&clients_for_sim, session, req.request_id, "expired session");
                             rejected_total += 1;
                             lj.expired_actions += 1;
+                            continue;
+                        }
+                        if !admit(
+                            &mut actions_admitted,
+                            session.raw(),
+                            MAX_ACTIONS_PER_CLIENT_PER_TICK,
+                        ) {
+                            reject(
+                                &clients_for_sim,
+                                session,
+                                req.request_id,
+                                "throttled: too many actions this tick, retry shortly",
+                            );
+                            rejected_total += 1;
+                            actions_throttled += 1;
                             continue;
                         }
                         let resolved = if dev_unvalidated_actions {
@@ -488,8 +715,17 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     }
                     Inbound::Repair(session, req) => {
                         saw_client_work = true;
-                        if !lj.session_expired(session) {
+                        if lj.session_expired(session) {
+                            continue;
+                        }
+                        if admit(
+                            &mut repairs_admitted,
+                            session.raw(),
+                            MAX_REPAIRS_PER_CLIENT_PER_TICK,
+                        ) {
                             repairs.push((session, req));
+                        } else {
+                            repairs_throttled += 1;
                         }
                     }
                     Inbound::Baseline(session, ack) => {
@@ -601,6 +837,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             late_joins_failed: lj.failed,
             expired_actions_rejected: lj.expired_actions,
             baseline_bytes_sent: lj.baseline_bytes,
+            actions_throttled,
+            repairs_throttled,
         }
     });
 
@@ -650,6 +888,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         late_joins_failed: sim_result.late_joins_failed,
         expired_actions_rejected: sim_result.expired_actions_rejected,
         baseline_bytes_sent: sim_result.baseline_bytes_sent,
+        inbound_actions_throttled: sim_result.actions_throttled,
+        inbound_repairs_throttled: sim_result.repairs_throttled,
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -684,6 +924,8 @@ struct SimResult {
     late_joins_failed: u64,
     expired_actions_rejected: u64,
     baseline_bytes_sent: u64,
+    actions_throttled: u64,
+    repairs_throttled: u64,
 }
 
 impl SimResult {
@@ -706,6 +948,8 @@ impl SimResult {
             late_joins_failed: 0,
             expired_actions_rejected: 0,
             baseline_bytes_sent: 0,
+            actions_throttled: 0,
+            repairs_throttled: 0,
         }
     }
 }
@@ -1273,15 +1517,43 @@ fn resolve_intent(
     })
 }
 
+/// Per-tick admission counter, shared by the action and repair intake. Returns
+/// `true` while `session` is still under `cap` for this tick and bumps its
+/// count; `false` once the quota is spent. Each session's count is independent,
+/// so one client's flood never consumes another's quota (ENG-48 fair
+/// scheduling).
+fn admit(counts: &mut HashMap<u64, u32>, session: u64, cap: u32) -> bool {
+    let n = counts.entry(session).or_insert(0);
+    if *n >= cap {
+        return false;
+    }
+    *n += 1;
+    true
+}
+
+/// Fans one message to every client. A client whose reliable backlog blew its
+/// bound ([`OutboundOverflow`]) is dropped from the fan-out set here; its
+/// writer task flushes the already-accepted backlog and then closes the
+/// connection, so committed topology is never silently discarded.
 fn broadcast(clients: &ClientMap, msg: Outbound) {
     let mut guard = clients.lock().unwrap_or_else(|e| e.into_inner());
-    guard.retain(|_, tx| tx.send(msg.clone()).is_ok());
+    let mut overflowed: Vec<u64> = Vec::new();
+    for (id, handle) in guard.iter() {
+        if handle.push(msg.clone()).is_err() {
+            overflowed.push(*id);
+        }
+    }
+    for id in overflowed {
+        guard.remove(&id);
+    }
 }
 
 fn send_to(clients: &ClientMap, session: SessionId, msg: Outbound) {
-    let guard = clients.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tx) = guard.get(&session.raw()) {
-        let _ = tx.send(msg);
+    let mut guard = clients.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard.get(&session.raw())
+        && handle.push(msg).is_err()
+    {
+        guard.remove(&session.raw());
     }
 }
 
@@ -1342,8 +1614,8 @@ async fn wait_true(mut rx: watch::Receiver<bool>) {
 /// writer that drains this client's outbound queue.
 async fn serve_conn(
     conn: Arc<Connection>,
-    inbound: mpsc::UnboundedSender<Inbound>,
-    mut outbound: mpsc::UnboundedReceiver<Outbound>,
+    inbound: mpsc::Sender<Inbound>,
+    handle: OutboundHandle,
     clients: ClientMap,
     stop: watch::Receiver<bool>,
 ) {
@@ -1352,7 +1624,7 @@ async fn serve_conn(
 
     // Announce the join in order so the sim loop can supersede an earlier
     // session on the same slot (reconnect) and drive a late-join baseline.
-    let _ = inbound.send(Inbound::Joined(session));
+    let _ = inbound.send(Inbound::Joined(session)).await;
 
     let liveness = tokio::spawn(conn.clone().run_liveness(stop.clone()));
 
@@ -1362,28 +1634,45 @@ async fn serve_conn(
         tokio::spawn(async move {
             loop {
                 match conn.recv_record().await {
+                    // ENG-48: never block the reader on a full bridge. A
+                    // flooding client's surplus is dropped here (the records
+                    // are client-retryable and rate-limited); the bounded
+                    // channel keeps host memory flat. A well-behaved client
+                    // stays far under the cap.
                     Ok(Some(WireRecord::ActionRequest(req))) => {
-                        let _ = inbound.send(Inbound::Action(session, req));
+                        match inbound.try_send(Inbound::Action(session, req)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
                     }
                     Ok(Some(WireRecord::RepairRequest(req))) => {
-                        let _ = inbound.send(Inbound::Repair(session, req));
+                        match inbound.try_send(Inbound::Repair(session, req)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
                     }
                     Ok(Some(WireRecord::BaselineAck(ack))) => {
-                        let _ = inbound.send(Inbound::Baseline(session, ack));
+                        if inbound.send(Inbound::Baseline(session, ack)).await.is_err() {
+                            break;
+                        }
                     }
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => break,
                 }
             }
-            let _ = inbound.send(Inbound::Gone(session));
+            let _ = inbound.send(Inbound::Gone(session)).await;
         })
     };
 
     let mut motion_seq = 0u64;
-    loop {
-        tokio::select! {
-            msg = outbound.recv() => {
-                let Some(msg) = msg else { break };
+    'writer: loop {
+        // Flush everything queued, in commit order, before parking.
+        loop {
+            let batch = handle.take();
+            if batch.is_empty() && !batch.overflowed {
+                break;
+            }
+            for msg in batch.reliable {
                 let ok = match msg {
                     Outbound::Transaction(tx) => conn
                         .send_record(WireRecord::TopologyTransaction((*tx).clone()))
@@ -1393,30 +1682,38 @@ async fn serve_conn(
                         .send_record(WireRecord::ActionStatus((*s).clone()))
                         .await
                         .is_ok(),
-                    Outbound::Baseline(transfer) => {
-                        send_baseline(&conn, &transfer).await
-                    }
-                    Outbound::Motion(snaps) => {
-                        let mut ok = true;
-                        for snap in snaps.iter() {
-                            if conn.send_datagram(motion_seq, snap).await.is_err() {
-                                ok = false;
-                                break;
-                            }
-                            motion_seq += 1;
-                        }
-                        ok
-                    }
+                    Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
+                    // Motion is never queued as reliable; ignore defensively.
+                    Outbound::Motion(_) => true,
                     Outbound::Shutdown => {
                         let _ = conn.say_bye("server complete").await;
                         false
                     }
                 };
                 if !ok {
-                    break;
+                    break 'writer;
                 }
             }
-            _ = wait_true(stop.clone()) => break,
+            if let Some(snaps) = batch.motion {
+                for snap in snaps.iter() {
+                    if conn.send_datagram(motion_seq, snap).await.is_err() {
+                        break 'writer;
+                    }
+                    motion_seq += 1;
+                }
+            }
+            if batch.overflowed {
+                // ENG-48: this client's reliable backlog blew its bound. The
+                // accepted backlog above has been flushed; end the connection
+                // so it re-baselines on reconnect rather than the host holding
+                // an unbounded queue or discarding committed topology in place.
+                let _ = conn.say_bye("reliable backlog exceeded").await;
+                break 'writer;
+            }
+        }
+        tokio::select! {
+            _ = handle.woken() => {}
+            _ = wait_true(stop.clone()) => break 'writer,
         }
     }
 
@@ -1802,5 +2099,138 @@ mod tests {
             lj.links.get(&live.raw()).map(|l| &l.phase),
             Some(Phase::Live)
         ));
+    }
+
+    // --- ENG-48: bounded replication host queues ----------------------------
+
+    fn empty_tx() -> Outbound {
+        Outbound::Transaction(Arc::new(TopologyTransaction {
+            transaction_id: spall_core::TransactionId::new(1).unwrap(),
+            server_tick: spall_core::Tick(1),
+            control_seq: spall_protocol::ControlSeq(0),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![],
+            result_hashes: vec![],
+        }))
+    }
+
+    #[test]
+    fn the_reliable_backlog_is_bounded_and_keeps_accepted_topology() {
+        let h = OutboundHandle::new();
+        let mut accepted = 0usize;
+        let mut overflowed = false;
+        // Sustained committed topology into a reader that never drains.
+        for _ in 0..(MAX_RELIABLE_BACKLOG * 8) {
+            match h.push(empty_tx()) {
+                Ok(()) => accepted += 1,
+                Err(_) => {
+                    overflowed = true;
+                    break;
+                }
+            }
+        }
+        assert!(overflowed, "the reliable backlog bound is enforced");
+        assert!(
+            accepted <= MAX_RELIABLE_BACKLOG,
+            "memory plateaus at the bound ({accepted} accepted)"
+        );
+        assert!(h.reliable_bytes() <= MAX_RELIABLE_BACKLOG_BYTES);
+        // The accepted backlog is still handed to the writer for delivery —
+        // committed topology is never silently discarded to stay under budget.
+        let batch = h.take();
+        assert_eq!(batch.reliable.len(), accepted);
+        assert!(
+            batch.overflowed,
+            "the writer is told to flush-then-disconnect this client"
+        );
+        assert!(
+            h.push(empty_tx()).is_err(),
+            "further reliable traffic stays refused; the client is being dropped"
+        );
+    }
+
+    #[test]
+    fn unsent_motion_is_superseded_not_accumulated() {
+        let sim = bridge_after_cut();
+        let mut mp = MotionPublisher::new(60, 20);
+        let h = OutboundHandle::new();
+        for t in 1..=5_000u64 {
+            let snaps = mp.snapshots(sim.world(), spall_core::Tick(t));
+            h.push(Outbound::Motion(Arc::new(snaps)))
+                .expect("motion never overflows the queue");
+        }
+        let batch = h.take();
+        assert!(batch.reliable.is_empty());
+        let motion = batch.motion.expect("the newest motion batch is retained");
+        assert!(!motion.is_empty());
+        assert_eq!(
+            motion[0].server_tick.get(),
+            5_000,
+            "only the newest batch survives a stalled reader"
+        );
+        assert!(h.take().is_empty(), "nothing accumulated behind it");
+    }
+
+    #[test]
+    fn a_broadcast_drops_only_the_client_whose_backlog_overflows() {
+        let clients = empty_clients();
+        let keeps_up = sess(0, 1);
+        let stalled = sess(1, 1);
+        {
+            let mut g = clients.lock().unwrap_or_else(|e| e.into_inner());
+            g.insert(keeps_up.raw(), OutboundHandle::new());
+            g.insert(stalled.raw(), OutboundHandle::new());
+        }
+        for _ in 0..(MAX_RELIABLE_BACKLOG * 3) {
+            broadcast(&clients, empty_tx());
+            // The healthy reader drains every round; the stalled one never does.
+            if let Some(h) = clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&keeps_up.raw())
+            {
+                let _ = h.take();
+            }
+        }
+        let g = clients.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            g.contains_key(&keeps_up.raw()),
+            "a reader that keeps up stays in the fan-out set"
+        );
+        assert!(
+            !g.contains_key(&stalled.raw()),
+            "the stalled reader is removed once its reliable backlog blows the bound"
+        );
+    }
+
+    #[test]
+    fn per_tick_admission_caps_each_session_independently() {
+        let mut counts: HashMap<u64, u32> = HashMap::new();
+        let flooder = sess(0, 1).raw();
+        let other = sess(1, 1).raw();
+
+        let mut admitted = 0u32;
+        for _ in 0..1_000 {
+            if admit(&mut counts, flooder, MAX_ACTIONS_PER_CLIENT_PER_TICK) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, MAX_ACTIONS_PER_CLIENT_PER_TICK,
+            "one session's flood is capped for the tick"
+        );
+
+        // A different session still gets its full quota — fair scheduling, the
+        // flood above did not consume it.
+        let mut other_ok = 0u32;
+        for _ in 0..1_000 {
+            if admit(&mut counts, other, MAX_ACTIONS_PER_CLIENT_PER_TICK) {
+                other_ok += 1;
+            }
+        }
+        assert_eq!(other_ok, MAX_ACTIONS_PER_CLIENT_PER_TICK);
     }
 }
