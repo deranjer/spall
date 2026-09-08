@@ -48,7 +48,7 @@ Canonical topology hashes include sorted volume IDs, cell-size codes, brick coor
 ## Transaction application
 
 1. Server constructs a complete transaction against specific input revisions. All source changes, children, mass/pose metadata, and required server collision updates are ready before commit.
-2. Server commits once at a tick boundary and journals the complete authoritative result. Repeated ActionRequest IDs return the existing status and cannot perform another cut.
+2. Server commits once at a tick boundary and journals the complete authoritative result. Once an action has passed authoritative validation and entered admission, repeated ActionRequest IDs return its stored `Queued`, `Committed`, or deterministic staging/commit `Rejected` status and cannot perform another cut. The replay lookup occurs before re-validating the wire claim, so a reconnect can recover a committed result even after that edit changed the ray target. Pre-admission validation and rate-limit refusals are not admitted actions: they do not reserve a request ID, and a corrected retry remains a new request for admission.
 3. Client stages all parts and checks source revisions, IDs, length limits, and hashes. It applies operations in the encoded order into a candidate replica.
 4. Publish the candidate only when the whole transaction validates. Retain the previous consistent replica while dependencies or derived client collision data are pending. Local visual feedback may show a pending action but must not change authoritative replica geometry.
 5. Duplicate transactions are ignored using session/stream sequencing and IDs. Unexpected source revisions trigger bounded repair, not guessed replay. A failed candidate cannot partly replace live state.

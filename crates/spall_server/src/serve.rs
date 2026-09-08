@@ -686,6 +686,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             lj.expired_actions += 1;
                             continue;
                         }
+                        // ENG-57: check the authoritative admission ledger
+                        // before rate limiting or resolving the claim. A
+                        // committed cut can make the original ray miss, and a
+                        // reconnect may legitimately retry the same reliable
+                        // request on its replacement session. Replaying this
+                        // status must not restage or re-apply the edit.
+                        if let Some(status) = replay_admitted_status(&sim, req.request_id) {
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Status(Arc::new(status.clone())),
+                            );
+                            continue;
+                        }
                         if !admit(
                             &mut actions_admitted,
                             session.raw(),
@@ -708,8 +722,13 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             resolve_intent(sim.world(), session, &req)
                         };
                         match resolved {
-                            Ok(intent) => {
-                                if let Err(e) = sim.submit(intent) {
+                            Ok(intent) => match sim.submit(intent) {
+                                Ok(status) => send_to(
+                                    &clients_for_sim,
+                                    session,
+                                    Outbound::Status(Arc::new(status)),
+                                ),
+                                Err(e) => {
                                     reject(
                                         &clients_for_sim,
                                         session,
@@ -718,7 +737,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                     );
                                     rejected_total += 1;
                                 }
-                            }
+                            },
                             Err(rej) => {
                                 reject(&clients_for_sim, session, req.request_id, &rej.reason());
                                 rejected_total += 1;
@@ -1615,6 +1634,14 @@ fn reject(clients: &ClientMap, session: SessionId, request: RequestId, reason: &
     );
 }
 
+/// Returns a replayable status only for an action that passed authoritative
+/// validation and was admitted to the simulation. Pre-admission validation and
+/// rate-limit refusals intentionally are not held here: no edit was staged, so
+/// a corrected retry is a new admission attempt (see `docs/protocol.md`).
+fn replay_admitted_status(sim: &Simulation, request: RequestId) -> Option<ActionStatus> {
+    sim.action_status(request).cloned()
+}
+
 /// Pushes one baseline transfer to a client: `BaselineBegin` on the control
 /// stream, every part on a fresh bulk stream, then `BaselineEnd` on control.
 /// Returns `false` if any leg fails (the writer loop then tears the connection
@@ -2040,6 +2067,74 @@ mod tests {
         let intent = dev_intent_from_request(sess(0, 1), &req).expect("dev passthrough");
         // No raycast, no re-derivation: exactly the claimed brush.
         assert_eq!(intent.brush, req.claimed_brush);
+    }
+
+    #[test]
+    fn reliable_retry_after_reconnect_replays_before_stale_claim_validation() {
+        let original_session = sess(0, 1);
+        let replacement_session = sess(0, 2);
+        let mut sim = Scene::BridgeCut.simulation();
+        let mut request = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [3, 1, 1],
+            2,
+        );
+        request.request_id = RequestId(57);
+
+        let intent = resolve_intent(sim.world(), original_session, &request).unwrap();
+        assert!(matches!(
+            sim.submit(intent).unwrap().outcome,
+            ActionOutcome::Queued
+        ));
+        sim.run_until_idle(8).unwrap();
+        let committed = replay_admitted_status(&sim, request.request_id).unwrap();
+        assert!(matches!(committed.outcome, ActionOutcome::Committed { .. }));
+
+        // The original ray now points at removed column cells. A handler that
+        // validated first would turn this reliable retry into a fresh rejection.
+        assert!(
+            resolve_intent(sim.world(), replacement_session, &request).is_err(),
+            "the fixture must prove that commit changed the original claim's target"
+        );
+        assert_eq!(
+            replay_admitted_status(&sim, request.request_id),
+            Some(committed),
+            "the replacement session receives the original committed status"
+        );
+    }
+
+    #[test]
+    fn pre_admission_validation_refusals_do_not_reserve_request_ids() {
+        let sim = Scene::BridgeCut.simulation();
+        let session = sess(0, 1);
+        let rejected = action_req(
+            77,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            2,
+        );
+        assert!(resolve_intent(sim.world(), session, &rejected).is_err());
+        assert!(replay_admitted_status(&sim, rejected.request_id).is_none());
+
+        // This is deliberately still eligible for validation/admission with a
+        // corrected payload: only accepted pipeline work has a replay ledger.
+        let corrected = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            2,
+        );
+        assert!(resolve_intent(sim.world(), session, &corrected).is_ok());
     }
 
     #[test]

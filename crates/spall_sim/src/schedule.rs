@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use spall_core::{BrickCoord, Tick, VolumeId};
 use spall_jobs::{JobId, JobRequest, JobToken, Lane, Priority, Scheduler, SchedulerConfig};
-use spall_protocol::{ControlSeq, RequestId};
+use spall_protocol::{ActionOutcome, ActionStatus, ControlSeq, RequestId};
 
 use crate::commit::{CommitError, CommitOutcome, Committed, commit};
 use crate::intent::{EditIntent, EditTarget, IntentError};
@@ -83,6 +83,12 @@ pub struct EditPipeline {
     conflicts: HashMap<RegionKey, u32>,
     serialized: HashSet<RegionKey>,
     committed: HashMap<u64, Committed>,
+    /// The idempotency ledger for every intent that passed admission.  A value
+    /// remains `Queued` while it is pending or in flight, then becomes its
+    /// terminal committed/rejected status.  This deliberately lives beside the
+    /// pipeline rather than in a transport session: a reliable retry may arrive
+    /// on a replacement connection.
+    statuses: HashMap<u64, ActionStatus>,
     /// Regions with a job in flight or staged-not-committed this tick.
     active_regions: HashSet<RegionKey>,
     max_pending: usize,
@@ -98,6 +104,7 @@ impl EditPipeline {
             conflicts: HashMap::new(),
             serialized: HashSet::new(),
             committed: HashMap::new(),
+            statuses: HashMap::new(),
             active_regions: HashSet::new(),
             max_pending,
             serialize_threshold: serialize_threshold.max(1),
@@ -107,6 +114,12 @@ impl EditPipeline {
     /// The committed [`Committed`] for `request_id`, if it has committed.
     pub fn committed(&self, request_id: RequestId) -> Option<&Committed> {
         self.committed.get(&request_id.0)
+    }
+
+    /// The current authoritative status for an admitted request.  A repeated
+    /// request id must receive this exact value without re-staging the intent.
+    pub fn action_status(&self, request_id: RequestId) -> Option<&ActionStatus> {
+        self.statuses.get(&request_id.0)
     }
 
     /// `true` when nothing is pending, in flight, or awaiting install.
@@ -123,22 +136,19 @@ impl EditPipeline {
         self.serialized.contains(&region)
     }
 
-    /// Admits an accepted intent. Rejects a duplicate request id and a full
-    /// queue.
+    /// Admits an accepted intent, returning its authoritative status.
+    ///
+    /// A first admission returns `Queued`. A duplicate returns the existing
+    /// `Queued`, `Committed`, or deterministic `Rejected` status without
+    /// changing the queue, world, journal, or one-time impulse state.
     pub fn submit_intent(
         &mut self,
         intent: EditIntent,
         world: &SimWorld,
-    ) -> Result<(), IntentError> {
+    ) -> Result<ActionStatus, IntentError> {
         let request = intent.request_id;
-        if self.committed.contains_key(&request.0)
-            || self.pending.iter().any(|q| q.intent.request_id == request)
-            || self
-                .inflight
-                .values()
-                .any(|q| q.intent.request_id == request)
-        {
-            return Err(IntentError::DuplicateRequest(request));
+        if let Some(status) = self.statuses.get(&request.0) {
+            return Ok(status.clone());
         }
         if self.pending.len() >= self.max_pending {
             return Err(IntentError::QueueFull {
@@ -160,7 +170,9 @@ impl EditPipeline {
             region,
             attempts: 0,
         });
-        Ok(())
+        let status = crate::commit::queued_status(request);
+        self.statuses.insert(request.0, status.clone());
+        Ok(status)
     }
 
     /// Runs one submit → stage → install → commit round.
@@ -188,9 +200,9 @@ impl EditPipeline {
             }
 
             let Some(snapshot) = world.volume_ref(queued.volume_id).cloned() else {
-                report
-                    .rejected
-                    .push((queued.intent.request_id, "target volume vanished".into()));
+                let reason = "target volume vanished".to_string();
+                self.record_rejection(queued.intent.request_id, reason.clone());
+                report.rejected.push((queued.intent.request_id, reason));
                 continue;
             };
             let input = StageInput::new(
@@ -247,7 +259,9 @@ impl EditPipeline {
             let staged = match entry.output {
                 Ok(staged) => staged,
                 Err(err) => {
-                    report.rejected.push((request, err.to_string()));
+                    let reason = err.to_string();
+                    self.record_rejection(request, reason.clone());
+                    report.rejected.push((request, reason));
                     self.conflicts.remove(&region);
                     continue;
                 }
@@ -263,6 +277,7 @@ impl EditPipeline {
                     *next_control_seq += 1;
                     self.conflicts.remove(&region);
                     self.committed.insert(request.0, done.clone());
+                    self.statuses.insert(request.0, done.action_status(request));
                     report.committed.push((request, done));
                 }
                 Err(err) => {
@@ -272,7 +287,9 @@ impl EditPipeline {
                     // deterministically; the tick continues and every other
                     // staged request still commits.
                     self.conflicts.remove(&region);
-                    report.rejected.push((request, err.to_string()));
+                    let reason = err.to_string();
+                    self.record_rejection(request, reason.clone());
+                    report.rejected.push((request, reason));
                 }
                 Ok(CommitOutcome::Stale(_reason)) => {
                     let count = self.conflicts.entry(region).or_insert(0);
@@ -292,13 +309,45 @@ impl EditPipeline {
         report.pending_after = self.pending.len();
         Ok(report)
     }
+
+    fn record_rejection(&mut self, request: RequestId, reason: String) {
+        self.statuses.insert(
+            request.0,
+            ActionStatus {
+                request_id: request,
+                outcome: ActionOutcome::Rejected { reason },
+            },
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spall_core::SphereBrush;
     use spall_core::units::{BRUSH_UNIT, BrushPoint};
+    use spall_core::{EntityId, SphereBrush};
+    use spall_protocol::ActionOutcome;
+
+    fn actor() -> EntityId {
+        EntityId::new(1).unwrap()
+    }
+
+    fn cut(request: u64, x: i64, y: i64, z: i64, radius_cells: i64) -> EditIntent {
+        EditIntent::cut(
+            RequestId(request),
+            actor(),
+            EditTarget::Terrain,
+            SphereBrush::new(
+                BrushPoint::from_units(
+                    x * BRUSH_UNIT + BRUSH_UNIT / 2,
+                    y * BRUSH_UNIT + BRUSH_UNIT / 2,
+                    z * BRUSH_UNIT + BRUSH_UNIT / 2,
+                ),
+                radius_cells * BRUSH_UNIT,
+            )
+            .unwrap(),
+        )
+    }
 
     #[test]
     fn region_key_is_the_brush_centre_brick() {
@@ -323,5 +372,106 @@ mod tests {
         let far =
             SphereBrush::new(BrushPoint::from_units(200 * BRUSH_UNIT, 0, 0), BRUSH_UNIT).unwrap();
         assert_ne!(RegionKey::of(vid, &far), key);
+    }
+
+    #[test]
+    fn retransmission_replays_queued_status_while_pending_and_inflight() {
+        let world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
+        let mut pipeline = EditPipeline::new(2, 3);
+        let request = RequestId(41);
+        let queued = pipeline
+            .submit_intent(cut(request.0, 2, 1, 2, 1), &world)
+            .unwrap();
+        assert!(matches!(queued.outcome, ActionOutcome::Queued));
+
+        // A different payload with the same id cannot replace the queued
+        // operation. The queue remains exactly one entry.
+        assert_eq!(
+            pipeline
+                .submit_intent(cut(request.0, 20, 1, 20, 1), &world)
+                .unwrap(),
+            queued
+        );
+        assert_eq!(pipeline.pending.len(), 1);
+
+        // Put that same request in the scheduler's in-flight set without
+        // executing it. This models a reliable retry while off-tick staging is
+        // active; submitting it again must still be a pure status replay.
+        let pending = pipeline.pending.pop_front().unwrap();
+        let handle = pipeline
+            .scheduler
+            .submit(JobRequest::new(
+                Lane::Edit,
+                Priority::NORMAL,
+                JobToken::new(world.generation(), world.topology_epoch()),
+                || -> StageResult { unreachable!("test job is never dispatched") },
+            ))
+            .unwrap();
+        pipeline.inflight.insert(handle.id(), pending);
+        assert_eq!(
+            pipeline
+                .submit_intent(cut(request.0, 8, 1, 8, 1), &world)
+                .unwrap(),
+            queued
+        );
+        assert!(pipeline.pending.is_empty());
+        assert_eq!(pipeline.inflight.len(), 1);
+    }
+
+    #[test]
+    fn retransmission_replays_terminal_status_without_mutating_world_or_journal() {
+        let mut world = SimWorld::new(crate::fixtures::bridged_terrain_setup()).unwrap();
+        let mut pipeline = EditPipeline::new(2, 3);
+        let mut journal = JournalSink::new();
+        let mut next_control_seq = 1;
+        let request = RequestId(42);
+
+        pipeline
+            .submit_intent(cut(request.0, 10, 4, 1, 2), &world)
+            .unwrap();
+        let report = pipeline
+            .run_tick(&mut world, &mut journal, Tick(1), &mut next_control_seq)
+            .unwrap();
+        assert_eq!(report.committed.len(), 1);
+        let committed = pipeline.action_status(request).cloned().unwrap();
+        assert!(matches!(committed.outcome, ActionOutcome::Committed { .. }));
+        let world_before = world.world_hash();
+        let journal_before = journal.entries().to_vec();
+
+        assert_eq!(
+            pipeline
+                .submit_intent(cut(request.0, 1, 1, 1, 1), &world)
+                .unwrap(),
+            committed
+        );
+        assert_eq!(world.world_hash(), world_before);
+        assert_eq!(journal.entries(), journal_before.as_slice());
+
+        // A deterministic staging failure also becomes a terminal, replayable
+        // status rather than allowing a later payload to take the same id.
+        let rejected_request = RequestId(43);
+        let zero = EditIntent::cut(
+            rejected_request,
+            actor(),
+            EditTarget::Terrain,
+            SphereBrush::new(BrushPoint::from_cells(0, 0, 0).unwrap(), 0).unwrap(),
+        );
+        pipeline.submit_intent(zero, &world).unwrap();
+        let report = pipeline
+            .run_tick(&mut world, &mut journal, Tick(2), &mut next_control_seq)
+            .unwrap();
+        assert_eq!(report.rejected.len(), 1);
+        let rejected = pipeline.action_status(rejected_request).cloned().unwrap();
+        assert!(matches!(rejected.outcome, ActionOutcome::Rejected { .. }));
+        let world_before = world.world_hash();
+        let journal_before = journal.entries().to_vec();
+        assert_eq!(
+            pipeline
+                .submit_intent(cut(rejected_request.0, 1, 1, 1, 1), &world)
+                .unwrap(),
+            rejected
+        );
+        assert_eq!(world.world_hash(), world_before);
+        assert_eq!(journal.entries(), journal_before.as_slice());
     }
 }
