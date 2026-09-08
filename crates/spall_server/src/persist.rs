@@ -121,6 +121,12 @@ pub enum PersistError {
         checkpoint: u32,
         runtime: u32,
     },
+    #[error(
+        "journal tick regression at seq {seq}: record tick {tick} precedes an already-durable \
+         tick {durable} (the durable suffix must be non-decreasing in tick — refusing to replay \
+         a suffix that would stamp new events before older durable ones)"
+    )]
+    JournalTickRegression { seq: u64, tick: u64, durable: u64 },
 }
 
 // --- capture --------------------------------------------------------------
@@ -263,6 +269,17 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
 /// durable journal suffix replayed onto it. Returns the simulation and the
 /// highest durable `JournalSeq` (the resume point for further journalling).
 ///
+/// Simulation time resumes at the **highest tick any durable record carries**,
+/// not the checkpoint tick. A replayed transaction/pose record can belong to a
+/// tick far later than `cp.tick`; resuming at `cp.tick` would let the first
+/// post-recovery [`Simulation::tick`] stamp new committed events and motion
+/// *before* records that are already durable, breaking tick ordering,
+/// interpolation and checkpoint ordering (ENG-39). Replay also validates that
+/// record ticks are monotonic non-decreasing (they are seq-ordered) and never
+/// precede the checkpoint; a regression is [`PersistError::JournalTickRegression`].
+/// The first tick after recovery is therefore strictly newer than every durable
+/// record.
+///
 /// `cfg` is the configured world identity the host is resuming; `materials`,
 /// `anchor`, and `physics` are redeployment config. Before any state is rebuilt
 /// the saved [`StoredWorldMeta`] is validated against `cfg` and this build:
@@ -385,8 +402,23 @@ pub fn restore(
     let mut max_entity = cp.meta.next_entity.saturating_sub(1);
     let mut max_volume = cp.meta.next_volume.saturating_sub(1);
     let mut last_seq = cp.journal_cursor;
+    // Highest tick proven durable: the checkpoint tick, then raised by every
+    // replayed record. Simulation time resumes here so the first post-recovery
+    // tick is strictly newer than every durable record (ENG-39).
+    let mut durable_tick = cp.tick;
 
     for record in &recovery.journal {
+        // The durable suffix is seq-ordered; its record ticks must be
+        // non-decreasing and never precede the checkpoint. A regression means
+        // the suffix is inconsistent — fail closed rather than replay it.
+        if record.tick < durable_tick {
+            return Err(PersistError::JournalTickRegression {
+                seq: record.seq,
+                tick: record.tick,
+                durable: durable_tick,
+            });
+        }
+        durable_tick = record.tick;
         match &record.payload {
             JournalPayload::Topology { .. } => {
                 let (tx, participants) =
@@ -425,7 +457,12 @@ pub fn restore(
 
     world.resume_registry(max_entity + 1, max_volume + 1, max_tx + 1, last_seq + 1)?;
 
-    Ok((Simulation::from_restored(world, Tick(cp.tick)), last_seq))
+    // Resume at the durable suffix tick, not `cp.tick`: the next `tick()` then
+    // stamps events at `durable_tick + 1`, strictly after every durable record.
+    Ok((
+        Simulation::from_restored(world, Tick(durable_tick)),
+        last_seq,
+    ))
 }
 
 /// Validates the saved world metadata against the configured world identity and

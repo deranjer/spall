@@ -575,6 +575,210 @@ fn a_journal_transaction_with_a_stale_algorithm_version_is_rejected() {
     }
 }
 
+// --- ENG-39: resume simulation time at the durable journal suffix -------
+
+/// Highest tick any durable record in a recovery carries (checkpoint tick
+/// included).
+fn max_durable_tick(recovery: &spall_store::Recovery) -> u64 {
+    recovery
+        .journal
+        .iter()
+        .map(|r| r.tick)
+        .max()
+        .unwrap_or(0)
+        .max(recovery.checkpoint.tick)
+}
+
+#[test]
+fn review_replay_must_advance_tick_past_durable_suffix() {
+    // The issue repro: checkpoint at tick 0, a column cut that becomes durable
+    // at a much later tick, journal appended, then restore. Resuming at the old
+    // checkpoint tick would let the next committed event be stamped *before* the
+    // already-durable transaction.
+    let s = Scratch::new("resume_tick");
+
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(10, 4, 1, 2),
+        ))
+        .unwrap();
+        sim.run_until_idle(16).unwrap();
+        assert_eq!(sim.world().body_count(), 1, "beam detached");
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].tick > 0,
+            "the durable transaction is at a tick strictly after the checkpoint"
+        );
+        w.append_journal(&records).unwrap();
+    }
+
+    let recovery = spall_store::recover(s.db()).unwrap();
+    let durable_tick = max_durable_tick(&recovery);
+    assert!(durable_tick > 0);
+
+    let (mut restored, _seq) = persist::restore(
+        &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .unwrap();
+
+    // Simulation time resumes at the durable suffix, not the checkpoint tick.
+    assert!(
+        restored.current_tick().get() >= durable_tick,
+        "restored at tick {} but the durable suffix reaches tick {durable_tick}",
+        restored.current_tick().get()
+    );
+
+    // The first post-recovery committed event is strictly newer than every
+    // durable record — tick / interpolation / checkpoint ordering hold.
+    restored
+        .submit(EditIntent::cut(
+            RequestId(2),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(6, 4, 1, 1),
+        ))
+        .unwrap();
+    restored.run_until_idle(16).unwrap();
+    let committed = restored
+        .committed(RequestId(2))
+        .expect("fresh cut commits after recovery");
+    assert!(
+        committed.topology.server_tick.get() > durable_tick,
+        "post-recovery transaction stamped at tick {} — not strictly after the \
+         durable suffix tick {durable_tick}",
+        committed.topology.server_tick.get()
+    );
+}
+
+#[test]
+fn checkpoint_plus_topology_and_pose_suffix_survives_a_second_restart() {
+    // A durable suffix that ends with a pose batch at a tick later than the
+    // topology transaction: recovery must resume past the *pose* tick, and that
+    // resumed time must itself survive a second save + restart.
+    let s = Scratch::new("second_restart");
+
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let topo_records = {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(10, 4, 1, 2),
+        ))
+        .unwrap();
+        sim.run_until_idle(16).unwrap();
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1);
+        let topo_tick = records[0].tick;
+        let pose_tick = topo_tick + 5;
+
+        // topology record, then a later pose batch (empty snapshots is a valid
+        // no-op payload — this test exercises the tick-ordering / resume path).
+        let mut suffix = records.clone();
+        suffix.push(spall_store::JournalRecord {
+            seq: records[0].seq + 1,
+            tick: pose_tick,
+            payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+        });
+        w.append_journal(&suffix).unwrap();
+        records
+    };
+
+    let recovery = spall_store::recover(s.db()).unwrap();
+    assert_eq!(recovery.journal.len(), 2);
+    let durable_tick = max_durable_tick(&recovery);
+    assert_eq!(
+        durable_tick,
+        topo_records[0].tick + 5,
+        "the pose batch is newest"
+    );
+
+    let (first, _) = persist::restore(
+        &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        first.current_tick().get() >= durable_tick,
+        "first restart resumed at tick {}, behind the durable suffix tick {durable_tick}",
+        first.current_tick().get()
+    );
+    let first_tick = first.current_tick();
+    let first_hash = first.world().world_hash();
+
+    // Second save + restart: checkpoint the recovered sim to a fresh database,
+    // recover, restore again. The resumed tick and world must round-trip.
+    let s2 = Scratch::new("second_restart_b");
+    publish(&s2.db(), &persist::capture(&first, &cfg(), 0).unwrap());
+    drop(first);
+    let (second, second_seq) = recover_restore(&s2.db());
+    assert_eq!(second_seq, 0);
+    assert_eq!(
+        second.current_tick(),
+        first_tick,
+        "the durable-suffix tick survived a second save/restart"
+    );
+    assert_eq!(second.world().world_hash(), first_hash);
+}
+
+#[test]
+fn review_restore_rejects_a_tick_regression_in_the_durable_suffix() {
+    let s = Scratch::new("tick_regression");
+    let sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        // Two pose batches whose ticks go backwards — an inconsistent suffix.
+        w.append_journal(&[
+            spall_store::JournalRecord {
+                seq: 1,
+                tick: 40,
+                payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+            },
+            spall_store::JournalRecord {
+                seq: 2,
+                tick: 9,
+                payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+            },
+        ])
+        .unwrap();
+    }
+    let recovery = spall_store::recover(s.db()).unwrap();
+    match restore_err(&recovery, &cfg()) {
+        persist::PersistError::JournalTickRegression {
+            seq: 2,
+            tick: 9,
+            durable: 40,
+        } => {}
+        other => panic!("expected JournalTickRegression, got {other:?}"),
+    }
+}
+
 // --- ENG-36: fail closed on a reported-corrupt recovery -----------------
 
 #[test]
