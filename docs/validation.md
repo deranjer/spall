@@ -45,9 +45,14 @@ schema and single WAL writer) and `spall_server::persist` (the `SimWorld` ⇄
 save-record conversion and recovery). `sandbox-server --serve --save` recovers
 from `<world>/world.db` on start, journals every committed transaction, and
 checkpoints on `--checkpoint-interval-ticks` and clean shutdown. `cargo xtask
-crash-test --suite persistence` runs the crash-point / disk-fault matrix
-end-to-end through a real `Simulation` (bridge scene → column cut → beam
-detaches) and writes `summary.json` with the measured bytes/write rate.
+crash-test --suite persistence` runs the in-process crash-point / disk-fault
+matrix through a real `Simulation` (bridge scene → column cut → beam detaches),
+including a genuine SQLite engine write failure, and writes `summary.json` with
+the measured bytes/write rate. Recovery after an **abrupt, unclean process
+kill** at the journal / checkpoint publication boundaries is a separate
+child-process harness: `cargo test -p spall_store --test abrupt_crash` (it kills
+real child processes and reopens from a fresh process). `summary.json`'s
+`unrun_here` field names what the in-process suite deliberately does not cover.
 T17 adds live late join: `sandbox-client --connect --late-join` pulls a
 dependency-complete `BaselineWorld` over a bulk transfer instead of installing
 the fixed scene, drains the server's bounded catch-up queue, and reaches the

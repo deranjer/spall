@@ -2,13 +2,27 @@
 //! (`docs/tasks.md` T16: "Implement controlled crash points and disk-error
 //! injection").
 //!
-//! A [`Writer`](crate::Writer) carries an optional [`FaultPlan`]. A crash point
-//! makes the writer return [`StoreError::CrashInjected`] at a labelled site,
-//! modelling the process dying there; the test then drops the writer and
-//! re-opens the database with [`crate::recover`] to assert the durable prefix.
-//! A disk fault makes the pending DB transaction roll back and the call return
-//! [`StoreError::Disk`], modelling a failed write — the API must never report a
-//! save it did not make durable.
+//! A [`Writer`](crate::Writer) carries an optional [`FaultPlan`].
+//!
+//! * A [`CrashPoint`] makes the writer return [`StoreError::CrashInjected`] at a
+//!   labelled site and *poison* the writer. This models the **API-visible
+//!   effect** of the process dying there while running in the same process: the
+//!   pending transaction is dropped (SQLite rolls it back normally) and no
+//!   durable ack is produced. It does **not** reproduce abrupt process
+//!   termination with an unclean WAL — that is covered separately by the
+//!   child-process harness (`tests/abrupt_crash.rs`), which kills a real child
+//!   at these same boundaries and reopens from a fresh process.
+//! * `fail_journal_commit` / `fail_checkpoint_commit` short-circuit *before*
+//!   `COMMIT` with [`StoreError::Disk`]; the DB transaction rolls back. Useful
+//!   as a fast API check but not a genuine engine failure.
+//! * `real_write_failure` forces a **genuine** `rusqlite` write error from the
+//!   SQLite engine itself (the connection is switched to `query_only`, so the
+//!   staged `INSERT`/`COMMIT` fails inside SQLite, not at a pre-commit branch).
+//!   This exercises the real error path end to end, including
+//!   [`Writer::poison`](crate::Writer) via `?`.
+//!
+//! In every failure mode the API must never report a save it did not make
+//! durable, and the writer must be poisoned/closed to further durable calls.
 
 /// A labelled point in a durable write where a crash can be injected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +51,11 @@ pub struct FaultPlan {
     /// Fail the next checkpoint `COMMIT` as a disk error (transaction rolls
     /// back).
     pub fail_checkpoint_commit: bool,
+    /// Force the next durable write to hit a **real** SQLite engine error: the
+    /// connection is switched to `query_only` just before the transaction, so
+    /// the staged `INSERT`/`COMMIT` returns an actual `rusqlite::Error`. One
+    /// shot; consumed when reached.
+    pub real_write_failure: bool,
 }
 
 impl FaultPlan {
@@ -60,6 +79,14 @@ impl FaultPlan {
     pub fn disk_fail_checkpoint() -> Self {
         Self {
             fail_checkpoint_commit: true,
+            ..Self::default()
+        }
+    }
+
+    /// A plan whose next durable write hits a genuine SQLite engine write error.
+    pub fn real_sqlite_write_failure() -> Self {
+        Self {
+            real_write_failure: true,
             ..Self::default()
         }
     }
