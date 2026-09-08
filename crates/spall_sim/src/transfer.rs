@@ -47,7 +47,6 @@ pub struct ChildBody {
     pub mass_kg: f64,
     pub com_world_m: [f64; 3],
     pub collider_plan: ColliderPlan,
-    pub collider_grid_origin: GlobalCell,
     pub collider_region: (GlobalCell, GlobalCell),
     pub cell_count: u64,
 }
@@ -119,8 +118,10 @@ pub fn plan_child(
     let mp = analytic_mass_properties(&grid, cell_m, density);
     let mass_kg = mp.mass_kg;
 
-    // Child COM in the parent's local metre frame: grid origin (in parent-local
-    // cells) scaled to metres, plus the analytic COM offset within the grid.
+    // Child COM in the parent's local metre frame: the child grid's origin (in
+    // parent-local cells) scaled to metres — the same body-local offset
+    // `PhysicsWorld` applies to the child collider (`ENG-55`) — plus the
+    // analytic COM offset within the grid.
     let origin = grid.origin();
     let child_com_local_m = DVec3::new(
         origin.x as f64 * cell_m + mp.com_m[0],
@@ -152,7 +153,6 @@ pub fn plan_child(
         mass_kg,
         com_world_m: child_com_world.to_array(),
         collider_plan,
-        collider_grid_origin: origin,
         collider_region: region,
         cell_count: membership.cell_count,
     })

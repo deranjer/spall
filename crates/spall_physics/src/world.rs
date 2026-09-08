@@ -118,6 +118,23 @@ struct Entry {
     cell_m: f32,
     representation: Representation,
     density: f32,
+    /// Body-local translation applied to the collider shape so grid cell
+    /// `(0, 0, 0)` sits at `grid.origin() * cell_m` rather than at body-local
+    /// zero. Preserves the authoritative volume transform: the rigid body still
+    /// sits at the volume's pose, and the off-origin occupancy is carried as a
+    /// collider offset (`ENG-55`).
+    collider_offset_m: [f32; 3],
+}
+
+/// The body-local offset that places a tight occupancy grid's cell `(0, 0, 0)`
+/// at its global-cell [`OccupancyGrid::origin`] scaled to metres.
+fn grid_origin_offset_m(grid: &OccupancyGrid, cell_m: f32) -> [f32; 3] {
+    let o = grid.origin();
+    [
+        o.x as f32 * cell_m,
+        o.y as f32 * cell_m,
+        o.z as f32 * cell_m,
+    ]
 }
 
 /// A fixed-step rigid-body world over voxel colliders.
@@ -187,8 +204,10 @@ impl PhysicsWorld {
         let body = self.bodies.insert(rb);
 
         let built = build_collider(&spec.grid, spec.cell_m, spec.representation);
+        let offset = grid_origin_offset_m(&spec.grid, spec.cell_m);
         let collider = ColliderBuilder::new(built.collider.shared_shape().clone())
             .density(spec.density_kg_m3)
+            .translation(Vector::new(offset[0], offset[1], offset[2]))
             .build();
         let collider = self
             .colliders
@@ -201,6 +220,7 @@ impl PhysicsWorld {
             cell_m: spec.cell_m,
             representation: spec.representation,
             density: spec.density_kg_m3,
+            collider_offset_m: offset,
         });
         id
     }
@@ -219,9 +239,11 @@ impl PhysicsWorld {
             .remove(entry.collider, &mut self.islands, &mut self.bodies, true);
 
         let built = build_collider(grid, cell_m, rep);
+        let offset = grid_origin_offset_m(grid, cell_m);
         let start = Instant::now();
         let collider = ColliderBuilder::new(built.collider.shared_shape().clone())
             .density(density)
+            .translation(Vector::new(offset[0], offset[1], offset[2]))
             .build();
         let handle = self
             .colliders
@@ -230,6 +252,7 @@ impl PhysicsWorld {
 
         self.entries[id.0 as usize].collider = handle;
         self.entries[id.0 as usize].representation = rep;
+        self.entries[id.0 as usize].collider_offset_m = offset;
         built.build + insert
     }
 
@@ -352,8 +375,18 @@ impl PhysicsWorld {
         );
     }
 
+    /// The body-local collider offset applied for this body's occupancy-grid
+    /// origin (`grid.origin() * cell_m`). Add it to
+    /// [`Self::derived_mass_properties`]'s grid-local centre of mass to get the
+    /// body-local centre of mass (`ENG-55`).
+    pub fn collider_offset_m(&self, id: BodyId) -> [f32; 3] {
+        self.entries[id.0 as usize].collider_offset_m
+    }
+
     /// Mass properties Rapier derived for a body's collider: `(mass_kg, local
-    /// centre of mass in metres, principal inertia diagonal)`.
+    /// centre of mass in metres, principal inertia diagonal)`. The centre of
+    /// mass is in the collider shape's grid-local frame (cell `(0, 0, 0)` corner
+    /// at the origin); [`Self::collider_offset_m`] shifts it to the body frame.
     pub fn derived_mass_properties(&self, id: BodyId) -> (f32, [f32; 3], [f32; 3]) {
         let entry = &self.entries[id.0 as usize];
         let shape = self.colliders[entry.collider].shared_shape().clone();

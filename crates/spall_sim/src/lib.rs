@@ -66,4 +66,4 @@ pub use sim::{Simulation, SimulationConfig, TickError};
 pub use stage::{StageError, StagedEdit, stage_edit};
 pub use transfer::{ChildBody, plan_child};
 pub use world::{RestoredBody, SimWorld, WorldError};
-pub use world::{WorldSetup, grid_origin_translation, solid_cells};
+pub use world::{WorldSetup, solid_cells};
