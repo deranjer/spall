@@ -53,7 +53,9 @@ pub mod world;
 pub use spall_protocol::RequestId;
 
 pub use body::{Body, BodyKind, BodyPose};
-pub use collider::{ColliderPlan, PRIMITIVE_BUDGET, plan_collider};
+pub use collider::{
+    ColliderInfeasible, ColliderPlan, MAX_ACTIVE_COLLIDER_CELLS, PRIMITIVE_BUDGET, plan_collider,
+};
 pub use commit::{CommitError, CommitOutcome, Committed};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
 pub use journal::{JournalEntry, JournalSink};
@@ -64,6 +66,6 @@ pub use replication::{
 pub use schedule::{EditPipeline, RegionKey, TickReport};
 pub use sim::{Simulation, SimulationConfig, TickError};
 pub use stage::{StageError, StagedEdit, stage_edit};
-pub use transfer::{ChildBody, plan_child};
+pub use transfer::{ChildBody, PlanChildError, plan_child};
 pub use world::{RestoredBody, SimWorld, WorldError};
 pub use world::{WorldSetup, solid_cells};
