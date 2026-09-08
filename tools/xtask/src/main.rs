@@ -393,9 +393,7 @@ fn capture(args: CaptureArgs) -> Result<(), XtaskError> {
         eprintln!("xtask: --strategy must be `greedy` or `culled`");
         return Err(XtaskError::Capability("invalid capture strategy".into()));
     }
-    let output = args
-        .output
-        .unwrap_or_else(|| unique_run_dir("t05-capture"));
+    let output = args.output.unwrap_or_else(|| unique_run_dir("t05-capture"));
     std::fs::create_dir_all(&output).map_err(|source| XtaskError::Output {
         path: output.display().to_string(),
         source,
