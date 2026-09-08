@@ -104,6 +104,28 @@ impl Simulation {
         &self.journal
     }
 
+    /// The journal cursor for a baseline transfer: the highest sequence the
+    /// sink has ever owned, retained across pruning (ENG-50).
+    pub fn journal_cursor(&self) -> u64 {
+        self.journal.cursor()
+    }
+
+    /// Reserves the next contiguous [`spall_core::JournalSeq`] for the
+    /// integrator to own — used for the periodic 20 Hz pose batches, which
+    /// share one sequence space with the committed topology transactions
+    /// (`docs/protocol.md`: "Journal periodic body pose batches at 20 Hz";
+    /// ENG-50: "contiguous sequence ownership").
+    pub fn reserve_journal_seq(&mut self) -> Result<spall_core::JournalSeq, IdError> {
+        self.world.registry_mut().allocate_journal_seq()
+    }
+
+    /// Drops in-memory journal entries at or below `through` after the
+    /// integrator has flushed them durably and a checkpoint covers them
+    /// (ENG-50 bounded retention). Returns how many entries were removed.
+    pub fn prune_journal(&mut self, through: u64) -> usize {
+        self.journal.prune_through(through)
+    }
+
     pub fn current_tick(&self) -> Tick {
         self.tick
     }

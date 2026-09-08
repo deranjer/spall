@@ -53,6 +53,15 @@ kill** at the journal / checkpoint publication boundaries is a separate
 child-process harness: `cargo test -p spall_store --test abrupt_crash` (it kills
 real child processes and reopens from a fresh process). `summary.json`'s
 `unrun_here` field names what the in-process suite deliberately does not cover.
+Durable writes go through `spall_server::persist_pipeline::PersistPipeline`: a
+single off-thread `Writer` fed a **bounded** queue of immutable
+snapshots/records, so a disk stall never stalls physics; a full backlog or a
+failed write stops the run rather than continuing an unsavable world. The
+integrator journals periodic 20 Hz body pose batches on a sequence contiguous
+with the topology transactions, so a crash rewinds motion only to the latest
+durable pose batch. `cargo test -p spall_server --test persist_pipeline`
+reports retained-snapshot memory (max queue depth) and flush / checkpoint
+latency.
 T17 adds live late join: `sandbox-client --connect --late-join` pulls a
 dependency-complete `BaselineWorld` over a bulk transfer instead of installing
 the fixed scene, drains the server's bounded catch-up queue, and reaches the

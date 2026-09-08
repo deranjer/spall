@@ -47,6 +47,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::baseline::{self, BaselineTransfer};
 use crate::persist::{self, PersistConfig};
+use crate::persist_pipeline::{PersistPipeline, PipelineConfig};
 
 /// A joining client's sentinel `BaselineAck.transfer_id`: "I am a late-join
 /// replica, send me a baseline". A real transfer id is always `>= 1`, so `0`
@@ -629,19 +630,21 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // Open the world database (T16). If it already holds a checkpoint,
         // recover from it; otherwise start the built-in scene and publish an
         // initial checkpoint so recovery always has a floor.
-        let (mut sim, mut durable_seq, mut store, mut checkpoints_published) =
-            match setup_persistence(save.as_deref(), scene, &persist_cfg) {
-                Ok(parts) => parts,
-                Err(e) => {
-                    return SimResult::error(format!("persistence setup failed: {e}"), 0);
-                }
-            };
-        // Test-only: arm the writer only now, so recovery and the first
-        // checkpoint are unaffected and the fault falls on a later durable
-        // write (periodic or clean-shutdown).
-        if let (Some(writer), Some(faults)) = (store.as_mut(), save_faults) {
-            writer.set_faults(faults);
-        }
+        // `setup_persistence` arms any test-only `save_faults` on the recovered
+        // writer *after* recovery and the initial checkpoint, so the fault
+        // falls on a later durable write, then hands the writer to the bounded
+        // off-thread `PersistPipeline` (ENG-50).
+        let Persistence {
+            mut sim,
+            mut pipeline,
+            mut journalled_through,
+            mut checkpoints_published,
+        } = match setup_persistence(save.as_deref(), scene, &persist_cfg, save_faults) {
+            Ok(parts) => parts,
+            Err(e) => {
+                return SimResult::error(format!("persistence setup failed: {e}"), 0);
+            }
+        };
         let mut journal_records_written: u64 = 0;
 
         let mut motion = MotionPublisher::new(60, 20);
@@ -784,33 +787,70 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
                 broadcast(&clients_for_sim, Outbound::Status(Arc::new(status)));
             }
-            if motion.due(tick) {
+            // The 20 Hz motion batch: broadcast it to replicas *and* keep it for
+            // the durable pose journal below.
+            let pose_batch: Option<Vec<MotionSnapshot>> = if motion.due(tick) {
                 let snaps = motion.snapshots(sim.world(), tick);
                 if !snaps.is_empty() {
-                    broadcast(&clients_for_sim, Outbound::Motion(Arc::new(snaps)));
+                    broadcast(&clients_for_sim, Outbound::Motion(Arc::new(snaps.clone())));
                 }
-            }
+                Some(snaps)
+            } else {
+                None
+            };
             for (session, req) in repairs {
                 lj.answer_repair(session, &req, &sim, &clients_for_sim);
             }
 
-            // T16: journal every newly committed transaction, then checkpoint
-            // on the interval. A durable-write failure stops the run rather
-            // than silently continuing an unsavable world.
-            if let Some(writer) = store.as_mut() {
-                match flush_journal(writer, &sim, &mut durable_seq) {
-                    Ok(n) => journal_records_written += n,
+            // ENG-50: queue immutable records to the bounded off-thread writer.
+            // The sim thread never blocks on the disk; when the backlog fills or
+            // a durable write has failed, the run stops rather than silently
+            // continuing an unsavable world (`docs/protocol.md` Persistence).
+            if let Some(pipe) = pipeline.as_ref() {
+                let batch = match tick_journal_batch(
+                    &mut sim,
+                    &mut journalled_through,
+                    pose_batch.as_deref(),
+                    tick.get(),
+                ) {
+                    Ok(b) => b,
                     Err(e) => {
-                        return SimResult::error(format!("journal flush failed: {e}"), ticks_run);
+                        return SimResult::error(format!("journal encode failed: {e}"), ticks_run);
                     }
+                };
+                if let Err(e) = pipe.submit_journal(batch) {
+                    return SimResult::error(format!("persistence: {e}"), ticks_run);
                 }
+
+                // A checkpoint's journal cursor is `journalled_through`: the FIFO
+                // writer commits every journal record up to that cursor *before*
+                // this checkpoint, so a durable checkpoint always has a durable
+                // journal prefix behind it. Retain right after, so disk use
+                // stays bounded during the run — not only at shutdown.
                 if checkpoint_interval > 0 && tick.get().is_multiple_of(checkpoint_interval) {
-                    match publish_checkpoint(writer, &sim, &persist_cfg, durable_seq) {
-                        Ok(()) => checkpoints_published += 1,
+                    match persist::capture(&sim, &persist_cfg, journalled_through) {
+                        Ok(cp) => {
+                            if let Err(e) = pipe
+                                .submit_checkpoint(cp)
+                                .and_then(|()| pipe.submit_retain(RETAIN_CHECKPOINTS))
+                            {
+                                return SimResult::error(format!("persistence: {e}"), ticks_run);
+                            }
+                        }
                         Err(e) => {
-                            return SimResult::error(format!("checkpoint failed: {e}"), ticks_run);
+                            return SimResult::error(
+                                format!("checkpoint capture failed: {e}"),
+                                ticks_run,
+                            );
                         }
                     }
+                }
+
+                // Drop the in-memory journal suffix the store has acknowledged.
+                sim.prune_journal(pipe.durable_seq());
+
+                if let Some(err) = pipe.error() {
+                    return SimResult::error(format!("persistence failed: {err}"), ticks_run);
                 }
             }
 
@@ -833,37 +873,48 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
         broadcast(&clients_for_sim, Outbound::Shutdown);
 
-        // Clean-shutdown durability: flush the journal tail, publish a final
-        // checkpoint, then prune to the last two. The flush and the checkpoint
-        // MUST both commit before this run reports a passed save — a disk-full
-        // or I/O error here means the final body motion / checkpoint never
-        // reached disk, and silently returning success would strand an
-        // unsavable world. Every counter below is still reported so the failing
-        // summary keeps its diagnostics.
+        // Clean-shutdown durability: queue the final journal tail + checkpoint
+        // + retain, then block until the off-thread writer has drained and
+        // exited (`docs/protocol.md`: "Clean shutdown waits for a final
+        // checkpoint/flush"). A failure on that final drain is surfaced through
+        // `shutdown_error` with every counter below still reported, so the
+        // failing summary keeps its diagnostics instead of returning early —
+        // silently reporting success would strand an unsavable world.
         let mut persist_bytes_per_write = 0.0;
         let mut persist_commit_bytes_per_sec = 0.0;
         let mut shutdown_error: Option<String> = None;
-        if let Some(writer) = store.as_mut() {
-            match flush_journal(writer, &sim, &mut durable_seq) {
-                Ok(n) => journal_records_written += n,
-                Err(e) => {
-                    shutdown_error = Some(format!("final journal flush failed: {e}"));
-                }
+        if let Some(pipe) = pipeline.take() {
+            let final_tick = sim.current_tick().get();
+            let tail = tick_journal_batch(&mut sim, &mut journalled_through, None, final_tick)
+                .unwrap_or_default();
+            let _ = pipe.submit_journal(tail);
+            if let Ok(cp) = persist::capture(&sim, &persist_cfg, journalled_through) {
+                let _ = pipe
+                    .submit_checkpoint(cp)
+                    .and_then(|()| pipe.submit_retain(RETAIN_CHECKPOINTS));
             }
-            if shutdown_error.is_none() {
-                match publish_checkpoint(writer, &sim, &persist_cfg, durable_seq) {
-                    Ok(()) => checkpoints_published += 1,
-                    Err(e) => shutdown_error = Some(format!("final checkpoint failed: {e}")),
-                }
-            }
-            if shutdown_error.is_none()
-                && let Err(e) = writer.retain(2)
-            {
-                shutdown_error = Some(format!("final checkpoint retain failed: {e}"));
-            }
-            let m = writer.metrics();
-            persist_bytes_per_write = m.bytes_per_journal_write();
-            persist_commit_bytes_per_sec = m.commit_bytes_per_sec();
+            let outcome = pipe.shutdown();
+            journal_records_written = outcome.status.journal_records;
+            checkpoints_published += outcome.status.checkpoints_published;
+            persist_bytes_per_write = outcome.metrics.bytes_per_journal_write();
+            persist_commit_bytes_per_sec = outcome.metrics.commit_bytes_per_sec();
+            // The final drain covers the journal tail, the final checkpoint, and
+            // the retain pass; attribute any failure to that shutdown flush so a
+            // stranded save is never reported as a pass.
+            shutdown_error = outcome
+                .status
+                .error
+                .map(|e| format!("final checkpoint/flush failed: {e}"));
+            tracing::info!(
+                durable_seq = outcome.status.durable_seq,
+                journal_records = outcome.status.journal_records,
+                checkpoints = outcome.status.checkpoints_published,
+                max_queue_depth = outcome.status.max_queue_depth,
+                last_flush_us = outcome.status.last_journal_flush.as_micros() as u64,
+                max_flush_us = outcome.status.max_journal_flush.as_micros() as u64,
+                max_checkpoint_us = outcome.status.max_checkpoint.as_micros() as u64,
+                "persistence pipeline drained"
+            );
         }
 
         SimResult {
@@ -1236,7 +1287,7 @@ impl LateJoin {
             return;
         };
         let id = self.next_id();
-        let cursor = JournalSeq(sim.journal().entries().last().map(|e| e.seq.0).unwrap_or(0));
+        let cursor = JournalSeq(sim.journal_cursor());
         if let Ok(transfer) = baseline::transfer_from_world(world, id, InterestEpoch(1), cursor) {
             self.baseline_bytes += transfer.payload_bytes() as u64;
             send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
@@ -1246,13 +1297,32 @@ impl LateJoin {
 
 /// Captures a baseline transfer at the current tick / journal cursor.
 fn capture_for(sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
-    let cursor = JournalSeq(sim.journal().entries().last().map(|e| e.seq.0).unwrap_or(0));
+    let cursor = JournalSeq(sim.journal_cursor());
     baseline::capture_transfer(sim, id, InterestEpoch(1), cursor).ok()
+}
+
+/// Complete checkpoints kept on disk at each retention pass. Older ones — and
+/// the journal rows they alone covered — are pruned (`docs/protocol.md`: "Cap
+/// retention; lagging joins get a fresh baseline").
+const RETAIN_CHECKPOINTS: usize = 2;
+
+/// What [`setup_persistence`] hands back: the simulation, the bounded async
+/// persistence pipeline (`None` when `--save` is unset), the highest journal
+/// sequence already durable at startup, and how many checkpoints were published
+/// synchronously during setup.
+struct Persistence {
+    sim: Simulation,
+    pipeline: Option<PersistPipeline>,
+    journalled_through: u64,
+    checkpoints_published: u64,
 }
 
 /// Opens the world database, recovering from it when it already holds a
 /// checkpoint and otherwise starting the built-in `scene` and publishing an
-/// initial checkpoint. `None` save path → no persistence.
+/// initial checkpoint. Any test-only `save_faults` are armed on the recovered
+/// [`Writer`] *after* recovery and that initial checkpoint, then the writer is
+/// handed to a [`PersistPipeline`] so every later durable write happens off the
+/// simulation thread (ENG-50). `None` save path → no persistence.
 ///
 /// This fails closed on corruption: only a genuinely empty database
 /// ([`spall_store::StoreError::NoCheckpoint`]) is initialised with the built-in
@@ -1264,12 +1334,18 @@ fn setup_persistence(
     save: Option<&std::path::Path>,
     scene: Scene,
     cfg: &PersistConfig,
-) -> Result<(Simulation, u64, Option<Writer>, u64), String> {
+    save_faults: Option<spall_store::FaultPlan>,
+) -> Result<Persistence, String> {
     let Some(path) = save else {
-        return Ok((scene.simulation(), 0, None, 0));
+        return Ok(Persistence {
+            sim: scene.simulation(),
+            pipeline: None,
+            journalled_through: 0,
+            checkpoints_published: 0,
+        });
     };
     let mut writer = Writer::open(path).map_err(|e| e.to_string())?;
-    match writer.recover() {
+    let (sim, journalled_through, checkpoints_published) = match writer.recover() {
         Ok(recovery) => {
             let (sim, seq) = persist::restore(
                 &recovery,
@@ -1280,7 +1356,7 @@ fn setup_persistence(
                 PhysicsConfig::default(),
             )
             .map_err(|e| e.to_string())?;
-            Ok((sim, seq, Some(writer), 0))
+            (sim, seq, 0)
         }
         // A genuinely new/empty database: seed it with the built-in scene.
         Err(spall_store::StoreError::NoCheckpoint) => {
@@ -1289,53 +1365,56 @@ fn setup_persistence(
             writer
                 .publish_checkpoint(&checkpoint)
                 .map_err(|e| e.to_string())?;
-            Ok((sim, 0, Some(writer), 1))
+            (sim, 0, 1)
         }
         // Checkpoints exist but none decoded — corruption, not an empty DB. Do
         // not overwrite the save with a fresh scene.
-        Err(e @ spall_store::StoreError::CheckpointsUnrecoverable(_)) => Err(format!(
-            "world database at {} is unrecoverable and must not be overwritten: {e}; \
-             an operator must supply a verified recovery source",
-            path.display()
-        )),
-        Err(e) => Err(e.to_string()),
+        Err(e @ spall_store::StoreError::CheckpointsUnrecoverable(_)) => {
+            return Err(format!(
+                "world database at {} is unrecoverable and must not be overwritten: {e}; \
+                 an operator must supply a verified recovery source",
+                path.display()
+            ));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    // Test-only: arm the writer only now, so recovery and the first checkpoint
+    // are unaffected and the fault falls on a later durable write.
+    if let Some(faults) = save_faults {
+        writer.set_faults(faults);
     }
+    let pipeline = PersistPipeline::spawn(writer, PipelineConfig::default());
+    Ok(Persistence {
+        sim,
+        pipeline: Some(pipeline),
+        journalled_through,
+        checkpoints_published,
+    })
 }
 
-/// Appends every simulation journal entry past `durable_seq` to the store and
-/// advances `durable_seq` to the acknowledged sequence. Returns how many
-/// records were written.
-fn flush_journal(
-    writer: &mut Writer,
-    sim: &Simulation,
-    durable_seq: &mut u64,
-) -> Result<u64, String> {
-    let pending: Vec<_> = sim
-        .journal()
-        .entries()
-        .iter()
-        .filter(|e| e.seq.0 > *durable_seq)
-        .cloned()
-        .collect();
-    if pending.is_empty() {
-        return Ok(0);
+/// Builds the contiguous journal batch owed for one tick: every committed
+/// topology entry past `journalled_through`, followed by this tick's 20 Hz pose
+/// batch (if any). The pose sequence is reserved from the simulation so it is
+/// contiguous with the topology sequences (`docs/protocol.md`: "Journal
+/// periodic body pose batches at 20 Hz"; ENG-50: "contiguous sequence
+/// ownership"). Advances `journalled_through` to the last sequence in the
+/// batch.
+fn tick_journal_batch(
+    sim: &mut Simulation,
+    journalled_through: &mut u64,
+    pose_batch: Option<&[MotionSnapshot]>,
+    tick: u64,
+) -> Result<Vec<spall_store::JournalRecord>, String> {
+    let mut batch = persist::journal_records(sim.journal().entries_after(*journalled_through))
+        .map_err(|e| e.to_string())?;
+    if let Some(snaps) = pose_batch.filter(|s| !s.is_empty()) {
+        let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
+        batch.push(persist::pose_batch_record(seq.0, tick, snaps).map_err(|e| e.to_string())?);
     }
-    let records = persist::journal_records(&pending).map_err(|e| e.to_string())?;
-    let durable = writer.append_journal(&records).map_err(|e| e.to_string())?;
-    *durable_seq = durable.journal_seq.0;
-    Ok(records.len() as u64)
-}
-
-fn publish_checkpoint(
-    writer: &mut Writer,
-    sim: &Simulation,
-    cfg: &PersistConfig,
-    durable_seq: u64,
-) -> Result<(), String> {
-    let checkpoint = persist::capture(sim, cfg, durable_seq).map_err(|e| e.to_string())?;
-    writer
-        .publish_checkpoint(&checkpoint)
-        .map_err(|e| e.to_string())
+    if let Some(last) = batch.last() {
+        *journalled_through = last.seq;
+    }
+    Ok(batch)
 }
 
 /// A stable per-session actor id. Authority is the server's; this is only
@@ -2405,11 +2484,19 @@ mod tests {
         drop(Writer::open(&db).unwrap());
         assert_eq!(checkpoint_row_count(&db), 0);
 
-        let (_, seq, writer, published) =
-            setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg()).unwrap();
-        assert_eq!(seq, 0);
-        assert!(writer.is_some());
-        assert_eq!(published, 1, "the built-in scene is published once");
+        let Persistence {
+            journalled_through,
+            pipeline,
+            checkpoints_published,
+            ..
+        } = setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg(), None).unwrap();
+        assert_eq!(journalled_through, 0);
+        assert!(pipeline.is_some());
+        assert_eq!(
+            checkpoints_published, 1,
+            "the built-in scene is published once"
+        );
+        drop(pipeline);
         assert_eq!(checkpoint_row_count(&db), 1);
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
@@ -2449,7 +2536,7 @@ mod tests {
         }
 
         let before = checkpoint_row_count(&db);
-        let err = match setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg()) {
+        let err = match setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg(), None) {
             Ok(_) => panic!("host startup must not silently continue from a shortened history"),
             Err(e) => e,
         };
@@ -2484,7 +2571,7 @@ mod tests {
 
         let before = checkpoint_row_count(&db);
         assert_eq!(before, 1);
-        let err = match setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg()) {
+        let err = match setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg(), None) {
             Ok(_) => panic!("undecodable checkpoints are corruption, not an empty database"),
             Err(e) => e,
         };
