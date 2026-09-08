@@ -70,6 +70,9 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         seed: 0,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        // Fixture scripts cut at arbitrary cells no real aim ray would produce;
+        // the ENG-47 dev-scenario path keeps this plumbing test working.
+        dev_unvalidated_actions: true,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -166,6 +169,8 @@ fn server_persists_and_recovers_across_a_restart() {
         seed: 9,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        // See above: arbitrary fixture cuts need the dev-scenario path.
+        dev_unvalidated_actions: true,
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {

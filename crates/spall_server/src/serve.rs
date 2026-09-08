@@ -20,9 +20,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use glam::DVec3;
 use serde::Serialize;
 use spall_core::{
-    EntityId, JournalSeq, JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole,
+    BRUSH_UNIT, BrushPoint, EntityId, GlobalCell, JournalSeq, JsonlError, JsonlLog, ProcessEvent,
+    ProcessRecord, ProcessRole, SphereBrush,
 };
 use spall_net::{
     Connection, DevIdentity, JoinToken, NetServer, Role, TransportConfig, TransportError,
@@ -35,11 +37,12 @@ use spall_protocol::{
     PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
 };
 use spall_sim::{
-    EditIntent, EditKind, EditTarget, MotionPublisher, Simulation, SimulationConfig,
-    action_statuses, committed_transactions, fixtures,
+    Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
+    SimulationConfig, action_statuses, committed_transactions, fixtures,
 };
 use spall_store::Writer;
 use spall_structure::AnchorPlane;
+use spall_voxel::{Ray, RayOutcome, cast_ray_world};
 use tokio::sync::{mpsc, watch};
 
 use crate::baseline::{self, BaselineTransfer};
@@ -123,6 +126,14 @@ pub struct ServeConfig {
     /// T17: bounded late-join transfer restarts before the client is dropped
     /// with an explicit failure (connected clients keep running).
     pub max_join_retries: u32,
+    /// **Development only.** Skip the server-side action-claim validation
+    /// (`resolve_intent`) and take each `ActionRequest`'s `claimed_target` /
+    /// `claimed_brush` verbatim. This is the "explicitly scoped authenticated
+    /// development scenario path" from ENG-47: it still requires the join token
+    /// and a live session, but it lets a fixture harness script arbitrary cuts
+    /// that no real aim ray would produce. Never enable it on a shared host —
+    /// with it on, any authenticated peer can edit any cell of any body.
+    pub dev_unvalidated_actions: bool,
 }
 
 impl ServeConfig {
@@ -148,6 +159,7 @@ impl ServeConfig {
             seed: 0,
             catch_up_cap: DEFAULT_CATCH_UP_CAP,
             max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
+            dev_unvalidated_actions: false,
         }
     }
 }
@@ -403,6 +415,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let checkpoint_interval = config.checkpoint_interval_ticks;
     let catch_up_cap = config.catch_up_cap.max(1);
     let max_join_retries = config.max_join_retries;
+    let dev_unvalidated_actions = config.dev_unvalidated_actions;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
@@ -449,8 +462,14 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             lj.expired_actions += 1;
                             continue;
                         }
-                        match intent_from_request(session, &req) {
-                            Some(intent) => {
+                        let resolved = if dev_unvalidated_actions {
+                            dev_intent_from_request(session, &req)
+                                .ok_or(ActionReject::Unsupported("unsupported target"))
+                        } else {
+                            resolve_intent(sim.world(), session, &req)
+                        };
+                        match resolved {
+                            Ok(intent) => {
                                 if let Err(e) = sim.submit(intent) {
                                     reject(
                                         &clients_for_sim,
@@ -461,13 +480,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                     rejected_total += 1;
                                 }
                             }
-                            None => {
-                                reject(
-                                    &clients_for_sim,
-                                    session,
-                                    req.request_id,
-                                    "unsupported target",
-                                );
+                            Err(rej) => {
+                                reject(&clients_for_sim, session, req.request_id, &rej.reason());
                                 rejected_total += 1;
                             }
                         }
@@ -1016,7 +1030,16 @@ fn publish_checkpoint(
         .map_err(|e| e.to_string())
 }
 
-fn intent_from_request(session: SessionId, req: &ActionRequest) -> Option<EditIntent> {
+/// A stable per-session actor id. Authority is the server's; this is only
+/// journal provenance.
+fn actor_for(session: SessionId) -> EntityId {
+    EntityId::new(1 + u64::from(session.slot().0)).unwrap_or(EntityId::new(1).unwrap())
+}
+
+/// **Development-scenario path** (`ServeConfig::dev_unvalidated_actions`). Trusts
+/// `claimed_target` / `claimed_brush` verbatim so a fixture harness can script
+/// arbitrary cuts. `None` only for a genuinely unrepresentable target.
+fn dev_intent_from_request(session: SessionId, req: &ActionRequest) -> Option<EditIntent> {
     let target = match req.claimed_target {
         ClaimedTarget::Terrain => EditTarget::Terrain,
         ClaimedTarget::Body(entity) => EditTarget::Body(entity),
@@ -1025,15 +1048,227 @@ fn intent_from_request(session: SessionId, req: &ActionRequest) -> Option<EditIn
         ActionKind::Cut => EditKind::Cut,
         ActionKind::Place => EditKind::Place(spall_voxel::fixtures::STONE),
     };
-    // A stable per-session actor id; authority is the server's, this is only
-    // journal provenance.
-    let actor = EntityId::new(1 + u64::from(session.slot().0)).unwrap_or(EntityId::new(1).unwrap());
     Some(EditIntent {
         request_id: req.request_id,
-        actor,
+        actor: actor_for(session),
         target,
         kind,
         brush: req.claimed_brush,
+        explosion: None,
+    })
+}
+
+// --- ENG-47: server-side action-claim validation -------------------------------
+
+/// A server-approved tool. On the wire `ActionRequest::tool` is an opaque `u16`;
+/// the server — not the client — decides what each id may do, how big a brush it
+/// may request, and how far its aim reaches. Unknown ids are refused. Real
+/// per-role tool grants are a later task; this is the minimum "action limits are
+/// resolved on the server" (`docs/architecture.md` Editing).
+#[derive(Debug, Clone, Copy)]
+struct ToolSpec {
+    /// The edit this tool performs on a validated hit.
+    kind: EditKind,
+    /// Largest brush radius this tool may request, in whole cells.
+    max_radius_cells: i64,
+    /// Farthest the aim ray may travel to a solid authoritative hit, in metres.
+    reach_m: f64,
+}
+
+/// The built-in T10 tool catalog.
+fn tool_spec(tool: u16) -> Option<ToolSpec> {
+    match tool {
+        // 0 — short-range cutter.
+        0 => Some(ToolSpec {
+            kind: EditKind::Cut,
+            max_radius_cells: 8,
+            reach_m: 12.0,
+        }),
+        // 1 — short-range stone placer.
+        1 => Some(ToolSpec {
+            kind: EditKind::Place(spall_voxel::fixtures::STONE),
+            max_radius_cells: 4,
+            reach_m: 8.0,
+        }),
+        _ => None,
+    }
+}
+
+/// Why an [`ActionRequest`] was refused before it could become an [`EditIntent`].
+/// The `&'static str` variants keep the `ActionStatus` reason strings stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionReject {
+    UnknownTool(u16),
+    ToolActionMismatch,
+    RadiusTooLarge {
+        requested_cells: i64,
+        max_cells: i64,
+    },
+    BadAim,
+    NoAuthoritativeHit,
+    TargetMismatch,
+    StaleTarget,
+    Unsupported(&'static str),
+}
+
+impl ActionReject {
+    fn reason(&self) -> String {
+        match self {
+            ActionReject::UnknownTool(t) => format!("tool {t} is not an approved tool"),
+            ActionReject::ToolActionMismatch => {
+                "requested action is not permitted for this tool".to_string()
+            }
+            ActionReject::RadiusTooLarge {
+                requested_cells,
+                max_cells,
+            } => format!(
+                "brush radius {requested_cells} cells exceeds this tool's limit of {max_cells}"
+            ),
+            ActionReject::BadAim => "aim origin/direction is not a usable ray".to_string(),
+            ActionReject::NoAuthoritativeHit => {
+                "aim does not hit authoritative geometry within reach".to_string()
+            }
+            ActionReject::TargetMismatch => {
+                "claimed target does not match the authoritative hit".to_string()
+            }
+            ActionReject::StaleTarget => "claimed target no longer exists".to_string(),
+            ActionReject::Unsupported(s) => s.to_string(),
+        }
+    }
+}
+
+/// One authoritative ray hit, resolved against committed geometry.
+struct Struck {
+    target: EditTarget,
+    /// Struck solid cell, in the hit volume's **local cell space**.
+    cell: GlobalCell,
+    /// Empty cell against the struck face (where a placement lands), same space.
+    placement_cell: GlobalCell,
+    /// Distance from the aim origin, metres.
+    t_m: f64,
+}
+
+/// The nearest solid cell an aim ray meets across the terrain and every detached
+/// body, or `None` if nothing solid is within `reach_m`. This is the server's
+/// authoritative hit: a client-supplied hit point / body id is only a claim
+/// (`docs/architecture.md`: "The server determines the hit against its current
+/// authoritative geometry").
+fn nearest_hit(world: &SimWorld, ray: Ray, reach_m: f64) -> Option<Struck> {
+    let mut best: Option<Struck> = None;
+    let mut consider = |target: EditTarget, body: &Body| {
+        let xform = body.pose.xform(body.cell_size());
+        if let Ok(RayOutcome::Hit(hit)) = cast_ray_world(&body.volume, &xform, ray, reach_m)
+            && hit.t <= reach_m
+            && best.as_ref().is_none_or(|b| hit.t < b.t_m)
+        {
+            best = Some(Struck {
+                target,
+                cell: hit.cell,
+                placement_cell: hit.placement_cell,
+                t_m: hit.t,
+            });
+        }
+    };
+    consider(EditTarget::Terrain, world.terrain());
+    for body in world.bodies() {
+        if let Some(entity) = body.entity {
+            consider(EditTarget::Body(entity), body);
+        }
+    }
+    best
+}
+
+fn target_matches(claimed: ClaimedTarget, struck: EditTarget) -> bool {
+    match (claimed, struck) {
+        (ClaimedTarget::Terrain, EditTarget::Terrain) => true,
+        (ClaimedTarget::Body(a), EditTarget::Body(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Validates an `ActionRequest`'s claims against the authoritative world and
+/// turns it into an [`EditIntent`] whose brush is re-derived in the accepted
+/// target frame from the server's own raycast — never copied from the client.
+///
+/// Checks, in order: the tool id is approved; the requested action fits the
+/// tool; the requested radius is within the tool's cap; a named body still
+/// exists; the aim ray hits solid authoritative geometry within reach; and the
+/// struck volume matches `claimed_target`. The `session` is already known-live
+/// (the caller rejects a superseded generation first).
+fn resolve_intent(
+    world: &SimWorld,
+    session: SessionId,
+    req: &ActionRequest,
+) -> Result<EditIntent, ActionReject> {
+    let spec = tool_spec(req.tool).ok_or(ActionReject::UnknownTool(req.tool))?;
+
+    let action_fits = matches!(
+        (req.action, spec.kind),
+        (ActionKind::Cut, EditKind::Cut) | (ActionKind::Place, EditKind::Place(_))
+    );
+    if !action_fits {
+        return Err(ActionReject::ToolActionMismatch);
+    }
+
+    let max_units = spec.max_radius_cells.saturating_mul(BRUSH_UNIT);
+    let requested_units = req.claimed_brush.radius_units();
+    if requested_units > max_units {
+        return Err(ActionReject::RadiusTooLarge {
+            requested_cells: requested_units / BRUSH_UNIT,
+            max_cells: spec.max_radius_cells,
+        });
+    }
+
+    // A named body must still be part of the authoritative world.
+    if let ClaimedTarget::Body(entity) = req.claimed_target
+        && world.body(entity).is_none()
+    {
+        return Err(ActionReject::StaleTarget);
+    }
+
+    let origin = DVec3::from_array(req.aim_origin_m);
+    let dir = DVec3::new(
+        req.aim_dir[0] as f64,
+        req.aim_dir[1] as f64,
+        req.aim_dir[2] as f64,
+    );
+    if !origin.is_finite() || !dir.is_finite() || dir.length_squared() < 1e-24 {
+        return Err(ActionReject::BadAim);
+    }
+
+    let hit = nearest_hit(world, Ray::new(origin, dir), spec.reach_m)
+        .ok_or(ActionReject::NoAuthoritativeHit)?;
+    if !target_matches(req.claimed_target, hit.target) {
+        return Err(ActionReject::TargetMismatch);
+    }
+
+    // Quantize the approved operation into the accepted target volume's local
+    // integer cell space, centred on the server's own hit cell (the empty cell
+    // against the struck face for a placement). The client's claimed centre is
+    // discarded; its radius is kept only after passing the tool cap above.
+    let base = match spec.kind {
+        EditKind::Cut => hit.cell,
+        EditKind::Place(_) => hit.placement_cell,
+    };
+    let h = BRUSH_UNIT / 2;
+    let centre = BrushPoint::from_units(
+        base.x.saturating_mul(BRUSH_UNIT).saturating_add(h),
+        base.y.saturating_mul(BRUSH_UNIT).saturating_add(h),
+        base.z.saturating_mul(BRUSH_UNIT).saturating_add(h),
+    );
+    let brush = SphereBrush::new(centre, requested_units.max(0)).map_err(|_| {
+        ActionReject::RadiusTooLarge {
+            requested_cells: requested_units / BRUSH_UNIT,
+            max_cells: spec.max_radius_cells,
+        }
+    })?;
+
+    Ok(EditIntent {
+        request_id: req.request_id,
+        actor: actor_for(session),
+        target: hit.target,
+        kind: spec.kind,
+        brush,
         explosion: None,
     })
 }
@@ -1204,6 +1439,264 @@ mod tests {
 
     fn sess(slot: u32, generation: u32) -> SessionId {
         SessionId::from_parts(SlotId(slot), generation)
+    }
+
+    // --- ENG-47: action-claim validation --------------------------------------
+
+    use spall_protocol::InputSeq;
+
+    /// An `ActionRequest` with a controllable aim, tool, claimed target, and
+    /// claimed brush. The brush centre is deliberately somewhere unrelated to
+    /// the aim so a passing test proves the server re-derived it.
+    fn action_req(
+        tool: u16,
+        action: ActionKind,
+        origin_m: [f64; 3],
+        dir: [f32; 3],
+        claimed_target: ClaimedTarget,
+        claimed_centre_cell: [i64; 3],
+        claimed_radius_cells: i64,
+    ) -> ActionRequest {
+        let h = BRUSH_UNIT / 2;
+        let brush = SphereBrush::new(
+            BrushPoint::from_units(
+                claimed_centre_cell[0] * BRUSH_UNIT + h,
+                claimed_centre_cell[1] * BRUSH_UNIT + h,
+                claimed_centre_cell[2] * BRUSH_UNIT + h,
+            ),
+            claimed_radius_cells * BRUSH_UNIT,
+        )
+        .expect("valid test brush");
+        ActionRequest {
+            request_id: RequestId(1),
+            input_seq: InputSeq(1),
+            action,
+            tool,
+            aim_origin_m: origin_m,
+            aim_dir: dir,
+            claimed_target,
+            claimed_brush: brush,
+        }
+    }
+
+    /// A `+X` aim from local cell `(0, 4, 1)` — inside the bridge scene's
+    /// resident brick, above the floor — that travels to the column at local
+    /// cell `(10, 4, 1)`. (An unbounded volume samples cells outside its
+    /// resident bricks as `Unknown`, so the ray must *start* inside one.)
+    const COLUMN_AIM_ORIGIN: [f64; 3] = [0.0, 1.0, 0.375];
+    const PLUS_X: [f32; 3] = [1.0, 0.0, 0.0];
+
+    fn bridge_after_cut() -> Simulation {
+        use spall_sim::{EditIntent, EditTarget};
+        let mut sim = Scene::BridgeCut.simulation();
+        let h = BRUSH_UNIT / 2;
+        let brush = SphereBrush::new(
+            BrushPoint::from_units(10 * BRUSH_UNIT + h, 4 * BRUSH_UNIT + h, BRUSH_UNIT + h),
+            2 * BRUSH_UNIT,
+        )
+        .unwrap();
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            EntityId::new(1).unwrap(),
+            EditTarget::Terrain,
+            brush,
+        ))
+        .unwrap();
+        // Enough ticks to commit the split; few enough that the freed beam has
+        // not fallen far.
+        sim.run_until_idle(8).unwrap();
+        assert!(sim.world().body_count() >= 1, "the cut detached the beam");
+        sim
+    }
+
+    #[test]
+    fn a_valid_aim_resolves_to_a_server_derived_brush_on_the_struck_cell() {
+        let sim = Scene::BridgeCut.simulation();
+        // Claimed centre `(3, 1, 1)` is nowhere near the aim; the resolved brush
+        // must sit on the server's hit cell `(10, 4, 1)` instead.
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [3, 1, 1],
+            2,
+        );
+        let intent = resolve_intent(sim.world(), sess(0, 1), &req).expect("resolves");
+        assert_eq!(intent.target, EditTarget::Terrain);
+        assert_eq!(intent.kind, EditKind::Cut);
+        let h = BRUSH_UNIT / 2;
+        assert_eq!(intent.brush.centre.x, 10 * BRUSH_UNIT + h);
+        assert_eq!(intent.brush.centre.y, 4 * BRUSH_UNIT + h);
+        assert_eq!(intent.brush.centre.z, BRUSH_UNIT + h);
+        assert_eq!(intent.brush.radius_units(), 2 * BRUSH_UNIT);
+    }
+
+    #[test]
+    fn an_unknown_tool_is_refused() {
+        let sim = Scene::BridgeCut.simulation();
+        let req = action_req(
+            77,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            2,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::UnknownTool(77))
+        );
+    }
+
+    #[test]
+    fn an_action_the_tool_does_not_grant_is_refused() {
+        let sim = Scene::BridgeCut.simulation();
+        // Tool 0 is a cutter; asking it to place is a mismatch.
+        let req = action_req(
+            0,
+            ActionKind::Place,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            2,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::ToolActionMismatch)
+        );
+    }
+
+    #[test]
+    fn an_excessive_tool_radius_is_refused() {
+        let sim = Scene::BridgeCut.simulation();
+        // Tool 0 caps at 8 cells; the request asks for 40.
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            40,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::RadiusTooLarge {
+                requested_cells: 40,
+                max_cells: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn an_aim_that_hits_nothing_within_reach_is_refused() {
+        let sim = Scene::BridgeCut.simulation();
+        // Aim out of the scene (toward -X off the resident geometry): no solid.
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            [-1.0, 0.0, 0.0],
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            2,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::NoAuthoritativeHit)
+        );
+    }
+
+    #[test]
+    fn a_spoofed_target_that_disagrees_with_the_raycast_is_refused() {
+        let sim = bridge_after_cut();
+        let beam = sim
+            .world()
+            .bodies()
+            .next()
+            .and_then(|b| b.entity)
+            .expect("the cut detached the beam");
+        // Aim straight down onto the terrain floor at x-cell 1 (clear of both
+        // the beam body's x-range and the cut column) but claim the real,
+        // still-live beam body.
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            [0.375, 2.0, 0.375],
+            [0.0, -1.0, 0.0],
+            ClaimedTarget::Body(beam),
+            [0, 0, 1],
+            1,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::TargetMismatch)
+        );
+    }
+
+    #[test]
+    fn a_stale_target_body_is_refused() {
+        let sim = Scene::BridgeCut.simulation();
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Body(EntityId::new(9999).unwrap()),
+            [10, 4, 1],
+            2,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::StaleTarget)
+        );
+    }
+
+    #[test]
+    fn a_body_hit_resolves_in_the_body_local_frame() {
+        let sim = bridge_after_cut();
+        let beam = sim
+            .world()
+            .bodies()
+            .next()
+            .and_then(|b| b.entity)
+            .expect("the cut detached the beam");
+        // Aim straight down at x-cell 5: clear of the (surviving) column top,
+        // so the nearest solid is the detached beam body itself.
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            [1.375, 7.0, 0.375],
+            [0.0, -1.0, 0.0],
+            ClaimedTarget::Body(beam),
+            [999, 999, 999],
+            1,
+        );
+        let intent = resolve_intent(sim.world(), sess(0, 1), &req).expect("resolves");
+        assert_eq!(intent.target, EditTarget::Body(beam));
+        // Server-derived in the beam's local frame, not the client's
+        // `(999, 999, 999)` claim.
+        assert!(intent.brush.centre.x.abs() < 100 * BRUSH_UNIT);
+    }
+
+    #[test]
+    fn the_dev_scenario_path_trusts_the_claim_verbatim() {
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            ClaimedTarget::Terrain,
+            [3, 1, 1],
+            2,
+        );
+        let intent = dev_intent_from_request(sess(0, 1), &req).expect("dev passthrough");
+        // No raycast, no re-derivation: exactly the claimed brush.
+        assert_eq!(intent.brush, req.claimed_brush);
     }
 
     #[test]

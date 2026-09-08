@@ -296,6 +296,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         "--max-clients",
         &clients.to_string(),
         "--paced",
+        // Scenario files script cuts at explicit cells that no aim ray would
+        // produce; the harness is the authenticated dev-scenario path (ENG-47).
+        "--dev-unvalidated-actions",
     ]);
     hide_console(&mut server_cmd);
     let mut guard = ChildGuard::default();
