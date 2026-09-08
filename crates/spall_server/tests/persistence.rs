@@ -66,6 +66,7 @@ fn recover_restore(db: &std::path::Path) -> (Simulation, u64) {
     let recovery = spall_store::recover(db).unwrap();
     persist::restore(
         &recovery,
+        &cfg(),
         fixtures::stone_manifest(),
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -270,6 +271,7 @@ fn checkpoint_plus_journal_suffix_recovers_topology() {
     assert_eq!(recovery.journal.len(), 1);
     let (mut restored, durable_seq) = persist::restore(
         &recovery,
+        &cfg(),
         fixtures::stone_manifest(),
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -330,6 +332,7 @@ fn a_manifest_hash_mismatch_is_rejected() {
 
     match persist::restore(
         &recovery,
+        &cfg(),
         air_only,
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -338,4 +341,125 @@ fn a_manifest_hash_mismatch_is_rejected() {
         Err(other) => panic!("expected ManifestMismatch, got {other:?}"),
         Ok(_) => panic!("expected ManifestMismatch, got a restored simulation"),
     }
+}
+
+// --- ENG-59: saved world identity + algorithm versions --------------------
+
+/// A recovery whose single checkpoint was captured with [`cfg`].
+fn recovery_for_meta_tests(s: &Scratch) -> spall_store::Recovery {
+    let sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let mut w = Writer::open(s.db()).unwrap();
+    w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+        .unwrap();
+    drop(w);
+    spall_store::recover(s.db()).unwrap()
+}
+
+/// Runs `restore` and returns the error, panicking if it unexpectedly succeeded
+/// (`Simulation` has no `Debug`, so the `Ok` payload cannot be printed).
+fn restore_err(recovery: &spall_store::Recovery, cfg: &PersistConfig) -> persist::PersistError {
+    match persist::restore(
+        recovery,
+        cfg,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    ) {
+        Ok(_) => panic!("restore accepted a database it must have rejected"),
+        Err(e) => e,
+    }
+}
+
+fn restore_ok(recovery: &spall_store::Recovery, cfg: &PersistConfig) -> bool {
+    persist::restore(
+        recovery,
+        cfg,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .is_ok()
+}
+
+#[test]
+fn a_mismatched_world_id_is_rejected() {
+    let s = Scratch::new("world_id");
+    let recovery = recovery_for_meta_tests(&s);
+    let wrong = PersistConfig {
+        world_id: cfg().world_id ^ 0x1,
+        ..cfg()
+    };
+    assert!(matches!(
+        restore_err(&recovery, &wrong),
+        persist::PersistError::WorldIdMismatch { .. }
+    ));
+    // The original database is untouched: a correct config still recovers.
+    assert!(restore_ok(&recovery, &cfg()));
+}
+
+#[test]
+fn a_mismatched_seed_is_rejected() {
+    let s = Scratch::new("seed");
+    let recovery = recovery_for_meta_tests(&s);
+    let wrong = PersistConfig {
+        seed: cfg().seed + 1,
+        ..cfg()
+    };
+    assert!(matches!(
+        restore_err(&recovery, &wrong),
+        persist::PersistError::ConfigMismatch { field: "seed", .. }
+    ));
+}
+
+#[test]
+fn a_mismatched_generator_version_is_rejected() {
+    let s = Scratch::new("generator");
+    let recovery = recovery_for_meta_tests(&s);
+    let wrong = PersistConfig {
+        generator_version: cfg().generator_version + 1,
+        ..cfg()
+    };
+    assert!(matches!(
+        restore_err(&recovery, &wrong),
+        persist::PersistError::ConfigMismatch {
+            field: "generator_version",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_mismatched_algorithm_version_is_rejected() {
+    for field in [
+        "integer_brush_version",
+        "structure_graph_version",
+        "topology_hash_version",
+    ] {
+        let s = Scratch::new(&format!("algo_{field}"));
+        let mut recovery = recovery_for_meta_tests(&s);
+        // A checkpoint written by an incompatible build of one algorithm.
+        match field {
+            "integer_brush_version" => recovery.checkpoint.meta.integer_brush_version = 999,
+            "structure_graph_version" => recovery.checkpoint.meta.structure_graph_version = 999,
+            "topology_hash_version" => recovery.checkpoint.meta.topology_hash_version = 999,
+            _ => unreachable!(),
+        }
+        match restore_err(&recovery, &cfg()) {
+            persist::PersistError::AlgorithmVersionMismatch { field: got, .. } => {
+                assert_eq!(got, field)
+            }
+            other => panic!("expected AlgorithmVersionMismatch({field}), got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_mismatched_store_schema_version_is_rejected() {
+    let s = Scratch::new("schema");
+    let mut recovery = recovery_for_meta_tests(&s);
+    recovery.checkpoint.meta.store_schema_version += 1;
+    assert!(matches!(
+        restore_err(&recovery, &cfg()),
+        persist::PersistError::SchemaMismatch { .. }
+    ));
 }
