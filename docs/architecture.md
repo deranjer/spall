@@ -10,7 +10,7 @@ Arrows below mean "depends on". Create crates when their first task needs them; 
 spall_core       IDs, coordinates, ticks, units, material definitions
 spall_voxel   -> spall_core                     storage, sampling, edits, queries
 spall_jobs    -> spall_core                     bounded scheduling, result tokens
-spall_mesh    -> spall_voxel                    surface generation, no GPU
+spall_mesh    -> spall_voxel, spall_jobs        surface generation, no GPU
 spall_structure -> spall_voxel, spall_jobs      connectivity, support, split plans
 spall_physics -> spall_voxel                    Rapier adapter, collision builds
 spall_sim     -> spall_structure, spall_physics, spall_jobs, spall_protocol   authoritative state and tick order
@@ -147,7 +147,7 @@ Separate geometry visibility from lighting. The initial renderer rasterizes gree
 
 Implement in this order:
 
-1. Camera, depth, correct face winding, opaque materials, frustum culling, bounded GPU mesh uploads, reusable buffers, resize/device failure handling.
+1. Camera, depth, correct face winding, opaque materials, frustum culling, bounded GPU mesh uploads, reusable buffers, resize/device failure handling. **(T05)** `spall_mesh` owns culled/greedy face generation with an AO-aware merge rule and a `spall_jobs` halo token; `spall_render` owns one opaque WGSL pipeline (CCW front faces, `Depth32Float`, back-cull), a free-fly `Camera` with Gribb–Hartmann frustum culling, a growing reusable vertex/index buffer with a byte budget, and an offscreen `capture_scene` writing shaded plus normal/depth PNGs. Cell size stays 0.25 m; no revision proposed.
 2. HDR linear-light rendering, physically based roughness/metalness shading, sun and sky, cascaded shadows, contact AO, tone mapping with fixed test exposure.
 3. Early lighting prototype: camera-local occupancy/material clipmap in a fixed-size 3D texture/brick atlas; compute voxel ray traversal for low-resolution diffuse indirect light and soft visibility. Initial near volume: 128 cubed at 0.5 m, covering 64 m. Coarse occupancy can leak or over-occlude thin walls: this is a measured risk, not accepted correctness for collision.
 4. Dirty-region updates for terrain edits and both old/new AABBs of moving objects. Clear/rebuild overlapping occupancy correctly; removing one object must not erase another. Emissive sources contribute to lighting. Limit bounce count initially to one diffuse bounce.

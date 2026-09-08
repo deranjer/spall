@@ -1,0 +1,24 @@
+[package]
+name = "spall_mesh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# Exposes the culled (one-quad-per-face) reference emitter and the small mesh
+# digest helper so downstream crates and gates can cross-check greedy output.
+# Always compiled for this crate's own tests.
+reference = []
+
+[dependencies]
+spall_core.workspace = true
+spall_jobs.workspace = true
+spall_voxel.workspace = true
+blake3.workspace = true
+glam.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Result-validation tests reuse the job-scheduler world-view double instead of
+# standing up a simulation.
+spall_jobs = { workspace = true, features = ["testkit"] }

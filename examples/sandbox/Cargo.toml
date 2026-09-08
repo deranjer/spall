@@ -13,16 +13,33 @@ name = "sandbox-client"
 path = "src/bin/sandbox-client.rs"
 required-features = ["client"]
 
+[[bin]]
+name = "sandbox-capture"
+path = "src/bin/sandbox-capture.rs"
+required-features = ["client"]
+
 [features]
 default = []
-client = ["dep:spall_client"]
+client = [
+    "dep:spall_client",
+    "dep:spall_mesh",
+    "dep:spall_render",
+    "dep:glam",
+    "dep:serde",
+    "dep:serde_json",
+]
 
 [dependencies]
 clap.workspace = true
 spall_client = { path = "../../crates/spall_client", optional = true }
 spall_core = { path = "../../crates/spall_core" }
+spall_mesh = { workspace = true, optional = true }
 spall_net = { path = "../../crates/spall_net" }
+spall_render = { workspace = true, optional = true }
 spall_server = { path = "../../crates/spall_server" }
 spall_sim = { path = "../../crates/spall_sim" }
+glam = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -7,6 +7,11 @@ T09 adds `cargo xtask net-check`: an in-process QUIC transport harness (one
 server, N authenticated headless clients, an optional opaque UDP loss proxy,
 every channel exercised, bounded teardown) that writes `summary.json`,
 `net.jsonl`, and `metrics.json`.
+T05 implements `cargo xtask capture`: offscreen greedy-meshed renders of the
+acceptance shapes (cube, tunnel, checkerboard, negative coordinates, adjacent
+bricks, rotated hollow volume) to a shaded PNG plus normal and depth debug
+images, with a `summary.json`; it exits 3 when no GPU adapter is available.
+Scene/camera fixture files and the lighting-quality capture stay T12/T13.
 T06 adds one offline measurement binary,
 `cargo run --release -p spall_physics --bin collision-bench`, which runs the
 voxel-collision feasibility scenarios and writes `collision-feasibility.json`;
@@ -44,9 +49,9 @@ after the tick loop is running and are excluded from `--min-clients`. Built-in
 replica. Mid-session brick `RepairRequest`s are answered with a one-brick
 authoritative baseline patch (exact revision parity), and a reconnected session
 generation invalidates the prior one server-side.
-`capture` and `bench` still return an explicit unavailable-capability result
-until their listed tasks are delivered. All numerical limits are provisional
-acceptance targets. None is a measured result.
+`bench` still returns an explicit unavailable-capability result until its listed
+task is delivered. All numerical limits are provisional acceptance targets. None
+is a measured result.
 
 ## Agent operation without an editor
 
@@ -86,7 +91,10 @@ cargo xtask scenario --name destruction-network --loss-percent 5 --output .local
 # pulls a baseline over a bulk transfer, and catches up to the server hash.
 cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 
-# Offscreen GPU rendering still requires a supported GPU/driver.
+# T05: offscreen renders of the acceptance shapes (shaded + normal + depth PNGs
+# and a summary.json). Needs a supported GPU/driver; exit 3 otherwise.
+cargo xtask capture --output .local/runs/t05-capture --width 1280 --height 720 --strategy greedy
+# T12/T13 extend capture with named lighting scenes and camera fixture files:
 cargo xtask capture --scene colored-room --camera fixtures/cameras/colored-room.toml --size 1920x1080 --frames 120 --output .local/runs/lighting
 
 # Release build, named fixture, fixed workload; emits machine-readable metrics.

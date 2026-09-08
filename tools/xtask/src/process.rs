@@ -58,6 +58,32 @@ impl ProcessFailure {
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
+/// Run a child to completion under a bounded timeout, killing it (and reaping
+/// it) on timeout or Ctrl-C. Used for short one-shot tools that do not emit a
+/// readiness record, such as the T05 renderer capture.
+pub fn run_bounded(mut command: Command, timeout: Duration) -> Result<ExitStatus, ProcessFailure> {
+    install_cancel_handler()?;
+    CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    hide_console(&mut command);
+    let child = command.spawn()?;
+    let pid = child.id();
+    let mut child = ChildCleanup(Some(child));
+    let deadline = Instant::now() + timeout;
+    loop {
+        if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            return Err(ProcessFailure::Cancelled { pid });
+        }
+        if let Some(status) = child.0.as_mut().expect("child present").try_wait()? {
+            child.0.take();
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(ProcessFailure::TimedOut { pid, timeout });
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 pub fn wait_for_server(
     command: Command,
     log: &Path,

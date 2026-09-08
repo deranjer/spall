@@ -1,0 +1,19 @@
+[package]
+name = "spall_render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+spall_core.workspace = true
+spall_mesh.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+image.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+spall_voxel.workspace = true
+spall_jobs.workspace = true
