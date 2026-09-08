@@ -12,6 +12,15 @@ acceptance shapes (cube, tunnel, checkerboard, negative coordinates, adjacent
 bricks, rotated hollow volume) to a shaded PNG plus normal and depth debug
 images, with a `summary.json`; it exits 3 when no GPU adapter is available.
 Scene/camera fixture files and the lighting-quality capture stay T12/T13.
+The `summary.json` is schema `version: 2`. CPU and GPU costs are reported
+separately and must not be conflated: `gpu_render_millis` is a real device
+measurement from render-pass timestamp queries and is `null` (with
+`gpu_timing_available: false`) on adapters that do not support them — it is
+never a CPU-derived figure. `cpu_capture_millis` (whole render → readback →
+PNG-encode loop), `cpu_readback_millis`, and `cpu_encode_millis` are CPU
+wall-clock and include the synchronous readback map wait and PNG compression.
+The pre-`version: 2` `gpu_millis` field measured that CPU loop, not the GPU, and
+must not be read as a GPU timing.
 T06 adds one offline measurement binary,
 `cargo run --release -p spall_physics --bin collision-bench`, which runs the
 voxel-collision feasibility scenarios and writes `collision-feasibility.json`;
