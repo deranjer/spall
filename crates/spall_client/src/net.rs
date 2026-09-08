@@ -354,38 +354,79 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         counters
                             .last_tick
                             .fetch_max(tx.server_tick.get(), Ordering::Relaxed);
-                        let outcome = {
+                        // ENG-49: a `Published` transaction can be the missing
+                        // predecessor another held transaction was gapped on, so
+                        // retry the pending set behind it. Every resulting
+                        // outcome is forwarded through one path.
+                        let mut outcomes = Vec::new();
+                        {
                             let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.apply_transaction(&tx)
-                        };
-                        match outcome {
-                            ApplyOutcome::Published { .. } => {
-                                counters.applied.fetch_add(1, Ordering::Relaxed);
-                            }
-                            ApplyOutcome::NeedsRepair(reqs) => {
-                                for req in reqs {
-                                    let _ = conn.send_record(WireRecord::RepairRequest(req)).await;
-                                    counters.repairs.fetch_add(1, Ordering::Relaxed);
+                            let primary = guard.apply_transaction(&tx);
+                            let publish = matches!(primary, ApplyOutcome::Published { .. });
+                            outcomes.push(primary);
+                            if publish {
+                                for (_, o) in guard.retry_pending_repair_txns() {
+                                    outcomes.push(o);
                                 }
                             }
-                            ApplyOutcome::Rejected { .. } => {
-                                counters.rejected.fetch_add(1, Ordering::Relaxed);
+                        }
+                        for outcome in outcomes {
+                            match outcome {
+                                ApplyOutcome::Published { .. } => {
+                                    counters.applied.fetch_add(1, Ordering::Relaxed);
+                                }
+                                ApplyOutcome::NeedsRepair(reqs) => {
+                                    for req in reqs {
+                                        let _ =
+                                            conn.send_record(WireRecord::RepairRequest(req)).await;
+                                        counters.repairs.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                ApplyOutcome::Rejected { .. } => {
+                                    counters.rejected.fetch_add(1, Ordering::Relaxed);
+                                }
+                                ApplyOutcome::Duplicate => {}
                             }
-                            ApplyOutcome::Duplicate => {}
                         }
                     }
                     Ok(Some(WireRecord::BaselineBegin(_))) => {
                         // A mid-session hash-repair patch: one-brick baseline
-                        // transfer, merged into the live replica.
+                        // transfer, merged into the live replica. ENG-49: after
+                        // it lands, retry every transaction that was held
+                        // pending this gap so no committed ops are lost, and
+                        // forward any fresh repair requests those retries raise.
                         match receive_baseline_body(&conn).await {
                             Some(patch) => {
-                                let applied = {
+                                let (applied, retried) = {
                                     let mut guard =
                                         replica.lock().unwrap_or_else(|e| e.into_inner());
-                                    guard.apply_baseline_patch(&patch).is_ok()
+                                    if guard.apply_baseline_patch(&patch).is_ok() {
+                                        (true, guard.retry_pending_repair_txns())
+                                    } else {
+                                        (false, Vec::new())
+                                    }
                                 };
                                 if applied {
                                     counters.patches.fetch_add(1, Ordering::Relaxed);
+                                }
+                                for (_, outcome) in retried {
+                                    match outcome {
+                                        ApplyOutcome::Published { .. } => {
+                                            counters.applied.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        ApplyOutcome::NeedsRepair(reqs) => {
+                                            for req in reqs {
+                                                let _ = conn
+                                                    .send_record(WireRecord::RepairRequest(req))
+                                                    .await;
+                                                counters.repairs.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        ApplyOutcome::Rejected { .. } => {
+                                            counters.rejected.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        ApplyOutcome::Duplicate => {}
+                                    }
                                 }
                             }
                             None => break,
