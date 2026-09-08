@@ -47,6 +47,8 @@ pub enum WorldError {
     Ids(#[from] spall_core::IdError),
     #[error("occupancy extraction failed: {0}")]
     Occupancy(#[from] spall_physics::ExtractError),
+    #[error("no exact active collider for the body: {0}")]
+    Collider(#[from] crate::collider::ColliderInfeasible),
     #[error("edit during replay failed: {0}")]
     Edit(#[from] spall_voxel::EditError),
     #[error("journal replay precondition failed: {0}")]
@@ -125,7 +127,7 @@ impl SimWorld {
         let terrain_volume_id = registry.allocate_volume()?; // volume 1 == terrain
 
         let grid = OccupancyGrid::from_volume(&setup.terrain)?.ok_or(WorldError::EmptyTerrain)?;
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         let cell_m = setup.terrain.cell_size().metres() as f32;
 
         let mut physics = PhysicsWorld::new(setup.physics);
@@ -321,7 +323,7 @@ impl SimWorld {
         let volume = build(volume_id);
 
         let grid = OccupancyGrid::from_volume(&volume)?.ok_or(WorldError::EmptyBody)?;
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         let cell_size_m = volume.cell_size().metres();
         let cell_m = cell_size_m as f32;
         // Mass / COM / inertia from the exact fine grid at the requested bulk
@@ -425,7 +427,7 @@ impl SimWorld {
     /// replication/journalling until then.
     pub fn insert_restored_body(&mut self, spec: RestoredBody) -> Result<EntityId, WorldError> {
         let grid = OccupancyGrid::from_volume(&spec.volume)?.ok_or(WorldError::EmptyBody)?;
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         let cell_size_m = spec.volume.cell_size().metres();
         let cell_m = cell_size_m as f32;
         // Re-derive the exact mass properties from the persisted fine material
@@ -812,7 +814,7 @@ impl SimWorld {
         let Some(grid) = OccupancyGrid::from_volume(&body.volume)? else {
             return Ok(());
         };
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         self.physics
             .rebuild_collider(phys, &plan.grid, plan.representation);
         if is_dynamic {

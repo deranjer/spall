@@ -92,12 +92,23 @@ pub enum CommitError {
     Edit(#[from] EditError),
     #[error("occupancy extraction failed: {0}")]
     Occupancy(#[from] spall_physics::ExtractError),
+    #[error("no exact active collider for the body: {0}")]
+    Collider(#[from] crate::collider::ColliderInfeasible),
     #[error("id space exhausted: {0}")]
     Ids(#[from] spall_core::IdError),
     #[error("emitted transaction DTO is invalid: {0}")]
     Record(#[from] RecordError),
     #[error("commit cannot be encoded for replication: {0}")]
     Replication(#[from] crate::replication::ReplicationError),
+}
+
+impl From<crate::transfer::PlanChildError> for CommitError {
+    fn from(e: crate::transfer::PlanChildError) -> Self {
+        match e {
+            crate::transfer::PlanChildError::Occupancy(x) => CommitError::Occupancy(x),
+            crate::transfer::PlanChildError::Collider(x) => CommitError::Collider(x),
+        }
+    }
 }
 
 /// Commits `staged` into `world`, appending a journal entry on success.
@@ -227,15 +238,20 @@ pub fn commit(
     // 7. Plan the parent collider rebuild from the candidate's final geometry,
     //    plus the mass / COM / inertia to reinstall from its post-cut fine
     //    material grid (a dynamic parent lost mass to the cut / to its children;
-    //    a terrain parent has no solver mass) (`ENG-41`).
-    let parent_rebuild = OccupancyGrid::from_volume(&parent_candidate)?.map(|grid| {
-        let plan = plan_collider(&grid);
-        let mass_properties = (!parent_is_terrain).then(|| {
-            analytic_mass_properties(&grid, cell_size.metres(), |m| world.density(m))
-                .to_body_properties()
-        });
-        (plan, mass_properties)
-    });
+    //    a terrain parent has no solver mass) (`ENG-41`). A fragmented parent
+    //    with no exact active collider fails the commit here, before publish
+    //    (`ENG-42`).
+    let parent_rebuild = match OccupancyGrid::from_volume(&parent_candidate)? {
+        Some(grid) => {
+            let plan = plan_collider(&grid)?;
+            let mass_properties = (!parent_is_terrain).then(|| {
+                analytic_mass_properties(&grid, cell_size.metres(), |m| world.density(m))
+                    .to_body_properties()
+            });
+            Some((plan, mass_properties))
+        }
+        None => None,
+    };
 
     // 8. Reserve the transaction id and journal sequence.
     let transaction_id = reg.allocate_transaction()?;
