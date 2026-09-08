@@ -2655,6 +2655,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spall_core",
+ "spall_net",
  "spall_protocol",
  "thiserror 2.0.20",
  "tokio",
