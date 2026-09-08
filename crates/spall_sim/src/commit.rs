@@ -2,16 +2,29 @@
 //!
 //! [`commit`] takes one [`StagedEdit`], re-validates its [`spall_jobs::JobToken`]
 //! against the *live* world, and — only if nothing it read has moved — applies
-//! the whole transaction in one shot:
+//! the whole transaction in one shot.
 //!
-//! 1. the deterministic brush plan is applied to the live target volume;
-//! 2. every component the edit disconnected is copied into a new body at its
-//!    exact world location with inherited mass and velocity, then removed from
-//!    the parent;
-//! 3. every affected collider is rebuilt in this same call, so a physics query
-//!    on the next step can never see the old geometry;
-//! 4. a [`TopologyTransaction`] and a journal entry are emitted from the one
-//!    committed state.
+//! # Isolation (`ENG-54`)
+//!
+//! The commit is built as a self-contained *candidate* that touches no live
+//! state:
+//!
+//! 1. a clone of the id registry reserves every child entity/volume id, the
+//!    transaction id and the journal sequence;
+//! 2. the deterministic brush plan and the cell-removal plan are applied to a
+//!    *clone* of the target volume;
+//! 3. every detached component is planned into a child body from that clone,
+//!    with inherited mass and velocity;
+//! 4. the parent collider rebuild is planned, the [`TopologyTransaction`] DTO is
+//!    assembled and validated, and the journal participant snapshots are built.
+//!
+//! Only once every fallible step above has succeeded does the *publish* phase
+//! run — swapping in the reserved registry, the edited volume, the rebuilt
+//! parent collider, and the installed child bodies, then appending the journal
+//! entry. Publish contains no fallible operation, so a late failure (id
+//! exhaustion, DTO validation, op-budget) leaves the world hash, cell counts,
+//! colliders, bodies, registry counters and journal exactly as they were and
+//! the request is rejected deterministically by the pipeline.
 //!
 //! A stale token returns [`CommitOutcome::Stale`] and changes nothing; the
 //! caller recomputes the intent and retries it in request order.
@@ -20,17 +33,18 @@ use spall_core::{BrickCoord, MaterialId, Revision, Tick, VolumeId};
 use spall_jobs::Staleness;
 use spall_physics::{BodyKind as PhysBodyKind, BodySpec, OccupancyGrid};
 use spall_protocol::{
-    ActionOutcome, ActionStatus, BrickRevision, ControlSeq, InputSeq, MotionSnapshot, Record,
-    RecordError, SnapshotSeq, TopologyOp, TopologyTransaction, TransferId, VolumeHash,
+    ActionOutcome, ActionStatus, BrickRevision, CanonicalOwner, ControlSeq, InputSeq,
+    MotionSnapshot, Record, RecordError, SnapshotSeq, TopologyOp, TopologyTransaction, TransferId,
+    VolumeHash,
 };
-use spall_voxel::{EditError, EditPlan};
+use spall_voxel::{EditError, EditPlan, Volume};
 
 use crate::body::{Body, BodyKind, BodyPose};
 use crate::collider::plan_collider;
 use crate::journal::{JournalEntry, JournalSink};
 use crate::stage::StagedEdit;
 use crate::transfer::{self, ChildBody, ParentState};
-use crate::world::SimWorld;
+use crate::world::{SimWorld, volume_topology_hash_for};
 
 /// Structural algorithm version stamped into every transaction.
 pub const ALGORITHM_VERSION: u32 = 1;
@@ -107,7 +121,7 @@ pub fn commit(
     let cell_size = parent.volume.cell_size();
     let parent_phys = parent.phys;
     let parent_is_terrain = parent.kind == BodyKind::Terrain;
-    let parent_region = parent.collider_region;
+    let parent_entity = parent.entity;
 
     // 2. Parent kinematic state at the split instant (world space).
     let parent_state = if parent_is_terrain {
@@ -143,50 +157,52 @@ pub fn commit(
         }
     };
 
-    // 3. Allocate child identities up front (never reused).
+    // ---- Build an isolated commit candidate. Nothing from here to the publish
+    // ---- marker mutates the live world, its physics, the id registry, or the
+    // ---- journal; every fallible step runs against clones so a late failure
+    // ---- leaves authoritative state exactly as it was (`ENG-54`).
+    let mut reg = world.registry().clone();
+
+    // 3. Reserve child identities up front from the candidate registry.
     let mut child_ids: Vec<(spall_core::EntityId, VolumeId)> = Vec::new();
     for _ in &staged.memberships {
-        let e = world.registry_mut().allocate_entity()?;
-        let v = world.registry_mut().allocate_volume()?;
+        let e = reg.allocate_entity()?;
+        let v = reg.allocate_volume()?;
         child_ids.push((e, v));
     }
 
-    // 4. Apply the brush to the live target volume.
-    let cut_outcome = {
-        let parent = world
-            .volume_body_mut(vid)
-            .ok_or(CommitError::UnknownVolume(vid))?;
-        parent.volume.apply_edit(&staged.plan)?
-    };
+    // 4. Apply the brush to a clone of the target volume.
+    let mut parent_candidate: Volume = world
+        .volume_ref(vid)
+        .ok_or(CommitError::UnknownVolume(vid))?
+        .clone();
+    let cut_outcome = parent_candidate.apply_edit(&staged.plan)?;
 
-    // 5. Build every child from the post-cut parent (components are still solid),
-    //    and capture the canonical cell-run ops a replica needs to reconstruct
-    //    the child without any structural code (`docs/protocol.md`).
+    // 5. Build every child from the post-cut candidate (components are still
+    //    solid), and capture the canonical cell-run ops a replica needs to
+    //    reconstruct the child without any structural code (`docs/protocol.md`).
     let mut children: Vec<ChildBody> = Vec::new();
     let mut child_fill_ops: Vec<Vec<spall_protocol::TopologyOp>> = Vec::new();
-    {
-        let parent_vol = world
-            .volume_ref(vid)
-            .ok_or(CommitError::UnknownVolume(vid))?;
-        for ((entity, child_vid), membership) in child_ids.iter().zip(&staged.memberships) {
-            let child = transfer::plan_child(
-                parent_vol,
-                membership,
-                parent_state,
-                *entity,
-                *child_vid,
-                &|m: MaterialId| world.density(m),
-                0,
-            )?;
-            child_fill_ops.push(crate::replication::child_fill_ops(
-                *child_vid, membership, parent_vol,
-            ));
-            children.push(child);
-        }
+    for ((entity, child_vid), membership) in child_ids.iter().zip(&staged.memberships) {
+        let child = transfer::plan_child(
+            &parent_candidate,
+            membership,
+            parent_state,
+            *entity,
+            *child_vid,
+            &|m: MaterialId| world.density(m),
+            0,
+        )?;
+        child_fill_ops.push(crate::replication::child_fill_ops(
+            *child_vid,
+            membership,
+            &parent_candidate,
+        ));
+        children.push(child);
     }
     transfer::apply_explosion(&mut children, staged.explosion);
 
-    // 6. Remove the detached cells from the parent.
+    // 6. Remove the detached cells from the candidate.
     let remove_outcome = if staged.splits() {
         let mut remove = EditPlan::new(vid);
         for membership in &staged.memberships {
@@ -194,30 +210,135 @@ pub fn commit(
                 remove.set(cell, MaterialId::AIR);
             }
         }
-        let parent = world
-            .volume_body_mut(vid)
-            .ok_or(CommitError::UnknownVolume(vid))?;
-        Some(parent.volume.apply_edit(&remove)?)
+        Some(parent_candidate.apply_edit(&remove)?)
     } else {
         None
     };
 
-    // 7. Rebuild the parent collider from its final geometry.
-    let rebuild = {
-        let parent = world.volume_body(vid).expect("parent still exists");
-        OccupancyGrid::from_volume(&parent.volume)?.map(|grid| (parent.phys, plan_collider(&grid)))
+    // 7. Plan the parent collider rebuild from the candidate's final geometry.
+    let parent_rebuild =
+        OccupancyGrid::from_volume(&parent_candidate)?.map(|grid| plan_collider(&grid));
+
+    // 8. Reserve the transaction id and journal sequence.
+    let transaction_id = reg.allocate_transaction()?;
+    let journal_seq = reg.allocate_journal_seq()?;
+
+    // 9. Assemble and validate the transaction DTO from the candidate state.
+    let mut affected: Vec<BrickCoord> = cut_outcome.bricks.iter().map(|b| b.coord).collect();
+    if let Some(remove) = &remove_outcome {
+        affected.extend(remove.bricks.iter().map(|b| b.coord));
+    }
+    affected.sort_by_key(|c| c.sort_key());
+    affected.dedup();
+
+    let before: Vec<BrickRevision> = cut_outcome
+        .bricks
+        .iter()
+        .map(|b| BrickRevision {
+            volume: vid,
+            coord: b.coord,
+            revision: b.before_revision,
+        })
+        .collect();
+    let after: Vec<BrickRevision> = affected
+        .iter()
+        .map(|&coord| BrickRevision {
+            volume: vid,
+            coord,
+            revision: parent_candidate
+                .brick_revision(coord)
+                .ok()
+                .flatten()
+                .unwrap_or(Revision::ZERO),
+        })
+        .collect();
+
+    // Self-describing op list: the brush, then for each child a `SplitOff`
+    // marker followed by the canonical cell runs that fill it, then the runs
+    // that remove every detached cell from the source. A replica applies these
+    // in order to reproduce the exact committed geometry.
+    let mut ops = vec![TopologyOp::IntegerBrush {
+        volume: vid,
+        brush: staged.brush,
+        material: staged.kind.write_material(),
+    }];
+    for (((entity, child_vid), _), fill) in child_ids
+        .iter()
+        .zip(&staged.memberships)
+        .zip(&child_fill_ops)
+    {
+        ops.push(TopologyOp::SplitOff {
+            source: vid,
+            child: *child_vid,
+            child_entity: *entity,
+        });
+        ops.extend(fill.iter().cloned());
+    }
+    if staged.splits() {
+        ops.extend(crate::replication::source_removal_ops(
+            vid,
+            &staged.memberships,
+        ));
+    }
+    crate::replication::check_op_budget(ops.len())?;
+
+    let parent_owner = match parent_entity {
+        Some(entity) => CanonicalOwner::Body(entity),
+        None => CanonicalOwner::Terrain,
     };
-    if let Some((phys, plan)) = rebuild {
+    let mut result_hashes = vec![VolumeHash {
+        volume: vid,
+        hash: volume_topology_hash_for(&parent_candidate, parent_owner),
+    }];
+    for child in &children {
+        result_hashes.push(VolumeHash {
+            volume: child.volume_id,
+            hash: volume_topology_hash_for(&child.volume, CanonicalOwner::Body(child.entity)),
+        });
+    }
+
+    let topology = TopologyTransaction {
+        transaction_id,
+        server_tick,
+        control_seq,
+        algorithm_version: ALGORITHM_VERSION,
+        dependencies: Vec::new(),
+        before,
+        after,
+        ops,
+        result_hashes,
+    };
+    topology.validate()?;
+
+    let bumped_epoch = staged.splits();
+    let participants = candidate_participant_snapshots(
+        world,
+        parent_is_terrain,
+        parent_entity,
+        &parent_candidate,
+        &children,
+        server_tick,
+        journal_seq,
+    );
+
+    // ---- Publish. Every step below is infallible: the candidate is committed
+    // ---- to the live world in one shot at the tick boundary.
+    *world.registry_mut() = reg;
+
+    if let Some(parent) = world.volume_body_mut(vid) {
+        parent.volume = parent_candidate;
+    }
+
+    if let Some(plan) = parent_rebuild {
         world
             .physics_mut()
-            .rebuild_collider(phys, &plan.grid, plan.representation);
-        let parent = world.volume_body_mut(vid).expect("parent still exists");
-        parent.collider_revision += 1;
-        parent.coarsen_k = plan.coarsen_k;
+            .rebuild_collider(parent_phys, &plan.grid, plan.representation);
+        if let Some(parent) = world.volume_body_mut(vid) {
+            parent.collider_revision += 1;
+            parent.coarsen_k = plan.coarsen_k;
+        }
     }
-    let _ = parent_region;
 
-    // 8. Install every child body and its collider.
     let mut child_entities = Vec::new();
     for child in children {
         let child_cell_m = child.volume.cell_size().metres() as f32;
@@ -263,102 +384,10 @@ pub fn commit(
         child_entities.push(child.entity);
     }
 
-    // 9. Advance the epoch iff cells moved between components.
-    let bumped_epoch = staged.splits();
     if bumped_epoch {
         world.bump_topology_epoch();
     }
 
-    // 10. Emit the transaction DTO and the journal entry.
-    let transaction_id = world.registry_mut().allocate_transaction()?;
-    let journal_seq = world.registry_mut().allocate_journal_seq()?;
-
-    let mut affected: Vec<BrickCoord> = cut_outcome.bricks.iter().map(|b| b.coord).collect();
-    if let Some(remove) = &remove_outcome {
-        affected.extend(remove.bricks.iter().map(|b| b.coord));
-    }
-    affected.sort_by_key(|c| c.sort_key());
-    affected.dedup();
-
-    let before: Vec<BrickRevision> = cut_outcome
-        .bricks
-        .iter()
-        .map(|b| BrickRevision {
-            volume: vid,
-            coord: b.coord,
-            revision: b.before_revision,
-        })
-        .collect();
-    let after: Vec<BrickRevision> = affected
-        .iter()
-        .map(|&coord| BrickRevision {
-            volume: vid,
-            coord,
-            revision: world
-                .volume_ref(vid)
-                .and_then(|v| v.brick_revision(coord).ok().flatten())
-                .unwrap_or(Revision::ZERO),
-        })
-        .collect();
-
-    // Self-describing op list: the brush, then for each child a `SplitOff`
-    // marker followed by the canonical cell runs that fill it, then the runs
-    // that remove every detached cell from the source. A replica applies these
-    // in order to reproduce the exact committed geometry.
-    let mut ops = vec![TopologyOp::IntegerBrush {
-        volume: vid,
-        brush: staged.brush,
-        material: staged.kind.write_material(),
-    }];
-    for (((entity, child_vid), _), fill) in child_ids
-        .iter()
-        .zip(&staged.memberships)
-        .zip(&child_fill_ops)
-    {
-        ops.push(TopologyOp::SplitOff {
-            source: vid,
-            child: *child_vid,
-            child_entity: *entity,
-        });
-        ops.extend(fill.iter().cloned());
-    }
-    if staged.splits() {
-        ops.extend(crate::replication::source_removal_ops(
-            vid,
-            &staged.memberships,
-        ));
-    }
-    crate::replication::check_op_budget(ops.len())?;
-
-    let mut result_hashes = vec![VolumeHash {
-        volume: vid,
-        hash: world
-            .volume_hash(vid)
-            .unwrap_or(spall_protocol::Hash32::ZERO),
-    }];
-    for (_, child_vid) in &child_ids {
-        result_hashes.push(VolumeHash {
-            volume: *child_vid,
-            hash: world
-                .volume_hash(*child_vid)
-                .unwrap_or(spall_protocol::Hash32::ZERO),
-        });
-    }
-
-    let topology = TopologyTransaction {
-        transaction_id,
-        server_tick,
-        control_seq,
-        algorithm_version: ALGORITHM_VERSION,
-        dependencies: Vec::new(),
-        before,
-        after,
-        ops,
-        result_hashes,
-    };
-    topology.validate()?;
-
-    let participants = participant_snapshots(world, vid, &child_entities, server_tick, journal_seq);
     journal.append(JournalEntry {
         seq: journal_seq,
         transaction: topology.clone(),
@@ -375,48 +404,54 @@ pub fn commit(
 }
 
 /// A `MotionSnapshot` for every dynamic body that took part in the transaction:
-/// the parent (if it is a body) and each child.
-fn participant_snapshots(
+/// the parent (if it is a body, read from the live world — a commit never moves
+/// the parent) and each planned child (read from the candidate, since the child
+/// bodies are not installed until publish).
+#[allow(clippy::too_many_arguments)]
+fn candidate_participant_snapshots(
     world: &SimWorld,
-    parent_vid: VolumeId,
-    children: &[spall_core::EntityId],
+    parent_is_terrain: bool,
+    parent_entity: Option<spall_core::EntityId>,
+    parent_candidate: &Volume,
+    children: &[ChildBody],
     server_tick: Tick,
     journal_seq: spall_core::JournalSeq,
 ) -> Vec<MotionSnapshot> {
     let mut out = Vec::new();
-    let mut push = |body: &Body| {
-        let Some(entity) = body.entity else { return };
+    if !parent_is_terrain
+        && let Some(entity) = parent_entity
+        && let Some(parent) = world.body(entity)
+    {
         out.push(MotionSnapshot {
             server_tick,
             snapshot_seq: SnapshotSeq(journal_seq.0),
             acked_input: InputSeq(0),
             body: entity,
-            topology_revision: latest_revision(world, body.volume_id),
-            pose: body.pose.to_protocol(),
-            linear_velocity: body.linvel_m_s.map(|v| v as f32),
-            angular_velocity: body.angvel_rad_s.map(|v| v as f32),
-            sleeping: body.sleeping,
+            topology_revision: latest_volume_revision(parent_candidate),
+            pose: parent.pose.to_protocol(),
+            linear_velocity: parent.linvel_m_s.map(|v| v as f32),
+            angular_velocity: parent.angvel_rad_s.map(|v| v as f32),
+            sleeping: parent.sleeping,
         });
-    };
-    if let Some(parent) = world.body_by_volume(parent_vid) {
-        push(parent);
     }
-    for entity in children {
-        if let Some(body) = world.body(*entity) {
-            push(body);
-        }
+    for child in children {
+        out.push(MotionSnapshot {
+            server_tick,
+            snapshot_seq: SnapshotSeq(journal_seq.0),
+            acked_input: InputSeq(0),
+            body: child.entity,
+            topology_revision: latest_volume_revision(&child.volume),
+            pose: child.pose.to_protocol(),
+            linear_velocity: child.linvel_m_s.map(|v| v as f32),
+            angular_velocity: child.angvel_rad_s.map(|v| v as f32),
+            sleeping: false,
+        });
     }
     out
 }
 
-fn latest_revision(world: &SimWorld, volume: VolumeId) -> Revision {
-    world
-        .volume_ref(volume)
-        .map(|v| {
-            let next = v.next_revision().get();
-            Revision(next.saturating_sub(1))
-        })
-        .unwrap_or(Revision::ZERO)
+fn latest_volume_revision(volume: &Volume) -> Revision {
+    Revision(volume.next_revision().get().saturating_sub(1))
 }
 
 /// Re-export for callers assembling an `ActionStatus::Queued` before a commit.

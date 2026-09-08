@@ -258,14 +258,23 @@ impl EditPipeline {
             }
 
             let control_seq = ControlSeq(*next_control_seq);
-            match commit(world, journal, &staged, server_tick, control_seq)? {
-                CommitOutcome::Committed(done) => {
+            match commit(world, journal, &staged, server_tick, control_seq) {
+                Ok(CommitOutcome::Committed(done)) => {
                     *next_control_seq += 1;
                     self.conflicts.remove(&region);
                     self.committed.insert(request.0, done.clone());
                     report.committed.push((request, done));
                 }
-                CommitOutcome::Stale(_reason) => {
+                Err(err) => {
+                    // The commit candidate failed a fallible step (id exhaustion,
+                    // DTO validation, op-budget) and was discarded before any
+                    // live state changed (`ENG-54`). Reject the request
+                    // deterministically; the tick continues and every other
+                    // staged request still commits.
+                    self.conflicts.remove(&region);
+                    report.rejected.push((request, err.to_string()));
+                }
+                Ok(CommitOutcome::Stale(_reason)) => {
                     let count = self.conflicts.entry(region).or_insert(0);
                     *count += 1;
                     if *count >= self.serialize_threshold && self.serialized.insert(region) {

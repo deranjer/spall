@@ -59,6 +59,61 @@ impl FeasibilityParams {
     }
 }
 
+/// Result of the sleep/wake feasibility scenario for one representation. Every
+/// field is observed from the solver directly — `sleeping` transitions, contact
+/// pairs, and travelled distance — so waking is never inferred from a count of
+/// bodies that slept.
+#[derive(Debug, Clone, Copy)]
+pub struct SleepWakeReport {
+    /// The body settled to sleep on the floor.
+    pub slept: bool,
+    /// It woke when its collider was rebuilt in place (the T08 nearby-edit path).
+    pub woke_on_rebuild: bool,
+    /// It settled back to sleep after the rebuild.
+    pub reslept_after_rebuild: bool,
+    /// It woke when a blast impulse was applied.
+    pub woke_on_impulse: bool,
+    /// Furthest it travelled from its rest pose after the impulse, metres.
+    pub travel_m: f64,
+    /// It left the floor and then re-established a floor contact (it collides).
+    pub recontact: bool,
+    /// It settled back to sleep a second time.
+    pub reslept: bool,
+    /// Every state stayed finite and contact penetration stayed bounded across
+    /// the whole scenario (no blow-up on wake).
+    pub stable: bool,
+}
+
+impl SleepWakeReport {
+    /// Compact JSON object for the bench output.
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"slept\":{},\"woke_on_rebuild\":{},\"reslept_after_rebuild\":{},\"woke_on_impulse\":{},\"travel_m\":{:.4},\"recontact\":{},\"reslept\":{},\"stable\":{}}}",
+            self.slept,
+            self.woke_on_rebuild,
+            self.reslept_after_rebuild,
+            self.woke_on_impulse,
+            self.travel_m,
+            self.recontact,
+            self.reslept,
+            self.stable,
+        )
+    }
+
+    /// Whole scenario passed: slept, both interactions woke it, it moved and
+    /// re-collided, it re-slept, and nothing blew up.
+    pub fn ok(&self) -> bool {
+        self.slept
+            && self.woke_on_rebuild
+            && self.reslept_after_rebuild
+            && self.woke_on_impulse
+            && self.travel_m > 0.1
+            && self.recontact
+            && self.reslept
+            && self.stable
+    }
+}
+
 /// Per-representation results.
 #[derive(Debug, Clone)]
 pub struct RepresentationReport {
@@ -80,6 +135,13 @@ pub struct RepresentationReport {
     pub settle_max_speed: f64,
     /// True if no body produced a non-finite state at any step.
     pub settle_finite: bool,
+
+    /// Editable-collider sleep/wake scenario (measured directly, never inferred
+    /// from a sleeping count): a dynamic voxel body is settled to sleep, then two
+    /// documented nearby interactions are applied in turn — an in-place collider
+    /// rebuild (the T08 edit path) and a blast impulse — and its response is
+    /// checked. `true` means the body actually reached that state.
+    pub sleep_wake: SleepWakeReport,
 
     /// Per-step pipeline time while the hollow building falls and lands.
     pub building_step: PercentileSummary,
@@ -112,7 +174,7 @@ impl RepresentationReport {
     /// Compact JSON object for the bench output.
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"representation\":\"{}\",\"multibrick_primitives\":{},\"multibrick_build_us\":{:.3},\"multibrick_est_bytes\":{},\"settle_step\":{},\"settle_sleep_fraction\":{:.4},\"settle_max_speed\":{:.4},\"settle_finite\":{},\"building_step\":{},\"building_interior_clearance_m\":{:.4},\"building_settled\":{},\"rebuild\":{},\"mass_rel_err\":{:.6},\"com_abs_err_m\":{:.6},\"inertia_rel_err\":{:.6},\"projectile_max_stop_m_s\":{:.1},\"worst_case_solid_cells\":{},\"worst_case_primitives\":{}}}",
+            "{{\"representation\":\"{}\",\"multibrick_primitives\":{},\"multibrick_build_us\":{:.3},\"multibrick_est_bytes\":{},\"settle_step\":{},\"settle_sleep_fraction\":{:.4},\"settle_max_speed\":{:.4},\"settle_finite\":{},\"sleep_wake\":{},\"building_step\":{},\"building_interior_clearance_m\":{:.4},\"building_settled\":{},\"rebuild\":{},\"mass_rel_err\":{:.6},\"com_abs_err_m\":{:.6},\"inertia_rel_err\":{:.6},\"projectile_max_stop_m_s\":{:.1},\"worst_case_solid_cells\":{},\"worst_case_primitives\":{}}}",
             self.representation,
             self.multibrick_primitives,
             self.multibrick_build_us,
@@ -121,6 +183,7 @@ impl RepresentationReport {
             self.settle_sleep_fraction,
             self.settle_max_speed,
             self.settle_finite,
+            self.sleep_wake.to_json(),
             self.building_step.to_json(),
             self.building_interior_clearance_m,
             self.building_settled,
@@ -175,6 +238,7 @@ pub fn run_feasibility(params: FeasibilityParams) -> FeasibilityReport {
 fn run_one(rep: Representation, params: FeasibilityParams) -> RepresentationReport {
     let (mb_primitives, mb_build_us, mb_bytes) = multibrick_build(rep, params.multibrick);
     let (settle_step, sleep_fraction, max_speed, finite) = debris_settle(rep, params);
+    let sleep_wake = sleep_wake_cycle(rep);
     let (building_step, clearance, settled) = building_drop(rep, params.settle_steps);
     let rebuild = rebuild_cost(rep, params.rebuild_iters);
     let (mass_rel, com_abs, inertia_rel) = mass_agreement(rep);
@@ -190,6 +254,7 @@ fn run_one(rep: Representation, params: FeasibilityParams) -> RepresentationRepo
         settle_sleep_fraction: sleep_fraction,
         settle_max_speed: max_speed,
         settle_finite: finite,
+        sleep_wake,
         building_step,
         building_interior_clearance_m: clearance,
         building_settled: settled,
@@ -320,6 +385,128 @@ fn debris_settle(
         max_speed,
         finite,
     )
+}
+
+/// T06's sleep/wake acceptance scenario, run for one representation.
+///
+/// Settles one dynamic voxel body to sleep on a fixed floor, then applies two
+/// documented nearby interactions in sequence and checks the body's real
+/// response each time:
+///
+/// 1. an **in-place collider rebuild** — exactly what the T08 authoritative edit
+///    path does to a body after an accepted topology transaction;
+/// 2. a **blast impulse** sized from the body's own mass for a ~4.5 m/s kick —
+///    a stand-in for a nearby explosion or impact.
+///
+/// After each it verifies the body left the sleeping state; after the impulse it
+/// verifies the body travelled, left the floor, and re-established a floor
+/// contact; and it checks that the body settles back to sleep both times with
+/// every state finite and contact penetration bounded. Nothing is inferred from
+/// a count of bodies that slept.
+fn sleep_wake_cycle(rep: Representation) -> SleepWakeReport {
+    let mut world = PhysicsWorld::new(PhysicsConfig::default());
+
+    let floor = fixtures::floor_slab(vid(1), 2, 2, 4);
+    let floor_grid = OccupancyGrid::from_volume(&floor).unwrap().unwrap();
+    world.add_body(BodySpec {
+        kind: BodyKind::Fixed,
+        representation: rep,
+        grid: floor_grid,
+        cell_m: fixtures::CELL_M,
+        density_kg_m3: fixtures::STONE_DENSITY,
+        translation_m: [0.0, 0.0, 0.0],
+        linvel_m_s: [0.0; 3],
+    });
+
+    // One small dynamic cube just above the slab (its top face at y = 1.0 m).
+    let piece = fixtures::debris_pieces(500, 1, 2).pop().unwrap().1;
+    let grid = OccupancyGrid::from_volume(&piece).unwrap().unwrap();
+    let id = world.add_body(BodySpec {
+        kind: BodyKind::Dynamic { ccd: false },
+        representation: rep,
+        grid: grid.clone(),
+        cell_m: fixtures::CELL_M,
+        density_kg_m3: fixtures::STONE_DENSITY,
+        translation_m: [4.0, 1.2, 4.0],
+        linvel_m_s: [0.0; 3],
+    });
+
+    let mut stable = true;
+    let check = |w: &PhysicsWorld| {
+        w.body_state(id).is_finite() && w.max_penetration_m() < 0.5 * fixtures::CELL_M
+    };
+    let settle = |w: &mut PhysicsWorld, stable: &mut bool, budget: u32| -> bool {
+        let mut slept = false;
+        for _ in 0..budget {
+            w.step();
+            *stable &= check(w);
+            if w.body_state(id).sleeping {
+                slept = true;
+                break;
+            }
+        }
+        // A few extra steps so the body is firmly at rest.
+        for _ in 0..10 {
+            w.step();
+            *stable &= check(w);
+        }
+        slept
+    };
+
+    // Phase 1: settle to sleep.
+    let slept = settle(&mut world, &mut stable, 600);
+
+    // Phase 2: rebuild the collider in place (the T08 nearby-edit path).
+    world.rebuild_collider(id, &grid, rep);
+    world.step();
+    stable &= check(&world);
+    let woke_on_rebuild = !world.body_state(id).sleeping;
+    let reslept_after_rebuild = settle(&mut world, &mut stable, 400);
+    let rest = world.body_state(id).translation_m;
+
+    // Phase 3: a blast impulse sized from the body's own mass (~4.5 m/s kick).
+    let m = world.body_state(id).mass_kg.max(f32::MIN_POSITIVE);
+    world.apply_impulse(id, [2.0 * m, 4.0 * m, 0.0]);
+    world.step();
+    stable &= check(&world);
+    let after = world.body_state(id);
+    let woke_on_impulse = !after.sleeping && after.speed_m_s() > 1.0;
+
+    // Phase 4: it flies up off the floor, then falls back and lands on it — a
+    // clear rise clear of the surface followed by a live floor contact back near
+    // the rest height is unambiguous "woke, moved, and collided".
+    let mut max_rise_m = 0.0_f64;
+    let mut recontact = false;
+    let mut travel_m = 0.0_f64;
+    for _ in 0..240 {
+        world.step();
+        stable &= check(&world);
+        let st = world.body_state(id);
+        let d = ((st.translation_m[0] - rest[0]).powi(2)
+            + (st.translation_m[1] - rest[1]).powi(2)
+            + (st.translation_m[2] - rest[2]).powi(2))
+        .sqrt() as f64;
+        travel_m = travel_m.max(d);
+        let rise_m = f64::from(st.translation_m[1] - rest[1]);
+        max_rise_m = max_rise_m.max(rise_m);
+        if max_rise_m > 0.25 && rise_m < 0.15 && world.contact_pair_count() > 0 {
+            recontact = true;
+        }
+    }
+
+    // Phase 5: settle back to sleep a second time.
+    let reslept = settle(&mut world, &mut stable, 600);
+
+    SleepWakeReport {
+        slept,
+        woke_on_rebuild,
+        reslept_after_rebuild,
+        woke_on_impulse,
+        travel_m,
+        recontact,
+        reslept,
+        stable,
+    }
 }
 
 fn building_drop(rep: Representation, steps: u32) -> (PercentileSummary, f64, bool) {
@@ -566,6 +753,58 @@ mod tests {
                 r.inertia_rel_err
             );
             assert!(r.rebuild.p50_us > 0.0);
+
+            // Sleep/wake acceptance: settled asleep, woke on the in-place
+            // collider rebuild *and* on a blast impulse, moved and re-collided,
+            // then settled back to sleep — all observed from the solver, not
+            // inferred from a sleeping count.
+            let sw = &r.sleep_wake;
+            assert!(
+                sw.slept,
+                "{}: body never settled to sleep",
+                r.representation
+            );
+            assert!(
+                sw.woke_on_rebuild,
+                "{}: an in-place collider rebuild did not wake the sleeping body",
+                r.representation
+            );
+            assert!(
+                sw.reslept_after_rebuild,
+                "{}: body did not settle back to sleep after the rebuild",
+                r.representation
+            );
+            assert!(
+                sw.woke_on_impulse,
+                "{}: a blast impulse did not wake the sleeping body",
+                r.representation
+            );
+            assert!(
+                sw.travel_m > 0.1,
+                "{}: woken body barely moved ({:.3} m)",
+                r.representation,
+                sw.travel_m
+            );
+            assert!(
+                sw.recontact,
+                "{}: woken body never left the floor and re-collided with it",
+                r.representation
+            );
+            assert!(
+                sw.reslept,
+                "{}: body did not settle back to sleep after the impulse",
+                r.representation
+            );
+            assert!(
+                sw.stable,
+                "{}: sleep/wake scenario went unstable (non-finite or deep penetration)",
+                r.representation
+            );
+            assert!(
+                sw.ok(),
+                "{}: sleep/wake scenario did not pass",
+                r.representation
+            );
         }
         // The merged compound is the correctness baseline: its interior must be
         // at least as open as the native shape's, and it must stop a fast CCD

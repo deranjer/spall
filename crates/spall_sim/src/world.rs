@@ -49,6 +49,10 @@ pub enum WorldError {
     Occupancy(#[from] spall_physics::ExtractError),
     #[error("edit during replay failed: {0}")]
     Edit(#[from] spall_voxel::EditError),
+    #[error("journal replay precondition failed: {0}")]
+    ReplayPrecondition(String),
+    #[error("journal replay result hash mismatch: {0}")]
+    ReplayResultHash(String),
 }
 
 /// A detached body being reinstated from a persisted checkpoint record.
@@ -470,12 +474,20 @@ impl SimWorld {
     /// recovery never pairs a checkpoint-frame parent with split-frame
     /// children. Colliders of every touched volume are rebuilt; the caller
     /// bumps the id counters past the replayed suffix afterwards.
+    ///
+    /// The transaction's `before` brick revisions are checked against the live
+    /// world *before* any op is applied, and its `after` brick revisions and
+    /// `result_hashes` are checked against the resulting geometry — a decodable
+    /// but semantically wrong record (or a replay defect) is rejected rather
+    /// than silently accepted as authoritative state.
     pub fn replay_transaction(
         &mut self,
         tx: &spall_protocol::TopologyTransaction,
         participants: &[MotionSnapshot],
     ) -> Result<(), WorldError> {
         use spall_protocol::TopologyOp;
+
+        self.check_replay_preconditions(tx)?;
 
         let terrain_cell_size = self.terrain.volume.cell_size();
         let mut touched: Vec<VolumeId> = Vec::new();
@@ -688,6 +700,84 @@ impl SimWorld {
         if split {
             self.bump_topology_epoch();
         }
+
+        self.check_replay_results(tx)?;
+        Ok(())
+    }
+
+    /// Checks a journalled transaction's `before` brick revisions against the
+    /// live world before any op is replayed. A non-resident brick reads as
+    /// [`Revision::ZERO`] — the implicit "before" of an untouched cell.
+    fn check_replay_preconditions(
+        &self,
+        tx: &spall_protocol::TopologyTransaction,
+    ) -> Result<(), WorldError> {
+        for br in &tx.before {
+            let found = self
+                .volume_ref(br.volume)
+                .ok_or_else(|| {
+                    WorldError::ReplayPrecondition(format!(
+                        "transaction {} references unknown volume {}",
+                        tx.transaction_id.get(),
+                        br.volume
+                    ))
+                })?
+                .brick_revision(br.coord)
+                .map_err(|e| {
+                    WorldError::ReplayPrecondition(format!(
+                        "transaction {} brick {:?} in volume {}: {e}",
+                        tx.transaction_id.get(),
+                        br.coord,
+                        br.volume
+                    ))
+                })?
+                .unwrap_or(Revision::ZERO);
+            if found != br.revision {
+                return Err(WorldError::ReplayPrecondition(format!(
+                    "transaction {} expected volume {} brick {:?} at revision {}, live world has {}",
+                    tx.transaction_id.get(),
+                    br.volume,
+                    br.coord,
+                    br.revision.get(),
+                    found.get()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks a journalled transaction's `after` brick revisions and
+    /// `result_hashes` against the geometry the replay just produced.
+    fn check_replay_results(
+        &self,
+        tx: &spall_protocol::TopologyTransaction,
+    ) -> Result<(), WorldError> {
+        for br in &tx.after {
+            let found = self
+                .volume_ref(br.volume)
+                .and_then(|v| v.brick_revision(br.coord).ok().flatten())
+                .unwrap_or(Revision::ZERO);
+            if found != br.revision {
+                return Err(WorldError::ReplayResultHash(format!(
+                    "transaction {} recorded volume {} brick {:?} at revision {} after replay, got {}",
+                    tx.transaction_id.get(),
+                    br.volume,
+                    br.coord,
+                    br.revision.get(),
+                    found.get()
+                )));
+            }
+        }
+        for vh in &tx.result_hashes {
+            let got = self.volume_hash(vh.volume);
+            if got != Some(vh.hash) {
+                return Err(WorldError::ReplayResultHash(format!(
+                    "transaction {} recorded a result hash for volume {} that the replayed geometry does not reproduce",
+                    tx.transaction_id.get(),
+                    vh.volume
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -753,28 +843,7 @@ impl SimWorld {
                 CanonicalOwner::Body(body.entity.expect("detached body has an entity")),
             )
         };
-        let mut bricks = Vec::new();
-        for coord in v.resident_brick_coords() {
-            let snap = v
-                .snapshot_brick(coord)
-                .ok()
-                .flatten()
-                .expect("coord came from the resident set");
-            bricks.push(CanonicalBrick {
-                coord,
-                revision: snap.revision(),
-                layers: vec![CanonicalLayer {
-                    kind: MATERIAL_LAYER_KIND,
-                    bytes: spall_voxel::BrickHash::to_bytes(snap.content_hash()).to_vec(),
-                }],
-            });
-        }
-        Some(CanonicalVolume {
-            volume_id: volume,
-            cell_size: v.cell_size(),
-            owner,
-            bricks,
-        })
+        Some(canonical_volume_for(v, owner))
     }
 
     /// Canonical topology hash of just `volume`.
@@ -833,6 +902,41 @@ impl WorldView for SimWorld {
             },
         }
     }
+}
+
+/// Canonical single-volume representation of `volume` under `owner`, for a
+/// volume that may not be installed in the world yet (a commit candidate).
+/// [`SimWorld::canonical_volume`] is this plus the live-world owner lookup.
+pub fn canonical_volume_for(volume: &Volume, owner: CanonicalOwner) -> CanonicalVolume {
+    let mut bricks = Vec::new();
+    for coord in volume.resident_brick_coords() {
+        let snap = volume
+            .snapshot_brick(coord)
+            .ok()
+            .flatten()
+            .expect("coord came from the resident set");
+        bricks.push(CanonicalBrick {
+            coord,
+            revision: snap.revision(),
+            layers: vec![CanonicalLayer {
+                kind: MATERIAL_LAYER_KIND,
+                bytes: spall_voxel::BrickHash::to_bytes(snap.content_hash()).to_vec(),
+            }],
+        });
+    }
+    CanonicalVolume {
+        volume_id: volume.id(),
+        cell_size: volume.cell_size(),
+        owner,
+        bricks,
+    }
+}
+
+/// Canonical topology hash of just `volume` under `owner` — the same value
+/// [`SimWorld::volume_hash`] returns once the volume is installed, so a commit
+/// candidate can compute its result hashes before publishing.
+pub fn volume_topology_hash_for(volume: &Volume, owner: CanonicalOwner) -> Hash32 {
+    canonical_topology_hash(&[canonical_volume_for(volume, owner)])
 }
 
 /// The world translation that places a body-local grid whose cell `(0,0,0)`

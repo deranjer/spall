@@ -46,6 +46,20 @@ pub struct PersistConfig {
     pub generator_version: u32,
 }
 
+/// What [`restore`] may do when the [`Recovery`] carries [`CorruptionReport`]s
+/// (a truncated / CRC-failed journal suffix, an interior gap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryChoice {
+    /// Resume only from a fully clean recovery. Any corruption report aborts
+    /// before the database is touched — the safe default a host uses without
+    /// operator input.
+    RequireClean,
+    /// The operator has reviewed the reported corruption and explicitly accepts
+    /// resuming from the verified durable prefix (the contiguous, CRC-checked
+    /// journal suffix), permanently discarding the lost tail.
+    AcceptDurablePrefix,
+}
+
 /// Anything that can go wrong converting to/from save records.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
@@ -67,6 +81,52 @@ pub enum PersistError {
     BadCellSize(u8),
     #[error("material manifest hash mismatch: checkpoint {checkpoint:.16}, runtime {runtime:.16}")]
     ManifestMismatch { checkpoint: String, runtime: String },
+    #[error(
+        "checkpoint world-hash mismatch: rebuilt {rebuilt:.16}, saved canonical {checkpoint:.16} \
+         (the checkpoint rows decoded but do not reproduce the state they claim — refusing to \
+         publish it as authoritative)"
+    )]
+    CheckpointHashMismatch { checkpoint: String, rebuilt: String },
+    #[error(
+        "recovery reported corruption and no operator choice was given: {reports}; \
+         {fallback} — resume requires an explicit RecoveryChoice"
+    )]
+    UnrecoverableCorruption { reports: String, fallback: String },
+    #[error(
+        "save schema version mismatch: checkpoint {checkpoint}, runtime {runtime} \
+         (a schema migration is required — do not replay this database in place)"
+    )]
+    SchemaMismatch { checkpoint: u32, runtime: u32 },
+    #[error(
+        "world identity mismatch: checkpoint world_id {checkpoint:#034x}, configured {runtime:#034x} \
+         (this database belongs to a different world — refusing to replay it as the current one)"
+    )]
+    WorldIdMismatch { checkpoint: u128, runtime: u128 },
+    #[error(
+        "world config mismatch on {field}: checkpoint {checkpoint}, configured {runtime} \
+         (an expected configuration migration — perform it explicitly on a separate, \
+         backed-up and verified copy, never as an in-place recovery)"
+    )]
+    ConfigMismatch {
+        field: &'static str,
+        checkpoint: u64,
+        runtime: u64,
+    },
+    #[error(
+        "algorithm version mismatch on {field}: checkpoint {checkpoint}, runtime {runtime} \
+         (this build cannot interpret the saved checkpoint/journal — upgrade or migrate explicitly)"
+    )]
+    AlgorithmVersionMismatch {
+        field: &'static str,
+        checkpoint: u32,
+        runtime: u32,
+    },
+    #[error(
+        "journal tick regression at seq {seq}: record tick {tick} precedes an already-durable \
+         tick {durable} (the durable suffix must be non-decreasing in tick — refusing to replay \
+         a suffix that would stamp new events before older durable ones)"
+    )]
+    JournalTickRegression { seq: u64, tick: u64, durable: u64 },
 }
 
 // --- capture --------------------------------------------------------------
@@ -209,15 +269,60 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
 /// durable journal suffix replayed onto it. Returns the simulation and the
 /// highest durable `JournalSeq` (the resume point for further journalling).
 ///
-/// `materials`, `anchor`, and `physics` are redeployment config; the material
-/// manifest hash is checked against the checkpoint.
+/// Simulation time resumes at the **highest tick any durable record carries**,
+/// not the checkpoint tick. A replayed transaction/pose record can belong to a
+/// tick far later than `cp.tick`; resuming at `cp.tick` would let the first
+/// post-recovery [`Simulation::tick`] stamp new committed events and motion
+/// *before* records that are already durable, breaking tick ordering,
+/// interpolation and checkpoint ordering (ENG-39). Replay also validates that
+/// record ticks are monotonic non-decreasing (they are seq-ordered) and never
+/// precede the checkpoint; a regression is [`PersistError::JournalTickRegression`].
+/// The first tick after recovery is therefore strictly newer than every durable
+/// record.
+///
+/// `cfg` is the configured world identity the host is resuming; `materials`,
+/// `anchor`, and `physics` are redeployment config. Before any state is rebuilt
+/// the saved [`StoredWorldMeta`] is validated against `cfg` and this build:
+/// schema version, world identity, seed/generator, every structural algorithm
+/// version, the material-manifest hash and the cell-size codes must all match.
+/// A mismatch is reported and nothing is rebuilt or written — an intentional
+/// migration is a deliberate, separate, backed-up operation, not an in-place
+/// recovery ([`PersistError::ConfigMismatch`] / [`PersistError::WorldIdMismatch`]
+/// / [`PersistError::AlgorithmVersionMismatch`]).
+///
+/// If the [`Recovery`] carries any [`spall_store::CorruptionReport`], recovery
+/// fails closed unless `choice` is [`RecoveryChoice::AcceptDurablePrefix`] — the
+/// host must not silently continue from a shortened durable history.
 pub fn restore(
     recovery: &Recovery,
+    cfg: &PersistConfig,
+    choice: RecoveryChoice,
     materials: MaterialManifest,
     anchor: AnchorPlane,
     physics: PhysicsConfig,
 ) -> Result<(Simulation, u64), PersistError> {
     let cp = &recovery.checkpoint;
+
+    // Fail closed on a reported-corrupt recovery before anything is rebuilt.
+    if !recovery.corruption.is_empty() && choice != RecoveryChoice::AcceptDurablePrefix {
+        return Err(PersistError::UnrecoverableCorruption {
+            reports: recovery
+                .corruption
+                .iter()
+                .map(|c| c.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+            fallback: match &recovery.previous_checkpoint {
+                Some(prev) => format!(
+                    "a previous complete checkpoint at tick {} is available as a verified fallback",
+                    prev.tick
+                ),
+                None => "no previous complete checkpoint is available as a fallback".to_string(),
+            },
+        });
+    }
+
+    validate_world_meta(&cp.meta, cfg)?;
 
     let runtime_hash = content_manifest_hash(&materials).0;
     if runtime_hash != cp.meta.material_manifest_hash {
@@ -281,16 +386,50 @@ pub fn restore(
         cp.meta.next_journal_seq,
     )?;
 
+    // The rebuilt checkpoint world — every body, brick, revision and owner — must
+    // reproduce the canonical hash the checkpoint was published with before any
+    // journal record is replayed onto it. A decodable row corruption (a flipped
+    // tombstone bit, a swapped revision) is caught here.
+    let rebuilt = world.world_hash().0;
+    if rebuilt != cp.world_hash {
+        return Err(PersistError::CheckpointHashMismatch {
+            checkpoint: hex32(&cp.world_hash),
+            rebuilt: hex32(&rebuilt),
+        });
+    }
+
     let mut max_tx = cp.meta.next_transaction.saturating_sub(1);
     let mut max_entity = cp.meta.next_entity.saturating_sub(1);
     let mut max_volume = cp.meta.next_volume.saturating_sub(1);
     let mut last_seq = cp.journal_cursor;
+    // Highest tick proven durable: the checkpoint tick, then raised by every
+    // replayed record. Simulation time resumes here so the first post-recovery
+    // tick is strictly newer than every durable record (ENG-39).
+    let mut durable_tick = cp.tick;
 
     for record in &recovery.journal {
+        // The durable suffix is seq-ordered; its record ticks must be
+        // non-decreasing and never precede the checkpoint. A regression means
+        // the suffix is inconsistent — fail closed rather than replay it.
+        if record.tick < durable_tick {
+            return Err(PersistError::JournalTickRegression {
+                seq: record.seq,
+                tick: record.tick,
+                durable: durable_tick,
+            });
+        }
+        durable_tick = record.tick;
         match &record.payload {
             JournalPayload::Topology { .. } => {
                 let (tx, participants) =
                     record.payload.as_topology().expect("payload is Topology")?;
+                if tx.algorithm_version != INTEGER_BRUSH_VERSION {
+                    return Err(PersistError::AlgorithmVersionMismatch {
+                        field: "journal transaction.algorithm_version",
+                        checkpoint: tx.algorithm_version,
+                        runtime: INTEGER_BRUSH_VERSION,
+                    });
+                }
                 world.replay_transaction(&tx, &participants)?;
                 max_tx = max_tx.max(tx.transaction_id.get());
                 for op in &tx.ops {
@@ -318,7 +457,80 @@ pub fn restore(
 
     world.resume_registry(max_entity + 1, max_volume + 1, max_tx + 1, last_seq + 1)?;
 
-    Ok((Simulation::from_restored(world, Tick(cp.tick)), last_seq))
+    // Resume at the durable suffix tick, not `cp.tick`: the next `tick()` then
+    // stamps events at `durable_tick + 1`, strictly after every durable record.
+    Ok((
+        Simulation::from_restored(world, Tick(durable_tick)),
+        last_seq,
+    ))
+}
+
+/// Validates the saved world metadata against the configured world identity and
+/// this build's algorithm/schema versions *before* any checkpoint or journal
+/// state is interpreted. Every branch returns without touching the database.
+fn validate_world_meta(meta: &StoredWorldMeta, cfg: &PersistConfig) -> Result<(), PersistError> {
+    if meta.store_schema_version != STORE_SCHEMA_VERSION {
+        return Err(PersistError::SchemaMismatch {
+            checkpoint: meta.store_schema_version,
+            runtime: STORE_SCHEMA_VERSION,
+        });
+    }
+    // Wrong-database: identity can never be "migrated", only pointed at correctly.
+    if meta.world_id != cfg.world_id {
+        return Err(PersistError::WorldIdMismatch {
+            checkpoint: meta.world_id,
+            runtime: cfg.world_id,
+        });
+    }
+    // Generation config: a real change is an intentional, separate migration.
+    if meta.seed != cfg.seed {
+        return Err(PersistError::ConfigMismatch {
+            field: "seed",
+            checkpoint: meta.seed,
+            runtime: cfg.seed,
+        });
+    }
+    if meta.generator_version != cfg.generator_version {
+        return Err(PersistError::ConfigMismatch {
+            field: "generator_version",
+            checkpoint: u64::from(meta.generator_version),
+            runtime: u64::from(cfg.generator_version),
+        });
+    }
+    // Every algorithm version needed to interpret the checkpoint/journal.
+    for (field, checkpoint, runtime) in [
+        (
+            "integer_brush_version",
+            meta.integer_brush_version,
+            INTEGER_BRUSH_VERSION,
+        ),
+        (
+            "structure_graph_version",
+            meta.structure_graph_version,
+            STRUCTURE_GRAPH_VERSION,
+        ),
+        (
+            "topology_hash_version",
+            meta.topology_hash_version,
+            TOPOLOGY_HASH_VERSION,
+        ),
+    ] {
+        if checkpoint != runtime {
+            return Err(PersistError::AlgorithmVersionMismatch {
+                field,
+                checkpoint,
+                runtime,
+            });
+        }
+    }
+    // Every cell-size code the checkpoint/journal references must be known to
+    // this build before a volume is rebuilt with it.
+    for &code in &meta.cell_size_codes {
+        if CellSizeCode::from_u8(code).is_none() {
+            return Err(PersistError::BadCellSize(code));
+        }
+    }
+    Ok(())
 }
 
 fn rebuild_volume(
@@ -403,6 +615,12 @@ pub struct CrashSuiteReport {
     pub scenarios: Vec<ScenarioResult>,
     pub workload: Workload,
     pub metrics: Metrics,
+    /// Validation this in-process suite does **not** perform, and where it is
+    /// actually exercised. The [`CrashPoint`] scenarios below model only the
+    /// API-visible effect of a crash inside one process (the pending
+    /// transaction still rolls back normally); they are not proof of recovery
+    /// after an abrupt, unclean process kill.
+    pub unrun_here: Vec<String>,
 }
 
 /// Workload the scenarios actually drove.
@@ -450,10 +668,18 @@ fn scripted_bridge_cut() -> Simulation {
     sim
 }
 
-/// Runs the persistence crash-point / disk-fault matrix end-to-end through a
-/// real [`Simulation`] (bridge scene, column cut → beam detaches) and asserts
-/// the durable prefix after recovery. Writes nothing itself; the caller
-/// serialises the returned report to `summary.json`.
+/// Runs the persistence crash-point / disk-fault matrix through a real
+/// [`Simulation`] (bridge scene, column cut → beam detaches) and asserts the
+/// durable prefix after recovery. Writes nothing itself; the caller serialises
+/// the returned report to `summary.json`.
+///
+/// Scope (ENG-51): the [`CrashPoint`] scenarios here run in **one process** and
+/// model the API-visible effect of a crash — the pending SQLite transaction
+/// still rolls back cleanly. Recovery after an abrupt, unclean process kill is
+/// validated separately by the child-process harness
+/// (`cargo test -p spall_store --test abrupt_crash`), reported in `unrun_here`.
+/// The `real_write_failure` scenario below *does* exercise a genuine SQLite
+/// engine write error end to end, including [`crate::Writer`] poisoning via `?`.
 pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport, PersistError> {
     use spall_sim::{SimulationConfig, fixtures};
 
@@ -507,7 +733,14 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         };
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, seq) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, seq) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "clean",
             sim.world().world_hash() == post_cut_hash
@@ -531,7 +764,14 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let crashed = w.append_journal(&journal).is_err();
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, _) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, _) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "crash_after_journal_commit",
             crashed
@@ -555,7 +795,14 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let crashed = w.append_journal(&journal).is_err();
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, seq) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, seq) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "crash_before_journal_commit",
             crashed
@@ -582,7 +829,14 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let crashed = w.publish_checkpoint(&checkpoint1).is_err();
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, _) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, _) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "crash_before_checkpoint_commit",
             crashed
@@ -612,7 +866,14 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let poisoned = w.is_poisoned();
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, _) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, _) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "disk_fault_on_journal",
             failed
@@ -640,7 +901,14 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         );
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, _) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, _) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "disk_fault_on_checkpoint",
             failed
@@ -651,6 +919,50 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
                 "failed={failed}, recovered_cp_tick={}, bodies={}",
                 rec.checkpoint.tick,
                 sim.world().body_count()
+            ),
+        ));
+    }
+
+    // 7. A *real* SQLite engine write failure on the journal (not a pre-`COMMIT`
+    //    branch): no durable ack, writer poisoned, nothing recovered.
+    {
+        let db = next_db();
+        let mut w = spall_store::Writer::open(&db)?;
+        w.publish_checkpoint(&checkpoint0)?;
+        w.set_faults(FaultPlan::real_sqlite_write_failure());
+        let failed = matches!(
+            w.append_journal(&journal),
+            Err(spall_store::StoreError::Sqlite(_))
+        );
+        let poisoned = w.is_poisoned();
+        // Poisoned writer refuses all further durable work.
+        let refuses_more = matches!(
+            w.publish_checkpoint(&checkpoint1),
+            Err(spall_store::StoreError::Poisoned(_))
+        );
+        drop(w);
+        let rec = spall_store::recover(&db)?;
+        let (sim, seq) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
+        scenarios.push(check(
+            "real_write_failure_on_journal",
+            failed
+                && poisoned
+                && refuses_more
+                && rec.journal.is_empty()
+                && rec.corruption.is_empty()
+                && seq == 0
+                && sim.world().body_count() == pre_cut_bodies,
+            format!(
+                "failed={failed}, poisoned={poisoned}, refuses_more={refuses_more}, \
+                 journal_suffix={}, durable_seq={seq}",
+                rec.journal.len()
             ),
         ));
     }
@@ -667,6 +979,12 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
             journal_records: journal.len(),
         },
         metrics,
+        unrun_here: vec![
+            "abrupt-process-death recovery (real, unclean process kill at journal \
+             and checkpoint publication boundaries) — exercised by `cargo test -p \
+             spall_store --test abrupt_crash`, not by this in-process suite"
+                .to_string(),
+        ],
     })
 }
 

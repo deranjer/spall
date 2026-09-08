@@ -470,6 +470,32 @@ fn interior_journal_corruption_truncates_and_reports_with_fallback() {
 }
 
 #[test]
+fn an_empty_database_is_distinct_from_one_whose_checkpoints_do_not_decode() {
+    // A fresh database has the schema but no complete checkpoint: NoCheckpoint.
+    let s = Scratch::new("empty_vs_corrupt");
+    drop(Writer::open(s.db()).unwrap());
+    assert!(matches!(recover(s.db()), Err(StoreError::NoCheckpoint)));
+
+    // Publish a checkpoint, then make every complete checkpoint's metadata
+    // undecodable: this is corruption, not an empty DB.
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(10, 0)).unwrap();
+    }
+    {
+        let conn = rusqlite_open(&s.db());
+        conn.execute("UPDATE checkpoints SET meta = X'DEADBEEF'", [])
+            .unwrap();
+    }
+    match recover(s.db()) {
+        Err(StoreError::CheckpointsUnrecoverable(detail)) => {
+            assert!(detail.contains("checkpoint tick 10"));
+        }
+        other => panic!("expected CheckpointsUnrecoverable, got {other:?}"),
+    }
+}
+
+#[test]
 fn retain_drops_old_checkpoints_and_covered_journal() {
     let s = Scratch::new("retain");
     let mut w = Writer::open(s.db()).unwrap();
@@ -501,6 +527,78 @@ fn retain_drops_old_checkpoints_and_covered_journal() {
 }
 
 #[test]
+fn real_sqlite_write_failure_on_journal_poisons_and_reports_no_success() {
+    // A genuine engine-level write error (not a pre-`COMMIT` branch): the
+    // connection is switched to `query_only`, so the staged `INSERT` returns a
+    // real `rusqlite::Error` that propagates through `?`. The writer must poison
+    // and no `DurableThrough` may be produced.
+    let s = Scratch::new("real_io_j");
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+        w.set_faults(FaultPlan::real_sqlite_write_failure());
+        let err = w
+            .append_journal(&[split_record(1, 1), pose_batch(2, 2)])
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected a real rusqlite error, got {err:?}"
+        );
+        assert!(
+            w.is_poisoned(),
+            "a real write failure must poison the writer"
+        );
+        // Every further durable call is refused until re-open.
+        assert!(matches!(
+            w.append_journal(&[split_record(1, 1)]),
+            Err(StoreError::Poisoned(_))
+        ));
+        assert!(matches!(
+            w.publish_checkpoint(&checkpoint(10, 0)),
+            Err(StoreError::Poisoned(_))
+        ));
+    }
+    // Nothing was made durable; the checkpoint at tick 0 still stands alone.
+    let rec = recover(s.db()).unwrap();
+    assert_eq!(rec.durable_through, 0);
+    assert!(rec.journal.is_empty());
+    assert!(
+        rec.corruption.is_empty(),
+        "rolled back cleanly, not corrupt"
+    );
+    assert_eq!(rec.checkpoint.tick, 0);
+
+    // A fresh writer resumes cleanly at seq 1.
+    let mut w = Writer::open(s.db()).unwrap();
+    assert_eq!(w.journal_max_seq().unwrap(), 0);
+    w.append_journal(&[split_record(1, 1)]).unwrap();
+}
+
+#[test]
+fn real_sqlite_write_failure_on_checkpoint_poisons_and_keeps_prior_checkpoint() {
+    let s = Scratch::new("real_io_cp");
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(100, 0)).unwrap();
+        w.append_journal(&[pose_batch(1, 1)]).unwrap();
+        w.set_faults(FaultPlan::real_sqlite_write_failure());
+        let err = w.publish_checkpoint(&checkpoint(200, 1)).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected a real rusqlite error, got {err:?}"
+        );
+        assert!(w.is_poisoned());
+    }
+    let rec = recover(s.db()).unwrap();
+    assert_eq!(
+        rec.checkpoint.tick, 100,
+        "the failed checkpoint never became visible"
+    );
+    assert!(rec.previous_checkpoint.is_none());
+    assert_eq!(rec.durable_through, 1);
+}
+
+#[test]
 fn metrics_expose_bytes_and_commit_rate() {
     let s = Scratch::new("metrics");
     let mut w = Writer::open(s.db()).unwrap();
@@ -514,4 +612,73 @@ fn metrics_expose_bytes_and_commit_rate() {
     assert!(m.bytes_per_journal_write() > 0.0);
     assert!(m.checkpoint_payload_bytes > 0);
     assert!(m.commit_bytes_per_sec() > 0.0);
+}
+
+// --- ENG-34: the durable journal high-water mark survives retention -------
+
+/// Probe `review_retention_must_preserve_next_journal_sequence`: pruning every
+/// journal row a checkpoint covers must not let the next sequence reset. Two
+/// checkpoints at the same cursor, `retain(2)`, then the next append.
+#[test]
+fn review_retention_must_preserve_next_journal_sequence() {
+    let s = Scratch::new("hwm_probe");
+    let mut w = Writer::open(s.db()).unwrap();
+    w.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+    w.append_journal(&[pose_batch(1, 1)]).unwrap();
+    w.publish_checkpoint(&checkpoint(10, 1)).unwrap();
+    w.publish_checkpoint(&checkpoint(20, 1)).unwrap();
+    w.retain(2).unwrap();
+
+    let result = w.append_journal(&[pose_batch(2, 21)]);
+    assert!(
+        result.is_ok(),
+        "valid append after pruning every covered journal row rejected: {result:?}"
+    );
+    assert_eq!(result.unwrap().journal_seq.0, 2);
+}
+
+/// Prune *every* journal row (no suffix left at all), across a writer reopen,
+/// then keep editing: sequence ids continue past the pruned rows, never reuse.
+#[test]
+fn full_journal_prune_then_reopen_then_edit_never_reuses_sequences() {
+    let s = Scratch::new("hwm_full_prune");
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+        w.append_journal(&[pose_batch(1, 1), pose_batch(2, 2), pose_batch(3, 3)])
+            .unwrap();
+        // A checkpoint whose cursor covers the whole journal, then retain: the
+        // journal table is emptied completely.
+        w.publish_checkpoint(&checkpoint(30, 3)).unwrap();
+        let (_, pruned) = w.retain(1).unwrap();
+        assert_eq!(pruned, 3, "all three journal rows pruned");
+        assert_eq!(w.journal_max_seq().unwrap(), 0, "journal table is empty");
+        assert_eq!(
+            w.durable_journal_high_water().unwrap(),
+            3,
+            "the high-water mark is preserved by the checkpoint cursor"
+        );
+    }
+
+    // Idle restart: reopen the database, no new edits yet.
+    {
+        let w = Writer::open(s.db()).unwrap();
+        assert_eq!(w.journal_max_seq().unwrap(), 0);
+        assert_eq!(w.durable_journal_high_water().unwrap(), 3);
+    }
+
+    // A subsequent edit resumes at seq 4 — never 1 — with no gap error.
+    let mut w = Writer::open(s.db()).unwrap();
+    let d = w
+        .append_journal(&[pose_batch(4, 40), pose_batch(5, 41)])
+        .unwrap();
+    assert_eq!(d.journal_seq.0, 5);
+
+    // And the earlier sequences are genuinely gone, not re-handed out.
+    let rec = w.recover().unwrap();
+    assert_eq!(
+        rec.journal.iter().map(|j| j.seq).collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    assert_eq!(rec.durable_through, 5);
 }

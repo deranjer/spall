@@ -198,11 +198,17 @@ async fn malformed_length_and_oversized_transfer_stay_bounded() {
 
     // (a) hostile length prefix: client writes a 3.5 GiB declared frame.
     {
-        let (mut send, _r) = client.open_bi_raw().await.unwrap();
-        send.write_all(&0xD000_0000u32.to_le_bytes()).await.unwrap();
-        send.write_all(b"not that many bytes").await.unwrap();
-        let (_s, mut recv) = server_conn.accept_bi_raw().await.unwrap();
-        let err = read_framed(&mut recv, cfg.limits.max_bulk_part)
+        let mut raw = client.open_bi_raw().await.unwrap();
+        raw.send_mut()
+            .write_all(&0xD000_0000u32.to_le_bytes())
+            .await
+            .unwrap();
+        raw.send_mut()
+            .write_all(b"not that many bytes")
+            .await
+            .unwrap();
+        let mut srv_raw = server_conn.accept_bi_raw().await.unwrap();
+        let err = read_framed(srv_raw.recv_mut(), cfg.limits.max_bulk_part)
             .await
             .expect_err("declared length far above the cap is rejected");
         assert!(
@@ -338,6 +344,143 @@ async fn bulk_transfer_metadata_and_part_count_are_bounded() {
 
     client.close("done");
     server.close();
+}
+
+/// ENG-52: the outbound bulk-stream ceiling is one shared budget. Filling it
+/// with any mix of `open_bulk` and the raw `open_bi_raw` bypass makes a fifth
+/// stream fail through *either* entry point, and every handle returns its
+/// permit the moment it is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_bulk_and_open_bi_raw_share_the_bulk_stream_cap() {
+    let cfg = TransportConfig::for_tests();
+    assert_eq!(
+        cfg.limits.max_bulk_streams, 4,
+        "test assumes the four-stream cap"
+    );
+    let (server, _accepted, client) = pair(cfg, cfg).await;
+
+    let b1 = client.open_bulk().await.unwrap();
+    let b2 = client.open_bulk().await.unwrap();
+    let r1 = client.open_bi_raw().await.unwrap();
+    let r2 = client.open_bi_raw().await.unwrap();
+    assert_eq!(client.bulk_stream_count(), 4);
+
+    // A fifth stream is refused whether the caller uses the framed or the raw
+    // door, and the rejected reservation is handed straight back.
+    assert!(
+        matches!(
+            client.open_bulk().await,
+            Err(TransportError::Frame(FrameError::WriteOversize {
+                actual: 5,
+                limit: 4
+            }))
+        ),
+        "fifth open_bulk refused"
+    );
+    assert!(
+        matches!(
+            client.open_bi_raw().await,
+            Err(TransportError::Frame(FrameError::WriteOversize {
+                actual: 5,
+                limit: 4
+            }))
+        ),
+        "fifth open_bi_raw refused"
+    );
+    assert_eq!(
+        client.bulk_stream_count(),
+        4,
+        "refused opens leak no permit"
+    );
+
+    // Dropping a handle frees exactly one permit for the next open.
+    drop(r2);
+    assert_eq!(client.bulk_stream_count(), 3);
+    let r3 = client.open_bi_raw().await.unwrap();
+    assert_eq!(client.bulk_stream_count(), 4);
+
+    drop((b1, b2, r1, r3));
+    assert_eq!(
+        client.bulk_stream_count(),
+        0,
+        "every handle released its permit"
+    );
+
+    client.close("done");
+    server.close();
+}
+
+/// ENG-52 (inbound): `accept_bulk` and `accept_bi_raw` draw on the same shared
+/// budget. With the cap already full, a fifth inbound stream is refused (and
+/// its transport stream reset) through the given entry point, without leaking
+/// the reservation; dropping the accepted handles frees every permit.
+async fn fifth_inbound_bulk_stream_is_refused(reject_via_raw: bool) {
+    let cfg = TransportConfig::for_tests();
+    let (server, accepted, client) = pair(cfg, cfg).await;
+
+    // The client opens five wire streams; the unguarded helper lets it exceed
+    // its own local budget so all five reach the server.
+    let mut wire = Vec::new();
+    for _ in 0..5 {
+        let (mut send, recv) = client.open_bi_unguarded().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        wire.push((send, recv));
+    }
+
+    // Fill the server's cap with a mix of both accept entry points.
+    let mut framed = Vec::new();
+    let mut raw = Vec::new();
+    for i in 0..4 {
+        if i % 2 == 0 {
+            framed.push(accepted.accept_bulk().await.expect("under the cap"));
+        } else {
+            raw.push(accepted.accept_bi_raw().await.expect("under the cap"));
+        }
+    }
+    assert_eq!(accepted.bulk_stream_count(), 4);
+
+    let err = if reject_via_raw {
+        accepted.accept_bi_raw().await.err()
+    } else {
+        accepted.accept_bulk().await.err()
+    };
+    assert!(
+        matches!(
+            err,
+            Some(TransportError::Frame(FrameError::WriteOversize {
+                actual: 5,
+                limit: 4
+            }))
+        ),
+        "fifth inbound stream refused, got {err:?}"
+    );
+    assert_eq!(
+        accepted.bulk_stream_count(),
+        4,
+        "the refused accept released its reservation"
+    );
+
+    framed.clear();
+    raw.clear();
+    assert_eq!(
+        accepted.bulk_stream_count(),
+        0,
+        "dropping every accepted handle frees every permit"
+    );
+
+    drop(wire);
+    client.close("done");
+    server.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accept_bulk_enforces_the_shared_bulk_stream_cap() {
+    fifth_inbound_bulk_stream_is_refused(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accept_bi_raw_enforces_the_shared_bulk_stream_cap() {
+    fifth_inbound_bulk_stream_is_refused(true).await;
 }
 
 /// Bullet 4: with a real lossy UDP proxy in front of the server, every reliable

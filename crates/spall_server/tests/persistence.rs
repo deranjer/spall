@@ -67,6 +67,8 @@ fn recover_restore(db: &std::path::Path) -> (Simulation, u64) {
     let recovery = spall_store::recover(db).unwrap();
     persist::restore(
         &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
         fixtures::stone_manifest(),
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -271,6 +273,8 @@ fn checkpoint_plus_journal_suffix_recovers_topology() {
     assert_eq!(recovery.journal.len(), 1);
     let (mut restored, durable_seq) = persist::restore(
         &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
         fixtures::stone_manifest(),
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -331,6 +335,8 @@ fn a_manifest_hash_mismatch_is_rejected() {
 
     match persist::restore(
         &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
         air_only,
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -339,6 +345,469 @@ fn a_manifest_hash_mismatch_is_rejected() {
         Err(other) => panic!("expected ManifestMismatch, got {other:?}"),
         Ok(_) => panic!("expected ManifestMismatch, got a restored simulation"),
     }
+}
+
+// --- ENG-59: saved world identity + algorithm versions --------------------
+
+/// A recovery whose single checkpoint was captured with [`cfg`].
+fn recovery_for_meta_tests(s: &Scratch) -> spall_store::Recovery {
+    let sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let mut w = Writer::open(s.db()).unwrap();
+    w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+        .unwrap();
+    drop(w);
+    spall_store::recover(s.db()).unwrap()
+}
+
+/// Runs `restore` and returns the error, panicking if it unexpectedly succeeded
+/// (`Simulation` has no `Debug`, so the `Ok` payload cannot be printed).
+fn restore_err(recovery: &spall_store::Recovery, cfg: &PersistConfig) -> persist::PersistError {
+    match persist::restore(
+        recovery,
+        cfg,
+        persist::RecoveryChoice::RequireClean,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    ) {
+        Ok(_) => panic!("restore accepted a database it must have rejected"),
+        Err(e) => e,
+    }
+}
+
+fn restore_ok(recovery: &spall_store::Recovery, cfg: &PersistConfig) -> bool {
+    persist::restore(
+        recovery,
+        cfg,
+        persist::RecoveryChoice::RequireClean,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .is_ok()
+}
+
+#[test]
+fn a_mismatched_world_id_is_rejected() {
+    let s = Scratch::new("world_id");
+    let recovery = recovery_for_meta_tests(&s);
+    let wrong = PersistConfig {
+        world_id: cfg().world_id ^ 0x1,
+        ..cfg()
+    };
+    assert!(matches!(
+        restore_err(&recovery, &wrong),
+        persist::PersistError::WorldIdMismatch { .. }
+    ));
+    // The original database is untouched: a correct config still recovers.
+    assert!(restore_ok(&recovery, &cfg()));
+}
+
+#[test]
+fn a_mismatched_seed_is_rejected() {
+    let s = Scratch::new("seed");
+    let recovery = recovery_for_meta_tests(&s);
+    let wrong = PersistConfig {
+        seed: cfg().seed + 1,
+        ..cfg()
+    };
+    assert!(matches!(
+        restore_err(&recovery, &wrong),
+        persist::PersistError::ConfigMismatch { field: "seed", .. }
+    ));
+}
+
+#[test]
+fn a_mismatched_generator_version_is_rejected() {
+    let s = Scratch::new("generator");
+    let recovery = recovery_for_meta_tests(&s);
+    let wrong = PersistConfig {
+        generator_version: cfg().generator_version + 1,
+        ..cfg()
+    };
+    assert!(matches!(
+        restore_err(&recovery, &wrong),
+        persist::PersistError::ConfigMismatch {
+            field: "generator_version",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_mismatched_algorithm_version_is_rejected() {
+    for field in [
+        "integer_brush_version",
+        "structure_graph_version",
+        "topology_hash_version",
+    ] {
+        let s = Scratch::new(&format!("algo_{field}"));
+        let mut recovery = recovery_for_meta_tests(&s);
+        // A checkpoint written by an incompatible build of one algorithm.
+        match field {
+            "integer_brush_version" => recovery.checkpoint.meta.integer_brush_version = 999,
+            "structure_graph_version" => recovery.checkpoint.meta.structure_graph_version = 999,
+            "topology_hash_version" => recovery.checkpoint.meta.topology_hash_version = 999,
+            _ => unreachable!(),
+        }
+        match restore_err(&recovery, &cfg()) {
+            persist::PersistError::AlgorithmVersionMismatch { field: got, .. } => {
+                assert_eq!(got, field)
+            }
+            other => panic!("expected AlgorithmVersionMismatch({field}), got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_mismatched_store_schema_version_is_rejected() {
+    let s = Scratch::new("schema");
+    let mut recovery = recovery_for_meta_tests(&s);
+    recovery.checkpoint.meta.store_schema_version += 1;
+    assert!(matches!(
+        restore_err(&recovery, &cfg()),
+        persist::PersistError::SchemaMismatch { .. }
+    ));
+}
+
+// --- ENG-37: checkpoint + replay hash verification -----------------------
+
+/// A recovery holding a fresh bridge checkpoint plus one durable column-cut
+/// transaction in its journal suffix.
+fn recovery_with_cut_journal(s: &Scratch) -> spall_store::Recovery {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let mut w = Writer::open(s.db()).unwrap();
+    w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+        .unwrap();
+    sim.submit(EditIntent::cut(
+        RequestId(1),
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10, 4, 1, 2),
+    ))
+    .unwrap();
+    sim.run_until_idle(16).unwrap();
+    let records = persist::journal_records(sim.journal().entries()).unwrap();
+    w.append_journal(&records).unwrap();
+    drop(w);
+    spall_store::recover(s.db()).unwrap()
+}
+
+#[test]
+fn review_restore_must_check_checkpoint_hash() {
+    // Decodable row corruption: flip one stored brick's tombstone bit but keep
+    // the saved canonical hash. The rows still decode; recovery must notice the
+    // rebuilt world no longer reproduces `checkpoint.world_hash`.
+    let s = Scratch::new("cp_hash");
+    let mut recovery = recovery_for_meta_tests(&s);
+    recovery.checkpoint.bricks[0].edited = !recovery.checkpoint.bricks[0].edited;
+    assert!(matches!(
+        restore_err(&recovery, &cfg()),
+        persist::PersistError::CheckpointHashMismatch { .. }
+    ));
+}
+
+#[test]
+fn a_swapped_checkpoint_brick_revision_is_rejected() {
+    let s = Scratch::new("cp_rev");
+    let mut recovery = recovery_for_meta_tests(&s);
+    recovery.checkpoint.bricks[0].revision += 7;
+    assert!(matches!(
+        restore_err(&recovery, &cfg()),
+        persist::PersistError::CheckpointHashMismatch { .. }
+    ));
+}
+
+#[test]
+fn a_journal_transaction_with_a_wrong_result_hash_is_rejected() {
+    let s = Scratch::new("replay_hash");
+    let mut recovery = recovery_with_cut_journal(&s);
+    let (mut tx, parts) = recovery.journal[0]
+        .payload
+        .as_topology()
+        .expect("suffix record is a topology transaction")
+        .unwrap();
+    // A replay defect / corrupt row: the transaction claims a result hash the
+    // reconstructed geometry will not reproduce.
+    tx.result_hashes[0].hash = spall_protocol::Hash32::ZERO;
+    recovery.journal[0].payload = spall_store::JournalPayload::topology(&tx, &parts).unwrap();
+    match restore_err(&recovery, &cfg()) {
+        persist::PersistError::World(spall_sim::WorldError::ReplayResultHash(_)) => {}
+        other => panic!("expected ReplayResultHash, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_journal_transaction_with_a_wrong_precondition_is_rejected() {
+    let s = Scratch::new("replay_pre");
+    let mut recovery = recovery_with_cut_journal(&s);
+    let (mut tx, parts) = recovery.journal[0]
+        .payload
+        .as_topology()
+        .expect("suffix record is a topology transaction")
+        .unwrap();
+    assert!(!tx.before.is_empty(), "the column cut records a before-set");
+    tx.before[0].revision = spall_core::Revision(999);
+    recovery.journal[0].payload = spall_store::JournalPayload::topology(&tx, &parts).unwrap();
+    match restore_err(&recovery, &cfg()) {
+        persist::PersistError::World(spall_sim::WorldError::ReplayPrecondition(_)) => {}
+        other => panic!("expected ReplayPrecondition, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_journal_transaction_with_a_stale_algorithm_version_is_rejected() {
+    let s = Scratch::new("replay_algo");
+    let mut recovery = recovery_with_cut_journal(&s);
+    let (mut tx, parts) = recovery.journal[0]
+        .payload
+        .as_topology()
+        .expect("suffix record is a topology transaction")
+        .unwrap();
+    tx.algorithm_version += 100;
+    recovery.journal[0].payload = spall_store::JournalPayload::topology(&tx, &parts).unwrap();
+    match restore_err(&recovery, &cfg()) {
+        persist::PersistError::AlgorithmVersionMismatch {
+            field: "journal transaction.algorithm_version",
+            ..
+        } => {}
+        other => panic!("expected AlgorithmVersionMismatch, got {other:?}"),
+    }
+}
+
+// --- ENG-39: resume simulation time at the durable journal suffix -------
+
+/// Highest tick any durable record in a recovery carries (checkpoint tick
+/// included).
+fn max_durable_tick(recovery: &spall_store::Recovery) -> u64 {
+    recovery
+        .journal
+        .iter()
+        .map(|r| r.tick)
+        .max()
+        .unwrap_or(0)
+        .max(recovery.checkpoint.tick)
+}
+
+#[test]
+fn review_replay_must_advance_tick_past_durable_suffix() {
+    // The issue repro: checkpoint at tick 0, a column cut that becomes durable
+    // at a much later tick, journal appended, then restore. Resuming at the old
+    // checkpoint tick would let the next committed event be stamped *before* the
+    // already-durable transaction.
+    let s = Scratch::new("resume_tick");
+
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(10, 4, 1, 2),
+        ))
+        .unwrap();
+        sim.run_until_idle(16).unwrap();
+        assert_eq!(sim.world().body_count(), 1, "beam detached");
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].tick > 0,
+            "the durable transaction is at a tick strictly after the checkpoint"
+        );
+        w.append_journal(&records).unwrap();
+    }
+
+    let recovery = spall_store::recover(s.db()).unwrap();
+    let durable_tick = max_durable_tick(&recovery);
+    assert!(durable_tick > 0);
+
+    let (mut restored, _seq) = persist::restore(
+        &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .unwrap();
+
+    // Simulation time resumes at the durable suffix, not the checkpoint tick.
+    assert!(
+        restored.current_tick().get() >= durable_tick,
+        "restored at tick {} but the durable suffix reaches tick {durable_tick}",
+        restored.current_tick().get()
+    );
+
+    // The first post-recovery committed event is strictly newer than every
+    // durable record — tick / interpolation / checkpoint ordering hold.
+    restored
+        .submit(EditIntent::cut(
+            RequestId(2),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(6, 4, 1, 1),
+        ))
+        .unwrap();
+    restored.run_until_idle(16).unwrap();
+    let committed = restored
+        .committed(RequestId(2))
+        .expect("fresh cut commits after recovery");
+    assert!(
+        committed.topology.server_tick.get() > durable_tick,
+        "post-recovery transaction stamped at tick {} — not strictly after the \
+         durable suffix tick {durable_tick}",
+        committed.topology.server_tick.get()
+    );
+}
+
+#[test]
+fn checkpoint_plus_topology_and_pose_suffix_survives_a_second_restart() {
+    // A durable suffix that ends with a pose batch at a tick later than the
+    // topology transaction: recovery must resume past the *pose* tick, and that
+    // resumed time must itself survive a second save + restart.
+    let s = Scratch::new("second_restart");
+
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let topo_records = {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(10, 4, 1, 2),
+        ))
+        .unwrap();
+        sim.run_until_idle(16).unwrap();
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1);
+        let topo_tick = records[0].tick;
+        let pose_tick = topo_tick + 5;
+
+        // topology record, then a later pose batch (empty snapshots is a valid
+        // no-op payload — this test exercises the tick-ordering / resume path).
+        let mut suffix = records.clone();
+        suffix.push(spall_store::JournalRecord {
+            seq: records[0].seq + 1,
+            tick: pose_tick,
+            payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+        });
+        w.append_journal(&suffix).unwrap();
+        records
+    };
+
+    let recovery = spall_store::recover(s.db()).unwrap();
+    assert_eq!(recovery.journal.len(), 2);
+    let durable_tick = max_durable_tick(&recovery);
+    assert_eq!(
+        durable_tick,
+        topo_records[0].tick + 5,
+        "the pose batch is newest"
+    );
+
+    let (first, _) = persist::restore(
+        &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        first.current_tick().get() >= durable_tick,
+        "first restart resumed at tick {}, behind the durable suffix tick {durable_tick}",
+        first.current_tick().get()
+    );
+    let first_tick = first.current_tick();
+    let first_hash = first.world().world_hash();
+
+    // Second save + restart: checkpoint the recovered sim to a fresh database,
+    // recover, restore again. The resumed tick and world must round-trip.
+    let s2 = Scratch::new("second_restart_b");
+    publish(&s2.db(), &persist::capture(&first, &cfg(), 0).unwrap());
+    drop(first);
+    let (second, second_seq) = recover_restore(&s2.db());
+    assert_eq!(second_seq, 0);
+    assert_eq!(
+        second.current_tick(),
+        first_tick,
+        "the durable-suffix tick survived a second save/restart"
+    );
+    assert_eq!(second.world().world_hash(), first_hash);
+}
+
+#[test]
+fn review_restore_rejects_a_tick_regression_in_the_durable_suffix() {
+    let s = Scratch::new("tick_regression");
+    let sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        // Two pose batches whose ticks go backwards — an inconsistent suffix.
+        w.append_journal(&[
+            spall_store::JournalRecord {
+                seq: 1,
+                tick: 40,
+                payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+            },
+            spall_store::JournalRecord {
+                seq: 2,
+                tick: 9,
+                payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+            },
+        ])
+        .unwrap();
+    }
+    let recovery = spall_store::recover(s.db()).unwrap();
+    match restore_err(&recovery, &cfg()) {
+        persist::PersistError::JournalTickRegression {
+            seq: 2,
+            tick: 9,
+            durable: 40,
+        } => {}
+        other => panic!("expected JournalTickRegression, got {other:?}"),
+    }
+}
+
+// --- ENG-36: fail closed on a reported-corrupt recovery -----------------
+
+#[test]
+fn review_restore_must_require_choice_after_corruption() {
+    let s = Scratch::new("corruption_choice");
+    let mut recovery = recovery_for_meta_tests(&s);
+    recovery.corruption.push(spall_store::CorruptionReport {
+        detail: "journal seq 1 failed CRC".into(),
+    });
+
+    // Default: a reported-corrupt recovery aborts before anything is rebuilt.
+    assert!(matches!(
+        restore_err(&recovery, &cfg()),
+        persist::PersistError::UnrecoverableCorruption { .. }
+    ));
+
+    // An explicit operator choice to accept the verified durable prefix works.
+    assert!(
+        persist::restore(
+            &recovery,
+            &cfg(),
+            persist::RecoveryChoice::AcceptDurablePrefix,
+            fixtures::stone_manifest(),
+            AnchorPlane::at(0),
+            PhysicsConfig::default(),
+        )
+        .is_ok()
+    );
 }
 
 // -------------------------------------------------------------------------

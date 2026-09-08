@@ -20,7 +20,7 @@ pub mod upload;
 pub mod vertex;
 
 pub use camera::{Aabb, Camera, Frustum};
-pub use capture::{CaptureImage, CaptureOptions, CaptureReport, capture_scene};
+pub use capture::{CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, capture_scene};
 pub use context::{RenderContext, RenderError};
 pub use pipeline::{DebugView, ScenePipeline};
 pub use scene::{Scene, SceneItem, default_palette};

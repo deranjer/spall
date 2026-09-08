@@ -326,6 +326,18 @@ impl PhysicsWorld {
         );
     }
 
+    /// Applies a linear impulse (N·s) to a body at its centre of mass and wakes
+    /// it if it was asleep. Models a documented "nearby interaction" — a blast
+    /// impulse or an impact from an adjacent edit — for the sleep/wake
+    /// feasibility scenario. No-op for `Fixed` bodies.
+    pub fn apply_impulse(&mut self, id: BodyId, impulse_n_s: [f32; 3]) {
+        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        rb.apply_impulse(
+            Vector::new(impulse_n_s[0], impulse_n_s[1], impulse_n_s[2]),
+            true,
+        );
+    }
+
     /// Sets a body's linear and angular velocity, m/s and rad/s. Used to hand a
     /// split child its inherited velocity.
     pub fn set_body_velocity(&mut self, id: BodyId, linvel_m_s: [f32; 3], angvel_rad_s: [f32; 3]) {

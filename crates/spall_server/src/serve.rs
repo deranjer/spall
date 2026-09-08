@@ -123,6 +123,10 @@ pub struct ServeConfig {
     /// T17: bounded late-join transfer restarts before the client is dropped
     /// with an explicit failure (connected clients keep running).
     pub max_join_retries: u32,
+    /// Test-only. A fault plan armed on the world [`Writer`] *after* initial
+    /// recovery / first checkpoint, so an injected disk fault lands on a
+    /// periodic or clean-shutdown durable write. `None` in production.
+    pub save_faults: Option<spall_store::FaultPlan>,
 }
 
 impl ServeConfig {
@@ -148,6 +152,7 @@ impl ServeConfig {
             seed: 0,
             catch_up_cap: DEFAULT_CATCH_UP_CAP,
             max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
+            save_faults: None,
         }
     }
 }
@@ -400,6 +405,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let scene = config.scene;
     let clients_for_sim = clients.clone();
     let save = config.save.clone();
+    let save_faults = config.save_faults.clone();
     let checkpoint_interval = config.checkpoint_interval_ticks;
     let catch_up_cap = config.catch_up_cap.max(1);
     let max_join_retries = config.max_join_retries;
@@ -420,6 +426,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     return SimResult::error(format!("persistence setup failed: {e}"), 0);
                 }
             };
+        // Test-only: arm the writer only now, so recovery and the first
+        // checkpoint are unaffected and the fault falls on a later durable
+        // write (periodic or clean-shutdown).
+        if let (Some(writer), Some(faults)) = (store.as_mut(), save_faults) {
+            writer.set_faults(faults);
+        }
         let mut journal_records_written: u64 = 0;
 
         let mut motion = MotionPublisher::new(60, 20);
@@ -552,26 +564,42 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
         broadcast(&clients_for_sim, Outbound::Shutdown);
 
-        // Clean-shutdown checkpoint: flush the journal tail, publish a final
-        // checkpoint, and prune to the last two.
+        // Clean-shutdown durability: flush the journal tail, publish a final
+        // checkpoint, then prune to the last two. The flush and the checkpoint
+        // MUST both commit before this run reports a passed save — a disk-full
+        // or I/O error here means the final body motion / checkpoint never
+        // reached disk, and silently returning success would strand an
+        // unsavable world. Every counter below is still reported so the failing
+        // summary keeps its diagnostics.
         let mut persist_bytes_per_write = 0.0;
         let mut persist_commit_bytes_per_sec = 0.0;
+        let mut shutdown_error: Option<String> = None;
         if let Some(writer) = store.as_mut() {
-            if let Ok(n) = flush_journal(writer, &sim, &mut durable_seq) {
-                journal_records_written += n;
+            match flush_journal(writer, &sim, &mut durable_seq) {
+                Ok(n) => journal_records_written += n,
+                Err(e) => {
+                    shutdown_error = Some(format!("final journal flush failed: {e}"));
+                }
             }
-            if publish_checkpoint(writer, &sim, &persist_cfg, durable_seq).is_ok() {
-                checkpoints_published += 1;
+            if shutdown_error.is_none() {
+                match publish_checkpoint(writer, &sim, &persist_cfg, durable_seq) {
+                    Ok(()) => checkpoints_published += 1,
+                    Err(e) => shutdown_error = Some(format!("final checkpoint failed: {e}")),
+                }
             }
-            let _ = writer.retain(2);
+            if shutdown_error.is_none()
+                && let Err(e) = writer.retain(2)
+            {
+                shutdown_error = Some(format!("final checkpoint retain failed: {e}"));
+            }
             let m = writer.metrics();
             persist_bytes_per_write = m.bytes_per_journal_write();
             persist_commit_bytes_per_sec = m.commit_bytes_per_sec();
         }
 
         SimResult {
-            ok: true,
-            error: None,
+            ok: shutdown_error.is_none(),
+            error: shutdown_error,
             ticks_run,
             committed_total,
             rejected_total,
@@ -948,6 +976,13 @@ fn capture_for(sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
 /// Opens the world database, recovering from it when it already holds a
 /// checkpoint and otherwise starting the built-in `scene` and publishing an
 /// initial checkpoint. `None` save path → no persistence.
+///
+/// This fails closed on corruption: only a genuinely empty database
+/// ([`spall_store::StoreError::NoCheckpoint`]) is initialised with the built-in
+/// scene. A recovery that reports corruption, or a database whose checkpoints
+/// exist but do not decode, aborts startup without touching the file — losing
+/// durable records requires an explicit operator choice
+/// ([`persist::RecoveryChoice`]), not an automatic resume or reinitialisation.
 fn setup_persistence(
     save: Option<&std::path::Path>,
     scene: Scene,
@@ -961,6 +996,8 @@ fn setup_persistence(
         Ok(recovery) => {
             let (sim, seq) = persist::restore(
                 &recovery,
+                cfg,
+                persist::RecoveryChoice::RequireClean,
                 fixtures::stone_manifest(),
                 AnchorPlane::at(0),
                 PhysicsConfig::default(),
@@ -968,6 +1005,7 @@ fn setup_persistence(
             .map_err(|e| e.to_string())?;
             Ok((sim, seq, Some(writer), 0))
         }
+        // A genuinely new/empty database: seed it with the built-in scene.
         Err(spall_store::StoreError::NoCheckpoint) => {
             let sim = scene.simulation();
             let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
@@ -976,6 +1014,13 @@ fn setup_persistence(
                 .map_err(|e| e.to_string())?;
             Ok((sim, 0, Some(writer), 1))
         }
+        // Checkpoints exist but none decoded — corruption, not an empty DB. Do
+        // not overwrite the save with a fresh scene.
+        Err(e @ spall_store::StoreError::CheckpointsUnrecoverable(_)) => Err(format!(
+            "world database at {} is unrecoverable and must not be overwritten: {e}; \
+             an operator must supply a verified recovery source",
+            path.display()
+        )),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -1197,6 +1242,7 @@ async fn serve_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spall_store::{JournalPayload, JournalRecord};
 
     fn empty_clients() -> ClientMap {
         Arc::new(Mutex::new(HashMap::new()))
@@ -1309,5 +1355,131 @@ mod tests {
             lj.links.get(&live.raw()).map(|l| &l.phase),
             Some(Phase::Live)
         ));
+    }
+
+    // --- ENG-36: recovery must fail closed on corruption -------------------
+
+    fn persist_cfg() -> PersistConfig {
+        PersistConfig {
+            world_id: T10_WORLD_ID,
+            seed: 42,
+            generator_version: 1,
+        }
+    }
+
+    fn scratch_db(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("spall_eng36_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("world.db")
+    }
+
+    fn checkpoint_row_count(db: &std::path::Path) -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM checkpoints", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn setup_persistence_seeds_only_a_genuinely_empty_database() {
+        let db = scratch_db("empty");
+        // Force the schema to exist with no checkpoint, exactly like a fresh DB.
+        drop(Writer::open(&db).unwrap());
+        assert_eq!(checkpoint_row_count(&db), 0);
+
+        let (_, seq, writer, published) =
+            setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg()).unwrap();
+        assert_eq!(seq, 0);
+        assert!(writer.is_some());
+        assert_eq!(published, 1, "the built-in scene is published once");
+        assert_eq!(checkpoint_row_count(&db), 1);
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn setup_persistence_fails_closed_on_interior_journal_corruption() {
+        let db = scratch_db("crc");
+        {
+            let mut w = Writer::open(&db).unwrap();
+            let sim = Scene::BridgeCut.simulation();
+            w.publish_checkpoint(&persist::capture(&sim, &persist_cfg(), 0).unwrap())
+                .unwrap();
+            w.append_journal(&[
+                JournalRecord {
+                    seq: 1,
+                    tick: 1,
+                    payload: JournalPayload::PoseBatch { snapshots: vec![] },
+                },
+                JournalRecord {
+                    seq: 2,
+                    tick: 2,
+                    payload: JournalPayload::PoseBatch { snapshots: vec![] },
+                },
+                JournalRecord {
+                    seq: 3,
+                    tick: 3,
+                    payload: JournalPayload::PoseBatch { snapshots: vec![] },
+                },
+            ])
+            .unwrap();
+        }
+        // Corrupt seq 2's payload without fixing its CRC — an interior CRC error.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("UPDATE journal SET payload = X'DEADBEEF' WHERE seq = 2", [])
+                .unwrap();
+        }
+
+        let before = checkpoint_row_count(&db);
+        let err = match setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg()) {
+            Ok(_) => panic!("host startup must not silently continue from a shortened history"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("corruption") || err.contains("RecoveryChoice"),
+            "error surfaces the corruption and the required operator choice: {err}"
+        );
+        assert!(db.exists(), "the original database is left in place");
+        assert_eq!(
+            checkpoint_row_count(&db),
+            before,
+            "no fresh-scene checkpoint was published automatically"
+        );
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn setup_persistence_refuses_a_database_whose_checkpoints_do_not_decode() {
+        let db = scratch_db("undecodable");
+        {
+            let mut w = Writer::open(&db).unwrap();
+            let sim = Scene::BridgeCut.simulation();
+            w.publish_checkpoint(&persist::capture(&sim, &persist_cfg(), 0).unwrap())
+                .unwrap();
+        }
+        // Every complete checkpoint's metadata is now undecodable.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("UPDATE checkpoints SET meta = X'DEADBEEF'", [])
+                .unwrap();
+        }
+
+        let before = checkpoint_row_count(&db);
+        assert_eq!(before, 1);
+        let err = match setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg()) {
+            Ok(_) => panic!("undecodable checkpoints are corruption, not an empty database"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("unrecoverable"),
+            "error distinguishes corruption from a fresh DB: {err}"
+        );
+        assert!(db.exists(), "the original database is left in place");
+        assert_eq!(
+            checkpoint_row_count(&db),
+            before,
+            "the corrupt save was not overwritten with the built-in scene"
+        );
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 }
