@@ -16,6 +16,7 @@ use spall_core::{
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
     BodyKind as PhysBodyKind, BodySpec, OccupancyGrid, PhysicsConfig, PhysicsWorld,
+    analytic_mass_properties,
 };
 use spall_protocol::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
@@ -465,8 +466,13 @@ impl SimWorld {
     /// Applies the ops of one journalled [`spall_protocol::TopologyTransaction`]
     /// to the live world during recovery: brush / cell-run writes go to their
     /// named volume, and each `SplitOff` child is built from its canonical fill
-    /// runs and installed as a body using the matching participant snapshot for
-    /// its transform. Colliders of every touched volume are rebuilt. The caller
+    /// runs and installed as a body. The child keeps the **source volume's**
+    /// cell size, the fine-grid material mass (so its Rapier mass, centre of
+    /// mass, and inertia match the live split), and the participant snapshot's
+    /// pose / velocity / sleep. Existing participants — the cut parent of a
+    /// body-to-body split — are advanced to the same transaction frame so
+    /// recovery never pairs a checkpoint-frame parent with split-frame
+    /// children. Colliders of every touched volume are rebuilt; the caller
     /// bumps the id counters past the replayed suffix afterwards.
     ///
     /// The transaction's `before` brick revisions are checked against the live
@@ -485,26 +491,35 @@ impl SimWorld {
 
         let terrain_cell_size = self.terrain.volume.cell_size();
         let mut touched: Vec<VolumeId> = Vec::new();
+        let mut new_children: Vec<EntityId> = Vec::new();
         let mut split = false;
 
         // Group consecutive same-volume cell writes so each volume is edited
-        // once. A `SplitOff` opens a new child group; its following `CellRun`s
-        // (same child volume) fill it.
+        // once. A `SplitOff` opens a new child group carrying its source volume;
+        // its following `CellRun`s (same child volume) fill it.
         struct Group {
             volume: VolumeId,
             new_child: Option<EntityId>,
+            source: Option<VolumeId>,
             writes: Vec<(GlobalCell, MaterialId)>,
         }
-        let mut group: Option<Group> = None;
         let flush = |world: &mut SimWorld,
                      group: Option<Group>,
-                     touched: &mut Vec<VolumeId>|
+                     touched: &mut Vec<VolumeId>,
+                     new_children: &mut Vec<EntityId>|
          -> Result<(), WorldError> {
             let Some(g) = group else { return Ok(()) };
             if let Some(child_entity) = g.new_child {
                 if g.writes.is_empty() {
                     return Err(WorldError::EmptyBody);
                 }
+                // The child body lives in the source volume's cell frame, not
+                // necessarily the terrain's (a detail-cell body cut is finer).
+                let src_cell_size = g
+                    .source
+                    .and_then(|s| world.volume_ref(s).map(|v| v.cell_size()))
+                    .unwrap_or(terrain_cell_size);
+
                 let mut min = BrickCoord::new(i64::MAX, i64::MAX, i64::MAX);
                 let mut max = BrickCoord::new(i64::MIN, i64::MIN, i64::MIN);
                 for (cell, _) in &g.writes {
@@ -513,7 +528,7 @@ impl SimWorld {
                     max = BrickCoord::new(max.x.max(b.x), max.y.max(b.y), max.z.max(b.z));
                 }
                 let bounds = BrickBounds::new(min, max).expect("min <= max by construction");
-                let mut child = Volume::bounded(g.volume, terrain_cell_size, bounds);
+                let mut child = Volume::bounded(g.volume, src_cell_size, bounds);
                 for bz in min.z..=max.z {
                     for by in min.y..=max.y {
                         for bx in min.x..=max.x {
@@ -558,6 +573,23 @@ impl SimWorld {
                         ),
                     )
                 };
+
+                // Representative density from the fine voxel grid's material
+                // mass, exactly as the live split does (`transfer::plan_child`
+                // + `commit`): mass / (solid-cell count * cell_m^3). Feeding
+                // this through the same collider plan reproduces the live
+                // Rapier mass / COM / inertia; a hard-coded `1.0` made the
+                // recovered body ~2600x too light.
+                let cell_m = src_cell_size.metres();
+                let mp = analytic_mass_properties(&grid, cell_m, |m| world.density(m));
+                let cube_m3 = cell_m.powi(3);
+                let cell_count = g.writes.len() as f64;
+                let density_kg_m3 = if cell_count > 0.0 && cube_m3 > 0.0 {
+                    (mp.mass_kg / (cell_count * cube_m3)) as f32
+                } else {
+                    1.0
+                };
+
                 world.insert_restored_body(RestoredBody {
                     entity: child_entity,
                     volume: child,
@@ -567,8 +599,9 @@ impl SimWorld {
                     sleeping,
                     collider_revision: 1,
                     collider_region: region,
-                    density_kg_m3: 1.0,
+                    density_kg_m3,
                 })?;
+                new_children.push(child_entity);
                 touched.push(g.volume);
             } else {
                 let vol = world
@@ -586,6 +619,7 @@ impl SimWorld {
             Ok(())
         };
 
+        let mut group: Option<Group> = None;
         for op in &tx.ops {
             match op {
                 TopologyOp::IntegerBrush {
@@ -593,7 +627,7 @@ impl SimWorld {
                     brush,
                     material,
                 } => {
-                    flush(self, group.take(), &mut touched)?;
+                    flush(self, group.take(), &mut touched, &mut new_children)?;
                     let vol = self
                         .volume_body_mut(*volume)
                         .ok_or(WorldError::UnknownVolume(*volume))?;
@@ -604,15 +638,16 @@ impl SimWorld {
                     }
                 }
                 TopologyOp::SplitOff {
+                    source,
                     child,
                     child_entity,
-                    ..
                 } => {
-                    flush(self, group.take(), &mut touched)?;
+                    flush(self, group.take(), &mut touched, &mut new_children)?;
                     split = true;
                     group = Some(Group {
                         volume: *child,
                         new_child: Some(*child_entity),
+                        source: Some(*source),
                         writes: Vec::new(),
                     });
                 }
@@ -623,10 +658,11 @@ impl SimWorld {
                     material,
                 } => {
                     if group.as_ref().map(|g| g.volume) != Some(*volume) {
-                        flush(self, group.take(), &mut touched)?;
+                        flush(self, group.take(), &mut touched, &mut new_children)?;
                         group = Some(Group {
                             volume: *volume,
                             new_child: None,
+                            source: None,
                             writes: Vec::new(),
                         });
                     }
@@ -642,11 +678,25 @@ impl SimWorld {
                 }
             }
         }
-        flush(self, group.take(), &mut touched)?;
+        flush(self, group.take(), &mut touched, &mut new_children)?;
 
         for vid in touched {
             self.rebuild_volume_collider(vid)?;
         }
+
+        // Advance every *existing* participant (notably the cut parent of a
+        // body-to-body split) to the transaction frame. `apply_pose_batch`
+        // skips ids it does not own, so terrain parents and the just-built
+        // children (already posed from their own snapshot) are left alone.
+        let carry: Vec<MotionSnapshot> = participants
+            .iter()
+            .filter(|s| !new_children.contains(&s.body))
+            .cloned()
+            .collect();
+        if !carry.is_empty() {
+            self.apply_pose_batch(&carry);
+        }
+
         if split {
             self.bump_topology_epoch();
         }

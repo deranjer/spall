@@ -7,13 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use glam::{DQuat, DVec3};
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
-use spall_core::{GlobalCell, SphereBrush};
+use spall_core::{CellSizeCode, GlobalCell, SphereBrush, VolumeId};
 use spall_physics::PhysicsConfig;
 use spall_protocol::RequestId;
 use spall_server::persist::{self, PersistConfig};
 use spall_sim::{BodyPose, EditIntent, EditTarget, Simulation, SimulationConfig, fixtures};
 use spall_store::Writer;
 use spall_structure::AnchorPlane;
+use spall_voxel::{EditPlan, Volume};
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -807,4 +808,292 @@ fn review_restore_must_require_choice_after_corruption() {
         )
         .is_ok()
     );
+}
+
+// -------------------------------------------------------------------------
+// ENG-38: a journalled split must reconstruct its children with the live
+// physical mass / centre of mass / inertia, the *source* volume's cell size,
+// and every participant's pose — geometry-hash parity is not enough.
+// -------------------------------------------------------------------------
+
+/// `entity id -> (mass_kg, local COM, principal inertia)` for every body.
+fn mass_props_by_entity(
+    sim: &Simulation,
+) -> std::collections::BTreeMap<u64, (f32, [f32; 3], [f32; 3])> {
+    sim.world()
+        .bodies()
+        .map(|b| {
+            (
+                b.entity.unwrap().get(),
+                sim.world().physics().derived_mass_properties(b.phys),
+            )
+        })
+        .collect()
+}
+
+/// A body-local dumbbell built at the fine `Sixteenth` cell size (the terrain
+/// fixtures are all `Quarter`), so a replay that wrongly used the terrain cell
+/// size would misplace ~64x the mass.
+fn sixteenth_dumbbell(sz: i64, gap: i64) -> impl FnOnce(VolumeId) -> Volume {
+    let stone = spall_core::MaterialId(1);
+    move |id| {
+        let mut v = Volume::new(id, CellSizeCode::Sixteenth);
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(sz - 1, sz - 1, sz - 1),
+            stone,
+        ))
+        .unwrap();
+        let rx = sz + gap;
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(rx, 0, 0),
+            GlobalCell::new(rx + sz - 1, sz - 1, sz - 1),
+            stone,
+        ))
+        .unwrap();
+        let mid = sz / 2;
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(sz, mid, mid),
+            GlobalCell::new(rx - 1, mid, mid),
+            stone,
+        ))
+        .unwrap();
+        v
+    }
+}
+
+/// Probe `review_replayed_child_must_preserve_mass`: checkpoint the bridge,
+/// durably journal the column cut, restore checkpoint + journal, and compare
+/// the recovered beam's actual Rapier mass properties against the live ones.
+#[test]
+fn review_replayed_child_must_preserve_mass() {
+    let s = Scratch::new("eng38_terrain_mass");
+
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(10, 4, 1, 2),
+        ))
+        .unwrap();
+        sim.run_until_idle(16).unwrap();
+        assert_eq!(sim.world().body_count(), 1, "the beam detached");
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1, "one split transaction journalled");
+        w.append_journal(&records).unwrap();
+    }
+
+    let (restored, _) = recover_restore(&s.db());
+
+    let live = sim.world().bodies().next().unwrap();
+    let got = restored.world().bodies().next().unwrap();
+    let (want_mass, want_com, want_inertia) =
+        sim.world().physics().derived_mass_properties(live.phys);
+    let (got_mass, got_com, got_inertia) =
+        restored.world().physics().derived_mass_properties(got.phys);
+
+    assert!(
+        want_mass > 1000.0,
+        "sanity: a stone beam is heavy ({want_mass} kg) — not the ~1 kg the density=1.0 bug produced"
+    );
+    assert!(
+        (want_mass - got_mass).abs() < 0.01,
+        "replayed body mass: expected {want_mass} kg, got {got_mass} kg"
+    );
+    for i in 0..3 {
+        assert!(
+            (want_com[i] - got_com[i]).abs() < 1e-3,
+            "COM axis {i}: expected {}, got {}",
+            want_com[i],
+            got_com[i]
+        );
+        let denom = want_inertia[i].abs().max(1e-6);
+        assert!(
+            (want_inertia[i] - got_inertia[i]).abs() / denom < 1e-3,
+            "principal inertia axis {i}: expected {}, got {}",
+            want_inertia[i],
+            got_inertia[i]
+        );
+    }
+}
+
+/// A rotated, airborne dumbbell that keeps moving between the checkpoint and
+/// the cut: the replay must fold every participant — including the surviving
+/// parent — to the split frame, not leave the parent stranded at the
+/// checkpoint frame while the child sits at the split frame.
+#[test]
+fn rotated_body_to_body_split_replay_preserves_mass_and_parent_frame() {
+    let s = Scratch::new("eng38_body_split");
+
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    let parent = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::dumbbell(4, 3),
+            BodyPose::new(fixtures::oblique_spin(), [3.0, 8.0, 3.0]),
+            [0.2, 0.0, 0.0],
+            [0.0, 0.3, 0.0],
+            2600.0,
+            1,
+        )
+        .unwrap();
+    let checkpoint_pose = sim.world().body(parent).unwrap().pose;
+
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+
+        // Fall + spin so the body's frame diverges from the checkpoint frame.
+        for _ in 0..12 {
+            sim.step_physics_only();
+        }
+        let moved = sim.world().body(parent).unwrap().pose;
+        assert!(
+            (DVec3::from_array(moved.translation_m)
+                - DVec3::from_array(checkpoint_pose.translation_m))
+            .length()
+                > 1e-3,
+            "the body moved between checkpoint and cut"
+        );
+
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Body(parent),
+            brush_cell(5, 2, 2, 1),
+        ))
+        .unwrap();
+        sim.run_until_idle(24).unwrap();
+        assert_eq!(sim.world().body_count(), 2, "the dumbbell fractured");
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1, "one split transaction journalled");
+        w.append_journal(&records).unwrap();
+    }
+
+    let live = mass_props_by_entity(&sim);
+    let (restored, _) = recover_restore(&s.db());
+    let got = mass_props_by_entity(&restored);
+
+    assert_eq!(
+        got.keys().collect::<Vec<_>>(),
+        live.keys().collect::<Vec<_>>(),
+        "the same body ids recovered"
+    );
+    for (entity, (want_mass, _, _)) in &live {
+        let (got_mass, _, _) = got[entity];
+        assert!(
+            *want_mass > 100.0,
+            "body {entity} is stone, not density=1.0"
+        );
+        assert!(
+            (want_mass - got_mass).abs() < 0.01,
+            "body {entity}: mass expected {want_mass} kg, got {got_mass} kg"
+        );
+    }
+
+    // The parent participant was carried to the split frame: off the
+    // checkpoint pose, and sharing the split-instant rotation with the child
+    // (a child reproduces the parent transform exactly at the cut).
+    let rp = restored.world().body(parent).unwrap();
+    assert!(
+        (DVec3::from_array(rp.pose.translation_m)
+            - DVec3::from_array(checkpoint_pose.translation_m))
+        .length()
+            > 1e-3,
+        "restored parent advanced past the checkpoint frame, not stranded at it"
+    );
+    let child = restored
+        .world()
+        .bodies()
+        .find(|b| b.entity.unwrap().get() != parent.get())
+        .expect("a detached child exists");
+    let (a, b) = (rp.pose.rotation, child.pose.rotation);
+    let dot = (a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w).abs();
+    assert!(
+        dot > 1.0 - 1e-6,
+        "restored parent + child share the split-instant rotation (dot={dot})"
+    );
+}
+
+/// A body cut at a finer cell size than the terrain: the recovered children
+/// must keep the source cell size and therefore the correct mass — a replay
+/// that reached for `terrain_cell_size` would be ~64x off.
+#[test]
+fn detail_cell_body_split_replay_uses_the_source_cell_size() {
+    let s = Scratch::new("eng38_detail");
+
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    let parent = sim
+        .world_mut()
+        .spawn_body(
+            sixteenth_dumbbell(4, 3),
+            BodyPose::new(DQuat::IDENTITY, [2.0, 6.0, 2.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            1,
+        )
+        .unwrap();
+    assert_ne!(
+        sim.world().body(parent).unwrap().cell_size(),
+        sim.world().terrain().cell_size(),
+        "the body is finer than the terrain"
+    );
+
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Body(parent),
+            brush_cell(5, 2, 2, 1),
+        ))
+        .unwrap();
+        sim.run_until_idle(24).unwrap();
+        assert_eq!(
+            sim.world().body_count(),
+            2,
+            "the detail-cell dumbbell fractured"
+        );
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        w.append_journal(&records).unwrap();
+    }
+
+    let live = mass_props_by_entity(&sim);
+    let (restored, _) = recover_restore(&s.db());
+    let got = mass_props_by_entity(&restored);
+
+    for (entity, (want_mass, _, _)) in &live {
+        let (got_mass, _, _) = got[entity];
+        assert!(
+            (want_mass - got_mass).abs() < 0.01,
+            "detail-cell body {entity}: expected {want_mass} kg, got {got_mass} kg \
+             (a terrain-cell-size child would be ~64x heavier)"
+        );
+    }
+    for b in restored.world().bodies() {
+        assert_eq!(
+            b.cell_size(),
+            CellSizeCode::Sixteenth,
+            "recovered body {} kept the source cell size",
+            b.entity.unwrap().get()
+        );
+    }
 }
