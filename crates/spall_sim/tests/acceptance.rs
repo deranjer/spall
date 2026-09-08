@@ -12,7 +12,7 @@
 use glam::{DQuat, DVec3};
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
 use spall_core::{CELLS_PER_BRICK, EntityId, GlobalCell, LocalCell, MaterialId, SphereBrush};
-use spall_protocol::RequestId;
+use spall_protocol::{ActionOutcome, RequestId};
 use spall_sim::fixtures::{self, STONE};
 use spall_sim::{BodyPose, EditIntent, EditTarget, ExplosionImpulse, Simulation, SimulationConfig};
 use spall_structure::AnchorPlane;
@@ -446,16 +446,21 @@ fn no_second_impulse_on_retry() {
     );
     assert_eq!(sim.world().body_count(), 1, "one child, created once");
 
-    // Re-submitting the same request id is a rejected no-op (idempotent).
-    assert!(matches!(
+    // Re-submitting the same request id is a committed no-op: it replays the
+    // original status rather than turning a reliable retry into a rejection.
+    assert_eq!(
         sim.submit(EditIntent::cut(
             split,
             actor(),
             EditTarget::Terrain,
             brush_cell(10, 4, 1, 2)
-        )),
-        Err(spall_sim::IntentError::DuplicateRequest(_))
-    ));
+        ))
+        .unwrap()
+        .outcome,
+        ActionOutcome::Committed {
+            transaction: sim.committed(split).unwrap().transaction,
+        }
+    );
 
     // The child's journalled launch speed reflects one impulse, not two.
     let child_entity = *sim.committed(split).unwrap().children.first().unwrap();

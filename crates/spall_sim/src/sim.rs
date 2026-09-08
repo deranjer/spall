@@ -9,6 +9,7 @@
 //! persistence (T16) are explicitly out of scope.
 
 use spall_core::{IdError, Tick};
+use spall_protocol::{ActionStatus, RequestId};
 
 use crate::commit::CommitError;
 use crate::intent::{EditIntent, IntentError};
@@ -113,15 +114,20 @@ impl Simulation {
     }
 
     /// The committed transaction for a request id, if it committed.
-    pub fn committed(
-        &self,
-        request_id: spall_protocol::RequestId,
-    ) -> Option<&crate::commit::Committed> {
+    pub fn committed(&self, request_id: RequestId) -> Option<&crate::commit::Committed> {
         self.pipeline.committed(request_id)
     }
 
-    /// Accepts an edit intent for staging.
-    pub fn submit(&mut self, intent: EditIntent) -> Result<(), IntentError> {
+    /// The current status of an admitted request, if this simulation has seen
+    /// it. Hosts use this before re-validating a reliable retry, because the
+    /// original action may already have changed the geometry it targeted.
+    pub fn action_status(&self, request_id: RequestId) -> Option<&ActionStatus> {
+        self.pipeline.action_status(request_id)
+    }
+
+    /// Admits an edit intent for staging, or replays the stored status for a
+    /// duplicate request id.
+    pub fn submit(&mut self, intent: EditIntent) -> Result<ActionStatus, IntentError> {
         self.pipeline.submit_intent(intent, &self.world)
     }
 
