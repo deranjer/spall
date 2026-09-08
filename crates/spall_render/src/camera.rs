@@ -256,6 +256,70 @@ mod tests {
     }
 
     #[test]
+    fn linear_eye_space_depth_is_flat_across_a_camera_facing_plane() {
+        // The depth debug view (opaque.wgsl mode 2) derives linear depth as
+        // `-(view * world_pos).z`. On a plane at constant view-space Z every
+        // off-axis point must read the same depth; the old
+        // `length(world_pos - camera_pos)` grew toward the edges.
+        let c = Camera {
+            position: Vec3::new(0.0, 0.0, 5.0),
+            aspect: 1.0,
+            ..Camera::default()
+        };
+        let view = c.view();
+
+        let plane_z = -3.0_f32; // 8 m in front of the eye, perpendicular to -Z
+        let mut depths = Vec::new();
+        let mut radials = Vec::new();
+        for x in [-4.0_f32, -2.0, 0.0, 2.0, 4.0] {
+            for y in [-4.0_f32, -1.0, 0.0, 1.0, 4.0] {
+                let p = Vec3::new(x, y, plane_z);
+                depths.push(-view.transform_point3(p).z);
+                radials.push((p - c.position).length());
+            }
+        }
+
+        let d0 = depths[0];
+        assert!(
+            (d0 - 8.0).abs() < 1e-4,
+            "linear depth is the view-axis distance"
+        );
+        for d in &depths {
+            assert!((d - d0).abs() < 1e-4, "depth {d} varies across the plane");
+        }
+        // The radial distance the buggy shader used is clearly not flat.
+        let r_min = radials.iter().cloned().fold(f32::INFINITY, f32::min);
+        let r_max = radials.iter().cloned().fold(0.0_f32, f32::max);
+        assert!(
+            r_max - r_min > 1.5,
+            "radial distance spans {r_min}..{r_max}"
+        );
+    }
+
+    #[test]
+    fn linear_eye_space_depth_projects_onto_the_view_axis_under_rotation() {
+        // Even with the camera yawed/pitched, a point straight ahead at range R
+        // reads linear depth R, and a point of the same range off to the side
+        // reads a *smaller* depth (its view-axis projection), never a larger one.
+        let mut c = Camera {
+            position: Vec3::new(2.0, 1.0, -3.0),
+            aspect: 16.0 / 9.0,
+            ..Camera::default()
+        };
+        c.look(0.7, -0.3);
+        let view = c.view();
+        let fwd = c.forward();
+
+        let ahead = c.position + fwd * 10.0;
+        let off = c.position + (fwd + c.right() * 0.3).normalize() * 10.0;
+
+        let depth_ahead = -view.transform_point3(ahead).z;
+        let depth_off = -view.transform_point3(off).z;
+        assert!((depth_ahead - 10.0).abs() < 1e-3);
+        assert!(depth_off < depth_ahead && depth_off > 9.0);
+    }
+
+    #[test]
     fn aabb_transformed_by_rotation_refits() {
         let b = Aabb::new(Vec3::splat(-1.0), Vec3::splat(1.0));
         let r = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_4);

@@ -47,6 +47,9 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Globals {
     view_proj: [[f32; 4]; 4],
+    /// World → eye space. Used by the depth debug view to report linear
+    /// eye-space depth rather than radial distance from the camera.
+    view: [[f32; 4]; 4],
     camera_pos: [f32; 4],
     sun_dir: [f32; 4],
     params: [f32; 4],
@@ -181,6 +184,7 @@ impl ScenePipeline {
     ) -> wgpu::BindGroup {
         let globals = Globals {
             view_proj: camera.view_projection().to_cols_array_2d(),
+            view: camera.view().to_cols_array_2d(),
             camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
             sun_dir: [self.sun_dir.x, self.sun_dir.y, self.sun_dir.z, 0.0],
             params: [view.code(), camera.z_near, camera.z_far, 0.0],
