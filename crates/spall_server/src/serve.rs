@@ -961,6 +961,7 @@ fn setup_persistence(
         Ok(recovery) => {
             let (sim, seq) = persist::restore(
                 &recovery,
+                cfg,
                 fixtures::stone_manifest(),
                 AnchorPlane::at(0),
                 PhysicsConfig::default(),

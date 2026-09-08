@@ -67,6 +67,35 @@ pub enum PersistError {
     BadCellSize(u8),
     #[error("material manifest hash mismatch: checkpoint {checkpoint:.16}, runtime {runtime:.16}")]
     ManifestMismatch { checkpoint: String, runtime: String },
+    #[error(
+        "save schema version mismatch: checkpoint {checkpoint}, runtime {runtime} \
+         (a schema migration is required — do not replay this database in place)"
+    )]
+    SchemaMismatch { checkpoint: u32, runtime: u32 },
+    #[error(
+        "world identity mismatch: checkpoint world_id {checkpoint:#034x}, configured {runtime:#034x} \
+         (this database belongs to a different world — refusing to replay it as the current one)"
+    )]
+    WorldIdMismatch { checkpoint: u128, runtime: u128 },
+    #[error(
+        "world config mismatch on {field}: checkpoint {checkpoint}, configured {runtime} \
+         (an expected configuration migration — perform it explicitly on a separate, \
+         backed-up and verified copy, never as an in-place recovery)"
+    )]
+    ConfigMismatch {
+        field: &'static str,
+        checkpoint: u64,
+        runtime: u64,
+    },
+    #[error(
+        "algorithm version mismatch on {field}: checkpoint {checkpoint}, runtime {runtime} \
+         (this build cannot interpret the saved checkpoint/journal — upgrade or migrate explicitly)"
+    )]
+    AlgorithmVersionMismatch {
+        field: &'static str,
+        checkpoint: u32,
+        runtime: u32,
+    },
 }
 
 // --- capture --------------------------------------------------------------
@@ -209,15 +238,25 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
 /// durable journal suffix replayed onto it. Returns the simulation and the
 /// highest durable `JournalSeq` (the resume point for further journalling).
 ///
-/// `materials`, `anchor`, and `physics` are redeployment config; the material
-/// manifest hash is checked against the checkpoint.
+/// `cfg` is the configured world identity the host is resuming; `materials`,
+/// `anchor`, and `physics` are redeployment config. Before any state is rebuilt
+/// the saved [`StoredWorldMeta`] is validated against `cfg` and this build:
+/// schema version, world identity, seed/generator, every structural algorithm
+/// version, the material-manifest hash and the cell-size codes must all match.
+/// A mismatch is reported and nothing is rebuilt or written — an intentional
+/// migration is a deliberate, separate, backed-up operation, not an in-place
+/// recovery ([`PersistError::ConfigMismatch`] / [`PersistError::WorldIdMismatch`]
+/// / [`PersistError::AlgorithmVersionMismatch`]).
 pub fn restore(
     recovery: &Recovery,
+    cfg: &PersistConfig,
     materials: MaterialManifest,
     anchor: AnchorPlane,
     physics: PhysicsConfig,
 ) -> Result<(Simulation, u64), PersistError> {
     let cp = &recovery.checkpoint;
+
+    validate_world_meta(&cp.meta, cfg)?;
 
     let runtime_hash = content_manifest_hash(&materials).0;
     if runtime_hash != cp.meta.material_manifest_hash {
@@ -319,6 +358,74 @@ pub fn restore(
     world.resume_registry(max_entity + 1, max_volume + 1, max_tx + 1, last_seq + 1)?;
 
     Ok((Simulation::from_restored(world, Tick(cp.tick)), last_seq))
+}
+
+/// Validates the saved world metadata against the configured world identity and
+/// this build's algorithm/schema versions *before* any checkpoint or journal
+/// state is interpreted. Every branch returns without touching the database.
+fn validate_world_meta(meta: &StoredWorldMeta, cfg: &PersistConfig) -> Result<(), PersistError> {
+    if meta.store_schema_version != STORE_SCHEMA_VERSION {
+        return Err(PersistError::SchemaMismatch {
+            checkpoint: meta.store_schema_version,
+            runtime: STORE_SCHEMA_VERSION,
+        });
+    }
+    // Wrong-database: identity can never be "migrated", only pointed at correctly.
+    if meta.world_id != cfg.world_id {
+        return Err(PersistError::WorldIdMismatch {
+            checkpoint: meta.world_id,
+            runtime: cfg.world_id,
+        });
+    }
+    // Generation config: a real change is an intentional, separate migration.
+    if meta.seed != cfg.seed {
+        return Err(PersistError::ConfigMismatch {
+            field: "seed",
+            checkpoint: meta.seed,
+            runtime: cfg.seed,
+        });
+    }
+    if meta.generator_version != cfg.generator_version {
+        return Err(PersistError::ConfigMismatch {
+            field: "generator_version",
+            checkpoint: u64::from(meta.generator_version),
+            runtime: u64::from(cfg.generator_version),
+        });
+    }
+    // Every algorithm version needed to interpret the checkpoint/journal.
+    for (field, checkpoint, runtime) in [
+        (
+            "integer_brush_version",
+            meta.integer_brush_version,
+            INTEGER_BRUSH_VERSION,
+        ),
+        (
+            "structure_graph_version",
+            meta.structure_graph_version,
+            STRUCTURE_GRAPH_VERSION,
+        ),
+        (
+            "topology_hash_version",
+            meta.topology_hash_version,
+            TOPOLOGY_HASH_VERSION,
+        ),
+    ] {
+        if checkpoint != runtime {
+            return Err(PersistError::AlgorithmVersionMismatch {
+                field,
+                checkpoint,
+                runtime,
+            });
+        }
+    }
+    // Every cell-size code the checkpoint/journal references must be known to
+    // this build before a volume is rebuilt with it.
+    for &code in &meta.cell_size_codes {
+        if CellSizeCode::from_u8(code).is_none() {
+            return Err(PersistError::BadCellSize(code));
+        }
+    }
+    Ok(())
 }
 
 fn rebuild_volume(
@@ -507,7 +614,13 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         };
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, seq) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, seq) = restore(
+            &rec,
+            &cfg,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "clean",
             sim.world().world_hash() == post_cut_hash
@@ -531,7 +644,13 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let crashed = w.append_journal(&journal).is_err();
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, _) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, _) = restore(
+            &rec,
+            &cfg,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "crash_after_journal_commit",
             crashed
@@ -555,7 +674,13 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let crashed = w.append_journal(&journal).is_err();
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, seq) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, seq) = restore(
+            &rec,
+            &cfg,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "crash_before_journal_commit",
             crashed
@@ -582,7 +707,13 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let crashed = w.publish_checkpoint(&checkpoint1).is_err();
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, _) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, _) = restore(
+            &rec,
+            &cfg,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "crash_before_checkpoint_commit",
             crashed
@@ -612,7 +743,13 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let poisoned = w.is_poisoned();
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, _) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, _) = restore(
+            &rec,
+            &cfg,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "disk_fault_on_journal",
             failed
@@ -640,7 +777,13 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         );
         drop(w);
         let rec = spall_store::recover(&db)?;
-        let (sim, _) = restore(&rec, manifest.clone(), anchor, PhysicsConfig::default())?;
+        let (sim, _) = restore(
+            &rec,
+            &cfg,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
         scenarios.push(check(
             "disk_fault_on_checkpoint",
             failed
