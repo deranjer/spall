@@ -65,6 +65,9 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         fingerprint_out: Some(fp_path.clone()),
         addr_out: Some(addr_path.clone()),
         transport: TransportConfig::for_tests(),
+        save: None,
+        checkpoint_interval_ticks: 0,
+        seed: 0,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -124,5 +127,102 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
     assert!(
         client.motion_snapshots >= 1,
         "the client received motion for the detached body"
+    );
+}
+
+/// Run the host once with `--save`, cut the column, let it checkpoint on
+/// shutdown; then run it again against the same database with a client that
+/// does nothing. The second host must recover the post-cut world (the detached
+/// body and its geometry), not restart the fresh bridge scene.
+///
+/// Client-side convergence after a restart needs a late-join baseline (T17);
+/// this asserts only the authoritative server recovery.
+#[test]
+fn server_persists_and_recovers_across_a_restart() {
+    let dir = unique_dir("persist");
+    let token = JoinToken::generate().unwrap();
+    let save = dir.join("world.db");
+
+    let base_cfg = |tag: &str| ServeConfig {
+        listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        scene: Scene::BridgeCut,
+        join_token: token,
+        max_ticks: 200,
+        quiescence_ticks: 20,
+        min_clients: 1,
+        max_clients: 2,
+        startup_timeout: Duration::from_secs(20),
+        paced: true,
+        log_json: dir.join(format!("server-{tag}.jsonl")),
+        summary_json: None,
+        fingerprint_out: Some(dir.join(format!("fp-{tag}"))),
+        addr_out: Some(dir.join(format!("addr-{tag}"))),
+        transport: TransportConfig::for_tests(),
+        save: Some(save.clone()),
+        checkpoint_interval_ticks: 0,
+        seed: 9,
+    };
+
+    let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {
+        let cfg = base_cfg(tag);
+        let fp_path = cfg.fingerprint_out.clone().unwrap();
+        let addr_path = cfg.addr_out.clone().unwrap();
+        let dir = dir.clone();
+        let server_thread = std::thread::spawn(move || serve(cfg));
+
+        let fp_hex = wait_for_file(&fp_path, Duration::from_secs(15));
+        let addr_str = wait_for_file(&addr_path, Duration::from_secs(15));
+        let client_cfg = ClientNetConfig {
+            connect_addr: addr_str.parse().unwrap(),
+            server_fingerprint: Fingerprint::from_hex(&fp_hex).unwrap(),
+            join_token: token,
+            script,
+            run_ticks: 0,
+            idle_grace: Duration::from_millis(500),
+            overall_timeout: Duration::from_secs(25),
+            log_json: dir.join(format!("client-{tag}.jsonl")),
+            summary_json: None,
+            transport: TransportConfig::for_tests(),
+        };
+        let _ = run_replication_client(client_cfg).expect("client run");
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("server run")
+    };
+
+    let first = run_once(
+        "1",
+        vec![ScriptedAction {
+            at_tick: 4,
+            request: cut_request(1, 0, [10, 4, 1], 2),
+        }],
+    );
+    assert!(first.body_count >= 1, "the beam detached in run 1");
+    assert!(
+        first.checkpoints_published >= 1,
+        "run 1 published a shutdown checkpoint"
+    );
+    assert!(
+        first.journal_records_written >= 1,
+        "run 1 journalled the split transaction"
+    );
+
+    let second = run_once("2", vec![]);
+    assert_eq!(
+        second.body_count, first.body_count,
+        "run 2 recovered the detached body"
+    );
+    assert_eq!(
+        second.total_solid_cells, first.total_solid_cells,
+        "run 2 recovered the same solid-cell total"
+    );
+    assert_eq!(
+        second.final_world_hash, first.final_world_hash,
+        "run 2 recovered the post-cut authoritative geometry"
+    );
+    assert_eq!(
+        second.transactions_committed, 0,
+        "run 2 did not replay or re-run the cut"
     );
 }

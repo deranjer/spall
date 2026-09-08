@@ -26,9 +26,17 @@ processes** over real QUIC — optionally behind per-client UDP proxies with
 `--loss-percent` — run the scenario's scripted cuts, and pass only if the server
 and every client agree on the final canonical topology hash. They write
 `summary.json` plus per-process `*.summary.json` / `*.jsonl`.
-`capture`, `bench`, and `crash-test` still return an explicit
-unavailable-capability result until their listed tasks are delivered. All
-numerical limits are provisional acceptance targets. None is a measured result.
+T16 adds durable persistence: `crates/spall_store` (the versioned SQLite save
+schema and single WAL writer) and `spall_server::persist` (the `SimWorld` ⇄
+save-record conversion and recovery). `sandbox-server --serve --save` recovers
+from `<world>/world.db` on start, journals every committed transaction, and
+checkpoints on `--checkpoint-interval-ticks` and clean shutdown. `cargo xtask
+crash-test --suite persistence` runs the crash-point / disk-fault matrix
+end-to-end through a real `Simulation` (bridge scene → column cut → beam
+detaches) and writes `summary.json` with the measured bytes/write rate.
+`capture` and `bench` still return an explicit unavailable-capability result
+until their listed tasks are delivered. All numerical limits are provisional
+acceptance targets. None is a measured result.
 
 ## Agent operation without an editor
 

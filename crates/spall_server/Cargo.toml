@@ -8,8 +8,12 @@ rust-version.workspace = true
 spall_core = { path = "../spall_core" }
 spall_protocol = { path = "../spall_protocol" }
 spall_net = { path = "../spall_net" }
+spall_physics = { path = "../spall_physics" }
 spall_sim = { path = "../spall_sim" }
+spall_store = { path = "../spall_store" }
+spall_structure = { path = "../spall_structure" }
 spall_voxel = { path = "../spall_voxel" }
+glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -18,3 +22,12 @@ tracing.workspace = true
 
 [dev-dependencies]
 spall_client = { path = "../spall_client" }
+
+[[bin]]
+name = "crash-bench"
+path = "src/bin/crash_bench.rs"
+required-features = ["persist-bench"]
+
+[features]
+# Pulls in the offline persistence crash-suite binary (`cargo xtask crash-test`).
+persist-bench = []

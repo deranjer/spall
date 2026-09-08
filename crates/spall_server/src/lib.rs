@@ -6,8 +6,13 @@
 //! accepts clients, and broadcasts committed topology transactions plus 20 Hz
 //! motion snapshots.
 
+pub mod persist;
 pub mod serve;
 
+pub use persist::{
+    CrashSuiteReport, PersistConfig, PersistError, ScenarioResult, capture, journal_records,
+    restore, run_crash_suite,
+};
 pub use serve::{Scene, ServeConfig, ServeError, ServeSummary, serve};
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};

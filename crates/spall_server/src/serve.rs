@@ -26,6 +26,7 @@ use spall_net::{
     Connection, DevIdentity, JoinToken, NetServer, Role, TransportConfig, TransportError,
     WireRecord,
 };
+use spall_physics::PhysicsConfig;
 use spall_protocol::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, AlgorithmVersions, ClaimedTarget,
     Handshake, Hash32, MotionSnapshot, NegotiatedLimits, PROTOCOL_VERSION, RepairRequest,
@@ -33,9 +34,13 @@ use spall_protocol::{
 };
 use spall_sim::{
     EditIntent, EditKind, EditTarget, MotionPublisher, Simulation, SimulationConfig,
-    action_statuses, committed_transactions, repair_ops,
+    action_statuses, committed_transactions, fixtures, repair_ops,
 };
+use spall_store::Writer;
+use spall_structure::AnchorPlane;
 use tokio::sync::{mpsc, watch};
+
+use crate::persist::{self, PersistConfig};
 
 /// Content-manifest tag both ends of a T10 session agree on out of band. Real
 /// manifest negotiation is T16/T17; this keeps the handshake honest meanwhile.
@@ -86,6 +91,15 @@ pub struct ServeConfig {
     /// Write the OS-resolved bound `ip:port` here once listening.
     pub addr_out: Option<PathBuf>,
     pub transport: TransportConfig,
+    /// On-disk world database (T16). When set, the run recovers from it on
+    /// start (if it exists), journals every committed transaction, and
+    /// checkpoints every `checkpoint_interval_ticks` and on clean shutdown.
+    pub save: Option<PathBuf>,
+    /// Ticks between engine checkpoints (`1800` == 30 s at 60 Hz). `0` disables
+    /// periodic checkpoints (a shutdown checkpoint still happens).
+    pub checkpoint_interval_ticks: u64,
+    /// World seed stamped into the save metadata.
+    pub seed: u64,
 }
 
 impl ServeConfig {
@@ -106,6 +120,9 @@ impl ServeConfig {
             fingerprint_out: None,
             addr_out: None,
             transport: TransportConfig::for_tests(),
+            save: None,
+            checkpoint_interval_ticks: 1_800,
+            seed: 0,
         }
     }
 }
@@ -124,6 +141,14 @@ pub struct ServeSummary {
     pub final_world_hash: String,
     pub total_solid_cells: u64,
     pub body_count: usize,
+    /// Engine checkpoints published this run (T16). `0` when `--save` is unset.
+    pub checkpoints_published: u64,
+    /// Topology journal records written this run.
+    pub journal_records_written: u64,
+    /// Measured mean journal payload bytes per durable journal commit.
+    pub persist_bytes_per_write: f64,
+    /// Measured durable payload bytes per second of `COMMIT` time.
+    pub persist_commit_bytes_per_sec: f64,
 }
 
 /// Anything that stops a [`serve`] run.
@@ -327,9 +352,27 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let quiescence = config.quiescence_ticks;
     let scene = config.scene;
     let clients_for_sim = clients.clone();
+    let save = config.save.clone();
+    let checkpoint_interval = config.checkpoint_interval_ticks;
+    let persist_cfg = PersistConfig {
+        world_id: T10_WORLD_ID,
+        seed: config.seed,
+        generator_version: 1,
+    };
 
     let sim_join = tokio::task::spawn_blocking(move || -> SimResult {
-        let mut sim = scene.simulation();
+        // Open the world database (T16). If it already holds a checkpoint,
+        // recover from it; otherwise start the built-in scene and publish an
+        // initial checkpoint so recovery always has a floor.
+        let (mut sim, mut durable_seq, mut store, mut checkpoints_published) =
+            match setup_persistence(save.as_deref(), scene, &persist_cfg) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    return SimResult::error(format!("persistence setup failed: {e}"), 0);
+                }
+            };
+        let mut journal_records_written: u64 = 0;
+
         let mut motion = MotionPublisher::new(60, 20);
         let mut committed_total = 0u64;
         let mut rejected_total = 0u64;
@@ -410,6 +453,26 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
+            // T16: journal every newly committed transaction, then checkpoint
+            // on the interval. A durable-write failure stops the run rather
+            // than silently continuing an unsavable world.
+            if let Some(writer) = store.as_mut() {
+                match flush_journal(writer, &sim, &mut durable_seq) {
+                    Ok(n) => journal_records_written += n,
+                    Err(e) => {
+                        return SimResult::error(format!("journal flush failed: {e}"), ticks_run);
+                    }
+                }
+                if checkpoint_interval > 0 && tick.get().is_multiple_of(checkpoint_interval) {
+                    match publish_checkpoint(writer, &sim, &persist_cfg, durable_seq) {
+                        Ok(()) => checkpoints_published += 1,
+                        Err(e) => {
+                            return SimResult::error(format!("checkpoint failed: {e}"), ticks_run);
+                        }
+                    }
+                }
+            }
+
             // Quiesce only after the pipeline is drained *and* no client has
             // sent anything for `quiescence` ticks — a late scripted action from
             // one client keeps the run alive for the others.
@@ -428,6 +491,24 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         }
 
         broadcast(&clients_for_sim, Outbound::Shutdown);
+
+        // Clean-shutdown checkpoint: flush the journal tail, publish a final
+        // checkpoint, and prune to the last two.
+        let mut persist_bytes_per_write = 0.0;
+        let mut persist_commit_bytes_per_sec = 0.0;
+        if let Some(writer) = store.as_mut() {
+            if let Ok(n) = flush_journal(writer, &sim, &mut durable_seq) {
+                journal_records_written += n;
+            }
+            if publish_checkpoint(writer, &sim, &persist_cfg, durable_seq).is_ok() {
+                checkpoints_published += 1;
+            }
+            let _ = writer.retain(2);
+            let m = writer.metrics();
+            persist_bytes_per_write = m.bytes_per_journal_write();
+            persist_commit_bytes_per_sec = m.commit_bytes_per_sec();
+        }
+
         SimResult {
             ok: true,
             error: None,
@@ -437,6 +518,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             final_world_hash: sim.world().world_hash().to_string(),
             total_solid_cells: sim.world().total_solid_cells(),
             body_count: sim.world().body_count(),
+            checkpoints_published,
+            journal_records_written,
+            persist_bytes_per_write,
+            persist_commit_bytes_per_sec,
         }
     });
 
@@ -477,6 +562,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         final_world_hash: sim_result.final_world_hash.clone(),
         total_solid_cells: sim_result.total_solid_cells,
         body_count: sim_result.body_count,
+        checkpoints_published: sim_result.checkpoints_published,
+        journal_records_written: sim_result.journal_records_written,
+        persist_bytes_per_write: sim_result.persist_bytes_per_write,
+        persist_commit_bytes_per_sec: sim_result.persist_commit_bytes_per_sec,
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -502,6 +591,10 @@ struct SimResult {
     final_world_hash: String,
     total_solid_cells: u64,
     body_count: usize,
+    checkpoints_published: u64,
+    journal_records_written: u64,
+    persist_bytes_per_write: f64,
+    persist_commit_bytes_per_sec: f64,
 }
 
 impl SimResult {
@@ -515,8 +608,83 @@ impl SimResult {
             final_world_hash: String::new(),
             total_solid_cells: 0,
             body_count: 0,
+            checkpoints_published: 0,
+            journal_records_written: 0,
+            persist_bytes_per_write: 0.0,
+            persist_commit_bytes_per_sec: 0.0,
         }
     }
+}
+
+/// Opens the world database, recovering from it when it already holds a
+/// checkpoint and otherwise starting the built-in `scene` and publishing an
+/// initial checkpoint. `None` save path → no persistence.
+fn setup_persistence(
+    save: Option<&std::path::Path>,
+    scene: Scene,
+    cfg: &PersistConfig,
+) -> Result<(Simulation, u64, Option<Writer>, u64), String> {
+    let Some(path) = save else {
+        return Ok((scene.simulation(), 0, None, 0));
+    };
+    let mut writer = Writer::open(path).map_err(|e| e.to_string())?;
+    match writer.recover() {
+        Ok(recovery) => {
+            let (sim, seq) = persist::restore(
+                &recovery,
+                fixtures::stone_manifest(),
+                AnchorPlane::at(0),
+                PhysicsConfig::default(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok((sim, seq, Some(writer), 0))
+        }
+        Err(spall_store::StoreError::NoCheckpoint) => {
+            let sim = scene.simulation();
+            let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
+            writer
+                .publish_checkpoint(&checkpoint)
+                .map_err(|e| e.to_string())?;
+            Ok((sim, 0, Some(writer), 1))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Appends every simulation journal entry past `durable_seq` to the store and
+/// advances `durable_seq` to the acknowledged sequence. Returns how many
+/// records were written.
+fn flush_journal(
+    writer: &mut Writer,
+    sim: &Simulation,
+    durable_seq: &mut u64,
+) -> Result<u64, String> {
+    let pending: Vec<_> = sim
+        .journal()
+        .entries()
+        .iter()
+        .filter(|e| e.seq.0 > *durable_seq)
+        .cloned()
+        .collect();
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let records = persist::journal_records(&pending).map_err(|e| e.to_string())?;
+    let durable = writer.append_journal(&records).map_err(|e| e.to_string())?;
+    *durable_seq = durable.journal_seq.0;
+    Ok(records.len() as u64)
+}
+
+fn publish_checkpoint(
+    writer: &mut Writer,
+    sim: &Simulation,
+    cfg: &PersistConfig,
+    durable_seq: u64,
+) -> Result<(), String> {
+    let checkpoint = persist::capture(sim, cfg, durable_seq).map_err(|e| e.to_string())?;
+    writer
+        .publish_checkpoint(&checkpoint)
+        .map_err(|e| e.to_string())
 }
 
 fn intent_from_request(session: SessionId, req: &ActionRequest) -> Option<EditIntent> {
