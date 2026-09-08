@@ -470,6 +470,32 @@ fn interior_journal_corruption_truncates_and_reports_with_fallback() {
 }
 
 #[test]
+fn an_empty_database_is_distinct_from_one_whose_checkpoints_do_not_decode() {
+    // A fresh database has the schema but no complete checkpoint: NoCheckpoint.
+    let s = Scratch::new("empty_vs_corrupt");
+    drop(Writer::open(s.db()).unwrap());
+    assert!(matches!(recover(s.db()), Err(StoreError::NoCheckpoint)));
+
+    // Publish a checkpoint, then make every complete checkpoint's metadata
+    // undecodable: this is corruption, not an empty DB.
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(10, 0)).unwrap();
+    }
+    {
+        let conn = rusqlite_open(&s.db());
+        conn.execute("UPDATE checkpoints SET meta = X'DEADBEEF'", [])
+            .unwrap();
+    }
+    match recover(s.db()) {
+        Err(StoreError::CheckpointsUnrecoverable(detail)) => {
+            assert!(detail.contains("checkpoint tick 10"));
+        }
+        other => panic!("expected CheckpointsUnrecoverable, got {other:?}"),
+    }
+}
+
+#[test]
 fn retain_drops_old_checkpoints_and_covered_journal() {
     let s = Scratch::new("retain");
     let mut w = Writer::open(s.db()).unwrap();

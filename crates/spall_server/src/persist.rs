@@ -46,6 +46,20 @@ pub struct PersistConfig {
     pub generator_version: u32,
 }
 
+/// What [`restore`] may do when the [`Recovery`] carries [`CorruptionReport`]s
+/// (a truncated / CRC-failed journal suffix, an interior gap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryChoice {
+    /// Resume only from a fully clean recovery. Any corruption report aborts
+    /// before the database is touched — the safe default a host uses without
+    /// operator input.
+    RequireClean,
+    /// The operator has reviewed the reported corruption and explicitly accepts
+    /// resuming from the verified durable prefix (the contiguous, CRC-checked
+    /// journal suffix), permanently discarding the lost tail.
+    AcceptDurablePrefix,
+}
+
 /// Anything that can go wrong converting to/from save records.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
@@ -73,6 +87,11 @@ pub enum PersistError {
          publish it as authoritative)"
     )]
     CheckpointHashMismatch { checkpoint: String, rebuilt: String },
+    #[error(
+        "recovery reported corruption and no operator choice was given: {reports}; \
+         {fallback} — resume requires an explicit RecoveryChoice"
+    )]
+    UnrecoverableCorruption { reports: String, fallback: String },
     #[error(
         "save schema version mismatch: checkpoint {checkpoint}, runtime {runtime} \
          (a schema migration is required — do not replay this database in place)"
@@ -253,14 +272,38 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
 /// migration is a deliberate, separate, backed-up operation, not an in-place
 /// recovery ([`PersistError::ConfigMismatch`] / [`PersistError::WorldIdMismatch`]
 /// / [`PersistError::AlgorithmVersionMismatch`]).
+///
+/// If the [`Recovery`] carries any [`spall_store::CorruptionReport`], recovery
+/// fails closed unless `choice` is [`RecoveryChoice::AcceptDurablePrefix`] — the
+/// host must not silently continue from a shortened durable history.
 pub fn restore(
     recovery: &Recovery,
     cfg: &PersistConfig,
+    choice: RecoveryChoice,
     materials: MaterialManifest,
     anchor: AnchorPlane,
     physics: PhysicsConfig,
 ) -> Result<(Simulation, u64), PersistError> {
     let cp = &recovery.checkpoint;
+
+    // Fail closed on a reported-corrupt recovery before anything is rebuilt.
+    if !recovery.corruption.is_empty() && choice != RecoveryChoice::AcceptDurablePrefix {
+        return Err(PersistError::UnrecoverableCorruption {
+            reports: recovery
+                .corruption
+                .iter()
+                .map(|c| c.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+            fallback: match &recovery.previous_checkpoint {
+                Some(prev) => format!(
+                    "a previous complete checkpoint at tick {} is available as a verified fallback",
+                    prev.tick
+                ),
+                None => "no previous complete checkpoint is available as a fallback".to_string(),
+            },
+        });
+    }
 
     validate_world_meta(&cp.meta, cfg)?;
 
@@ -642,6 +685,7 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let (sim, seq) = restore(
             &rec,
             &cfg,
+            RecoveryChoice::RequireClean,
             manifest.clone(),
             anchor,
             PhysicsConfig::default(),
@@ -672,6 +716,7 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let (sim, _) = restore(
             &rec,
             &cfg,
+            RecoveryChoice::RequireClean,
             manifest.clone(),
             anchor,
             PhysicsConfig::default(),
@@ -702,6 +747,7 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let (sim, seq) = restore(
             &rec,
             &cfg,
+            RecoveryChoice::RequireClean,
             manifest.clone(),
             anchor,
             PhysicsConfig::default(),
@@ -735,6 +781,7 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let (sim, _) = restore(
             &rec,
             &cfg,
+            RecoveryChoice::RequireClean,
             manifest.clone(),
             anchor,
             PhysicsConfig::default(),
@@ -771,6 +818,7 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let (sim, _) = restore(
             &rec,
             &cfg,
+            RecoveryChoice::RequireClean,
             manifest.clone(),
             anchor,
             PhysicsConfig::default(),
@@ -805,6 +853,7 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
         let (sim, _) = restore(
             &rec,
             &cfg,
+            RecoveryChoice::RequireClean,
             manifest.clone(),
             anchor,
             PhysicsConfig::default(),

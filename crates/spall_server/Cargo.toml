@@ -22,6 +22,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 spall_client = { path = "../spall_client" }
+rusqlite = { workspace = true }
 
 [[bin]]
 name = "crash-bench"
