@@ -47,6 +47,8 @@ pub enum WorldError {
     Ids(#[from] spall_core::IdError),
     #[error("occupancy extraction failed: {0}")]
     Occupancy(#[from] spall_physics::ExtractError),
+    #[error("no exact active collider for the body: {0}")]
+    Collider(#[from] crate::collider::ColliderInfeasible),
     #[error("edit during replay failed: {0}")]
     Edit(#[from] spall_voxel::EditError),
     #[error("journal replay precondition failed: {0}")]
@@ -125,7 +127,7 @@ impl SimWorld {
         let terrain_volume_id = registry.allocate_volume()?; // volume 1 == terrain
 
         let grid = OccupancyGrid::from_volume(&setup.terrain)?.ok_or(WorldError::EmptyTerrain)?;
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         let cell_m = setup.terrain.cell_size().metres() as f32;
 
         let mut physics = PhysicsWorld::new(setup.physics);
@@ -321,7 +323,7 @@ impl SimWorld {
         let volume = build(volume_id);
 
         let grid = OccupancyGrid::from_volume(&volume)?.ok_or(WorldError::EmptyBody)?;
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         let cell_size_m = volume.cell_size().metres();
         let cell_m = cell_size_m as f32;
         // Mass / COM / inertia from the exact fine grid at the requested bulk
@@ -398,6 +400,31 @@ impl SimWorld {
         entity
     }
 
+    /// Retires the ownership of `volume` because its authoritative geometry
+    /// became empty (`ENG-56`), atomically with the edit that emptied it:
+    ///
+    /// * a **detached body** is dropped from the world — its physics rigid body
+    ///   and collider are removed, and it is no longer enumerable, targetable by
+    ///   a raycast, or published in a motion batch;
+    /// * **terrain** keeps its (now empty) record but loses its physical
+    ///   collider, so nothing rests on or tunnels the obsolete solid shape.
+    ///
+    /// Idempotent; a no-op for an unknown volume.
+    pub fn retire_empty_volume(&mut self, volume: VolumeId) {
+        if volume == self.terrain.volume_id {
+            self.physics.remove_collider(self.terrain.phys);
+            self.terrain.collider_revision += 1;
+            return;
+        }
+        let Some(&entity) = self.volume_owner.get(&volume.get()) else {
+            return;
+        };
+        if let Some(body) = self.bodies.remove(&entity) {
+            self.physics.retire_body(body.phys);
+        }
+        self.volume_owner.remove(&volume.get());
+    }
+
     // --- save recovery (T16) ------------------------------------------------
     //
     // These reinstate authoritative state from persisted records without
@@ -425,7 +452,7 @@ impl SimWorld {
     /// replication/journalling until then.
     pub fn insert_restored_body(&mut self, spec: RestoredBody) -> Result<EntityId, WorldError> {
         let grid = OccupancyGrid::from_volume(&spec.volume)?.ok_or(WorldError::EmptyBody)?;
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         let cell_size_m = spec.volume.cell_size().metres();
         let cell_m = cell_size_m as f32;
         // Re-derive the exact mass properties from the persisted fine material
@@ -699,7 +726,7 @@ impl SimWorld {
         }
         flush(self, group.take(), &mut touched, &mut new_children)?;
 
-        for vid in touched {
+        for &vid in &touched {
             self.rebuild_volume_collider(vid)?;
         }
 
@@ -721,6 +748,16 @@ impl SimWorld {
         }
 
         self.check_replay_results(tx)?;
+
+        // Retire any volume this transaction cleared to empty, now that its
+        // verified post-state has been checked against the record. This mirrors
+        // the live commit path so a recovered world has the same set of live
+        // bodies and colliders (`ENG-56`).
+        for vid in touched {
+            if self.volume_ref(vid).is_some_and(|v| solid_cells(v) == 0) {
+                self.retire_empty_volume(vid);
+            }
+        }
         Ok(())
     }
 
@@ -801,7 +838,9 @@ impl SimWorld {
     }
 
     /// Rebuilds one volume's collider from its current geometry (recovery and
-    /// post-replay). No-op if the volume has no solid cell left.
+    /// post-replay). No-op if the volume has no solid cell left — an emptied
+    /// volume is retired by [`Self::retire_empty_volume`] once the replay's
+    /// result checks have run (`ENG-56`).
     pub fn rebuild_volume_collider(&mut self, volume: VolumeId) -> Result<(), WorldError> {
         let Some(body) = self.volume_body(volume) else {
             return Err(WorldError::UnknownVolume(volume));
@@ -812,7 +851,7 @@ impl SimWorld {
         let Some(grid) = OccupancyGrid::from_volume(&body.volume)? else {
             return Ok(());
         };
-        let plan = plan_collider(&grid);
+        let plan = plan_collider(&grid)?;
         self.physics
             .rebuild_collider(phys, &plan.grid, plan.representation);
         if is_dynamic {
