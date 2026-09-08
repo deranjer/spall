@@ -68,6 +68,12 @@ pub enum PersistError {
     #[error("material manifest hash mismatch: checkpoint {checkpoint:.16}, runtime {runtime:.16}")]
     ManifestMismatch { checkpoint: String, runtime: String },
     #[error(
+        "checkpoint world-hash mismatch: rebuilt {rebuilt:.16}, saved canonical {checkpoint:.16} \
+         (the checkpoint rows decoded but do not reproduce the state they claim — refusing to \
+         publish it as authoritative)"
+    )]
+    CheckpointHashMismatch { checkpoint: String, rebuilt: String },
+    #[error(
         "save schema version mismatch: checkpoint {checkpoint}, runtime {runtime} \
          (a schema migration is required — do not replay this database in place)"
     )]
@@ -320,6 +326,18 @@ pub fn restore(
         cp.meta.next_journal_seq,
     )?;
 
+    // The rebuilt checkpoint world — every body, brick, revision and owner — must
+    // reproduce the canonical hash the checkpoint was published with before any
+    // journal record is replayed onto it. A decodable row corruption (a flipped
+    // tombstone bit, a swapped revision) is caught here.
+    let rebuilt = world.world_hash().0;
+    if rebuilt != cp.world_hash {
+        return Err(PersistError::CheckpointHashMismatch {
+            checkpoint: hex32(&cp.world_hash),
+            rebuilt: hex32(&rebuilt),
+        });
+    }
+
     let mut max_tx = cp.meta.next_transaction.saturating_sub(1);
     let mut max_entity = cp.meta.next_entity.saturating_sub(1);
     let mut max_volume = cp.meta.next_volume.saturating_sub(1);
@@ -330,6 +348,13 @@ pub fn restore(
             JournalPayload::Topology { .. } => {
                 let (tx, participants) =
                     record.payload.as_topology().expect("payload is Topology")?;
+                if tx.algorithm_version != INTEGER_BRUSH_VERSION {
+                    return Err(PersistError::AlgorithmVersionMismatch {
+                        field: "journal transaction.algorithm_version",
+                        checkpoint: tx.algorithm_version,
+                        runtime: INTEGER_BRUSH_VERSION,
+                    });
+                }
                 world.replay_transaction(&tx, &participants)?;
                 max_tx = max_tx.max(tx.transaction_id.get());
                 for op in &tx.ops {
