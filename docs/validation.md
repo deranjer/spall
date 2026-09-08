@@ -12,12 +12,46 @@ acceptance shapes (cube, tunnel, checkerboard, negative coordinates, adjacent
 bricks, rotated hollow volume) to a shaded PNG plus normal and depth debug
 images, with a `summary.json`; it exits 3 when no GPU adapter is available.
 Scene/camera fixture files and the lighting-quality capture stay T12/T13.
-`session`, `scenario`, `bench`, and `crash-test` still return an explicit
-unavailable-capability result until their listed tasks are delivered. The
-`sandbox-server` host still records but does not bind `--listen`; wiring
-`spall_net` into the host and the documented connected-client command is T10.
-All numerical limits are provisional acceptance targets. None is a measured
-result.
+T06 adds one offline measurement binary,
+`cargo run --release -p spall_physics --bin collision-bench`, which runs the
+voxel-collision feasibility scenarios and writes `collision-feasibility.json`;
+it is not wired into `cargo xtask bench`.
+T08 adds one offline authoritative-edit binary,
+`cargo run -p spall_sim --features scenario --bin sim-scenario`, which drives the
+in-process `Simulation` through the terrain-split, rotated-moving-body cut,
+conflict-convergence, and no-second-impulse scenarios and writes `summary.json`.
+It runs the authoritative edit/split/collider-swap path only.
+T10 wires `spall_net` into the hosts and adds the multi-process replication
+harness: `sandbox-server --serve` binds `--listen` and runs the authoritative
+`spall_sim::Simulation` behind QUIC; `sandbox-client --connect` is a headless
+replica that applies committed `TopologyTransaction`s and scripts cuts. `cargo
+xtask session --scenario <file.json>` and `cargo xtask scenario --name <builtin>`
+(built-ins in `fixtures/scenarios/`) launch one server and N client **OS
+processes** over real QUIC — optionally behind per-client UDP proxies with
+`--loss-percent` — run the scenario's scripted cuts, and pass only if the server
+and every client agree on the final canonical topology hash. They write
+`summary.json` plus per-process `*.summary.json` / `*.jsonl`.
+T16 adds durable persistence: `crates/spall_store` (the versioned SQLite save
+schema and single WAL writer) and `spall_server::persist` (the `SimWorld` ⇄
+save-record conversion and recovery). `sandbox-server --serve --save` recovers
+from `<world>/world.db` on start, journals every committed transaction, and
+checkpoints on `--checkpoint-interval-ticks` and clean shutdown. `cargo xtask
+crash-test --suite persistence` runs the crash-point / disk-fault matrix
+end-to-end through a real `Simulation` (bridge scene → column cut → beam
+detaches) and writes `summary.json` with the measured bytes/write rate.
+T17 adds live late join: `sandbox-client --connect --late-join` pulls a
+dependency-complete `BaselineWorld` over a bulk transfer instead of installing
+the fixed scene, drains the server's bounded catch-up queue, and reaches the
+authoritative topology hash with no edit replay. A scenario file may list
+`late_join_clients` (and `late_join_connect_delay_ms`); those clients connect
+after the tick loop is running and are excluded from `--min-clients`. Built-in
+`late-join-collapse` runs one server + two early cutters + one late-join
+replica. Mid-session brick `RepairRequest`s are answered with a one-brick
+authoritative baseline patch (exact revision parity), and a reconnected session
+generation invalidates the prior one server-side.
+`bench` still returns an explicit unavailable-capability result until its listed
+task is delivered. All numerical limits are provisional acceptance targets. None
+is a measured result.
 
 ## Agent operation without an editor
 
@@ -32,20 +66,30 @@ cargo xtask smoke --ticks 60
 # through an opaque UDP loss proxy; reliable records must survive the loss.
 cargo xtask net-check --clients 2 --loss-percent 2 --output .local/runs/net
 
-# Dedicated server, bounded automation run, no window/GPU dependency.
-cargo run -p sandbox --bin sandbox-server -- --world .local/worlds/dev --seed 42 --listen 127.0.0.1:5000 --ticks 3600 --log-json .local/runs/server.jsonl
+# T10: authoritative replication host. Binds --listen, runs spall_sim behind
+# QUIC, writes its cert fingerprint and a run summary. --paced for 60 Hz real
+# time so scripted clients can interact. (T00 bounded loop: drop --serve.)
+cargo run -p sandbox --bin sandbox-server -- --serve --listen 127.0.0.1:0 --ticks 300 --paced \
+  --join-token-file .local/session/join.token --fingerprint-out .local/session/server.fingerprint \
+  --addr-out .local/session/server.addr --summary-json .local/runs/server.summary.json --log-json .local/runs/server.jsonl
 
-# Direct render window and input, no menus.
-cargo run -p sandbox --bin sandbox-client -- --connect 127.0.0.1:5000 --server-fingerprint .local/session/server.fingerprint --join-token-file .local/session/join.token
+# T10: headless replication client. Applies committed transactions to a replica
+# and scripts cuts as `--cut TICK:X,Y,Z:RADIUS`.
+cargo run -p sandbox --features client --bin sandbox-client -- --connect 127.0.0.1:5000 \
+  --server-fingerprint .local/session/server.fingerprint --join-token-file .local/session/join.token \
+  --cut 4:10,4,1:2 --summary-json .local/runs/client.summary.json
 
-# One server and two clients; collects outputs and terminates its own processes.
-cargo xtask session --clients 2 --scenario fixtures/scenarios/tower-cut.toml --ticks 1800 --output .local/runs/tower-cut
+# One server and two client OS processes over real QUIC; collects outputs and
+# terminates its own processes. Passes iff every replica agrees on the topology hash.
+cargo xtask session --scenario fixtures/scenarios/tower-cut.json --clients 2 --output .local/runs/tower-cut
 
-# Separate-process bots exercise the actual transport without a GPU.
-cargo xtask scenario --name destruction-network --clients 2 --headless-clients --ticks 3600 --output .local/runs/network
+# Named built-in scenario. --loss-percent runs each client behind a UDP proxy
+# that drops/delays/reorders encrypted packets.
+cargo xtask scenario --name destruction-network --loss-percent 5 --output .local/runs/network
 
-# Packet impairment means encrypted UDP packets through the test proxy.
-cargo xtask scenario --name late-join-collapse --clients 3 --headless-clients --rtt-ms 100 --jitter-ms 20 --loss-percent 2 --output .local/runs/join
+# T17: two early cutters plus one --late-join replica that connects mid-collapse,
+# pulls a baseline over a bulk transfer, and catches up to the server hash.
+cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 
 # T05: offscreen renders of the acceptance shapes (shaded + normal + depth PNGs
 # and a summary.json). Needs a supported GPU/driver; exit 3 otherwise.

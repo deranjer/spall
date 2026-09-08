@@ -1,4 +1,24 @@
-//! GPU-free authoritative-server host. Networking is deliberately deferred to T09.
+//! GPU-free authoritative-server host.
+//!
+//! [`run`] is the T00 bounded process (no world state, no transport) still used
+//! by `cargo xtask smoke`. [`serve`] is the T10 networked replication host: it
+//! wraps a [`spall_sim::Simulation`] behind a [`spall_net`] QUIC endpoint,
+//! accepts clients, and broadcasts committed topology transactions plus 20 Hz
+//! motion snapshots.
+
+pub mod baseline;
+pub mod persist;
+pub mod serve;
+
+pub use baseline::{
+    BaselineError, BaselineTransfer, brick_repair_patch, capture_transfer, chunk_payload,
+    transfer_from_world, world_baseline,
+};
+pub use persist::{
+    CrashSuiteReport, PersistConfig, PersistError, ScenarioResult, capture, journal_records,
+    restore, run_crash_suite,
+};
+pub use serve::{Scene, ServeConfig, ServeError, ServeSummary, serve};
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};
 use std::{net::SocketAddr, path::PathBuf, thread, time::Duration};

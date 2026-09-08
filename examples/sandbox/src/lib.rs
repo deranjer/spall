@@ -1,4 +1,8 @@
-//! Game-owned configuration belongs here. T00 intentionally has no game rules yet.
+//! Game-owned configuration belongs here.
+
+/// Minimal game content (material catalog, player tools) that turns tool use
+/// into engine [`spall_sim::EditIntent`]s. The engine never imports this.
+pub mod game;
 
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()

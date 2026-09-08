@@ -1,0 +1,592 @@
+//! The T06 feasibility harness: runs every acceptance scenario against both
+//! collider representations and collects the measurements the ticket asks for
+//! (p50/p95/p99 step time, rebuild cost, primitive count, estimated memory,
+//! settle behaviour, mass agreement, tunnelling).
+//!
+//! [`run_feasibility`] is deterministic in *structure* (same scenes, same
+//! iteration counts) but its timing numbers are machine-dependent, so the
+//! CI-run tests here assert only on behaviour (settles, no blow-up, interior
+//! preserved, no tunnel, mass within tolerance). The absolute percentile
+//! numbers are produced by the `collision-bench` binary and recorded in
+//! `docs/collision-decision.md`.
+
+use crate::collider::{Representation, build_collider};
+use crate::fixtures;
+use crate::mass::analytic_mass_properties;
+use crate::metrics::{DurationSamples, PercentileSummary};
+use crate::occupancy::OccupancyGrid;
+use crate::world::{BodyKind, BodySpec, PhysicsConfig, PhysicsWorld};
+use spall_core::VolumeId;
+
+/// Knobs for one feasibility run. `small()` is the CI-sized configuration;
+/// `collision-bench` uses larger counts.
+#[derive(Debug, Clone, Copy)]
+pub struct FeasibilityParams {
+    /// Connected-body size, in bricks per axis, for the build/stress scenario.
+    pub multibrick: [i64; 3],
+    /// Number of loose debris pieces for the settle scenario.
+    pub debris_count: usize,
+    /// Steps to run each drop/settle scene.
+    pub settle_steps: u32,
+    /// Number of collider rebuilds to time for the edit-cost scenario.
+    pub rebuild_iters: u32,
+    /// Projectile speed, m/s, for the fast-object scenario.
+    pub projectile_speed: f32,
+}
+
+impl FeasibilityParams {
+    /// A configuration cheap enough for `cargo test` on CI.
+    pub fn small() -> Self {
+        Self {
+            multibrick: [2, 2, 2],
+            debris_count: 64,
+            settle_steps: 180,
+            rebuild_iters: 12,
+            projectile_speed: 220.0,
+        }
+    }
+
+    /// A heavier configuration for the standalone bench: the full 64-brick body
+    /// and 256 debris pieces from the ticket.
+    pub fn gate() -> Self {
+        Self {
+            multibrick: [4, 4, 4],
+            debris_count: 256,
+            settle_steps: 420,
+            rebuild_iters: 60,
+            projectile_speed: 220.0,
+        }
+    }
+}
+
+/// Per-representation results.
+#[derive(Debug, Clone)]
+pub struct RepresentationReport {
+    /// `"native_voxels"` or `"merged_cuboids"`.
+    pub representation: &'static str,
+
+    /// Primitive count for the 64-brick connected body.
+    pub multibrick_primitives: usize,
+    /// One-shot build time for that body, microseconds.
+    pub multibrick_build_us: f64,
+    /// Estimated collider memory for that body, bytes.
+    pub multibrick_est_bytes: usize,
+
+    /// Per-step pipeline time across the debris settle scene.
+    pub settle_step: PercentileSummary,
+    /// Fraction of debris pieces asleep at the end of the settle scene.
+    pub settle_sleep_fraction: f64,
+    /// Largest linear speed of any debris piece over the final 30 steps, m/s.
+    pub settle_max_speed: f64,
+    /// True if no body produced a non-finite state at any step.
+    pub settle_finite: bool,
+
+    /// Per-step pipeline time while the hollow building falls and lands.
+    pub building_step: PercentileSummary,
+    /// Interior clearance (ray from the centre) after settling, metres.
+    pub building_interior_clearance_m: f64,
+    /// True if the building came to rest.
+    pub building_settled: bool,
+
+    /// Collider rebuild cost after an edit, across `rebuild_iters` rebuilds.
+    pub rebuild: PercentileSummary,
+
+    /// Relative mass error vs the analytic reference for the hollow building.
+    pub mass_rel_err: f64,
+    /// Absolute centre-of-mass error vs the analytic reference, metres.
+    pub com_abs_err_m: f64,
+    /// Relative error of the sorted principal inertia vs the analytic reference.
+    pub inertia_rel_err: f64,
+
+    /// Highest CCD projectile speed (m/s) the thin wall still stopped.
+    pub projectile_max_stop_m_s: f64,
+
+    /// Solid cells in the worst-case fragmentation probe (a 3D checkerboard).
+    pub worst_case_solid_cells: u64,
+    /// Collider primitives for that probe: `1` for the voxel shape, or the box
+    /// count the greedy decomposition degenerates to (one per isolated cell).
+    pub worst_case_primitives: usize,
+}
+
+impl RepresentationReport {
+    /// Compact JSON object for the bench output.
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"representation\":\"{}\",\"multibrick_primitives\":{},\"multibrick_build_us\":{:.3},\"multibrick_est_bytes\":{},\"settle_step\":{},\"settle_sleep_fraction\":{:.4},\"settle_max_speed\":{:.4},\"settle_finite\":{},\"building_step\":{},\"building_interior_clearance_m\":{:.4},\"building_settled\":{},\"rebuild\":{},\"mass_rel_err\":{:.6},\"com_abs_err_m\":{:.6},\"inertia_rel_err\":{:.6},\"projectile_max_stop_m_s\":{:.1},\"worst_case_solid_cells\":{},\"worst_case_primitives\":{}}}",
+            self.representation,
+            self.multibrick_primitives,
+            self.multibrick_build_us,
+            self.multibrick_est_bytes,
+            self.settle_step.to_json(),
+            self.settle_sleep_fraction,
+            self.settle_max_speed,
+            self.settle_finite,
+            self.building_step.to_json(),
+            self.building_interior_clearance_m,
+            self.building_settled,
+            self.rebuild.to_json(),
+            self.mass_rel_err,
+            self.com_abs_err_m,
+            self.inertia_rel_err,
+            self.projectile_max_stop_m_s,
+            self.worst_case_solid_cells,
+            self.worst_case_primitives,
+        )
+    }
+}
+
+/// Full feasibility report: both representations under identical scenes.
+#[derive(Debug, Clone)]
+pub struct FeasibilityReport {
+    /// Parameters used.
+    pub params: FeasibilityParams,
+    /// Native voxel shape results.
+    pub native: RepresentationReport,
+    /// Merged-cuboid compound results.
+    pub compound: RepresentationReport,
+}
+
+impl FeasibilityReport {
+    /// Compact JSON for the bench output.
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"debris_count\":{},\"multibrick_bricks\":[{},{},{}],\"settle_steps\":{},\"rebuild_iters\":{},\"native\":{},\"compound\":{}}}",
+            self.params.debris_count,
+            self.params.multibrick[0],
+            self.params.multibrick[1],
+            self.params.multibrick[2],
+            self.params.settle_steps,
+            self.params.rebuild_iters,
+            self.native.to_json(),
+            self.compound.to_json(),
+        )
+    }
+}
+
+/// Runs the whole feasibility suite for both representations.
+pub fn run_feasibility(params: FeasibilityParams) -> FeasibilityReport {
+    FeasibilityReport {
+        params,
+        native: run_one(Representation::NativeVoxels, params),
+        compound: run_one(Representation::MergedCuboids, params),
+    }
+}
+
+fn run_one(rep: Representation, params: FeasibilityParams) -> RepresentationReport {
+    let (mb_primitives, mb_build_us, mb_bytes) = multibrick_build(rep, params.multibrick);
+    let (settle_step, sleep_fraction, max_speed, finite) = debris_settle(rep, params);
+    let (building_step, clearance, settled) = building_drop(rep, params.settle_steps);
+    let rebuild = rebuild_cost(rep, params.rebuild_iters);
+    let (mass_rel, com_abs, inertia_rel) = mass_agreement(rep);
+    let projectile_max_stop_m_s = projectile_threshold(rep, params.projectile_speed);
+    let (worst_case_solid_cells, worst_case_primitives) = worst_case_fragmentation(rep);
+
+    RepresentationReport {
+        representation: rep.label(),
+        multibrick_primitives: mb_primitives,
+        multibrick_build_us: mb_build_us,
+        multibrick_est_bytes: mb_bytes,
+        settle_step,
+        settle_sleep_fraction: sleep_fraction,
+        settle_max_speed: max_speed,
+        settle_finite: finite,
+        building_step,
+        building_interior_clearance_m: clearance,
+        building_settled: settled,
+        rebuild,
+        mass_rel_err: mass_rel,
+        com_abs_err_m: com_abs,
+        inertia_rel_err: inertia_rel,
+        projectile_max_stop_m_s,
+        worst_case_solid_cells,
+        worst_case_primitives,
+    }
+}
+
+/// A 3D checkerboard in a 16³ region: every occupied cell is isolated, so the
+/// greedy box decomposition cannot merge anything and degenerates to one box
+/// per cell. Reports `(solid cells, collider primitives)` — the number that
+/// bounds when the merged-cuboid path needs a coarse-fracture fallback.
+fn worst_case_fragmentation(rep: Representation) -> (u64, usize) {
+    use spall_core::{CellSizeCode, GlobalCell, VolumeId};
+    use spall_voxel::{EditPlan, Volume, fixtures as vox};
+    let id = VolumeId::new(1).unwrap();
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    let mut plan = EditPlan::new(id);
+    for z in 0..16 {
+        for y in 0..16 {
+            for x in 0..16 {
+                if (x + y + z) % 2 == 0 {
+                    plan.set(GlobalCell::new(x, y, z), vox::STONE);
+                }
+            }
+        }
+    }
+    v.apply_edit(&plan).expect("checkerboard edit");
+    let grid =
+        OccupancyGrid::from_region(&v, GlobalCell::new(0, 0, 0), GlobalCell::new(15, 15, 15))
+            .unwrap();
+    let built = build_collider(&grid, fixtures::CELL_M, rep);
+    (grid.solid_count(), built.primitives)
+}
+
+fn vid(n: u64) -> VolumeId {
+    VolumeId::new(n).unwrap()
+}
+
+fn multibrick_build(rep: Representation, bricks: [i64; 3]) -> (usize, f64, usize) {
+    let v = fixtures::connected_multibrick(vid(1), bricks, true);
+    let grid = OccupancyGrid::from_volume(&v)
+        .expect("resident")
+        .expect("non-empty");
+    let built = build_collider(&grid, fixtures::CELL_M, rep);
+    (
+        built.primitives,
+        built.build.as_secs_f64() * 1e6,
+        built.est_bytes,
+    )
+}
+
+fn debris_settle(
+    rep: Representation,
+    params: FeasibilityParams,
+) -> (PercentileSummary, f64, f64, bool) {
+    let mut world = PhysicsWorld::new(PhysicsConfig::default());
+
+    // Fixed floor: shallow slab, top surface at y = 1.0 m.
+    let floor = fixtures::floor_slab(vid(1), 2, 2, 4);
+    let floor_grid = OccupancyGrid::from_volume(&floor).unwrap().unwrap();
+    world.add_body(BodySpec {
+        kind: BodyKind::Fixed,
+        representation: rep,
+        grid: floor_grid,
+        cell_m: fixtures::CELL_M,
+        density_kg_m3: fixtures::STONE_DENSITY,
+        translation_m: [0.0, 0.0, 0.0],
+        linvel_m_s: [0.0; 3],
+    });
+
+    // Loose grid of pieces above the floor.
+    let pieces = fixtures::debris_pieces(100, params.debris_count, 2);
+    let per_row = (params.debris_count as f64).cbrt().ceil() as usize;
+    let mut ids = Vec::with_capacity(pieces.len());
+    for (n, (_, v)) in pieces.iter().enumerate() {
+        let grid = OccupancyGrid::from_volume(v).unwrap().unwrap();
+        let (ix, iy, iz) = (
+            n % per_row,
+            (n / per_row) % per_row,
+            n / (per_row * per_row),
+        );
+        let id = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: rep,
+            grid,
+            cell_m: fixtures::CELL_M,
+            density_kg_m3: fixtures::STONE_DENSITY,
+            translation_m: [
+                2.0 + ix as f32 * 0.9,
+                2.0 + iy as f32 * 0.9,
+                2.0 + iz as f32 * 0.9,
+            ],
+            linvel_m_s: [0.0; 3],
+        });
+        ids.push(id);
+    }
+
+    let mut step = DurationSamples::new();
+    let mut finite = true;
+    let mut max_speed = 0.0_f64;
+    for s in 0..params.settle_steps {
+        let t = world.step();
+        step.push(t.pipeline);
+        let tail = s + 30 >= params.settle_steps;
+        for id in &ids {
+            let st = world.body_state(*id);
+            if !st.is_finite() {
+                finite = false;
+            }
+            if tail {
+                max_speed = max_speed.max(st.speed_m_s() as f64);
+            }
+        }
+    }
+    let asleep = ids
+        .iter()
+        .filter(|id| world.body_state(**id).sleeping)
+        .count();
+    (
+        step.summary_us(),
+        asleep as f64 / ids.len() as f64,
+        max_speed,
+        finite,
+    )
+}
+
+fn building_drop(rep: Representation, steps: u32) -> (PercentileSummary, f64, bool) {
+    let mut world = PhysicsWorld::new(PhysicsConfig::default());
+
+    let floor = fixtures::floor_slab(vid(1), 2, 2, 4);
+    let floor_grid = OccupancyGrid::from_volume(&floor).unwrap().unwrap();
+    world.add_body(BodySpec {
+        kind: BodyKind::Fixed,
+        representation: rep,
+        grid: floor_grid,
+        cell_m: fixtures::CELL_M,
+        density_kg_m3: fixtures::STONE_DENSITY,
+        translation_m: [0.0, 0.0, 0.0],
+        linvel_m_s: [0.0; 3],
+    });
+
+    // Floor slab top is at y = 4 cells * 0.25 m = 1.0 m; drop the building a
+    // short distance onto it, centred over the slab (16 m wide, building 3 m).
+    let building = fixtures::hollow_building(vid(2));
+    let grid = OccupancyGrid::from_volume(&building).unwrap().unwrap();
+    let dims = grid.dims();
+    let id = world.add_body(BodySpec {
+        kind: BodyKind::Dynamic { ccd: false },
+        representation: rep,
+        grid,
+        cell_m: fixtures::CELL_M,
+        density_kg_m3: fixtures::STONE_DENSITY,
+        translation_m: [6.5, 1.3, 6.5],
+        linvel_m_s: [0.0; 3],
+    });
+
+    let mut step = DurationSamples::new();
+    let mut finite = true;
+    for _ in 0..steps {
+        step.push(world.step().pipeline);
+        if !world.body_state(id).is_finite() {
+            finite = false;
+        }
+    }
+
+    let st = world.body_state(id);
+    let settled = finite && st.is_finite() && st.speed_m_s() < 0.35;
+
+    // Interior clearance: rebuild the collider shape at the settled pose is
+    // unnecessary — the shape is rigid, so query the freshly built shape.
+    let clearance = {
+        let building = fixtures::hollow_building(vid(2));
+        let grid = OccupancyGrid::from_volume(&building).unwrap().unwrap();
+        let built = build_collider(&grid, fixtures::CELL_M, rep);
+        interior_clearance(built.collider.shape(), dims, fixtures::CELL_M) as f64
+    };
+
+    (step.summary_us(), clearance, settled)
+}
+
+fn interior_clearance(
+    shape: &dyn rapier3d::parry::shape::Shape,
+    dims: [u32; 3],
+    cell_m: f32,
+) -> f32 {
+    use rapier3d::parry::math::{Pose, Vector};
+    use rapier3d::parry::query::Ray;
+    let centre = Vector::new(
+        dims[0] as f32 * cell_m * 0.5,
+        dims[1] as f32 * cell_m * 0.5,
+        dims[2] as f32 * cell_m * 0.5,
+    );
+    let ray = Ray::new(centre, Vector::new(1.0, 0.0, 0.0));
+    shape
+        .cast_ray(&Pose::IDENTITY, &ray, 100.0, true)
+        .unwrap_or(0.0)
+}
+
+fn rebuild_cost(rep: Representation, iters: u32) -> PercentileSummary {
+    let mut world = PhysicsWorld::new(PhysicsConfig::default());
+    let building = fixtures::hollow_building(vid(1));
+    let grid = OccupancyGrid::from_volume(&building).unwrap().unwrap();
+    let id = world.add_body(BodySpec {
+        kind: BodyKind::Dynamic { ccd: false },
+        representation: rep,
+        grid: grid.clone(),
+        cell_m: fixtures::CELL_M,
+        density_kg_m3: fixtures::STONE_DENSITY,
+        translation_m: [0.0, 5.0, 0.0],
+        linvel_m_s: [0.0; 3],
+    });
+
+    let mut samples = DurationSamples::new();
+    for _ in 0..iters {
+        let d = world.rebuild_collider(id, &grid, rep);
+        samples.push(d);
+        world.step();
+    }
+    samples.summary_us()
+}
+
+fn mass_agreement(rep: Representation) -> (f64, f64, f64) {
+    let building = fixtures::hollow_building(vid(1));
+    let grid = OccupancyGrid::from_volume(&building).unwrap().unwrap();
+    let analytic =
+        analytic_mass_properties(&grid, fixtures::CELL_M as f64, fixtures::stone_density);
+
+    let mut world = PhysicsWorld::new(PhysicsConfig::default());
+    let id = world.add_body(BodySpec {
+        kind: BodyKind::Dynamic { ccd: false },
+        representation: rep,
+        grid,
+        cell_m: fixtures::CELL_M,
+        density_kg_m3: fixtures::STONE_DENSITY,
+        translation_m: [0.0, 0.0, 0.0],
+        linvel_m_s: [0.0; 3],
+    });
+    let (mass, com, inertia) = world.derived_mass_properties(id);
+
+    let mass_rel = ((analytic.mass_kg - mass as f64) / analytic.mass_kg).abs();
+    let com_abs = (0..3)
+        .map(|i| (analytic.com_m[i] - com[i] as f64).abs())
+        .fold(0.0_f64, f64::max);
+
+    // The hollow building is axis-aligned and mirror-symmetric, so its analytic
+    // inertia tensor is diagonal and its diagonal *is* the principal inertia.
+    // Rapier may return the three principal values in a different axis order, so
+    // compare the sorted triples.
+    let mut a_diag = analytic.principal_diagonal();
+    let mut d_diag = [inertia[0] as f64, inertia[1] as f64, inertia[2] as f64];
+    a_diag.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    d_diag.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let scale = a_diag.iter().cloned().fold(1e-9_f64, f64::max);
+    let inertia_rel = (0..3)
+        .map(|i| (a_diag[i] - d_diag[i]).abs() / scale)
+        .fold(0.0_f64, f64::max);
+    (mass_rel, com_abs, inertia_rel)
+}
+
+/// Fires a CCD pellet at a 0.5 m thin wall at rising speeds and returns the
+/// highest speed (m/s) at which the pellet was still stopped on the near side.
+fn projectile_threshold(rep: Representation, top_speed: f32) -> f64 {
+    let ladder = [
+        20.0_f32,
+        40.0,
+        60.0,
+        90.0,
+        130.0,
+        180.0,
+        top_speed.max(180.0),
+    ];
+    let mut best = 0.0_f64;
+    for &speed in &ladder {
+        if projectile_stops(rep, speed) {
+            best = speed as f64;
+        } else {
+            break;
+        }
+    }
+    best
+}
+
+fn projectile_stops(rep: Representation, speed: f32) -> bool {
+    let mut world = PhysicsWorld::new(PhysicsConfig::default());
+
+    let wall = fixtures::thin_wall(vid(1), 2);
+    let wall_grid = OccupancyGrid::from_volume(&wall).unwrap().unwrap();
+    world.add_body(BodySpec {
+        kind: BodyKind::Fixed,
+        representation: rep,
+        grid: wall_grid,
+        cell_m: fixtures::CELL_M,
+        density_kg_m3: fixtures::STONE_DENSITY,
+        translation_m: [4.0, 0.0, 0.0],
+        linvel_m_s: [0.0; 3],
+    });
+
+    let pellet = fixtures::debris_pieces(50, 1, 1).pop().unwrap().1;
+    let pellet_grid = OccupancyGrid::from_volume(&pellet).unwrap().unwrap();
+    let id = world.add_body(BodySpec {
+        kind: BodyKind::Dynamic { ccd: true },
+        representation: rep,
+        grid: pellet_grid,
+        cell_m: fixtures::CELL_M,
+        density_kg_m3: fixtures::STONE_DENSITY,
+        translation_m: [0.0, 3.0, 3.0],
+        linvel_m_s: [speed, 0.0, 0.0],
+    });
+
+    // Only step long enough for the pellet to have crossed the wall many times
+    // over if it were going to tunnel; keep it short so gravity stays irrelevant.
+    for _ in 0..30 {
+        world.step();
+    }
+    let x = world.body_state(id).translation_m[0];
+    // Wall front face is at x = 4.0; a stopped pellet rests near x = 3.75.
+    x.is_finite() && x < 4.3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_feasibility_run_behaves() {
+        let report = run_feasibility(FeasibilityParams::small());
+        for r in [&report.native, &report.compound] {
+            assert!(r.settle_finite, "{}: non-finite state", r.representation);
+            assert!(
+                r.settle_max_speed < 1.0,
+                "{}: debris still moving at {} m/s",
+                r.representation,
+                r.settle_max_speed
+            );
+            assert!(
+                r.settle_sleep_fraction >= 0.9,
+                "{}: only {:.0}% of debris asleep",
+                r.representation,
+                r.settle_sleep_fraction * 100.0
+            );
+            assert!(
+                r.building_settled,
+                "{}: hollow building did not come to rest",
+                r.representation
+            );
+            assert!(
+                r.building_interior_clearance_m > 3.0 * fixtures::CELL_M as f64,
+                "{}: interior clearance {} collapsed",
+                r.representation,
+                r.building_interior_clearance_m
+            );
+            assert!(
+                r.mass_rel_err < 0.02,
+                "{}: mass error {:.3}",
+                r.representation,
+                r.mass_rel_err
+            );
+            assert!(
+                r.com_abs_err_m < 0.05,
+                "{}: COM error {} m",
+                r.representation,
+                r.com_abs_err_m
+            );
+            assert!(
+                r.inertia_rel_err < 0.15,
+                "{}: principal-inertia error {:.3}",
+                r.representation,
+                r.inertia_rel_err
+            );
+            assert!(r.rebuild.p50_us > 0.0);
+        }
+        // The merged compound is the correctness baseline: its interior must be
+        // at least as open as the native shape's, and it must stop a fast CCD
+        // projectile hitting a 0.5 m wall.
+        assert!(
+            report.compound.building_interior_clearance_m
+                >= report.native.building_interior_clearance_m - 0.05
+        );
+        assert!(
+            report.compound.projectile_max_stop_m_s >= 60.0,
+            "compound tunnelled at {} m/s",
+            report.compound.projectile_max_stop_m_s
+        );
+
+        // Fragmentation probe: the voxel shape stays one primitive; the greedy
+        // compound degenerates to one box per isolated cell — the bound that
+        // drives the coarse-fracture fallback in docs/collision-decision.md.
+        assert_eq!(report.native.worst_case_primitives, 1);
+        assert_eq!(
+            report.compound.worst_case_primitives as u64,
+            report.compound.worst_case_solid_cells
+        );
+    }
+}

@@ -175,6 +175,143 @@ Transitive crates newly locked by `image` with only the `png` feature:
 `pxfm 0.1.30` (`miniz_oxide` is already present via wgpu) — all
 `MIT`/`MIT OR Apache-2.0`/`Zlib`.
 
+## T06 — editable voxel collision feasibility (verified 2026-09-07)
+
+`spall_physics` adds the physics solver named in `README.md`. It is the only
+crate that depends on `rapier3d`; Rapier/parry types never leave the
+`spall_physics::world` and `::collider` modules (callers address bodies by an
+opaque `BodyId`). Dependency direction matches `docs/architecture.md`:
+`spall_physics -> spall_voxel` (`-> spall_core`); no `spall_jobs` /
+`spall_structure` / GPU / window / network edge.
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T06 |
+| --- | ---: | --- | --- | --- |
+| rapier3d | 0.35.3 | default (`dim3` + `f32` + `std`) | `Apache-2.0` | rigid-body solver, compound + voxel colliders, CCD, contact manifolds |
+
+`rapier3d 0.35` moved its public math to **glam** (via the `glamx` wrapper):
+`Vector` = `glam::Vec3`, `Rotation` = `glam::Quat`, `Pose` = `glamx::Pose3`,
+`IVector` = `glam::IVec3`. `PhysicsPipeline::step` takes a `&mut BroadPhaseBvh`
+(aliased `DefaultBroadPhase`). This is the released `0.35.3` surface, not the
+`master`-branch docs.
+
+Transitive crates newly locked (all `Apache-2.0` or `MIT OR Apache-2.0`
+family; `wide` is `Zlib OR Apache-2.0 OR MIT`): `parry3d 0.30.2`,
+`nalgebra 0.35.0`, `nalgebra-macros`, `simba 0.10.2`, `glamx 0.3.0`,
+`glam 0.30.10` / `0.31.1` / `0.32.1` (older majors pulled by parry/rapier/glamx,
+coexisting with the workspace's `glam 0.33.6`), `approx`, `wide`, `safe_arch`,
+`matrixmultiply`, `rawpointer`, `libm`, `typenum`, `num-complex`,
+`num-rational`, `num-bigint`, `num-integer`, `num-derive`, `num-traits`,
+`ordered-float`, `spade`, `rstar`, `robust`, `heapless` (already present via
+postcard), `hash32`, `hashbrown`, `foldhash`, `allocator-api2`, `ena`,
+`downcast-rs`, `either`, `profiling-procmacros`. `nalgebra`/`simba` compile a
+`build.rs`; no C toolchain beyond the MSVC tools already recorded is needed.
+
+`rapier3d` features **available but not enabled**: `enhanced-determinism`
+(libm-forced math for cross-platform reproducibility — physics tests use
+position/energy tolerances instead), `parallel` (rayon), `simd8`,
+`serde-serialize`. A dev-dependency enables `spall_voxel/oracle` for the mass
+cross-check. The `collision-bench` binary and the `#[cfg(test)]` feasibility
+scenarios are the only consumers; no server loop drives physics yet (T08).
+
+## T08 — authoritative edit and body transfer (verified 2026-09-07)
+
+`spall_sim` adds **no new external dependency**. It depends on `spall_structure`
+(support graph, split membership, conservation ledger), `spall_physics`
+(collider builds, `PhysicsWorld`, analytic mass), `spall_jobs`
+(`Scheduler` / `JobToken` / `WorldView` for bounded staging and commit-time
+re-validation), `spall_protocol` (`TopologyTransaction` / `MotionSnapshot` DTOs
+and the canonical hash), `spall_voxel`, `spall_core`, `glam` (already locked in
+T03 — used for the child-velocity cross product and pose math), and `thiserror`.
+`Cargo.lock` gains only the `spall_sim` package node.
+
+The `docs/architecture.md` dependency graph is refined from
+`spall_sim -> spall_structure, spall_physics` to add `-> spall_jobs, spall_protocol`
+(both `-> spall_core` foundation crates; no cycle). Rationale: staging is a
+bounded off-tick job re-validated through the same `JobToken` mechanism every
+other derived result uses, and `spall_sim` owns the authoritative-state → wire
+record conversion (`docs/architecture.md`).
+
+An optional `scenario` feature enables `serde` / `serde_json` (already locked)
+for the offline `sim-scenario` binary; the library and its tests do not pull
+them. Dev-dependencies enable `spall_structure/oracle` (dense BFS support
+reference for the conservation cross-check) and `spall_voxel/oracle`. No GPU,
+window, network, async, or filesystem code enters `spall_sim` (the scenario
+binary writes a `summary.json` under `.local/`, like `collision-bench`).
+
+Two additive, non-breaking methods were added to `spall_physics` for the T08
+integration (no contract or signature change to existing items):
+`OccupancyGrid::from_solid_mask` (build a grid from a caller-supplied solid
+mask — used by the coarse-fracture fallback) and
+`PhysicsWorld::set_body_pose` / `set_body_velocity` (spawn a split child at its
+parent's transform and inherited velocity).
+
+## T10 — replica transactions and motion (verified 2026-09-07)
+
+**No new external dependency.** The T10 crates only add workspace-internal path
+edges and reuse already-locked crates:
+
+- `spall_sim` gains a `replication` module (no new deps).
+- `spall_client` adds path deps `spall_protocol`, `spall_net`, `spall_voxel`
+  and enables `tokio` (`rt`, `rt-multi-thread`, `net`, `time`, `sync`, `macros`)
+  + `serde` / `serde_json` for the headless replication client and its JSON
+  summary. `spall_sim` is a **dev-dependency** only (the phase-B acceptance test
+  drives a real authoritative `Simulation`; it is not a runtime edge in the
+  `docs/architecture.md` graph). A `[dev-dependencies]` cycle
+  `spall_client -> spall_sim -> ... -> spall_client`? No: `spall_sim` does not
+  depend on `spall_client`.
+- `spall_server` adds path deps `spall_protocol`, `spall_net`, `spall_sim`,
+  `spall_voxel` and the same `tokio` feature set, plus `serde` / `serde_json` /
+  `tracing`. `spall_client` is a **dev-dependency** for the in-process
+  server↔client session test.
+- `examples/sandbox` adds a non-optional `spall_net` path dep so
+  `sandbox-server --serve` / `sandbox-client --connect` can read per-run
+  credential files.
+- `tools/xtask` adds no dep: `cargo xtask session` / `scenario` reuse the
+  already-present `spall_net` (`UdpProxy`), `tokio`, and `serde_json`.
+
+`Cargo.lock` gains only the new package nodes; every external version is
+unchanged from T06 (`rapier3d` stack) and T09 (`quinn` / `rustls` / `tokio`
+stack).
+
+## T16 — durable world checkpoint and journal (verified 2026-09-07)
+
+New crate `crates/spall_store` — the save schema and durable SQLite I/O. It is
+the only crate that depends on `rusqlite` / `zstd`; dependency direction matches
+`docs/architecture.md` (`spall_store -> spall_protocol -> spall_core`), with no
+edge to `spall_voxel` / `spall_sim` / GPU / window / async.
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T16 |
+| --- | ---: | --- | --- | --- |
+| rusqlite | 0.37.0 | `bundled` (vendored SQLite 3, `libsqlite3-sys 0.35`) | `MIT` | WAL writer, checkpoint/journal transactions, `PRAGMA user_version` guard |
+| zstd | 0.13.3 | default (`zstd-safe 7`, `zstd-sys 2.1.0+zstd.1.5.7`) | `MIT` | compressed dense brick payloads, bounded decompression |
+
+Transitive crates newly locked: `libsqlite3-sys 0.35.0` (`MIT`), `zstd-safe
+7.3.0` (`BSD-3-Clause`), `zstd-sys 2.1.0+zstd.1.5.7` (`BSD-3-Clause`; vendored
+zstd C is `BSD-3-Clause OR GPL-2.0`), `hashlink 0.10.0` (`MIT OR Apache-2.0`),
+`fallible-iterator 0.3.0` / `fallible-streaming-iterator 0.1.9` (`MIT/Apache-2.0`),
+`getrandom 0.4.3` (`MIT OR Apache-2.0`), plus build-time `pkg-config`, `vcpkg`,
+`jobserver`. `libsqlite3-sys` and `zstd-sys` compile vendored C with the MSVC C
+toolchain already recorded below; no extra Windows prerequisite.
+
+`rusqlite` features **available but not enabled**: `serde_json`, `chrono`,
+`load_extension`, `backup` (versioned DTO migration into a separate database is
+a later task; `docs/protocol.md`). `spall_store` sets `synchronous=FULL` and
+verifies both pragmas on open. `blake3` (already locked in T01) provides the
+16-byte journal-payload integrity check. `postcard` (T01) encodes the save DTOs;
+the journal keeps `spall_protocol` wire records verbatim so the wire schema
+stays versioned independently of the save schema.
+
+## T17 — live late join, repair, reconnect (verified 2026-09-07)
+
+**No new external dependency.** `spall_protocol` gains a `baseline` module (the
+`BaselineWorld` payload; reuses `postcard` / `serde` / `blake3`). `spall_server`
+gains a `baseline` module and the `serve` late-join bridge, and reuses its
+existing `spall_store` path dep only for the crash suite — the late-join
+baseline is built straight from `SimWorld`, not from a `Checkpoint`, so the
+transfer path has no SQLite dependency. `spall_client::net` reuses the
+already-present `spall_net` bulk-stream API. `tools/xtask` and `examples/sandbox`
+add no dependency (new CLI flags only). `Cargo.lock` is unchanged.
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,

@@ -104,6 +104,35 @@ pub fn sloped_terrain(id: VolumeId) -> Volume {
     v
 }
 
+/// The T10 replication scene: an anchored stone floor, a single slender column,
+/// and a raised beam the column alone holds up, plus a resident air layer above.
+/// Cutting the column detaches the beam as exactly one unsupported component —
+/// the terrain-to-body transfer the replication tests exercise. Shared verbatim
+/// by the authoritative server (`spall_sim`) and the client replica baseline
+/// (`spall_client`) so both start from an identical volume.
+///
+/// - floor:  `x 0..=23`, `z 0..=3`,  `y 0..=1`  (anchored at `y = 0`)
+/// - column: `x 10..=11`, `z 1..=2`, `y 2..=7`
+/// - beam:   `x 4..=20`, `z 1..=2`,  `y 8..=9`
+/// - air:    `x 0..=23`, `z 0..=3`,  `y 10..=15` (resident, not merely absent)
+pub fn bridge_scene(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    for (a, b, m) in [
+        (GlobalCell::new(0, 0, 0), GlobalCell::new(23, 1, 3), STONE),
+        (GlobalCell::new(10, 2, 1), GlobalCell::new(11, 7, 2), STONE),
+        (GlobalCell::new(4, 8, 1), GlobalCell::new(20, 9, 2), STONE),
+        (
+            GlobalCell::new(0, 10, 0),
+            GlobalCell::new(23, 15, 3),
+            MaterialId::AIR,
+        ),
+    ] {
+        v.apply_edit(&EditPlan::filled_box(id, a, b, m))
+            .expect("bridge scene edit");
+    }
+    v
+}
+
 /// BLAKE3 digest over a volume's resident bricks in canonical `(z, y, x)`
 /// order: cell size, then per brick `(coord, content hash, revision)`. Stable
 /// across runs and platforms for a given fixture; use it to pin fixtures in

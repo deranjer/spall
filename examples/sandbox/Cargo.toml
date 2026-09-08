@@ -32,9 +32,12 @@ client = [
 [dependencies]
 clap.workspace = true
 spall_client = { path = "../../crates/spall_client", optional = true }
+spall_core = { path = "../../crates/spall_core" }
 spall_mesh = { workspace = true, optional = true }
+spall_net = { path = "../../crates/spall_net" }
 spall_render = { workspace = true, optional = true }
 spall_server = { path = "../../crates/spall_server" }
+spall_sim = { path = "../../crates/spall_sim" }
 glam = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

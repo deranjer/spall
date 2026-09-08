@@ -1,0 +1,39 @@
+[package]
+name = "spall_sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints.clippy]
+# The commit/transfer path threads many measured authoritative values.
+too_many_arguments = "allow"
+
+[dependencies]
+glam.workspace = true
+spall_core.workspace = true
+spall_jobs.workspace = true
+spall_physics.workspace = true
+spall_protocol.workspace = true
+spall_structure.workspace = true
+spall_voxel.workspace = true
+thiserror.workspace = true
+
+# Offline scenario binary only.
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+# Pulls in the JSON serialisation used by the offline `sim-scenario` binary.
+scenario = ["dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+glam = { workspace = true }
+spall_core = { workspace = true }
+spall_protocol = { workspace = true }
+spall_structure = { workspace = true, features = ["oracle"] }
+spall_voxel = { workspace = true, features = ["oracle"] }
+
+[[bin]]
+name = "sim-scenario"
+path = "src/bin/sim_scenario.rs"
+required-features = ["scenario"]

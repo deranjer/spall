@@ -1,5 +1,6 @@
 mod netcheck;
 mod process;
+mod session;
 
 use clap::{Args, Parser, Subcommand};
 use process::{ProcessFailure, run_bounded, wait_for_server};
@@ -30,17 +31,31 @@ enum CommandKind {
     /// T09 transport harness: one QUIC server, N headless clients, an opt UDP
     /// loss proxy, every channel exercised, bounded teardown.
     NetCheck(netcheck::NetCheckArgs),
-    /// Planned for T10+ (needs replication + scenario fixtures).
-    Session(UnavailableArgs),
-    /// Planned for T10+ (needs replication + scenario fixtures).
-    Scenario(UnavailableArgs),
+    /// T10 replication harness: one `sandbox-server --serve`, N
+    /// `sandbox-client --connect`, real QUIC, converge-to-one-hash check.
+    Session(session::SessionArgs),
+    /// T10 replication harness against a named built-in scenario
+    /// (`fixtures/scenarios/<name>.json`).
+    Scenario(session::ScenarioArgs),
     /// Render the T05 acceptance shapes offscreen (shaded + normal + depth
     /// PNGs). Exit 3 means no GPU/capture capability.
     Capture(CaptureArgs),
     /// Planned for later performance gates.
     Bench(UnavailableArgs),
-    /// Planned for T16.
-    CrashTest(UnavailableArgs),
+    /// T16 persistence crash suite: real `spall_sim::Simulation` → `spall_store`
+    /// → recovery, with crash-point and disk-fault injection. Writes
+    /// `summary.json` with the measured bytes/write rate.
+    CrashTest(CrashTestArgs),
+}
+
+#[derive(Debug, Args)]
+struct CrashTestArgs {
+    /// Only `persistence` is implemented.
+    #[arg(long, default_value = "persistence")]
+    suite: String,
+    /// Output directory. If omitted a unique directory under .local/runs is created.
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -133,13 +148,54 @@ fn run(cli: Cli) -> Result<(), XtaskError> {
         CommandKind::Check => check(),
         CommandKind::Smoke(args) => smoke(args),
         CommandKind::NetCheck(args) => netcheck::run(args, unique_output),
-        CommandKind::Session(_) => unavailable("session", "T10 replication and scenario fixtures"),
-        CommandKind::Scenario(_) => {
-            unavailable("scenario", "T10 replication and scenario fixtures")
-        }
+        CommandKind::Session(args) => session::run_session(args, || unique_run_dir("session")),
+        CommandKind::Scenario(args) => session::run_scenario(args, || unique_run_dir("scenario")),
         CommandKind::Capture(args) => capture(args),
         CommandKind::Bench(_) => unavailable("bench", "G1/G2 measurement work"),
-        CommandKind::CrashTest(_) => unavailable("crash-test", "T16 persistence"),
+        CommandKind::CrashTest(args) => crash_test(args),
+    }
+}
+
+fn crash_test(args: CrashTestArgs) -> Result<(), XtaskError> {
+    if args.suite != "persistence" {
+        eprintln!(
+            "xtask: crash-test suite {:?} is not implemented (only `persistence`)",
+            args.suite
+        );
+        return Err(XtaskError::Capability("unknown crash-test suite".into()));
+    }
+    let output = args.output.unwrap_or_else(|| unique_run_dir("crash"));
+    std::fs::create_dir_all(&output).map_err(|source| XtaskError::Output {
+        path: output.display().to_string(),
+        source,
+    })?;
+
+    run_cargo(&[
+        "build",
+        "-p",
+        "spall_server",
+        "--features",
+        "persist-bench",
+        "--bin",
+        "crash-bench",
+    ])?;
+
+    let status = Command::new(sandbox_binary("crash-bench"))
+        .args(["--output", &output.display().to_string()])
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|source| XtaskError::Output {
+            path: "crash-bench".into(),
+            source,
+        })?;
+    if status.success() {
+        println!("crash-test passed: {}", output.display());
+        Ok(())
+    } else {
+        Err(XtaskError::Cargo(
+            vec!["crash-bench".into()],
+            status.code().unwrap_or(1),
+        ))
     }
 }
 
@@ -339,7 +395,7 @@ fn capture(args: CaptureArgs) -> Result<(), XtaskError> {
     }
     let output = args
         .output
-        .unwrap_or_else(|| unique_output_named("t05-capture"));
+        .unwrap_or_else(|| unique_run_dir("t05-capture"));
     std::fs::create_dir_all(&output).map_err(|source| XtaskError::Output {
         path: output.display().to_string(),
         source,
@@ -402,10 +458,10 @@ fn sandbox_binary(name: &str) -> PathBuf {
 }
 
 fn unique_output() -> PathBuf {
-    unique_output_named("smoke")
+    unique_run_dir("smoke")
 }
 
-fn unique_output_named(prefix: &str) -> PathBuf {
+fn unique_run_dir(prefix: &str) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock precedes Unix epoch")

@@ -1,4 +1,14 @@
-//! Native render-window host. Voxel extraction and networking are added by later tasks.
+//! Native render-window host and the client-side replica. GPU voxel extraction
+//! and transport wiring are added by later tasks.
+
+pub mod net;
+pub mod replica;
+
+pub use net::{
+    ClientNetConfig, ClientNetError, ClientSummary, ScriptedAction, cut_request,
+    run_replication_client,
+};
+pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};
 use std::{path::PathBuf, sync::Arc};

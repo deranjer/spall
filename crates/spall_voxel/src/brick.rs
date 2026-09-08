@@ -153,6 +153,33 @@ impl Brick {
         Self::uniform(MaterialId::AIR, Revision::ZERO)
     }
 
+    /// Rebuilds a brick from a persisted `32768`-cell material layer, its
+    /// revision, and its modified flag. Used by save recovery (T16): the
+    /// authoritative bytes come straight from the store, not from replaying an
+    /// edit, so the `edited` tombstone bit and the exact revision are restored
+    /// verbatim. Collapses to uniform storage when every cell is equal.
+    ///
+    /// Panics if `cells.len() != CELLS_PER_BRICK`.
+    pub fn restored(cells: &[MaterialId], revision: Revision, edited: bool) -> Self {
+        assert_eq!(
+            cells.len(),
+            CELLS_PER_BRICK,
+            "a restored brick layer is exactly {CELLS_PER_BRICK} cells"
+        );
+        let first = cells[0];
+        let mut brick = Self::uniform(first, revision);
+        for (i, &material) in cells.iter().enumerate() {
+            if material != first {
+                let local = LocalCell::from_linear_index(i as u16)
+                    .expect("i < CELLS_PER_BRICK fits a LocalCell");
+                brick.set_cell(local, material);
+            }
+        }
+        brick.collapse();
+        brick.edited = edited;
+        brick
+    }
+
     #[inline]
     pub fn get(&self, cell: LocalCell) -> MaterialId {
         self.material.get(cell)
@@ -347,6 +374,28 @@ mod tests {
         assert!(dense.is_dense());
 
         assert_eq!(uniform.content_hash(), dense.content_hash());
+    }
+
+    #[test]
+    fn restored_brick_round_trips_cells_revision_and_modified_flag() {
+        let mut cells = vec![MaterialId(1); CELLS_PER_BRICK];
+        cells[0] = MaterialId(4);
+        cells[9] = MaterialId::AIR;
+        let brick = Brick::restored(&cells, Revision(42), true);
+        assert_eq!(brick.revision(), Revision(42));
+        assert!(brick.is_edited());
+        assert_eq!(brick.get(cell(0, 0, 0)), MaterialId(4));
+        assert_eq!(brick.get(cell(9, 0, 0)), MaterialId::AIR);
+        assert_eq!(brick.get(cell(1, 0, 0)), MaterialId(1));
+
+        // An all-equal restore collapses to uniform storage.
+        let uniform = Brick::restored(&vec![MaterialId(2); CELLS_PER_BRICK], Revision(1), false);
+        assert!(!uniform.is_dense());
+        assert!(!uniform.is_edited());
+
+        // A fully mined restore is a modified-air tombstone.
+        let tomb = Brick::restored(&vec![MaterialId::AIR; CELLS_PER_BRICK], Revision(7), true);
+        assert!(tomb.is_modified_air());
     }
 
     #[test]

@@ -13,7 +13,7 @@ spall_jobs    -> spall_core                     bounded scheduling, result token
 spall_mesh    -> spall_voxel, spall_jobs        surface generation, no GPU
 spall_structure -> spall_voxel, spall_jobs      connectivity, support, split plans
 spall_physics -> spall_voxel                    Rapier adapter, collision builds
-spall_sim     -> spall_structure, spall_physics    authoritative state and tick order
+spall_sim     -> spall_structure, spall_physics, spall_jobs, spall_protocol   authoritative state and tick order
 spall_protocol -> spall_core                   explicit DTOs and codecs only
 spall_net     -> spall_protocol                 Quinn transport adapter (Tokio; T09)
 spall_store   -> spall_protocol                 checkpoint/journal bytes and indexes
@@ -24,7 +24,7 @@ sandbox (example) -> spall_server, spall_client   game rules and executable entr
 xtask                                    process/scenario/build orchestration
 ```
 
-spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
+spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The graph edge is refined from `spall_sim -> spall_structure, spall_physics` to add `-> spall_jobs, spall_protocol` (T08): staging is submitted to a `spall_jobs::Scheduler` and re-validated through a `JobToken` like any other off-tick result, and every commit emits a `spall_protocol::TopologyTransaction`. Both new targets are foundation crates (`-> spall_core`); no cycle is introduced. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
 
 Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
 in-process `cargo xtask net-check` transport harness. Add `games/survival` only
@@ -91,6 +91,10 @@ Conflict rule: jobs may overlap in preparation, but commits revalidate every rea
 
 Physics must never collide with a deleted wall or fall through a newly built wall after the authoritative transaction commits. Renderer uploads may lag briefly, but staging keeps an old consistent replica visible until its transaction can be presented. Expose revision lag and prioritize local collision/render updates.
 
+T08 outcome (`spall_sim`): the whole path above is implemented for the all-resident G1 case. An accepted `EditIntent` is staged off-tick against an immutable snapshot (`stage_edit`) — deterministic brush plan, dry-run `EditOutcome`, `spall_structure` re-classification, and a `JobToken` over every brick read — then committed atomically at a tick boundary (`commit`). A stale token at commit means an earlier commit that tick touched a shared brick; the intent is recomputed and retried in request order, and a region that keeps losing that race is routed through a bounded serial queue (one commit per tick) so it still progresses. On commit the brush is applied to the live volume, every unsupported component (terrain) or every non-largest component (a free dynamic body) is copied into a new body **at its exact split-instant world location** with mass from the fine voxel grid and velocity `v_parent + omega_parent x (r_child_com - r_parent_com)` plus a one-time explosion impulse, and every affected collider is rebuilt in the same tick. A repeated `RequestId` returns the existing `ActionStatus` and can never cut twice or apply a second impulse. The collider budget from `docs/collision-decision.md` (`B = 4096` merged boxes, then a conservative same-resolution coarsen) is enforced here. Terrain-to-body and body-to-body transfer do **not** re-centre the child onto its COM: keeping the child's cells and transform identical to the parent's is the exact preservation the architecture requires, and `spall_physics` carries the off-origin COM. No replication, persistence, player movement, or contact-to-intent conversion is in T08.
+
+T10 outcome (`spall_sim` replication surface + `spall_server` / `spall_client`): a committed `TopologyTransaction` is now **self-describing**. `spall_sim::commit` appends, after the `IntegerBrush` op and each `SplitOff`, explicit canonical `+X` `TopologyOp::CellRun`s — one group filling each child volume with its detached cells' materials, then the runs that set those cells to air in the source — so a replica reconstructs an exact split with no `spall_structure` (`docs/protocol.md`: "canonical source-cell ranges ... not a client rerun of ... support heuristics"). A split whose runs would exceed `MAX_TRANSACTION_OPS` fails the commit rather than emitting a transaction a replica cannot fully apply; the baseline-blob path is T17. `spall_sim` also exposes the per-tick server feed (committed transactions, `ActionStatus`, a 20 Hz `MotionPublisher`, a `RepairRequest` → `CellRun` responder). `spall_client::replica::ReplicaWorld` holds the last consistent view as plain `spall_voxel` volumes and applies each transaction **candidate-first**: it checks every `before` brick revision against the live replica (a `Revision::ZERO` entry means "was absent"), replays the ops into an isolated clone, verifies every declared `result_hash`, and only then swaps it in — a `before` gap yields `RepairRequest`s and no mutation, any op or hash failure is rejected whole. The applied-`TransactionId` set is the replay guard; the control `SequenceGate` only tracks the high-water mark so a catch-up delivery of an earlier transaction is still evaluated. An emptied body (source or child) is tombstoned and a late motion packet can never resurrect it. `MotionTrack` holds the two newest accepted states for interpolation and one newest pending snapshot for a body the replica has not created yet (or whose topology revision it has not reached). `spall_server::serve` runs the authoritative `Simulation` on a blocking thread behind a `spall_net` QUIC endpoint and fans committed transactions + `ActionStatus` to every client's reliable control stream in commit order, with motion as datagrams; `spall_client::net` is the headless replica client. Live late join and hash repair land in T17; player prediction remains a later task (T19).
+
 ## Structural connectivity and collapse
 
 Use six-face connectivity; corner/edge contact does not create a bond. Do not assume that all solid cells in a brick share one connected component.
@@ -129,6 +133,8 @@ T06 compares native voxel colliders with deterministic merged-cuboid compounds f
 
 Exact occupied-space compounds are the correctness baseline. A single convex hull over a hollow building would block its rooms and is unacceptable. Approximate far collision is permitted only where it cannot affect gameplay and before promotion to a fully simulated area. Keep collision materials separate from visual palettes where the adapter requires it.
 
+T06 outcome (`spall_physics`, pinned `rapier3d 0.35.3`): the **merged-cuboid compound** is the selected representation for both terrain and dynamic bodies. Versus a native `parry` `Voxels` shape it rebuilds ~150x faster after an edit, stops a fast CCD projectile the voxel shape lets tunnel, and matches the analytic mass/COM/inertia exactly, while a deterministic greedy box decomposition keeps the occupied set exact. Its failure mode — one box per cell on highly fragmented occupancy — is bounded by a per-body primitive budget with a conservative coarse-downsample fallback (never a hull, never dropped mass). Full rationale, measurements, and the coarse-fracture policy are in [`docs/collision-decision.md`](collision-decision.md). `spall_physics` depends only on `spall_voxel`; Rapier types stay inside its `world` / `collider` modules.
+
 Use a capsule character controller with grounded state, gravity, jump, slope/step constraints, swept movement, and server-authoritative interaction with dynamic bodies. Physics queries need up-to-date collider revisions. Enable CCD selectively for fast damaging bodies; test tunneling and contact-energy thresholds before enabling impact-triggered destruction.
 
 Client player movement is predicted and reconciled. Remote bodies initially use snapshot interpolation plus kinematic collision proxies. They never gain authority from a client's local collision. Later local dynamic extrapolation is optional only if correction tests show a benefit.
@@ -161,3 +167,78 @@ Brick states: absent -> requested -> resident -> dirty -> checkpointed -> evicta
 Storage partitions index data; they do not own indivisible physical objects. A body spanning partitions has one authoritative identity and geometry owner, plus spatial index references. Relevance uses its bounds, not just its centre.
 
 Begin G1/G2 with all scene geometry resident. G3 introduces eviction against the same invariants. Distant render LOD never changes authoritative voxels, collision, support, or replicated destruction outcomes.
+
+## Persistence and recovery (T16)
+
+`spall_store` (`-> spall_protocol`) owns the durable save schema and SQLite I/O
+only, never simulation objects. It exposes: a versioned save schema
+(`STORE_SCHEMA_VERSION`; a `PRAGMA user_version` guard rejects a newer database
+untouched), zstd-compressed brick payloads with one-brick-bounded decode, a
+single WAL `Writer` that verifies `journal_mode=WAL` + `synchronous=FULL` on
+open and returns a `DurableThrough` only after a successful `COMMIT`, checkpoint
+publication (all body/brick rows + the journal cursor + a `complete=1` marker
+in one transaction), and recovery (latest complete checkpoint + contiguous
+CRC-verified journal suffix; interior corruption truncates the replay, is
+reported, and the previous checkpoint is offered as a fallback).
+`fault::{CrashPoint, FaultPlan}` inject controlled crashes around the commit
+boundaries and disk errors that roll the transaction back so the API never
+reports a save it did not make durable.
+
+The authoritative-state to save-record conversion lives in the integrator:
+`spall_server::persist` provides `capture` (`SimWorld` to `Checkpoint`),
+`restore` (`Checkpoint` + durable journal suffix to a fresh `Simulation`, with
+the material-manifest hash checked), `journal_records`, and the 30 s /
+clean-shutdown checkpoint cadence wired into `sandbox-server --serve --save`.
+It sits in `spall_server` — which already depends on both `spall_sim` and
+`spall_store` — rather than adding a `spall_sim -> spall_store` edge that would
+pull the vendored SQLite C build into the otherwise pure simulation crate.
+`spall_sim` already emits the `spall_protocol` records the journal stores
+(`journal.rs`); T16 adds only additive restore hooks there
+(`SimWorld::resume_registry` / `insert_restored_body` / `replay_transaction` /
+`apply_pose_batch`, `Simulation::from_restored`) and
+`spall_voxel::Brick::restored`, so its "owns conversion between authoritative
+state and protocol records" responsibility is unchanged.
+
+Only topology transactions are journalled (seq = the simulation's
+`JournalSeq`), each carrying its participant body snapshots; periodic 20 Hz
+pose-batch journaling is deferred, so a crash rewinds body motion to the last
+checkpoint / last topology-record participant state, which the
+`docs/protocol.md` durability model permits. `restore` replays a `SplitOff`
+from the transaction's own canonical fill runs and the participant snapshot (no
+`spall_structure` re-run) and resumes the id counters past everything the
+suffix consumed, so a post-restart edit still commits with fresh ids.
+
+## Live late join, repair, reconnect (T17)
+
+`spall_protocol::baseline` adds `BaselineWorld` — a postcard payload carrying
+**authoritative geometry only**: every resident brick of every volume with its
+real revision and material layer, plus the owner (terrain / body). Motion is
+excluded; a `MotionSnapshot` keyframe follows the catch-up barrier. Because the
+payload carries real revisions, a late-join replica reaches the exact canonical
+topology hash with no follow-up edit replay and no repair.
+
+`spall_server::baseline` captures a `BaselineWorld` from the live `SimWorld` at
+the current tick, chunks it into hashed `BaselinePart`s under the 1 MiB
+bulk-part / 64 MiB assembled ceilings, and builds `BaselineBegin` /
+`BaselineEnd` with `journal_cursor = J`. `brick_repair_patch` builds a
+one-brick authoritative patch from a `RepairRequest`.
+
+`spall_server::serve` runs a per-client `LateJoin` bridge alongside the tick
+loop. A joining replica sends a `BaselineAck` sentinel (`transfer_id == 0`); the
+server captures a baseline, streams `BaselineBegin` (control) + parts (a bulk
+stream) + `BaselineEnd` (control), and moves that client to a `Joining` phase
+whose committed transactions are buffered in a bounded catch-up queue instead
+of broadcast. On the client's real `BaselineAck` the queue is flushed in commit
+order, a current motion keyframe for every body follows, and the client goes
+`Live`. Already-connected clients never pause. A catch-up queue past
+`catch_up_cap` cancels the transfer and re-captures a fresher one; after
+`max_join_retries` the joiner is dropped with an explicit goodbye while everyone
+else keeps running. A brick `RepairRequest` is now answered with a one-brick
+authoritative baseline patch (full parity, revision included) — the T10
+`CellRun` reply healed cell content but not revision. Reconnect: `Inbound::Joined`
+tracks the highest session generation per connection slot, and an
+`ActionRequest` / `RepairRequest` from a superseded generation is rejected
+("expired session"). `spall_client::net --late-join` pulls the baseline over
+the bulk transfer before touching the replication stream and applies a
+mid-session `BaselineBegin` as a repair patch. No new external dependency; no
+change to the frozen wire record set (the sentinel reuses `BaselineAck`).
