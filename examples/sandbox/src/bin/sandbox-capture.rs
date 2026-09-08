@@ -64,15 +64,31 @@ struct ShapeSummary {
     triangles_rasterised: u64,
     vertex_bytes: u64,
     index_bytes: u64,
-    gpu_millis: f64,
+    /// Real GPU render-pass time from timestamp queries, milliseconds. `null`
+    /// when the adapter/driver does not support them (see `gpu_timing_available`).
+    /// Never a CPU-derived figure.
+    gpu_render_millis: Option<f64>,
+    /// `true` only when `gpu_render_millis` is a measured device timing.
+    gpu_timing_available: bool,
+    /// CPU wall-clock for the whole render → readback → PNG-encode loop,
+    /// milliseconds. This is NOT GPU time.
+    cpu_capture_millis: f64,
+    /// CPU wall-clock inside GPU→CPU readback (map wait + row unpad), ms.
+    cpu_readback_millis: f64,
+    /// CPU wall-clock inside PNG compression and file writes, ms.
+    cpu_encode_millis: f64,
     images: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct Summary {
+    /// Bumped to 2 when `gpu_millis` was split into separated CPU/GPU timings.
     version: u32,
     adapter: String,
     backend: String,
+    /// `true` when the shapes carry a measured GPU render-pass timing;
+    /// `false` means GPU timing was unavailable on this adapter.
+    gpu_timing_available: bool,
     width: u32,
     height: u32,
     strategy: String,
@@ -144,12 +160,15 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
 
     let mut summaries = Vec::new();
     let (mut adapter, mut backend) = (String::new(), String::new());
+    let mut gpu_timing_available = false;
     for shape in &shapes {
         let (scene, stats) = build_scene(shape, strategy);
         let out_dir = args.out.join(shape.name);
         let report = capture_scene(&ctx, &scene, &out_dir, &opts)?;
         adapter = report.adapter.clone();
         backend = report.backend.clone();
+        let timing = report.timing;
+        gpu_timing_available |= timing.gpu_render_millis.is_some();
 
         summaries.push(ShapeSummary {
             name: shape.name.to_string(),
@@ -164,7 +183,11 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
             triangles_rasterised: report.triangles,
             vertex_bytes: report.vertex_bytes,
             index_bytes: report.index_bytes,
-            gpu_millis: report.gpu_millis,
+            gpu_render_millis: timing.gpu_render_millis,
+            gpu_timing_available: timing.gpu_render_millis.is_some(),
+            cpu_capture_millis: timing.cpu_total_millis,
+            cpu_readback_millis: timing.cpu_readback_millis,
+            cpu_encode_millis: timing.cpu_encode_millis,
             images: report
                 .images
                 .iter()
@@ -174,9 +197,10 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
     }
 
     Ok(Summary {
-        version: 1,
+        version: 2,
         adapter,
         backend,
+        gpu_timing_available,
         width: args.width,
         height: args.height,
         strategy: format!("{strategy:?}"),

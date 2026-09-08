@@ -42,6 +42,31 @@ pub struct CaptureImage {
     pub path: PathBuf,
 }
 
+/// Timings for one [`capture_scene`] call.
+///
+/// GPU and CPU costs are reported separately and must never be conflated. In
+/// particular `cpu_*` figures include the synchronous readback map wait and the
+/// PNG compression, neither of which is GPU work; `gpu_render_millis` is a real
+/// device measurement from timestamp queries or [`None`] when the adapter does
+/// not support them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureTiming {
+    /// Wall-clock time for the whole render → readback → PNG-encode loop,
+    /// measured on the CPU. This is *not* a GPU timing.
+    pub cpu_total_millis: f64,
+    /// CPU wall-clock spent inside `map_async` readback + row unpadding, summed
+    /// over every captured view.
+    pub cpu_readback_millis: f64,
+    /// CPU wall-clock spent in PNG compression and the file write, summed over
+    /// every captured view.
+    pub cpu_encode_millis: f64,
+    /// GPU time spent inside the render passes, measured with timestamp queries
+    /// and summed over every captured view. [`None`] when the adapter/driver
+    /// does not support render-pass timestamp queries — callers must surface it
+    /// as "GPU timing unavailable" and never substitute a CPU figure.
+    pub gpu_render_millis: Option<f64>,
+}
+
 /// Result of [`capture_scene`].
 #[derive(Debug, Clone)]
 pub struct CaptureReport {
@@ -55,7 +80,108 @@ pub struct CaptureReport {
     pub index_bytes: u64,
     pub adapter: String,
     pub backend: String,
-    pub gpu_millis: f64,
+    /// Separated CPU/GPU timings. See [`CaptureTiming`].
+    pub timing: CaptureTiming,
+}
+
+/// Render-pass timestamp queries for the capture loop. One begin/end pair per
+/// captured view; resolved and read back once at the end.
+struct GpuTimer {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    period_ns: f64,
+    pairs: u32,
+}
+
+impl GpuTimer {
+    /// Allocate a timer for `pairs` render passes, or `None` when the device has
+    /// no timestamp-query support.
+    fn new(ctx: &RenderContext, pairs: u32) -> Option<Self> {
+        if !ctx.supports_gpu_timestamps() || pairs == 0 {
+            return None;
+        }
+        let count = pairs.checked_mul(2)?;
+        let bytes = u64::from(count) * std::mem::size_of::<u64>() as u64;
+        let set = ctx.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("spall-capture-timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count,
+        });
+        let resolve = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spall-capture-timestamp-resolve"),
+            size: bytes,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spall-capture-timestamp-readback"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some(Self {
+            set,
+            resolve,
+            readback,
+            period_ns: f64::from(ctx.timestamp_period_ns()),
+            pairs,
+        })
+    }
+
+    /// Timestamp writes for render pass number `index` (`0`-based).
+    fn writes(&self, index: u32) -> wgpu::RenderPassTimestampWrites<'_> {
+        wgpu::RenderPassTimestampWrites {
+            query_set: &self.set,
+            beginning_of_pass_write_index: Some(index * 2),
+            end_of_pass_write_index: Some(index * 2 + 1),
+        }
+    }
+
+    /// Resolve and read the queries. Returns the summed GPU pass time in
+    /// milliseconds, or `None` if the driver produced no usable delta.
+    fn total_millis(self, ctx: &RenderContext) -> Option<f64> {
+        let count = self.pairs * 2;
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("spall-capture-timestamp-resolve-encoder"),
+            });
+        encoder.resolve_query_set(&self.set, 0..count, &self.resolve, 0);
+        encoder.copy_buffer_to_buffer(
+            &self.resolve,
+            0,
+            &self.readback,
+            0,
+            u64::from(count) * std::mem::size_of::<u64>() as u64,
+        );
+        ctx.queue.submit([encoder.finish()]);
+
+        let slice = self.readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        ctx.wait();
+        rx.recv().ok()?.ok()?;
+
+        let ticks: Vec<u64> = {
+            let mapped = slice.get_mapped_range();
+            bytemuck::cast_slice::<u8, u64>(&mapped).to_vec()
+        };
+        self.readback.unmap();
+
+        let mut total_ns = 0.0f64;
+        let mut usable = false;
+        for pair in ticks.chunks_exact(2) {
+            let delta = pair[1].saturating_sub(pair[0]);
+            if delta > 0 {
+                usable = true;
+                total_ns += delta as f64 * self.period_ns;
+            }
+        }
+        usable.then_some(total_ns / 1.0e6)
+    }
 }
 
 /// Render `scene` to `<out_dir>/<view>.png` for each requested view.
@@ -101,9 +227,13 @@ pub fn capture_scene(
         a: scene.clear[3],
     };
 
-    let started = Instant::now();
+    let mut gpu_timer = GpuTimer::new(ctx, opts.views.len() as u32);
+
+    let loop_start = Instant::now();
+    let mut readback_millis = 0.0f64;
+    let mut encode_millis = 0.0f64;
     let mut images = Vec::new();
-    for &view in &opts.views {
+    for (index, &view) in opts.views.iter().enumerate() {
         let bind_group =
             pipeline.frame_bind_group(&ctx.device, &ctx.queue, &scene.camera, view, &palette);
 
@@ -113,6 +243,7 @@ pub fn capture_scene(
                 label: Some("spall-capture-encoder"),
             });
         {
+            let timestamp_writes = gpu_timer.as_ref().map(|t| t.writes(index as u32));
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("spall-capture-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -131,7 +262,7 @@ pub fn capture_scene(
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(pipeline.raw());
@@ -145,19 +276,27 @@ pub fn capture_scene(
         target.copy_to_readback(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
 
+        let readback_start = Instant::now();
         let rgba = target.read_rgba(ctx)?;
         let image: ImageBuffer<Rgba<u8>, _> =
             ImageBuffer::from_raw(target.width, target.height, rgba)
                 .expect("readback buffer is exactly width*height*4");
+        readback_millis += readback_start.elapsed().as_secs_f64() * 1000.0;
+
+        let encode_start = Instant::now();
         let path = out_dir.join(format!("{}.png", view.stem()));
         image.save(&path).map_err(|source| RenderError::Image {
             path: path.display().to_string(),
             source,
         })?;
+        encode_millis += encode_start.elapsed().as_secs_f64() * 1000.0;
+
         images.push(CaptureImage { view, path });
     }
     ctx.wait();
-    let gpu_millis = started.elapsed().as_secs_f64() * 1000.0;
+    let cpu_total_millis = loop_start.elapsed().as_secs_f64() * 1000.0;
+
+    let gpu_render_millis = gpu_timer.take().and_then(|t| t.total_millis(ctx));
 
     Ok(CaptureReport {
         images,
@@ -170,6 +309,11 @@ pub fn capture_scene(
         index_bytes,
         adapter: ctx.adapter_name().to_string(),
         backend: format!("{:?}", ctx.backend()),
-        gpu_millis,
+        timing: CaptureTiming {
+            cpu_total_millis,
+            cpu_readback_millis: readback_millis,
+            cpu_encode_millis: encode_millis,
+            gpu_render_millis,
+        },
     })
 }

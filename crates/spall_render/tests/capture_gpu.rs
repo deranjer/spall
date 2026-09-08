@@ -40,6 +40,26 @@ fn every_acceptance_shape_captures_three_non_empty_images() {
         let dir = out_root.join(shape.name);
         let report = capture_scene(&ctx, &scene, &dir, &opts).expect("capture");
 
+        // CPU/GPU timings are reported separately and never conflated.
+        assert!(
+            report.timing.cpu_total_millis > 0.0,
+            "{}: cpu capture time recorded",
+            shape.name
+        );
+        if ctx.supports_gpu_timestamps() {
+            let gpu = report
+                .timing
+                .gpu_render_millis
+                .expect("timestamp-capable adapter reports a GPU pass time");
+            assert!(gpu >= 0.0, "{}: non-negative GPU pass time", shape.name);
+        } else {
+            assert!(
+                report.timing.gpu_render_millis.is_none(),
+                "{}: GPU timing must be unavailable without timestamp support",
+                shape.name
+            );
+        }
+
         assert_eq!(
             report.images.len(),
             3,
