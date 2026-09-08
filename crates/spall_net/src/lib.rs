@@ -38,7 +38,9 @@ pub mod tls;
 use std::io;
 
 pub use config::{TransportConfig, TransportLimits};
-pub use conn::{BulkRecv, BulkSend, ConnStatsSnapshot, Connection, DatagramRecord, Role};
+pub use conn::{
+    BulkRecv, BulkSend, ConnStatsSnapshot, Connection, DatagramRecord, RawBulkStream, Role,
+};
 pub use dedup::{DedupVerdict, StreamDeduper};
 pub use endpoint::{NetServer, connect};
 pub use fault::{AppFaultPlan, FaultChannel, FaultStats};

@@ -41,11 +41,32 @@ compound stops a 60 m/s CCD projectile).
 | Collider rebuild after an edit (hollow tower), p50 / p99 | 224 µs / 229 µs | **1.5 µs / 2.5 µs** |
 | Debris settle (256 pieces on a floor), step time p95 / p99 | 3.70 ms / 6.41 ms | **0.13 ms / 0.18 ms** |
 | Debris settle — all pieces finite, at rest, asleep | yes | yes |
+| Editable-collider sleep/wake — settled asleep, woke on an in-place collider rebuild, re-slept, woke on a blast impulse, travelled ~1.7 m, left the floor and re-collided, re-slept, stable throughout | yes | yes |
 | Hollow building drop — settles, interior clearance kept | yes, 1.0 m | yes, 1.0 m |
 | Mass / centre-of-mass error vs analytic reference | 0 / 0 | 0 / 0 |
 | Sorted principal-inertia error vs analytic reference | 6e-6 | 0 |
 | Fast CCD projectile vs 0.5 m wall — max speed still stopped | **20 m/s** | **220 m/s** |
 | Worst-case fragmentation (16³ checkerboard, 2048 isolated cells) — primitives | 1 | 2048 |
+
+### Sleep / wake verification
+
+T06 requires that an editable collider goes to sleep when it settles *and* wakes
+and responds when something acts on it. `report::sleep_wake_cycle` measures the
+wake path directly for both representations rather than inferring it from a
+count of bodies that slept:
+
+1. a dynamic voxel cube is settled to sleep on the fixed floor;
+2. its collider is **rebuilt in place** — the exact operation the T08
+   authoritative edit path performs after an accepted topology transaction — and
+   the body is observed to leave the sleeping state, then settle back to sleep;
+3. a **blast impulse** sized from the body's own mass (~4.5 m/s) is applied; the
+   body is observed to leave the sleeping state, rise clear of the floor, fall
+   back and re-establish a floor contact near its rest height, then settle to
+   sleep a second time.
+
+Every state stays finite and contact penetration stays below half a cell across
+the whole cycle. Both representations pass. CI asserts this at `--small` size in
+`report::tests::small_feasibility_run_behaves`.
 
 ## Decision: merged cuboids
 

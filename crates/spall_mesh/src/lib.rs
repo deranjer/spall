@@ -16,15 +16,20 @@
 //!   across brick seams for face culling and AO, and returns a
 //!   [`spall_jobs::JobToken`] over the exact brick revisions and
 //!   missing-neighbour sentinels it read. When a halo brick later arrives the
-//!   token goes stale and the caller re-meshes.
+//!   token goes stale and the caller re-meshes. Enumeration is bounded by the
+//!   resident data ([`ResidentCells`], one `32^3` box per resident brick), not
+//!   by the bounding hull, so far-apart bricks cost only their own cells; a
+//!   checked work budget and checked cell-coordinate math turn pathological
+//!   input into a [`MeshError`] rather than unbounded work.
 //!
 //! Faces are emitted in a canonical order ([`FaceDir`] then plane then `v` then
 //! `u`) so a mesh is a deterministic function of the volume contents;
 //! [`mesh_digest`] pins that for tests.
 //!
-//! Everything here is all-resident G1 behaviour: the whole volume is meshed at
-//! once. Per-brick chunk meshing and streamed halo loading are a later
-//! optimisation (T18).
+//! Everything here is all-resident G1 behaviour: every resident brick is meshed
+//! at once. Per-brick chunk *caching* and streamed halo loading are a later
+//! optimisation (T18); the per-brick enumeration bound here is not that — it
+//! only stops sparse residency from enumerating the empty space between bricks.
 
 pub mod ao;
 pub mod build;
@@ -43,4 +48,4 @@ pub use enumerate::{ExposedFace, for_each_exposed_face};
 pub use face::{FACE_DIRS, FaceDir};
 pub use greedy::emit_greedy;
 pub use mesh::{FaceQuad, Mesh, MeshStats, MeshStrategy, Vertex, mesh_digest, mesh_digest_hex};
-pub use sample::{CellBox, Occupancy, VolumeSampler};
+pub use sample::{CellBox, MeshError, Occupancy, ResidentCells, VolumeSampler};

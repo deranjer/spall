@@ -12,18 +12,24 @@ use crate::culled::emit_culled;
 use crate::enumerate::for_each_exposed_face;
 use crate::greedy::emit_greedy;
 use crate::mesh::{FaceQuad, Mesh, MeshStats, MeshStrategy};
-use crate::sample::{CellBox, Occupancy, VolumeSampler};
+use crate::sample::{MeshError, Occupancy, ResidentCells, VolumeSampler};
 
 /// Options for [`build_volume_mesh`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeshOptions {
     pub strategy: MeshStrategy,
+    /// Upper bound on cell visits (`resident_brick_count * 32768`) before
+    /// [`build_volume_mesh`] refuses the volume with
+    /// [`MeshError::WorkBudgetExceeded`]. Defaults to
+    /// [`ResidentCells::DEFAULT_CELL_VISIT_BUDGET`].
+    pub cell_visit_budget: u128,
 }
 
 impl Default for MeshOptions {
     fn default() -> Self {
         Self {
             strategy: MeshStrategy::Greedy,
+            cell_visit_budget: ResidentCells::DEFAULT_CELL_VISIT_BUDGET,
         }
     }
 }
@@ -55,17 +61,23 @@ impl VolumeMesh {
 /// Mesh every resident brick of `volume`. `generation` and `topology_epoch`
 /// stamp the returned token so a world reload or a coarse topology change also
 /// invalidates the result.
+///
+/// Only resident-brick cells are enumerated (see [`ResidentCells`]), so the cost
+/// is `resident_brick_count * 32768` cell visits and is independent of how far
+/// apart the bricks sit. Returns [`MeshError`] when the resident set exceeds
+/// `opts.cell_visit_budget` or a brick's cell extent overflows `i64`.
 pub fn build_volume_mesh(
     volume: &Volume,
     generation: Generation,
     topology_epoch: TopologyEpoch,
     opts: MeshOptions,
-) -> VolumeMesh {
+) -> Result<VolumeMesh, MeshError> {
     let cell_m = volume.cell_size().metres();
     let resident = volume.resident_brick_coords();
 
-    let Some(cell_box) = CellBox::of_resident(volume) else {
-        return VolumeMesh {
+    let cells = ResidentCells::plan(volume, opts.cell_visit_budget)?;
+    if cells.is_empty() {
+        return Ok(VolumeMesh {
             mesh: Mesh::default(),
             quads: Vec::new(),
             stats: MeshStats {
@@ -78,19 +90,19 @@ pub fn build_volume_mesh(
                 unresolved_halo_faces: 0,
             },
             token: JobToken::new(generation, topology_epoch),
-        };
-    };
+        });
+    }
 
     let sampler = VolumeSampler::new(volume);
     let quads = match opts.strategy {
-        MeshStrategy::Culled => emit_culled(&sampler, cell_box),
-        MeshStrategy::Greedy => emit_greedy(&sampler, cell_box),
+        MeshStrategy::Culled => emit_culled(&sampler, &cells),
+        MeshStrategy::Greedy => emit_greedy(&sampler, &cells),
     };
     let mesh = Mesh::from_quads(&quads, cell_m);
 
     let mut exposed_unit_faces = 0u64;
     let mut unresolved_halo_faces = 0u64;
-    for_each_exposed_face(&sampler, cell_box, |face| {
+    for_each_exposed_face(&sampler, &cells, |face| {
         exposed_unit_faces += 1;
         if matches!(face.neighbour, Occupancy::Unknown(_)) {
             unresolved_halo_faces += 1;
@@ -107,12 +119,12 @@ pub fn build_volume_mesh(
         unresolved_halo_faces,
     };
 
-    VolumeMesh {
+    Ok(VolumeMesh {
         mesh,
         quads,
         stats,
         token: build_token(volume, &resident, generation, topology_epoch),
-    }
+    })
 }
 
 /// Records one dependency per resident brick and one absent/failed sentinel per
@@ -202,16 +214,20 @@ mod tests {
             TopologyEpoch::START,
             MeshOptions {
                 strategy: MeshStrategy::Culled,
+                ..MeshOptions::default()
             },
-        );
+        )
+        .unwrap();
         let greedy = build_volume_mesh(
             &v,
             gen1(),
             TopologyEpoch::START,
             MeshOptions {
                 strategy: MeshStrategy::Greedy,
+                ..MeshOptions::default()
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(culled.stats.surface_area_m2, greedy.stats.surface_area_m2);
         assert_eq!(
@@ -231,7 +247,8 @@ mod tests {
         plan.set(GlobalCell::new(1, 1, 1), STONE);
         v.apply_edit(&plan).unwrap();
 
-        let vm = build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default());
+        let vm =
+            build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default()).unwrap();
 
         let mut world = MapWorld::new(gen1());
         let rev = v.brick_revision(BrickCoord::new(0, 0, 0)).unwrap().unwrap();
@@ -251,7 +268,8 @@ mod tests {
         v.insert_brick(BrickCoord::new(0, 0, 0), Brick::uniform(STONE, Revision(1)))
             .unwrap();
 
-        let before = build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default());
+        let before =
+            build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default()).unwrap();
         let seam_before = before
             .quads
             .iter()
@@ -282,7 +300,8 @@ mod tests {
         world.set_brick(vid(), BrickCoord::new(1, 0, 0), Revision(1));
         assert!(before.is_stale(&world));
 
-        let after = build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default());
+        let after =
+            build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default()).unwrap();
         let seam_after = after
             .quads
             .iter()
@@ -294,9 +313,114 @@ mod tests {
     #[test]
     fn an_empty_volume_yields_an_empty_mesh_with_a_dependency_free_token() {
         let v = Volume::new(vid(), CellSizeCode::Quarter);
-        let vm = build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default());
+        let vm =
+            build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default()).unwrap();
         assert!(vm.mesh.is_empty());
         assert_eq!(vm.stats.exposed_unit_faces, 0);
         assert!(vm.token.reads().is_empty());
+    }
+
+    #[test]
+    fn distant_resident_bricks_cost_only_their_own_cells() {
+        // Two lone solid bricks a million bricks apart on X. The old hull
+        // enumeration visits ~32.8 billion cells (the ENG-44 figure); the
+        // resident-bounded plan visits exactly 2 * 32768.
+        let mut v = Volume::new(vid(), CellSizeCode::Quarter);
+        v.insert_brick(BrickCoord::new(0, 0, 0), Brick::uniform(STONE, Revision(1)))
+            .unwrap();
+        v.insert_brick(
+            BrickCoord::new(1_000_000, 0, 0),
+            Brick::uniform(STONE, Revision(1)),
+        )
+        .unwrap();
+
+        let cells =
+            crate::sample::ResidentCells::plan(&v, MeshOptions::default().cell_visit_budget)
+                .unwrap();
+        assert_eq!(cells.brick_count(), 2);
+        assert_eq!(cells.cell_visits(), 2 * 32_768);
+        // The hull the old code would have enumerated is ~500_000x larger.
+        let hull = crate::sample::CellBox::of_resident(&v).unwrap();
+        assert!(hull.cell_count() > 32_000_000_000);
+        assert!(hull.cell_count() > cells.cell_visits() * 100_000);
+
+        // A work counter over the enumeration proves the cost tracks resident
+        // data, not the hull.
+        let visited = cells.cells().count() as u128;
+        assert_eq!(visited, cells.cell_visits());
+
+        let vm = build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default())
+            .expect("distant bricks mesh within the default budget");
+        // Each isolated 32^3 brick contributes a full 6 * 32 * 32 exposed faces.
+        assert_eq!(vm.stats.exposed_unit_faces, 2 * 6 * 32 * 32);
+        // Both bricks are fully surrounded by absent space -> every face is an
+        // unresolved halo dependency (missing-neighbour invalidation still holds).
+        assert_eq!(vm.stats.unresolved_halo_faces, vm.stats.exposed_unit_faces);
+    }
+
+    #[test]
+    fn adjacent_resident_bricks_drop_the_shared_seam() {
+        // Two solid bricks sharing the x = 32 face. Per-brick enumeration must
+        // still see across the seam: the shared face is interior and the greedy
+        // pass merges the 64 x 32 x 32 box into six quads.
+        let mut v = Volume::new(vid(), CellSizeCode::Quarter);
+        v.insert_brick(BrickCoord::new(0, 0, 0), Brick::uniform(STONE, Revision(1)))
+            .unwrap();
+        v.insert_brick(BrickCoord::new(1, 0, 0), Brick::uniform(STONE, Revision(1)))
+            .unwrap();
+
+        let vm =
+            build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default()).unwrap();
+        let seam = vm
+            .quads
+            .iter()
+            .filter(|q| q.dir == FaceDir::PosX && q.plane == 32)
+            .count();
+        assert_eq!(
+            seam, 0,
+            "the x = 32 seam is interior across two resident bricks"
+        );
+        // Surface of a 64 x 32 x 32 box: 2*(32*32) + 4*(64*32) unit faces.
+        assert_eq!(vm.stats.exposed_unit_faces, 2 * 32 * 32 + 4 * 64 * 32);
+        assert_eq!(vm.stats.quad_count, 6, "greedy merges across the seam");
+    }
+
+    #[test]
+    fn a_resident_set_over_budget_is_a_deterministic_error() {
+        let mut v = Volume::new(vid(), CellSizeCode::Quarter);
+        v.insert_brick(BrickCoord::new(0, 0, 0), Brick::uniform(STONE, Revision(1)))
+            .unwrap();
+
+        let opts = MeshOptions {
+            cell_visit_budget: 1_000,
+            ..MeshOptions::default()
+        };
+        let err = build_volume_mesh(&v, gen1(), TopologyEpoch::START, opts).unwrap_err();
+        assert_eq!(
+            err,
+            MeshError::WorkBudgetExceeded {
+                cell_visits: 32_768,
+                budget: 1_000,
+            }
+        );
+    }
+
+    #[test]
+    fn a_brick_whose_cells_overflow_i64_is_a_deterministic_error() {
+        let mut v = Volume::new(vid(), CellSizeCode::Quarter);
+        v.insert_brick(
+            BrickCoord::new(i64::MAX, 0, 0),
+            Brick::uniform(STONE, Revision(1)),
+        )
+        .unwrap();
+
+        let err = build_volume_mesh(&v, gen1(), TopologyEpoch::START, MeshOptions::default())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MeshError::CoordinateOverflow {
+                coord: BrickCoord::new(i64::MAX, 0, 0),
+            }
+        );
     }
 }

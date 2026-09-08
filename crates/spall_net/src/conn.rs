@@ -368,22 +368,45 @@ impl Connection {
         })
     }
 
-    /// Opens a raw bidirectional stream with no framing wrapper. For callers
+    /// Opens a raw bidirectional stream with no framing wrapper, for callers
     /// that drive their own framed reads (baseline plumbing in later tasks, and
-    /// the malformed-input tests here).
-    pub async fn open_bi_raw(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        self.quic
+    /// the malformed-input tests here). It counts against
+    /// [`TransportConfig::limits`]`.max_bulk_streams` exactly like [`open_bulk`]:
+    /// the returned [`RawBulkStream`] holds the reservation and releases it when
+    /// dropped, on success or error.
+    ///
+    /// [`open_bulk`]: Self::open_bulk
+    pub async fn open_bi_raw(&self) -> Result<RawBulkStream> {
+        let guard = self.reserve_bulk()?;
+        let (send, recv) = self
+            .quic
             .open_bi()
             .await
-            .map_err(|e| TransportError::ConnectionLost(e.to_string()))
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
+        Ok(RawBulkStream {
+            send,
+            recv,
+            _open: guard,
+        })
     }
 
-    /// Accepts a raw bidirectional stream with no framing wrapper.
-    pub async fn accept_bi_raw(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        self.quic
+    /// Accepts a raw bidirectional stream with no framing wrapper, applying the
+    /// same ceiling as [`accept_bulk`]. The returned [`RawBulkStream`] owns the
+    /// reservation and releases it on drop.
+    ///
+    /// [`accept_bulk`]: Self::accept_bulk
+    pub async fn accept_bi_raw(&self) -> Result<RawBulkStream> {
+        let (send, recv) = self
+            .quic
             .accept_bi()
             .await
-            .map_err(|e| TransportError::ConnectionLost(e.to_string()))
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
+        let guard = self.reserve_bulk()?;
+        Ok(RawBulkStream {
+            send,
+            recv,
+            _open: guard,
+        })
     }
 
     /// Accepts the next inbound bulk stream, applying the same ceiling.
@@ -401,6 +424,27 @@ impl Connection {
             assembled_cap: self.cfg.limits.max_assembled_transfer,
             _open: guard,
         })
+    }
+
+    /// Number of live bulk-stream reservations across every entry point
+    /// ([`open_bulk`](Self::open_bulk), [`accept_bulk`](Self::accept_bulk),
+    /// [`open_bi_raw`](Self::open_bi_raw), [`accept_bi_raw`](Self::accept_bi_raw)).
+    /// Exposed for diagnostics and tests; never exceeds
+    /// [`TransportConfig::limits`]`.max_bulk_streams`.
+    pub fn bulk_stream_count(&self) -> u32 {
+        self.bulk_open.load(Ordering::SeqCst)
+    }
+
+    /// Opens a bidirectional stream that deliberately does **not** count against
+    /// the bulk-stream ceiling, so a test can push a peer past the negotiated
+    /// cap on purpose. Gated behind the `test-util` feature; never reachable
+    /// from a production build.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn open_bi_unguarded(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+        self.quic
+            .open_bi()
+            .await
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))
     }
 
     fn reserve_bulk(&self) -> Result<BulkGuard> {
@@ -533,6 +577,32 @@ struct BulkGuard(Arc<AtomicU32>);
 impl Drop for BulkGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A raw bidirectional stream pair with no framing wrapper, handed out by
+/// [`Connection::open_bi_raw`] / [`Connection::accept_bi_raw`]. It counts
+/// against the negotiated bulk-stream ceiling; dropping it (on success, error,
+/// or an early bail) releases the reservation, exactly like [`BulkSend`] /
+/// [`BulkRecv`].
+///
+/// The stream halves are only lent out by reference so the reservation guard
+/// cannot be split away from the live streams.
+pub struct RawBulkStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    _open: BulkGuard,
+}
+
+impl RawBulkStream {
+    /// The reliable send half; the caller drives its own framing.
+    pub fn send_mut(&mut self) -> &mut quinn::SendStream {
+        &mut self.send
+    }
+
+    /// The reliable receive half; the caller drives its own framing.
+    pub fn recv_mut(&mut self) -> &mut quinn::RecvStream {
+        &mut self.recv
     }
 }
 

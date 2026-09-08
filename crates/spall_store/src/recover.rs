@@ -113,7 +113,21 @@ pub fn recover_conn(conn: &Connection) -> Result<Recovery, StoreError> {
             ))),
         }
     }
-    let checkpoint = selected.ok_or(StoreError::NoCheckpoint)?;
+    // Distinguish a genuinely empty database (no complete checkpoint rows at all)
+    // from a corrupt one (checkpoint rows exist but none decoded). The caller
+    // must not treat the latter as a fresh DB and overwrite it.
+    let checkpoint = match selected {
+        Some(cp) => cp,
+        None if corruption.is_empty() => return Err(StoreError::NoCheckpoint),
+        None => {
+            let details = corruption
+                .iter()
+                .map(|c| c.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(StoreError::CheckpointsUnrecoverable(details));
+        }
+    };
 
     // Walk the journal suffix, stopping at the first gap or CRC failure.
     let cursor = checkpoint.journal_cursor;

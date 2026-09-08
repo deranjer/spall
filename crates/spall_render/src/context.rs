@@ -7,6 +7,7 @@ pub struct RenderContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     adapter_info: wgpu::AdapterInfo,
+    timestamps: bool,
 }
 
 /// Why the renderer could not start or run.
@@ -43,10 +44,20 @@ impl RenderContext {
         }))
         .ok_or(RenderError::NoAdapter)?;
 
+        // Opt into render-pass timestamp queries when (and only when) the adapter
+        // reports support. Where they are unavailable the capture path reports
+        // GPU timing as unavailable rather than substituting a CPU figure.
+        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let required_features = if timestamps {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("spall-render-headless"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::downlevel_defaults(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
@@ -57,6 +68,7 @@ impl RenderContext {
             device,
             queue,
             adapter_info: adapter.get_info(),
+            timestamps,
         })
     }
 
@@ -66,6 +78,18 @@ impl RenderContext {
 
     pub fn backend(&self) -> wgpu::Backend {
         self.adapter_info.backend
+    }
+
+    /// Whether this device was created with render-pass timestamp queries. When
+    /// `false`, callers must report GPU timing as unavailable.
+    pub fn supports_gpu_timestamps(&self) -> bool {
+        self.timestamps
+    }
+
+    /// Nanoseconds per timestamp-query tick for this queue. Only meaningful when
+    /// [`RenderContext::supports_gpu_timestamps`] is `true`.
+    pub fn timestamp_period_ns(&self) -> f32 {
+        self.queue.get_timestamp_period()
     }
 
     /// Block until every submitted GPU command has completed.

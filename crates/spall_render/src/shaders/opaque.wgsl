@@ -1,9 +1,12 @@
 // Opaque voxel-surface shading for the T05 baseline.
 //
-// debug_mode selects the output: 0 = shaded, 1 = world normal, 2 = linear depth.
+// debug_mode selects the output: 0 = shaded, 1 = world normal, 2 = linear
+// eye-space depth (distance along the camera's view axis, NOT radial distance
+// from the eye).
 
 struct Globals {
     view_proj: mat4x4<f32>,
+    view: mat4x4<f32>,       // world -> eye space (RH, camera looks down -Z)
     camera_pos: vec4<f32>,   // xyz, w unused
     sun_dir: vec4<f32>,      // normalised direction the sunlight travels, xyz
     params: vec4<f32>,       // x = debug_mode, y = z_near, z = z_far, w unused
@@ -60,8 +63,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if mode == 2 {
         let z_near = globals.params.y;
         let z_far = globals.params.z;
-        let view_z = length(in.world_pos - globals.camera_pos.xyz);
-        let g = clamp((view_z - z_near) / (z_far - z_near), 0.0, 1.0);
+        // Linear eye-space depth: project the world position onto the camera's
+        // view axis. In the right-handed view space the camera looks down -Z,
+        // so points in front have negative eye Z and their depth is -eye_z.
+        // A plane at constant view-space Z reads a constant value across every
+        // off-axis pixel, unlike the radial distance `length(world_pos - eye)`.
+        let eye_z = (globals.view * vec4<f32>(in.world_pos, 1.0)).z;
+        let linear_depth = -eye_z;
+        let g = clamp((linear_depth - z_near) / (z_far - z_near), 0.0, 1.0);
         return vec4<f32>(vec3<f32>(1.0 - g), 1.0);
     }
 

@@ -75,6 +75,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         // Scripted fixture cuts hit arbitrary cells; use the ENG-47
         // dev-scenario path so this late-join plumbing test still runs.
         dev_unvalidated_actions: true,
+        save_faults: None,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 
