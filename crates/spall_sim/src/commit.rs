@@ -252,6 +252,9 @@ pub fn commit(
         }
         None => None,
     };
+    // The cut cleared the parent's last solid cell: its ownership is retired on
+    // publish (`ENG-56`). A retired body emits no participant snapshot.
+    let parent_emptied = !parent_is_terrain && parent_rebuild.is_none();
 
     // 8. Reserve the transaction id and journal sequence.
     let transaction_id = reg.allocate_transaction()?;
@@ -348,6 +351,7 @@ pub fn commit(
     let participants = candidate_participant_snapshots(
         world,
         parent_is_terrain,
+        parent_emptied,
         parent_entity,
         &parent_candidate,
         &children,
@@ -363,18 +367,29 @@ pub fn commit(
         parent.volume = parent_candidate;
     }
 
-    if let Some((plan, mass_properties)) = parent_rebuild {
-        world
-            .physics_mut()
-            .rebuild_collider(parent_phys, &plan.grid, plan.representation);
-        if let Some(mass_properties) = mass_properties {
+    match parent_rebuild {
+        Some((plan, mass_properties)) => {
             world
                 .physics_mut()
-                .set_mass_properties(parent_phys, mass_properties);
+                .rebuild_collider(parent_phys, &plan.grid, plan.representation);
+            if let Some(mass_properties) = mass_properties {
+                world
+                    .physics_mut()
+                    .set_mass_properties(parent_phys, mass_properties);
+            }
+            if let Some(parent) = world.volume_body_mut(vid) {
+                parent.collider_revision += 1;
+                parent.coarsen_k = plan.coarsen_k;
+            }
         }
-        if let Some(parent) = world.volume_body_mut(vid) {
-            parent.collider_revision += 1;
-            parent.coarsen_k = plan.coarsen_k;
+        None => {
+            // The cut cleared the parent's last solid cell. Retire its
+            // ownership atomically with the edit (`ENG-56`): a detached body
+            // and its physics handle are removed; terrain loses its collider.
+            // Nothing keeps colliding with the obsolete solid shape, and the
+            // transaction's cell-removal ops already carry the emptying for
+            // replicas and for journal replay.
+            world.retire_empty_volume(vid);
         }
     }
 
@@ -449,6 +464,7 @@ pub fn commit(
 fn candidate_participant_snapshots(
     world: &SimWorld,
     parent_is_terrain: bool,
+    parent_emptied: bool,
     parent_entity: Option<spall_core::EntityId>,
     parent_candidate: &Volume,
     children: &[ChildBody],
@@ -456,7 +472,10 @@ fn candidate_participant_snapshots(
     journal_seq: spall_core::JournalSeq,
 ) -> Vec<MotionSnapshot> {
     let mut out = Vec::new();
+    // A parent whose last cell this transaction removed is retired on publish
+    // (`ENG-56`): it no longer exists, so it carries no motion snapshot.
     if !parent_is_terrain
+        && !parent_emptied
         && let Some(entity) = parent_entity
         && let Some(parent) = world.body(entity)
     {

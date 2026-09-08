@@ -400,6 +400,31 @@ impl SimWorld {
         entity
     }
 
+    /// Retires the ownership of `volume` because its authoritative geometry
+    /// became empty (`ENG-56`), atomically with the edit that emptied it:
+    ///
+    /// * a **detached body** is dropped from the world — its physics rigid body
+    ///   and collider are removed, and it is no longer enumerable, targetable by
+    ///   a raycast, or published in a motion batch;
+    /// * **terrain** keeps its (now empty) record but loses its physical
+    ///   collider, so nothing rests on or tunnels the obsolete solid shape.
+    ///
+    /// Idempotent; a no-op for an unknown volume.
+    pub fn retire_empty_volume(&mut self, volume: VolumeId) {
+        if volume == self.terrain.volume_id {
+            self.physics.remove_collider(self.terrain.phys);
+            self.terrain.collider_revision += 1;
+            return;
+        }
+        let Some(&entity) = self.volume_owner.get(&volume.get()) else {
+            return;
+        };
+        if let Some(body) = self.bodies.remove(&entity) {
+            self.physics.retire_body(body.phys);
+        }
+        self.volume_owner.remove(&volume.get());
+    }
+
     // --- save recovery (T16) ------------------------------------------------
     //
     // These reinstate authoritative state from persisted records without
@@ -701,7 +726,7 @@ impl SimWorld {
         }
         flush(self, group.take(), &mut touched, &mut new_children)?;
 
-        for vid in touched {
+        for &vid in &touched {
             self.rebuild_volume_collider(vid)?;
         }
 
@@ -723,6 +748,16 @@ impl SimWorld {
         }
 
         self.check_replay_results(tx)?;
+
+        // Retire any volume this transaction cleared to empty, now that its
+        // verified post-state has been checked against the record. This mirrors
+        // the live commit path so a recovered world has the same set of live
+        // bodies and colliders (`ENG-56`).
+        for vid in touched {
+            if self.volume_ref(vid).is_some_and(|v| solid_cells(v) == 0) {
+                self.retire_empty_volume(vid);
+            }
+        }
         Ok(())
     }
 
@@ -803,7 +838,9 @@ impl SimWorld {
     }
 
     /// Rebuilds one volume's collider from its current geometry (recovery and
-    /// post-replay). No-op if the volume has no solid cell left.
+    /// post-replay). No-op if the volume has no solid cell left — an emptied
+    /// volume is retired by [`Self::retire_empty_volume`] once the replay's
+    /// result checks have run (`ENG-56`).
     pub fn rebuild_volume_collider(&mut self, volume: VolumeId) -> Result<(), WorldError> {
         let Some(body) = self.volume_body(volume) else {
             return Err(WorldError::UnknownVolume(volume));
