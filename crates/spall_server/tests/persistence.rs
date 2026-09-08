@@ -67,6 +67,7 @@ fn recover_restore(db: &std::path::Path) -> (Simulation, u64) {
     persist::restore(
         &recovery,
         &cfg(),
+        persist::RecoveryChoice::RequireClean,
         fixtures::stone_manifest(),
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -272,6 +273,7 @@ fn checkpoint_plus_journal_suffix_recovers_topology() {
     let (mut restored, durable_seq) = persist::restore(
         &recovery,
         &cfg(),
+        persist::RecoveryChoice::RequireClean,
         fixtures::stone_manifest(),
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -333,6 +335,7 @@ fn a_manifest_hash_mismatch_is_rejected() {
     match persist::restore(
         &recovery,
         &cfg(),
+        persist::RecoveryChoice::RequireClean,
         air_only,
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -361,6 +364,7 @@ fn restore_err(recovery: &spall_store::Recovery, cfg: &PersistConfig) -> persist
     match persist::restore(
         recovery,
         cfg,
+        persist::RecoveryChoice::RequireClean,
         fixtures::stone_manifest(),
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -374,6 +378,7 @@ fn restore_ok(recovery: &spall_store::Recovery, cfg: &PersistConfig) -> bool {
     persist::restore(
         recovery,
         cfg,
+        persist::RecoveryChoice::RequireClean,
         fixtures::stone_manifest(),
         AnchorPlane::at(0),
         PhysicsConfig::default(),
@@ -568,4 +573,34 @@ fn a_journal_transaction_with_a_stale_algorithm_version_is_rejected() {
         } => {}
         other => panic!("expected AlgorithmVersionMismatch, got {other:?}"),
     }
+}
+
+// --- ENG-36: fail closed on a reported-corrupt recovery -----------------
+
+#[test]
+fn review_restore_must_require_choice_after_corruption() {
+    let s = Scratch::new("corruption_choice");
+    let mut recovery = recovery_for_meta_tests(&s);
+    recovery.corruption.push(spall_store::CorruptionReport {
+        detail: "journal seq 1 failed CRC".into(),
+    });
+
+    // Default: a reported-corrupt recovery aborts before anything is rebuilt.
+    assert!(matches!(
+        restore_err(&recovery, &cfg()),
+        persist::PersistError::UnrecoverableCorruption { .. }
+    ));
+
+    // An explicit operator choice to accept the verified durable prefix works.
+    assert!(
+        persist::restore(
+            &recovery,
+            &cfg(),
+            persist::RecoveryChoice::AcceptDurablePrefix,
+            fixtures::stone_manifest(),
+            AnchorPlane::at(0),
+            PhysicsConfig::default(),
+        )
+        .is_ok()
+    );
 }
