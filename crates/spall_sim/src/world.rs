@@ -9,17 +9,20 @@
 use std::collections::BTreeMap;
 
 use glam::DQuat;
-use spall_core::{BrickCoord, CellSizeCode, EntityId, GlobalCell, LocalCell, MaterialId, VolumeId};
+use spall_core::{
+    BrickCoord, CellSizeCode, EntityId, GlobalCell, IdError, LocalCell, MaterialId, Revision,
+    VolumeId,
+};
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
     BodyKind as PhysBodyKind, BodySpec, OccupancyGrid, PhysicsConfig, PhysicsWorld,
 };
 use spall_protocol::{
-    CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32,
+    CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
     canonical_topology_hash,
 };
 use spall_structure::AnchorPlane;
-use spall_voxel::{BrickState, Volume};
+use spall_voxel::{Brick, BrickBounds, BrickState, EditPlan, Volume};
 
 use crate::body::{Body, BodyKind, BodyPose};
 use crate::collider::plan_collider;
@@ -43,6 +46,40 @@ pub enum WorldError {
     Ids(#[from] spall_core::IdError),
     #[error("occupancy extraction failed: {0}")]
     Occupancy(#[from] spall_physics::ExtractError),
+    #[error("edit during replay failed: {0}")]
+    Edit(#[from] spall_voxel::EditError),
+}
+
+/// A detached body being reinstated from a persisted checkpoint record.
+#[derive(Debug, Clone)]
+pub struct RestoredBody {
+    pub entity: EntityId,
+    /// The body's volume, already carrying its saved [`VolumeId`].
+    pub volume: Volume,
+    pub pose: BodyPose,
+    pub linvel_m_s: [f64; 3],
+    pub angvel_rad_s: [f64; 3],
+    pub sleeping: bool,
+    pub collider_revision: u64,
+    /// Inclusive global-cell box `[min, max]` the collider covers.
+    pub collider_region: (GlobalCell, GlobalCell),
+    /// Bulk density input, kg/m³.
+    pub density_kg_m3: f32,
+}
+
+/// A [`BodyPose`] from a wire [`MotionSnapshot`] (rotation is the decoded i16
+/// quaternion; a zero-magnitude quaternion falls back to identity).
+fn pose_from_snapshot(snap: &MotionSnapshot) -> BodyPose {
+    let q = snap.pose.rotation.to_unit().unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    BodyPose::new(
+        DQuat::from_xyzw(
+            f64::from(q[0]),
+            f64::from(q[1]),
+            f64::from(q[2]),
+            f64::from(q[3]),
+        ),
+        snap.pose.translation_m,
+    )
 }
 
 /// Everything needed to stand up a world.
@@ -342,6 +379,315 @@ impl SimWorld {
         self.volume_owner.insert(body.volume_id.get(), entity.get());
         self.bodies.insert(entity.get(), body);
         entity
+    }
+
+    // --- save recovery (T16) ------------------------------------------------
+    //
+    // These reinstate authoritative state from persisted records without
+    // replaying an edit. `spall_store` holds the bytes; the save-record ↔
+    // `SimWorld` mapping lives in the integrator (`spall_server::persist`).
+
+    /// Replaces the id allocators with resumed counters (`docs/protocol.md`:
+    /// "Persist next-ID counters" so a restart cannot re-hand a live id).
+    pub fn resume_registry(
+        &mut self,
+        next_entity: u64,
+        next_volume: u64,
+        next_transaction: u64,
+        next_journal_seq: u64,
+    ) -> Result<(), IdError> {
+        self.registry =
+            IdRegistry::resume(next_entity, next_volume, next_transaction, next_journal_seq)?;
+        Ok(())
+    }
+
+    /// Reinstates one detached body from a checkpoint record: it keeps its saved
+    /// entity/volume id, transform, velocity, sleep flag, and collider revision.
+    /// A body saved asleep resumes with zero velocity (the solver re-sleeps it
+    /// on the next step); the saved `sleeping` flag stays authoritative for
+    /// replication/journalling until then.
+    pub fn insert_restored_body(&mut self, spec: RestoredBody) -> Result<EntityId, WorldError> {
+        let grid = OccupancyGrid::from_volume(&spec.volume)?.ok_or(WorldError::EmptyBody)?;
+        let plan = plan_collider(&grid);
+        let cell_m = spec.volume.cell_size().metres() as f32;
+        let trans = [
+            spec.pose.translation_m[0] as f32,
+            spec.pose.translation_m[1] as f32,
+            spec.pose.translation_m[2] as f32,
+        ];
+        let rot = spec.pose.rotation;
+        let rot_xyzw = [rot.x as f32, rot.y as f32, rot.z as f32, rot.w as f32];
+        let (linvel, angvel) = if spec.sleeping {
+            ([0.0f32; 3], [0.0f32; 3])
+        } else {
+            (
+                spec.linvel_m_s.map(|v| v as f32),
+                spec.angvel_rad_s.map(|v| v as f32),
+            )
+        };
+
+        let phys = self.physics.add_body(BodySpec {
+            kind: PhysBodyKind::Dynamic { ccd: false },
+            representation: plan.representation,
+            grid: plan.grid.clone(),
+            cell_m,
+            density_kg_m3: spec.density_kg_m3.max(f32::MIN_POSITIVE),
+            translation_m: trans,
+            linvel_m_s: linvel,
+        });
+        self.physics.set_body_pose(phys, trans, rot_xyzw);
+        self.physics.set_body_velocity(phys, linvel, angvel);
+
+        let entity = spec.entity;
+        let body = Body {
+            entity: Some(entity),
+            volume_id: spec.volume.id(),
+            volume: spec.volume,
+            kind: BodyKind::Dynamic,
+            pose: spec.pose,
+            linvel_m_s: spec.linvel_m_s,
+            angvel_rad_s: spec.angvel_rad_s,
+            sleeping: spec.sleeping,
+            collider_revision: spec.collider_revision,
+            coarsen_k: plan.coarsen_k,
+            phys,
+            collider_region: spec.collider_region,
+        };
+        self.volume_owner.insert(body.volume_id.get(), entity.get());
+        self.bodies.insert(entity.get(), body);
+        Ok(entity)
+    }
+
+    /// Applies the ops of one journalled [`spall_protocol::TopologyTransaction`]
+    /// to the live world during recovery: brush / cell-run writes go to their
+    /// named volume, and each `SplitOff` child is built from its canonical fill
+    /// runs and installed as a body using the matching participant snapshot for
+    /// its transform. Colliders of every touched volume are rebuilt. The caller
+    /// bumps the id counters past the replayed suffix afterwards.
+    pub fn replay_transaction(
+        &mut self,
+        tx: &spall_protocol::TopologyTransaction,
+        participants: &[MotionSnapshot],
+    ) -> Result<(), WorldError> {
+        use spall_protocol::TopologyOp;
+
+        let terrain_cell_size = self.terrain.volume.cell_size();
+        let mut touched: Vec<VolumeId> = Vec::new();
+        let mut split = false;
+
+        // Group consecutive same-volume cell writes so each volume is edited
+        // once. A `SplitOff` opens a new child group; its following `CellRun`s
+        // (same child volume) fill it.
+        struct Group {
+            volume: VolumeId,
+            new_child: Option<EntityId>,
+            writes: Vec<(GlobalCell, MaterialId)>,
+        }
+        let mut group: Option<Group> = None;
+        let flush = |world: &mut SimWorld,
+                     group: Option<Group>,
+                     touched: &mut Vec<VolumeId>|
+         -> Result<(), WorldError> {
+            let Some(g) = group else { return Ok(()) };
+            if let Some(child_entity) = g.new_child {
+                if g.writes.is_empty() {
+                    return Err(WorldError::EmptyBody);
+                }
+                let mut min = BrickCoord::new(i64::MAX, i64::MAX, i64::MAX);
+                let mut max = BrickCoord::new(i64::MIN, i64::MIN, i64::MIN);
+                for (cell, _) in &g.writes {
+                    let b = cell.split().0;
+                    min = BrickCoord::new(min.x.min(b.x), min.y.min(b.y), min.z.min(b.z));
+                    max = BrickCoord::new(max.x.max(b.x), max.y.max(b.y), max.z.max(b.z));
+                }
+                let bounds = BrickBounds::new(min, max).expect("min <= max by construction");
+                let mut child = Volume::bounded(g.volume, terrain_cell_size, bounds);
+                for bz in min.z..=max.z {
+                    for by in min.y..=max.y {
+                        for bx in min.x..=max.x {
+                            child
+                                .insert_brick(
+                                    BrickCoord::new(bx, by, bz),
+                                    Brick::uniform(MaterialId::AIR, Revision(1)),
+                                )
+                                .expect("brick within the bounds just set");
+                        }
+                    }
+                }
+                let mut plan = EditPlan::new(g.volume);
+                for (cell, material) in &g.writes {
+                    plan.set(*cell, *material);
+                }
+                child.apply_edit(&plan)?;
+
+                let snap = participants.iter().find(|s| s.body == child_entity);
+                let pose = snap
+                    .map(pose_from_snapshot)
+                    .unwrap_or_else(BodyPose::identity);
+                let (linvel, angvel, sleeping) = snap
+                    .map(|s| {
+                        (
+                            s.linear_velocity.map(f64::from),
+                            s.angular_velocity.map(f64::from),
+                            s.sleeping,
+                        )
+                    })
+                    .unwrap_or(([0.0; 3], [0.0; 3], false));
+                let grid = OccupancyGrid::from_volume(&child)?.ok_or(WorldError::EmptyBody)?;
+                let region = {
+                    let o = grid.origin();
+                    let d = grid.dims();
+                    (
+                        GlobalCell::new(o.x, o.y, o.z),
+                        GlobalCell::new(
+                            o.x + d[0] as i64 - 1,
+                            o.y + d[1] as i64 - 1,
+                            o.z + d[2] as i64 - 1,
+                        ),
+                    )
+                };
+                world.insert_restored_body(RestoredBody {
+                    entity: child_entity,
+                    volume: child,
+                    pose,
+                    linvel_m_s: linvel,
+                    angvel_rad_s: angvel,
+                    sleeping,
+                    collider_revision: 1,
+                    collider_region: region,
+                    density_kg_m3: 1.0,
+                })?;
+                touched.push(g.volume);
+            } else {
+                let vol = world
+                    .volume_body_mut(g.volume)
+                    .ok_or(WorldError::UnknownVolume(g.volume))?;
+                let mut plan = EditPlan::new(g.volume);
+                for (cell, material) in &g.writes {
+                    plan.set(*cell, *material);
+                }
+                vol.volume.apply_edit(&plan)?;
+                if !touched.contains(&g.volume) {
+                    touched.push(g.volume);
+                }
+            }
+            Ok(())
+        };
+
+        for op in &tx.ops {
+            match op {
+                TopologyOp::IntegerBrush {
+                    volume,
+                    brush,
+                    material,
+                } => {
+                    flush(self, group.take(), &mut touched)?;
+                    let vol = self
+                        .volume_body_mut(*volume)
+                        .ok_or(WorldError::UnknownVolume(*volume))?;
+                    vol.volume
+                        .apply_edit(&EditPlan::sphere(*volume, *brush, *material))?;
+                    if !touched.contains(volume) {
+                        touched.push(*volume);
+                    }
+                }
+                TopologyOp::SplitOff {
+                    child,
+                    child_entity,
+                    ..
+                } => {
+                    flush(self, group.take(), &mut touched)?;
+                    split = true;
+                    group = Some(Group {
+                        volume: *child,
+                        new_child: Some(*child_entity),
+                        writes: Vec::new(),
+                    });
+                }
+                TopologyOp::CellRun {
+                    volume,
+                    start,
+                    len,
+                    material,
+                } => {
+                    if group.as_ref().map(|g| g.volume) != Some(*volume) {
+                        flush(self, group.take(), &mut touched)?;
+                        group = Some(Group {
+                            volume: *volume,
+                            new_child: None,
+                            writes: Vec::new(),
+                        });
+                    }
+                    let g = group.as_mut().expect("just set");
+                    let last_x = start
+                        .x
+                        .checked_add(i64::from(*len).saturating_sub(1))
+                        .ok_or(WorldError::UnknownVolume(*volume))?;
+                    for x in start.x..=last_x {
+                        g.writes
+                            .push((GlobalCell::new(x, start.y, start.z), *material));
+                    }
+                }
+            }
+        }
+        flush(self, group.take(), &mut touched)?;
+
+        for vid in touched {
+            self.rebuild_volume_collider(vid)?;
+        }
+        if split {
+            self.bump_topology_epoch();
+        }
+        Ok(())
+    }
+
+    /// Rebuilds one volume's collider from its current geometry (recovery and
+    /// post-replay). No-op if the volume has no solid cell left.
+    pub fn rebuild_volume_collider(&mut self, volume: VolumeId) -> Result<(), WorldError> {
+        let Some(body) = self.volume_body(volume) else {
+            return Err(WorldError::UnknownVolume(volume));
+        };
+        let phys = body.phys;
+        let Some(grid) = OccupancyGrid::from_volume(&body.volume)? else {
+            return Ok(());
+        };
+        let plan = plan_collider(&grid);
+        self.physics
+            .rebuild_collider(phys, &plan.grid, plan.representation);
+        if let Some(body) = self.volume_body_mut(volume) {
+            body.collider_revision += 1;
+            body.coarsen_k = plan.coarsen_k;
+        }
+        Ok(())
+    }
+
+    /// Applies a durable 20 Hz pose batch during recovery: each body's
+    /// transform, velocity, and sleep flag are set to the snapshot's (rotation
+    /// is the i16-quantized wire value — the accepted motion-rewind loss from
+    /// `docs/protocol.md`).
+    pub fn apply_pose_batch(&mut self, snapshots: &[MotionSnapshot]) {
+        for snap in snapshots {
+            let Some(body) = self.bodies.get_mut(&snap.body.get()) else {
+                continue;
+            };
+            let pose = pose_from_snapshot(snap);
+            let trans = [
+                pose.translation_m[0] as f32,
+                pose.translation_m[1] as f32,
+                pose.translation_m[2] as f32,
+            ];
+            let rot = pose.rotation;
+            let rot_xyzw = [rot.x as f32, rot.y as f32, rot.z as f32, rot.w as f32];
+            let linvel = snap.linear_velocity;
+            let angvel = snap.angular_velocity;
+            body.pose = pose;
+            body.linvel_m_s = linvel.map(f64::from);
+            body.angvel_rad_s = angvel.map(f64::from);
+            body.sleeping = snap.sleeping;
+            let phys = body.phys;
+            self.physics.set_body_pose(phys, trans, rot_xyzw);
+            self.physics.set_body_velocity(phys, linvel, angvel);
+        }
     }
 
     /// Canonical representation of one volume for hashing / result hashes. The

@@ -391,7 +391,7 @@ fn save_air_brick_stays_empty_across_restart() {
         .unwrap();
     let cells = decode_cells(&solid.payload).unwrap();
     assert_eq!(cells.len(), spall_core::CELLS_PER_BRICK);
-    assert!(cells.iter().any(|&c| c == 1) && cells.iter().any(|&c| c == 2));
+    assert!(cells.contains(&1) && cells.contains(&2));
 }
 
 #[test]

@@ -6,8 +6,8 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 #[derive(Debug, Parser)]
 #[command(name = "sandbox-server", about = "GPU-free Spall sandbox server host")]
 struct Args {
-    /// Reserved for the T16 on-disk world; unused by the T00 loop and the T10
-    /// built-in scene.
+    /// Directory for the T16 on-disk world; the SQLite database is
+    /// `<world>/world.db`. Used by `--serve --save`; ignored by the T00 loop.
     #[arg(long, default_value = ".local/worlds/dev")]
     world: PathBuf,
     #[arg(long, default_value_t = 0)]
@@ -49,6 +49,14 @@ struct Args {
     /// Real-time 60 Hz pacing (needed for interactive / networked clients).
     #[arg(long)]
     paced: bool,
+    /// T16: persist to `<world>/world.db` — recover from it on start, journal
+    /// committed transactions, checkpoint on the interval and on shutdown.
+    #[arg(long)]
+    save: bool,
+    /// Ticks between engine checkpoints (1800 == 30 s at 60 Hz). 0 disables the
+    /// periodic checkpoint (a shutdown checkpoint still happens).
+    #[arg(long, default_value_t = 1_800)]
+    checkpoint_interval_ticks: u64,
 }
 
 fn main() -> ExitCode {
@@ -93,6 +101,13 @@ fn run_serve(args: Args) -> ExitCode {
         }
     };
 
+    let save = args.save.then(|| args.world.join("world.db"));
+    if let Some(db) = &save
+        && let Some(parent) = db.parent()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
     let config = ServeConfig {
         listen: args.listen,
         scene: Scene::BridgeCut,
@@ -108,6 +123,9 @@ fn run_serve(args: Args) -> ExitCode {
         fingerprint_out: args.fingerprint_out,
         addr_out: args.addr_out,
         transport: TransportConfig::default(),
+        save,
+        checkpoint_interval_ticks: args.checkpoint_interval_ticks,
+        seed: args.seed,
     };
     match spall_server::serve(config) {
         Ok(summary) => {

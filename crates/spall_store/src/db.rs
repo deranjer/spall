@@ -158,21 +158,26 @@ impl Writer {
             });
         }
 
-        let mut expect = self
+        let start = self
             .journal_max_seq()?
             .checked_add(1)
             .ok_or(StoreError::JournalGap {
                 expected: u64::MAX,
                 got: u64::MAX,
             })?;
-        for r in records {
+        for (offset, r) in records.iter().enumerate() {
+            let expect = start
+                .checked_add(offset as u64)
+                .ok_or(StoreError::JournalGap {
+                    expected: u64::MAX,
+                    got: r.seq,
+                })?;
             if r.seq != expect {
                 return Err(StoreError::JournalGap {
                     expected: expect,
                     got: r.seq,
                 });
             }
-            expect += 1;
         }
 
         let mut payload_bytes = 0u64;

@@ -167,3 +167,43 @@ Brick states: absent -> requested -> resident -> dirty -> checkpointed -> evicta
 Storage partitions index data; they do not own indivisible physical objects. A body spanning partitions has one authoritative identity and geometry owner, plus spatial index references. Relevance uses its bounds, not just its centre.
 
 Begin G1/G2 with all scene geometry resident. G3 introduces eviction against the same invariants. Distant render LOD never changes authoritative voxels, collision, support, or replicated destruction outcomes.
+
+## Persistence and recovery (T16)
+
+`spall_store` (`-> spall_protocol`) owns the durable save schema and SQLite I/O
+only, never simulation objects. It exposes: a versioned save schema
+(`STORE_SCHEMA_VERSION`; a `PRAGMA user_version` guard rejects a newer database
+untouched), zstd-compressed brick payloads with one-brick-bounded decode, a
+single WAL `Writer` that verifies `journal_mode=WAL` + `synchronous=FULL` on
+open and returns a `DurableThrough` only after a successful `COMMIT`, checkpoint
+publication (all body/brick rows + the journal cursor + a `complete=1` marker
+in one transaction), and recovery (latest complete checkpoint + contiguous
+CRC-verified journal suffix; interior corruption truncates the replay, is
+reported, and the previous checkpoint is offered as a fallback).
+`fault::{CrashPoint, FaultPlan}` inject controlled crashes around the commit
+boundaries and disk errors that roll the transaction back so the API never
+reports a save it did not make durable.
+
+The authoritative-state to save-record conversion lives in the integrator:
+`spall_server::persist` provides `capture` (`SimWorld` to `Checkpoint`),
+`restore` (`Checkpoint` + durable journal suffix to a fresh `Simulation`, with
+the material-manifest hash checked), `journal_records`, and the 30 s /
+clean-shutdown checkpoint cadence wired into `sandbox-server --serve --save`.
+It sits in `spall_server` — which already depends on both `spall_sim` and
+`spall_store` — rather than adding a `spall_sim -> spall_store` edge that would
+pull the vendored SQLite C build into the otherwise pure simulation crate.
+`spall_sim` already emits the `spall_protocol` records the journal stores
+(`journal.rs`); T16 adds only additive restore hooks there
+(`SimWorld::resume_registry` / `insert_restored_body` / `replay_transaction` /
+`apply_pose_batch`, `Simulation::from_restored`) and
+`spall_voxel::Brick::restored`, so its "owns conversion between authoritative
+state and protocol records" responsibility is unchanged.
+
+Only topology transactions are journalled (seq = the simulation's
+`JournalSeq`), each carrying its participant body snapshots; periodic 20 Hz
+pose-batch journaling is deferred, so a crash rewinds body motion to the last
+checkpoint / last topology-record participant state, which the
+`docs/protocol.md` durability model permits. `restore` replays a `SplitOff`
+from the transaction's own canonical fill runs and the participant snapshot (no
+`spall_structure` re-run) and resumes the id counters past everything the
+suffix consumed, so a post-restart edit still commits with fresh ids.

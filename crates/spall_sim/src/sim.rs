@@ -27,11 +27,16 @@ pub struct SimulationConfig {
 }
 
 impl SimulationConfig {
+    /// Default accepted-but-unstaged intent backlog.
+    pub const DEFAULT_MAX_PENDING_INTENTS: usize = 256;
+    /// Default consecutive-conflict count before a region is serialized.
+    pub const DEFAULT_SERIALIZE_THRESHOLD: u32 = 3;
+
     pub fn new(world: WorldSetup) -> Self {
         Self {
             world,
-            max_pending_intents: 256,
-            serialize_threshold: 3,
+            max_pending_intents: Self::DEFAULT_MAX_PENDING_INTENTS,
+            serialize_threshold: Self::DEFAULT_SERIALIZE_THRESHOLD,
         }
     }
 }
@@ -64,6 +69,24 @@ impl Simulation {
             tick: Tick::ZERO,
             next_control_seq: 1,
         })
+    }
+
+    /// Rebuilds a simulation from a recovered [`SimWorld`] (T16). `tick` is the
+    /// checkpoint tick the world was restored to (and journal suffix replayed
+    /// onto). The in-memory journal starts empty — the durable journal lives in
+    /// `spall_store` — and control-stream sequencing restarts at 1 for the fresh
+    /// post-restart session.
+    pub fn from_restored(world: SimWorld, tick: Tick) -> Self {
+        Self {
+            world,
+            pipeline: EditPipeline::new(
+                SimulationConfig::DEFAULT_MAX_PENDING_INTENTS,
+                SimulationConfig::DEFAULT_SERIALIZE_THRESHOLD,
+            ),
+            journal: JournalSink::new(),
+            tick,
+            next_control_seq: 1,
+        }
     }
 
     pub fn world(&self) -> &SimWorld {

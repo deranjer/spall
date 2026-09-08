@@ -237,6 +237,34 @@ edges and reuse already-locked crates:
 unchanged from T06 (`rapier3d` stack) and T09 (`quinn` / `rustls` / `tokio`
 stack).
 
+## T16 — durable world checkpoint and journal (verified 2026-09-07)
+
+New crate `crates/spall_store` — the save schema and durable SQLite I/O. It is
+the only crate that depends on `rusqlite` / `zstd`; dependency direction matches
+`docs/architecture.md` (`spall_store -> spall_protocol -> spall_core`), with no
+edge to `spall_voxel` / `spall_sim` / GPU / window / async.
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T16 |
+| --- | ---: | --- | --- | --- |
+| rusqlite | 0.37.0 | `bundled` (vendored SQLite 3, `libsqlite3-sys 0.35`) | `MIT` | WAL writer, checkpoint/journal transactions, `PRAGMA user_version` guard |
+| zstd | 0.13.3 | default (`zstd-safe 7`, `zstd-sys 2.1.0+zstd.1.5.7`) | `MIT` | compressed dense brick payloads, bounded decompression |
+
+Transitive crates newly locked: `libsqlite3-sys 0.35.0` (`MIT`), `zstd-safe
+7.3.0` (`BSD-3-Clause`), `zstd-sys 2.1.0+zstd.1.5.7` (`BSD-3-Clause`; vendored
+zstd C is `BSD-3-Clause OR GPL-2.0`), `hashlink 0.10.0` (`MIT OR Apache-2.0`),
+`fallible-iterator 0.3.0` / `fallible-streaming-iterator 0.1.9` (`MIT/Apache-2.0`),
+`getrandom 0.4.3` (`MIT OR Apache-2.0`), plus build-time `pkg-config`, `vcpkg`,
+`jobserver`. `libsqlite3-sys` and `zstd-sys` compile vendored C with the MSVC C
+toolchain already recorded below; no extra Windows prerequisite.
+
+`rusqlite` features **available but not enabled**: `serde_json`, `chrono`,
+`load_extension`, `backup` (versioned DTO migration into a separate database is
+a later task; `docs/protocol.md`). `spall_store` sets `synchronous=FULL` and
+verifies both pragmas on open. `blake3` (already locked in T01) provides the
+16-byte journal-payload integrity check. `postcard` (T01) encodes the save DTOs;
+the journal keeps `spall_protocol` wire records verbatim so the wire schema
+stays versioned independently of the save schema.
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,
