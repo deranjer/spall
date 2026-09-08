@@ -515,3 +515,72 @@ fn metrics_expose_bytes_and_commit_rate() {
     assert!(m.checkpoint_payload_bytes > 0);
     assert!(m.commit_bytes_per_sec() > 0.0);
 }
+
+// --- ENG-34: the durable journal high-water mark survives retention -------
+
+/// Probe `review_retention_must_preserve_next_journal_sequence`: pruning every
+/// journal row a checkpoint covers must not let the next sequence reset. Two
+/// checkpoints at the same cursor, `retain(2)`, then the next append.
+#[test]
+fn review_retention_must_preserve_next_journal_sequence() {
+    let s = Scratch::new("hwm_probe");
+    let mut w = Writer::open(s.db()).unwrap();
+    w.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+    w.append_journal(&[pose_batch(1, 1)]).unwrap();
+    w.publish_checkpoint(&checkpoint(10, 1)).unwrap();
+    w.publish_checkpoint(&checkpoint(20, 1)).unwrap();
+    w.retain(2).unwrap();
+
+    let result = w.append_journal(&[pose_batch(2, 21)]);
+    assert!(
+        result.is_ok(),
+        "valid append after pruning every covered journal row rejected: {result:?}"
+    );
+    assert_eq!(result.unwrap().journal_seq.0, 2);
+}
+
+/// Prune *every* journal row (no suffix left at all), across a writer reopen,
+/// then keep editing: sequence ids continue past the pruned rows, never reuse.
+#[test]
+fn full_journal_prune_then_reopen_then_edit_never_reuses_sequences() {
+    let s = Scratch::new("hwm_full_prune");
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+        w.append_journal(&[pose_batch(1, 1), pose_batch(2, 2), pose_batch(3, 3)])
+            .unwrap();
+        // A checkpoint whose cursor covers the whole journal, then retain: the
+        // journal table is emptied completely.
+        w.publish_checkpoint(&checkpoint(30, 3)).unwrap();
+        let (_, pruned) = w.retain(1).unwrap();
+        assert_eq!(pruned, 3, "all three journal rows pruned");
+        assert_eq!(w.journal_max_seq().unwrap(), 0, "journal table is empty");
+        assert_eq!(
+            w.durable_journal_high_water().unwrap(),
+            3,
+            "the high-water mark is preserved by the checkpoint cursor"
+        );
+    }
+
+    // Idle restart: reopen the database, no new edits yet.
+    {
+        let w = Writer::open(s.db()).unwrap();
+        assert_eq!(w.journal_max_seq().unwrap(), 0);
+        assert_eq!(w.durable_journal_high_water().unwrap(), 3);
+    }
+
+    // A subsequent edit resumes at seq 4 — never 1 — with no gap error.
+    let mut w = Writer::open(s.db()).unwrap();
+    let d = w
+        .append_journal(&[pose_batch(4, 40), pose_batch(5, 41)])
+        .unwrap();
+    assert_eq!(d.journal_seq.0, 5);
+
+    // And the earlier sequences are genuinely gone, not re-handed out.
+    let rec = w.recover().unwrap();
+    assert_eq!(
+        rec.journal.iter().map(|j| j.seq).collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    assert_eq!(rec.durable_through, 5);
+}

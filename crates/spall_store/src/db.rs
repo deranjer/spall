@@ -138,10 +138,34 @@ impl Writer {
         Ok(v as u64)
     }
 
+    /// The durable journal high-water mark: the highest sequence that is either
+    /// still stored in `journal` **or** already folded into a complete
+    /// checkpoint's cursor. `retain` prunes journal rows once a checkpoint
+    /// covers them, so `MAX(journal.seq)` alone drops back to `0` after a full
+    /// prune even though those sequences were durably applied — the checkpoint
+    /// cursors are the surviving record. Both inputs are on disk, so this is
+    /// stable across reopen and never regresses; sequence ids are therefore
+    /// never reset or reused.
+    pub fn durable_journal_high_water(&self) -> Result<u64, StoreError> {
+        let v: i64 = self.conn.query_row(
+            "SELECT MAX(hi) FROM ( \
+                 SELECT COALESCE(MAX(seq), 0) AS hi FROM journal \
+                 UNION ALL \
+                 SELECT COALESCE(MAX(journal_cursor), 0) AS hi \
+                     FROM checkpoints WHERE complete = 1 \
+             )",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(v as u64)
+    }
+
     /// Groups `records` into one DB transaction and commits it. On success the
     /// batch is durable and the returned [`DurableThrough`] names its last
     /// sequence. `records` must be contiguous and start exactly one past the
-    /// stored maximum.
+    /// durable journal high-water mark (see
+    /// [`Writer::durable_journal_high_water`]) — which survives checkpoint
+    /// retention pruning every stored journal row.
     pub fn append_journal(
         &mut self,
         records: &[JournalRecord],
@@ -158,13 +182,13 @@ impl Writer {
             });
         }
 
-        let start = self
-            .journal_max_seq()?
-            .checked_add(1)
-            .ok_or(StoreError::JournalGap {
-                expected: u64::MAX,
-                got: u64::MAX,
-            })?;
+        let start =
+            self.durable_journal_high_water()?
+                .checked_add(1)
+                .ok_or(StoreError::JournalGap {
+                    expected: u64::MAX,
+                    got: u64::MAX,
+                })?;
         for (offset, r) in records.iter().enumerate() {
             let expect = start
                 .checked_add(offset as u64)
@@ -348,6 +372,11 @@ impl Writer {
     /// Keeps the newest `keep` complete checkpoints and drops older ones, then
     /// prunes journal rows no retained checkpoint still needs. Returns
     /// `(checkpoints_dropped, journal_rows_pruned)`.
+    ///
+    /// Pruning a covered journal row does not lower the next sequence: a
+    /// retained checkpoint's cursor still records those sequences as durably
+    /// applied, and [`Writer::append_journal`] resumes past
+    /// [`Writer::durable_journal_high_water`], not `MAX(journal.seq)`.
     pub fn retain(&mut self, keep: usize) -> Result<(u64, u64), StoreError> {
         self.ensure_live()?;
         let keep = keep.max(1);
