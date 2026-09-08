@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Spall QUIC transport adapter: TLS-pinned dev sessions, framed reliable records, motion datagrams, and a deterministic fault harness."
 
+[features]
+# Exposes deliberately unguarded stream helpers (e.g. `Connection::open_bi_unguarded`)
+# so integration tests can drive a peer past the negotiated bulk-stream cap.
+# Never enabled by production dependents.
+test-util = []
+
 [dependencies]
 blake3.workspace = true
 postcard.workspace = true
@@ -22,3 +28,5 @@ tracing.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util", "test-util"] }
+# Turns on the `test-util` feature for this crate's own test/bench builds.
+spall_net = { path = ".", features = ["test-util"] }
