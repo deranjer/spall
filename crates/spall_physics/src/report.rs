@@ -30,6 +30,9 @@ pub struct FeasibilityParams {
     pub settle_steps: u32,
     /// Number of collider rebuilds to time for the edit-cost scenario.
     pub rebuild_iters: u32,
+    /// Number of one-shot 64-brick collider builds to time for the build-cost
+    /// percentiles.
+    pub build_iters: u32,
     /// Projectile speed, m/s, for the fast-object scenario.
     pub projectile_speed: f32,
 }
@@ -42,6 +45,7 @@ impl FeasibilityParams {
             debris_count: 64,
             settle_steps: 180,
             rebuild_iters: 12,
+            build_iters: 24,
             projectile_speed: 220.0,
         }
     }
@@ -54,6 +58,7 @@ impl FeasibilityParams {
             debris_count: 256,
             settle_steps: 420,
             rebuild_iters: 60,
+            build_iters: 64,
             projectile_speed: 220.0,
         }
     }
@@ -122,8 +127,14 @@ pub struct RepresentationReport {
 
     /// Primitive count for the 64-brick connected body.
     pub multibrick_primitives: usize,
-    /// One-shot build time for that body, microseconds.
-    pub multibrick_build_us: f64,
+    /// **Complete** occupancy → collider build time for that body across
+    /// `build_iters` builds, microseconds: native index extraction / greedy
+    /// decomposition, all shape allocation, and the Rapier wrapping.
+    pub multibrick_build: PercentileSummary,
+    /// Component of the build spent only in the final Rapier shape wrapping,
+    /// across the same builds, microseconds. Retained so the wrap-only figure
+    /// stays visible next to the complete cost.
+    pub multibrick_wrap: PercentileSummary,
     /// Estimated collider memory for that body, bytes.
     pub multibrick_est_bytes: usize,
 
@@ -174,10 +185,11 @@ impl RepresentationReport {
     /// Compact JSON object for the bench output.
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"representation\":\"{}\",\"multibrick_primitives\":{},\"multibrick_build_us\":{:.3},\"multibrick_est_bytes\":{},\"settle_step\":{},\"settle_sleep_fraction\":{:.4},\"settle_max_speed\":{:.4},\"settle_finite\":{},\"sleep_wake\":{},\"building_step\":{},\"building_interior_clearance_m\":{:.4},\"building_settled\":{},\"rebuild\":{},\"mass_rel_err\":{:.6},\"com_abs_err_m\":{:.6},\"inertia_rel_err\":{:.6},\"projectile_max_stop_m_s\":{:.1},\"worst_case_solid_cells\":{},\"worst_case_primitives\":{}}}",
+            "{{\"representation\":\"{}\",\"multibrick_primitives\":{},\"multibrick_build\":{},\"multibrick_wrap\":{},\"multibrick_est_bytes\":{},\"settle_step\":{},\"settle_sleep_fraction\":{:.4},\"settle_max_speed\":{:.4},\"settle_finite\":{},\"sleep_wake\":{},\"building_step\":{},\"building_interior_clearance_m\":{:.4},\"building_settled\":{},\"rebuild\":{},\"mass_rel_err\":{:.6},\"com_abs_err_m\":{:.6},\"inertia_rel_err\":{:.6},\"projectile_max_stop_m_s\":{:.1},\"worst_case_solid_cells\":{},\"worst_case_primitives\":{}}}",
             self.representation,
             self.multibrick_primitives,
-            self.multibrick_build_us,
+            self.multibrick_build.to_json(),
+            self.multibrick_wrap.to_json(),
             self.multibrick_est_bytes,
             self.settle_step.to_json(),
             self.settle_sleep_fraction,
@@ -236,7 +248,8 @@ pub fn run_feasibility(params: FeasibilityParams) -> FeasibilityReport {
 }
 
 fn run_one(rep: Representation, params: FeasibilityParams) -> RepresentationReport {
-    let (mb_primitives, mb_build_us, mb_bytes) = multibrick_build(rep, params.multibrick);
+    let (mb_primitives, mb_build, mb_wrap, mb_bytes) =
+        multibrick_build(rep, params.multibrick, params.build_iters);
     let (settle_step, sleep_fraction, max_speed, finite) = debris_settle(rep, params);
     let sleep_wake = sleep_wake_cycle(rep);
     let (building_step, clearance, settled) = building_drop(rep, params.settle_steps);
@@ -248,7 +261,8 @@ fn run_one(rep: Representation, params: FeasibilityParams) -> RepresentationRepo
     RepresentationReport {
         representation: rep.label(),
         multibrick_primitives: mb_primitives,
-        multibrick_build_us: mb_build_us,
+        multibrick_build: mb_build,
+        multibrick_wrap: mb_wrap,
         multibrick_est_bytes: mb_bytes,
         settle_step,
         settle_sleep_fraction: sleep_fraction,
@@ -299,17 +313,33 @@ fn vid(n: u64) -> VolumeId {
     VolumeId::new(n).unwrap()
 }
 
-fn multibrick_build(rep: Representation, bricks: [i64; 3]) -> (usize, f64, usize) {
+/// Times the **complete** occupancy → collider build of the named 64-brick
+/// connected body (`iters` builds): native solid-index extraction / greedy
+/// decomposition, every shape allocation, and the Rapier wrapping. Returns the
+/// primitive count, the complete-build percentile summary, the wrap-only
+/// component summary, and the estimated collider memory.
+fn multibrick_build(
+    rep: Representation,
+    bricks: [i64; 3],
+    iters: u32,
+) -> (usize, PercentileSummary, PercentileSummary, usize) {
     let v = fixtures::connected_multibrick(vid(1), bricks, true);
     let grid = OccupancyGrid::from_volume(&v)
         .expect("resident")
         .expect("non-empty");
-    let built = build_collider(&grid, fixtures::CELL_M, rep);
-    (
-        built.primitives,
-        built.build.as_secs_f64() * 1e6,
-        built.est_bytes,
-    )
+
+    let mut build = DurationSamples::new();
+    let mut wrap = DurationSamples::new();
+    let mut primitives = 0;
+    let mut est_bytes = 0;
+    for _ in 0..iters.max(1) {
+        let built = build_collider(&grid, fixtures::CELL_M, rep);
+        build.push(built.build);
+        wrap.push(built.wrap);
+        primitives = built.primitives;
+        est_bytes = built.est_bytes;
+    }
+    (primitives, build.summary_us(), wrap.summary_us(), est_bytes)
 }
 
 fn debris_settle(
@@ -753,6 +783,18 @@ mod tests {
                 r.inertia_rel_err
             );
             assert!(r.rebuild.p50_us > 0.0);
+
+            // The reported 64-brick build cost is the complete occupancy →
+            // collider work, so it must be at least the wrap-only component it
+            // contains (ENG-40: no wrap-only figure under the build name).
+            assert!(
+                r.multibrick_build.p50_us >= r.multibrick_wrap.p50_us,
+                "{}: complete build p50 {:.3} us < wrap-only p50 {:.3} us",
+                r.representation,
+                r.multibrick_build.p50_us,
+                r.multibrick_wrap.p50_us
+            );
+            assert!(r.multibrick_build.p50_us > 0.0);
 
             // Sleep/wake acceptance: settled asleep, woke on the in-place
             // collider rebuild *and* on a blast impulse, moved and re-collided,

@@ -33,13 +33,24 @@ CI runs the same scenarios at `--small` size as `spall_physics` tests, asserting
 behaviour only (settles, finite, interior preserved, mass/COM/inertia match,
 compound stops a 60 m/s CCD projectile).
 
+**Build / rebuild timing method (ENG-40).** Every build and rebuild figure below
+is the **complete** occupancy → collider cost, not the final-wrap sub-interval:
+the native path's solid-index extraction and allocation, the compound path's
+greedy decomposition over the whole grid and every per-part cuboid/isometry
+allocation, the Rapier shape construction, and — for a rebuild — the old
+collider's removal and the new collider's reinsertion under the body. The
+wrap-only component is retained (`ColliderBuild::wrap`,
+`RepresentationReport::multibrick_wrap`) and reported separately. The 64-brick
+build is sampled `build_iters` times (64 at gate size) for percentiles.
+
 | Metric | Native voxels | Merged cuboids |
 | --- | ---: | ---: |
 | 64-brick connected body (128³-cell region, hollow) — primitives | 1 | 6 |
-| … one-shot collider build | 15.1 ms | **7.8 µs** |
+| … complete occupancy→collider build, p50 / p99 (n=64) | 16.1 ms / 18.1 ms | **1.57 ms / 1.86 ms** |
+| … of which the final Rapier shape wrapping (p50) | 15.0 ms | 1.5 µs |
 | … estimated collider memory | ~8 MiB (dense upper bound) | ~0.6 KiB |
-| Collider rebuild after an edit (hollow tower), p50 / p99 | 224 µs / 229 µs | **1.5 µs / 2.5 µs** |
-| Debris settle (256 pieces on a floor), step time p95 / p99 | 3.70 ms / 6.41 ms | **0.13 ms / 0.18 ms** |
+| Collider rebuild after a bounded edit (hollow tower — remove + decompose + wrap + reinsert), p50 / p99 (n=60) | 224 µs / 241 µs | **6.1 µs / 8.1 µs** |
+| Debris settle (256 pieces on a floor), step time p95 / p99 | 3.81 ms / 6.97 ms | **0.13 ms / 0.18 ms** |
 | Debris settle — all pieces finite, at rest, asleep | yes | yes |
 | Editable-collider sleep/wake — settled asleep, woke on an in-place collider rebuild, re-slept, woke on a blast impulse, travelled ~1.7 m, left the floor and re-collided, re-slept, stable throughout | yes | yes |
 | Hollow building drop — settles, interior clearance kept | yes, 1.0 m | yes, 1.0 m |
@@ -73,10 +84,18 @@ the whole cycle. Both representations pass. CI asserts this at `--small` size in
 `spall_physics` builds **merged-cuboid compounds** for both static terrain and
 dynamic detached bodies. Rationale, in order of weight:
 
-1. **Editability.** A cut rebuilds the collider in ~1.5 µs versus ~224 µs, and a
-   fresh large body in ~8 µs versus ~15 ms. The authoritative edit path (T08)
-   rebuilds a body's collider on every accepted topology transaction; the
-   compound cost disappears into the tick, the voxel-shape cost does not.
+1. **Editability.** Measured as complete occupancy → collider cost (ENG-40): a
+   bounded edit rebuilds the compound collider in **~6.1 µs** versus **~224 µs**
+   for the voxel shape — ~37× faster — and a full fresh 64-brick body builds in
+   **~1.57 ms** versus **~16.1 ms** — ~10× faster, at ~10,000× less resident
+   geometry. The greedy decomposition itself dominates the compound build (the
+   Rapier wrapping is only ~1.5 µs of the 1.57 ms), so the compound's build edge
+   over the voxel shape is one order of magnitude, not the ~1900× the earlier
+   wrap-only figure implied; for the common case — a bounded edit over a body's
+   collider region — it is roughly two orders. The authoritative edit path (T08)
+   rebuilds a body's collider on every accepted topology transaction; ~6 µs
+   disappears into the 16.7 ms tick, ~224 µs is a far larger bite. The fresh
+   large-body build is a spawn-time cost, not a per-tick cost.
 2. **Continuous collision detection.** `parry`'s `Voxels` shape gained no CCD
    benefit in testing — a fast body tunnels a 0.5 m wall above ~20 m/s — whereas
    the cuboid compound stops a 220 m/s projectile. Fast damaging bodies (T19,
@@ -88,6 +107,16 @@ dynamic detached bodies. Rationale, in order of weight:
 
 Native concave triangle meshes for dynamic solids remain prohibited, per the
 architecture.
+
+**Gate status (after the ENG-40 complete-timing re-measurement): pass, decision
+unchanged.** Correcting the build/rebuild timers to cover the whole occupancy →
+collider path shrinks the compound's build-cost advantage from ~1900× to ~10×
+(fresh body) and its rebuild advantage from ~150× to ~37× (bounded edit), and
+exposes the greedy decomposition (~1.57 ms for the 64-brick body) as the real
+compound build cost. Both figures still sit an order of magnitude under the
+voxel-shape path, the bounded-edit rebuild the tick actually runs is ~6 µs, and
+memory, per-step cost, CCD, and exact hollow interiors are all still decisively
+in the compound's favour. No acceptance scenario regressed.
 
 ## Known limitation and the coarse-fracture policy
 
