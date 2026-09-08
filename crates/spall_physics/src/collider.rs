@@ -42,8 +42,17 @@ pub struct ColliderBuild {
     pub collider: Collider,
     /// Primitive count: `1` for the voxel shape, or the number of merged boxes.
     pub primitives: usize,
-    /// Wall-clock time spent constructing the shape.
+    /// Wall-clock time for the **complete** occupancy → collider construction:
+    /// the native solid-index extraction (and its allocation) or the greedy box
+    /// decomposition and every per-part shape allocation, *plus* the final
+    /// Rapier shape wrapping. This is the figure the feasibility report and
+    /// `docs/collision-decision.md` cite as build / rebuild cost — it is not a
+    /// wrap-only measurement.
     pub build: Duration,
+    /// The sub-interval of [`Self::build`] spent only inside the final Rapier
+    /// shape construction (`ColliderBuilder::voxels` / `::compound`). Retained as
+    /// a component timing so the wrapping cost stays visible next to the total.
+    pub wrap: Duration,
     /// Rough resident size of the shape's geometry, bytes. An estimate for the
     /// feasibility report, not an allocator measurement.
     pub est_bytes: usize,
@@ -59,14 +68,19 @@ pub fn build_collider(grid: &OccupancyGrid, cell_m: f32, rep: Representation) ->
 }
 
 fn build_native(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
+    // The timer starts before the solid-index extraction: pulling every solid
+    // cell out of the dense grid and allocating the index vector is part of the
+    // occupancy → collider work, not setup that can be excluded.
+    let start = Instant::now();
     let indices: Vec<IVector> = grid
         .solid_indices()
         .into_iter()
         .map(|[x, y, z]| IVector::new(x, y, z))
         .collect();
 
-    let start = Instant::now();
+    let wrap_start = Instant::now();
     let collider = ColliderBuilder::voxels(Vector::splat(cell_m), &indices).build();
+    let wrap = wrap_start.elapsed();
     let build = start.elapsed();
 
     // parry stores per-voxel state (occupancy + face flags) plus a spatial
@@ -78,11 +92,16 @@ fn build_native(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
         collider,
         primitives: 1,
         build,
+        wrap,
         est_bytes,
     }
 }
 
 fn build_compound(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
+    // The timer covers the whole decomposition: the greedy box merge over the
+    // grid (the potentially dominant 128³ scan for a large body) and every
+    // per-part cuboid/isometry allocation, then the Rapier compound wrapping.
+    let start = Instant::now();
     let boxes = greedy_boxes(grid);
     let parts: Vec<(Pose, SharedShape)> = boxes
         .iter()
@@ -106,8 +125,9 @@ fn build_compound(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
         .collect();
     let primitives = parts.len();
 
-    let start = Instant::now();
+    let wrap_start = Instant::now();
     let collider = ColliderBuilder::compound(parts).build();
+    let wrap = wrap_start.elapsed();
     let build = start.elapsed();
 
     // Per part: an isometry (~28 B) + a cuboid half-extents vector (12 B) + the
@@ -118,6 +138,7 @@ fn build_compound(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
         collider,
         primitives,
         build,
+        wrap,
         est_bytes,
     }
 }
@@ -136,6 +157,28 @@ mod tests {
     fn hollow_grid() -> OccupancyGrid {
         let v = fixtures::hollow_tower(vid(1));
         OccupancyGrid::from_volume(&v).unwrap().unwrap()
+    }
+
+    #[test]
+    fn build_time_covers_decomposition_not_just_the_rapier_wrap() {
+        let grid = hollow_grid();
+        for rep in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let built = build_collider(&grid, 0.25, rep);
+            // The complete build must include, and so be at least as large as,
+            // the wrap-only component it contains.
+            assert!(
+                built.build >= built.wrap,
+                "{}: complete build {:?} < wrap-only {:?}",
+                rep.label(),
+                built.build,
+                built.wrap
+            );
+            assert!(
+                built.build.as_nanos() > 0,
+                "{}: zero build time",
+                rep.label()
+            );
+        }
     }
 
     #[test]

@@ -206,7 +206,10 @@ impl PhysicsWorld {
     }
 
     /// Swaps a body's collider for one rebuilt from `grid` in `rep` (an edit).
-    /// Returns the total rebuild cost: shape construction plus reinsertion.
+    /// Returns the **complete** rebuild cost: removing the old collider, the full
+    /// occupancy → shape construction (native index extraction or greedy
+    /// decomposition plus all shape allocation), the Rapier wrapping, and
+    /// re-inserting the new collider under the same body.
     pub fn rebuild_collider(
         &mut self,
         id: BodyId,
@@ -214,23 +217,24 @@ impl PhysicsWorld {
         rep: Representation,
     ) -> Duration {
         let entry = &mut self.entries[id.0 as usize];
-        let (cell_m, density, body) = (entry.cell_m, entry.density, entry.body);
-        self.colliders
-            .remove(entry.collider, &mut self.islands, &mut self.bodies, true);
+        let (cell_m, density, body, old_collider) =
+            (entry.cell_m, entry.density, entry.body, entry.collider);
 
-        let built = build_collider(grid, cell_m, rep);
         let start = Instant::now();
+        self.colliders
+            .remove(old_collider, &mut self.islands, &mut self.bodies, true);
+        let built = build_collider(grid, cell_m, rep);
         let collider = ColliderBuilder::new(built.collider.shared_shape().clone())
             .density(density)
             .build();
         let handle = self
             .colliders
             .insert_with_parent(collider, body, &mut self.bodies);
-        let insert = start.elapsed();
+        let total = start.elapsed();
 
         self.entries[id.0 as usize].collider = handle;
         self.entries[id.0 as usize].representation = rep;
-        built.build + insert
+        total
     }
 
     /// Advances the world by one fixed step.
