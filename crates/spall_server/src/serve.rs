@@ -14,33 +14,50 @@
 //! has been idle for `quiescence_ticks` consecutive ticks after at least one
 //! commit, then tells every client goodbye and tears the endpoint down.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
-use spall_core::{EntityId, JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole, Tick};
+use spall_core::{
+    EntityId, JournalSeq, JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole,
+};
 use spall_net::{
     Connection, DevIdentity, JoinToken, NetServer, Role, TransportConfig, TransportError,
     WireRecord,
 };
 use spall_physics::PhysicsConfig;
 use spall_protocol::{
-    ActionKind, ActionOutcome, ActionRequest, ActionStatus, AlgorithmVersions, ClaimedTarget,
-    Handshake, Hash32, MotionSnapshot, NegotiatedLimits, PROTOCOL_VERSION, RepairRequest,
-    RequestId, SessionId, SlotId, TopologyTransaction,
+    ActionKind, ActionOutcome, ActionRequest, ActionStatus, AlgorithmVersions, BaselineAck,
+    ClaimedTarget, Handshake, Hash32, InterestEpoch, MotionSnapshot, NegotiatedLimits,
+    PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
 };
 use spall_sim::{
     EditIntent, EditKind, EditTarget, MotionPublisher, Simulation, SimulationConfig,
-    action_statuses, committed_transactions, fixtures, repair_ops,
+    action_statuses, committed_transactions, fixtures,
 };
 use spall_store::Writer;
 use spall_structure::AnchorPlane;
 use tokio::sync::{mpsc, watch};
 
+use crate::baseline::{self, BaselineTransfer};
 use crate::persist::{self, PersistConfig};
+
+/// A joining client's sentinel `BaselineAck.transfer_id`: "I am a late-join
+/// replica, send me a baseline". A real transfer id is always `>= 1`, so `0`
+/// can never collide with an install confirmation.
+pub const BASELINE_REQUEST_SENTINEL: TransferId = TransferId(0);
+
+/// Default cap on a joining client's catch-up queue. A burst past this while the
+/// baseline is still installing cancels the transfer and re-captures a fresher
+/// one (`docs/protocol.md`: "If the client cannot catch up within memory/time
+/// limits, cancel the transfer and create a fresher snapshot").
+pub const DEFAULT_CATCH_UP_CAP: usize = 512;
+
+/// Default bounded retry count for late-join transfer restarts.
+pub const DEFAULT_MAX_JOIN_RETRIES: u32 = 3;
 
 /// Content-manifest tag both ends of a T10 session agree on out of band. Real
 /// manifest negotiation is T16/T17; this keeps the handshake honest meanwhile.
@@ -100,6 +117,12 @@ pub struct ServeConfig {
     pub checkpoint_interval_ticks: u64,
     /// World seed stamped into the save metadata.
     pub seed: u64,
+    /// T17: cap on a joining client's catch-up queue before the transfer is
+    /// cancelled and re-captured fresher.
+    pub catch_up_cap: usize,
+    /// T17: bounded late-join transfer restarts before the client is dropped
+    /// with an explicit failure (connected clients keep running).
+    pub max_join_retries: u32,
 }
 
 impl ServeConfig {
@@ -123,6 +146,8 @@ impl ServeConfig {
             save: None,
             checkpoint_interval_ticks: 1_800,
             seed: 0,
+            catch_up_cap: DEFAULT_CATCH_UP_CAP,
+            max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
         }
     }
 }
@@ -149,6 +174,17 @@ pub struct ServeSummary {
     pub persist_bytes_per_write: f64,
     /// Measured durable payload bytes per second of `COMMIT` time.
     pub persist_commit_bytes_per_sec: f64,
+    /// T17: late-join baselines that reached `BaselineAck` and went live.
+    pub late_joins_completed: u64,
+    /// T17: late-join transfers cancelled + re-captured on catch-up overflow.
+    pub late_join_retries: u64,
+    /// T17: joining clients dropped after exhausting the retry budget.
+    pub late_joins_failed: u64,
+    /// T17: `ActionRequest`s rejected because their session generation was
+    /// superseded by a reconnect.
+    pub expired_actions_rejected: u64,
+    /// T17: total baseline bulk payload bytes pushed this run.
+    pub baseline_bytes_sent: u64,
 }
 
 /// Anything that stops a [`serve`] run.
@@ -198,19 +234,30 @@ fn server_handshake() -> Handshake {
 /// One reliable/repair message from a client to the sim bridge.
 #[derive(Debug)]
 enum Inbound {
+    /// A connection was accepted; the sim loop learns its session (and, from the
+    /// generation, whether it supersedes an earlier one on the same slot).
+    Joined(SessionId),
     Action(SessionId, ActionRequest),
     Repair(SessionId, RepairRequest),
-    Gone,
+    /// A `BaselineAck`: the sentinel (`transfer_id == 0`) asks for a late-join
+    /// baseline; a real id confirms one is installed.
+    Baseline(SessionId, BaselineAck),
+    Gone(SessionId),
 }
 
-/// One message from the sim bridge to a client's writer task. Repair replies are
-/// already routed to one client's queue, so they need no session tag here.
+/// One message from the sim bridge to a client's writer task. Repair replies and
+/// baseline transfers are already routed to one client's queue, so they need no
+/// session tag here.
 #[derive(Debug, Clone)]
 enum Outbound {
     Transaction(Arc<TopologyTransaction>),
     Status(Arc<ActionStatus>),
     Motion(Arc<Vec<MotionSnapshot>>),
-    Repair(Arc<TopologyTransaction>),
+    /// A baseline transfer: `BaselineBegin` on control, parts on a bulk stream,
+    /// `BaselineEnd` on control. Carries the whole world for a first late join,
+    /// or one brick for a hash repair — the client decides replace vs. merge
+    /// from whether it has installed a baseline yet.
+    Baseline(Arc<BaselineTransfer>),
     Shutdown,
 }
 
@@ -354,6 +401,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let clients_for_sim = clients.clone();
     let save = config.save.clone();
     let checkpoint_interval = config.checkpoint_interval_ticks;
+    let catch_up_cap = config.catch_up_cap.max(1);
+    let max_join_retries = config.max_join_retries;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
@@ -380,6 +429,9 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut ticks_run = 0u64;
         let tick_dt = Duration::from_nanos(1_000_000_000 / 60);
 
+        // T17 late-join / reconnect state.
+        let mut lj = LateJoin::new(catch_up_cap, max_join_retries);
+
         for _ in 0..max_ticks {
             let started = std::time::Instant::now();
 
@@ -388,8 +440,15 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             let mut saw_client_work = false;
             while let Ok(msg) = inbound_rx.try_recv() {
                 match msg {
+                    Inbound::Joined(session) => lj.on_joined(session),
                     Inbound::Action(session, req) => {
                         saw_client_work = true;
+                        if lj.session_expired(session) {
+                            reject(&clients_for_sim, session, req.request_id, "expired session");
+                            rejected_total += 1;
+                            lj.expired_actions += 1;
+                            continue;
+                        }
                         match intent_from_request(session, &req) {
                             Some(intent) => {
                                 if let Err(e) = sim.submit(intent) {
@@ -415,9 +474,15 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     }
                     Inbound::Repair(session, req) => {
                         saw_client_work = true;
-                        repairs.push((session, req));
+                        if !lj.session_expired(session) {
+                            repairs.push((session, req));
+                        }
                     }
-                    Inbound::Gone => {}
+                    Inbound::Baseline(session, ack) => {
+                        saw_client_work = true;
+                        lj.on_baseline_ack(session, ack, &sim, &clients_for_sim, &mut motion);
+                    }
+                    Inbound::Gone(session) => lj.on_gone(session),
                 }
             }
 
@@ -430,7 +495,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
             for tx in committed_transactions(&report).map(|(_, t)| t.clone()) {
                 committed_total += 1;
-                broadcast(&clients_for_sim, Outbound::Transaction(Arc::new(tx)));
+                lj.fan_out_transaction(Arc::new(tx), &sim, &clients_for_sim);
             }
             for status in action_statuses(&report) {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
@@ -445,12 +510,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
             for (session, req) in repairs {
-                if let Some(ops) = repair_ops(sim.world(), &req)
-                    && !ops.is_empty()
-                {
-                    let tx = synthetic_repair_tx(tick, ops);
-                    send_to(&clients_for_sim, session, Outbound::Repair(Arc::new(tx)));
-                }
+                lj.answer_repair(session, &req, &sim, &clients_for_sim);
             }
 
             // T16: journal every newly committed transaction, then checkpoint
@@ -522,6 +582,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             journal_records_written,
             persist_bytes_per_write,
             persist_commit_bytes_per_sec,
+            late_joins_completed: lj.completed,
+            late_join_retries: lj.retries,
+            late_joins_failed: lj.failed,
+            expired_actions_rejected: lj.expired_actions,
+            baseline_bytes_sent: lj.baseline_bytes,
         }
     });
 
@@ -566,6 +631,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         journal_records_written: sim_result.journal_records_written,
         persist_bytes_per_write: sim_result.persist_bytes_per_write,
         persist_commit_bytes_per_sec: sim_result.persist_commit_bytes_per_sec,
+        late_joins_completed: sim_result.late_joins_completed,
+        late_join_retries: sim_result.late_join_retries,
+        late_joins_failed: sim_result.late_joins_failed,
+        expired_actions_rejected: sim_result.expired_actions_rejected,
+        baseline_bytes_sent: sim_result.baseline_bytes_sent,
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -595,6 +665,11 @@ struct SimResult {
     journal_records_written: u64,
     persist_bytes_per_write: f64,
     persist_commit_bytes_per_sec: f64,
+    late_joins_completed: u64,
+    late_join_retries: u64,
+    late_joins_failed: u64,
+    expired_actions_rejected: u64,
+    baseline_bytes_sent: u64,
 }
 
 impl SimResult {
@@ -612,8 +687,262 @@ impl SimResult {
             journal_records_written: 0,
             persist_bytes_per_write: 0.0,
             persist_commit_bytes_per_sec: 0.0,
+            late_joins_completed: 0,
+            late_join_retries: 0,
+            late_joins_failed: 0,
+            expired_actions_rejected: 0,
+            baseline_bytes_sent: 0,
         }
     }
+}
+
+// --- T17 late-join / catch-up / session renewal ---------------------------
+
+/// How the server is currently treating one connected client.
+enum Phase {
+    /// Normal replication: every committed transaction is pushed immediately.
+    Live,
+    /// A late-join baseline is in flight. Transactions committed after the
+    /// capture tick are buffered until the client acks the transfer; a burst
+    /// past the cap cancels and re-captures a fresher baseline.
+    Joining {
+        transfer_id: TransferId,
+        queue: VecDeque<Arc<TopologyTransaction>>,
+        retries: u32,
+    },
+}
+
+struct ClientLink {
+    session: SessionId,
+    phase: Phase,
+}
+
+/// All the per-run late-join / reconnect bookkeeping the sim loop needs, kept
+/// out of the loop body. Also the unit-test surface for the catch-up bound and
+/// the session-generation guard.
+struct LateJoin {
+    /// `session.raw()` → link.
+    links: HashMap<u64, ClientLink>,
+    /// slot → highest session generation seen. A record from a lower generation
+    /// is from a superseded (reconnected-past) session.
+    latest_gen: HashMap<u32, u32>,
+    next_transfer_id: u64,
+    catch_up_cap: usize,
+    max_retries: u32,
+    completed: u64,
+    retries: u64,
+    failed: u64,
+    expired_actions: u64,
+    baseline_bytes: u64,
+}
+
+impl LateJoin {
+    fn new(catch_up_cap: usize, max_retries: u32) -> Self {
+        Self {
+            links: HashMap::new(),
+            latest_gen: HashMap::new(),
+            next_transfer_id: 1,
+            catch_up_cap,
+            max_retries,
+            completed: 0,
+            retries: 0,
+            failed: 0,
+            expired_actions: 0,
+            baseline_bytes: 0,
+        }
+    }
+
+    fn on_joined(&mut self, session: SessionId) {
+        self.latest_gen
+            .entry(session.slot().0)
+            .and_modify(|g| *g = (*g).max(session.generation()))
+            .or_insert(session.generation());
+        self.links.insert(
+            session.raw(),
+            ClientLink {
+                session,
+                phase: Phase::Live,
+            },
+        );
+    }
+
+    fn on_gone(&mut self, session: SessionId) {
+        // Keep `latest_gen` so a straggler record from this session is still
+        // rejected after the link is gone.
+        self.links.remove(&session.raw());
+    }
+
+    /// `true` if `session`'s generation has been superseded by a reconnect on
+    /// the same slot (`docs/protocol.md`: "Reconnect uses a new session
+    /// generation; old queued inputs and packets are invalid").
+    fn session_expired(&self, session: SessionId) -> bool {
+        self.latest_gen
+            .get(&session.slot().0)
+            .is_some_and(|&g| session.generation() < g)
+    }
+
+    fn next_id(&mut self) -> TransferId {
+        let id = TransferId(self.next_transfer_id);
+        self.next_transfer_id += 1;
+        id
+    }
+
+    /// Handles a `BaselineAck`: the sentinel starts a late-join transfer; a real
+    /// id that matches the in-flight transfer flushes the catch-up queue, sends
+    /// a motion keyframe, and promotes the client to live.
+    fn on_baseline_ack(
+        &mut self,
+        session: SessionId,
+        ack: BaselineAck,
+        sim: &Simulation,
+        clients: &ClientMap,
+        motion: &mut MotionPublisher,
+    ) {
+        if self.session_expired(session) {
+            return;
+        }
+        let want_baseline = ack.transfer_id == BASELINE_REQUEST_SENTINEL;
+        let Some(link) = self.links.get(&session.raw()) else {
+            return;
+        };
+
+        if want_baseline {
+            let id = self.next_id();
+            match capture_for(sim, id) {
+                Some(transfer) => {
+                    self.baseline_bytes += transfer.payload_bytes() as u64;
+                    if let Some(link) = self.links.get_mut(&session.raw()) {
+                        link.phase = Phase::Joining {
+                            transfer_id: id,
+                            queue: VecDeque::new(),
+                            retries: 0,
+                        };
+                    }
+                    send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
+                }
+                None => {
+                    self.failed += 1;
+                    self.links.remove(&session.raw());
+                    send_to(clients, session, Outbound::Shutdown);
+                }
+            }
+            return;
+        }
+
+        // Confirmation of an in-flight transfer.
+        let matches = matches!(&link.phase, Phase::Joining { transfer_id, .. } if *transfer_id == ack.transfer_id);
+        if !matches {
+            return; // stale / duplicate ack
+        }
+        let drained: Vec<Arc<TopologyTransaction>> = match self.links.get_mut(&session.raw()) {
+            Some(ClientLink {
+                phase: Phase::Joining { queue, .. },
+                ..
+            }) => queue.drain(..).collect(),
+            _ => Vec::new(),
+        };
+        for tx in drained {
+            send_to(clients, session, Outbound::Transaction(tx));
+        }
+        // A current motion keyframe for every body (`docs/protocol.md` step 4).
+        let keyframe = motion.snapshots(sim.world(), sim.current_tick());
+        if !keyframe.is_empty() {
+            send_to(clients, session, Outbound::Motion(Arc::new(keyframe)));
+        }
+        if let Some(link) = self.links.get_mut(&session.raw()) {
+            link.phase = Phase::Live;
+        }
+        self.completed += 1;
+    }
+
+    /// Routes one committed transaction: live clients get it now; joining
+    /// clients get it queued, and a queue past the cap triggers a bounded
+    /// re-capture (or an explicit drop once the retry budget is spent).
+    fn fan_out_transaction(
+        &mut self,
+        tx: Arc<TopologyTransaction>,
+        sim: &Simulation,
+        clients: &ClientMap,
+    ) {
+        let mut overflowed: Vec<u64> = Vec::new();
+        for (raw, link) in self.links.iter_mut() {
+            match &mut link.phase {
+                Phase::Live => {
+                    send_to(clients, link.session, Outbound::Transaction(tx.clone()));
+                }
+                Phase::Joining { queue, .. } => {
+                    queue.push_back(tx.clone());
+                    if queue.len() > self.catch_up_cap {
+                        overflowed.push(*raw);
+                    }
+                }
+            }
+        }
+        for raw in overflowed {
+            let (session, retries) = match self.links.get_mut(&raw) {
+                Some(ClientLink {
+                    session,
+                    phase: Phase::Joining { retries, .. },
+                }) => {
+                    *retries += 1;
+                    (*session, *retries)
+                }
+                _ => continue,
+            };
+            if retries > self.max_retries {
+                self.failed += 1;
+                self.links.remove(&raw);
+                send_to(clients, session, Outbound::Shutdown);
+                continue;
+            }
+            self.retries += 1;
+            let id = self.next_id();
+            match capture_for(sim, id) {
+                Some(transfer) => {
+                    self.baseline_bytes += transfer.payload_bytes() as u64;
+                    if let Some(link) = self.links.get_mut(&raw) {
+                        link.phase = Phase::Joining {
+                            transfer_id: id,
+                            queue: VecDeque::new(),
+                            retries,
+                        };
+                    }
+                    send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
+                }
+                None => {
+                    self.failed += 1;
+                    self.links.remove(&raw);
+                    send_to(clients, session, Outbound::Shutdown);
+                }
+            }
+        }
+    }
+
+    /// Answers a brick `RepairRequest` with an authoritative one-brick baseline
+    /// patch (full parity, revision included).
+    fn answer_repair(
+        &mut self,
+        session: SessionId,
+        req: &RepairRequest,
+        sim: &Simulation,
+        clients: &ClientMap,
+    ) {
+        let Some(world) = baseline::brick_repair_patch(sim, req) else {
+            return;
+        };
+        let id = self.next_id();
+        let cursor = JournalSeq(sim.journal().entries().last().map(|e| e.seq.0).unwrap_or(0));
+        if let Ok(transfer) = baseline::transfer_from_world(world, id, InterestEpoch(1), cursor) {
+            self.baseline_bytes += transfer.payload_bytes() as u64;
+            send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
+        }
+    }
+}
+
+/// Captures a baseline transfer at the current tick / journal cursor.
+fn capture_for(sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
+    let cursor = JournalSeq(sim.journal().entries().last().map(|e| e.seq.0).unwrap_or(0));
+    baseline::capture_transfer(sim, id, InterestEpoch(1), cursor).ok()
 }
 
 /// Opens the world database, recovering from it when it already holds a
@@ -709,20 +1038,6 @@ fn intent_from_request(session: SessionId, req: &ActionRequest) -> Option<EditIn
     })
 }
 
-fn synthetic_repair_tx(tick: Tick, ops: Vec<spall_protocol::TopologyOp>) -> TopologyTransaction {
-    TopologyTransaction {
-        transaction_id: spall_core::TransactionId::new(1).unwrap(),
-        server_tick: tick,
-        control_seq: spall_protocol::ControlSeq(0),
-        algorithm_version: 1,
-        dependencies: vec![],
-        before: vec![],
-        after: vec![],
-        ops,
-        result_hashes: vec![],
-    }
-}
-
 fn broadcast(clients: &ClientMap, msg: Outbound) {
     let mut guard = clients.lock().unwrap_or_else(|e| e.into_inner());
     guard.retain(|_, tx| tx.send(msg.clone()).is_ok());
@@ -748,6 +1063,35 @@ fn reject(clients: &ClientMap, session: SessionId, request: RequestId, reason: &
     );
 }
 
+/// Pushes one baseline transfer to a client: `BaselineBegin` on the control
+/// stream, every part on a fresh bulk stream, then `BaselineEnd` on control.
+/// Returns `false` if any leg fails (the writer loop then tears the connection
+/// down).
+async fn send_baseline(conn: &Connection, transfer: &BaselineTransfer) -> bool {
+    if conn
+        .send_record(WireRecord::BaselineBegin(transfer.begin.clone()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut bulk = match conn.open_bulk().await {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    for part in &transfer.parts {
+        if bulk.send_part(part).await.is_err() {
+            return false;
+        }
+    }
+    if bulk.finish().is_err() {
+        return false;
+    }
+    conn.send_record(WireRecord::BaselineEnd(transfer.end))
+        .await
+        .is_ok()
+}
+
 async fn wait_true(mut rx: watch::Receiver<bool>) {
     loop {
         if *rx.borrow() {
@@ -771,6 +1115,10 @@ async fn serve_conn(
     debug_assert_eq!(conn.role(), Role::Server);
     let session = conn.session();
 
+    // Announce the join in order so the sim loop can supersede an earlier
+    // session on the same slot (reconnect) and drive a late-join baseline.
+    let _ = inbound.send(Inbound::Joined(session));
+
     let liveness = tokio::spawn(conn.clone().run_liveness(stop.clone()));
 
     let reader = {
@@ -785,11 +1133,14 @@ async fn serve_conn(
                     Ok(Some(WireRecord::RepairRequest(req))) => {
                         let _ = inbound.send(Inbound::Repair(session, req));
                     }
+                    Ok(Some(WireRecord::BaselineAck(ack))) => {
+                        let _ = inbound.send(Inbound::Baseline(session, ack));
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => break,
                 }
             }
-            let _ = inbound.send(Inbound::Gone);
+            let _ = inbound.send(Inbound::Gone(session));
         })
     };
 
@@ -799,7 +1150,7 @@ async fn serve_conn(
             msg = outbound.recv() => {
                 let Some(msg) = msg else { break };
                 let ok = match msg {
-                    Outbound::Transaction(tx) | Outbound::Repair(tx) => conn
+                    Outbound::Transaction(tx) => conn
                         .send_record(WireRecord::TopologyTransaction((*tx).clone()))
                         .await
                         .is_ok(),
@@ -807,6 +1158,9 @@ async fn serve_conn(
                         .send_record(WireRecord::ActionStatus((*s).clone()))
                         .await
                         .is_ok(),
+                    Outbound::Baseline(transfer) => {
+                        send_baseline(&conn, &transfer).await
+                    }
                     Outbound::Motion(snaps) => {
                         let mut ok = true;
                         for snap in snaps.iter() {
@@ -838,4 +1192,122 @@ async fn serve_conn(
     conn.close("connection complete");
     reader.abort();
     liveness.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_clients() -> ClientMap {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn sess(slot: u32, generation: u32) -> SessionId {
+        SessionId::from_parts(SlotId(slot), generation)
+    }
+
+    #[test]
+    fn a_reconnect_supersedes_the_old_session_generation() {
+        let mut lj = LateJoin::new(DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES);
+        let old = sess(0, 1);
+        let new = sess(0, 2);
+        lj.on_joined(old);
+        assert!(!lj.session_expired(old));
+        lj.on_joined(new);
+        assert!(lj.session_expired(old), "the old generation is now expired");
+        assert!(!lj.session_expired(new));
+        // A straggler after the old link is gone is still rejected.
+        lj.on_gone(old);
+        assert!(lj.session_expired(old));
+        // A slot that never connected is not "expired".
+        assert!(!lj.session_expired(sess(3, 1)));
+    }
+
+    #[test]
+    fn catch_up_overflow_recaptures_then_drops_after_the_retry_budget() {
+        let sim = Scene::BridgeCut.simulation();
+        let clients = empty_clients();
+        // cap 2, one retry allowed.
+        let mut lj = LateJoin::new(2, 1);
+        let joiner = sess(0, 1);
+        lj.on_joined(joiner);
+        lj.on_baseline_ack(
+            joiner,
+            BaselineAck {
+                transfer_id: BASELINE_REQUEST_SENTINEL,
+                verified_manifest_hash: Hash32::ZERO,
+                installed_cursor: spall_core::JournalSeq(0),
+            },
+            &sim,
+            &clients,
+            &mut MotionPublisher::new(60, 20),
+        );
+        assert!(matches!(
+            lj.links.get(&joiner.raw()).map(|l| &l.phase),
+            Some(Phase::Joining { .. })
+        ));
+
+        let tx = || {
+            Arc::new(TopologyTransaction {
+                transaction_id: spall_core::TransactionId::new(1).unwrap(),
+                server_tick: spall_core::Tick(1),
+                control_seq: spall_protocol::ControlSeq(0),
+                algorithm_version: 1,
+                dependencies: vec![],
+                before: vec![],
+                after: vec![],
+                ops: vec![],
+                result_hashes: vec![],
+            })
+        };
+
+        // Fill past the cap → first overflow → one re-capture (retry 1).
+        for _ in 0..3 {
+            lj.fan_out_transaction(tx(), &sim, &clients);
+        }
+        assert_eq!(lj.retries, 1);
+        assert!(lj.links.contains_key(&joiner.raw()));
+
+        // Fill the fresh queue past the cap again → retry 2 > budget → dropped.
+        for _ in 0..3 {
+            lj.fan_out_transaction(tx(), &sim, &clients);
+        }
+        assert_eq!(lj.failed, 1);
+        assert!(
+            !lj.links.contains_key(&joiner.raw()),
+            "the joiner was dropped after exhausting its retry budget; other clients are untouched"
+        );
+    }
+
+    #[test]
+    fn a_live_client_is_never_queued() {
+        let sim = Scene::BridgeCut.simulation();
+        let clients = empty_clients();
+        let mut lj = LateJoin::new(1, 1);
+        let live = sess(1, 1);
+        lj.on_joined(live);
+        for _ in 0..50 {
+            lj.fan_out_transaction(
+                Arc::new(TopologyTransaction {
+                    transaction_id: spall_core::TransactionId::new(1).unwrap(),
+                    server_tick: spall_core::Tick(1),
+                    control_seq: spall_protocol::ControlSeq(0),
+                    algorithm_version: 1,
+                    dependencies: vec![],
+                    before: vec![],
+                    after: vec![],
+                    ops: vec![],
+                    result_hashes: vec![],
+                }),
+                &sim,
+                &clients,
+            );
+        }
+        assert_eq!(lj.retries, 0);
+        assert_eq!(lj.failed, 0);
+        assert!(matches!(
+            lj.links.get(&live.raw()).map(|l| &l.phase),
+            Some(Phase::Live)
+        ));
+    }
 }

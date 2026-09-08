@@ -122,10 +122,10 @@ impl BaselineWorld {
                 return Err(BaselineDecodeError::EmptyVolume(v.volume_id.get()));
             }
             for b in &v.bricks {
-                if let BaselineCells::Dense(cells) = &b.cells {
-                    if cells.len() != CELLS_PER_BRICK {
-                        return Err(BaselineDecodeError::BrickLen(cells.len()));
-                    }
+                if let BaselineCells::Dense(cells) = &b.cells
+                    && cells.len() != CELLS_PER_BRICK
+                {
+                    return Err(BaselineDecodeError::BrickLen(cells.len()));
                 }
             }
         }

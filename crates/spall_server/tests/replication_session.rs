@@ -68,6 +68,8 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         save: None,
         checkpoint_interval_ticks: 0,
         seed: 0,
+        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -161,6 +163,8 @@ fn server_persists_and_recovers_across_a_restart() {
         save: Some(save.clone()),
         checkpoint_interval_ticks: 0,
         seed: 9,
+        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {

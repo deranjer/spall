@@ -88,7 +88,17 @@ pub fn capture_transfer(
     interest_epoch: InterestEpoch,
     journal_cursor: JournalSeq,
 ) -> Result<BaselineTransfer, BaselineError> {
-    let world = world_baseline(sim);
+    transfer_from_world(world_baseline(sim), transfer_id, interest_epoch, journal_cursor)
+}
+
+/// Packages an already-built [`BaselineWorld`] (a full snapshot or a one-brick
+/// repair patch) into a [`BaselineTransfer`].
+pub fn transfer_from_world(
+    world: BaselineWorld,
+    transfer_id: TransferId,
+    interest_epoch: InterestEpoch,
+    journal_cursor: JournalSeq,
+) -> Result<BaselineTransfer, BaselineError> {
     let payload = world.encode();
 
     if payload.len() > limits::MAX_ASSEMBLED_TRANSFER {

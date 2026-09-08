@@ -57,6 +57,14 @@ struct Args {
     /// periodic checkpoint (a shutdown checkpoint still happens).
     #[arg(long, default_value_t = 1_800)]
     checkpoint_interval_ticks: u64,
+    /// T17: a joining client's catch-up-queue cap before its baseline transfer
+    /// is cancelled and re-captured fresher.
+    #[arg(long, default_value_t = spall_server::serve::DEFAULT_CATCH_UP_CAP)]
+    catch_up_cap: usize,
+    /// T17: bounded late-join transfer restarts before a joining client is
+    /// dropped (connected clients keep running).
+    #[arg(long, default_value_t = spall_server::serve::DEFAULT_MAX_JOIN_RETRIES)]
+    max_join_retries: u32,
 }
 
 fn main() -> ExitCode {
@@ -126,6 +134,8 @@ fn run_serve(args: Args) -> ExitCode {
         save,
         checkpoint_interval_ticks: args.checkpoint_interval_ticks,
         seed: args.seed,
+        catch_up_cap: args.catch_up_cap,
+        max_join_retries: args.max_join_retries,
     };
     match spall_server::serve(config) {
         Ok(summary) => {
