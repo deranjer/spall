@@ -77,6 +77,18 @@ No rewind of destructible world history for competitive lag compensation in v1. 
 
 Interest re-entry follows the same protocol. Unsubscribing evicts only the replica view, not the persistent entity. Reconnect uses a new session generation; old queued inputs and packets are invalid. Cached content may be reused only after matching world/manifest/revision hashes.
 
+T18 makes interest eviction revision-safe. The shared cache treats server and
+client brick count/dense bytes as hard ceilings and retains an outer hysteresis
+band after a brick leaves the enter radius. Server eviction requires an exact
+durable revision acknowledgement first; a dirty brick is never removed merely
+because a write was queued. Modified-air is carried by the existing
+`StoredBrick.edited` field and restored before generation can run. Structural
+queries return pending while any streamed dependency is unavailable. Collision
+entry likewise returns a bounded missing-brick set and defers movement instead
+of sampling unknown space as air. A dynamic body's intersected partitions are
+references to one stable entity/volume pair; dependency baselines include the
+complete body, never a partition-owned fragment.
+
 ## Persistence
 
 Use SQLite transactions through one I/O writer. Store metadata, versioned compressed brick payloads, volume/body records, spatial references, checkpoints, and an ordered authoritative journal. Configure and verify `journal_mode=WAL` and `synchronous=FULL` on the writer in T16. Group pending journal records into a database transaction, and acknowledge durability only after its successful commit. Keep the database on local storage. SQLite permits one WAL writer at a time and distinguishes commit durability from checkpointing. [SQLite WAL documentation](https://sqlite.org/wal.html).

@@ -172,6 +172,27 @@ Storage partitions index data; they do not own indivisible physical objects. A b
 
 Begin G1/G2 with all scene geometry resident. G3 introduces eviction against the same invariants. Distant render LOD never changes authoritative voxels, collision, support, or replicated destruction outcomes.
 
+T18 implements the shared policy in `spall_voxel::residency`: server and client
+hosts account resident brick count and dense material bytes against explicit
+ceilings, apply an enter/retain hysteresis band, and choose only clean,
+durable, unpinned LRU entries for eviction. Pin counts cover overlapping users
+without transferring ownership. `CollisionReadiness::admit_sweep` checks the
+complete swept local-space AABB against versioned ready bricks and returns a
+bounded missing set; non-finite or oversized sweeps fail closed.
+
+`spall_server::residency` binds that policy to the authoritative world and the
+existing `StoredBrick` format. Dirty candidates are encoded and durably
+acknowledged by a `ResidencyBacking` before removal; a failed write leaves them
+resident. Explicit `KnownEmpty` loads become resident air, while `Unavailable`
+stays absent. Compact per-brick face/anchor metadata survives voxel eviction,
+but never decides support alone: `resolve_structure` repeatedly builds the T07
+graph in `ResidencyMode::Streamed`, loads every `Support::Unknown` dependency,
+and either returns a fully resolved index or the exact pending keys. Dynamic
+body bricks are pinned complete, and `BodySpatialIndex` maps every intersected
+world partition to the same stable body ID using its rotated bounds. The client
+uses the same cache policy through `ClientResidency`; an evicted dependency
+re-enters through the existing baseline/repair path.
+
 ## Persistence and recovery (T16)
 
 `spall_store` (`-> spall_protocol`) owns the durable save schema and SQLite I/O

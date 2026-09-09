@@ -336,6 +336,14 @@ transfer path has no SQLite dependency. `spall_client::net` reuses the
 already-present `spall_net` bulk-stream API. `tools/xtask` and `examples/sandbox`
 add no dependency (new CLI flags only). `Cargo.lock` is unchanged.
 
+## T18 — streamed voxel and body residency (verified 2026-09-09)
+
+**No new external dependency.** The shared cache/hysteresis/collision policy is
+implemented inside `spall_voxel`; `spall_server` reuses its existing
+`spall_sim`, `spall_store`, and `spall_structure` edges for durable eviction
+and dependency loading, and `spall_client` already depends on `spall_voxel`.
+`Cargo.lock` is unchanged.
+
 ## Verified Windows prerequisites
 
 - Rust toolchain: `rustc 1.96.1 (31fca3adb 2026-06-26)`, Cargo 1.96.1,

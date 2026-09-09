@@ -520,6 +520,30 @@ impl ReplicaWorld {
         self.volumes.get(&self.terrain_id.get())
     }
 
+    /// Any live volume by stable id. Streamed client caches use this to account
+    /// resident bricks without reaching into replica internals.
+    pub fn volume(&self, volume: VolumeId) -> Option<&Volume> {
+        self.volumes.get(&volume.get())
+    }
+
+    /// Stable `(entity, volume)` ownership pairs for complete-body residency.
+    pub fn body_volumes(&self) -> impl Iterator<Item = (EntityId, VolumeId)> + '_ {
+        self.bodies.values().map(|b| (b.entity, b.volume_id))
+    }
+
+    /// Evicts one client brick. Authoritative transactions that later depend on
+    /// it take the existing bounded repair/baseline path; absence is not air.
+    pub fn evict_brick(&mut self, volume: VolumeId, coord: BrickCoord) -> bool {
+        let Some(v) = self.volumes.get_mut(&volume.get()) else {
+            return false;
+        };
+        let resident = v.brick_revision(coord).ok().flatten().is_some();
+        if resident {
+            v.evict_brick(coord);
+        }
+        resident
+    }
+
     /// The canonical hash of the terrain volume — a cheap dirty check for
     /// rebuilding the predicted-movement collider after an edit.
     pub fn terrain_hash(&self) -> Option<Hash32> {

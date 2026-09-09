@@ -24,6 +24,7 @@ pub mod brush;
 pub mod edit;
 pub mod fixtures;
 pub mod query;
+pub mod residency;
 pub mod transform;
 pub mod volume;
 
@@ -38,6 +39,10 @@ pub use brick::{Brick, BrickHash, BrickSnapshot, DENSE_LAYER_BYTES, LayerKind};
 pub use edit::{BrickRevisionRecord, CellEdit, EditError, EditOutcome, EditPlan};
 pub use query::{
     Face, MissReason, Ray, RayConfig, RayError, RayHit, RayOutcome, cast_ray, cast_ray_world,
+};
+pub use residency::{
+    BrickCacheKey, CacheBudget, CacheEntryState, CollisionAdmission, CollisionReadiness,
+    InterestRadii, ResidencyCache, ResidencyPlan,
 };
 pub use transform::RigidXform;
 pub use volume::{AccessError, BrickBounds, BrickState, Residency, Sample, Volume};
