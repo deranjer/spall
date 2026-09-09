@@ -488,6 +488,23 @@ impl ReplicaWorld {
         )]))
     }
 
+    /// The terrain volume id.
+    pub fn terrain_volume_id(&self) -> VolumeId {
+        self.terrain_id
+    }
+
+    /// The live terrain volume, for building a client-side collision world (T19
+    /// prediction). `None` before a baseline is installed.
+    pub fn terrain_volume(&self) -> Option<&Volume> {
+        self.volumes.get(&self.terrain_id.get())
+    }
+
+    /// The canonical hash of the terrain volume — a cheap dirty check for
+    /// rebuilding the predicted-movement collider after an edit.
+    pub fn terrain_hash(&self) -> Option<Hash32> {
+        self.volume_hash(self.terrain_id)
+    }
+
     /// Whether a transaction id has already been applied.
     pub fn has_applied(&self, transaction: TransactionId) -> bool {
         self.applied_tx.contains(&transaction.get())

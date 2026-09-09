@@ -29,6 +29,10 @@ struct Args {
     /// Requires --join-token-file.
     #[arg(long)]
     serve: bool,
+    /// Built-in scene: `bridge` (default) or `walk` (T19 player-movement arena —
+    /// every client gets a predicted player capsule).
+    #[arg(long, default_value = "bridge")]
+    scene: String,
     /// Per-run join secret (hex), shared with clients out of band.
     #[arg(long)]
     join_token_file: Option<PathBuf>,
@@ -121,9 +125,17 @@ fn run_serve(args: Args) -> ExitCode {
         let _ = std::fs::create_dir_all(parent);
     }
 
+    let Some(scene) = Scene::from_name(&args.scene) else {
+        eprintln!(
+            "sandbox-server: unknown --scene {:?} (want `bridge` or `walk`)",
+            args.scene
+        );
+        return ExitCode::from(2);
+    };
+
     let config = ServeConfig {
         listen: args.listen,
-        scene: Scene::BridgeCut,
+        scene,
         join_token: token,
         max_ticks: args.ticks,
         quiescence_ticks: 45,

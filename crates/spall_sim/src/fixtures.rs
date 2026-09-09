@@ -124,6 +124,30 @@ pub fn bridged_terrain_setup() -> WorldSetup {
     }
 }
 
+/// The T19 movement arena: a flat anchored floor + a 0.5 m step ledge + a
+/// resident air ceiling ([`spall_voxel::fixtures::walk_arena`]). Scripted
+/// players walk this lane; `player_spawns` gives feet positions in metres near
+/// `x = 0` and clear of the step.
+pub fn walk_arena_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: spall_voxel::fixtures::walk_arena(id),
+        terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(119, 13, 15)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
+/// Feet spawn positions (metres) for [`walk_arena_setup`]; index is the player /
+/// connection slot. The floor top is `y = 1.0 m`.
+pub const WALK_ARENA_SPAWNS: [[f64; 3]; 4] = [
+    [1.0, 1.0, 1.5],
+    [1.0, 1.0, 2.5],
+    [1.0, 1.0, 1.0],
+    [1.0, 1.0, 3.0],
+];
+
 /// Like [`bridged_terrain_setup`], but the whole scene is translated so its
 /// occupancy's minimum corner is far from the world origin, and the floor sits
 /// **only under the beam's own x-range**. A detached beam whose collider is

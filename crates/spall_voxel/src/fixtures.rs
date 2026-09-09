@@ -133,6 +133,39 @@ pub fn bridge_scene(id: VolumeId) -> Volume {
     v
 }
 
+/// The T19 player-movement arena: a flat anchored stone floor with a low step
+/// ledge and a resident air ceiling, sized for CPU CI.
+///
+/// - floor: `x 0..=119`, `z 0..=15`, `y 0..=3` — top surface at `y = 1.0 m`,
+///   anchored at `y = 0`; the lane is 30 m long.
+/// - step: `x 88..=119`, `z 0..=15`, `y 4..=5` — a 0.5 m ledge at `x = 22 m`
+///   for the autostep / grounding case.
+/// - air: `x 0..=119`, `z 0..=15`, `y 6..=13` — resident, not merely absent.
+///
+/// Scripted players spawn on the floor near `x = 0` and walk `+X`; a scenario
+/// cut that removes a run of floor cells under a player exercises "removing a
+/// floor during replay cannot leave the player hovering".
+pub fn walk_arena(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    for (a, b, m) in [
+        (GlobalCell::new(0, 0, 0), GlobalCell::new(119, 3, 15), STONE),
+        (
+            GlobalCell::new(88, 4, 0),
+            GlobalCell::new(119, 5, 15),
+            STONE,
+        ),
+        (
+            GlobalCell::new(0, 6, 0),
+            GlobalCell::new(119, 13, 15),
+            MaterialId::AIR,
+        ),
+    ] {
+        v.apply_edit(&EditPlan::filled_box(id, a, b, m))
+            .expect("walk arena edit");
+    }
+    v
+}
+
 /// BLAKE3 digest over a volume's resident bricks in canonical `(z, y, x)`
 /// order: cell size, then per brick `(coord, content hash, revision)`. Stable
 /// across runs and platforms for a given fixture; use it to pin fixtures in

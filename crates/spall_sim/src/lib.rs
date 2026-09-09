@@ -41,6 +41,7 @@ pub mod commit;
 pub mod fixtures;
 pub mod intent;
 pub mod journal;
+pub mod player;
 pub mod registry;
 pub mod replication;
 pub mod schedule;
@@ -59,12 +60,13 @@ pub use collider::{
 pub use commit::{CommitError, CommitOutcome, Committed};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
 pub use journal::{JournalEntry, JournalSink};
+pub use player::{HELD_INPUT_TIMEOUT_TICKS, Player, transaction_world_box};
 pub use registry::IdRegistry;
 pub use replication::{
     MotionPublisher, ReplicationError, action_statuses, committed_transactions, repair_ops,
 };
 pub use schedule::{EditPipeline, RegionKey, TickReport};
-pub use sim::{Simulation, SimulationConfig, TickError};
+pub use sim::{Simulation, SimulationConfig, TICK_DT_S, TickError};
 pub use stage::{StageError, StagedEdit, stage_edit};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
 pub use world::{RestoredBody, SimWorld, WorldError};
