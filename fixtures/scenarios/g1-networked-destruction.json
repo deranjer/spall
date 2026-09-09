@@ -1,20 +1,21 @@
 {
   "name": "g1-networked-destruction",
-  "description": "CPU-side G1 gate fixture: two clients cut a cross-brick bridge, excavate terrain concurrently, and continue edits while detached geometry is moving. Run with --loss-percent 2 for encrypted transport impairment.",
+  "description": "CPU-side G1 gate fixture on the single-brick bridge scene: client 0 cuts the load-bearing column to detach the beam, then carves the falling beam again (a body-targeted cut) while it is still moving, and both clients excavate opposite ends of the floor concurrently. Every scripted cut must commit, both clients must observe the beam actually move, and the body cut must land against the detached body. Run with --loss-percent 2 for encrypted transport impairment.",
   "server_ticks": 600,
   "clients": 2,
-  "minimum_transactions": 6,
+  "minimum_transactions": 10,
   "minimum_motion_snapshots": 1,
+  "minimum_body_displacement_m": 0.3,
   "cuts": [
-    { "client": 0, "at_tick": 4,   "cell": [10, 4, 1], "radius": 2 },
-    { "client": 1, "at_tick": 8,   "cell": [3, 1, 1],  "radius": 1 },
-    { "client": 0, "at_tick": 30,  "cell": [5, 1, 1],  "radius": 1 },
-    { "client": 1, "at_tick": 60,  "cell": [7, 1, 1],  "radius": 1 },
-    { "client": 0, "at_tick": 90,  "cell": [9, 1, 1],  "radius": 1 },
-    { "client": 1, "at_tick": 120, "cell": [12, 1, 1], "radius": 1 },
-    { "client": 0, "at_tick": 180, "cell": [14, 1, 1], "radius": 1 },
-    { "client": 1, "at_tick": 240, "cell": [16, 1, 1], "radius": 1 },
-    { "client": 0, "at_tick": 300, "cell": [18, 1, 1], "radius": 1 },
-    { "client": 1, "at_tick": 360, "cell": [20, 1, 1], "radius": 1 }
+    { "client": 0, "at_tick": 4,  "cell": [10, 4, 1],  "radius": 2 },
+    { "client": 1, "at_tick": 10, "cell": [0, 1, 1],   "radius": 1 },
+    { "client": 0, "at_tick": 18, "cell": [1, 1, 1],   "radius": 1 },
+    { "client": 1, "at_tick": 26, "cell": [23, 1, 1],  "radius": 1 },
+    { "client": 0, "at_tick": 30, "cell": [12, 8, 1],  "radius": 1, "target": "body" },
+    { "client": 1, "at_tick": 40, "cell": [22, 1, 1],  "radius": 1 },
+    { "client": 0, "at_tick": 52, "cell": [2, 1, 1],   "radius": 1 },
+    { "client": 1, "at_tick": 64, "cell": [21, 1, 1],  "radius": 1 },
+    { "client": 0, "at_tick": 76, "cell": [3, 1, 1],   "radius": 1 },
+    { "client": 1, "at_tick": 88, "cell": [0, 1, 2],   "radius": 1 }
   ]
 }

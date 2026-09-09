@@ -147,12 +147,19 @@ struct Scenario {
     /// after the early clients have started cutting.
     #[serde(default = "default_late_delay")]
     late_join_connect_delay_ms: u64,
-    /// Minimum authoritative work required by a gate fixture.
+    /// Minimum authoritative work required by a gate fixture. The harness also
+    /// independently requires that every scripted cut committed, so a run that
+    /// quiesces early (before the whole script fires) fails regardless of this.
     #[serde(default)]
     minimum_transactions: u64,
     /// Minimum motion samples each client must receive.
     #[serde(default)]
     minimum_motion_snapshots: u64,
+    /// Minimum straight-line distance (metres) some replicated body must have
+    /// travelled on every live client — proof the detached geometry actually
+    /// moved, not merely that a (possibly stationary) snapshot arrived.
+    #[serde(default)]
+    minimum_body_displacement_m: f64,
 }
 
 fn one() -> u64 {
@@ -170,6 +177,18 @@ struct CutSpec {
     at_tick: u64,
     cell: [i64; 3],
     radius: i64,
+    /// `"terrain"` (default) or `"body"` — a `"body"` cut is retargeted at the
+    /// detached body on the client just before it is sent.
+    #[serde(default)]
+    target: CutTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CutTarget {
+    #[default]
+    Terrain,
+    Body,
 }
 
 // --- process summaries (subset of the server / client structs) ----------------
@@ -182,7 +201,7 @@ struct ServerSummary {
     final_world_hash: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ClientSummary {
     result: String,
     transactions_applied: u64,
@@ -194,6 +213,10 @@ struct ClientSummary {
     late_join: bool,
     #[serde(default)]
     baseline_bricks: u64,
+    #[serde(default)]
+    max_body_displacement_m: f64,
+    #[serde(default)]
+    body_cut_committed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,6 +243,8 @@ struct ClientRow {
     repair_requests_sent: u64,
     transactions_rejected: u64,
     motion_snapshots: u64,
+    max_body_displacement_m: f64,
+    body_cut_committed: bool,
     hash_matches_server: bool,
 }
 
@@ -228,12 +253,33 @@ fn requirements_met(
     transactions_committed: u64,
     clients: &[Option<ClientSummary>],
 ) -> bool {
-    transactions_committed >= scenario.minimum_transactions
-        && clients.iter().all(|client| {
-            client.as_ref().is_some_and(|summary| {
-                summary.motion_snapshots >= scenario.minimum_motion_snapshots
-            })
+    // The whole script must have run: a fixture that quiesces early (a gap
+    // between scripted cuts longer than the server's idle window) commits fewer
+    // transactions than it has cuts, and that is a failure no matter how the
+    // `minimum_transactions` floor is set.
+    let all_cuts_committed = transactions_committed >= scenario.cuts.len() as u64;
+
+    let work_ok = transactions_committed >= scenario.minimum_transactions && all_cuts_committed;
+
+    let per_client_ok = clients.iter().all(|client| {
+        client.as_ref().is_some_and(|s| {
+            let motion_ok = s.motion_snapshots >= scenario.minimum_motion_snapshots;
+            // Late joiners connect after the body has settled; only hold live
+            // clients to the "geometry actually moved" bar.
+            let displacement_ok =
+                s.late_join || s.max_body_displacement_m >= scenario.minimum_body_displacement_m;
+            motion_ok && displacement_ok
         })
+    });
+
+    // If the script contains a body-targeted cut, some client must have landed
+    // it against the detached body (material removed from that body).
+    let body_cut_ok = !scenario.cuts.iter().any(|c| c.target == CutTarget::Body)
+        || clients
+            .iter()
+            .any(|c| c.as_ref().is_some_and(|s| s.body_cut_committed));
+
+    work_ok && per_client_ok && body_cut_ok
 }
 
 #[cfg(test)]
@@ -250,6 +296,8 @@ mod requirement_tests {
             final_world_hash: String::new(),
             late_join: false,
             baseline_bricks: 0,
+            max_body_displacement_m: 5.0,
+            body_cut_committed: true,
         }
     }
 
@@ -269,6 +317,58 @@ mod requirement_tests {
             &scenario,
             2,
             &[Some(client(1)), Some(client(4))]
+        ));
+    }
+
+    #[test]
+    fn gate_requirements_need_the_whole_script_and_real_motion() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 600,
+                "minimum_transactions": 4,
+                "minimum_motion_snapshots": 1,
+                "minimum_body_displacement_m": 0.3,
+                "cuts": [
+                    { "client": 0, "at_tick": 4,  "cell": [10, 4, 1], "radius": 2 },
+                    { "client": 1, "at_tick": 10, "cell": [3, 1, 1],  "radius": 1 },
+                    { "client": 0, "at_tick": 30, "cell": [12, 8, 1], "radius": 1, "target": "body" },
+                    { "client": 1, "at_tick": 40, "cell": [9, 1, 1],  "radius": 1 }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        // Enough transactions for `minimum_transactions`, but fewer than the
+        // four scripted cuts: the run quiesced early.
+        assert!(!requirements_met(
+            &scenario,
+            3,
+            &[Some(client(4)), Some(client(4))]
+        ));
+
+        // All four cuts committed and both clients saw real displacement.
+        assert!(requirements_met(
+            &scenario,
+            4,
+            &[Some(client(4)), Some(client(4))]
+        ));
+
+        // A stationary body (snapshots arrived, nothing moved) fails.
+        let mut still = client(4);
+        still.max_body_displacement_m = 0.01;
+        assert!(!requirements_met(
+            &scenario,
+            4,
+            &[Some(still), Some(client(4))]
+        ));
+
+        // Nobody landed the body-targeted cut.
+        let mut no_body_cut = client(4);
+        no_body_cut.body_cut_committed = false;
+        assert!(!requirements_met(
+            &scenario,
+            4,
+            &[Some(no_body_cut.clone()), Some(no_body_cut)]
         ));
     }
 }
@@ -423,13 +523,14 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             &i.to_string(),
         ]);
         for cut in by_client.get(&i).into_iter().flatten() {
-            c.args([
-                "--cut",
-                &format!(
-                    "{}:{},{},{}:{}",
-                    cut.at_tick, cut.cell[0], cut.cell[1], cut.cell[2], cut.radius
-                ),
-            ]);
+            let mut spec = format!(
+                "{}:{},{},{}:{}",
+                cut.at_tick, cut.cell[0], cut.cell[1], cut.cell[2], cut.radius
+            );
+            if cut.target == CutTarget::Body {
+                spec.push_str(":body");
+            }
+            c.args(["--cut", &spec]);
         }
         if scenario.late_join_clients.contains(&i) {
             c.args([
@@ -505,6 +606,8 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     repair_requests_sent: c.repair_requests_sent,
                     transactions_rejected: c.transactions_rejected,
                     motion_snapshots: c.motion_snapshots,
+                    max_body_displacement_m: c.max_body_displacement_m,
+                    body_cut_committed: c.body_cut_committed,
                     hash_matches_server: hash_ok,
                 });
             }
@@ -517,6 +620,8 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     repair_requests_sent: 0,
                     transactions_rejected: 0,
                     motion_snapshots: 0,
+                    max_body_displacement_m: 0.0,
+                    body_cut_committed: false,
                     hash_matches_server: false,
                 });
             }
@@ -539,7 +644,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             all_hashes_match: all_match,
             requirements_met,
             per_client: rows,
-            note: "real OS processes over QUIC; encrypted-packet loss via per-client UDP proxy; gate requirements are fixture-defined",
+            note: "real OS processes over QUIC; encrypted-packet loss via per-client UDP proxy; gate requirements are fixture-defined: every scripted cut commits, each live client sees real body displacement, and any body-targeted cut lands",
         },
     )
 }
