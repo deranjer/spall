@@ -168,8 +168,10 @@ encoding used for hashing.
   mismatch — a saved `DamageState` is only meaningful under the algorithm that
   produced it.
 - **Per-volume authoritative layer** `DamageState` — a canonically sorted
-  `Vec<BrokenBond>`, `BrokenBond { a: GlobalCell, b: GlobalCell }` with
-  `key(a) < key(b)`. `DamageState::canonical_bytes` is the little-endian
+  `Vec<BrokenBond>`, where a `BrokenBond` holds two `GlobalCell` endpoints with
+  `key(a) <= key(b)`. The endpoints are private and `BrokenBond::new` is the only
+  constructor, so a non-canonical bond cannot be built and every hash / dedupe /
+  lookup sees one representative per face. `DamageState::canonical_bytes` is the little-endian
   `i64`-sextuple-per-bond encoding that feeds BLAKE3. This layer participates in
   revision / hash / checkpoint like every other authoritative layer
   (`docs/architecture.md`: "All authoritative layers participate in

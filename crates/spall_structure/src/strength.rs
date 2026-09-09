@@ -42,11 +42,16 @@ fn key(c: GlobalCell) -> (i64, i64, i64) {
 }
 
 /// A single broken inter-cell face bond, stored canonically with
-/// `key(a) < key(b)`.
+/// `key(a) <= key(b)`.
+///
+/// The endpoints are private: [`BrokenBond::new`] is the only constructor and it
+/// always orders them, so a non-canonical bond cannot be built. This matters
+/// because [`DamageState`] hashes, de-dupes, and binary-searches on endpoint
+/// order — a reversed pair would hash differently and escape [`DamageState::contains`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BrokenBond {
-    pub a: GlobalCell,
-    pub b: GlobalCell,
+    a: GlobalCell,
+    b: GlobalCell,
 }
 
 impl BrokenBond {
@@ -57,6 +62,18 @@ impl BrokenBond {
         } else {
             Self { a: q, b: p }
         }
+    }
+
+    /// The lower-keyed endpoint (`key(a) <= key(b)`).
+    #[inline]
+    pub fn a(self) -> GlobalCell {
+        self.a
+    }
+
+    /// The higher-keyed endpoint (`key(a) <= key(b)`).
+    #[inline]
+    pub fn b(self) -> GlobalCell {
+        self.b
     }
 
     fn order_key(self) -> ((i64, i64, i64), (i64, i64, i64)) {
@@ -1006,5 +1023,36 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.canonical_bytes(), b.canonical_bytes());
         assert_eq!(a.canonical_bytes().len(), 8 + 2 * 48);
+    }
+
+    #[test]
+    fn broken_bond_endpoints_are_canonical_regardless_of_arg_order() {
+        let p = GlobalCell::new(3, 6, 0);
+        let q = GlobalCell::new(2, 6, 0); // key(q) < key(p)
+
+        // `new` is the only constructor; it orders the endpoints either way.
+        let forward = BrokenBond::new(q, p);
+        let reversed = BrokenBond::new(p, q);
+        assert_eq!(forward, reversed);
+        assert_eq!(forward.a(), q);
+        assert_eq!(forward.b(), p);
+
+        // A state seeded from reversed raw endpoints still normalizes, so
+        // `contains` (which normalizes its query) finds the bond and the
+        // authoritative bytes match the forward-built state.
+        let from_reversed = DamageState::from_bonds([BrokenBond::new(p, q)]);
+        let from_forward = DamageState::from_bonds([BrokenBond::new(q, p)]);
+        assert!(from_reversed.contains(p, q));
+        assert!(from_reversed.contains(q, p));
+        assert_eq!(
+            from_reversed.canonical_bytes(),
+            from_forward.canonical_bytes()
+        );
+
+        // `insert` agrees with `contains` on an already-recorded bond.
+        let mut s = DamageState::new();
+        assert!(s.insert(BrokenBond::new(p, q)));
+        assert!(!s.insert(BrokenBond::new(q, p)));
+        assert_eq!(s.len(), 1);
     }
 }
