@@ -57,14 +57,22 @@ lit room; `panning_camera_temporal_matches_no_accumulation` confirms a
 `temporal_weight = 0.1` run matches a `1.0` run frame for frame — the
 world-anchored cache means camera motion cannot smear the lighting.
 
+`cargo xtask capture --scene lighting-sequence` runs the `rapid_destruction`
+edit followed by settle frames with accumulation on and reports edit and
+convergence latency in frames and milliseconds (`nominal_frame_millis`, the
+provisional G2 client-frame target, converts the two). On the reference adapter
+the edit shows in the next frame and the band reaches within 5 % of its settled
+value in that same frame; `docs/reports/G2-lighting.md` collects the T14
+numbers.
+
 Known limit: a lighting change is only refreshed inside the dirty AABB plus the
 halo, so a far-reaching light change (a bright emitter moving many metres)
 leaves stale radiance beyond the halo until the next full re-trace. The gate
 fixtures keep light changes local; a periodic full re-trace or a halo sized to
 the trace reach covers the general case and is follow-up work.
 
-Edit-commit-to-lighting wall-clock latency (with a real frame/tick loop) remains
-a later T14 increment; cross-GPU quality and p95 frame cost remain T15.
+A wall-clock latency figure against a live 60 Hz tick loop is deferred with the
+game loop; cross-GPU quality and p95 frame cost remain T15.
 Each run also writes `summary.json`; it exits 3 when no GPU adapter is available.
 The `summary.json` is schema `version: 4`. CPU and GPU costs are reported
 separately and must not be conflated: `gpu_render_millis` is a real device
@@ -212,9 +220,14 @@ cargo xtask scenario --name player-movement --loss-percent 0 --output .local/run
 # Needs a supported GPU/driver; exit 3 otherwise.
 cargo xtask capture --output .local/runs/t12-1080p --width 1920 --height 1080 --strategy greedy
 
-# T13: static one-bounce colored-room feasibility capture. Moving 120-frame
-# evidence remains T14/T15. See docs/lighting-decision.md.
+# T13: static one-bounce colored-room feasibility capture. See
+# docs/lighting-decision.md.
 cargo xtask capture --scene colored-room --width 1920 --height 1080 --output .local/runs/t13-lighting
+
+# T14: incremental edit + settle frames with temporal accumulation on; reports
+# per-frame band luminance, per-step re-trace counts, and edit/convergence
+# latency (frames and ms). See docs/reports/G2-lighting.md.
+cargo xtask capture --scene lighting-sequence --width 1920 --height 1080 --output .local/runs/t14-sequence
 
 # Release build, named fixture, fixed workload; emits machine-readable metrics.
 cargo xtask bench --suite engine-slice --clients 8 --warmup-seconds 30 --duration-seconds 120 --output .local/runs/bench
