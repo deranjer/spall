@@ -9,6 +9,7 @@
 pub mod baseline;
 pub mod persist;
 pub mod persist_pipeline;
+pub mod residency;
 pub mod serve;
 
 pub use baseline::{
@@ -23,6 +24,10 @@ pub use persist::{
 pub use persist_pipeline::{
     DEFAULT_QUEUE_CAPACITY, PersistPipeline, PipelineConfig, PipelineError, PipelineOutcome,
     PipelineStatus,
+};
+pub use residency::{
+    BackingLoad, BodySpatialIndex, GraphBrickMeta, MemoryBackingError, MemoryBrickBacking,
+    PartitionCoord, ResidencyBacking, ResidencyController, ResidencyError, StructuralResolution,
 };
 pub use serve::{Scene, ServeConfig, ServeError, ServeSummary, serve};
 

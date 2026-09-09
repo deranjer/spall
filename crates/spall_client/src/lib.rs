@@ -4,6 +4,7 @@
 pub mod net;
 pub mod predict;
 pub mod replica;
+pub mod residency;
 
 pub use net::{
     BaselineScene, ClientNetConfig, ClientNetError, ClientSummary, MovementStep, ScriptTarget,
@@ -11,6 +12,7 @@ pub use net::{
 };
 pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
+pub use residency::ClientResidency;
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};
 use std::{path::PathBuf, sync::Arc};

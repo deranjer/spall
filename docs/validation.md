@@ -172,6 +172,11 @@ cargo xtask bench --suite engine-slice --clients 8 --warmup-seconds 30 --duratio
 
 # Defined fault points around journal/checkpoint publication.
 cargo xtask crash-test --suite persistence --output .local/runs/crash
+
+# T18 CPU acceptance: shared cache policy plus the bounded 256 x 128 x 256 m
+# streamed fixture (structural reload, save-air, body crossing, collision gate,
+# traversal plateau). The full G3 multi-process gate remains T23.
+cargo test -p spall_voxel -p spall_client -p spall_server --all-features
 ```
 
 Interactive controls: mouse look, WASD, jump, primary tool, alternate placement, debug free-camera toggle, Escape to exit. Controls are configuration data. Scenarios can run every action without synthesizing keyboard/mouse events.
@@ -267,6 +272,18 @@ Use a 256 x 128 x 256 m bounded world with resident cache limits low enough to f
 Required: post-recovery topology equals the declared durable prefix, IDs remain unique, no partial ownership transactions, and no mined-terrain regrowth. Normal checkpoint remains asynchronous; measure its retained snapshot memory. Record expected crash loss from the unflushed suffix separately from corruption.
 
 Join target: dependency-complete near-player baseline <=16 MiB compressed, ready within 30 seconds on an imposed 1 MiB/s transfer budget with 100 ms RTT and 2% packet loss. The general transfer bound is larger, but exceeding this workload target fails the normal-join gate. Retry/catch-up stress must terminate with either successful join or a bounded explicit failure while connected clients continue.
+
+T18's CPU acceptance uses the bounded world dimensions above with deliberately
+small cache ceilings. `spall_server/tests/residency.rs` verifies that a remote
+anchor dependency is reloaded before its beam is classified and then releases
+after the anchor cut; a modified-air brick is persisted before eviction and
+reloads without regrowth; one rotated/moving body remains one identity across
+partition references; a fast swept entry is blocked until all collision bricks
+are ready; and a 20-brick traversal never exceeds its three-brick fixture
+budget. `spall_client/tests/residency.rs` applies the same policy to replica
+terrain while retaining complete body geometry. These are correctness and
+bounded-accounting results, not the G3 memory, network, or join-duration gate;
+those measurements remain for T23.
 
 ### G4 — eight-client engine slice
 
