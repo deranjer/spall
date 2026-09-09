@@ -124,6 +124,22 @@ pub fn bridged_terrain_setup() -> WorldSetup {
     }
 }
 
+/// Like [`bridged_terrain_setup`], but the column and beam **cross the `x = 32`
+/// brick boundary**: cutting the seam-straddling column detaches the beam as one
+/// unsupported component whose cells were owned across two bricks. Exercises
+/// cross-brick structural support propagation and brick-boundary ownership
+/// transfer — see [`spall_voxel::fixtures::cross_brick_bridge_scene`].
+pub fn cross_brick_bridged_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: spall_voxel::fixtures::cross_brick_bridge_scene(id),
+        terrain_collider_region: (GlobalCell::new(20, 0, 0), GlobalCell::new(44, 15, 3)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
 /// Like [`bridged_terrain_setup`], but the whole scene is translated so its
 /// occupancy's minimum corner is far from the world origin, and the floor sits
 /// **only under the beam's own x-range**. A detached beam whose collider is

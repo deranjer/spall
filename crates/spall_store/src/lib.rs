@@ -38,7 +38,10 @@ pub use dto::{
 };
 pub use fault::{CrashPoint, FaultPlan};
 pub use metrics::WriteMetrics;
-pub use recover::{CorruptionReport, Recovery, recover, recover_conn};
+pub use recover::{
+    CorruptionReport, RecoverBase, Recovery, recover, recover_conn, recover_conn_from,
+    recover_from_base,
+};
 
 /// Anything that can go wrong opening, writing, or recovering a world database.
 #[derive(Debug, thiserror::Error)]

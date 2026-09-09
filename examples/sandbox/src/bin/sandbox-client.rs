@@ -1,6 +1,6 @@
 use clap::Parser;
 use spall_client::{
-    ClientConfig, ClientNetConfig, ScriptTarget, ScriptedAction, cut_request,
+    BaselineScene, ClientConfig, ClientNetConfig, ScriptTarget, ScriptedAction, cut_request,
     run_replication_client,
 };
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
@@ -51,6 +51,10 @@ struct Args {
     /// topology with no edit replay.
     #[arg(long)]
     late_join: bool,
+    /// Fixed baseline scene a live replica installs; must match the server's
+    /// `--scene`. `bridge-cut` (default) or `cross-bridge-cut`.
+    #[arg(long, default_value = "bridge-cut")]
+    scene: String,
     /// T17: wait this long after the process starts before connecting, so a
     /// harness can stagger a late joiner behind an already-running client.
     #[arg(long, default_value_t = 0)]
@@ -156,6 +160,17 @@ fn run_replication(args: Args) -> ExitCode {
         }
     };
 
+    let baseline_scene = match BaselineScene::from_name(&args.scene) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "sandbox-client: unknown --scene `{}` (expected bridge-cut or cross-bridge-cut)",
+                args.scene
+            );
+            return ExitCode::from(2);
+        }
+    };
+
     if args.connect_delay_ms > 0 {
         std::thread::sleep(Duration::from_millis(args.connect_delay_ms));
     }
@@ -178,6 +193,7 @@ fn run_replication(args: Args) -> ExitCode {
         join_token: token,
         script,
         late_join: args.late_join,
+        baseline_scene,
         run_ticks: args.run_ticks,
         idle_grace: Duration::from_millis(500),
         overall_timeout: Duration::from_millis(args.timeout_ms),

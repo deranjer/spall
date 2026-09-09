@@ -107,6 +107,7 @@ pub fn run(args: NetCheckArgs, unique_output: impl FnOnce() -> PathBuf) -> Resul
                 duplicate_ratio: 0.0,
                 delay: Duration::from_millis(15),
                 jitter: Duration::from_millis(10),
+                reorder_period: 0,
             })
         },
         run_bulk_transfer: true,

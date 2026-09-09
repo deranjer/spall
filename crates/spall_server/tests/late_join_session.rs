@@ -12,7 +12,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use spall_client::{ClientNetConfig, ScriptedAction, cut_request, run_replication_client};
+use spall_client::{
+    BaselineScene, ClientNetConfig, ScriptedAction, cut_request, run_replication_client,
+};
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
 use spall_server::serve::{DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES};
 use spall_server::{Scene, ServeConfig, serve};
@@ -118,6 +120,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
             },
         ],
         late_join: false,
+        baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 0,
         idle_grace: Duration::from_millis(800),
         overall_timeout: Duration::from_secs(35),
@@ -142,6 +145,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
             target: spall_client::ScriptTarget::Terrain,
         }],
         late_join: true,
+        baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 0,
         idle_grace: Duration::from_millis(800),
         overall_timeout: Duration::from_secs(35),

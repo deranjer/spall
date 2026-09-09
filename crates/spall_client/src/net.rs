@@ -15,6 +15,7 @@
 //! or an idle-grace timeout elapses, and reports the replica's final topology
 //! hash so a harness can compare it against the server's.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,8 +32,9 @@ use spall_net::{
     WireRecord, connect,
 };
 use spall_protocol::{
-    ActionKind, ActionRequest, AlgorithmVersions, BaselineAck, BaselineWorld, ClaimedTarget,
-    Handshake, Hash32, InputSeq, NegotiatedLimits, PROTOCOL_VERSION, RequestId, TransferId,
+    ActionKind, ActionOutcome, ActionRequest, AlgorithmVersions, BaselineAck, BaselineWorld,
+    ClaimedTarget, Handshake, Hash32, InputSeq, NegotiatedLimits, PROTOCOL_VERSION, RequestId,
+    TransferId,
 };
 
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
@@ -98,6 +100,38 @@ pub fn cut_request(
     }
 }
 
+/// Which fixed baseline scene a live (non-late-join) replica installs. Must
+/// match the scene the server is running or the topology hashes never converge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BaselineScene {
+    /// [`spall_voxel::fixtures::bridge_scene`] — single brick.
+    #[default]
+    BridgeCut,
+    /// [`spall_voxel::fixtures::cross_brick_bridge_scene`] — column + beam cross
+    /// the `x = 32` brick boundary.
+    CrossBridgeCut,
+}
+
+impl BaselineScene {
+    /// Parses the harness `--scene` value; `None` for an unknown name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "bridge-cut" | "bridgecut" | "bridge" => Some(Self::BridgeCut),
+            "cross-bridge-cut" | "cross-brick-bridge" | "crossbridgecut" => {
+                Some(Self::CrossBridgeCut)
+            }
+            _ => None,
+        }
+    }
+
+    fn baseline(self, id: VolumeId) -> spall_voxel::Volume {
+        match self {
+            Self::BridgeCut => spall_voxel::fixtures::bridge_scene(id),
+            Self::CrossBridgeCut => spall_voxel::fixtures::cross_brick_bridge_scene(id),
+        }
+    }
+}
+
 /// Inputs to [`run_replication_client`].
 #[derive(Debug, Clone)]
 pub struct ClientNetConfig {
@@ -110,6 +144,9 @@ pub struct ClientNetConfig {
     /// installing the fixed `bridge_scene`. The replica reaches the server's
     /// current topology hash with no edit replay from world creation.
     pub late_join: bool,
+    /// Fixed baseline a live replica installs (ignored when `late_join`). Must
+    /// match the server's `--scene`.
+    pub baseline_scene: BaselineScene,
     /// Stop once the observed server tick reaches this (0 = only stop on close).
     pub run_ticks: u64,
     /// Stop after this long with no new record once at least one has arrived.
@@ -131,6 +168,9 @@ pub struct ClientSummary {
     pub repair_requests_sent: u64,
     pub transactions_rejected: u64,
     pub motion_snapshots: u64,
+    /// Motion datagrams delivered out of `snapshot_seq` order — non-zero only
+    /// when the transport (a lossy/jittered proxy) actually reordered them.
+    pub motion_snapshots_out_of_order: u64,
     pub actions_sent: u64,
     pub last_server_tick: u64,
     pub final_world_hash: String,
@@ -199,6 +239,12 @@ struct Counters {
     repairs: AtomicU64,
     rejected: AtomicU64,
     motion: AtomicU64,
+    /// Motion datagrams that arrived carrying a `snapshot_seq` lower than one
+    /// already delivered — proof the transport reordered snapshot datagrams
+    /// (the server assigns a strictly increasing per-publisher `snapshot_seq`).
+    motion_reordered: AtomicU64,
+    /// Highest `snapshot_seq` observed so far, for the reorder check above.
+    motion_seq_hwm: AtomicU64,
     actions: AtomicU64,
     last_tick: AtomicU64,
     /// Hash-repair baseline patches applied mid-session (T17).
@@ -331,7 +377,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         ReplicaWorld::empty(ReplicaConfig::default())
     } else {
         ReplicaWorld::from_baseline(
-            spall_voxel::fixtures::bridge_scene(VolumeId::new(TERRAIN_VOLUME).unwrap()),
+            config
+                .baseline_scene
+                .baseline(VolumeId::new(TERRAIN_VOLUME).unwrap()),
             ReplicaConfig::default(),
         )
     }));
@@ -365,11 +413,20 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
 
     let liveness = tokio::spawn(conn.clone().run_liveness(stop_rx.clone()));
 
+    // Bounded resend of `ActionRequest`s the server throttled (its per-tick
+    // admission quota was exceeded — an explicitly retryable rejection). The
+    // scripter records each request it sends; the control reader forwards
+    // throttled request ids here; the retrier re-sends, capped per request.
+    let sent_actions: Arc<Mutex<HashMap<u64, (WireRecord, u8)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (throttle_tx, mut throttle_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+
     // Control reader: apply transactions, answer repair gaps.
     let control = {
         let conn = conn.clone();
         let replica = replica.clone();
         let counters = counters.clone();
+        let throttle_tx = throttle_tx.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_record().await {
@@ -455,9 +512,46 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             None => break,
                         }
                     }
-                    Ok(Some(WireRecord::ActionStatus(_))) => {}
+                    Ok(Some(WireRecord::ActionStatus(st))) => {
+                        if let ActionOutcome::Rejected { reason } = &st.outcome
+                            && reason.starts_with("throttled")
+                        {
+                            let _ = throttle_tx.send(st.request_id.0);
+                        }
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => break,
+                }
+            }
+        })
+    };
+
+    // Retrier: re-send a throttled `ActionRequest` after a short back-off, at
+    // most a few times per request, so a scripted gate action still lands under
+    // an impaired transport that bunches retransmits into one server tick.
+    let retrier = {
+        let conn = conn.clone();
+        let sent_actions = sent_actions.clone();
+        let stop_rx = stop_rx.clone();
+        tokio::spawn(async move {
+            const MAX_ACTION_RETRIES: u8 = 4;
+            while let Some(id) = throttle_rx.recv().await {
+                if *stop_rx.borrow() {
+                    break;
+                }
+                let record = {
+                    let mut g = sent_actions.lock().unwrap_or_else(|e| e.into_inner());
+                    match g.get_mut(&id) {
+                        Some((rec, tries)) if *tries < MAX_ACTION_RETRIES => {
+                            *tries += 1;
+                            Some(rec.clone())
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(rec) = record {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    let _ = conn.send_record(rec).await;
                 }
             }
         })
@@ -475,6 +569,13 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         counters
                             .last_tick
                             .fetch_max(snap.server_tick.get(), Ordering::Relaxed);
+                        // A strictly-decreasing per-publisher `snapshot_seq`
+                        // means this datagram overtook a newer one in transit.
+                        let seq = snap.snapshot_seq.0;
+                        let prev_hwm = counters.motion_seq_hwm.fetch_max(seq, Ordering::Relaxed);
+                        if seq < prev_hwm {
+                            counters.motion_reordered.fetch_add(1, Ordering::Relaxed);
+                        }
                         let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
                         guard.ingest_snapshot(&snap);
                         drop(guard);
@@ -495,6 +596,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let conn = conn.clone();
         let counters = counters.clone();
         let replica = replica.clone();
+        let sent_actions = sent_actions.clone();
         let mut script = config.script.clone();
         script.sort_by_key(|a| a.at_tick);
         let stop_rx = stop_rx.clone();
@@ -551,12 +653,16 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         .store(pre_cells, Ordering::Relaxed);
                 }
 
-                if conn
-                    .send_record(WireRecord::ActionRequest(request))
-                    .await
-                    .is_ok()
-                {
+                let request_id = request.request_id.0;
+                let record = WireRecord::ActionRequest(request);
+                if conn.send_record(record.clone()).await.is_ok() {
                     counters.actions.fetch_add(1, Ordering::Relaxed);
+                    // Keep the exact record (a body cut carries its retargeted
+                    // `claimed_target`) so the retrier can resend it verbatim.
+                    sent_actions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(request_id, (record, 0));
                 }
             }
         })
@@ -586,6 +692,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let _ = tokio::time::timeout(config.overall_timeout, done).await;
     let _ = stop_tx.send(true);
     scripter.abort();
+    retrier.abort();
     liveness.abort();
 
     let _ = conn.say_bye("client complete").await;
@@ -619,6 +726,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         repair_requests_sent: counters.repairs.load(Ordering::Relaxed),
         transactions_rejected: counters.rejected.load(Ordering::Relaxed),
         motion_snapshots: counters.motion.load(Ordering::Relaxed),
+        motion_snapshots_out_of_order: counters.motion_reordered.load(Ordering::Relaxed),
         actions_sent: counters.actions.load(Ordering::Relaxed),
         last_server_tick: last_tick,
         final_world_hash: guard.world_hash().to_string(),
