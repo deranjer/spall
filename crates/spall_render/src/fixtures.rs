@@ -4,13 +4,19 @@ use glam::{IVec3, Mat4, Vec3};
 use spall_mesh::{Mesh, MeshStats, MeshStrategy, Vertex};
 
 use crate::camera::Camera;
-use crate::indirect::{LightingUpdate, LightingVolume};
+use crate::capture::LightingStep;
+use crate::indirect::{LightingRegion, LightingUpdate, LightingVolume};
 use crate::scene::{Scene, SceneItem, default_materials};
 
 /// The single represented `0.5 m` occluder column shared by
 /// [`emitter_occlusion_scenes`] and [`rapid_destruction`], in world metres.
 pub const OCCLUDER_MIN_M: Vec3 = Vec3::new(2.0, 0.0, -6.0);
 pub const OCCLUDER_MAX_M: Vec3 = Vec3::new(2.5, 5.0, -2.0);
+
+/// The receiver-wall shell shared by [`emitter_occlusion_scenes`],
+/// [`rapid_destruction`], and [`moving_body_overlap`], in world metres.
+pub const RECEIVER_MIN_M: Vec3 = Vec3::new(-6.0, 0.0, -6.0);
+pub const RECEIVER_MAX_M: Vec3 = Vec3::new(6.0, 5.0, -5.5);
 
 #[derive(Debug, Clone, Copy)]
 pub struct LightingFixtureMetrics {
@@ -104,12 +110,7 @@ pub fn emitter_occlusion_scenes(aspect: f32) -> EmitterOcclusionScenes {
     let volume = |panel_material: u32, occluder: bool| {
         let mut v = LightingVolume::empty(origin);
         // Receiver wall shell, one cache cell thick behind the raster quad.
-        fill_world_box(
-            &mut v,
-            Vec3::new(-6.0, 0.0, -6.0),
-            Vec3::new(6.0, 5.0, -5.5),
-            1,
-        );
+        fill_world_box(&mut v, RECEIVER_MIN_M, RECEIVER_MAX_M, 1);
         // Emitter panel on the far +X side, outside the measured band.
         fill_world_box(
             &mut v,
@@ -158,6 +159,51 @@ pub fn rapid_destruction(aspect: f32) -> RapidDestruction {
         scene: scenes.occluded,
         remove_occluder: LightingUpdate::new().dirty_bound(OCCLUDER_MIN_M, OCCLUDER_MAX_M),
         receiver_band: scenes.receiver_band,
+    }
+}
+
+/// The T14 "moving body" case: a lighting-cache box occluder that starts in the
+/// emitter -> receiver light path (so `receiver_band` is shadowed), then moves
+/// fully out of the path and back in. A `capture_lighting_sequence` run over
+/// `steps` must show the shadowed band recover with no ghost when the body
+/// leaves, and the shadow re-form when it returns — while the receiver wall the
+/// body swept past is never erased.
+pub struct MovingBodyOverlap {
+    pub scene: Scene,
+    pub steps: Vec<LightingStep>,
+    pub receiver_band: [f32; 2],
+    /// A world point behind the in-path box whose `+x` fixed probe ray is
+    /// occluded by the box before it can reach the emitter.
+    pub probe_behind: Vec3,
+}
+
+pub fn moving_body_overlap(aspect: f32) -> MovingBodyOverlap {
+    let scenes = emitter_occlusion_scenes(aspect);
+    let receiver = LightingRegion {
+        min_m: RECEIVER_MIN_M,
+        max_m: RECEIVER_MAX_M,
+        material: 1,
+    };
+    let in_path = (OCCLUDER_MIN_M, OCCLUDER_MAX_M);
+    // Far to the -X side, well clear of the emitter -> receiver path but still
+    // inside the 64 m cache.
+    let clear = (Vec3::new(-12.0, 0.0, -6.0), Vec3::new(-11.5, 5.0, -2.0));
+
+    MovingBodyOverlap {
+        // `occluded` already has the box (== the occluder column) in the path.
+        scene: scenes.occluded,
+        steps: vec![
+            LightingStep {
+                label: "body clears the light path".to_string(),
+                update: LightingUpdate::moving_box(in_path, clear, 1, &[receiver]),
+            },
+            LightingStep {
+                label: "body returns to the light path".to_string(),
+                update: LightingUpdate::moving_box(clear, in_path, 1, &[receiver]),
+            },
+        ],
+        receiver_band: scenes.receiver_band,
+        probe_behind: Vec3::new(0.0, 2.5, -5.0),
     }
 }
 
@@ -438,6 +484,46 @@ mod tests {
             volume.dirty_len() <= 80,
             "dirtied too much: {}",
             volume.dirty_len()
+        );
+    }
+
+    #[test]
+    fn moving_body_overlap_tracks_the_shadow_and_keeps_the_receiver_wall() {
+        let mbo = moving_body_overlap(16.0 / 9.0);
+        let materials = default_materials();
+        let mut volume = mbo.scene.lighting.as_ref().unwrap().clone();
+        let probe = mbo.probe_behind;
+        let dim = crate::indirect::LIGHT_VOLUME_DIM as i32;
+        let flat = |v: &LightingVolume, world: Vec3| -> usize {
+            let c = v.world_to_cell(world);
+            (c.x + dim * (c.y + dim * c.z)) as usize
+        };
+        // A receiver-wall cell the in-path box overlaps in Z.
+        let swept_wall = Vec3::new(2.2, 2.0, -5.9);
+
+        let with_body = luminance(volume.probe_radiance(probe, &materials));
+
+        volume.apply_update(&mbo.steps[0].update);
+        let cleared = luminance(volume.probe_radiance(probe, &materials));
+        assert!(
+            cleared > with_body + 0.05,
+            "no ghost: shadowed probe did not recover when the body left: {with_body} -> {cleared}"
+        );
+        assert_eq!(
+            volume.cells()[flat(&volume, swept_wall)],
+            1,
+            "the receiver wall the body swept past was erased"
+        );
+
+        volume.apply_update(&mbo.steps[1].update);
+        let returned = luminance(volume.probe_radiance(probe, &materials));
+        assert!(
+            returned < cleared - 0.05,
+            "shadow did not re-form when the body returned: {cleared} -> {returned}"
+        );
+        assert!(
+            (returned - with_body).abs() < 0.02,
+            "returned state drifted from the original: {with_body} vs {returned}"
         );
     }
 }

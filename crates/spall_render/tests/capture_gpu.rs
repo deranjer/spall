@@ -12,7 +12,7 @@ use spall_mesh::{Mesh, MeshStrategy, Vertex};
 use spall_render::{
     Camera, CaptureOptions, DebugView, LightingStep, RenderContext, Scene, SceneItem,
     capture_lighting_sequence, capture_scene, colored_rooms, emitter_occlusion_scenes,
-    rapid_destruction,
+    moving_body_overlap, rapid_destruction,
 };
 
 #[test]
@@ -510,6 +510,53 @@ fn rapid_destruction_reexposes_the_band_with_a_bounded_retrace() {
         assert!(
             after_trace <= base_trace + 0.5,
             "bounded re-trace slower than the full base trace: {base_trace:.3} -> {after_trace:.3}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// T14 increment 3: a moving lighting-cache body does not leave a ghost where
+/// it was, its shadow re-forms when it returns, and the static geometry it
+/// swept past is never erased — all through the GPU trace/denoise/sample path.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn moving_body_leaves_no_ghost_and_keeps_swept_geometry() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let mbo = moving_body_overlap(16.0 / 9.0);
+    let band = mbo.receiver_band;
+    let out = std::env::temp_dir().join(format!("spall-t14-move-{}", std::process::id()));
+
+    let report = capture_lighting_sequence(&ctx, mbo.scene, band, 12, 1.0, &mbo.steps, &out)
+        .expect("moving-body lighting sequence");
+
+    assert_eq!(report.steps.len(), 3);
+    let base = report.steps[0].band_luminance; // body in the path -> shadowed
+    let cleared = report.steps[1].band_luminance; // body left -> band recovers
+    let returned = report.steps[2].band_luminance; // body back -> shadow re-forms
+
+    // Measured on the reference adapter: 22.77 -> 28.46 -> 22.77 (the returned
+    // frame is bit-identical to the base — nothing left behind, wall intact).
+    assert!(
+        cleared > base + 2.0,
+        "ghost: shadowed band did not recover when the body left: {base:.3} -> {cleared:.3}"
+    );
+    assert!(
+        returned < cleared - 2.0,
+        "shadow did not re-form when the body returned: {cleared:.3} -> {returned:.3}"
+    );
+    assert!(
+        (returned - base).abs() < 1.0,
+        "returned lighting drifted from the original (swept geometry damaged?): {base:.3} vs {returned:.3}"
+    );
+
+    // Each move re-traces only the two body boxes grown by the halo.
+    for step in &report.steps[1..] {
+        assert!(
+            step.retraced_cells < report.total_cells / 8,
+            "re-trace not bounded on a body move: {} of {}",
+            step.retraced_cells,
+            report.total_cells
         );
     }
 

@@ -63,6 +63,38 @@ impl LightingUpdate {
         });
         self
     }
+
+    /// Add an existing [`LightingRegion`] verbatim.
+    pub fn with_region(mut self, region: LightingRegion) -> Self {
+        self.regions.push(region);
+        self
+    }
+
+    /// Build the update for a box-shaped body moving from world AABB `prev` to
+    /// `next`: both boxes are dirty, then `keep` (the static geometry that
+    /// overlaps either box) is re-asserted so the move does not erase it, and
+    /// finally the body is filled at `next` with `material`.
+    ///
+    /// Callers pass every static region that intersects `prev` or `next`.
+    /// Nothing outside the two dirty boxes is touched, so unrelated geometry
+    /// and other bodies are unaffected.
+    pub fn moving_box(
+        prev: (Vec3, Vec3),
+        next: (Vec3, Vec3),
+        material: u32,
+        keep: &[LightingRegion],
+    ) -> Self {
+        let mut update = Self::new()
+            .dirty_bound(prev.0, prev.1)
+            .dirty_bound(next.0, next.1);
+        update.regions.extend_from_slice(keep);
+        update.regions.push(LightingRegion {
+            min_m: next.0,
+            max_m: next.1,
+            material,
+        });
+        update
+    }
 }
 
 /// CPU staging image for the 128^3 occupancy/material clipmap. Each cell is a
@@ -716,6 +748,50 @@ mod tests {
             v.cells()[cell_at(&v, Vec3::new(2.5, 0.5, 0.5))],
             5,
             "entered -> solid"
+        );
+    }
+
+    #[test]
+    fn moving_box_tracks_the_body_without_erasing_static_geometry() {
+        let mut v = LightingVolume::empty(Vec3::splat(-32.0));
+        // A low static slab the body stands on and slides along.
+        let wall = LightingRegion {
+            min_m: Vec3::new(-3.0, 0.0, -1.0),
+            max_m: Vec3::new(3.0, 1.0, 1.0),
+            material: 1,
+        };
+        let start = (Vec3::new(-0.5, 0.0, -1.0), Vec3::new(0.0, 2.0, 1.0));
+        v.apply_update(
+            &LightingUpdate::new()
+                .with_region(wall)
+                .dirty_bound(start.0, start.1)
+                .region(start.0, start.1, 6),
+        );
+        v.take_dirty();
+
+        // Slide the body +2.5 m along X, re-asserting the slab it overlaps.
+        let moved = (Vec3::new(2.0, 0.0, -1.0), Vec3::new(2.5, 2.0, 1.0));
+        v.apply_update(&LightingUpdate::moving_box(start, moved, 6, &[wall]));
+
+        assert_eq!(
+            v.cells()[cell_at(&v, Vec3::new(-2.5, 0.5, 0.0))],
+            1,
+            "slab outside the swept boxes is untouched"
+        );
+        assert_eq!(
+            v.cells()[cell_at(&v, Vec3::new(-0.25, 1.5, 0.0))],
+            0,
+            "the body's start cells above the slab are vacated to air"
+        );
+        assert_eq!(
+            v.cells()[cell_at(&v, Vec3::new(-0.25, 0.5, 0.0))],
+            1,
+            "slab under the vacated body is re-asserted, not erased"
+        );
+        assert_eq!(
+            v.cells()[cell_at(&v, Vec3::new(2.25, 1.5, 0.0))],
+            6,
+            "the body now occupies its new box"
         );
     }
 
