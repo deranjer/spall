@@ -37,8 +37,8 @@ enum CommandKind {
     /// T10 replication harness against a named built-in scenario
     /// (`fixtures/scenarios/<name>.json`).
     Scenario(session::ScenarioArgs),
-    /// Render the T05 acceptance shapes offscreen (shaded + normal + depth
-    /// PNGs). Exit 3 means no GPU/capture capability.
+    /// Render acceptance shapes or a named lighting fixture offscreen.
+    /// Exit 3 means no GPU/capture capability.
     Capture(CaptureArgs),
     /// Planned for later performance gates.
     Bench(UnavailableArgs),
@@ -73,6 +73,9 @@ struct CaptureArgs {
     /// Render only the named acceptance shape.
     #[arg(long)]
     only: Option<String>,
+    /// T13 fixture scene, currently `colored-room`.
+    #[arg(long)]
+    scene: Option<String>,
     #[arg(long, default_value_t = 120_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]
     timeout_ms: u64,
 }
@@ -422,6 +425,9 @@ fn capture(args: CaptureArgs) -> Result<(), XtaskError> {
     ]);
     if let Some(only) = &args.only {
         command.args(["--only", only]);
+    }
+    if let Some(scene) = &args.scene {
+        command.args(["--scene", scene]);
     }
 
     match run_bounded(command, Duration::from_millis(args.timeout_ms)) {

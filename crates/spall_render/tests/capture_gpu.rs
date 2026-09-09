@@ -10,6 +10,7 @@ use spall_mesh::fixtures::{acceptance_shapes, mesh_shape};
 use spall_mesh::{Mesh, MeshStrategy, Vertex};
 use spall_render::{
     Camera, CaptureOptions, DebugView, RenderContext, Scene, SceneItem, capture_scene,
+    colored_rooms,
 };
 
 #[test]
@@ -273,5 +274,46 @@ fn depth_debug_view_is_flat_across_a_camera_facing_plane() {
         "depth varies across a camera-facing plane: {lo}..{hi} (radial-distance bug)"
     );
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn colored_room_produces_real_indirect_only_pixels_and_separate_timings() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let fixture = colored_rooms(16.0 / 9.0).remove(0);
+    assert!(fixture.metrics.closed_probe_luminance < fixture.metrics.open_probe_luminance);
+    assert!(fixture.metrics.thin_wall_leakage_ratio <= 0.05);
+    let dir = std::env::temp_dir().join(format!("spall-t13-colored-room-{}", std::process::id()));
+    let report = capture_scene(
+        &ctx,
+        &fixture.scene,
+        &dir,
+        &CaptureOptions {
+            width: 640,
+            height: 360,
+            views: vec![DebugView::IndirectOnly],
+            ..Default::default()
+        },
+    )
+    .expect("indirect capture");
+    assert!(report.indirect_enabled);
+    assert_eq!(report.indirect_cells, 128usize.pow(3));
+    if ctx.supports_gpu_timestamps() {
+        let passes = report.timing.gpu_passes.expect("timestamp timings");
+        assert!(passes.indirect_trace_millis > 0.0);
+        assert!(passes.indirect_denoise_millis > 0.0);
+    } else {
+        assert!(report.timing.gpu_passes.is_none());
+    }
+    let image = image::open(&report.images[0].path).unwrap().to_rgb8();
+    let indirect_pixels = image
+        .pixels()
+        .filter(|pixel| pixel.0.iter().copied().max().unwrap_or(0) > 18)
+        .count();
+    assert!(
+        indirect_pixels > image.pixels().len() / 20,
+        "indirect-only image is empty"
+    );
     let _ = fs::remove_dir_all(&dir);
 }

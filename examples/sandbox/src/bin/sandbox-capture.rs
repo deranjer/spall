@@ -1,4 +1,4 @@
-//! Offscreen renderer capture for the T05 visible-voxel baseline.
+//! Offscreen renderer capture for the T05/T12 baseline and T13 lighting fixture.
 //!
 //! Meshes each acceptance shape (`spall_mesh::fixtures`), renders it to a
 //! shaded PNG plus normal and depth debug images with `spall_render`, writes a
@@ -13,7 +13,10 @@ use glam::{Mat4, Vec3};
 use serde::Serialize;
 use spall_mesh::MeshStrategy;
 use spall_mesh::fixtures::{AcceptanceShape, acceptance_shapes, mesh_shape};
-use spall_render::{CaptureOptions, RenderContext, RenderError, Scene, SceneItem, capture_scene};
+use spall_render::{
+    CaptureOptions, DebugView, RenderContext, RenderError, Scene, SceneItem, capture_scene,
+    colored_rooms,
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Strategy {
@@ -48,6 +51,9 @@ struct Args {
     /// Render only this shape (by name). Omit to render every acceptance shape.
     #[arg(long)]
     only: Option<String>,
+    /// T13 fixture scene. Currently: `colored-room`.
+    #[arg(long)]
+    scene: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -69,6 +75,8 @@ struct ShapeSummary {
     /// Never a CPU-derived figure.
     gpu_render_millis: Option<f64>,
     gpu_shadow_millis: Option<f64>,
+    gpu_indirect_trace_millis: Option<f64>,
+    gpu_indirect_denoise_millis: Option<f64>,
     gpu_opaque_millis: Option<f64>,
     gpu_tone_map_millis: Option<f64>,
     /// `true` only when `gpu_render_millis` is a measured device timing.
@@ -76,16 +84,21 @@ struct ShapeSummary {
     /// CPU wall-clock for the whole render → readback → PNG-encode loop,
     /// milliseconds. This is NOT GPU time.
     cpu_capture_millis: f64,
+    cpu_lighting_upload_millis: f64,
     /// CPU wall-clock inside GPU→CPU readback (map wait + row unpad), ms.
     cpu_readback_millis: f64,
     /// CPU wall-clock inside PNG compression and file writes, ms.
     cpu_encode_millis: f64,
+    indirect_cells: usize,
+    open_probe_luminance: Option<f32>,
+    closed_probe_luminance: Option<f32>,
+    thin_wall_leakage_ratio: Option<f32>,
     images: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct Summary {
-    /// Version 3 adds the T12 pass timing breakdown and diagnostic images.
+    /// Version 4 adds T13 cache/probe data and trace/denoise timing.
     version: u32,
     adapter: String,
     backend: String,
@@ -156,6 +169,20 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
     let ctx = RenderContext::headless()?;
     let strategy: MeshStrategy = args.strategy.into();
 
+    if let Some(scene) = &args.scene {
+        if scene != "colored-room" {
+            return Err(RenderError::Gpu(format!(
+                "no fixture scene named {scene:?}"
+            )));
+        }
+        if args.only.is_some() {
+            return Err(RenderError::Gpu(
+                "--scene and --only are mutually exclusive".into(),
+            ));
+        }
+        return run_colored_room(args, &ctx, strategy);
+    }
+
     let mut shapes = acceptance_shapes();
     if let Some(only) = &args.only {
         shapes.retain(|s| s.name == only);
@@ -200,12 +227,21 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
             index_bytes: report.index_bytes,
             gpu_render_millis: timing.gpu_render_millis,
             gpu_shadow_millis: timing.gpu_passes.map(|passes| passes.shadow_millis),
+            gpu_indirect_trace_millis: timing.gpu_passes.map(|passes| passes.indirect_trace_millis),
+            gpu_indirect_denoise_millis: timing
+                .gpu_passes
+                .map(|passes| passes.indirect_denoise_millis),
             gpu_opaque_millis: timing.gpu_passes.map(|passes| passes.opaque_millis),
             gpu_tone_map_millis: timing.gpu_passes.map(|passes| passes.tone_map_millis),
             gpu_timing_available: timing.gpu_render_millis.is_some(),
             cpu_capture_millis: timing.cpu_total_millis,
+            cpu_lighting_upload_millis: timing.cpu_lighting_upload_millis,
             cpu_readback_millis: timing.cpu_readback_millis,
             cpu_encode_millis: timing.cpu_encode_millis,
+            indirect_cells: report.indirect_cells,
+            open_probe_luminance: None,
+            closed_probe_luminance: None,
+            thin_wall_leakage_ratio: None,
             images: report
                 .images
                 .iter()
@@ -215,7 +251,90 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
     }
 
     Ok(Summary {
-        version: 3,
+        version: 4,
+        adapter,
+        backend,
+        gpu_timing_available,
+        width: args.width,
+        height: args.height,
+        strategy: format!("{strategy:?}"),
+        shapes: summaries,
+    })
+}
+
+fn run_colored_room(
+    args: &Args,
+    ctx: &RenderContext,
+    strategy: MeshStrategy,
+) -> Result<Summary, RenderError> {
+    let opts = CaptureOptions {
+        width: args.width,
+        height: args.height,
+        views: vec![DebugView::Shaded, DebugView::IndirectOnly],
+        ..Default::default()
+    };
+    let mut summaries = Vec::new();
+    let mut adapter = String::new();
+    let mut backend = String::new();
+    let mut gpu_timing_available = false;
+    let fixtures = colored_rooms(capture_aspect(args.width, args.height));
+    let metrics = fixtures[0].metrics;
+    if metrics.closed_probe_luminance >= metrics.open_probe_luminance {
+        return Err(RenderError::Gpu(format!(
+            "closed-room probe is not darker: closed={} open={}",
+            metrics.closed_probe_luminance, metrics.open_probe_luminance
+        )));
+    }
+    if metrics.thin_wall_leakage_ratio > 0.05 {
+        return Err(RenderError::Gpu(format!(
+            "represented thin-wall leakage {} exceeds 0.05",
+            metrics.thin_wall_leakage_ratio
+        )));
+    }
+    for fixture in fixtures {
+        let report = capture_scene(ctx, &fixture.scene, &args.out.join(fixture.name), &opts)?;
+        adapter = report.adapter.clone();
+        backend = report.backend.clone();
+        let timing = report.timing;
+        gpu_timing_available |= timing.gpu_render_millis.is_some();
+        let passes = timing.gpu_passes;
+        summaries.push(ShapeSummary {
+            name: fixture.name.to_owned(),
+            strategy: format!("{strategy:?}"),
+            quad_count: fixture.mesh_stats.quad_count,
+            triangle_count: fixture.mesh_stats.triangle_count,
+            vertex_count: fixture.mesh_stats.vertex_count,
+            surface_area_m2: fixture.mesh_stats.surface_area_m2,
+            exposed_unit_faces: fixture.mesh_stats.exposed_unit_faces,
+            unresolved_halo_faces: fixture.mesh_stats.unresolved_halo_faces,
+            items_drawn: report.items_drawn,
+            triangles_rasterised: report.triangles,
+            vertex_bytes: report.vertex_bytes,
+            index_bytes: report.index_bytes,
+            gpu_render_millis: timing.gpu_render_millis,
+            gpu_shadow_millis: passes.map(|p| p.shadow_millis),
+            gpu_indirect_trace_millis: passes.map(|p| p.indirect_trace_millis),
+            gpu_indirect_denoise_millis: passes.map(|p| p.indirect_denoise_millis),
+            gpu_opaque_millis: passes.map(|p| p.opaque_millis),
+            gpu_tone_map_millis: passes.map(|p| p.tone_map_millis),
+            gpu_timing_available: timing.gpu_render_millis.is_some(),
+            cpu_capture_millis: timing.cpu_total_millis,
+            cpu_lighting_upload_millis: timing.cpu_lighting_upload_millis,
+            cpu_readback_millis: timing.cpu_readback_millis,
+            cpu_encode_millis: timing.cpu_encode_millis,
+            indirect_cells: report.indirect_cells,
+            open_probe_luminance: Some(fixture.metrics.open_probe_luminance),
+            closed_probe_luminance: Some(fixture.metrics.closed_probe_luminance),
+            thin_wall_leakage_ratio: Some(fixture.metrics.thin_wall_leakage_ratio),
+            images: report
+                .images
+                .iter()
+                .map(|image| image.path.display().to_string())
+                .collect(),
+        });
+    }
+    Ok(Summary {
+        version: 4,
         adapter,
         backend,
         gpu_timing_available,

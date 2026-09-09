@@ -16,6 +16,13 @@ struct Material { base_color: vec4<f32>, params: vec4<f32>, };
 @group(0) @binding(1) var<storage, read> materials: array<Material>;
 @group(0) @binding(2) var shadow_maps: texture_depth_2d_array;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
+struct IndirectGlobals {
+    origin_cell_size: vec4<f32>,
+    dimensions: vec4<u32>,
+    sky: vec4<f32>,
+};
+@group(1) @binding(0) var<storage, read> indirect_radiance: array<vec4<f32>>;
+@group(1) @binding(1) var<uniform> indirect_globals: IndirectGlobals;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -88,6 +95,18 @@ fn geometry_schlick(n_dot_v: f32, roughness: f32) -> f32 {
     return n_dot_v / max(n_dot_v * (1.0 - k) + k, 0.0001);
 }
 
+fn sample_indirect(world_pos: vec3<f32>, normal: vec3<f32>, base: vec3<f32>) -> vec3<f32> {
+    if indirect_globals.dimensions.z == 0u { return vec3<f32>(0.0); }
+    let dim = i32(indirect_globals.dimensions.x);
+    // Step past the occupied cache cell that owns the raster surface. A
+    // sub-cell offset can quantise back into the wall at negative faces.
+    let sample_pos = world_pos + normal * indirect_globals.origin_cell_size.w * 1.1;
+    let coord = vec3<i32>(floor((sample_pos - indirect_globals.origin_cell_size.xyz) / indirect_globals.origin_cell_size.w));
+    if any(coord < vec3<i32>(0)) || any(coord >= vec3<i32>(dim)) { return vec3<f32>(0.0); }
+    let index = u32(coord.x + dim * (coord.y + dim * coord.z));
+    return base * indirect_radiance[index].rgb / PI;
+}
+
 @fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
     let mode = i32(round(globals.params.x));
@@ -107,6 +126,9 @@ fn geometry_schlick(n_dot_v: f32, roughness: f32) -> f32 {
     }
     if mode == 3 { return vec4<f32>(base, 1.0); }
     if mode == 5 { return vec4<f32>(vec3<f32>(roughness), 1.0); }
+
+    let indirect = sample_indirect(in.world_pos, n, base);
+    if mode == 6 { return vec4<f32>(indirect, 1.0); }
 
     let cascade = cascade_index(eye_depth);
     let l = normalize(-globals.sun_dir.xyz);
@@ -131,5 +153,5 @@ fn geometry_schlick(n_dot_v: f32, roughness: f32) -> f32 {
     let direct = (diffuse + specular) * globals.light.x * n_dot_l * visibility;
     let sky = mix(globals.light.y, globals.light.z, n.y * 0.5 + 0.5);
     let ambient = base * sky * mix(0.35, 1.0, clamp(in.ao, 0.0, 1.0));
-    return vec4<f32>(ambient + direct, 1.0);
+    return vec4<f32>(ambient + direct + indirect, 1.0);
 }
