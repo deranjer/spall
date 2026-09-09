@@ -121,6 +121,8 @@ Connectivity-only collapse is G1. For G4, partition connected material into stru
 
 This is a gameplay approximation, with fixtures for weak cantilevers, strong arches, undermined ground, and damaged joints. An experienced reviewer must freeze the actual equations and units in T22 before an implementation agent writes them. Finite-element simulation is out of scope.
 
+The frozen equations, integer units, propagation order, failure order, and save/replication field shapes are in `docs/structural-strength.md` (`strength_algo_version = 1`, awaiting integrator sign-off). `spall_structure::strength` implements exactly that: a support forest rooted at the anchor plane, saturating post-order load accumulation, per-bond demand-vs-capacity with a moment arm on lateral joints, and a one-bond-per-iteration deterministic cascade producing an authoritative `DamageState`. Wiring `DamageState` into the `spall_protocol` / `spall_store` DTOs is the second increment of T22.
+
 ### Large collapses and load policy
 
 Do not solve overload by turning every voxel into a body. Use connected compound bodies and bounded fracture granularity. A huge connected object can remain one multi-brick body if the collider representation supports it. If it cannot, T06 must establish a documented deterministic coarse fracture policy before the scale gate.

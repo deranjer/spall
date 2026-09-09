@@ -933,3 +933,109 @@ fn a_bounded_search_is_resumable_to_the_same_result() {
     assert_eq!(resumed.unsupported_cells, unbounded.unsupported_cells);
     assert_eq!(resumed.supported_cells, unbounded.supported_cells);
 }
+
+/// T22 `cantilever-strength`: the strength stage layers on top of the T07
+/// support pass. A cantilever that is *connected* (T07 sees it fully supported)
+/// still fails on material capacity, the identical geometry in a stronger
+/// material does not, and the persisted damage does not heal on a restart.
+#[test]
+fn material_capacity_changes_the_cantilever_outcome_and_damage_survives_restart() {
+    use crate::strength::{DamageState, StrengthParams, evaluate};
+    use spall_core::{MaterialDef, MaterialFlags, RenderProps, SimProps};
+
+    fn mat(id: u16, name: &str, density: f32, bond: f32) -> MaterialDef {
+        MaterialDef {
+            id: MaterialId(id),
+            name: name.into(),
+            render: RenderProps {
+                albedo: [0.5; 3],
+                roughness: 0.9,
+                metalness: 0.0,
+                emissive: [0.0; 3],
+            },
+            sim: SimProps {
+                density_kg_m3: density,
+                friction: 0.8,
+                restitution: 0.05,
+                hardness: 4.0,
+                bond_strength: bond,
+                flags: MaterialFlags(
+                    MaterialFlags::OPAQUE.0
+                        | MaterialFlags::COLLIDES.0
+                        | MaterialFlags::STRUCTURAL.0,
+                ),
+            },
+        }
+    }
+    let manifest = spall_core::MaterialManifest::validated(vec![
+        MaterialDef {
+            id: MaterialId::AIR,
+            name: "air".into(),
+            render: RenderProps {
+                albedo: [0.0; 3],
+                roughness: 1.0,
+                metalness: 0.0,
+                emissive: [0.0; 3],
+            },
+            sim: SimProps {
+                density_kg_m3: 0.0,
+                friction: 0.0,
+                restitution: 0.0,
+                hardness: 0.0,
+                bond_strength: 0.0,
+                flags: MaterialFlags::NONE,
+            },
+        },
+        mat(1, "column", 4000.0, 60.0),
+        mat(2, "weak", 2000.0, 3.0),
+        mat(3, "strong", 2000.0, 60.0),
+    ])
+    .unwrap();
+    let params = StrengthParams::from_manifest(&manifest, CellSizeCode::Quarter);
+
+    let cantilever = |beam: MaterialId| {
+        let mut v = terrain();
+        fill(
+            &mut v,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(0, 6, 0),
+            MaterialId(1),
+        );
+        fill(
+            &mut v,
+            GlobalCell::new(1, 6, 0),
+            GlobalCell::new(10, 6, 0),
+            beam,
+        );
+        v
+    };
+
+    // T07 sees the weak cantilever as fully connected and supported.
+    let weak_world = cantilever(MaterialId(2));
+    let support = build(&weak_world, 0).report();
+    assert_eq!(
+        support.unsupported_cells, 0,
+        "connectivity alone keeps it up"
+    );
+
+    // T22 fails it on capacity; the stronger material holds the same geometry.
+    let weak = evaluate(
+        &weak_world,
+        AnchorPlane::at(0),
+        &params,
+        &DamageState::new(),
+    );
+    let strong = evaluate(
+        &cantilever(MaterialId(3)),
+        AnchorPlane::at(0),
+        &params,
+        &DamageState::new(),
+    );
+    assert!(weak.stable && !weak.failures.is_empty() && !weak.detached.is_empty());
+    assert!(strong.stable && strong.failures.is_empty() && strong.detached.is_empty());
+
+    // Restart from the persisted damage: nothing new breaks, nothing heals.
+    let restart = evaluate(&weak_world, AnchorPlane::at(0), &params, &weak.damage);
+    assert!(restart.failures.is_empty());
+    assert_eq!(restart.damage, weak.damage);
+}

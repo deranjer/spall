@@ -16,6 +16,11 @@
 //! - emits canonical X-run cell membership for every unsupported component and a
 //!   conservation ledger the split must balance ([`split`]).
 //!
+//! - adds a material-dependent strength stage ([`strength`], T22): a still-
+//!   connected component can fail when a bond on its load path carries more than
+//!   its material's capacity, and the resulting broken bonds are authoritative,
+//!   persisted [`strength::DamageState`] so a restart cannot heal a failing beam.
+//!
 //! [`StructureIndex`] is the incremental entry point: it carries a
 //! [`spall_jobs::JobToken`] for the exact brick revisions it read, so a
 //! consumer can reject a stale analysis the same way it would reject any other
@@ -28,6 +33,7 @@
 pub mod graph;
 pub mod label;
 pub mod split;
+pub mod strength;
 pub mod support;
 
 #[cfg(any(test, feature = "oracle"))]
@@ -42,4 +48,8 @@ pub use graph::{
 };
 pub use label::{BrickLabels, LocalComponent, label_brick};
 pub use split::{CellSpanX, ComponentMembership, ConservationError, ConservationLedger};
+pub use strength::{
+    BondFailure, BrokenBond, DamageState, DetachedComponent, STRENGTH_ALGO_VERSION, StrengthParams,
+    StrengthReport, evaluate as evaluate_strength,
+};
 pub use support::{ClassifiedComponent, StructureIndex, Support, SupportReport};
