@@ -23,11 +23,17 @@ plus solid regions refilled in order; `LightingVolume::apply_update` applies one
 and records a cell dirty only when its material actually changes, so a moving
 body vacates old cells and fills new ones with no separate clear step erasing
 overlapping geometry. `capture_lighting_sequence` renders a base
-`IndirectOnly` frame, then applies a list of updates, re-uploading only the
-dirty cells (`take_dirty`) and re-tracing only the dirty cell-AABB grown by a
-halo (`set_trace_region`); the denoise still runs full. Its `SequenceReport`
-records per step: `dirty_cells`, `retraced_cells`, `gpu_trace_millis` /
-`gpu_denoise_millis`, and the measured `band_luminance`. The
+`IndirectOnly` frame, then applies a list of `LightingStep`s (each an update
+and, optionally, a new camera pose), re-uploading only the dirty cells
+(`take_dirty`) and re-tracing only the dirty cell-AABB grown by a halo
+(`set_trace_region`); the denoise still runs full. A `temporal_weight < 1.0`
+enables a temporal accumulation pass: each frame's denoised estimate is blended
+into a persistent history that is clamped to the current neighbourhood
+min/max — so the 12-ray trace noise settles while an edit's re-traced region
+(forced to full weight) and the clamp keep stale shadows and light trails from
+surviving. `SequenceReport` records per step: `dirty_cells`, `retraced_cells`,
+`gpu_trace_millis` / `gpu_denoise_millis` / `gpu_temporal_millis`, and the
+measured `band_luminance`. The
 `rapid_destruction` fixture (colored emitter scene, one represented 0.5 m
 occluder column removed) is exercised by
 `rapid_destruction_reexposes_the_band_with_a_bounded_retrace` in
@@ -44,10 +50,21 @@ cache-only occluder in an emitter -> receiver path, then moves it out and back;
 recovers when the body leaves (22.8 -> 28.5), the shadow re-forms when it
 returns (back to 22.8, bit-identical to the base frame), and each move
 re-traces only ~3 % of the cache.
+`temporal_accumulation_keeps_a_moving_occluder_ghost_free` reruns that fixture
+with `temporal_weight = 0.1` and confirms the shadow still clears, re-forms, and
+returns to the base frame with accumulation on. `panning_camera` pans a static
+lit room; `panning_camera_temporal_matches_no_accumulation` confirms a
+`temporal_weight = 0.1` run matches a `1.0` run frame for frame — the
+world-anchored cache means camera motion cannot smear the lighting.
 
-Temporal reprojection, moving-camera light-trail evidence, and
-edit-commit-to-lighting wall-clock latency remain later T14 increments;
-cross-GPU and p95 frame cost remain T15.
+Known limit: a lighting change is only refreshed inside the dirty AABB plus the
+halo, so a far-reaching light change (a bright emitter moving many metres)
+leaves stale radiance beyond the halo until the next full re-trace. The gate
+fixtures keep light changes local; a periodic full re-trace or a halo sized to
+the trace reach covers the general case and is follow-up work.
+
+Edit-commit-to-lighting wall-clock latency (with a real frame/tick loop) remains
+a later T14 increment; cross-GPU quality and p95 frame cost remain T15.
 Each run also writes `summary.json`; it exits 3 when no GPU adapter is available.
 The `summary.json` is schema `version: 4`. CPU and GPU costs are reported
 separately and must not be conflated: `gpu_render_millis` is a real device

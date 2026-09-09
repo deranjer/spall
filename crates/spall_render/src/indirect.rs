@@ -331,16 +331,26 @@ struct IndirectGlobals {
     /// [`IndirectResources::set_trace_region`].
     trace_region_min: [u32; 4],
     trace_region_max: [u32; 4],
+    /// T14 temporal blend: `[history_weight_of_current_frame, clamp_slack, 0, 0]`.
+    /// `1.0` weight means no accumulation. See
+    /// [`IndirectResources::set_temporal`].
+    temporal: [f32; 4],
 }
 
 /// Byte offset of `trace_region_min` within [`IndirectGlobals`] — three
 /// preceding `vec4`s. `set_trace_region` writes 8 `u32` from here.
 const TRACE_REGION_OFFSET: u64 = 3 * 16;
+/// Byte offset of `temporal` within [`IndirectGlobals`] — five preceding `vec4`s.
+const TEMPORAL_OFFSET: u64 = 5 * 16;
 
 pub(crate) struct IndirectResources {
     pub(crate) trace_bind: wgpu::BindGroup,
     pub(crate) denoise_bind: wgpu::BindGroup,
+    pub(crate) temporal_bind: wgpu::BindGroup,
+    /// Samples the denoised buffer — the T13 path, no temporal accumulation.
     pub(crate) display_bind: wgpu::BindGroup,
+    /// Samples the temporal history buffer — used after [`dispatch_temporal`].
+    pub(crate) history_display_bind: wgpu::BindGroup,
     pub(crate) upload_millis: f64,
     pub(crate) enabled: bool,
     pub(crate) cells: usize,
@@ -349,6 +359,7 @@ pub(crate) struct IndirectResources {
     _source_dummy: wgpu::Buffer,
     _trace: wgpu::Buffer,
     _denoised: wgpu::Buffer,
+    _history: wgpu::Buffer,
 }
 
 impl IndirectResources {
@@ -397,11 +408,26 @@ impl IndirectResources {
             glam::UVec3::splat(LIGHT_VOLUME_DIM),
         );
     }
+
+    /// Configure the temporal pass: `current_weight` is how much of this frame's
+    /// denoised estimate is mixed into the history for cells outside the
+    /// re-traced region (`1.0` disables accumulation and reproduces the T13
+    /// path); `slack` is the history clamp margin as a fraction of the local
+    /// neighbourhood spread.
+    pub(crate) fn set_temporal(&self, queue: &wgpu::Queue, current_weight: f32, slack: f32) {
+        let payload: [f32; 4] = [current_weight.clamp(0.0, 1.0), slack.max(0.0), 0.0, 0.0];
+        queue.write_buffer(
+            &self.globals_buffer,
+            TEMPORAL_OFFSET,
+            bytemuck::cast_slice(&payload),
+        );
+    }
 }
 
 pub(crate) struct IndirectPipeline {
     trace: wgpu::ComputePipeline,
     denoise: wgpu::ComputePipeline,
+    temporal: wgpu::ComputePipeline,
     compute_layout: wgpu::BindGroupLayout,
     display_layout: wgpu::BindGroupLayout,
 }
@@ -447,6 +473,7 @@ impl IndirectPipeline {
         Self {
             trace: make("spall-t13-trace-pipeline", "trace_main"),
             denoise: make("spall-t13-denoise-pipeline", "denoise_main"),
+            temporal: make("spall-t14-temporal-pipeline", "temporal_main"),
             compute_layout,
             display_layout,
         }
@@ -490,6 +517,7 @@ impl IndirectPipeline {
         };
         let trace = output("spall-t13-traced-radiance");
         let denoised = output("spall-t13-denoised-radiance");
+        let history = output("spall-t14-history-radiance");
         let source_dummy = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("spall-t13-unused-trace-source"),
             size: std::mem::size_of::<[f32; 4]>() as u64,
@@ -502,6 +530,8 @@ impl IndirectPipeline {
             sky: [0.24, 0.31, 0.42, 0.0],
             trace_region_min: [0, 0, 0, 0],
             trace_region_max: [dim, dim, dim, 0],
+            // Default: no accumulation, so `capture_scene` is unchanged.
+            temporal: [1.0, 0.25, 0.0, 0.0],
         };
         let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("spall-t13-indirect-globals"),
@@ -525,18 +555,26 @@ impl IndirectPipeline {
         // a storage buffer cannot be read-only and read-write in one dispatch.
         let trace_bind = compute_bind("spall-t13-trace-bind", &source_dummy, &trace);
         let denoise_bind = compute_bind("spall-t13-denoise-bind", &trace, &denoised);
-        let display_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("spall-t13-display-bind"),
-            layout: &self.display_layout,
-            entries: &[entry(0, &denoised), entry(1, &globals)],
-        });
+        // Temporal reads this frame's denoised estimate, reads+writes history.
+        let temporal_bind = compute_bind("spall-t14-temporal-bind", &denoised, &history);
+        let display = |label, buffer: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.display_layout,
+                entries: &[entry(0, buffer), entry(1, &globals)],
+            })
+        };
+        let display_bind = display("spall-t13-display-bind", &denoised);
+        let history_display_bind = display("spall-t14-history-display-bind", &history);
         // Include command submission overhead for the initial occupancy upload;
         // device pass timings remain separate timestamp measurements.
         queue.submit(std::iter::empty());
         IndirectResources {
             trace_bind,
             denoise_bind,
+            temporal_bind,
             display_bind,
+            history_display_bind,
             upload_millis: start.elapsed().as_secs_f64() * 1000.0,
             enabled,
             cells: cells.len(),
@@ -545,6 +583,7 @@ impl IndirectPipeline {
             _source_dummy: source_dummy,
             _trace: trace,
             _denoised: denoised,
+            _history: history,
         }
     }
 
@@ -578,6 +617,29 @@ impl IndirectPipeline {
             pass.set_bind_group(0, &resources.denoise_bind, &[]);
             pass.dispatch_workgroups(groups, groups, groups);
         }
+    }
+
+    /// Run the T14 temporal accumulation pass, blending this frame's denoised
+    /// estimate into the persistent history. Sample `history_display_bind`
+    /// afterwards.
+    pub(crate) fn dispatch_temporal<'a>(
+        &'a self,
+        encoder: &'a mut wgpu::CommandEncoder,
+        resources: &'a IndirectResources,
+        timestamps: Option<wgpu::ComputePassTimestampWrites<'a>>,
+    ) {
+        let groups = if resources.enabled {
+            LIGHT_VOLUME_DIM.div_ceil(TRACE_WORKGROUP)
+        } else {
+            1
+        };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("spall-t14-temporal-pass"),
+            timestamp_writes: timestamps,
+        });
+        pass.set_pipeline(&self.temporal);
+        pass.set_bind_group(0, &resources.temporal_bind, &[]);
+        pass.dispatch_workgroups(groups, groups, groups);
     }
 }
 

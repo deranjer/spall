@@ -11,8 +11,8 @@ use spall_mesh::fixtures::{acceptance_shapes, mesh_shape};
 use spall_mesh::{Mesh, MeshStrategy, Vertex};
 use spall_render::{
     Camera, CaptureOptions, DebugView, LightingStep, RenderContext, Scene, SceneItem,
-    capture_lighting_sequence, capture_scene, colored_rooms, emitter_occlusion_scenes,
-    moving_body_overlap, rapid_destruction,
+    SequenceOptions, capture_lighting_sequence, capture_scene, colored_rooms,
+    emitter_occlusion_scenes, moving_body_overlap, panning_camera, rapid_destruction,
 };
 
 #[test]
@@ -458,13 +458,12 @@ fn rapid_destruction_reexposes_the_band_with_a_bounded_retrace() {
     let report = capture_lighting_sequence(
         &ctx,
         rd.scene,
-        rd.receiver_band,
-        12,
-        1.0,
-        &[LightingStep {
-            label: "remove occluder".to_string(),
-            update: rd.remove_occluder,
-        }],
+        // temporal accumulation off (default): each step is one settled frame
+        SequenceOptions {
+            band: rd.receiver_band,
+            ..Default::default()
+        },
+        &[LightingStep::edit("remove occluder", rd.remove_occluder)],
         &out,
     )
     .expect("lighting sequence capture");
@@ -527,8 +526,17 @@ fn moving_body_leaves_no_ghost_and_keeps_swept_geometry() {
     let band = mbo.receiver_band;
     let out = std::env::temp_dir().join(format!("spall-t14-move-{}", std::process::id()));
 
-    let report = capture_lighting_sequence(&ctx, mbo.scene, band, 12, 1.0, &mbo.steps, &out)
-        .expect("moving-body lighting sequence");
+    let report = capture_lighting_sequence(
+        &ctx,
+        mbo.scene,
+        SequenceOptions {
+            band,
+            ..Default::default()
+        },
+        &mbo.steps,
+        &out,
+    )
+    .expect("moving-body lighting sequence");
 
     assert_eq!(report.steps.len(), 3);
     let base = report.steps[0].band_luminance; // body in the path -> shadowed
@@ -557,6 +565,100 @@ fn moving_body_leaves_no_ghost_and_keeps_swept_geometry() {
             "re-trace not bounded on a body move: {} of {}",
             step.retraced_cells,
             report.total_cells
+        );
+    }
+
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// T14 increment 4: turning on heavy temporal accumulation must not reintroduce
+/// the ghost / stale-shadow that increment 3 removed. The moving occluder's
+/// shadow still clears when it leaves and re-forms when it returns, and the
+/// returned frame still matches the base — the region-forced refresh and the
+/// neighbourhood clamp keep the accumulated history honest.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn temporal_accumulation_keeps_a_moving_occluder_ghost_free() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let mbo = moving_body_overlap(16.0 / 9.0);
+    let band = mbo.receiver_band;
+    let out = std::env::temp_dir().join(format!("spall-t14-tmove-{}", std::process::id()));
+
+    let report = capture_lighting_sequence(
+        &ctx,
+        mbo.scene,
+        SequenceOptions {
+            band,
+            temporal_weight: 0.1, // heavy accumulation
+            ..Default::default()
+        },
+        &mbo.steps,
+        &out,
+    )
+    .expect("temporal moving-body lighting sequence");
+
+    assert_eq!(report.steps.len(), 3);
+    let base = report.steps[0].band_luminance;
+    let cleared = report.steps[1].band_luminance;
+    let returned = report.steps[2].band_luminance;
+
+    assert!(
+        cleared > base + 1.5,
+        "accumulated ghost: band did not recover when the occluder left ({base:.3} -> {cleared:.3})"
+    );
+    assert!(
+        returned < cleared - 1.5,
+        "shadow did not re-form under accumulation ({cleared:.3} -> {returned:.3})"
+    );
+    assert!(
+        (returned - base).abs() < 2.0,
+        "accumulation drifted the returned frame from the base ({base:.3} vs {returned:.3})"
+    );
+    if ctx.supports_gpu_timestamps() {
+        assert!(
+            report.steps[1].gpu_temporal_millis.unwrap_or(-1.0) >= 0.0,
+            "temporal pass was not timed"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// T14 increment 4: the lighting cache is world-anchored, so panning the camera
+/// over a static lit room must not smear or shift the accumulated lighting — a
+/// heavy-accumulation run matches a no-accumulation run frame for frame.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn panning_camera_temporal_matches_no_accumulation() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let out = std::env::temp_dir().join(format!("spall-t14-pan-{}", std::process::id()));
+
+    let run = |weight: f32, sub: &str| {
+        let pc = panning_camera(16.0 / 9.0);
+        capture_lighting_sequence(
+            &ctx,
+            pc.scene,
+            SequenceOptions {
+                band: pc.band,
+                temporal_weight: weight,
+                ..Default::default()
+            },
+            &pc.steps,
+            &out.join(sub),
+        )
+        .expect("panning-camera lighting sequence")
+    };
+    let reference = run(1.0, "reference");
+    let temporal = run(0.1, "temporal");
+
+    assert_eq!(reference.steps.len(), temporal.steps.len());
+    for (r, t) in reference.steps.iter().zip(&temporal.steps) {
+        assert!(
+            (r.band_luminance - t.band_luminance).abs() < 1.0,
+            "temporal accumulation smeared the panning view at '{}': {:.3} vs {:.3}",
+            r.label,
+            r.band_luminance,
+            t.band_luminance
         );
     }
 

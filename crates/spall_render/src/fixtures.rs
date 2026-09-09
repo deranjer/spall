@@ -193,17 +193,47 @@ pub fn moving_body_overlap(aspect: f32) -> MovingBodyOverlap {
         // `occluded` already has the box (== the occluder column) in the path.
         scene: scenes.occluded,
         steps: vec![
-            LightingStep {
-                label: "body clears the light path".to_string(),
-                update: LightingUpdate::moving_box(in_path, clear, 1, &[receiver]),
-            },
-            LightingStep {
-                label: "body returns to the light path".to_string(),
-                update: LightingUpdate::moving_box(clear, in_path, 1, &[receiver]),
-            },
+            LightingStep::edit(
+                "body clears the light path",
+                LightingUpdate::moving_box(in_path, clear, 1, &[receiver]),
+            ),
+            LightingStep::edit(
+                "body returns to the light path",
+                LightingUpdate::moving_box(clear, in_path, 1, &[receiver]),
+            ),
         ],
         receiver_band: scenes.receiver_band,
         probe_behind: Vec3::new(0.0, 2.5, -5.0),
+    }
+}
+
+/// The T14 moving-camera case: a static lit room viewed from a panning camera.
+/// The lighting cache is world-anchored, so camera motion must not shift or
+/// smear the accumulated lighting — a temporal run should match a
+/// no-accumulation run frame for frame.
+pub struct PanningCamera {
+    pub scene: Scene,
+    pub steps: Vec<LightingStep>,
+    pub band: [f32; 2],
+}
+
+pub fn panning_camera(aspect: f32) -> PanningCamera {
+    let mut rooms = colored_rooms(aspect);
+    let open = rooms
+        .drain(..)
+        .find(|room| room.name == "colored_room_open")
+        .expect("colored_room_open fixture");
+    let base = open.scene.camera;
+    let yawed = |yaw: f32| Camera { yaw, ..base };
+
+    PanningCamera {
+        scene: open.scene,
+        steps: vec![
+            LightingStep::view("pan left", yawed(-0.18)),
+            LightingStep::view("pan right", yawed(0.18)),
+            LightingStep::view("recentre", yawed(0.0)),
+        ],
+        band: [0.30, 0.70],
     }
 }
 
