@@ -27,15 +27,17 @@ use spall_core::{
     ProcessRecord, ProcessRole, SphereBrush,
 };
 use spall_net::{
-    Connection, DevIdentity, JoinToken, NetServer, Role, TransportConfig, TransportError,
-    WireRecord,
+    Connection, DatagramRecord, DevIdentity, JoinToken, NetServer, Role, TransportConfig,
+    TransportError, WireRecord,
 };
 use spall_physics::PhysicsConfig;
 use spall_protocol::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, AlgorithmVersions, BaselineAck,
-    ClaimedTarget, Handshake, Hash32, InterestEpoch, MotionSnapshot, NegotiatedLimits,
+    ClaimedTarget, Handshake, Hash32, InputFrame, InterestEpoch, MotionSnapshot, NegotiatedLimits,
     PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
+    frame_input, recent_input, session_player_entity,
 };
+use spall_sim::fixtures::WALK_ARENA_SPAWNS;
 use spall_sim::{
     Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
     SimulationConfig, action_statuses, committed_transactions, fixtures,
@@ -121,6 +123,10 @@ pub enum Scene {
     /// detaches a body whose cells were owned across two bricks. See
     /// [`spall_voxel::fixtures::cross_brick_bridge_scene`].
     CrossBridgeCut,
+    /// T19: a flat anchored walking arena with a step ledge. Each connecting
+    /// client is given an authoritative player capsule; clients script movement
+    /// and predict it locally. See [`spall_sim::fixtures::walk_arena_setup`].
+    Walk,
 }
 
 impl Scene {
@@ -132,14 +138,30 @@ impl Scene {
             "cross-bridge-cut" | "cross-brick-bridge" | "crossbridgecut" => {
                 Some(Scene::CrossBridgeCut)
             }
+            "walk" | "walk-arena" | "player-movement" => Some(Scene::Walk),
             _ => None,
         }
+    }
+
+    /// A short stable name for the run summary.
+    pub fn name(self) -> &'static str {
+        match self {
+            Scene::BridgeCut => "bridge-cut",
+            Scene::CrossBridgeCut => "cross-bridge-cut",
+            Scene::Walk => "walk",
+        }
+    }
+
+    /// `true` if this scene gives every connecting client a player capsule.
+    pub fn has_players(self) -> bool {
+        matches!(self, Scene::Walk)
     }
 
     fn simulation(self) -> Simulation {
         let mut setup = match self {
             Scene::BridgeCut => spall_sim::fixtures::bridged_terrain_setup(),
             Scene::CrossBridgeCut => spall_sim::fixtures::cross_brick_bridged_setup(),
+            Scene::Walk => spall_sim::fixtures::walk_arena_setup(),
         };
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
@@ -333,6 +355,9 @@ enum Inbound {
     Joined(SessionId),
     Action(SessionId, ActionRequest),
     Repair(SessionId, RepairRequest),
+    /// T19: a player movement input frame (datagram). At most one is applied per
+    /// player per tick; redundant `recent` copies recover a dropped frame.
+    Input(SessionId, InputFrame),
     /// A `BaselineAck`: the sentinel (`transfer_id == 0`) asks for a late-join
     /// baseline; a real id confirms one is installed.
     Baseline(SessionId, BaselineAck),
@@ -709,7 +734,31 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 };
                 drained += 1;
                 match msg {
-                    Inbound::Joined(session) => lj.on_joined(session),
+                    Inbound::Joined(session) => {
+                        lj.on_joined(session);
+                        // T19: give this connection an authoritative player
+                        // capsule on a player scene (respawn on reconnect).
+                        if scene.has_players() {
+                            let slot = session.slot().0 as usize;
+                            let spawn = WALK_ARENA_SPAWNS[slot.min(WALK_ARENA_SPAWNS.len() - 1)];
+                            sim.add_player(session_player_entity(session), spawn);
+                        }
+                    }
+                    Inbound::Input(session, frame) => {
+                        saw_client_work = true;
+                        if lj.session_expired(session) {
+                            continue;
+                        }
+                        let entity = session_player_entity(session);
+                        // Apply the redundant recent copies oldest-first, then
+                        // the current frame. `set_player_input` drops any that
+                        // are not newer than what the server already has, so a
+                        // single surviving datagram recovers a dropped frame.
+                        for r in frame.recent.iter().rev() {
+                            sim.set_player_input(entity, recent_input(r), r.input_seq);
+                        }
+                        sim.set_player_input(entity, frame_input(&frame), frame.input_seq);
+                    }
                     Inbound::Action(session, req) => {
                         saw_client_work = true;
                         if lj.session_expired(session) {
@@ -1853,6 +1902,28 @@ async fn serve_conn(
         })
     };
 
+    // T19: player movement input arrives as datagrams. Same non-blocking policy
+    // as the reliable reader — a flooding client's surplus is dropped, and the
+    // sim applies at most one frame per player per tick anyway.
+    let dgram_reader = {
+        let conn = conn.clone();
+        let inbound = inbound.clone();
+        tokio::spawn(async move {
+            loop {
+                match conn.recv_datagram().await {
+                    Ok(Some(DatagramRecord::Input(frame))) => {
+                        match inbound.try_send(Inbound::Input(session, frame)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        })
+    };
+
     let mut motion_seq = 0u64;
     'writer: loop {
         // Flush everything queued, in commit order, before parking.
@@ -1912,6 +1983,7 @@ async fn serve_conn(
         .remove(&session.raw());
     conn.close("connection complete");
     reader.abort();
+    dgram_reader.abort();
     liveness.abort();
 }
 

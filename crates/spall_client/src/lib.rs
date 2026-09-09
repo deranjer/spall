@@ -2,12 +2,14 @@
 //! and transport wiring are added by later tasks.
 
 pub mod net;
+pub mod predict;
 pub mod replica;
 
 pub use net::{
-    BaselineScene, ClientNetConfig, ClientNetError, ClientSummary, ScriptTarget, ScriptedAction,
-    cut_request, run_replication_client,
+    BaselineScene, ClientNetConfig, ClientNetError, ClientSummary, MovementStep, ScriptTarget,
+    ScriptedAction, cut_request, run_replication_client,
 };
+pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};

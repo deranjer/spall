@@ -10,13 +10,13 @@ use std::collections::BTreeMap;
 
 use glam::DQuat;
 use spall_core::{
-    BrickCoord, CellSizeCode, EntityId, GlobalCell, IdError, LocalCell, MaterialId, Revision,
-    VolumeId,
+    BrickCoord, CellSizeCode, EntityId, GlobalCell, IdError, LocalCell, MaterialId, PlayerInput,
+    Revision, VolumeId,
 };
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
-    BodyKind as PhysBodyKind, BodySpec, OccupancyGrid, PhysicsConfig, PhysicsWorld,
-    analytic_mass_properties,
+    BodyKind as PhysBodyKind, BodySpec, CharacterParams, OccupancyGrid, PhysicsConfig,
+    PhysicsWorld, analytic_mass_properties, step_character,
 };
 use spall_protocol::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
@@ -27,7 +27,9 @@ use spall_voxel::{Brick, BrickBounds, BrickState, EditPlan, Volume};
 
 use crate::body::{Body, BodyKind, BodyPose};
 use crate::collider::plan_collider;
+use crate::player::Player;
 use crate::registry::IdRegistry;
+use spall_protocol::InputSeq;
 
 /// The stable numeric layer code for the material layer in a canonical brick.
 const MATERIAL_LAYER_KIND: u16 = 0;
@@ -117,6 +119,9 @@ pub struct SimWorld {
     bodies: BTreeMap<u64, Body>,
     /// `volume id -> entity id` for detached bodies.
     volume_owner: BTreeMap<u64, u64>,
+    /// Authoritative player capsules keyed by their reserved-band entity id
+    /// (T19). Not bodies: no volume, never split, never in the dynamic set.
+    players: BTreeMap<u64, Player>,
     physics: PhysicsWorld,
 }
 
@@ -170,6 +175,7 @@ impl SimWorld {
             terrain,
             bodies: BTreeMap::new(),
             volume_owner: BTreeMap::new(),
+            players: BTreeMap::new(),
             physics,
         })
     }
@@ -286,6 +292,100 @@ impl SimWorld {
 
     pub fn body_count(&self) -> usize {
         self.bodies.len()
+    }
+
+    // --- players (T19) ----------------------------------------------------
+
+    /// Registers an authoritative player capsule standing at `feet_m`. `entity`
+    /// is the caller's reserved-band id ([`spall_core::player_entity_for`]).
+    /// Replaces any existing player with the same id.
+    pub fn add_player(
+        &mut self,
+        entity: EntityId,
+        feet_m: [f64; 3],
+        params: CharacterParams,
+    ) -> EntityId {
+        self.players
+            .insert(entity.get(), Player::new(entity, params, feet_m));
+        entity
+    }
+
+    /// Removes a player capsule (its connection dropped).
+    pub fn remove_player(&mut self, entity: EntityId) {
+        self.players.remove(&entity.get());
+    }
+
+    pub fn player(&self, entity: EntityId) -> Option<&Player> {
+        self.players.get(&entity.get())
+    }
+
+    pub fn players(&self) -> impl Iterator<Item = &Player> {
+        self.players.values()
+    }
+
+    pub fn player_count(&self) -> usize {
+        self.players.len()
+    }
+
+    /// Accepts one validated input frame for a player. Returns `false` for an
+    /// unknown player or a stale / duplicate / non-finite frame.
+    pub fn set_player_input(
+        &mut self,
+        entity: EntityId,
+        input: PlayerInput,
+        seq: InputSeq,
+    ) -> bool {
+        match self.players.get_mut(&entity.get()) {
+            Some(player) => player.accept_input(input, seq),
+            None => false,
+        }
+    }
+
+    /// Advances every player capsule one fixed step against the current collider
+    /// world with the deterministic [`step_character`] kernel.
+    ///
+    /// `invalidation_boxes` are the world-space AABBs (metres) of the cells
+    /// touched by transactions that committed this tick
+    /// ([`crate::player::transaction_world_box`]). A player within
+    /// [`crate::player::INVALIDATION_MARGIN_M`] of one has its `movement_epoch`
+    /// bumped and is depenetrated before the normal step, so the authoritative
+    /// capsule is never left inside new solid or hovering over removed floor and
+    /// the client knows to rebuild prediction from the next snapshot.
+    pub fn advance_players(&mut self, dt_s: f32, invalidation_boxes: &[([f64; 3], [f64; 3])]) {
+        let physics = &self.physics;
+        for player in self.players.values_mut() {
+            if invalidation_boxes
+                .iter()
+                .any(|(lo, hi)| player.near_world_box(*lo, *hi))
+            {
+                player.movement_epoch = player.movement_epoch.wrapping_add(1);
+                let mv =
+                    physics.sweep_character(player.params, player.state.position_m, [0.0; 3], dt_s);
+                player.state.position_m = [
+                    player.state.position_m[0] + f64::from(mv.translation_m[0]),
+                    player.state.position_m[1] + f64::from(mv.translation_m[1]),
+                    player.state.position_m[2] + f64::from(mv.translation_m[2]),
+                ];
+                player.state.grounded = mv.grounded;
+                player.state.velocity_m_s = [0.0; 3];
+            }
+
+            let input = player.effective_input();
+            let params = player.params;
+            player.state = step_character(player.state, input, dt_s, |pos, desired| {
+                physics.sweep_character(params, pos, desired, dt_s)
+            });
+
+            // Bounded-fixture safety net: a capsule that leaves the world (bad
+            // input math, a floor pulled out from under it with nothing below)
+            // is reset to its spawn rather than integrated to infinity.
+            if !player.state.is_finite() || player.state.position_m[1] < -100.0 {
+                player.state = player.spawn;
+                player.movement_epoch = player.movement_epoch.wrapping_add(1);
+            }
+
+            player.age_input();
+        }
     }
 
     /// A mutable reference to whichever body owns `volume` (terrain or detached).

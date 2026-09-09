@@ -4,18 +4,23 @@
 //! One `tick` runs the in-scope steps of the `docs/architecture.md` tick order:
 //! drain accepted intents, validate and commit prepared transactions in
 //! server-assigned order with matching collision / ownership updates, advance
-//! physics one fixed step, and refresh the extracted body poses. Player
-//! movement (T19), contact-to-intent conversion (T21), replication (T10) and
-//! persistence (T16) are explicitly out of scope.
+//! physics one fixed step, refresh the extracted body poses, and advance the
+//! player capsules (T19). Contact-to-intent conversion (T21), replication (T10)
+//! and persistence (T16) are handled by the integrator, not here.
 
-use spall_core::{IdError, Tick};
-use spall_protocol::{ActionStatus, RequestId};
+use spall_core::{EntityId, IdError, PlayerInput, Tick};
+use spall_physics::{CharacterParams, CharacterState};
+use spall_protocol::{ActionStatus, InputSeq, RequestId};
 
 use crate::commit::CommitError;
 use crate::intent::{EditIntent, IntentError};
 use crate::journal::JournalSink;
+use crate::player::transaction_world_box;
 use crate::schedule::{EditPipeline, TickReport};
 use crate::world::{SimWorld, WorldSetup};
+
+/// The fixed server timestep: 60 Hz (`docs/architecture.md`).
+pub const TICK_DT_S: f32 = 1.0 / 60.0;
 
 /// Tunables for a [`Simulation`].
 pub struct SimulationConfig {
@@ -167,7 +172,67 @@ impl Simulation {
             &mut self.next_control_seq,
         )?;
         self.world.step_physics();
+        self.advance_players(&report);
         Ok(report)
+    }
+
+    /// Advances the player capsules after the physics step, so the character
+    /// sweep runs against the broad-phase BVH this tick's [`SimWorld::step_physics`]
+    /// just refreshed — including any collider a commit rebuilt. A player near a
+    /// cell this tick's transactions edited has its prediction epoch bumped and
+    /// is depenetrated (`crate::player`).
+    fn advance_players(&mut self, report: &TickReport) {
+        if self.world.player_count() == 0 {
+            return;
+        }
+        let terrain = self.world.terrain_volume_id();
+        let cell_m = self.world.terrain().cell_size().metres();
+        let boxes: Vec<([f64; 3], [f64; 3])> = report
+            .committed
+            .iter()
+            .filter_map(|(_, committed)| {
+                transaction_world_box(&committed.topology, terrain, cell_m)
+            })
+            .collect();
+        self.world.advance_players(TICK_DT_S, &boxes);
+    }
+
+    /// Registers an authoritative player capsule at `feet_m` (metres). `entity`
+    /// is a reserved-band id from [`spall_core::player_entity_for`].
+    pub fn add_player(&mut self, entity: EntityId, feet_m: [f64; 3]) -> EntityId {
+        self.world
+            .add_player(entity, feet_m, CharacterParams::DEFAULT)
+    }
+
+    /// Feeds one validated input frame to a player (at most one per tick per
+    /// player). Returns `false` for an unknown player or a stale / duplicate /
+    /// non-finite frame.
+    pub fn set_player_input(
+        &mut self,
+        entity: EntityId,
+        input: PlayerInput,
+        seq: InputSeq,
+    ) -> bool {
+        self.world.set_player_input(entity, input, seq)
+    }
+
+    /// The authoritative kinematic state of a player, if it exists.
+    pub fn player_state(&self, entity: EntityId) -> Option<CharacterState> {
+        self.world.player(entity).map(|p| p.state)
+    }
+
+    /// A player's prediction-invalidation epoch (bumped by a nearby commit).
+    pub fn player_movement_epoch(&self, entity: EntityId) -> Option<u64> {
+        self.world.player(entity).map(|p| p.movement_epoch)
+    }
+
+    /// The last input sequence this simulation accepted for a player.
+    pub fn player_acked_input(&self, entity: EntityId) -> Option<InputSeq> {
+        self.world.player(entity).map(|p| p.last_input_seq)
+    }
+
+    pub fn player_count(&self) -> usize {
+        self.world.player_count()
     }
 
     /// Runs ticks until the pipeline is idle or `max_ticks` is reached. Returns

@@ -1,7 +1,7 @@
 use clap::Parser;
 use spall_client::{
-    BaselineScene, ClientConfig, ClientNetConfig, ScriptTarget, ScriptedAction, cut_request,
-    run_replication_client,
+    BaselineScene, ClientConfig, ClientNetConfig, MovementStep, ScriptTarget, ScriptedAction,
+    cut_request, run_replication_client,
 };
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
@@ -39,6 +39,12 @@ struct Args {
     /// terrain. Repeatable.
     #[arg(long = "cut", value_parser = parse_cut)]
     cuts: Vec<Cut>,
+    /// T19 scripted movement leg: `FROM:TO:MX,MY,MZ:BUTTONS` — hold the
+    /// (clamped `-1..=1`) movement axes and button bitset from server tick
+    /// `FROM` up to `TO`. The player walks along `+X` (button 1 = jump).
+    /// Repeatable; implies a predicted player capsule.
+    #[arg(long = "move", value_parser = parse_move)]
+    moves: Vec<MoveLeg>,
     /// This client's index in a multi-client session; namespaces request ids so
     /// two clients never collide on the server's idempotency ledger.
     #[arg(long, default_value_t = 0)]
@@ -72,6 +78,37 @@ struct Cut {
     cell: [i64; 3],
     radius: i64,
     target: ScriptTarget,
+}
+
+#[derive(Debug, Clone)]
+struct MoveLeg {
+    from: u64,
+    to: u64,
+    movement: [f32; 3],
+    buttons: u32,
+}
+
+fn parse_move(s: &str) -> Result<MoveLeg, String> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 4 {
+        return Err("expected FROM:TO:MX,MY,MZ:BUTTONS".into());
+    }
+    let from = parts[0].parse().map_err(|_| "bad from tick")?;
+    let to = parts[1].parse().map_err(|_| "bad to tick")?;
+    let m: Vec<f32> = parts[2]
+        .split(',')
+        .map(|v| v.parse().map_err(|_| "bad movement axis".to_string()))
+        .collect::<Result<_, _>>()?;
+    if m.len() != 3 {
+        return Err("movement must be MX,MY,MZ".into());
+    }
+    let buttons = parts[3].parse().map_err(|_| "bad buttons")?;
+    Ok(MoveLeg {
+        from,
+        to,
+        movement: [m[0], m[1], m[2]],
+        buttons,
+    })
 }
 
 fn parse_cut(s: &str) -> Result<Cut, String> {
@@ -160,8 +197,11 @@ fn run_replication(args: Args) -> ExitCode {
         }
     };
 
+    // A movement client (T19) always pulls a baseline (any scene), so the fixed
+    // `BaselineScene` selector is unused and `--scene walk` is accepted.
     let baseline_scene = match BaselineScene::from_name(&args.scene) {
         Some(s) => s,
+        None if !args.moves.is_empty() => BaselineScene::default(),
         None => {
             eprintln!(
                 "sandbox-client: unknown --scene `{}` (expected bridge-cut or cross-bridge-cut)",
@@ -187,11 +227,24 @@ fn run_replication(args: Args) -> ExitCode {
         })
         .collect();
 
+    let movement_script: Vec<MovementStep> = args
+        .moves
+        .iter()
+        .map(|m| MovementStep {
+            from_tick: m.from,
+            to_tick: m.to,
+            movement: m.movement,
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: m.buttons,
+        })
+        .collect();
+
     let config = ClientNetConfig {
         connect_addr,
         server_fingerprint: fingerprint,
         join_token: token,
         script,
+        movement_script,
         late_join: args.late_join,
         baseline_scene,
         run_ticks: args.run_ticks,

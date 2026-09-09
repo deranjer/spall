@@ -463,6 +463,53 @@ impl PhysicsWorld {
         }
     }
 
+    /// Sweeps a capsule character through the current collider world one tick
+    /// (T19). `position_m` and the returned translation are the capsule's
+    /// **feet**; collision resolution (wall slide, autostep, slope limit, ground
+    /// snap) is Rapier's `KinematicCharacterController` with the frozen
+    /// [`crate::character::tuning`] constants.
+    ///
+    /// The query runs against the broad-phase BVH as last refreshed by
+    /// [`Self::step`], so callers advance characters *after* stepping physics on
+    /// a tick that rebuilt any collider.
+    pub fn sweep_character(
+        &self,
+        params: crate::character::CharacterParams,
+        position_m: [f64; 3],
+        desired_translation_m: [f32; 3],
+        dt_s: f32,
+    ) -> crate::character::CharacterMove {
+        let controller = crate::character::controller();
+        let shape = crate::character::capsule(params);
+        let centre = params.centre_offset_m();
+        let feet = Vector::new(
+            position_m[0] as f32,
+            position_m[1] as f32,
+            position_m[2] as f32,
+        );
+        let pos = Pose::from_translation(feet + Vector::new(0.0, centre, 0.0));
+        let queries = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            QueryFilter::default(),
+        );
+        let desired = Vector::new(
+            desired_translation_m[0],
+            desired_translation_m[1],
+            desired_translation_m[2],
+        );
+        let moved = controller.move_shape(dt_s, &queries, &shape, &pos, desired, |_| {});
+        crate::character::CharacterMove {
+            translation_m: [
+                moved.translation.x,
+                moved.translation.y,
+                moved.translation.z,
+            ],
+            grounded: moved.grounded,
+        }
+    }
+
     /// Number of bodies.
     pub fn body_count(&self) -> usize {
         self.entries.len()

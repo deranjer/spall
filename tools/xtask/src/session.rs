@@ -185,6 +185,13 @@ struct Scenario {
     /// moved, not merely that a (possibly stationary) snapshot arrived.
     #[serde(default)]
     minimum_body_displacement_m: f64,
+    /// T19: scripted movement paths keyed by client index. A client with a path
+    /// predicts a player capsule; its `movement` summary is checked against
+    /// `movement`.
+    #[serde(default)]
+    player_paths: Vec<PlayerPath>,
+    #[serde(default)]
+    movement: MovementAcceptance,
 }
 
 fn one() -> u64 {
@@ -224,6 +231,59 @@ enum CutTarget {
     Body,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct PlayerPath {
+    #[serde(default)]
+    client: u64,
+    legs: Vec<PathLeg>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PathLeg {
+    from: u64,
+    to: u64,
+    /// Local movement axes `[strafe, _, forward]`, each `-1..=1`.
+    movement: [f32; 3],
+    #[serde(default)]
+    buttons: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MovementAcceptance {
+    #[serde(default = "default_max_correction")]
+    max_correction_m: f64,
+    #[serde(default = "default_min_distance")]
+    min_distance_m: f64,
+    #[serde(default = "default_min_ground_ratio")]
+    min_ground_contact_ratio: f64,
+    #[serde(default = "default_true")]
+    expect_no_hover: bool,
+}
+
+impl Default for MovementAcceptance {
+    fn default() -> Self {
+        Self {
+            max_correction_m: default_max_correction(),
+            min_distance_m: default_min_distance(),
+            min_ground_contact_ratio: default_min_ground_ratio(),
+            expect_no_hover: true,
+        }
+    }
+}
+
+fn default_max_correction() -> f64 {
+    0.75
+}
+fn default_min_distance() -> f64 {
+    2.0
+}
+fn default_min_ground_ratio() -> f64 {
+    0.85
+}
+fn default_true() -> bool {
+    true
+}
+
 // --- process summaries (subset of the server / client structs) ----------------
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +314,19 @@ struct ClientSummary {
     max_body_displacement_m: f64,
     #[serde(default)]
     body_cut_committed: bool,
+    #[serde(default)]
+    movement: Option<MovementRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MovementRow {
+    #[serde(default)]
+    ticks: u64,
+    distance_travelled_m: f64,
+    max_correction_m: f64,
+    ground_contact_ratio: f64,
+    hovered_after_floor_removal: bool,
+    held_button_release_ok: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -360,6 +433,7 @@ mod requirement_tests {
             baseline_bricks: 0,
             max_body_displacement_m: 5.0,
             body_cut_committed: true,
+            movement: None,
         }
     }
 
@@ -653,6 +727,22 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             }
             c.args(["--cut", &spec]);
         }
+        for path in scenario.player_paths.iter().filter(|p| p.client == i) {
+            for leg in &path.legs {
+                c.args([
+                    "--move",
+                    &format!(
+                        "{}:{}:{},{},{}:{}",
+                        leg.from,
+                        leg.to,
+                        leg.movement[0],
+                        leg.movement[1],
+                        leg.movement[2],
+                        leg.buttons
+                    ),
+                ]);
+            }
+        }
         if scenario.late_join_clients.contains(&i) {
             c.args([
                 "--late-join",
@@ -712,17 +802,39 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     let mut rows = Vec::new();
     for (i, summary) in client_summaries.iter().enumerate() {
         let exit_ok = statuses.get(&format!("client{i}")).copied().flatten() == Some(0);
+        let is_mover = scenario.player_paths.iter().any(|p| p.client == i as u64);
         match summary {
             Some(c) => {
                 let hash_ok = c.final_world_hash == agreed;
                 // A late joiner that caught up entirely from the baseline (no
                 // cuts after it joined) is still a pass.
-                let progressed =
-                    c.transactions_applied >= 1 || (c.late_join && c.baseline_bricks > 0);
+                let progressed = is_mover
+                    || c.transactions_applied >= 1
+                    || (c.late_join && c.baseline_bricks > 0);
+                // T19: a scripted mover passes on its prediction summary — it
+                // may commit no transactions of its own.
+                let movement_ok = if is_mover {
+                    match &c.movement {
+                        Some(m) => {
+                            m.ticks > 0
+                                && (!scenario.movement.expect_no_hover
+                                    || !m.hovered_after_floor_removal)
+                                && m.held_button_release_ok
+                                && m.max_correction_m <= scenario.movement.max_correction_m
+                                && m.distance_travelled_m >= scenario.movement.min_distance_m
+                                && m.ground_contact_ratio
+                                    >= scenario.movement.min_ground_contact_ratio
+                        }
+                        None => false,
+                    }
+                } else {
+                    true
+                };
                 all_match &= exit_ok
                     && c.result == "passed"
                     && hash_ok
                     && progressed
+                    && movement_ok
                     && c.transactions_rejected == 0;
                 rows.push(ClientRow {
                     index: i as u64,

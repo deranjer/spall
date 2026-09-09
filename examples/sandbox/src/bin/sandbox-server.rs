@@ -49,8 +49,9 @@ struct Args {
     /// Real-time 60 Hz pacing (needed for interactive / networked clients).
     #[arg(long)]
     paced: bool,
-    /// Built-in scene to serve: `bridge-cut` (default, single brick) or
-    /// `cross-bridge-cut` (column + beam cross the x = 32 brick boundary).
+    /// Built-in scene to serve: `bridge-cut` (default, single brick),
+    /// `cross-bridge-cut` (column + beam cross the x = 32 brick boundary), or
+    /// `walk` (T19 player-movement arena — every client gets a predicted capsule).
     #[arg(long, default_value = "bridge-cut")]
     scene: String,
     /// T16: persist to `<world>/world.db` — recover from it on start, journal
@@ -142,7 +143,7 @@ fn run_serve(args: Args) -> ExitCode {
         Some(s) => s,
         None => {
             eprintln!(
-                "sandbox-server: unknown --scene `{}` (expected bridge-cut or cross-bridge-cut)",
+                "sandbox-server: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, or walk)",
                 args.scene
             );
             return ExitCode::from(2);

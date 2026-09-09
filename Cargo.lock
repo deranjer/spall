@@ -2603,6 +2603,7 @@ dependencies = [
  "serde_json",
  "spall_core",
  "spall_net",
+ "spall_physics",
  "spall_protocol",
  "spall_sim",
  "spall_voxel",

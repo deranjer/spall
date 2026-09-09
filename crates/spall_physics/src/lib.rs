@@ -19,6 +19,7 @@
 //! No GPU, window, or network dependency. This crate does not run the server
 //! tick; body/collider ownership and the authoritative edit path are T08.
 
+pub mod character;
 pub mod collider;
 pub mod fixtures;
 pub mod mass;
@@ -28,6 +29,7 @@ pub mod occupancy;
 pub mod report;
 pub mod world;
 
+pub use character::{CharacterMove, CharacterParams, CharacterState, PlayerInput, step_character};
 pub use collider::{ColliderBuild, Representation, build_collider};
 pub use mass::{BodyMassProperties, MassProperties, analytic_mass_properties};
 pub use merge::{BoxSpan, greedy_boxes};

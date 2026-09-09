@@ -21,6 +21,7 @@
 //! answers, the 20 Hz [`spall_protocol::MotionSnapshot`]s, and a `CellRun` reply
 //! to a [`spall_protocol::RepairRequest`].
 
+use glam::DQuat;
 use spall_core::{CELLS_PER_BRICK, GlobalCell, LocalCell, MaterialId, Revision, Tick, VolumeId};
 use spall_protocol::{
     ActionOutcome, ActionStatus, MotionSnapshot, RepairKey, RepairRequest, RequestId, SnapshotSeq,
@@ -29,6 +30,7 @@ use spall_protocol::{
 use spall_structure::{CellSpanX, ComponentMembership};
 use spall_voxel::{Sample, Volume};
 
+use crate::body::BodyPose;
 use crate::schedule::TickReport;
 use crate::world::SimWorld;
 
@@ -195,11 +197,14 @@ impl MotionPublisher {
         tick.get().is_multiple_of(self.interval_ticks)
     }
 
-    /// One [`MotionSnapshot`] per dynamic body at `tick`. Each carries a
-    /// strictly increasing per-publisher `snapshot_seq` so a replica can order
-    /// and dedup them.
+    /// One [`MotionSnapshot`] per dynamic body **and per player capsule** (T19)
+    /// at `tick`. Each carries a strictly increasing per-publisher
+    /// `snapshot_seq` so a replica can order and dedup them. A player snapshot
+    /// sets `body` to the player's reserved-band entity id and `acked_input` to
+    /// the last input sequence the server integrated for that player — the
+    /// client uses it to drop acknowledged inputs and replay the rest.
     pub fn snapshots(&mut self, world: &SimWorld, tick: Tick) -> Vec<MotionSnapshot> {
-        let mut out = Vec::with_capacity(world.body_count());
+        let mut out = Vec::with_capacity(world.body_count() + world.player_count());
         for body in world.bodies() {
             let Some(entity) = body.entity else { continue };
             let seq = self.next_seq;
@@ -214,6 +219,24 @@ impl MotionPublisher {
                 linear_velocity: body.linvel_m_s.map(|v| v as f32),
                 angular_velocity: body.angvel_rad_s.map(|v| v as f32),
                 sleeping: body.sleeping,
+            });
+        }
+
+        let terrain_rev = latest_revision(world, world.terrain_volume_id());
+        for player in world.players() {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            let pose = BodyPose::new(DQuat::IDENTITY, player.state.position_m);
+            out.push(MotionSnapshot {
+                server_tick: tick,
+                snapshot_seq: SnapshotSeq(seq),
+                acked_input: player.last_input_seq,
+                body: player.entity,
+                topology_revision: terrain_rev,
+                pose: pose.to_protocol(),
+                linear_velocity: player.state.velocity_m_s,
+                angular_velocity: [0.0; 3],
+                sleeping: false,
             });
         }
         out

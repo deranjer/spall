@@ -80,6 +80,24 @@ after the tick loop is running and are excluded from `--min-clients`. Built-in
 replica. Mid-session brick `RepairRequest`s are answered with a one-brick
 authoritative baseline patch (exact revision parity), and a reconnected session
 generation invalidates the prior one server-side.
+T19 adds headless player movement: `sandbox-server --serve --scene walk` runs the
+flat `walk_arena` and gives each connecting client an authoritative capsule;
+`sandbox-client --move FROM:TO:MX,MY,MZ:BUTTONS` (repeatable) scripts a movement
+path, predicts the capsule locally with the shared `step_character` kernel, sends
+`InputFrame` datagrams, and reconciles against the server's player snapshots. A
+scenario file may set `scene` and list `player_paths` (per-client legs) plus a
+`movement` acceptance block (`max_correction_m`, `min_distance_m`,
+`min_ground_contact_ratio`, `expect_no_hover`). Built-in `player-movement` runs
+one `walk` server + two scripted movers plus one floor cut; each mover's
+`ClientSummary.movement` must show bounded corrections, sustained ground contact,
+the scripted travel distance, no hover after the cut, and a clean held-input
+release. It passes headless and with `--loss-percent 2`. The deep
+prediction/reconciliation acceptance is CPU tests: `cargo test -p spall_physics
+character::`, `-p spall_sim --test player_movement`, and `-p spall_client --test
+prediction` (predictor vs. a live `spall_sim::Simulation` through an injected
+100 ms link — convergence, floor-removal-no-hover, lost-button-release).
+Interactive window input and full moving-body crush outcomes remain unrun /
+follow-up.
 `bench` still returns an explicit unavailable-capability result until its listed
 task is delivered. All numerical limits are provisional acceptance targets. None
 is a measured result.
@@ -136,6 +154,11 @@ cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 # docs/reports/G1.md.
 cargo xtask scenario --name g1-networked-destruction --loss-percent 0 --output .local/runs/g1
 
+# T19: one `walk` server + two scripted player capsules that predict movement,
+# send InputFrame datagrams, and reconcile against the server's player snapshots.
+# Passes on bounded corrections, ground contact, travel distance, and no hover.
+cargo xtask scenario --name player-movement --loss-percent 0 --output .local/runs/player-movement
+
 # T12: stable acceptance cameras with six views and per-pass GPU timing.
 # Needs a supported GPU/driver; exit 3 otherwise.
 cargo xtask capture --output .local/runs/t12-1080p --width 1920 --height 1080 --strategy greedy
@@ -189,6 +212,7 @@ At a gate, retain raw metrics alongside a concise report in `docs/reports/Gx.md`
 | cantilever-strength | Material capacity changes failure outcome; damage/bonds survive restart and replication |
 | sleep-wake | Settled persistent rubble wakes before nearby interaction and remains destructible |
 | scene-switch | Old asynchronous results never enter a new world/session at reused coordinates |
+| player-movement | A scripted capsule walks and stays grounded; a 100 ms link keeps corrections bounded; removing a floor cannot leave the player hovering; a lost button release stops it within 250 ms |
 
 Use property tests for coordinates, storage/edit conservation, and codec bounds. Use tiny reference algorithms for topology/mesh coverage. Physics tests use position/energy tolerances where appropriate; exact hashes test topology, not floating-point trajectories. A rendered screenshot is not proof of collision or replication correctness.
 
