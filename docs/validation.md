@@ -33,9 +33,21 @@ occluder column removed) is exercised by
 `rapid_destruction_reexposes_the_band_with_a_bounded_retrace` in
 `spall_render/tests/capture_gpu.rs`: on the reference adapter the shadowed band
 brightens ~22.8 -> ~26.3 sRGB luminance in the next frame while the re-trace
-touches ~1.3 % of the cache (~1.43 ms -> ~0.11 ms). Temporal reprojection,
-moving-camera light-trail evidence, and edit-commit-to-lighting wall-clock
-latency remain later T14 increments; cross-GPU and p95 frame cost remain T15.
+touches ~1.3 % of the cache (~1.43 ms -> ~0.11 ms).
+
+`LightingUpdate::moving_box` builds the update for a box body moving between two
+world AABBs: both boxes are dirty, the caller's static regions are re-asserted,
+then the body is filled at its new box — so a moving body never erases geometry
+that overlaps its old bounds. The `moving_body_overlap` fixture puts a
+cache-only occluder in an emitter -> receiver path, then moves it out and back;
+`moving_body_leaves_no_ghost_and_keeps_swept_geometry` checks the shadowed band
+recovers when the body leaves (22.8 -> 28.5), the shadow re-forms when it
+returns (back to 22.8, bit-identical to the base frame), and each move
+re-traces only ~3 % of the cache.
+
+Temporal reprojection, moving-camera light-trail evidence, and
+edit-commit-to-lighting wall-clock latency remain later T14 increments;
+cross-GPU and p95 frame cost remain T15.
 Each run also writes `summary.json`; it exits 3 when no GPU adapter is available.
 The `summary.json` is schema `version: 4`. CPU and GPU costs are reported
 separately and must not be conflated: `gpu_render_millis` is a real device
