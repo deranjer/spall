@@ -17,3 +17,4 @@ wgpu.workspace = true
 [dev-dependencies]
 spall_voxel.workspace = true
 spall_jobs.workspace = true
+naga = { version = "24", features = ["wgsl-in", "spv-out"] }

@@ -4,6 +4,7 @@
 //! `cargo test -p spall_render -- --ignored` on a host with a working adapter.
 
 use std::fs;
+use std::process::Command;
 
 use glam::{Mat4, Vec3};
 use spall_mesh::fixtures::{acceptance_shapes, mesh_shape};
@@ -274,4 +275,51 @@ fn depth_debug_view_is_flat_across_a_camera_facing_plane() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// ENG-60 regression watch. On Windows the pinned wgpu 24 / naga 24 Vulkan path
+/// crashes NVIDIA's driver (STATUS_ACCESS_VIOLATION) while compiling the T12
+/// pipelines — see `docs/reports/ENG-60.md`. This spawns the `vulkan_shadow_probe`
+/// example with the Vulkan backend forced and asserts it still crashes rather
+/// than completing. When a `wgpu`/`naga` upgrade or a new driver fixes it, this
+/// test starts failing: at that point re-run the full `capture_gpu` suite on
+/// Vulkan and, if it passes, drop the Windows D3D12-only guard in
+/// `RenderContext::headless` and delete this test.
+///
+/// Opt in with `SPALL_ENG60_RECHECK=1` because it shells out to `cargo run` and
+/// deliberately provokes a native crash.
+#[test]
+#[ignore = "ENG-60: opt in with SPALL_ENG60_RECHECK=1; provokes a native driver crash"]
+fn windows_vulkan_backend_still_crashes_compiling_t12_pipelines() {
+    if std::env::var_os("SPALL_ENG60_RECHECK").is_none() {
+        eprintln!("skipped: set SPALL_ENG60_RECHECK=1 to run the ENG-60 Vulkan recheck");
+        return;
+    }
+    if !cfg!(target_os = "windows") {
+        eprintln!("skipped: ENG-60 is a Windows/NVIDIA Vulkan driver fault");
+        return;
+    }
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(cargo)
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "spall_render",
+            "--example",
+            "vulkan_shadow_probe",
+            "--",
+            "case:pipelines",
+        ])
+        .env("SPALL_WGPU_BACKEND", "vulkan")
+        .status()
+        .expect("spawn vulkan_shadow_probe");
+
+    assert!(
+        !status.success(),
+        "ENG-60: ScenePipeline::new() completed on the Vulkan backend — the driver \
+         crash is gone. Re-validate the full capture_gpu suite on Vulkan and, if it \
+         passes, restore Vulkan as an accepted Windows backend (see docs/reports/ENG-60.md)."
+    );
 }
