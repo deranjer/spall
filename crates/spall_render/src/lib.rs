@@ -24,7 +24,9 @@ pub use fixtures::{
     EmitterOcclusionScenes, LightingFixture, LightingFixtureMetrics, colored_rooms,
     emitter_occlusion_scenes,
 };
-pub use indirect::{LIGHT_CELL_SIZE_METRES, LIGHT_VOLUME_DIM, LightingVolume};
+pub use indirect::{
+    LIGHT_CELL_SIZE_METRES, LIGHT_VOLUME_DIM, LightingRegion, LightingUpdate, LightingVolume,
+};
 pub use pipeline::{CASCADE_COUNT, DebugView, PassTiming, ScenePipeline};
 pub use scene::{Material, Scene, SceneItem, default_materials};
 pub use target::OffscreenTarget;
