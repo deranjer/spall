@@ -10,7 +10,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use spall_client::{ClientNetConfig, ScriptedAction, cut_request, run_replication_client};
+use spall_client::{
+    BaselineScene, ClientNetConfig, ScriptedAction, cut_request, run_replication_client,
+};
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
 use spall_server::{Scene, ServeConfig, ServeError, serve};
 use spall_store::FaultPlan;
@@ -92,9 +94,11 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         script: vec![ScriptedAction {
             at_tick: 4,
             request: cut_request(1, 0, [10, 4, 1], 2),
+            target: spall_client::ScriptTarget::Terrain,
         }],
         movement_script: Vec::new(),
         late_join: false,
+        baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 0,
         idle_grace: Duration::from_millis(500),
         overall_timeout: Duration::from_secs(25),
@@ -193,6 +197,7 @@ fn server_persists_and_recovers_across_a_restart() {
             script,
             movement_script: Vec::new(),
             late_join: false,
+            baseline_scene: BaselineScene::BridgeCut,
             run_ticks: 0,
             idle_grace: Duration::from_millis(500),
             overall_timeout: Duration::from_secs(25),
@@ -212,6 +217,7 @@ fn server_persists_and_recovers_across_a_restart() {
         vec![ScriptedAction {
             at_tick: 4,
             request: cut_request(1, 0, [10, 4, 1], 2),
+            target: spall_client::ScriptTarget::Terrain,
         }],
     );
     assert!(first.body_count >= 1, "the beam detached in run 1");
@@ -297,9 +303,11 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         script: vec![ScriptedAction {
             at_tick: 4,
             request: cut_request(1, 0, [10, 4, 1], 2),
+            target: spall_client::ScriptTarget::Terrain,
         }],
         movement_script: Vec::new(),
         late_join: false,
+        baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 0,
         idle_grace: Duration::from_millis(500),
         overall_timeout: Duration::from_secs(25),

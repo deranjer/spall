@@ -134,12 +134,18 @@ pub fn run_scenario(
 struct Scenario {
     #[serde(default)]
     name: String,
+    /// Built-in scene both the server and the live clients install:
+    /// `bridge-cut` (default) or `cross-bridge-cut`.
+    #[serde(default = "default_scene")]
+    scene: String,
     server_ticks: u64,
+    /// Consecutive idle ticks before the server stops early. A gate fixture with
+    /// widely-spaced scripted cuts under an impaired transport needs a larger
+    /// window so a late action still lands before shutdown.
+    #[serde(default = "default_quiescence")]
+    quiescence_ticks: u64,
     #[serde(default = "one")]
     clients: u64,
-    /// Built-in server scene: `bridge` (default) or `walk` (T19 movement arena).
-    #[serde(default)]
-    scene: Option<String>,
     #[serde(default)]
     cuts: Vec<CutSpec>,
     /// T17: client indices that pull a full late-join baseline over a bulk
@@ -150,6 +156,35 @@ struct Scenario {
     /// after the early clients have started cutting.
     #[serde(default = "default_late_delay")]
     late_join_connect_delay_ms: u64,
+    /// Minimum authoritative work required by a gate fixture. The harness also
+    /// independently requires that every scripted cut committed, so a run that
+    /// quiesces early (before the whole script fires) fails regardless of this.
+    #[serde(default)]
+    minimum_transactions: u64,
+    /// Minimum motion samples each client must receive.
+    #[serde(default)]
+    minimum_motion_snapshots: u64,
+    /// Minimum motion datagrams each live client must have received *out of
+    /// `snapshot_seq` order*. Only enforced on a run whose per-client UDP proxy
+    /// is active (`--loss-percent > 0`): it proves the "reordered snapshots"
+    /// half of the T11 requirement was actually exercised, not just claimed.
+    #[serde(default)]
+    minimum_reordered_snapshots: u64,
+    /// Minimum number of distinct bricks the largest detached body must span at
+    /// end of run. `>= 2` proves a body's cells were transferred out of terrain
+    /// across a brick boundary (cross-brick ownership transfer). `0` disables.
+    #[serde(default)]
+    minimum_detached_body_brick_span: u64,
+    /// Journal every committed transaction and, after the run, replay the whole
+    /// topology-event stream from the tick-0 baseline; the rebuilt canonical
+    /// hash must equal the live run's agreed hash (T11 exact replay).
+    #[serde(default)]
+    replay_check: bool,
+    /// Minimum straight-line distance (metres) some replicated body must have
+    /// travelled on every live client — proof the detached geometry actually
+    /// moved, not merely that a (possibly stationary) snapshot arrived.
+    #[serde(default)]
+    minimum_body_displacement_m: f64,
     /// T19: scripted movement paths keyed by client index. A client with a path
     /// predicts a player capsule; its `movement` summary is checked against
     /// `movement`.
@@ -163,6 +198,14 @@ fn one() -> u64 {
     1
 }
 
+fn default_scene() -> String {
+    "bridge-cut".to_string()
+}
+
+fn default_quiescence() -> u64 {
+    45
+}
+
 fn default_late_delay() -> u64 {
     900
 }
@@ -174,6 +217,18 @@ struct CutSpec {
     at_tick: u64,
     cell: [i64; 3],
     radius: i64,
+    /// `"terrain"` (default) or `"body"` — a `"body"` cut is retargeted at the
+    /// detached body on the client just before it is sent.
+    #[serde(default)]
+    target: CutTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CutTarget {
+    #[default]
+    Terrain,
+    Body,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,20 +292,28 @@ struct ServerSummary {
     ticks_run: u64,
     transactions_committed: u64,
     final_world_hash: String,
+    #[serde(default)]
+    max_detached_body_brick_span: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ClientSummary {
     result: String,
     transactions_applied: u64,
     repair_requests_sent: u64,
     transactions_rejected: u64,
     motion_snapshots: u64,
+    #[serde(default)]
+    motion_snapshots_out_of_order: u64,
     final_world_hash: String,
     #[serde(default)]
     late_join: bool,
     #[serde(default)]
     baseline_bricks: u64,
+    #[serde(default)]
+    max_body_displacement_m: f64,
+    #[serde(default)]
+    body_cut_committed: bool,
     #[serde(default)]
     movement: Option<MovementRow>,
 }
@@ -275,8 +338,16 @@ struct SessionSummary {
     loss_percent: u8,
     server_ticks_run: u64,
     transactions_committed: u64,
+    /// Largest distinct-brick span of any detached body (server-authoritative).
+    max_detached_body_brick_span: u64,
+    /// T11 exact-replay check: whether it ran, whether the replayed baseline
+    /// hash matched, and how many committed topology events were replayed.
+    replay_checked: bool,
+    replay_matches: bool,
+    replayed_topology_events: u64,
     agreed_world_hash: String,
     all_hashes_match: bool,
+    requirements_met: bool,
     per_client: Vec<ClientRow>,
     note: &'static str,
 }
@@ -289,7 +360,187 @@ struct ClientRow {
     repair_requests_sent: u64,
     transactions_rejected: u64,
     motion_snapshots: u64,
+    motion_snapshots_out_of_order: u64,
+    max_body_displacement_m: f64,
+    body_cut_committed: bool,
     hash_matches_server: bool,
+}
+
+fn requirements_met(
+    scenario: &Scenario,
+    transactions_committed: u64,
+    clients: &[Option<ClientSummary>],
+    proxy_active: bool,
+) -> bool {
+    // The whole script must have run: a fixture that quiesces early (a gap
+    // between scripted cuts longer than the server's idle window) commits fewer
+    // transactions than it has cuts, and that is a failure no matter how the
+    // `minimum_transactions` floor is set.
+    let all_cuts_committed = transactions_committed >= scenario.cuts.len() as u64;
+
+    let work_ok = transactions_committed >= scenario.minimum_transactions && all_cuts_committed;
+
+    let per_client_ok = clients.iter().all(|client| {
+        client.as_ref().is_some_and(|s| {
+            let motion_ok = s.motion_snapshots >= scenario.minimum_motion_snapshots;
+            // Late joiners connect after the body has settled; only hold live
+            // clients to the "geometry actually moved" bar.
+            let displacement_ok =
+                s.late_join || s.max_body_displacement_m >= scenario.minimum_body_displacement_m;
+            motion_ok && displacement_ok
+        })
+    });
+
+    // The "reordered snapshots" half of T11: on an impaired-transport run the
+    // live clients together must have observed motion datagrams delivered out of
+    // `snapshot_seq` order. Aggregated across live clients (which snapshot is
+    // reordered on which client is a per-datagram coin flip); a clean loopback
+    // run never reorders, so this is skipped there.
+    let reorder_ok = !proxy_active
+        || scenario.minimum_reordered_snapshots == 0
+        || clients
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .filter(|s| !s.late_join)
+            .map(|s| s.motion_snapshots_out_of_order)
+            .sum::<u64>()
+            >= scenario.minimum_reordered_snapshots;
+
+    // If the script contains a body-targeted cut, some client must have landed
+    // it against the detached body (material removed from that body).
+    let body_cut_ok = !scenario.cuts.iter().any(|c| c.target == CutTarget::Body)
+        || clients
+            .iter()
+            .any(|c| c.as_ref().is_some_and(|s| s.body_cut_committed));
+
+    work_ok && per_client_ok && reorder_ok && body_cut_ok
+}
+
+#[cfg(test)]
+mod requirement_tests {
+    use super::*;
+
+    fn client(motion_snapshots: u64) -> ClientSummary {
+        ClientSummary {
+            result: "passed".into(),
+            transactions_applied: 1,
+            repair_requests_sent: 0,
+            transactions_rejected: 0,
+            motion_snapshots,
+            motion_snapshots_out_of_order: 3,
+            final_world_hash: String::new(),
+            late_join: false,
+            baseline_bricks: 0,
+            max_body_displacement_m: 5.0,
+            body_cut_committed: true,
+            movement: None,
+        }
+    }
+
+    #[test]
+    fn gate_requirements_reject_insufficient_work_or_motion() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "minimum_transactions": 2,
+                "minimum_motion_snapshots": 1
+            }"#,
+        )
+        .unwrap();
+        assert!(!requirements_met(&scenario, 1, &[Some(client(2))], false));
+        assert!(!requirements_met(&scenario, 2, &[Some(client(0))], false));
+        assert!(requirements_met(
+            &scenario,
+            2,
+            &[Some(client(1)), Some(client(4))],
+            false
+        ));
+    }
+
+    #[test]
+    fn gate_requirements_need_the_whole_script_and_real_motion() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 600,
+                "minimum_transactions": 4,
+                "minimum_motion_snapshots": 1,
+                "minimum_body_displacement_m": 0.3,
+                "cuts": [
+                    { "client": 0, "at_tick": 4,  "cell": [10, 4, 1], "radius": 2 },
+                    { "client": 1, "at_tick": 10, "cell": [3, 1, 1],  "radius": 1 },
+                    { "client": 0, "at_tick": 30, "cell": [12, 8, 1], "radius": 1, "target": "body" },
+                    { "client": 1, "at_tick": 40, "cell": [9, 1, 1],  "radius": 1 }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        // Enough transactions for `minimum_transactions`, but fewer than the
+        // four scripted cuts: the run quiesced early.
+        assert!(!requirements_met(
+            &scenario,
+            3,
+            &[Some(client(4)), Some(client(4))],
+            false
+        ));
+
+        // All four cuts committed and both clients saw real displacement.
+        assert!(requirements_met(
+            &scenario,
+            4,
+            &[Some(client(4)), Some(client(4))],
+            false
+        ));
+
+        // A stationary body (snapshots arrived, nothing moved) fails.
+        let mut still = client(4);
+        still.max_body_displacement_m = 0.01;
+        assert!(!requirements_met(
+            &scenario,
+            4,
+            &[Some(still), Some(client(4))],
+            false
+        ));
+
+        // Nobody landed the body-targeted cut.
+        let mut no_body_cut = client(4);
+        no_body_cut.body_cut_committed = false;
+        assert!(!requirements_met(
+            &scenario,
+            4,
+            &[Some(no_body_cut.clone()), Some(no_body_cut)],
+            false
+        ));
+    }
+
+    #[test]
+    fn reordered_snapshot_requirement_only_bites_when_the_proxy_is_active() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 600,
+                "minimum_transactions": 1,
+                "minimum_motion_snapshots": 1,
+                "minimum_reordered_snapshots": 1,
+                "cuts": [ { "client": 0, "at_tick": 4, "cell": [10, 4, 1], "radius": 2 } ]
+            }"#,
+        )
+        .unwrap();
+
+        let mut ordered = client(4);
+        ordered.motion_snapshots_out_of_order = 0;
+
+        // Clean loopback run (no proxy): reordering is not required.
+        assert!(requirements_met(
+            &scenario,
+            1,
+            &[Some(ordered.clone())],
+            false
+        ));
+        // Impaired run: a client that never saw a reordered datagram fails.
+        assert!(!requirements_met(&scenario, 1, &[Some(ordered)], true));
+        // Impaired run with real reordering observed: passes.
+        assert!(requirements_met(&scenario, 1, &[Some(client(4))], true));
+    }
 }
 
 // --- the run -----------------------------------------------------------------
@@ -372,12 +623,30 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         "--max-clients",
         &clients.to_string(),
         "--scene",
-        scenario.scene.as_deref().unwrap_or("bridge"),
+        &scenario.scene,
+        "--quiescence-ticks",
+        &scenario.quiescence_ticks.to_string(),
         "--paced",
         // Scenario files script cuts at explicit cells that no aim ray would
         // produce; the harness is the authenticated dev-scenario path (ENG-47).
         "--dev-unvalidated-actions",
     ]);
+    // T11 exact-replay check: journal every committed transaction to a world DB
+    // and, after the run, replay the whole journal from the tick-0 baseline and
+    // assert it reproduces the agreed hash.
+    let replay_db = output.join("world.db");
+    if scenario.replay_check {
+        let _ = fs::remove_file(&replay_db);
+        server_cmd.args([
+            "--world",
+            &output.display().to_string(),
+            "--save",
+            // Only a tick-0 baseline + a shutdown checkpoint, so the durable
+            // journal after the base is the entire committed-transaction stream.
+            "--checkpoint-interval-ticks",
+            "0",
+        ]);
+    }
     hide_console(&mut server_cmd);
     let mut guard = ChildGuard::default();
     let server_child = server_cmd.spawn().map_err(|source| XtaskError::Output {
@@ -445,15 +714,18 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             &client_timeout.to_string(),
             "--client-index",
             &i.to_string(),
+            "--scene",
+            &scenario.scene,
         ]);
         for cut in by_client.get(&i).into_iter().flatten() {
-            c.args([
-                "--cut",
-                &format!(
-                    "{}:{},{},{}:{}",
-                    cut.at_tick, cut.cell[0], cut.cell[1], cut.cell[2], cut.radius
-                ),
-            ]);
+            let mut spec = format!(
+                "{}:{},{},{}:{}",
+                cut.at_tick, cut.cell[0], cut.cell[1], cut.cell[2], cut.radius
+            );
+            if cut.target == CutTarget::Body {
+                spec.push_str(":body");
+            }
+            c.args(["--cut", &spec]);
         }
         for path in scenario.player_paths.iter().filter(|p| p.client == i) {
             for leg in &path.legs {
@@ -511,8 +783,13 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     loss_percent: run.loss_percent,
                     server_ticks_run: 0,
                     transactions_committed: 0,
+                    max_detached_body_brick_span: 0,
+                    replay_checked: false,
+                    replay_matches: false,
+                    replayed_topology_events: 0,
                     agreed_world_hash: String::new(),
                     all_hashes_match: false,
+                    requirements_met: false,
                     per_client: Vec::new(),
                     note: "server produced no summary; inspect server.jsonl",
                 },
@@ -566,6 +843,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     repair_requests_sent: c.repair_requests_sent,
                     transactions_rejected: c.transactions_rejected,
                     motion_snapshots: c.motion_snapshots,
+                    motion_snapshots_out_of_order: c.motion_snapshots_out_of_order,
+                    max_body_displacement_m: c.max_body_displacement_m,
+                    body_cut_committed: c.body_cut_committed,
                     hash_matches_server: hash_ok,
                 });
             }
@@ -578,11 +858,41 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     repair_requests_sent: 0,
                     transactions_rejected: 0,
                     motion_snapshots: 0,
+                    motion_snapshots_out_of_order: 0,
+                    max_body_displacement_m: 0.0,
+                    body_cut_committed: false,
                     hash_matches_server: false,
                 });
             }
         }
     }
+    let mut requirements_met = requirements_met(
+        &scenario,
+        server.transactions_committed,
+        &client_summaries,
+        run.loss_percent > 0,
+    );
+    // Cross-brick ownership transfer: a detached body's cells must have been
+    // taken out of terrain across a brick boundary (server-authoritative).
+    if scenario.minimum_detached_body_brick_span > 0
+        && server.max_detached_body_brick_span < scenario.minimum_detached_body_brick_span
+    {
+        requirements_met = false;
+    }
+
+    // T11 exact replay: fold the committed topology-event stream from the tick-0
+    // baseline and require the rebuilt canonical hash to equal the live hash.
+    let replay = if scenario.replay_check {
+        let r = run_replay_check(&replay_db, &agreed, &output);
+        if !(r.ran && r.matches) {
+            requirements_met = false;
+        }
+        Some(r)
+    } else {
+        None
+    };
+
+    all_match &= requirements_met;
     finish(
         &output,
         SessionSummary {
@@ -593,12 +903,72 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             loss_percent: run.loss_percent,
             server_ticks_run: server.ticks_run,
             transactions_committed: server.transactions_committed,
+            max_detached_body_brick_span: server.max_detached_body_brick_span,
+            replay_checked: replay.is_some(),
+            replay_matches: replay.as_ref().map(|r| r.ran && r.matches).unwrap_or(false),
+            replayed_topology_events: replay.as_ref().map(|r| r.events).unwrap_or(0),
             agreed_world_hash: agreed,
             all_hashes_match: all_match,
+            requirements_met,
             per_client: rows,
-            note: "real OS processes over QUIC; encrypted-packet loss via per-client UDP proxy",
+            note: "real OS processes over QUIC; encrypted-packet loss via per-client UDP proxy; gate requirements are fixture-defined: every scripted cut commits, each live client sees real body displacement, any body-targeted cut lands, and (when enabled) the committed topology-event stream replays from baseline to the same hash",
         },
     )
+}
+
+struct ReplayCheck {
+    ran: bool,
+    matches: bool,
+    events: u64,
+}
+
+/// Runs `sandbox-server --replay` over the journalled world DB and checks the
+/// rebuilt canonical hash against `expected`.
+fn run_replay_check(db: &Path, expected: &str, output: &Path) -> ReplayCheck {
+    if !db.exists() {
+        return ReplayCheck {
+            ran: false,
+            matches: false,
+            events: 0,
+        };
+    }
+    let summary_path = output.join("replay.summary.json");
+    let _ = fs::remove_file(&summary_path);
+    let mut cmd = Command::new(sandbox_binary("sandbox-server"));
+    cmd.args([
+        // `--listen` / `--ticks` / `--log-json` are required by the arg parser
+        // but ignored on the `--replay` path.
+        "--listen",
+        "127.0.0.1:0",
+        "--ticks",
+        "1",
+        "--log-json",
+        &output.join("replay.jsonl").display().to_string(),
+        "--replay",
+        &db.display().to_string(),
+        "--expect-hash",
+        expected,
+        "--summary-json",
+        &summary_path.display().to_string(),
+    ]);
+    hide_console(&mut cmd);
+    let status = cmd.status();
+    let ran = status.is_ok();
+    let ok = matches!(status, Ok(s) if s.success());
+    let events = read_json::<ReplaySummary>(&summary_path)
+        .map(|s| s.replayed_topology_events)
+        .unwrap_or(0);
+    ReplayCheck {
+        ran,
+        matches: ok,
+        events,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplaySummary {
+    #[serde(default)]
+    replayed_topology_events: u64,
 }
 
 fn finish(output: &Path, summary: SessionSummary) -> Result<(), XtaskError> {
@@ -788,12 +1158,19 @@ impl ProxyFarm {
                 let mut proxies = Vec::new();
                 let mut addrs = Vec::new();
                 for i in 0..count {
+                    // Deterministic reordering: every 3rd server->client datagram
+                    // is held past the 20 Hz (50 ms) snapshot spacing so the
+                    // next one overtakes it — the "reordered snapshots" half of
+                    // T11, which the harness asserts the live clients observed.
+                    // Light `jitter` on top keeps timing irregular without the
+                    // heavy lag that made a late scripted cut miss the run.
                     let plan = PacketFaultPlan {
                         seed: seed ^ (i as u64 + 1),
                         loss_ratio: f64::from(loss_percent) / 100.0,
                         duplicate_ratio: 0.0,
-                        delay: Duration::from_millis(15),
-                        jitter: Duration::from_millis(10),
+                        delay: Duration::from_millis(3),
+                        jitter: Duration::from_millis(15),
+                        reorder_period: 3,
                     };
                     match UdpProxy::spawn(upstream, plan).await {
                         Ok(p) => {

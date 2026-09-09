@@ -6,8 +6,8 @@ pub mod predict;
 pub mod replica;
 
 pub use net::{
-    ClientNetConfig, ClientNetError, ClientSummary, MovementStep, ScriptedAction, cut_request,
-    run_replication_client,
+    BaselineScene, ClientNetConfig, ClientNetError, ClientSummary, MovementStep, ScriptTarget,
+    ScriptedAction, cut_request, run_replication_client,
 };
 pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};

@@ -118,6 +118,11 @@ pub enum Scene {
     /// Anchored floor + single column + raised beam; cutting the column
     /// detaches the beam. See [`spall_voxel::fixtures::bridge_scene`].
     BridgeCut,
+    /// Like [`Scene::BridgeCut`] but the seam-straddling column and the beam it
+    /// holds both cross the `x = 32` brick boundary, so cutting the column
+    /// detaches a body whose cells were owned across two bricks. See
+    /// [`spall_voxel::fixtures::cross_brick_bridge_scene`].
+    CrossBridgeCut,
     /// T19: a flat anchored walking arena with a step ledge. Each connecting
     /// client is given an authoritative player capsule; clients script movement
     /// and predict it locally. See [`spall_sim::fixtures::walk_arena_setup`].
@@ -125,11 +130,14 @@ pub enum Scene {
 }
 
 impl Scene {
-    /// Parses a `--scene` / scenario value. Unknown names are the caller's error
-    /// to surface, not a silent fallback.
+    /// Parses the `--scene` / scenario `scene` value. Unknown names are an error
+    /// the caller surfaces rather than silently falling back.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "bridge-cut" | "bridgecut" | "bridge" => Some(Scene::BridgeCut),
+            "cross-bridge-cut" | "cross-brick-bridge" | "crossbridgecut" => {
+                Some(Scene::CrossBridgeCut)
+            }
             "walk" | "walk-arena" | "player-movement" => Some(Scene::Walk),
             _ => None,
         }
@@ -139,6 +147,7 @@ impl Scene {
     pub fn name(self) -> &'static str {
         match self {
             Scene::BridgeCut => "bridge-cut",
+            Scene::CrossBridgeCut => "cross-bridge-cut",
             Scene::Walk => "walk",
         }
     }
@@ -149,10 +158,18 @@ impl Scene {
     }
 
     fn simulation(self) -> Simulation {
-        let setup = match self {
+        let mut setup = match self {
             Scene::BridgeCut => spall_sim::fixtures::bridged_terrain_setup(),
+            Scene::CrossBridgeCut => spall_sim::fixtures::cross_brick_bridged_setup(),
             Scene::Walk => spall_sim::fixtures::walk_arena_setup(),
         };
+        // No detached body in these scenes enables per-body CCD, and the serve
+        // loop rebuilds the terrain collider on every committed cut. Rapier's
+        // CCD broad-phase BVH can keep a stale proxy for the just-removed
+        // collider and panic with "No element at index" mid-sweep when a body
+        // is still settling (repro: `cargo xtask scenario --name
+        // g1-networked-destruction`). Skip the CCD pass — a no-op here.
+        setup.physics.disable_ccd = true;
         Simulation::new(SimulationConfig::new(setup)).expect("built-in scene is valid")
     }
 }
@@ -255,6 +272,10 @@ pub struct ServeSummary {
     pub final_world_hash: String,
     pub total_solid_cells: u64,
     pub body_count: usize,
+    /// Largest number of distinct bricks any single detached (non-terrain) body
+    /// occupied at end of run. `>= 2` means a body's cells were owned across a
+    /// brick boundary — the cross-brick ownership-transfer signal for T11.
+    pub max_detached_body_brick_span: u64,
     /// Engine checkpoints published this run (T16). `0` when `--save` is unset.
     pub checkpoints_published: u64,
     /// Topology journal records written this run.
@@ -983,6 +1004,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             final_world_hash: sim.world().world_hash().to_string(),
             total_solid_cells: sim.world().total_solid_cells(),
             body_count: sim.world().body_count(),
+            max_detached_body_brick_span: sim
+                .world()
+                .bodies()
+                .map(|b| b.volume.resident_brick_coords().len() as u64)
+                .max()
+                .unwrap_or(0),
             checkpoints_published,
             journal_records_written,
             persist_bytes_per_write,
@@ -1034,6 +1061,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         final_world_hash: sim_result.final_world_hash.clone(),
         total_solid_cells: sim_result.total_solid_cells,
         body_count: sim_result.body_count,
+        max_detached_body_brick_span: sim_result.max_detached_body_brick_span,
         checkpoints_published: sim_result.checkpoints_published,
         journal_records_written: sim_result.journal_records_written,
         persist_bytes_per_write: sim_result.persist_bytes_per_write,
@@ -1070,6 +1098,7 @@ struct SimResult {
     final_world_hash: String,
     total_solid_cells: u64,
     body_count: usize,
+    max_detached_body_brick_span: u64,
     checkpoints_published: u64,
     journal_records_written: u64,
     persist_bytes_per_write: f64,
@@ -1094,6 +1123,7 @@ impl SimResult {
             final_world_hash: String::new(),
             total_solid_cells: 0,
             body_count: 0,
+            max_detached_body_brick_span: 0,
             checkpoints_published: 0,
             journal_records_written: 0,
             persist_bytes_per_write: 0.0,

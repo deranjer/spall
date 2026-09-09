@@ -133,6 +133,35 @@ pub fn bridge_scene(id: VolumeId) -> Volume {
     v
 }
 
+/// Like [`bridge_scene`], but shifted and widened so the load-bearing geometry
+/// **crosses the `x = 32` brick boundary**. A single column straddling the seam
+/// holds up a beam that also spans both bricks; cutting the column must detach
+/// the beam as exactly one unsupported component whose cells were owned across
+/// two bricks. This is the cross-brick structural-support / brick-boundary
+/// ownership-transfer case the single-brick `bridge_scene` cannot show.
+///
+/// - floor:  `x 20..=44`, `z 0..=3`,  `y 0..=1`   (anchored at `y = 0`; bricks x0+x1)
+/// - column: `x 31..=32`, `z 1..=2`,  `y 2..=6`   (straddles the `x = 32` seam)
+/// - beam:   `x 22..=42`, `z 1..=2`,  `y 7..=8`   (held only by the column; bricks x0+x1)
+/// - air:    `x 20..=44`, `z 0..=3`,  `y 9..=15`  (resident, not merely absent)
+pub fn cross_brick_bridge_scene(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    for (a, b, m) in [
+        (GlobalCell::new(20, 0, 0), GlobalCell::new(44, 1, 3), STONE),
+        (GlobalCell::new(31, 2, 1), GlobalCell::new(32, 6, 2), STONE),
+        (GlobalCell::new(22, 7, 1), GlobalCell::new(42, 8, 2), STONE),
+        (
+            GlobalCell::new(20, 9, 0),
+            GlobalCell::new(44, 15, 3),
+            MaterialId::AIR,
+        ),
+    ] {
+        v.apply_edit(&EditPlan::filled_box(id, a, b, m))
+            .expect("cross-brick bridge scene edit");
+    }
+    v
+}
+
 /// The T19 player-movement arena: a flat anchored stone floor with a low step
 /// ledge and a resident air ceiling, sized for CPU CI.
 ///
@@ -280,6 +309,35 @@ mod tests {
         assert_eq!(
             v.sample(GlobalCell::new(40, 0, 0)).unwrap(),
             Sample::Empty { modified: true }
+        );
+    }
+
+    #[test]
+    fn cross_brick_bridge_scene_column_and_beam_span_the_x_seam() {
+        let v = cross_brick_bridge_scene(vid(1));
+        let x_bricks: std::collections::BTreeSet<i64> =
+            v.resident_brick_coords().iter().map(|c| c.x).collect();
+        assert!(
+            x_bricks.contains(&0) && x_bricks.contains(&1),
+            "scene must occupy both x-bricks, got {x_bricks:?}"
+        );
+        // Column cells on both sides of the x = 32 seam.
+        assert_eq!(
+            v.sample(GlobalCell::new(31, 4, 1)).unwrap(),
+            Sample::Filled(STONE)
+        );
+        assert_eq!(
+            v.sample(GlobalCell::new(32, 4, 1)).unwrap(),
+            Sample::Filled(STONE)
+        );
+        // Beam cells on both sides of the seam.
+        assert_eq!(
+            v.sample(GlobalCell::new(24, 7, 1)).unwrap(),
+            Sample::Filled(STONE)
+        );
+        assert_eq!(
+            v.sample(GlobalCell::new(40, 8, 2)).unwrap(),
+            Sample::Filled(STONE)
         );
     }
 

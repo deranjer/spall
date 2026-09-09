@@ -124,10 +124,26 @@ pub fn bridged_terrain_setup() -> WorldSetup {
     }
 }
 
+/// Like [`bridged_terrain_setup`], but the column and beam **cross the `x = 32`
+/// brick boundary**: cutting the seam-straddling column detaches the beam as one
+/// unsupported component whose cells were owned across two bricks. Exercises
+/// cross-brick structural support propagation and brick-boundary ownership
+/// transfer — see [`spall_voxel::fixtures::cross_brick_bridge_scene`].
+pub fn cross_brick_bridged_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: spall_voxel::fixtures::cross_brick_bridge_scene(id),
+        terrain_collider_region: (GlobalCell::new(20, 0, 0), GlobalCell::new(44, 15, 3)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
 /// The T19 movement arena: a flat anchored floor + a 0.5 m step ledge + a
 /// resident air ceiling ([`spall_voxel::fixtures::walk_arena`]). Scripted
-/// players walk this lane; `player_spawns` gives feet positions in metres near
-/// `x = 0` and clear of the step.
+/// players walk this lane; [`WALK_ARENA_SPAWNS`] gives feet positions in metres
+/// near `x = 0` and clear of the step.
 pub fn walk_arena_setup() -> WorldSetup {
     let id = VolumeId::new(1).unwrap();
     WorldSetup {

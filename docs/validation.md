@@ -140,6 +140,20 @@ cargo xtask scenario --name destruction-network --loss-percent 5 --output .local
 # pulls a baseline over a bulk transfer, and catches up to the server hash.
 cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 
+# T11 CPU-side G1 gate fixture on the cross-brick bridge scene. The full
+# graphical capture portion remains unavailable until T05/T12. Two real OS
+# clients over QUIC: client 0 cuts the seam-straddling column to detach the
+# beam then cuts the falling beam again (a body-targeted cut), both clients
+# excavate opposite floor ends concurrently. Passes only if all ten scripted
+# cuts commit, the server and both clients agree on one hash, the detached body
+# spans >= 2 bricks (cross-brick ownership transfer), each live client sees the
+# beam move >= 0.3 m, the body cut lands, and the committed topology-event
+# stream replayed from the tick-0 baseline reproduces the hash. Add
+# --loss-percent 2 for the impaired-transport run, which additionally requires
+# the clients to have observed motion datagrams delivered out of order. See
+# docs/reports/G1.md.
+cargo xtask scenario --name g1-networked-destruction --loss-percent 0 --output .local/runs/g1
+
 # T19: one `walk` server + two scripted player capsules that predict movement,
 # send InputFrame datagrams, and reconcile against the server's player snapshots.
 # Passes on bounded corrections, ground contact, travel distance, and no hover.
@@ -215,6 +229,26 @@ Clean checkout builds with the pinned toolchain. CPU checks need no display adap
 64 x 32 x 64 m world, 25 cm terrain cells. Include a 12 m hollow tower/bridge spanning brick boundaries, an excavatable slope, and a moving hollow test volume. Run 60 seconds at 60 server ticks/s; after initial cuts, drive 10 tool requests/s total across two clients. Include one cut affecting a 4 m diameter sphere and a 64-brick connected body stress case.
 
 Required: exact ownership/conservation, zero unrepaired topology mismatch at quiescence, all accepted work eventually completes within the stated budget, and no permanent hidden support. Normal single-brick edit server commit target: p95 <=100 ms without network delay. Ordinary structure split target: <=500 ms; designated large-collapse stress target <=2 s before consistent activation. These are gates to measure, not guarantees from the chosen algorithms.
+
+The tracked `g1-networked-destruction` fixture is the CPU-side T11 evidence
+surface. It runs on the cross-brick `cross_brick_bridge_scene` (a seam-
+straddling column holds a beam, both spanning the `x = 32` brick boundary) and
+requires: every scripted cut to commit (so an early quiescence fails the run);
+final server/client hash agreement; the detached body's cells to have been
+owned across a brick boundary (`>= 2` distinct bricks — cross-brick structural
+support propagation and brick-boundary ownership transfer); at least
+`minimum_body_displacement_m` of real detached-body motion on every live
+client; the body-targeted cut landing against the detached body; and the
+committed topology-event stream, replayed deterministically from the tick-0
+baseline via the durable journal, reproducing the live canonical hash. The
+`--loss-percent 2` variant additionally asserts the clients observed motion
+datagrams delivered out of `snapshot_seq` order. It does **not** yet cover a
+detached body coming to rest on remaining structure (the beam free-falls —
+tracked separately), nor the full 64 x 32 x 64 m / 60-second /
+10-requests-per-second workload, 64-brick collapse stress case, graphical
+captures, or GPU timings; those remain explicit follow-up evidence until the
+renderer and gate workload are available. Measured results:
+`docs/reports/G1.md`.
 
 For overload tests, requests beyond admission capacity may return busy. The report must distinguish requested, rejected, queued, and committed counts. Rejecting every expensive action does not satisfy the gate: all named mandatory edits must complete.
 

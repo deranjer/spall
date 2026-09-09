@@ -88,6 +88,7 @@ fn process_role() {
                     loss_ratio: 0.02,
                     delay: Duration::from_millis(15),
                     jitter: Duration::from_millis(5),
+                    reorder_period: 0,
                     ..PacketFaultPlan::transparent(1)
                 };
                 let proxy = UdpProxy::spawn(upstream.addr, plan).await.unwrap();

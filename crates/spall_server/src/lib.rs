@@ -16,8 +16,9 @@ pub use baseline::{
     transfer_from_world, world_baseline,
 };
 pub use persist::{
-    CrashSuiteReport, PersistConfig, PersistError, ScenarioResult, capture, journal_records,
-    pose_batch_record, restore, run_crash_suite,
+    CrashSuiteReport, PersistConfig, PersistError, RecoveryChoice, ScenarioResult, capture,
+    journal_records, pose_batch_record, replay_from_base, replay_from_base_builtin, restore,
+    run_crash_suite,
 };
 pub use persist_pipeline::{
     DEFAULT_QUEUE_CAPACITY, PersistPipeline, PipelineConfig, PipelineError, PipelineOutcome,
