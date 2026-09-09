@@ -309,9 +309,21 @@ client; the body-targeted cut landing against the detached body; and the
 committed topology-event stream, replayed deterministically from the tick-0
 baseline via the durable journal, reproducing the live canonical hash. The
 `--loss-percent 2` variant additionally asserts the clients observed motion
-datagrams delivered out of `snapshot_seq` order. It does **not** yet cover a
-detached body coming to rest on remaining structure (the beam free-falls —
-tracked separately), nor the full 64 x 32 x 64 m / 60-second /
+datagrams delivered out of `snapshot_seq` order.
+
+The sibling `body-rest-on-structure` fixture covers a **detached body coming to
+rest on remaining structure**: it severs the seam column so the cross-brick beam
+detaches, excavates only the floor ends *outside* the beam's span, then runs the
+server with `--await-body-settle` so physics keeps stepping past edit-quiescence
+until the beam sleeps. It passes only if — on top of the hash-agreement and
+replay checks above — the server reports the detached beam at rest: every
+detached body asleep, final linear speed `<= body_settle_speed_epsilon_m_s`, its
+origin held still (`< 1 mm/tick`) for `>= body_settle_min_stable_ticks` ticks,
+and end-of-run contact penetration `<= body_settle_max_penetration_m` (it settled
+*on* the floor, not through it). CPU-side proof:
+`spall_sim` `body_rest_on_structure` integration test.
+
+Neither fixture yet covers the full 64 x 32 x 64 m / 60-second /
 10-requests-per-second workload, 64-brick collapse stress case, graphical
 captures, or GPU timings; those remain explicit follow-up evidence until the
 renderer and gate workload are available. Measured results:
