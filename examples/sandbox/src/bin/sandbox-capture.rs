@@ -14,9 +14,15 @@ use serde::Serialize;
 use spall_mesh::MeshStrategy;
 use spall_mesh::fixtures::{AcceptanceShape, acceptance_shapes, mesh_shape};
 use spall_render::{
-    CaptureOptions, DebugView, RenderContext, RenderError, Scene, SceneItem, capture_scene,
-    colored_rooms,
+    CaptureOptions, DebugView, LightingStep, RenderContext, RenderError, Scene, SceneItem,
+    SequenceOptions, capture_lighting_sequence, capture_scene, colored_rooms, rapid_destruction,
 };
+
+/// Nominal frame time used to turn `lighting-sequence` frame counts into
+/// milliseconds — the provisional G2 client-frame target.
+const NOMINAL_FRAME_MS: f64 = 16.7;
+/// Band-luminance tolerance (fraction) for calling the lighting settled.
+const CONVERGE_TOLERANCE: f32 = 0.05;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Strategy {
@@ -51,9 +57,13 @@ struct Args {
     /// Render only this shape (by name). Omit to render every acceptance shape.
     #[arg(long)]
     only: Option<String>,
-    /// T13 fixture scene. Currently: `colored-room`.
+    /// Fixture scene: `colored-room` (T13) or `lighting-sequence` (T14).
     #[arg(long)]
     scene: Option<String>,
+    /// `lighting-sequence` only: settle frames rendered after the edit so the
+    /// temporal history's convergence latency can be measured.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=120))]
+    settle_frames: u32,
 }
 
 #[derive(Serialize)]
@@ -170,15 +180,16 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
     let strategy: MeshStrategy = args.strategy.into();
 
     if let Some(scene) = &args.scene {
-        if scene != "colored-room" {
-            return Err(RenderError::Gpu(format!(
-                "no fixture scene named {scene:?}"
-            )));
-        }
         if args.only.is_some() {
             return Err(RenderError::Gpu(
                 "--scene and --only are mutually exclusive".into(),
             ));
+        }
+        // `lighting-sequence` has its own summary shape and is handled in main.
+        if scene != "colored-room" {
+            return Err(RenderError::Gpu(format!(
+                "no fixture scene named {scene:?}"
+            )));
         }
         return run_colored_room(args, &ctx, strategy);
     }
@@ -345,6 +356,166 @@ fn run_colored_room(
     })
 }
 
+#[derive(Serialize)]
+struct LightingSequenceStep {
+    index: usize,
+    label: String,
+    dirty_cells: usize,
+    retraced_cells: u64,
+    band_luminance: f32,
+    gpu_trace_millis: Option<f64>,
+    gpu_denoise_millis: Option<f64>,
+    gpu_temporal_millis: Option<f64>,
+    image: String,
+}
+
+/// T14 `lighting-sequence` evidence: the `rapid_destruction` edit followed by
+/// settle frames, with the temporal accumulation on so convergence latency is
+/// meaningful.
+#[derive(Serialize)]
+struct LightingSequenceSummary {
+    version: u32,
+    scene: &'static str,
+    adapter: String,
+    backend: String,
+    gpu_timing_available: bool,
+    width: u32,
+    height: u32,
+    total_cells: u64,
+    band: [f32; 2],
+    halo_cells: u32,
+    temporal_weight: f32,
+    /// Frames from the edit to the first frame that reflects it — always 1 with
+    /// the one-frame-per-step model.
+    edit_latency_frames: u32,
+    edit_latency_millis: f64,
+    /// Frames from the edit until the measured band stays within
+    /// `converge_tolerance` of its final value; `null` if it never settled in
+    /// the captured run.
+    converge_frames: Option<u32>,
+    converge_millis: Option<f64>,
+    converge_tolerance: f32,
+    nominal_frame_millis: f64,
+    steps: Vec<LightingSequenceStep>,
+}
+
+fn run_lighting_sequence(args: &Args) -> Result<LightingSequenceSummary, RenderError> {
+    let ctx = RenderContext::headless()?;
+    let aspect = capture_aspect(args.width, args.height);
+    let rd = rapid_destruction(aspect);
+    let camera = rd.scene.camera;
+    let band = rd.receiver_band;
+
+    let mut steps = Vec::with_capacity(1 + args.settle_frames as usize);
+    steps.push(LightingStep::edit("remove occluder", rd.remove_occluder));
+    for frame in 1..=args.settle_frames {
+        steps.push(LightingStep::view(format!("settle {frame}"), camera));
+    }
+
+    let report = capture_lighting_sequence(
+        &ctx,
+        rd.scene,
+        SequenceOptions {
+            band,
+            temporal_weight: 0.1,
+            width: args.width,
+            height: args.height,
+            ..Default::default()
+        },
+        &steps,
+        &args.out,
+    )?;
+
+    // Step 0 is the base (occluder present); step 1 is the edit; the rest are
+    // settle frames. Convergence is measured against the final captured frame.
+    let post_edit: Vec<f32> = report
+        .steps
+        .iter()
+        .skip(1)
+        .map(|step| step.band_luminance)
+        .collect();
+    let final_band = post_edit.last().copied().unwrap_or(0.0);
+    let tolerance = CONVERGE_TOLERANCE * final_band.abs().max(1.0);
+    let converge_frames = (1..=post_edit.len()).find(|&k| {
+        post_edit[k - 1..]
+            .iter()
+            .all(|value| (value - final_band).abs() <= tolerance)
+    });
+
+    let gpu_timing_available = report
+        .steps
+        .iter()
+        .any(|step| step.gpu_trace_millis.is_some());
+
+    Ok(LightingSequenceSummary {
+        version: 1,
+        scene: "lighting-sequence",
+        adapter: report.adapter.clone(),
+        backend: report.backend.clone(),
+        gpu_timing_available,
+        width: report.width,
+        height: report.height,
+        total_cells: report.total_cells,
+        band: report.band,
+        halo_cells: report.halo_cells,
+        temporal_weight: report.temporal_weight,
+        edit_latency_frames: 1,
+        edit_latency_millis: NOMINAL_FRAME_MS,
+        converge_frames: converge_frames.map(|k| k as u32),
+        converge_millis: converge_frames.map(|k| k as f64 * NOMINAL_FRAME_MS),
+        converge_tolerance: CONVERGE_TOLERANCE,
+        nominal_frame_millis: NOMINAL_FRAME_MS,
+        steps: report
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| LightingSequenceStep {
+                index,
+                label: step.label.clone(),
+                dirty_cells: step.dirty_cells,
+                retraced_cells: step.retraced_cells,
+                band_luminance: step.band_luminance,
+                gpu_trace_millis: step.gpu_trace_millis,
+                gpu_denoise_millis: step.gpu_denoise_millis,
+                gpu_temporal_millis: step.gpu_temporal_millis,
+                image: step.indirect_image.display().to_string(),
+            })
+            .collect(),
+    })
+}
+
+/// Serialise `result` to `<out>/summary.json` and turn it into a process exit
+/// code, so every scene mode shares one write + error path.
+fn finish<T: Serialize>(out: &std::path::Path, result: Result<T, RenderError>) -> ExitCode {
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(RenderError::NoAdapter) => {
+            eprintln!(
+                "sandbox-capture: no compatible GPU adapter; offscreen capture needs a working GPU/driver"
+            );
+            return ExitCode::from(3);
+        }
+        Err(error) => {
+            eprintln!("sandbox-capture: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let path = out.join("summary.json");
+    let body = match serde_json::to_vec_pretty(&summary) {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!("sandbox-capture: cannot serialise summary: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = std::fs::write(&path, body) {
+        eprintln!("sandbox-capture: cannot write {}: {error}", path.display());
+        return ExitCode::from(1);
+    }
+    println!("sandbox-capture: summary written to {}", path.display());
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     sandbox::init_tracing();
     let args = Args::parse();
@@ -357,39 +528,10 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    match run(&args) {
-        Ok(summary) => {
-            let path = args.out.join("summary.json");
-            match serde_json::to_vec_pretty(&summary) {
-                Ok(body) => {
-                    if let Err(error) = std::fs::write(&path, body) {
-                        eprintln!("sandbox-capture: cannot write {}: {error}", path.display());
-                        return ExitCode::from(1);
-                    }
-                }
-                Err(error) => {
-                    eprintln!("sandbox-capture: cannot serialise summary: {error}");
-                    return ExitCode::from(1);
-                }
-            }
-            println!(
-                "sandbox-capture: {} shape(s) captured to {}",
-                summary.shapes.len(),
-                args.out.display()
-            );
-            ExitCode::SUCCESS
-        }
-        Err(RenderError::NoAdapter) => {
-            eprintln!(
-                "sandbox-capture: no compatible GPU adapter; offscreen capture needs a working GPU/driver"
-            );
-            ExitCode::from(3)
-        }
-        Err(error) => {
-            eprintln!("sandbox-capture: {error}");
-            ExitCode::from(1)
-        }
+    if args.scene.as_deref() == Some("lighting-sequence") {
+        return finish(&args.out, run_lighting_sequence(&args));
     }
+    finish(&args.out, run(&args))
 }
 
 #[cfg(test)]

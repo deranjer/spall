@@ -484,6 +484,9 @@ pub struct SequenceOptions {
     /// re-traced region. `1.0` disables accumulation (each step is one settled
     /// frame); a small value (e.g. `0.1`) accumulates.
     pub temporal_weight: f32,
+    /// Render size. Both values are clamped up to the nearest even number.
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Default for SequenceOptions {
@@ -493,6 +496,8 @@ impl Default for SequenceOptions {
             halo_cells: 12,
             exposure: 1.0,
             temporal_weight: 1.0,
+            width: 1280,
+            height: 720,
         }
     }
 }
@@ -522,6 +527,8 @@ pub fn capture_lighting_sequence(
         halo_cells,
         exposure,
         temporal_weight,
+        width,
+        height,
     } = opts;
     std::fs::create_dir_all(out_dir).map_err(|error| RenderError::Image {
         path: out_dir.display().to_string(),
@@ -536,7 +543,7 @@ pub fn capture_lighting_sequence(
     let pipeline = ScenePipeline::new(&ctx.device);
     let materials = pipeline.material_buffer(&ctx.device, &scene.materials);
     let indirect = pipeline.indirect_resources(&ctx.device, &ctx.queue, Some(&volume), &materials);
-    let (width, height) = band_capture_dim(scene.camera.aspect, 720);
+    let (width, height) = (even(width), even(height));
     let target = OffscreenTarget::new(&ctx.device, width, height);
 
     let frustum = scene.camera.frustum();
@@ -759,11 +766,10 @@ pub fn capture_lighting_sequence(
     })
 }
 
-/// Capture size for a given aspect and target height, both even.
-fn band_capture_dim(aspect: f32, height: u32) -> (u32, u32) {
-    let height = height.max(2) & !1;
-    let width = ((height as f32 * aspect).round() as u32).max(2) & !1;
-    (width, height)
+/// Round up to an even value of at least 2.
+fn even(value: u32) -> u32 {
+    let value = value.max(2);
+    value + (value & 1)
 }
 
 /// Clamped cell AABB `[lo, hi)` covering every dirty cell, grown by `halo` on
