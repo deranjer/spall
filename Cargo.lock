@@ -2385,11 +2385,13 @@ dependencies = [
  "serde_json",
  "spall_client",
  "spall_core",
+ "spall_jobs",
  "spall_mesh",
  "spall_net",
  "spall_render",
  "spall_server",
  "spall_sim",
+ "spall_voxel",
  "tracing",
  "tracing-subscriber",
 ]
