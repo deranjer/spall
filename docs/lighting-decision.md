@@ -1,9 +1,12 @@
 # T13 indirect-light feasibility decision
 
-Status: proposed on 2026-09-08, pending review sign-off. It records the
-resource/pass contract intended to freeze for T14 — not final visual quality
-and not a persistent world format. Do not treat the contract as frozen until
-this document is marked accepted after review.
+Status: **accepted 2026-09-09** after coordinator review of the single-adapter
+rendered controls (see "Fixture and measurements"). The resource/pass contract
+in this document is now **frozen for T14** — the exact frozen surface is listed
+under "Freeze list (frozen for T14)". Acceptance covers indirect-lighting
+*feasibility* only: it is not final visual quality, not a persistent world
+format, and makes no cross-GPU, temporal-stability, or p95 frame-cost claim
+(those are T14/T15 acceptance work).
 
 ## Decision
 
@@ -24,6 +27,38 @@ before choosing texture/brick-atlas packing.
 Material records keep linear base color, roughness, metalness, and a nonnegative
 emissive multiplier. Emission uses `base_color * emissive`; no runtime light
 entity or second material registry is introduced.
+
+## Freeze list (frozen for T14)
+
+Accepted 2026-09-09. T14 builds against exactly this surface; changing any
+frozen item requires fresh colored-room / leakage evidence and a new review.
+
+**Frozen — T14 may not change without re-review:**
+
+- Cache geometry: `128 x 128 x 128` cells, `0.5 m` per cell, `64 m` cube,
+  camera-local, derived render resource only.
+- Hard boundary: the cache can never affect collision, topology, replication, or
+  saved geometry.
+- CPU staging format: one `u32` material id per cell, `0 = air`.
+- GPU radiance format: linear RGB in an `array<vec4<f32>>`, plus a second
+  equally-sized buffer for the denoised result.
+- Material encoding: linear base color + roughness + metalness + nonnegative
+  emissive multiplier; emission `= base_color * emissive`; no light entity, no
+  second registry.
+- Explicit pass order: the six steps below (T14 temporal work is an inserted
+  sub-step after step 3, not a reorder).
+- `DebugView::IndirectOnly` semantics: direct sun and T12 ambient disabled.
+
+**Not frozen — T14 may choose or change (additive):**
+
+- Denoiser internals (tap count / weights), provided it stays occupancy-aware
+  and never averages through an occupied cell.
+- Trace ray count, directions, and maximum cache-cell march distance.
+- New temporal history resources (previous radiance, previous cache origin,
+  per-cell age / validity) — purely additive.
+- Dirty-region update strategy and camera clipmap scroll strategy.
+- Later texture / brick-atlas packing, under the same evidence bar and the same
+  derived-cache boundary.
 
 ## Traversal and sampling
 
@@ -101,10 +136,29 @@ the render, in the same direction as the probe copy. Rendered leakage past the
 represented wall is higher than the CPU `0.0` (denoise spread and the fixed
 diagonal rays), but stays a minority of the unoccluded transport.
 
+### Acceptance review run — 2026-09-09
+
+Re-run for the acceptance review on the reference adapter (NVIDIA GeForce
+RTX 4080 SUPER, Dx12, `gpu_timing_available: true`), 1920x1080,
+`.local/runs/t13-review`:
+
+| Variant | GPU trace | GPU denoise | GPU render total | open probe | closed probe | thin-wall leakage | cells |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| open | 1.420 ms | 0.105 ms | 1.670 ms | 0.36867 | 0.23797 | 0.0 | 2097152 |
+| closed | 1.443 ms | 0.089 ms | 1.819 ms | 0.36867 | 0.23797 | 0.0 | 2097152 |
+
+Reproduces the prototype numbers. `indirect_only.png` for the two variants was
+inspected: the open room shows red/blue wall bleed, warm emitter transport onto
+the back wall and floor, and cool sky fill through the open ceiling; the closed
+room is visibly darker (sky fill gone) with only the emitter cone and its
+ceiling bounce, matching the `35.4%` darker probe. `trace` and `denoise` are
+reported as separate GPU timestamp measurements. Blocky directional bleed is
+present as documented.
+
 Rendered cross-GPU quality, temporal stability, and p95 frame cost remain
-unvalidated here and are T14/T15 acceptance work; this document should not be
-marked accepted until at least the single-adapter rendered controls above have
-been reviewed.
+unvalidated and are T14/T15 acceptance work. The single-adapter rendered
+controls required for this feasibility acceptance have been reviewed (above);
+the contract is frozen for T14 per "Freeze list (frozen for T14)".
 
 ## Known limits and T14 contract
 
