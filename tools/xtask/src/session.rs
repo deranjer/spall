@@ -210,6 +210,56 @@ struct Scenario {
     player_paths: Vec<PlayerPath>,
     #[serde(default)]
     movement: MovementAcceptance,
+    /// T11a / ENG-62: when set, assert the server's measured commit-latency p95
+    /// (per commit shape) against the G1 gate targets. A bucket the run did not
+    /// exercise (0 samples) is not asserted.
+    #[serde(default)]
+    latency_targets: Option<LatencyTargets>,
+}
+
+/// G1 commit-latency p95 ceilings (milliseconds). Defaults are the
+/// `docs/validation.md` "G1" numbers.
+#[derive(Debug, Clone, Deserialize)]
+struct LatencyTargets {
+    #[serde(default = "default_single_brick_ms")]
+    single_brick_commit_p95_ms: f64,
+    #[serde(default = "default_structure_split_ms")]
+    structure_split_p95_ms: f64,
+    #[serde(default = "default_large_collapse_ms")]
+    large_collapse_p95_ms: f64,
+}
+
+fn default_single_brick_ms() -> f64 {
+    100.0
+}
+fn default_structure_split_ms() -> f64 {
+    500.0
+}
+fn default_large_collapse_ms() -> f64 {
+    2000.0
+}
+
+/// Whether every commit-latency bucket the run exercised stayed within the
+/// scenario's `latency_targets`. `true` when no targets are configured, or when
+/// a bucket has no samples (nothing to fail).
+fn latency_targets_met(scenario: &Scenario, server: &ServerSummary) -> bool {
+    let Some(t) = &scenario.latency_targets else {
+        return true;
+    };
+    let ok = |samples: u64, measured: f64, target: f64| samples == 0 || measured <= target;
+    ok(
+        server.single_brick_commit_samples,
+        server.single_brick_commit_p95_ms,
+        t.single_brick_commit_p95_ms,
+    ) && ok(
+        server.structure_split_samples,
+        server.structure_split_p95_ms,
+        t.structure_split_p95_ms,
+    ) && ok(
+        server.large_collapse_samples,
+        server.large_collapse_p95_ms,
+        t.large_collapse_p95_ms,
+    )
 }
 
 fn one() -> u64 {
@@ -324,6 +374,27 @@ struct ServerSummary {
     final_world_hash: String,
     #[serde(default)]
     max_detached_body_brick_span: u64,
+    // T11a / ENG-62: admission breakdown + commit-latency p95s (ServeSummary v3).
+    #[serde(default)]
+    actions_requested: u64,
+    #[serde(default)]
+    actions_rejected: u64,
+    #[serde(default)]
+    actions_staged: u64,
+    #[serde(default)]
+    actions_queued_unresolved: u64,
+    #[serde(default)]
+    single_brick_commit_p95_ms: f64,
+    #[serde(default)]
+    single_brick_commit_samples: u64,
+    #[serde(default)]
+    structure_split_p95_ms: f64,
+    #[serde(default)]
+    structure_split_samples: u64,
+    #[serde(default)]
+    large_collapse_p95_ms: f64,
+    #[serde(default)]
+    large_collapse_samples: u64,
     // ENG-61 detached-body settle evidence.
     #[serde(default)]
     detached_body_max_final_speed_m_s: f64,
@@ -410,8 +481,52 @@ struct SessionSummary {
     agreed_world_hash: String,
     all_hashes_match: bool,
     requirements_met: bool,
+    /// T11a / ENG-62: the gate's requested / rejected / queued / committed
+    /// breakdown (server-authoritative) and the measured commit-latency p95s.
+    admission: AdmissionRow,
     per_client: Vec<ClientRow>,
     note: &'static str,
+}
+
+/// T11a / ENG-62: server-side admission accounting + commit-latency p95s, and
+/// whether the measured p95s stayed within the scenario's `latency_targets`
+/// (`latency_targets_met` is `true` when no targets are configured).
+#[derive(Debug, Serialize)]
+struct AdmissionRow {
+    actions_requested: u64,
+    actions_rejected: u64,
+    actions_staged: u64,
+    actions_queued_unresolved: u64,
+    transactions_committed: u64,
+    single_brick_commit_p95_ms: f64,
+    single_brick_commit_samples: u64,
+    structure_split_p95_ms: f64,
+    structure_split_samples: u64,
+    large_collapse_p95_ms: f64,
+    large_collapse_samples: u64,
+    latency_targets_configured: bool,
+    latency_targets_met: bool,
+}
+
+impl AdmissionRow {
+    /// All-zero row for a run that produced no server summary.
+    fn empty() -> Self {
+        Self {
+            actions_requested: 0,
+            actions_rejected: 0,
+            actions_staged: 0,
+            actions_queued_unresolved: 0,
+            transactions_committed: 0,
+            single_brick_commit_p95_ms: 0.0,
+            single_brick_commit_samples: 0,
+            structure_split_p95_ms: 0.0,
+            structure_split_samples: 0,
+            large_collapse_p95_ms: 0.0,
+            large_collapse_samples: 0,
+            latency_targets_configured: false,
+            latency_targets_met: false,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -658,6 +773,47 @@ mod requirement_tests {
         assert!(!requirements_met(&scenario, 1, &[Some(ordered)], true));
         // Impaired run with real reordering observed: passes.
         assert!(requirements_met(&scenario, 1, &[Some(client(4))], true));
+    }
+
+    #[test]
+    fn latency_targets_only_bite_on_exercised_buckets_over_budget() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 600,
+                "latency_targets": {
+                    "single_brick_commit_p95_ms": 100,
+                    "structure_split_p95_ms": 500,
+                    "large_collapse_p95_ms": 2000
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut server = ServerSummary::default();
+        // Nothing measured yet: no bucket can fail.
+        assert!(latency_targets_met(&scenario, &server));
+
+        // Single-brick p95 within budget, split bucket unexercised: passes.
+        server.single_brick_commit_samples = 40;
+        server.single_brick_commit_p95_ms = 80.0;
+        assert!(latency_targets_met(&scenario, &server));
+
+        // Single-brick p95 over its 100 ms target: fails.
+        server.single_brick_commit_p95_ms = 140.0;
+        assert!(!latency_targets_met(&scenario, &server));
+        server.single_brick_commit_p95_ms = 80.0;
+
+        // An exercised structure-split bucket over 500 ms: fails.
+        server.structure_split_samples = 10;
+        server.structure_split_p95_ms = 620.0;
+        assert!(!latency_targets_met(&scenario, &server));
+        server.structure_split_p95_ms = 300.0;
+        assert!(latency_targets_met(&scenario, &server));
+
+        // With no targets configured, latency never gates.
+        let no_targets: Scenario = serde_json::from_str(r#"{ "server_ticks": 1 }"#).unwrap();
+        server.structure_split_p95_ms = 9_999.0;
+        assert!(latency_targets_met(&no_targets, &server));
     }
 }
 
@@ -917,6 +1073,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     agreed_world_hash: String::new(),
                     all_hashes_match: false,
                     requirements_met: false,
+                    admission: AdmissionRow::empty(),
                     per_client: Vec::new(),
                     note: "server produced no summary; inspect server.jsonl",
                 },
@@ -1026,6 +1183,28 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         None
     };
 
+    // T11a / ENG-62: assert the measured commit-latency p95s against the G1 gate
+    // targets when the scenario configured them.
+    let latency_ok = latency_targets_met(&scenario, &server);
+    if scenario.latency_targets.is_some() && !latency_ok {
+        requirements_met = false;
+    }
+    let admission = AdmissionRow {
+        actions_requested: server.actions_requested,
+        actions_rejected: server.actions_rejected,
+        actions_staged: server.actions_staged,
+        actions_queued_unresolved: server.actions_queued_unresolved,
+        transactions_committed: server.transactions_committed,
+        single_brick_commit_p95_ms: server.single_brick_commit_p95_ms,
+        single_brick_commit_samples: server.single_brick_commit_samples,
+        structure_split_p95_ms: server.structure_split_p95_ms,
+        structure_split_samples: server.structure_split_samples,
+        large_collapse_p95_ms: server.large_collapse_p95_ms,
+        large_collapse_samples: server.large_collapse_samples,
+        latency_targets_configured: scenario.latency_targets.is_some(),
+        latency_targets_met: latency_ok,
+    };
+
     all_match &= requirements_met;
     finish(
         &output,
@@ -1048,6 +1227,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             agreed_world_hash: agreed,
             all_hashes_match: all_match,
             requirements_met,
+            admission,
             per_client: rows,
             note: "real OS processes over QUIC; encrypted-packet loss via per-client UDP proxy; gate requirements are fixture-defined: every scripted cut commits, each live client sees real body displacement, any body-targeted cut lands, and (when enabled) the committed topology-event stream replays from baseline to the same hash",
         },

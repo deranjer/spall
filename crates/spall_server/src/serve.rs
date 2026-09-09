@@ -49,6 +49,7 @@ use spall_voxel::{Ray, RayOutcome, cast_ray_world};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::baseline::{self, BaselineTransfer};
+use crate::commit_latency::{self, CommitLatency};
 use crate::persist::{self, PersistConfig};
 use crate::persist_pipeline::{PersistPipeline, PipelineConfig};
 
@@ -394,6 +395,27 @@ pub struct ServeSummary {
     /// connection — Quinn's `udp_tx.bytes`, i.e. actual UDP payload on the wire
     /// including QUIC framing and retransmission.
     pub transport_egress_bytes: u64,
+    /// T11a / ENG-62: inbound `ActionRequest`s received this run, retries
+    /// included ("requested" in the gate's requested / rejected / queued /
+    /// committed breakdown). "rejected" is [`Self::actions_rejected`];
+    /// "committed" is [`Self::transactions_committed`].
+    pub actions_requested: u64,
+    /// T11a / ENG-62: `ActionRequest`s the simulation accepted for staging.
+    pub actions_staged: u64,
+    /// T11a / ENG-62: staged requests that had not committed when the run ended
+    /// ("queued" in the gate breakdown).
+    pub actions_queued_unresolved: u64,
+    /// T11a / ENG-62: server commit latency — admission to commit — as a
+    /// nearest-rank p95 (ms) per commit shape, with the sample count behind each
+    /// figure. Gate targets (`docs/validation.md` "G1"): single-brick commit
+    /// p95 `<= 100 ms`, ordinary structure split `<= 500 ms`, designated
+    /// large-collapse `<= 2000 ms`. A bucket with `0` samples was not exercised.
+    pub single_brick_commit_p95_ms: f64,
+    pub single_brick_commit_samples: u64,
+    pub structure_split_p95_ms: f64,
+    pub structure_split_samples: u64,
+    pub large_collapse_p95_ms: f64,
+    pub large_collapse_samples: u64,
 }
 
 /// Anything that stops a [`serve`] run.
@@ -819,6 +841,18 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // (actions) or dropped (repairs).
         let mut actions_throttled = 0u64;
         let mut repairs_throttled = 0u64;
+
+        // T11a / ENG-62: commit-latency measurement + admission accounting.
+        // `actions_requested` counts every inbound `ActionRequest` (retries
+        // included); `actions_staged` counts those the sim accepted for staging;
+        // `submitted_at` times each staged request from admission to the tick
+        // its transaction commits. Whatever is still in `submitted_at` at end of
+        // run was staged but never committed — the "queued" bucket.
+        let mut actions_requested = 0u64;
+        let mut actions_staged = 0u64;
+        let mut submitted_at: HashMap<RequestId, std::time::Instant> = HashMap::new();
+        let mut commit_latency = CommitLatency::default();
+
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
         let tick_dt = Duration::from_nanos(1_000_000_000 / 60);
@@ -884,6 +918,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     }
                     Inbound::Action(session, req) => {
                         saw_client_work = true;
+                        actions_requested += 1;
                         if lj.session_expired(session) {
                             reject(&clients_for_sim, session, req.request_id, "expired session");
                             rejected_total += 1;
@@ -927,11 +962,17 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         };
                         match resolved {
                             Ok(intent) => match sim.submit(intent) {
-                                Ok(status) => send_to(
-                                    &clients_for_sim,
-                                    session,
-                                    Outbound::Status(Arc::new(status)),
-                                ),
+                                Ok(status) => {
+                                    submitted_at
+                                        .entry(req.request_id)
+                                        .or_insert_with(std::time::Instant::now);
+                                    actions_staged += 1;
+                                    send_to(
+                                        &clients_for_sim,
+                                        session,
+                                        Outbound::Status(Arc::new(status)),
+                                    );
+                                }
                                 Err(e) => {
                                     reject(
                                         &clients_for_sim,
@@ -1008,6 +1049,15 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             for tx in committed_transactions(&report).map(|(_, t)| t.clone()) {
                 committed_total += 1;
                 lj.fan_out_transaction(Arc::new(tx), &sim, &clients_for_sim);
+            }
+            // T11a / ENG-62: bucket each commit's server-side latency (admission
+            // → commit) by whether it split and how much geometry detached.
+            for (rid, committed) in &report.committed {
+                if let Some(started_at) = submitted_at.remove(rid) {
+                    let class =
+                        commit_latency::classify(committed.bumped_epoch, &committed.topology);
+                    commit_latency.record(class, started_at.elapsed());
+                }
             }
             for status in action_statuses(&report) {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
@@ -1230,6 +1280,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             motion_snapshots_interest_culled: motion_egress.interest_culled,
             motion_snapshots_budget_deferred: motion_egress.budget_deferred,
             max_client_motion_batch_bytes: motion_egress.max_client_batch_bytes,
+            actions_requested,
+            actions_staged,
+            actions_queued_unresolved: submitted_at.len() as u64,
+            latency: commit_latency.report(),
         }
     });
 
@@ -1273,7 +1327,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     ))?;
 
     let summary = ServeSummary {
-        version: 2,
+        version: 3,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -1307,6 +1361,15 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         max_client_motion_batch_bytes: sim_result.max_client_motion_batch_bytes,
         app_egress_bytes,
         transport_egress_bytes,
+        actions_requested: sim_result.actions_requested,
+        actions_staged: sim_result.actions_staged,
+        actions_queued_unresolved: sim_result.actions_queued_unresolved,
+        single_brick_commit_p95_ms: sim_result.latency.single_brick_commit_p95_ms,
+        single_brick_commit_samples: sim_result.latency.single_brick_commit_samples,
+        structure_split_p95_ms: sim_result.latency.structure_split_p95_ms,
+        structure_split_samples: sim_result.latency.structure_split_samples,
+        large_collapse_p95_ms: sim_result.latency.large_collapse_p95_ms,
+        large_collapse_samples: sim_result.latency.large_collapse_samples,
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -1353,6 +1416,11 @@ struct SimResult {
     motion_snapshots_interest_culled: u64,
     motion_snapshots_budget_deferred: u64,
     max_client_motion_batch_bytes: u64,
+    // T11a / ENG-62.
+    actions_requested: u64,
+    actions_staged: u64,
+    actions_queued_unresolved: u64,
+    latency: commit_latency::LatencyReport,
 }
 
 impl SimResult {
@@ -1387,6 +1455,10 @@ impl SimResult {
             motion_snapshots_interest_culled: 0,
             motion_snapshots_budget_deferred: 0,
             max_client_motion_batch_bytes: 0,
+            actions_requested: 0,
+            actions_staged: 0,
+            actions_queued_unresolved: 0,
+            latency: commit_latency::LatencyReport::default(),
         }
     }
 }
