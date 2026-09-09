@@ -19,14 +19,15 @@ pub mod vertex;
 
 pub use camera::{Aabb, Camera, Frustum};
 pub use capture::{
-    CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, LightingStep, SequenceReport,
-    SequenceStep, capture_lighting_sequence, capture_scene,
+    CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, LightingStep, SequenceOptions,
+    SequenceReport, SequenceStep, capture_lighting_sequence, capture_scene,
 };
 pub use context::{RenderContext, RenderError};
 pub use fixtures::{
     EmitterOcclusionScenes, LightingFixture, LightingFixtureMetrics, MovingBodyOverlap,
-    OCCLUDER_MAX_M, OCCLUDER_MIN_M, RECEIVER_MAX_M, RECEIVER_MIN_M, RapidDestruction,
-    colored_rooms, emitter_occlusion_scenes, moving_body_overlap, rapid_destruction,
+    OCCLUDER_MAX_M, OCCLUDER_MIN_M, PanningCamera, RECEIVER_MAX_M, RECEIVER_MIN_M,
+    RapidDestruction, colored_rooms, emitter_occlusion_scenes, moving_body_overlap, panning_camera,
+    rapid_destruction,
 };
 pub use indirect::{
     LIGHT_CELL_SIZE_METRES, LIGHT_VOLUME_DIM, LightingRegion, LightingUpdate, LightingVolume,

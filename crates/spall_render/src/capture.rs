@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use image::{ImageBuffer, Rgba};
 
+use crate::camera::Camera;
 use crate::context::{RenderContext, RenderError};
 use crate::indirect::{LIGHT_VOLUME_DIM, LightingUpdate};
 use crate::pipeline::{CASCADE_COUNT, DebugView, PassTiming, ScenePipeline, default_sun_dir};
@@ -398,11 +399,34 @@ fn draw_meshes<'pass>(pass: &mut wgpu::RenderPass<'pass>, draws: &'pass [GpuMesh
     }
 }
 
-/// One incremental world change to feed into [`capture_lighting_sequence`].
+/// One step of a [`capture_lighting_sequence`] run: an incremental world change
+/// and, optionally, a new camera pose to render it from (for moving-camera
+/// fixtures). `update` may be empty when only the camera moves.
 #[derive(Debug, Clone)]
 pub struct LightingStep {
     pub label: String,
     pub update: LightingUpdate,
+    pub camera: Option<Camera>,
+}
+
+impl LightingStep {
+    /// A step that only applies a world change, rendered from the base camera.
+    pub fn edit(label: impl Into<String>, update: LightingUpdate) -> Self {
+        Self {
+            label: label.into(),
+            update,
+            camera: None,
+        }
+    }
+
+    /// A step that only moves the camera over an unchanged world.
+    pub fn view(label: impl Into<String>, camera: Camera) -> Self {
+        Self {
+            label: label.into(),
+            update: LightingUpdate::new(),
+            camera: Some(camera),
+        }
+    }
 }
 
 /// The lighting state rendered at one step of a [`capture_lighting_sequence`]
@@ -418,6 +442,7 @@ pub struct SequenceStep {
     pub retraced_cells: u64,
     pub gpu_trace_millis: Option<f64>,
     pub gpu_denoise_millis: Option<f64>,
+    pub gpu_temporal_millis: Option<f64>,
     /// Mean sRGB luminance of the measured image band in the `IndirectOnly`
     /// render for this step.
     pub band_luminance: f32,
@@ -437,7 +462,39 @@ pub struct SequenceReport {
     /// Fractional image-x band `[x0, x1)` the `band_luminance` figures measure.
     pub band: [f32; 2],
     pub halo_cells: u32,
+    /// Weight of the current frame mixed into history outside the re-traced
+    /// region: `1.0` disables temporal accumulation.
+    pub temporal_weight: f32,
     pub steps: Vec<SequenceStep>,
+}
+
+/// History clamp slack for [`capture_lighting_sequence`], as a fraction of the
+/// local neighbourhood spread.
+const TEMPORAL_SLACK: f32 = 0.25;
+
+/// Settings for a [`capture_lighting_sequence`] run.
+#[derive(Debug, Clone, Copy)]
+pub struct SequenceOptions {
+    /// Fractional image-x band `[x0, x1)` whose mean luminance is measured.
+    pub band: [f32; 2],
+    /// Cells added on each side of a step's dirty AABB before re-tracing.
+    pub halo_cells: u32,
+    pub exposure: f32,
+    /// Weight of the current frame mixed into the temporal history outside the
+    /// re-traced region. `1.0` disables accumulation (each step is one settled
+    /// frame); a small value (e.g. `0.1`) accumulates.
+    pub temporal_weight: f32,
+}
+
+impl Default for SequenceOptions {
+    fn default() -> Self {
+        Self {
+            band: [0.3, 0.7],
+            halo_cells: 12,
+            exposure: 1.0,
+            temporal_weight: 1.0,
+        }
+    }
 }
 
 /// Render `scene` under `IndirectOnly`, then apply each [`LightingStep`] to the
@@ -446,17 +503,26 @@ pub struct SequenceReport {
 ///
 /// This is the T14 partial-update path exercised end to end: it proves an edit
 /// reaches the rendered indirect lighting in the next frame and reports how
-/// much of the cache each step actually touched. Temporal reprojection is a
-/// later increment; here each step is a single settled frame.
+/// much of the cache each step actually touched.
+///
+/// `temporal_weight` controls the temporal accumulation pass: `1.0` disables it
+/// (each step is a single settled frame); a small value (e.g. `0.1`) blends
+/// each frame into a persistent, neighbourhood-clamped history so the 12-ray
+/// trace noise settles, while the re-traced region and the clamp keep edits and
+/// moving occluders from leaving stale shadows or light trails.
 pub fn capture_lighting_sequence(
     ctx: &RenderContext,
     scene: Scene,
-    band: [f32; 2],
-    halo_cells: u32,
-    exposure: f32,
+    opts: SequenceOptions,
     steps: &[LightingStep],
     out_dir: &Path,
 ) -> Result<SequenceReport, RenderError> {
+    let SequenceOptions {
+        band,
+        halo_cells,
+        exposure,
+        temporal_weight,
+    } = opts;
     std::fs::create_dir_all(out_dir).map_err(|error| RenderError::Image {
         path: out_dir.display().to_string(),
         source: image::ImageError::IoError(error),
@@ -521,10 +587,12 @@ pub fn capture_lighting_sequence(
     }
     ctx.queue.submit([shadow_encoder.finish()]);
 
+    type FrameResult = (f32, Option<f64>, Option<f64>, Option<f64>, PathBuf);
     let render_indirect = |step_index: usize,
-                           label: &str|
-     -> Result<(f32, Option<f64>, Option<f64>, PathBuf), RenderError> {
-        let timer = GpuTimer::new(ctx, 2);
+                           label: &str,
+                           camera: &Camera|
+     -> Result<FrameResult, RenderError> {
+        let timer = GpuTimer::new(ctx, 3);
         let mut lighting_encoder =
             ctx.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -536,12 +604,17 @@ pub fn capture_lighting_sequence(
             timer.as_ref().map(|timer| timer.compute_writes(0)),
             timer.as_ref().map(|timer| timer.compute_writes(1)),
         );
+        pipeline.dispatch_indirect_temporal(
+            &mut lighting_encoder,
+            &indirect,
+            timer.as_ref().map(|timer| timer.compute_writes(2)),
+        );
         ctx.queue.submit([lighting_encoder.finish()]);
 
         let scene_bind = pipeline.scene_bind_group(
             &ctx.device,
             &ctx.queue,
-            &scene.camera,
+            camera,
             DebugView::IndirectOnly,
             exposure,
             &materials,
@@ -582,7 +655,7 @@ pub fn capture_lighting_sequence(
             });
             pass.set_pipeline(pipeline.opaque());
             pass.set_bind_group(0, &scene_bind, &[]);
-            pass.set_bind_group(1, &indirect.display_bind, &[]);
+            pass.set_bind_group(1, &indirect.history_display_bind, &[]);
             draw_meshes(&mut pass, &draws);
         }
         {
@@ -620,21 +693,26 @@ pub fn capture_lighting_sequence(
         })?;
 
         let times = timer.and_then(|timer| timer.millis(ctx));
-        let (trace_ms, denoise_ms) = match times.as_deref() {
-            Some([trace, denoise, ..]) => (Some(*trace), Some(*denoise)),
-            _ => (None, None),
+        let (trace_ms, denoise_ms, temporal_ms) = match times.as_deref() {
+            Some([trace, denoise, temporal, ..]) => (Some(*trace), Some(*denoise), Some(*temporal)),
+            _ => (None, None, None),
         };
-        Ok((luminance, trace_ms, denoise_ms, path))
+        Ok((luminance, trace_ms, denoise_ms, temporal_ms, path))
     };
 
     let mut report_steps = Vec::with_capacity(steps.len() + 1);
-    let (base_luma, base_trace, base_denoise, base_path) = render_indirect(0, "base")?;
+    // Base step: full trace, full history seed (the shader forces weight 1.0
+    // inside the re-traced region, which is the whole cache here).
+    indirect.set_temporal(&ctx.queue, 1.0, TEMPORAL_SLACK);
+    let (base_luma, base_trace, base_denoise, base_temporal, base_path) =
+        render_indirect(0, "base", &scene.camera)?;
     report_steps.push(SequenceStep {
         label: "base".to_string(),
         dirty_cells: 0,
         retraced_cells: total_cells,
         gpu_trace_millis: base_trace,
         gpu_denoise_millis: base_denoise,
+        gpu_temporal_millis: base_temporal,
         band_luminance: base_luma,
         indirect_image: base_path,
     });
@@ -646,16 +724,20 @@ pub fn capture_lighting_sequence(
 
         let (lo, hi) = trace_region(&dirty, halo_cells);
         indirect.set_trace_region(&ctx.queue, lo, hi);
+        indirect.set_temporal(&ctx.queue, temporal_weight, TEMPORAL_SLACK);
         let retraced_cells = u64::from((hi.x - lo.x) * (hi.y - lo.y) * (hi.z - lo.z));
 
         let slug = slugify(&step.label);
-        let (luma, trace_ms, denoise_ms, path) = render_indirect(i + 1, &slug)?;
+        let camera = step.camera.unwrap_or(scene.camera);
+        let (luma, trace_ms, denoise_ms, temporal_ms, path) =
+            render_indirect(i + 1, &slug, &camera)?;
         report_steps.push(SequenceStep {
             label: step.label.clone(),
             dirty_cells: dirty.len(),
             retraced_cells,
             gpu_trace_millis: trace_ms,
             gpu_denoise_millis: denoise_ms,
+            gpu_temporal_millis: temporal_ms,
             band_luminance: luma,
             indirect_image: path,
         });
@@ -672,6 +754,7 @@ pub fn capture_lighting_sequence(
         total_cells,
         band,
         halo_cells,
+        temporal_weight,
         steps: report_steps,
     })
 }

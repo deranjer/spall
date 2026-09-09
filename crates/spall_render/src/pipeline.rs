@@ -319,6 +319,16 @@ impl ScenePipeline {
             .dispatch(encoder, resources, trace_timestamps, denoise_timestamps);
     }
 
+    pub(crate) fn dispatch_indirect_temporal<'a>(
+        &'a self,
+        encoder: &'a mut wgpu::CommandEncoder,
+        resources: &'a IndirectResources,
+        timestamps: Option<wgpu::ComputePassTimestampWrites<'a>>,
+    ) {
+        self.indirect
+            .dispatch_temporal(encoder, resources, timestamps);
+    }
+
     pub fn material_buffer(&self, device: &wgpu::Device, materials: &[Material]) -> wgpu::Buffer {
         let fallback = [Material::new([0.5, 0.5, 0.5], 0.8, 0.0)];
         let source = if materials.is_empty() {
