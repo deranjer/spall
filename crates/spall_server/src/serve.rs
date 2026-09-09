@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::replication::{BodyDigest, ClientReplication, InterestSet, MotionBudget};
 use glam::DVec3;
 use serde::Serialize;
 use spall_core::{
@@ -239,7 +240,45 @@ pub struct ServeConfig {
     /// asleep (still bounded by [`Self::max_ticks`]). Off by default so ordinary
     /// runs still stop as soon as the edit pipeline is idle.
     pub await_body_settle: bool,
+    /// T20: per-client interest relevance + motion bandwidth policy. `None`
+    /// keeps the pre-T20 behaviour — one 20 Hz motion batch broadcast
+    /// unfiltered to every client. `Some(_)` filters each client's motion to
+    /// its interest set, tiers `Far` bodies onto a reduced cadence, and caps
+    /// each client's per-batch motion bytes.
+    pub motion_interest: Option<MotionInterest>,
 }
+
+/// T20 per-client interest + motion bandwidth policy for a [`serve`] run.
+///
+/// `docs/protocol.md` ("Network budget and overload behavior"): "Prioritize
+/// players, imminent contacts, nearby moving bodies … send distant/sleeping
+/// bodies less frequently with periodic keyframes."
+#[derive(Debug, Clone, Copy)]
+pub struct MotionInterest {
+    /// A body whose bounds are within this distance of a client's anchor is
+    /// replicated every 20 Hz batch.
+    pub near_radius_m: f64,
+    /// Out to this distance a body is replicated on the reduced `far_interval`
+    /// cadence; beyond it (plus hysteresis) a non-player body is not replicated
+    /// to that client at all.
+    pub far_radius_m: f64,
+    /// Send `Far`-tier snapshots only on every Nth 20 Hz batch (`1` or `0` =
+    /// every batch).
+    pub far_interval: u64,
+    /// Per-client, per-batch motion byte ceiling, accounted at
+    /// [`crate::MOTION_SNAPSHOT_WIRE_BYTES`] per snapshot (`0` = no ceiling). When it
+    /// bites, the lowest-priority motion (far, then sleeping) is deferred to the
+    /// next batch — committed topology is never affected.
+    pub per_client_budget_bytes: usize,
+    /// Interest anchor for a client on a scene with no player capsule (the
+    /// bridge scenes). `None` there leaves that client unfiltered
+    /// ([`InterestSet::Global`]).
+    pub static_anchor_m: Option<[f64; 3]>,
+}
+
+/// A player capsule's bounding radius for interest tests, metres. Small and
+/// fixed — a player is prioritised and never `Excluded` regardless.
+const PLAYER_INTEREST_RADIUS_M: f64 = 1.0;
 
 impl ServeConfig {
     /// A headless bounded config for `scene` on `listen` with `token`.
@@ -267,6 +306,7 @@ impl ServeConfig {
             dev_unvalidated_actions: false,
             save_faults: None,
             await_body_settle: false,
+            motion_interest: None,
         }
     }
 }
@@ -331,6 +371,29 @@ pub struct ServeSummary {
     /// ENG-48: `RepairRequest`s dropped because their session exceeded
     /// [`MAX_REPAIRS_PER_CLIENT_PER_TICK`] this tick.
     pub inbound_repairs_throttled: u64,
+    /// T20: motion snapshots actually sent this run, summed over every client
+    /// and batch. With `motion_interest` unset this is `batches * bodies *
+    /// clients`; with it set, interest-culled and cadence-deferred snapshots are
+    /// not counted here.
+    pub motion_snapshots_sent: u64,
+    /// T20: motion snapshots withheld because the body was outside a client's
+    /// interest set (`Relevance::Excluded`). `0` when `motion_interest` is unset.
+    pub motion_snapshots_interest_culled: u64,
+    /// T20: motion snapshots deferred to a later batch by the `Far` cadence or
+    /// the per-client byte ceiling — motion is superseded, so this is a
+    /// bandwidth measure, not lost geometry. `0` when `motion_interest` is unset.
+    pub motion_snapshots_budget_deferred: u64,
+    /// T20: largest single-batch motion payload sent to one client, accounted
+    /// bytes ([`crate::MOTION_SNAPSHOT_WIRE_BYTES`] each).
+    pub max_client_motion_batch_bytes: u64,
+    /// T20: total **application** bytes this host sent across every client
+    /// connection (control records + datagrams + bulk parts, excluding QUIC
+    /// framing) — `spall_net`'s own `app_bytes_sent` counter.
+    pub app_egress_bytes: u64,
+    /// T20: total **transport** bytes this host sent across every client
+    /// connection — Quinn's `udp_tx.bytes`, i.e. actual UDP payload on the wire
+    /// including QUIC framing and retransmission.
+    pub transport_egress_bytes: u64,
 }
 
 /// Anything that stops a [`serve`] run.
@@ -611,6 +674,13 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     ))?;
 
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+    // T20 egress accounting: live connection handles (for a final stats read at
+    // teardown) plus the summed `(app_bytes, transport_bytes)` of connections
+    // that already closed. A closing `serve_conn` removes itself from `conns`
+    // and folds its final counts into `egress_closed` under the `conns` lock, so
+    // teardown counts every connection exactly once.
+    let conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let egress_closed: Arc<Mutex<(u64, u64)>> = Arc::new(Mutex::new((0, 0)));
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -619,6 +689,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let accept = {
         let server = server.clone();
         let clients = clients.clone();
+        let conns = conns.clone();
+        let egress_closed = egress_closed.clone();
         let inbound_tx = inbound_tx.clone();
         let stop_rx = stop_rx.clone();
         let max_clients = config.max_clients;
@@ -650,11 +722,17 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(conn.session().raw(), handle.clone());
+                conns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(conn.session().raw(), conn.clone());
                 tokio::spawn(serve_conn(
                     conn,
                     inbound_tx.clone(),
                     handle,
                     clients.clone(),
+                    conns.clone(),
+                    egress_closed.clone(),
                     stop_rx.clone(),
                 ));
             }
@@ -697,6 +775,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let max_ticks = config.max_ticks;
     let quiescence = config.quiescence_ticks;
     let await_body_settle = config.await_body_settle;
+    let motion_interest = config.motion_interest;
     let scene = config.scene;
     let clients_for_sim = clients.clone();
     let save = config.save.clone();
@@ -743,6 +822,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
         let tick_dt = Duration::from_nanos(1_000_000_000 / 60);
+
+        // T20: per-client interest / bandwidth state and run counters. Empty and
+        // untouched unless `motion_interest` is configured.
+        let mut client_repl: HashMap<u64, ClientReplication> = HashMap::new();
+        let mut motion_batch_index = 0u64;
+        let mut motion_egress = MotionEgress::default();
 
         // ENG-61: rolling "every detached body is holding still" window. Each
         // tick we compare every body's origin Y against the previous tick; a run
@@ -930,12 +1015,38 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
                 broadcast(&clients_for_sim, Outbound::Status(Arc::new(status)));
             }
-            // The 20 Hz motion batch: broadcast it to replicas *and* keep it for
-            // the durable pose journal below.
+            // The 20 Hz motion batch: send it to replicas *and* keep the full
+            // batch for the durable pose journal below (durability is never
+            // interest-filtered).
             let pose_batch: Option<Vec<MotionSnapshot>> = if motion.due(tick) {
                 let snaps = motion.snapshots(sim.world(), tick);
                 if !snaps.is_empty() {
-                    broadcast(&clients_for_sim, Outbound::Motion(Arc::new(snaps.clone())));
+                    match motion_interest {
+                        // Pre-T20: one batch, broadcast unfiltered.
+                        None => {
+                            let recipients = clients_for_sim
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .len() as u64;
+                            broadcast(&clients_for_sim, Outbound::Motion(Arc::new(snaps.clone())));
+                            motion_egress.snapshots_sent += snaps.len() as u64 * recipients;
+                        }
+                        // T20: per-client interest relevance + bandwidth budget.
+                        Some(mi) => {
+                            dispatch_motion_by_interest(
+                                &mi,
+                                scene,
+                                motion_batch_index,
+                                &snaps,
+                                &sim,
+                                &lj,
+                                &clients_for_sim,
+                                &mut client_repl,
+                                &mut motion_egress,
+                            );
+                        }
+                    }
+                    motion_batch_index += 1;
                 }
                 Some(snaps)
             } else {
@@ -1115,6 +1226,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             baseline_bytes_sent: lj.baseline_bytes,
             actions_throttled,
             repairs_throttled,
+            motion_snapshots_sent: motion_egress.snapshots_sent,
+            motion_snapshots_interest_culled: motion_egress.interest_culled,
+            motion_snapshots_budget_deferred: motion_egress.budget_deferred,
+            max_client_motion_batch_bytes: motion_egress.max_client_batch_bytes,
         }
     });
 
@@ -1127,6 +1242,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     server.close();
     let _ = tokio::time::timeout(Duration::from_secs(3), server.wait_idle()).await;
     let _ = accept.await;
+
+    // T20: total egress. Hold the `conns` lock across the whole read so a
+    // late-closing `serve_conn` can neither remove-and-accumulate an entry
+    // concurrently (it takes the same lock first) nor be missed — every
+    // connection is counted once, here or in `egress_closed`.
+    let (app_egress_bytes, transport_egress_bytes) = {
+        let conns_guard = conns.lock().unwrap_or_else(|e| e.into_inner());
+        let mut acc = egress_closed.lock().unwrap_or_else(|e| e.into_inner());
+        for conn in conns_guard.values() {
+            acc.0 = acc.0.saturating_add(conn.stats().app_bytes_sent);
+            acc.1 = acc.1.saturating_add(conn.transport_stats().udp_tx.bytes);
+        }
+        (acc.0, acc.1)
+    };
 
     let clients_connected = *count_rx.borrow();
     let result = if sim_result.ok { "passed" } else { "failed" };
@@ -1144,7 +1273,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     ))?;
 
     let summary = ServeSummary {
-        version: 1,
+        version: 2,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -1172,6 +1301,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         baseline_bytes_sent: sim_result.baseline_bytes_sent,
         inbound_actions_throttled: sim_result.actions_throttled,
         inbound_repairs_throttled: sim_result.repairs_throttled,
+        motion_snapshots_sent: sim_result.motion_snapshots_sent,
+        motion_snapshots_interest_culled: sim_result.motion_snapshots_interest_culled,
+        motion_snapshots_budget_deferred: sim_result.motion_snapshots_budget_deferred,
+        max_client_motion_batch_bytes: sim_result.max_client_motion_batch_bytes,
+        app_egress_bytes,
+        transport_egress_bytes,
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -1214,6 +1349,10 @@ struct SimResult {
     baseline_bytes_sent: u64,
     actions_throttled: u64,
     repairs_throttled: u64,
+    motion_snapshots_sent: u64,
+    motion_snapshots_interest_culled: u64,
+    motion_snapshots_budget_deferred: u64,
+    max_client_motion_batch_bytes: u64,
 }
 
 impl SimResult {
@@ -1244,6 +1383,10 @@ impl SimResult {
             baseline_bytes_sent: 0,
             actions_throttled: 0,
             repairs_throttled: 0,
+            motion_snapshots_sent: 0,
+            motion_snapshots_interest_culled: 0,
+            motion_snapshots_budget_deferred: 0,
+            max_client_motion_batch_bytes: 0,
         }
     }
 }
@@ -1322,6 +1465,17 @@ impl LateJoin {
         // Keep `latest_gen` so a straggler record from this session is still
         // rejected after the link is gone.
         self.links.remove(&session.raw());
+    }
+
+    /// Every connected client currently in normal (`Live`) replication. A client
+    /// still pulling a late-join baseline is excluded — it gets a motion
+    /// keyframe when its catch-up barrier is reached, not the live 20 Hz feed
+    /// (`docs/protocol.md` late-join step 4).
+    fn live_sessions(&self) -> impl Iterator<Item = SessionId> + '_ {
+        self.links
+            .values()
+            .filter(|link| matches!(link.phase, Phase::Live))
+            .map(|link| link.session)
     }
 
     /// `true` if `session`'s generation has been superseded by a reconnect on
@@ -1870,6 +2024,113 @@ fn admit(counts: &mut HashMap<u64, u32>, session: u64, cap: u32) -> bool {
     true
 }
 
+/// T20: a [`BodyDigest`] per authoritative body **and** per player capsule,
+/// keyed by entity id, for this motion batch. The body centre is its pose
+/// origin and its interest radius is half the diagonal of the collider region
+/// box — a conservative bound (the origin need not be the box centre), which
+/// only ever keeps a body *more* relevant.
+fn build_body_digests(world: &SimWorld) -> HashMap<u64, BodyDigest> {
+    let mut digests: HashMap<u64, BodyDigest> = HashMap::new();
+    for body in world.bodies() {
+        let Some(entity) = body.entity else { continue };
+        let (lo, hi) = body.collider_region;
+        let cs = body.cell_size().metres();
+        let ex = (hi.x - lo.x + 1) as f64 * cs;
+        let ey = (hi.y - lo.y + 1) as f64 * cs;
+        let ez = (hi.z - lo.z + 1) as f64 * cs;
+        digests.insert(
+            entity.get(),
+            BodyDigest {
+                key: entity.get(),
+                center_m: body.pose.translation_m,
+                radius_m: 0.5 * (ex * ex + ey * ey + ez * ez).sqrt(),
+                is_player: false,
+                sleeping: body.sleeping,
+            },
+        );
+    }
+    for player in world.players() {
+        digests.insert(
+            player.entity.get(),
+            BodyDigest {
+                key: player.entity.get(),
+                center_m: player.state.position_m,
+                radius_m: PLAYER_INTEREST_RADIUS_M,
+                is_player: true,
+                sleeping: false,
+            },
+        );
+    }
+    digests
+}
+
+/// Run totals for the T20 motion path, accumulated across every batch and
+/// client. All zero (and untouched) unless `motion_interest` is configured.
+#[derive(Debug, Default)]
+struct MotionEgress {
+    snapshots_sent: u64,
+    interest_culled: u64,
+    budget_deferred: u64,
+    max_client_batch_bytes: u64,
+}
+
+/// T20: route one 20 Hz motion batch to each live client filtered by its
+/// interest set and bandwidth budget. Committed topology is untouched — only
+/// motion, which the next batch supersedes, is ever withheld here.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_motion_by_interest(
+    mi: &MotionInterest,
+    scene: Scene,
+    batch_index: u64,
+    snaps: &[MotionSnapshot],
+    sim: &Simulation,
+    lj: &LateJoin,
+    clients: &ClientMap,
+    client_repl: &mut HashMap<u64, ClientReplication>,
+    egress: &mut MotionEgress,
+) {
+    let world = sim.world();
+    let digests = build_body_digests(world);
+    let budget = MotionBudget {
+        far_interval: mi.far_interval,
+        per_batch_bytes: mi.per_client_budget_bytes,
+    };
+
+    for session in lj.live_sessions() {
+        // The client's interest anchor: its own player capsule on a player
+        // scene, else the configured static anchor, else unfiltered.
+        let own_entity = scene.has_players().then(|| session_player_entity(session));
+        let own_player_key = own_entity.map(|e| e.get());
+        let anchor = match own_entity {
+            Some(entity) => world
+                .players()
+                .find(|p| p.entity == entity)
+                .map(|p| p.state.position_m),
+            None => mi.static_anchor_m,
+        };
+        let interest = match anchor {
+            Some(center_m) => InterestSet::Anchored {
+                center_m,
+                near_radius_m: mi.near_radius_m,
+                far_radius_m: mi.far_radius_m,
+            },
+            None => InterestSet::Global,
+        };
+
+        let repl = client_repl.entry(session.raw()).or_default();
+        repl.set_interest(interest);
+        let kept = repl.select(batch_index, own_player_key, snaps, &digests, &budget);
+        let outcome = repl.last_outcome();
+        egress.snapshots_sent += outcome.kept;
+        egress.interest_culled += outcome.interest_culled;
+        egress.budget_deferred += outcome.budget_deferred;
+        egress.max_client_batch_bytes = egress.max_client_batch_bytes.max(outcome.bytes as u64);
+        if !kept.is_empty() {
+            send_to(clients, session, Outbound::Motion(Arc::new(kept)));
+        }
+    }
+}
+
 /// Fans one message to every client. A client whose reliable backlog blew its
 /// bound ([`OutboundOverflow`]) is dropped from the fan-out set here; its
 /// writer task flushes the already-accepted backlog and then closes the
@@ -1964,6 +2225,8 @@ async fn serve_conn(
     inbound: mpsc::Sender<Inbound>,
     handle: OutboundHandle,
     clients: ClientMap,
+    conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
+    egress_closed: Arc<Mutex<(u64, u64)>>,
     stop: watch::Receiver<bool>,
 ) {
     debug_assert_eq!(conn.role(), Role::Server);
@@ -2090,6 +2353,17 @@ async fn serve_conn(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&session.raw());
+    // T20 egress accounting: fold this connection's final byte counters into the
+    // closed-connection accumulator and drop its handle, both under the `conns`
+    // lock so teardown counts every connection exactly once.
+    {
+        let mut conns_guard = conns.lock().unwrap_or_else(|e| e.into_inner());
+        if conns_guard.remove(&session.raw()).is_some() {
+            let mut acc = egress_closed.lock().unwrap_or_else(|e| e.into_inner());
+            acc.0 = acc.0.saturating_add(conn.stats().app_bytes_sent);
+            acc.1 = acc.1.saturating_add(conn.transport_stats().udp_tx.bytes);
+        }
+    }
     conn.close("connection complete");
     reader.abort();
     dgram_reader.abort();

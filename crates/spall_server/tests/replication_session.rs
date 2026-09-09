@@ -78,6 +78,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         dev_unvalidated_actions: true,
         save_faults: None,
         await_body_settle: false,
+        motion_interest: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -181,6 +182,7 @@ fn server_persists_and_recovers_across_a_restart() {
         dev_unvalidated_actions: true,
         save_faults: None,
         await_body_settle: false,
+        motion_interest: None,
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {
@@ -293,6 +295,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         dev_unvalidated_actions: false,
         save_faults: Some(FaultPlan::disk_fail_checkpoint()),
         await_body_settle: false,
+        motion_interest: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(cfg));

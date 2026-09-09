@@ -155,6 +155,27 @@ prediction` (predictor vs. a live `spall_sim::Simulation` through an injected
 100 ms link — convergence, floor-removal-no-hover, lost-button-release).
 Interactive window input and full moving-body crush outcomes remain unrun /
 follow-up.
+T20 (increment 1) adds opt-in per-client interest + motion bandwidth
+scheduling to the host: `sandbox-server --serve --motion-interest`
+(with `--motion-near-m` / `--motion-far-m` / `--motion-far-interval` /
+`--motion-client-budget-bytes` / `--motion-static-anchor`) filters each live
+client's 20 Hz `MotionSnapshot` batch to its interest set, tiers `Far` bodies
+onto a reduced cadence, and caps per-client per-batch motion bytes. Without the
+flag the host is byte-for-byte unchanged (`g1-networked-destruction`,
+`body-rest-on-structure`, `player-movement` reproduce their recorded hashes).
+`ServeSummary` is now `version: 2` with `motion_snapshots_sent` /
+`_interest_culled` / `_budget_deferred`, `max_client_motion_batch_bytes`, and
+`app_egress_bytes` + `transport_egress_bytes` (Quinn `udp_tx.bytes`) summed
+over every connection. CPU acceptance: `cargo test -p spall_server
+replication::` (interest tiers, hysteresis, `far_interval` cadence, the byte
+ceiling shedding lowest-priority motion first) and `cargo test -p spall_server
+--test interest_bandwidth` (a scene-covering interest set changes nothing and
+reports real egress; a far static anchor culls the detached body's motion
+entirely while every committed transaction still reaches the client and the
+hashes agree). The full G4 eight-client separated-interest bandwidth scenario
+(<= 256 KiB/s/client steady egress, topology backlog drains after a blast,
+join not starved) and its xtask acceptance assertions remain follow-up — they
+need a world larger than the current 64 x 32 x 64 m / walk-arena fixtures.
 `bench` still returns an explicit unavailable-capability result until its listed
 task is delivered. All numerical limits are provisional acceptance targets. None
 is a measured result.
