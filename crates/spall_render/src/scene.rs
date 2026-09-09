@@ -1,5 +1,4 @@
-//! A camera, a set of placed meshes, and a material palette — everything a
-//! capture needs.
+//! A camera, placed meshes, and linear-light material data.
 
 use glam::{Mat4, Vec3};
 use spall_mesh::Mesh;
@@ -49,8 +48,8 @@ impl SceneItem {
 pub struct Scene {
     pub camera: Camera,
     pub items: Vec<SceneItem>,
-    /// Linear RGBA colour per material id.
-    pub palette: Vec<[f32; 4]>,
+    /// Linear-light PBR material per material id.
+    pub materials: Vec<Material>,
     /// Linear clear colour.
     pub clear: [f64; 4],
 }
@@ -60,7 +59,7 @@ impl Scene {
         Self {
             camera,
             items: Vec::new(),
-            palette: default_palette(),
+            materials: default_materials(),
             clear: [0.017, 0.03, 0.06, 1.0],
         }
     }
@@ -101,19 +100,39 @@ impl Scene {
     }
 }
 
-/// A small linear-RGB palette keyed by the fixture material ids
-/// (`0 = air`, `1 = stone`, `2 = dirt`, ...). Real worlds supply their own from
-/// the material manifest.
-pub fn default_palette() -> Vec<[f32; 4]> {
+/// Material properties consumed by the direct-light pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Material {
+    /// Linear (not display/sRGB) reflectance.
+    pub base_color: [f32; 3],
+    /// Perceptual roughness in `[0, 1]`.
+    pub roughness: f32,
+    /// Metallic fraction in `[0, 1]`.
+    pub metallic: f32,
+}
+
+impl Material {
+    pub const fn new(base_color: [f32; 3], roughness: f32, metallic: f32) -> Self {
+        Self {
+            base_color,
+            roughness,
+            metallic,
+        }
+    }
+}
+
+/// Fixture materials keyed by material id (`0 = air`, `1 = stone`, ...).
+/// Real worlds build this table from their material manifest.
+pub fn default_materials() -> Vec<Material> {
     vec![
-        [0.0, 0.0, 0.0, 1.0],    // 0 air (unused)
-        [0.42, 0.44, 0.47, 1.0], // 1 stone
-        [0.36, 0.26, 0.16, 1.0], // 2 dirt
-        [0.20, 0.45, 0.18, 1.0], // 3 grass
-        [0.62, 0.55, 0.38, 1.0], // 4 sand
-        [0.70, 0.20, 0.16, 1.0], // 5 brick
-        [0.14, 0.30, 0.55, 1.0], // 6 metal
-        [0.85, 0.85, 0.90, 1.0], // 7 chalk
+        Material::new([0.0, 0.0, 0.0], 1.0, 0.0),      // 0 air
+        Material::new([0.42, 0.44, 0.47], 0.86, 0.0),  // 1 stone
+        Material::new([0.36, 0.26, 0.16], 0.94, 0.0),  // 2 dirt
+        Material::new([0.20, 0.45, 0.18], 0.90, 0.0),  // 3 grass
+        Material::new([0.62, 0.55, 0.38], 0.82, 0.0),  // 4 sand
+        Material::new([0.70, 0.20, 0.16], 0.78, 0.0),  // 5 brick
+        Material::new([0.14, 0.30, 0.55], 0.28, 0.82), // 6 metal
+        Material::new([0.85, 0.85, 0.90], 0.96, 0.0),  // 7 chalk
     ]
 }
 

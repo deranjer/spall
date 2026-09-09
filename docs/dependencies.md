@@ -175,6 +175,14 @@ Transitive crates newly locked by `image` with only the `png` feature:
 `pxfm 0.1.30` (`miniz_oxide` is already present via wgpu) — all
 `MIT`/`MIT OR Apache-2.0`/`Zlib`.
 
+## T12 — material and direct-light pipeline (verified 2026-09-08)
+
+No new dependency or Cargo feature is introduced. The cascaded shadow maps,
+linear `Rgba16Float` target, comparison sampling, timestamp queries, GGX
+shading, and tone-map pass all use the pinned `wgpu 24.0.5`; material/cascade
+uniforms reuse `bytemuck 1.25.2` and camera math reuses `glam 0.33.6`.
+The server dependency graph remains GPU-free.
+
 ## T06 — editable voxel collision feasibility (verified 2026-09-07)
 
 `spall_physics` adds the physics solver named in `README.md`. It is the only

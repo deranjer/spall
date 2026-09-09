@@ -36,7 +36,19 @@ impl RenderContext {
     /// host has no usable GPU — the caller maps that to the "missing
     /// environment capability" exit code.
     pub fn headless() -> Result<Self, RenderError> {
-        let instance = wgpu::Instance::default();
+        let requested_backends = match std::env::var("SPALL_WGPU_BACKEND").as_deref() {
+            Ok("dx12") => wgpu::Backends::DX12,
+            Ok("vulkan") => wgpu::Backends::VULKAN,
+            // The pinned wgpu 24 Vulkan path crashes in the NVIDIA Windows
+            // driver when this renderer samples a comparison depth array.
+            // D3D12 is the stable native baseline; Vulkan remains explicit.
+            _ if cfg!(target_os = "windows") => wgpu::Backends::DX12,
+            _ => wgpu::Backends::all(),
+        };
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: requested_backends,
+            ..Default::default()
+        });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
@@ -47,7 +59,10 @@ impl RenderContext {
         // Opt into render-pass timestamp queries when (and only when) the adapter
         // reports support. Where they are unavailable the capture path reports
         // GPU timing as unavailable rather than substituting a CPU figure.
-        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        // The opt-out is useful for diagnosing driver timestamp-query faults;
+        // normal captures keep queries enabled and must report real GPU time.
+        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+            && std::env::var_os("SPALL_DISABLE_GPU_TIMESTAMPS").is_none();
         let required_features = if timestamps {
             wgpu::Features::TIMESTAMP_QUERY
         } else {

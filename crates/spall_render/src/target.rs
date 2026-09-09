@@ -1,7 +1,7 @@
 //! An offscreen colour + depth target and RGBA readback.
 
 use crate::context::{RenderContext, RenderError};
-use crate::pipeline::{COLOR_FORMAT, DEPTH_FORMAT};
+use crate::pipeline::{COLOR_FORMAT, DEPTH_FORMAT, HDR_FORMAT};
 
 const ROW_ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
@@ -11,6 +11,8 @@ pub struct OffscreenTarget {
     pub height: u32,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    _hdr: wgpu::Texture,
+    hdr_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     readback: wgpu::Buffer,
     padded_bytes_per_row: u32,
@@ -34,6 +36,16 @@ impl OffscreenTarget {
             dimension: wgpu::TextureDimension::D2,
             format: COLOR_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let hdr = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("spall-capture-hdr"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let depth = device.create_texture(&wgpu::TextureDescriptor {
@@ -61,6 +73,8 @@ impl OffscreenTarget {
             height,
             color_view: color.create_view(&wgpu::TextureViewDescriptor::default()),
             color,
+            hdr_view: hdr.create_view(&wgpu::TextureViewDescriptor::default()),
+            _hdr: hdr,
             depth_view: depth.create_view(&wgpu::TextureViewDescriptor::default()),
             readback,
             padded_bytes_per_row,
@@ -69,6 +83,10 @@ impl OffscreenTarget {
 
     pub fn color_view(&self) -> &wgpu::TextureView {
         &self.color_view
+    }
+
+    pub fn hdr_view(&self) -> &wgpu::TextureView {
+        &self.hdr_view
     }
 
     pub fn depth_view(&self) -> &wgpu::TextureView {

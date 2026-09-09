@@ -14,7 +14,7 @@ use spall_render::{
 
 #[test]
 #[ignore = "requires a working GPU adapter"]
-fn every_acceptance_shape_captures_three_non_empty_images() {
+fn every_acceptance_shape_captures_all_t12_debug_images() {
     let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored capture test");
 
     let out_root = std::env::temp_dir().join(format!("spall-capture-gpu-{}", std::process::id()));
@@ -64,8 +64,8 @@ fn every_acceptance_shape_captures_three_non_empty_images() {
 
         assert_eq!(
             report.images.len(),
-            3,
-            "{}: shaded + normals + depth",
+            6,
+            "{}: shaded + albedo + normals + depth + cascades + roughness",
             shape.name
         );
         assert_eq!(
@@ -104,9 +104,93 @@ fn every_acceptance_shape_captures_three_non_empty_images() {
             "{}: shaded image looks empty ({bright} lit px)",
             shape.name
         );
+
+        // Stone's linear 0.42 reflectance should land around sRGB 173 in the
+        // albedo view. Values near 107 indicate a missing transfer; values
+        // above 205 indicate it was applied twice.
+        if shape.name == "cube" {
+            let albedo = report
+                .images
+                .iter()
+                .find(|image| image.view == DebugView::Albedo)
+                .unwrap();
+            let pixels = image::open(&albedo.path).unwrap().to_rgb8();
+            let correctly_encoded = pixels
+                .pixels()
+                .filter(|pixel| {
+                    let [r, g, b] = pixel.0;
+                    (150..=195).contains(&r) && (150..=200).contains(&g) && (150..=205).contains(&b)
+                })
+                .count();
+            assert!(
+                correctly_encoded > pixels.pixels().len() / 50,
+                "linear albedo was not encoded to sRGB exactly once"
+            );
+        }
     }
 
     let _ = fs::remove_dir_all(&out_root);
+}
+
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn a_transformed_body_casts_a_shadow_onto_static_geometry() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let shapes = acceptance_shapes();
+    let cube = shapes.iter().find(|shape| shape.name == "cube").unwrap();
+    let mesh = mesh_shape(&cube.volume, MeshStrategy::Greedy).mesh;
+    let mut scene = Scene::new(Camera {
+        aspect: 1.0,
+        ..Default::default()
+    })
+    .with_item(SceneItem::new(
+        "ground",
+        mesh.clone(),
+        Mat4::from_scale(Vec3::new(4.0, 0.2, 4.0)),
+    ))
+    .with_item(SceneItem::new(
+        "moving-body",
+        mesh,
+        Mat4::from_translation(Vec3::new(0.4, 1.4, 0.2)) * Mat4::from_rotation_y(0.55),
+    ));
+    scene.frame_all(Vec3::new(1.1, 0.8, 1.2));
+    let dir = std::env::temp_dir().join(format!("spall-t12-shadow-{}", std::process::id()));
+    let report = capture_scene(
+        &ctx,
+        &scene,
+        &dir,
+        &CaptureOptions {
+            width: 512,
+            height: 512,
+            views: vec![DebugView::Shaded, DebugView::ShadowCascades],
+            ..Default::default()
+        },
+    )
+    .expect("capture");
+    assert_eq!(report.items_drawn, 2);
+    assert!(report.timing.gpu_passes.is_some());
+    let shadow = report
+        .images
+        .iter()
+        .find(|image| image.view == DebugView::ShadowCascades)
+        .unwrap();
+    let pixels = image::open(&shadow.path).unwrap().to_rgb8();
+    let background = pixels.get_pixel(0, 0).0;
+    let dark = pixels
+        .pixels()
+        .filter(|pixel| {
+            let rgb = pixel.0;
+            let differs_from_background = rgb
+                .iter()
+                .zip(background)
+                .any(|(&channel, bg)| channel.abs_diff(bg) > 20);
+            let min = rgb.iter().copied().min().unwrap_or(0);
+            let max = rgb.iter().copied().max().unwrap_or(0);
+            differs_from_background && max - min > 20 && max < 150
+        })
+        .count();
+    assert!(dark > 32, "expected an observable shadowed region");
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// A plane at constant view-space Z must show constant depth across off-axis

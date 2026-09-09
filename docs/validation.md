@@ -9,14 +9,17 @@ every channel exercised, bounded teardown) that writes `summary.json`,
 `net.jsonl`, and `metrics.json`.
 T05 implements `cargo xtask capture`: offscreen greedy-meshed renders of the
 acceptance shapes (cube, tunnel, checkerboard, negative coordinates, adjacent
-bricks, rotated hollow volume) to a shaded PNG plus normal and depth debug
-images, with a `summary.json`; it exits 3 when no GPU adapter is available.
-Scene/camera fixture files and the lighting-quality capture stay T12/T13.
-The `summary.json` is schema `version: 2`. CPU and GPU costs are reported
+bricks, rotated hollow volume). T12 extends each capture to shaded, albedo,
+normal, linear-depth, shadow-cascade, and roughness PNGs using four sun-shadow
+cascades, a linear-HDR opaque pass, and fixed-exposure tone mapping.
+Each run also writes `summary.json`; it exits 3 when no GPU adapter is available.
+The colored-room/indirect-light fixture stays T13.
+The `summary.json` is schema `version: 3`. CPU and GPU costs are reported
 separately and must not be conflated: `gpu_render_millis` is a real device
 measurement from render-pass timestamp queries and is `null` (with
 `gpu_timing_available: false`) on adapters that do not support them — it is
-never a CPU-derived figure. `cpu_capture_millis` (whole render → readback →
+never a CPU-derived figure. T12 also reports `gpu_shadow_millis`,
+`gpu_opaque_millis`, and `gpu_tone_map_millis`. `cpu_capture_millis` (whole render → readback →
 PNG-encode loop), `cpu_readback_millis`, and `cpu_encode_millis` are CPU
 wall-clock and include the synchronous readback map wait and PNG compression.
 The pre-`version: 2` `gpu_millis` field measured that CPU loop, not the GPU, and
@@ -114,11 +117,10 @@ cargo xtask scenario --name destruction-network --loss-percent 5 --output .local
 # pulls a baseline over a bulk transfer, and catches up to the server hash.
 cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 
-# T05: offscreen renders of the acceptance shapes (shaded + normal + depth PNGs
-# and a summary.json). Needs a supported GPU/driver; exit 3 otherwise.
-cargo xtask capture --output .local/runs/t05-capture --width 1280 --height 720 --strategy greedy
-# T12/T13 extend capture with named lighting scenes and camera fixture files:
-cargo xtask capture --scene colored-room --camera fixtures/cameras/colored-room.toml --size 1920x1080 --frames 120 --output .local/runs/lighting
+# T12: stable acceptance cameras with six views and per-pass GPU timing.
+# Needs a supported GPU/driver; exit 3 otherwise.
+cargo xtask capture --output .local/runs/t12-1080p --width 1920 --height 1080 --strategy greedy
+# T13 adds the named colored-room/indirect-light fixture.
 
 # Release build, named fixture, fixed workload; emits machine-readable metrics.
 cargo xtask bench --suite engine-slice --clients 8 --warmup-seconds 30 --duration-seconds 120 --output .local/runs/bench
