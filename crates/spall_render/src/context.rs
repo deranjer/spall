@@ -38,10 +38,23 @@ impl RenderContext {
     pub fn headless() -> Result<Self, RenderError> {
         let requested_backends = match std::env::var("SPALL_WGPU_BACKEND").as_deref() {
             Ok("dx12") => wgpu::Backends::DX12,
-            Ok("vulkan") => wgpu::Backends::VULKAN,
-            // The pinned wgpu 24 Vulkan path crashes in the NVIDIA Windows
-            // driver when this renderer samples a comparison depth array.
-            // D3D12 is the stable native baseline; Vulkan remains explicit.
+            Ok("vulkan") => {
+                // The pinned wgpu 24 / naga 24 Vulkan path crashes the NVIDIA
+                // Windows driver (STATUS_ACCESS_VIOLATION) while compiling this
+                // renderer's pipelines — before any draw. D3D12 with the
+                // identical shaders is unaffected and is the accepted default.
+                // Diagnosis and the regression probe: docs/reports/ENG-60.md.
+                if cfg!(target_os = "windows") {
+                    eprintln!(
+                        "spall_render: SPALL_WGPU_BACKEND=vulkan forces a Windows backend that \
+                         crashes NVIDIA's driver during pipeline compilation (ENG-60); \
+                         unset it to use the supported D3D12 path."
+                    );
+                }
+                wgpu::Backends::VULKAN
+            }
+            // D3D12 is the stable native baseline on Windows; see the comment
+            // above and docs/reports/ENG-60.md.
             _ if cfg!(target_os = "windows") => wgpu::Backends::DX12,
             _ => wgpu::Backends::all(),
         };

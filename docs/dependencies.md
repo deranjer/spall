@@ -183,6 +183,22 @@ shading, and tone-map pass all use the pinned `wgpu 24.0.5`; material/cascade
 uniforms reuse `bytemuck 1.25.2` and camera math reuses `glam 0.33.6`.
 The server dependency graph remains GPU-free.
 
+### ENG-60 — Vulkan crash diagnosis (verified 2026-09-08)
+
+One crate is added to `spall_render`'s **`[dev-dependencies]` only**, used solely
+by the `vulkan_shadow_probe` example that reproduces and isolates the Vulkan
+pipeline-compile crash (`docs/reports/ENG-60.md`). It does not enter any library,
+binary, or the default test graph.
+
+| Dev dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by |
+| --- | ---: | --- | --- | --- |
+| naga | 24.0.0 | `wgsl-in`, `spv-out` | `MIT OR Apache-2.0` | `vulkan_shadow_probe spirv`: dump the SPIR-V naga hands the driver |
+
+`naga 24.0.0` is the exact version `wgpu 24.0.5` already locks transitively, so
+no new crate version is introduced — only the `wgsl-in` / `spv-out` features are
+newly built. The probe's optional `RUST_LOG=wgpu_hal=trace` output needs a `log`
+subscriber on the caller's path; none is vendored.
+
 ## T06 — editable voxel collision feasibility (verified 2026-09-07)
 
 `spall_physics` adds the physics solver named in `README.md`. It is the only

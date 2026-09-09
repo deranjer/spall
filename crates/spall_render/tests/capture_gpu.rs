@@ -4,13 +4,14 @@
 //! `cargo test -p spall_render -- --ignored` on a host with a working adapter.
 
 use std::fs;
+use std::process::Command;
 
 use glam::{Mat4, Vec3};
 use spall_mesh::fixtures::{acceptance_shapes, mesh_shape};
 use spall_mesh::{Mesh, MeshStrategy, Vertex};
 use spall_render::{
     Camera, CaptureOptions, DebugView, RenderContext, Scene, SceneItem, capture_scene,
-    colored_rooms,
+    colored_rooms, emitter_occlusion_scenes,
 };
 
 #[test]
@@ -277,43 +278,215 @@ fn depth_debug_view_is_flat_across_a_camera_facing_plane() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Mean sRGB luminance over the fractional image-x band `[band.0, band.1)`,
+/// full height. Geometry is identical across the compared captures, so clear
+/// pixels cancel and the band mean tracks receiver-wall brightness.
+fn band_mean_luminance(path: &std::path::Path, band: (f32, f32)) -> f64 {
+    let image = image::open(path).unwrap().to_rgb8();
+    let (w, h) = (image.width(), image.height());
+    let x0 = (band.0 * w as f32).round() as u32;
+    let x1 = ((band.1 * w as f32).round() as u32).min(w);
+    let mut sum = 0.0f64;
+    let mut count = 0u64;
+    for y in 0..h {
+        for x in x0..x1 {
+            let [r, g, b] = image.get_pixel(x, y).0;
+            sum += 0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b);
+            count += 1;
+        }
+    }
+    sum / count.max(1) as f64
+}
+
+/// Count receiver-band pixels whose sRGB luminance in `lit` exceeds the same
+/// pixel in `reference` by more than `delta` (8-bit units). With `reference`
+/// captured from an identical scene minus the emissive term, this is a direct
+/// pixel count of transported emitter light on the non-emissive receiver.
+fn transported_pixels(
+    lit: &std::path::Path,
+    reference: &std::path::Path,
+    band: (f32, f32),
+    delta: f64,
+) -> (u64, u64) {
+    let a = image::open(lit).unwrap().to_rgb8();
+    let b = image::open(reference).unwrap().to_rgb8();
+    assert_eq!(a.dimensions(), b.dimensions());
+    let (w, h) = a.dimensions();
+    let x0 = (band.0 * w as f32).round() as u32;
+    let x1 = ((band.1 * w as f32).round() as u32).min(w);
+    let luma =
+        |p: [u8; 3]| 0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2]);
+    let mut brighter = 0u64;
+    let mut total = 0u64;
+    for y in 0..h {
+        for x in x0..x1 {
+            total += 1;
+            if luma(a.get_pixel(x, y).0) - luma(b.get_pixel(x, y).0) > delta {
+                brighter += 1;
+            }
+        }
+    }
+    (brighter, total)
+}
+
 #[test]
 #[ignore = "requires a working GPU adapter"]
 fn colored_room_produces_real_indirect_only_pixels_and_separate_timings() {
     let ctx = RenderContext::headless().expect("GPU adapter");
-    let fixture = colored_rooms(16.0 / 9.0).remove(0);
-    assert!(fixture.metrics.closed_probe_luminance < fixture.metrics.open_probe_luminance);
-    assert!(fixture.metrics.thin_wall_leakage_ratio <= 0.05);
-    let dir = std::env::temp_dir().join(format!("spall-t13-colored-room-{}", std::process::id()));
-    let report = capture_scene(
-        &ctx,
-        &fixture.scene,
-        &dir,
-        &CaptureOptions {
-            width: 640,
-            height: 360,
-            views: vec![DebugView::IndirectOnly],
-            ..Default::default()
-        },
-    )
-    .expect("indirect capture");
-    assert!(report.indirect_enabled);
-    assert_eq!(report.indirect_cells, 128usize.pow(3));
+    let mut fixtures = colored_rooms(16.0 / 9.0);
+    let closed = fixtures.pop().unwrap();
+    let open = fixtures.pop().unwrap();
+    assert_eq!(open.name, "colored_room_open");
+    assert_eq!(closed.name, "colored_room_closed");
+
+    // CPU probe copy direction, restated so the rendered check below can be read
+    // against the frozen decision-document numbers.
+    assert!(open.metrics.closed_probe_luminance < open.metrics.open_probe_luminance);
+    assert!(open.metrics.thin_wall_leakage_ratio <= 0.05);
+
+    let opts = CaptureOptions {
+        width: 640,
+        height: 360,
+        views: vec![DebugView::IndirectOnly],
+        ..Default::default()
+    };
+    let root = std::env::temp_dir().join(format!("spall-t13-colored-room-{}", std::process::id()));
+    let open_report =
+        capture_scene(&ctx, &open.scene, &root.join("open"), &opts).expect("open indirect capture");
+    let closed_report = capture_scene(&ctx, &closed.scene, &root.join("closed"), &opts)
+        .expect("closed indirect capture");
+
+    assert!(open_report.indirect_enabled);
+    assert_eq!(open_report.indirect_cells, 128usize.pow(3));
     if ctx.supports_gpu_timestamps() {
-        let passes = report.timing.gpu_passes.expect("timestamp timings");
+        let passes = open_report.timing.gpu_passes.expect("timestamp timings");
         assert!(passes.indirect_trace_millis > 0.0);
         assert!(passes.indirect_denoise_millis > 0.0);
     } else {
-        assert!(report.timing.gpu_passes.is_none());
+        assert!(open_report.timing.gpu_passes.is_none());
     }
-    let image = image::open(&report.images[0].path).unwrap().to_rgb8();
-    let indirect_pixels = image
+
+    let open_image = image::open(&open_report.images[0].path).unwrap().to_rgb8();
+    let indirect_pixels = open_image
         .pixels()
         .filter(|pixel| pixel.0.iter().copied().max().unwrap_or(0) > 18)
         .count();
     assert!(
-        indirect_pixels > image.pixels().len() / 20,
+        indirect_pixels > open_image.pixels().len() / 20,
         "indirect-only image is empty"
     );
-    let _ = fs::remove_dir_all(&dir);
+
+    // Rendered through GPU trace + GPU denoise + surface sample, the closed roof
+    // darkens the room in the same direction the CPU probe copy reports.
+    let lit_wall = (0.30f32, 0.70f32);
+    let open_luminance = band_mean_luminance(&open_report.images[0].path, lit_wall);
+    let closed_luminance = band_mean_luminance(&closed_report.images[0].path, lit_wall);
+    assert!(
+        closed_luminance < open_luminance,
+        "closed room not darker in the render: open={open_luminance:.3} closed={closed_luminance:.3}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The T13 GPU-quality claim, validated on rendered pixels rather than the CPU
+/// probe copy: a non-emissive receiver wall brightens where the represented
+/// emitter can reach it, and one represented 0.5 m wall removes most of that
+/// transported light. Both measurements come out of `DebugView::IndirectOnly`
+/// captures, i.e. through the GPU trace, GPU denoise, and surface sample.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn indirect_only_render_shows_emitter_transport_and_wall_occlusion() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let scenes = emitter_occlusion_scenes(16.0 / 9.0);
+    let band = (scenes.receiver_band[0], scenes.receiver_band[1]);
+    let opts = CaptureOptions {
+        width: 640,
+        height: 360,
+        views: vec![DebugView::IndirectOnly],
+        ..Default::default()
+    };
+    let root = std::env::temp_dir().join(format!("spall-t13-occlusion-{}", std::process::id()));
+    let capture = |name: &str, scene: &Scene| {
+        capture_scene(&ctx, scene, &root.join(name), &opts)
+            .expect("indirect capture")
+            .images[0]
+            .path
+            .clone()
+    };
+    let lit = capture("lit", &scenes.lit);
+    let occluded = capture("occluded", &scenes.occluded);
+    let dark = capture("dark", &scenes.dark);
+
+    let (lit_transport, band_pixels) = transported_pixels(&lit, &dark, band, 6.0);
+    let (occluded_transport, _) = transported_pixels(&occluded, &dark, band, 6.0);
+
+    // The emitter reaches the non-emissive receiver in the render at all.
+    assert!(
+        lit_transport > band_pixels / 12,
+        "no rendered emitter transport on the receiver: {lit_transport}/{band_pixels} px"
+    );
+    // One represented 0.5 m wall between the panel and this band removes at
+    // least half of the transported pixels (the CPU probe copy measures ~0).
+    assert!(
+        occluded_transport * 2 <= lit_transport,
+        "represented 0.5 m wall did not occlude the render: lit={lit_transport} occluded={occluded_transport}"
+    );
+    // And it is darker on the mean, not just on a pixel count.
+    let lit_mean = band_mean_luminance(&lit, band);
+    let occluded_mean = band_mean_luminance(&occluded, band);
+    let dark_mean = band_mean_luminance(&dark, band);
+    assert!(
+        occluded_mean < lit_mean && dark_mean <= occluded_mean + 1.0,
+        "band means inconsistent: lit={lit_mean:.3} occluded={occluded_mean:.3} dark={dark_mean:.3}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// ENG-60 regression watch. On Windows the pinned wgpu 24 / naga 24 Vulkan path
+/// crashes NVIDIA's driver (STATUS_ACCESS_VIOLATION) while compiling the T12
+/// pipelines — see `docs/reports/ENG-60.md`. This spawns the `vulkan_shadow_probe`
+/// example with the Vulkan backend forced and asserts it still crashes rather
+/// than completing. When a `wgpu`/`naga` upgrade or a new driver fixes it, this
+/// test starts failing: at that point re-run the full `capture_gpu` suite on
+/// Vulkan and, if it passes, drop the Windows D3D12-only guard in
+/// `RenderContext::headless` and delete this test.
+///
+/// Opt in with `SPALL_ENG60_RECHECK=1` because it shells out to `cargo run` and
+/// deliberately provokes a native crash.
+#[test]
+#[ignore = "ENG-60: opt in with SPALL_ENG60_RECHECK=1; provokes a native driver crash"]
+fn windows_vulkan_backend_still_crashes_compiling_t12_pipelines() {
+    if std::env::var_os("SPALL_ENG60_RECHECK").is_none() {
+        eprintln!("skipped: set SPALL_ENG60_RECHECK=1 to run the ENG-60 Vulkan recheck");
+        return;
+    }
+    if !cfg!(target_os = "windows") {
+        eprintln!("skipped: ENG-60 is a Windows/NVIDIA Vulkan driver fault");
+        return;
+    }
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(cargo)
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "spall_render",
+            "--example",
+            "vulkan_shadow_probe",
+            "--",
+            "case:pipelines",
+        ])
+        .env("SPALL_WGPU_BACKEND", "vulkan")
+        .status()
+        .expect("spawn vulkan_shadow_probe");
+
+    assert!(
+        !status.success(),
+        "ENG-60: ScenePipeline::new() completed on the Vulkan backend — the driver \
+         crash is gone. Re-validate the full capture_gpu suite on Vulkan and, if it \
+         passes, restore Vulkan as an accepted Windows backend (see docs/reports/ENG-60.md)."
+    );
 }

@@ -20,7 +20,10 @@ pub mod vertex;
 pub use camera::{Aabb, Camera, Frustum};
 pub use capture::{CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, capture_scene};
 pub use context::{RenderContext, RenderError};
-pub use fixtures::{LightingFixture, LightingFixtureMetrics, colored_rooms};
+pub use fixtures::{
+    EmitterOcclusionScenes, LightingFixture, LightingFixtureMetrics, colored_rooms,
+    emitter_occlusion_scenes,
+};
 pub use indirect::{LIGHT_CELL_SIZE_METRES, LIGHT_VOLUME_DIM, LightingVolume};
 pub use pipeline::{CASCADE_COUNT, DebugView, PassTiming, ScenePipeline};
 pub use scene::{Material, Scene, SceneItem, default_materials};

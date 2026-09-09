@@ -40,6 +40,108 @@ pub fn colored_rooms(aspect: f32) -> Vec<LightingFixture> {
     ]
 }
 
+/// Three scenes that share one non-emissive receiver wall, camera, and
+/// `128^3` cache. They differ only in the emissive term of the represented
+/// panel and in one represented `0.5 m` occluder, so a rendered
+/// `DebugView::IndirectOnly` capture isolates transported emitter radiance on
+/// a non-emissive receiver — and its leakage past the wall — entirely through
+/// the GPU trace, GPU denoise, and surface-sample path rather than the CPU
+/// probe copy.
+pub struct EmitterOcclusionScenes {
+    /// Emitter represented, no occluder: the receiver band sees the panel.
+    pub lit: Scene,
+    /// Emitter represented, one `0.5 m` wall cell column between panel and band.
+    pub occluded: Scene,
+    /// Panel cells set to plain stone: the sky/ambient floor with no transport.
+    pub dark: Scene,
+    /// Fractional image-x span `[x0, x1)` that views only receiver wall the
+    /// occluder shadows (left of the panel and of the occluder column).
+    pub receiver_band: [f32; 2],
+}
+
+pub fn emitter_occlusion_scenes(aspect: f32) -> EmitterOcclusionScenes {
+    let origin = Vec3::splat(-32.0);
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.5, 4.0),
+        yaw: 0.0,
+        pitch: 0.0,
+        aspect,
+        fov_y: 55_f32.to_radians(),
+        z_near: 0.1,
+        z_far: 40.0,
+    };
+
+    let mut receiver = Mesh::default();
+    quad(
+        &mut receiver,
+        [
+            Vec3::new(-6.0, 0.0, -5.75),
+            Vec3::new(6.0, 0.0, -5.75),
+            Vec3::new(6.0, 5.0, -5.75),
+            Vec3::new(-6.0, 5.0, -5.75),
+        ],
+        Vec3::Z,
+        1,
+    );
+    let mut panel = Mesh::default();
+    quad(
+        &mut panel,
+        [
+            Vec3::new(5.5, 1.0, -6.0),
+            Vec3::new(5.5, 1.0, -4.0),
+            Vec3::new(5.5, 4.0, -4.0),
+            Vec3::new(5.5, 4.0, -6.0),
+        ],
+        -Vec3::X,
+        10,
+    );
+
+    let volume = |panel_material: u32, occluder: bool| {
+        let mut v = LightingVolume::empty(origin);
+        // Receiver wall shell, one cache cell thick behind the raster quad.
+        fill_world_box(
+            &mut v,
+            Vec3::new(-6.0, 0.0, -6.0),
+            Vec3::new(6.0, 5.0, -5.5),
+            1,
+        );
+        // Emitter panel on the far +X side, outside the measured band.
+        fill_world_box(
+            &mut v,
+            Vec3::new(5.5, 1.0, -6.0),
+            Vec3::new(6.0, 4.0, -4.0),
+            panel_material,
+        );
+        if occluder {
+            // One represented 0.5 m wall between the panel and the band.
+            fill_world_box(
+                &mut v,
+                Vec3::new(2.0, 0.0, -6.0),
+                Vec3::new(2.5, 5.0, -2.0),
+                1,
+            );
+        }
+        v
+    };
+
+    let build = |lighting: LightingVolume| {
+        let mut scene = Scene::new(camera)
+            .with_item(SceneItem::new("receiver", receiver.clone(), Mat4::IDENTITY))
+            .with_item(SceneItem::new("panel", panel.clone(), Mat4::IDENTITY))
+            .with_lighting(lighting);
+        scene.materials = default_materials();
+        scene.clear = [0.003, 0.004, 0.008, 1.0];
+        scene
+    };
+
+    EmitterOcclusionScenes {
+        lit: build(volume(10, false)),
+        occluded: build(volume(10, true)),
+        dark: build(volume(1, false)),
+        receiver_band: [0.10, 0.42],
+    }
+}
+
 fn room_fixture(
     name: &'static str,
     closed: bool,

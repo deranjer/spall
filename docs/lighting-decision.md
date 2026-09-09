@@ -1,8 +1,9 @@
 # T13 indirect-light feasibility decision
 
-Status: accepted as the G2 baseline prototype on 2026-09-08. This freezes the
-resource/pass contract for T14, not final visual quality or a persistent world
-format.
+Status: proposed on 2026-09-08, pending review sign-off. It records the
+resource/pass contract intended to freeze for T14 — not final visual quality
+and not a persistent world format. Do not treat the contract as frozen until
+this document is marked accepted after review.
 
 ## Decision
 
@@ -61,6 +62,7 @@ Reproduce the measured fixture with:
 ```powershell
 cargo xtask capture --scene colored-room --width 1920 --height 1080 --output .local/runs/t13-lighting
 cargo test -p spall_render --test capture_gpu colored_room_produces_real_indirect_only_pixels_and_separate_timings -- --ignored --test-threads=1
+cargo test -p spall_render --test capture_gpu indirect_only_render_shows_emitter_transport_and_wall_occlusion -- --ignored --test-threads=1
 ```
 
 The command captures open- and closed-roof variants as both `shaded.png` and
@@ -84,6 +86,25 @@ The deterministic CPU copy of the shader trace measured probe luminance
 `0.368666` in the open room and `0.237972` in the closed room (35.4% darker).
 The same ray set measured `0.0` residual emitter contribution behind one aligned
 `0.5 m` occupied wall versus the unobstructed control.
+
+Those CPU-copy numbers are corroborated on rendered pixels by
+`indirect_only_render_shows_emitter_transport_and_wall_occlusion`, which reads
+only `DebugView::IndirectOnly` output — i.e. results that passed through the GPU
+trace, the GPU denoise, and the opaque surface sample. Against an
+emissive-term-removed control captured from the same geometry and cache, it
+requires that a non-emissive stone receiver wall brightens where the represented
+panel can reach it, and that inserting one represented `0.5 m` wall between the
+panel and the measured band removes at least half of those transported pixels
+and lowers the band mean. `colored_room_produces_real_indirect_only_pixels_and_separate_timings`
+additionally renders both roof variants and asserts the closed room is darker in
+the render, in the same direction as the probe copy. Rendered leakage past the
+represented wall is higher than the CPU `0.0` (denoise spread and the fixed
+diagonal rays), but stays a minority of the unoccluded transport.
+
+Rendered cross-GPU quality, temporal stability, and p95 frame cost remain
+unvalidated here and are T14/T15 acceptance work; this document should not be
+marked accepted until at least the single-adapter rendered controls above have
+been reviewed.
 
 ## Known limits and T14 contract
 
