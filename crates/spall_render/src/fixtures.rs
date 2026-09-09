@@ -4,8 +4,13 @@ use glam::{IVec3, Mat4, Vec3};
 use spall_mesh::{Mesh, MeshStats, MeshStrategy, Vertex};
 
 use crate::camera::Camera;
-use crate::indirect::LightingVolume;
+use crate::indirect::{LightingUpdate, LightingVolume};
 use crate::scene::{Scene, SceneItem, default_materials};
+
+/// The single represented `0.5 m` occluder column shared by
+/// [`emitter_occlusion_scenes`] and [`rapid_destruction`], in world metres.
+pub const OCCLUDER_MIN_M: Vec3 = Vec3::new(2.0, 0.0, -6.0);
+pub const OCCLUDER_MAX_M: Vec3 = Vec3::new(2.5, 5.0, -2.0);
 
 #[derive(Debug, Clone, Copy)]
 pub struct LightingFixtureMetrics {
@@ -114,12 +119,7 @@ pub fn emitter_occlusion_scenes(aspect: f32) -> EmitterOcclusionScenes {
         );
         if occluder {
             // One represented 0.5 m wall between the panel and the band.
-            fill_world_box(
-                &mut v,
-                Vec3::new(2.0, 0.0, -6.0),
-                Vec3::new(2.5, 5.0, -2.0),
-                1,
-            );
+            fill_world_box(&mut v, OCCLUDER_MIN_M, OCCLUDER_MAX_M, 1);
         }
         v
     };
@@ -139,6 +139,25 @@ pub fn emitter_occlusion_scenes(aspect: f32) -> EmitterOcclusionScenes {
         occluded: build(volume(10, true)),
         dark: build(volume(1, false)),
         receiver_band: [0.10, 0.42],
+    }
+}
+
+/// The T14 "rapid destruction" case: the occluded emitter scene plus the
+/// [`LightingUpdate`] that removes the represented `0.5 m` occluder column. A
+/// `capture_lighting_sequence` run applying `remove_occluder` must brighten the
+/// shadowed `receiver_band`.
+pub struct RapidDestruction {
+    pub scene: Scene,
+    pub remove_occluder: LightingUpdate,
+    pub receiver_band: [f32; 2],
+}
+
+pub fn rapid_destruction(aspect: f32) -> RapidDestruction {
+    let scenes = emitter_occlusion_scenes(aspect);
+    RapidDestruction {
+        scene: scenes.occluded,
+        remove_occluder: LightingUpdate::new().dirty_bound(OCCLUDER_MIN_M, OCCLUDER_MAX_M),
+        receiver_band: scenes.receiver_band,
     }
 }
 
@@ -391,6 +410,34 @@ mod tests {
         assert_eq!(
             fixtures[0].scene.lighting.as_ref().unwrap().cells().len(),
             128usize.pow(3)
+        );
+    }
+
+    #[test]
+    fn rapid_destruction_removes_the_occluder_and_reexposes_the_shadow() {
+        let rd = rapid_destruction(16.0 / 9.0);
+        let materials = default_materials();
+        let mut volume = rd.scene.lighting.as_ref().unwrap().clone();
+
+        // A point in front of the receiver wall whose +x fixed ray is blocked by
+        // the occluder column before it can reach the emitter panel.
+        let probe = Vec3::new(0.0, 2.5, -5.0);
+        let before = luminance(volume.probe_radiance(probe, &materials));
+
+        let changed = volume.apply_update(&rd.remove_occluder);
+        assert!(changed > 0, "the occluder column should have been cleared");
+        let after = luminance(volume.probe_radiance(probe, &materials));
+
+        assert!(
+            after > before + 0.05,
+            "removing the occluder did not re-expose the emitter: {before} -> {after}"
+        );
+        // Only the occluder column's cells (0.5 m x 5 m x 4 m = 1 x 10 x 8
+        // cache cells) are dirty.
+        assert!(
+            volume.dirty_len() <= 80,
+            "dirtied too much: {}",
+            volume.dirty_len()
         );
     }
 }

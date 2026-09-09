@@ -295,7 +295,15 @@ struct IndirectGlobals {
     origin_cell_size: [f32; 4],
     dimensions: [u32; 4],
     sky: [f32; 4],
+    /// T14 partial re-trace bounds, in cache cells; `w` unused. See
+    /// [`IndirectResources::set_trace_region`].
+    trace_region_min: [u32; 4],
+    trace_region_max: [u32; 4],
 }
+
+/// Byte offset of `trace_region_min` within [`IndirectGlobals`] — three
+/// preceding `vec4`s. `set_trace_region` writes 8 `u32` from here.
+const TRACE_REGION_OFFSET: u64 = 3 * 16;
 
 pub(crate) struct IndirectResources {
     pub(crate) trace_bind: wgpu::BindGroup,
@@ -304,11 +312,59 @@ pub(crate) struct IndirectResources {
     pub(crate) upload_millis: f64,
     pub(crate) enabled: bool,
     pub(crate) cells: usize,
-    _cells: wgpu::Buffer,
+    cell_buffer: wgpu::Buffer,
+    globals_buffer: wgpu::Buffer,
     _source_dummy: wgpu::Buffer,
     _trace: wgpu::Buffer,
     _denoised: wgpu::Buffer,
-    _globals: wgpu::Buffer,
+}
+
+impl IndirectResources {
+    /// Re-upload only the cells [`LightingVolume::take_dirty`] reported changed,
+    /// coalescing the sorted flat indices into contiguous runs so a scattered
+    /// edit is a few `write_buffer` calls, not one per cell. Returns the number
+    /// of cells written.
+    pub(crate) fn upload_dirty(&self, queue: &wgpu::Queue, dirty: &[(u32, u32)]) -> usize {
+        let stride = std::mem::size_of::<u32>() as u64;
+        let mut written = 0usize;
+        let mut i = 0usize;
+        while i < dirty.len() {
+            let start = dirty[i].0;
+            let mut run: Vec<u32> = Vec::new();
+            while i < dirty.len() && dirty[i].0 == start + run.len() as u32 {
+                run.push(dirty[i].1);
+                i += 1;
+            }
+            queue.write_buffer(
+                &self.cell_buffer,
+                u64::from(start) * stride,
+                bytemuck::cast_slice(&run),
+            );
+            written += run.len();
+        }
+        written
+    }
+
+    /// Bound the next trace dispatch to `[min, max)` in cache cells. Cells
+    /// outside keep their previous traced radiance, so a small edit re-traces a
+    /// small region. The denoise pass still runs over the whole cache.
+    pub(crate) fn set_trace_region(&self, queue: &wgpu::Queue, min: glam::UVec3, max: glam::UVec3) {
+        let payload: [u32; 8] = [min.x, min.y, min.z, 0, max.x, max.y, max.z, 0];
+        queue.write_buffer(
+            &self.globals_buffer,
+            TRACE_REGION_OFFSET,
+            bytemuck::cast_slice(&payload),
+        );
+    }
+
+    /// Reset the trace region to the whole cache.
+    pub(crate) fn set_full_trace_region(&self, queue: &wgpu::Queue) {
+        self.set_trace_region(
+            queue,
+            glam::UVec3::ZERO,
+            glam::UVec3::splat(LIGHT_VOLUME_DIM),
+        );
+    }
 }
 
 pub(crate) struct IndirectPipeline {
@@ -389,7 +445,7 @@ impl IndirectPipeline {
         let cell_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("spall-t13-occupancy-material-cells"),
             contents: bytemuck::cast_slice(cells),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let output_size = cells.len() as u64 * std::mem::size_of::<[f32; 4]>() as u64;
         let output = |label| {
@@ -412,11 +468,13 @@ impl IndirectPipeline {
             origin_cell_size: [origin.x, origin.y, origin.z, LIGHT_CELL_SIZE_METRES],
             dimensions: [dim, 48, u32::from(enabled), 0],
             sky: [0.24, 0.31, 0.42, 0.0],
+            trace_region_min: [0, 0, 0, 0],
+            trace_region_max: [dim, dim, dim, 0],
         };
         let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("spall-t13-indirect-globals"),
             contents: bytemuck::bytes_of(&globals),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let compute_bind = |label, source: &wgpu::Buffer, target: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -450,11 +508,11 @@ impl IndirectPipeline {
             upload_millis: start.elapsed().as_secs_f64() * 1000.0,
             enabled,
             cells: cells.len(),
-            _cells: cell_buffer,
+            cell_buffer,
+            globals_buffer: globals,
             _source_dummy: source_dummy,
             _trace: trace,
             _denoised: denoised,
-            _globals: globals,
         }
     }
 

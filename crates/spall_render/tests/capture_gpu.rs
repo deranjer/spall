@@ -10,8 +10,9 @@ use glam::{Mat4, Vec3};
 use spall_mesh::fixtures::{acceptance_shapes, mesh_shape};
 use spall_mesh::{Mesh, MeshStrategy, Vertex};
 use spall_render::{
-    Camera, CaptureOptions, DebugView, RenderContext, Scene, SceneItem, capture_scene,
-    colored_rooms, emitter_occlusion_scenes,
+    Camera, CaptureOptions, DebugView, LightingStep, RenderContext, Scene, SceneItem,
+    capture_lighting_sequence, capture_scene, colored_rooms, emitter_occlusion_scenes,
+    rapid_destruction,
 };
 
 #[test]
@@ -442,6 +443,77 @@ fn indirect_only_render_shows_emitter_transport_and_wall_occlusion() {
     );
 
     let _ = fs::remove_dir_all(&root);
+}
+
+/// T14 increment 2: a scripted lighting update reaches the rendered indirect
+/// lighting in the next frame, re-uploading only the changed cells and
+/// re-tracing only the changed region (plus a halo) rather than the whole cache.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn rapid_destruction_reexposes_the_band_with_a_bounded_retrace() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let rd = rapid_destruction(16.0 / 9.0);
+    let out = std::env::temp_dir().join(format!("spall-t14-seq-{}", std::process::id()));
+
+    let report = capture_lighting_sequence(
+        &ctx,
+        rd.scene,
+        rd.receiver_band,
+        12,
+        1.0,
+        &[LightingStep {
+            label: "remove occluder".to_string(),
+            update: rd.remove_occluder,
+        }],
+        &out,
+    )
+    .expect("lighting sequence capture");
+
+    assert_eq!(report.steps.len(), 2);
+    let base = &report.steps[0];
+    let after = &report.steps[1];
+
+    // The edit reaches the rendered indirect lighting: the shadowed band
+    // brightens (measured ~22.8 -> ~26.3 sRGB luminance on the reference
+    // adapter).
+    assert!(
+        after.band_luminance > base.band_luminance + 2.0,
+        "occluder removal did not re-expose the band in the render: {:.3} -> {:.3}",
+        base.band_luminance,
+        after.band_luminance
+    );
+
+    // The base step re-traces everything; the edit step re-traces only the
+    // 80-cell occluder column grown by the 12-cell halo (27_200 cells, ~1.3% of
+    // the 128^3 cache on the reference adapter).
+    assert_eq!(base.retraced_cells, report.total_cells);
+    assert!(
+        after.retraced_cells < report.total_cells / 16,
+        "bounded re-trace touched {} of {} cells",
+        after.retraced_cells,
+        report.total_cells
+    );
+    assert!(
+        after.dirty_cells > 0 && after.dirty_cells <= 80,
+        "unexpected dirty cell count: {}",
+        after.dirty_cells
+    );
+
+    if ctx.supports_gpu_timestamps() {
+        let (base_trace, after_trace) = (
+            base.gpu_trace_millis.expect("base trace timing"),
+            after.gpu_trace_millis.expect("edit trace timing"),
+        );
+        // Bounded re-trace is cheaper than the full trace, not merely no slower
+        // (measured ~1.43 ms -> ~0.11 ms on the reference adapter).
+        assert!(after_trace >= 0.0);
+        assert!(
+            after_trace <= base_trace + 0.5,
+            "bounded re-trace slower than the full base trace: {base_trace:.3} -> {after_trace:.3}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&out);
 }
 
 /// ENG-60 regression watch. On Windows the pinned wgpu 24 / naga 24 Vulkan path
