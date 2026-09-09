@@ -30,6 +30,13 @@ pub struct PhysicsConfig {
     pub dt_s: f32,
     /// Constraint solver iterations per step.
     pub solver_iterations: usize,
+    /// Skip rapier's CCD solver pass entirely (`max_ccd_substeps = 0`). Callers
+    /// that never enable per-body CCD should set this: rapier's CCD broad-phase
+    /// BVH can retain a stale proxy for a collider that was removed and
+    /// re-inserted in the same step (as [`PhysicsWorld::rebuild_collider`] does
+    /// on every voxel edit), then panic with "No element at index" mid-sweep.
+    /// Disabling the pass is a no-op when no body has `ccd` set.
+    pub disable_ccd: bool,
 }
 
 impl Default for PhysicsConfig {
@@ -38,6 +45,7 @@ impl Default for PhysicsConfig {
             gravity_m_s2: [0.0, -9.81, 0.0],
             dt_s: 1.0 / 60.0,
             solver_iterations: 4,
+            disable_ccd: false,
         }
     }
 }
@@ -145,6 +153,9 @@ impl PhysicsWorld {
             ..Default::default()
         };
         params.num_solver_iterations = cfg.solver_iterations.max(1);
+        if cfg.disable_ccd {
+            params.max_ccd_substeps = 0;
+        }
         Self {
             gravity: Vector::new(
                 cfg.gravity_m_s2[0],

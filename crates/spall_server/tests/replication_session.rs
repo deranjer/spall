@@ -87,6 +87,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         script: vec![ScriptedAction {
             at_tick: 4,
             request: cut_request(1, 0, [10, 4, 1], 2),
+            target: spall_client::ScriptTarget::Terrain,
         }],
         late_join: false,
         run_ticks: 0,
@@ -202,6 +203,7 @@ fn server_persists_and_recovers_across_a_restart() {
         vec![ScriptedAction {
             at_tick: 4,
             request: cut_request(1, 0, [10, 4, 1], 2),
+            target: spall_client::ScriptTarget::Terrain,
         }],
     );
     assert!(first.body_count >= 1, "the beam detached in run 1");
