@@ -232,6 +232,13 @@ cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 # docs/reports/G1.md.
 cargo xtask scenario --name g1-networked-destruction --loss-percent 0 --output .local/runs/g1
 
+# T17 / ENG-64: a cut that detaches a 24^3 checkerboard block — a component too
+# fragmented to encode as inline CellRuns. The commit falls back to compressed
+# SplitOffBaseline / SourcePatchBaseline op blobs; server + both live replicas
+# converge on one hash and the tick-0 baseline replay reproduces it. Before this
+# ticket the same cut was rejected (ReplicationError::SplitTooLarge).
+cargo xtask scenario --name oversized-split --loss-percent 0 --output .local/runs/oversized-split
+
 # T19: one `walk` server + two scripted player capsules that predict movement,
 # send InputFrame datagrams, and reconcile against the server's player snapshots.
 # Passes on bounded corrections, ground contact, travel distance, and no hover.

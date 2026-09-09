@@ -115,6 +115,11 @@ impl Replica {
                         plan.set(GlobalCell::new(start.x + i, start.y, start.z), *material);
                     }
                 }
+                // This mini-applier only covers the inline-encoded scenes it
+                // drives; the compressed-blob split path (T17) has its own tests.
+                TopologyOp::SplitOffBaseline { .. } | TopologyOp::SourcePatchBaseline { .. } => {
+                    panic!("test applier does not handle split baseline ops")
+                }
             }
         }
         flush(&mut pending, &mut self.volumes);

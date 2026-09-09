@@ -2685,6 +2685,7 @@ dependencies = [
  "serde_json",
  "spall_core",
  "thiserror 2.0.20",
+ "zstd",
 ]
 
 [[package]]

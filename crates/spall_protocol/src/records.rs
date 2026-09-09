@@ -16,7 +16,8 @@ use spall_core::{
 use crate::canonical::Hash32;
 use crate::limits::{
     self, MAX_BASELINE_PARTS, MAX_BASELINE_REGIONS, MAX_BULK_PART, MAX_CELL_RUN_LEN,
-    MAX_REDUNDANT_INPUTS, MAX_TRANSACTION_OPS, MAX_TRANSACTION_REFS, SizeLimitError,
+    MAX_REDUNDANT_INPUTS, MAX_SPLIT_BASELINE_BLOB, MAX_TRANSACTION_OPS, MAX_TRANSACTION_REFS,
+    SizeLimitError,
 };
 
 /// Schema version stamped into every encoded record header.
@@ -315,6 +316,23 @@ pub enum TopologyOp {
         child: VolumeId,
         child_entity: EntityId,
     },
+    /// A split whose child geometry is too large to encode as inline
+    /// [`TopologyOp::CellRun`]s (T17): `blob` is the zstd-compressed postcard of
+    /// a [`crate::baseline::BaselineVolume`] holding the whole child volume, at
+    /// its authoritative brick revisions. Replaces the `SplitOff` marker **and**
+    /// its child-fill runs. Bounded by
+    /// [`crate::limits::MAX_SPLIT_BASELINE_BLOB`].
+    SplitOffBaseline {
+        source: VolumeId,
+        child: VolumeId,
+        child_entity: EntityId,
+        blob: Vec<u8>,
+    },
+    /// The source side of an oversized split (T17): `blob` is the
+    /// zstd-compressed postcard of a [`crate::baseline::BaselineVolume`] holding
+    /// the source volume's post-cut **affected** bricks, at their authoritative
+    /// revisions. Replaces the inline source-removal `CellRun`s.
+    SourcePatchBaseline { source: VolumeId, blob: Vec<u8> },
 }
 
 /// `TopologyTransaction`: the authoritative record of one committed edit.
@@ -383,6 +401,19 @@ impl Record for TopologyTransaction {
                     detail: "run length must be 1..=MAX_CELL_RUN_LEN",
                 });
             }
+            let blob = match op {
+                TopologyOp::SplitOffBaseline { blob, .. }
+                | TopologyOp::SourcePatchBaseline { blob, .. } => Some(blob),
+                _ => None,
+            };
+            if let Some(blob) = blob
+                && (blob.is_empty() || blob.len() > MAX_SPLIT_BASELINE_BLOB)
+            {
+                return Err(RecordError::OutOfRange {
+                    field: "TopologyOp split baseline blob",
+                    detail: "blob length must be 1..=MAX_SPLIT_BASELINE_BLOB",
+                });
+            }
         }
         Ok(())
     }
@@ -398,6 +429,21 @@ impl TopologyTransaction {
                 TopologyOp::IntegerBrush { material, .. } => *material,
                 TopologyOp::CellRun { material, .. } => *material,
                 TopologyOp::SplitOff { .. } => continue,
+                // A split baseline blob carries whole bricks: decode it and
+                // check every material it names against the manifest.
+                TopologyOp::SplitOffBaseline { blob, .. }
+                | TopologyOp::SourcePatchBaseline { blob, .. } => {
+                    let volume =
+                        crate::baseline::BaselineVolume::decode_compressed(blob).map_err(|_| {
+                            RecordError::Inconsistent("split baseline op blob failed to decode")
+                        })?;
+                    for id in volume.material_ids() {
+                        if !id.is_air() && !manifest.contains(id) {
+                            return Err(RecordError::UnknownMaterial(id.raw()));
+                        }
+                    }
+                    continue;
+                }
             };
             if !material.is_air() && !manifest.contains(material) {
                 return Err(RecordError::UnknownMaterial(material.raw()));
@@ -770,6 +816,128 @@ mod tests {
             crate::decode_topology(&bytes, &manifest),
             Err(crate::CodecError::Invalid(RecordError::UnknownMaterial(9)))
         ));
+    }
+
+    #[test]
+    fn split_baseline_ops_round_trip_and_validate() {
+        use crate::baseline::{BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume};
+        use spall_core::{CELLS_PER_BRICK, MaterialDef, MaterialFlags, RenderProps, SimProps};
+
+        let stone = MaterialDef {
+            id: MaterialId(1),
+            name: "stone".into(),
+            render: RenderProps {
+                albedo: [0.5; 3],
+                roughness: 0.9,
+                metalness: 0.0,
+                emissive: [0.0; 3],
+            },
+            sim: SimProps {
+                density_kg_m3: 2600.0,
+                friction: 0.8,
+                restitution: 0.0,
+                hardness: 4.0,
+                bond_strength: 12.0,
+                flags: MaterialFlags(MaterialFlags::COLLIDES.0 | MaterialFlags::STRUCTURAL.0),
+            },
+        };
+        let air = MaterialDef {
+            id: MaterialId::AIR,
+            name: "air".into(),
+            render: RenderProps {
+                albedo: [0.0; 3],
+                roughness: 1.0,
+                metalness: 0.0,
+                emissive: [0.0; 3],
+            },
+            sim: SimProps {
+                density_kg_m3: 0.0,
+                friction: 0.0,
+                restitution: 0.0,
+                hardness: 0.0,
+                bond_strength: 0.0,
+                flags: MaterialFlags::NONE,
+            },
+        };
+        let manifest = MaterialManifest::validated(vec![air, stone]).unwrap();
+
+        let child_blob = |material: u16| {
+            BaselineVolume {
+                volume_id: VolumeId::new(2).unwrap(),
+                cell_size_code: 2,
+                owner: BaselineOwner::Body(EntityId::new(5).unwrap()),
+                bounds: Some([[0, 0, 0], [0, 0, 0]]),
+                bricks: vec![BaselineBrick {
+                    coord: [0, 0, 0],
+                    revision: 2,
+                    edited: true,
+                    cells: BaselineCells::Dense({
+                        let mut c = vec![0u16; CELLS_PER_BRICK];
+                        c[0] = material;
+                        c
+                    }),
+                }],
+            }
+            .encode_compressed()
+        };
+
+        let mut tx = TopologyTransaction {
+            transaction_id: TransactionId::new(1).unwrap(),
+            server_tick: Tick(9),
+            control_seq: ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![
+                TopologyOp::IntegerBrush {
+                    volume: VolumeId::new(1).unwrap(),
+                    brush: SphereBrush::new(BrushPoint::from_cells(0, 0, 0).unwrap(), 256).unwrap(),
+                    material: MaterialId::AIR,
+                },
+                TopologyOp::SplitOffBaseline {
+                    source: VolumeId::new(1).unwrap(),
+                    child: VolumeId::new(2).unwrap(),
+                    child_entity: EntityId::new(5).unwrap(),
+                    blob: child_blob(1),
+                },
+                TopologyOp::SourcePatchBaseline {
+                    source: VolumeId::new(1).unwrap(),
+                    blob: child_blob(1),
+                },
+            ],
+            result_hashes: vec![],
+        };
+
+        // Wire round-trip through the control codec.
+        assert!(tx.validate_against(&manifest).is_ok());
+        let bytes = crate::encode_control(&tx).unwrap();
+        assert_eq!(
+            crate::decode_topology(&bytes, &manifest).unwrap(),
+            tx,
+            "SplitOffBaseline / SourcePatchBaseline survive the wire"
+        );
+
+        // An unknown material *inside* the blob is caught by validate_against.
+        tx.ops[1] = TopologyOp::SplitOffBaseline {
+            source: VolumeId::new(1).unwrap(),
+            child: VolumeId::new(2).unwrap(),
+            child_entity: EntityId::new(5).unwrap(),
+            blob: child_blob(9),
+        };
+        assert_eq!(
+            tx.validate_against(&manifest),
+            Err(RecordError::UnknownMaterial(9))
+        );
+
+        // An empty blob is rejected by the structural validate().
+        tx.ops[1] = TopologyOp::SplitOffBaseline {
+            source: VolumeId::new(1).unwrap(),
+            child: VolumeId::new(2).unwrap(),
+            child_entity: EntityId::new(5).unwrap(),
+            blob: Vec::new(),
+        };
+        assert!(matches!(tx.validate(), Err(RecordError::OutOfRange { .. })));
     }
 
     #[test]

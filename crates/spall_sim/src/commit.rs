@@ -290,15 +290,31 @@ pub fn commit(
         })
         .collect();
 
+    let parent_owner = match parent_entity {
+        Some(entity) => CanonicalOwner::Body(entity),
+        None => CanonicalOwner::Terrain,
+    };
+    let mut result_hashes = vec![VolumeHash {
+        volume: vid,
+        hash: volume_topology_hash_for(&parent_candidate, parent_owner),
+    }];
+    for child in &children {
+        result_hashes.push(VolumeHash {
+            volume: child.volume_id,
+            hash: volume_topology_hash_for(&child.volume, CanonicalOwner::Body(child.entity)),
+        });
+    }
+
     // Self-describing op list: the brush, then for each child a `SplitOff`
     // marker followed by the canonical cell runs that fill it, then the runs
     // that remove every detached cell from the source. A replica applies these
     // in order to reproduce the exact committed geometry.
-    let mut ops = vec![TopologyOp::IntegerBrush {
+    let brush_op = TopologyOp::IntegerBrush {
         volume: vid,
         brush: staged.brush,
         material: staged.kind.write_material(),
-    }];
+    };
+    let mut ops = vec![brush_op.clone()];
     for (((entity, child_vid), _), fill) in child_ids
         .iter()
         .zip(&staged.memberships)
@@ -317,24 +333,8 @@ pub fn commit(
             &staged.memberships,
         ));
     }
-    crate::replication::check_op_budget(ops.len())?;
 
-    let parent_owner = match parent_entity {
-        Some(entity) => CanonicalOwner::Body(entity),
-        None => CanonicalOwner::Terrain,
-    };
-    let mut result_hashes = vec![VolumeHash {
-        volume: vid,
-        hash: volume_topology_hash_for(&parent_candidate, parent_owner),
-    }];
-    for child in &children {
-        result_hashes.push(VolumeHash {
-            volume: child.volume_id,
-            hash: volume_topology_hash_for(&child.volume, CanonicalOwner::Body(child.entity)),
-        });
-    }
-
-    let topology = TopologyTransaction {
+    let mut topology = TopologyTransaction {
         transaction_id,
         server_tick,
         control_seq,
@@ -345,6 +345,25 @@ pub fn commit(
         ops,
         result_hashes,
     };
+
+    // T17: an oversized split whose inline `CellRun` list overflows one reliable
+    // control record is re-encoded as `[IntegerBrush, SplitOffBaseline*,
+    // SourcePatchBaseline]` — the child geometry and the source's post-cut
+    // affected bricks travel as compressed baseline blobs instead. `before` /
+    // `after` / `result_hashes` are unchanged and remain the replica's
+    // acceptance check.
+    if !crate::replication::inline_wire_fits(&topology) {
+        topology.ops = build_split_baseline_ops(
+            vid,
+            brush_op,
+            parent_owner,
+            &parent_candidate,
+            &affected,
+            &child_ids,
+            &children,
+            staged.splits(),
+        )?;
+    }
     topology.validate()?;
 
     let bumped_epoch = staged.splits();
@@ -454,6 +473,67 @@ pub fn commit(
         children: child_entities,
         bumped_epoch,
     }))
+}
+
+/// T17: re-encode an oversized split as `[IntegerBrush, SplitOffBaseline*,
+/// SourcePatchBaseline]`. Each child's whole geometry and the source's post-cut
+/// affected bricks travel as a compressed [`spall_protocol::baseline::BaselineVolume`]
+/// blob. Fails with [`crate::replication::ReplicationError::SplitTooLarge`] if a
+/// blob is still over [`spall_protocol::limits::MAX_SPLIT_BASELINE_BLOB`] — that
+/// giant collapse needs the bulk-stream baseline path (T17 increment 2).
+#[allow(clippy::too_many_arguments)]
+fn build_split_baseline_ops(
+    source: VolumeId,
+    brush_op: TopologyOp,
+    parent_owner: CanonicalOwner,
+    parent_candidate: &Volume,
+    affected: &[BrickCoord],
+    child_ids: &[(spall_core::EntityId, VolumeId)],
+    children: &[ChildBody],
+    splits: bool,
+) -> Result<Vec<TopologyOp>, CommitError> {
+    use spall_protocol::baseline::BaselineOwner;
+    use spall_protocol::limits::MAX_SPLIT_BASELINE_BLOB;
+
+    let too_large = |volume: u64, blob_bytes: usize| {
+        CommitError::Replication(crate::replication::ReplicationError::SplitTooLarge {
+            volume,
+            blob_bytes,
+            cap: MAX_SPLIT_BASELINE_BLOB,
+        })
+    };
+
+    let mut ops = vec![brush_op];
+    for ((entity, child_vid), child) in child_ids.iter().zip(children) {
+        let bv = crate::replication::baseline_volume_of(
+            &child.volume,
+            BaselineOwner::Body(*entity),
+            None,
+        );
+        let blob = bv.encode_compressed();
+        if blob.len() > MAX_SPLIT_BASELINE_BLOB {
+            return Err(too_large(child_vid.get(), blob.len()));
+        }
+        ops.push(TopologyOp::SplitOffBaseline {
+            source,
+            child: *child_vid,
+            child_entity: *entity,
+            blob,
+        });
+    }
+    if splits {
+        let bv = crate::replication::baseline_volume_of(
+            parent_candidate,
+            crate::replication::baseline_owner(parent_owner),
+            Some(affected),
+        );
+        let blob = bv.encode_compressed();
+        if blob.len() > MAX_SPLIT_BASELINE_BLOB {
+            return Err(too_large(source.get(), blob.len()));
+        }
+        ops.push(TopologyOp::SourcePatchBaseline { source, blob });
+    }
+    Ok(ops)
 }
 
 /// A `MotionSnapshot` for every dynamic body that took part in the transaction:

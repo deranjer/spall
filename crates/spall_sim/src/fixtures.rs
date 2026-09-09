@@ -140,6 +140,23 @@ pub fn cross_brick_bridged_setup() -> WorldSetup {
     }
 }
 
+/// T17 / ENG-64: a scene whose detached component is too fragmented to encode
+/// inline. An anchored floor holds a `24 x 24 x 24` checkerboard `STONE`/`DIRT`
+/// block through one column; cutting the column detaches the whole block, whose
+/// ~13.8k single-cell runs overflow the inline `CellRun` budget and force the
+/// compressed-baseline-blob commit path. See
+/// [`spall_voxel::fixtures::checkerboard_split_scene`].
+pub fn checkerboard_split_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: spall_voxel::fixtures::checkerboard_split_scene(id),
+        terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(31, 31, 31)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
 /// The T19 movement arena: a flat anchored floor + a 0.5 m step ledge + a
 /// resident air ceiling ([`spall_voxel::fixtures::walk_arena`]). Scripted
 /// players walk this lane; [`WALK_ARENA_SPAWNS`] gives feet positions in metres

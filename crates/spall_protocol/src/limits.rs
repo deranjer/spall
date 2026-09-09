@@ -43,6 +43,18 @@ pub const MAX_BASELINE_PARTS: usize = 4096;
 /// Maximum cells addressed by one encoded cell run.
 pub const MAX_CELL_RUN_LEN: u32 = 1 << 20;
 
+/// Maximum **compressed** bytes in one `SplitOffBaseline` / `SourcePatchBaseline`
+/// op blob (T17). Small enough that an oversized split's whole
+/// `TopologyTransaction` — brush op, one child blob, one source-patch blob, plus
+/// `before` / `after` / `result_hashes` — still fits [`MAX_CONTROL_RECORD`]. A
+/// split whose blob would exceed this needs the bulk-stream baseline path.
+pub const MAX_SPLIT_BASELINE_BLOB: usize = 28 * 1024;
+
+/// Maximum **decompressed** bytes accepted from one split baseline op blob — a
+/// DoS bound on `zstd` output, well above any blob the commit path will emit
+/// under [`MAX_SPLIT_BASELINE_BLOB`].
+pub const MAX_SPLIT_BASELINE_DECOMPRESSED: usize = 4 * 1024 * 1024;
+
 /// Error returned when an encoded or declared size exceeds its limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SizeLimitError {

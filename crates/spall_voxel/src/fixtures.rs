@@ -133,6 +133,56 @@ pub fn bridge_scene(id: VolumeId) -> Volume {
     v
 }
 
+/// A replication scene whose detached component is deliberately **too
+/// fragmented to encode inline** (T17 / ENG-64): an anchored floor, one slender
+/// column, and a raised `24 x 24 x 24` cell block whose material alternates
+/// `STONE` / `DIRT` per cell (`(x + y + z)` parity). Cutting the column detaches
+/// the whole checkerboard block as one body; its `13 824` single-cell canonical
+/// runs blow the inline `CellRun` budget, so the commit falls back to the
+/// compressed-baseline-blob op path.
+///
+/// - floor:  `x 0..=31`, `z 0..=31`, `y 0..=1`   (anchored at `y = 0`)
+/// - column: `x 15..=16`, `z 15..=16`, `y 2..=7`
+/// - block:  `x 4..=27`, `z 4..=27`, `y 8..=31`  (checkerboard STONE/DIRT)
+/// - air:    `x 0..=31`, `z 0..=31`, `y 2..=31`  (resident; solids written over it)
+pub fn checkerboard_split_scene(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    // Resident air envelope first, so the solid writes below win.
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 2, 0),
+        GlobalCell::new(31, 31, 31),
+        MaterialId::AIR,
+    ))
+    .expect("air envelope edit");
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(31, 1, 31),
+        STONE,
+    ))
+    .expect("floor edit");
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(15, 2, 15),
+        GlobalCell::new(16, 7, 16),
+        STONE,
+    ))
+    .expect("column edit");
+
+    let mut block = EditPlan::new(id);
+    for z in 4..=27 {
+        for y in 8..=31 {
+            for x in 4..=27 {
+                let m = if (x + y + z) % 2 == 0 { STONE } else { DIRT };
+                block.set(GlobalCell::new(x, y, z), m);
+            }
+        }
+    }
+    v.apply_edit(&block).expect("checkerboard block edit");
+    v
+}
+
 /// Like [`bridge_scene`], but shifted and widened so the load-bearing geometry
 /// **crosses the `x = 32` brick boundary**. A single column straddling the seam
 /// holds up a beam that also spans both bricks; cutting the column must detach
@@ -241,6 +291,28 @@ mod tests {
         assert_eq!(digest_hex(&hollow_tower(vid(1))), HOLLOW_TOWER_DIGEST);
         assert_eq!(digest_hex(&cross_brick_bridge(vid(1))), BRIDGE_DIGEST);
         assert_eq!(digest_hex(&sloped_terrain(vid(1))), SLOPE_DIGEST);
+    }
+
+    #[test]
+    fn checkerboard_split_scene_block_is_a_fragmented_connected_component() {
+        let v = checkerboard_split_scene(vid(1));
+        assert_eq!(
+            v.sample(GlobalCell::new(0, 0, 0)).unwrap(),
+            Sample::Filled(STONE),
+            "anchored floor"
+        );
+        assert_eq!(
+            v.sample(GlobalCell::new(15, 4, 15)).unwrap(),
+            Sample::Filled(STONE),
+            "column"
+        );
+        let a = v.sample(GlobalCell::new(4, 8, 4)).unwrap();
+        let b = v.sample(GlobalCell::new(5, 8, 4)).unwrap();
+        assert!(
+            matches!(a, Sample::Filled(_)) && matches!(b, Sample::Filled(_)) && a != b,
+            "adjacent block cells carry different materials (checkerboard): {a:?} vs {b:?}"
+        );
+        assert_eq!(digest_hex(&v), CHECKERBOARD_SPLIT_DIGEST);
     }
 
     #[test]
@@ -366,4 +438,6 @@ mod tests {
         "e164e7dc4ef3565cfc181de28442875ff6dc91f0321dfd69fb0e0a483f382933";
     const BRIDGE_DIGEST: &str = "70905cb1ba1414ca3eef09912281e3ddfa94cb23fbe1ff9f69fb15b22b856ab8";
     const SLOPE_DIGEST: &str = "30023f777e4a2c0cc1f0515785581b6d4cd95dd3d304a8e7bdc51e1d50ec5862";
+    const CHECKERBOARD_SPLIT_DIGEST: &str =
+        "46de0b892ccac5b223bf95a3d8ddd4dc6db64234787d958276bd9da4f9239434";
 }

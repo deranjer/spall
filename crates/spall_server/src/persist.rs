@@ -451,14 +451,22 @@ pub fn restore(
                 world.replay_transaction(&tx, &participants)?;
                 max_tx = max_tx.max(tx.transaction_id.get());
                 for op in &tx.ops {
-                    if let TopologyOp::SplitOff {
-                        child,
-                        child_entity,
-                        ..
-                    } = op
-                    {
-                        max_entity = max_entity.max(child_entity.get());
-                        max_volume = max_volume.max(child.get());
+                    let child_ids = match op {
+                        TopologyOp::SplitOff {
+                            child,
+                            child_entity,
+                            ..
+                        }
+                        | TopologyOp::SplitOffBaseline {
+                            child,
+                            child_entity,
+                            ..
+                        } => Some((child.get(), child_entity.get())),
+                        _ => None,
+                    };
+                    if let Some((child, child_entity)) = child_ids {
+                        max_entity = max_entity.max(child_entity);
+                        max_volume = max_volume.max(child);
                     }
                 }
             }
