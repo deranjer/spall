@@ -49,6 +49,10 @@ struct Args {
     /// Real-time 60 Hz pacing (needed for interactive / networked clients).
     #[arg(long)]
     paced: bool,
+    /// Built-in scene to serve: `bridge-cut` (default, single brick) or
+    /// `cross-bridge-cut` (column + beam cross the x = 32 brick boundary).
+    #[arg(long, default_value = "bridge-cut")]
+    scene: String,
     /// T16: persist to `<world>/world.db` — recover from it on start, journal
     /// committed transactions, checkpoint on the interval and on shutdown.
     #[arg(long)]
@@ -57,6 +61,11 @@ struct Args {
     /// periodic checkpoint (a shutdown checkpoint still happens).
     #[arg(long, default_value_t = 1_800)]
     checkpoint_interval_ticks: u64,
+    /// Consecutive idle ticks (no committed work, no client input) after which
+    /// the run stops early. Larger values give a scripted client more slack to
+    /// land late actions under an impaired transport. 0 disables early stop.
+    #[arg(long, default_value_t = 45)]
+    quiescence_ticks: u64,
     /// T17: a joining client's catch-up-queue cap before its baseline transfer
     /// is cancelled and re-captured fresher.
     #[arg(long, default_value_t = spall_server::serve::DEFAULT_CATCH_UP_CAP)]
@@ -70,11 +79,26 @@ struct Args {
     /// Lets a fixture harness script arbitrary cuts. Never use on a shared host.
     #[arg(long, hide = true)]
     dev_unvalidated_actions: bool,
+
+    // --- T11 exact-replay check ---
+    /// Instead of serving, recover from this world database's **oldest**
+    /// checkpoint and replay its entire committed topology journal, then print
+    /// the rebuilt canonical topology hash. Exit 0 iff it matches
+    /// `--expect-hash` (when given).
+    #[arg(long)]
+    replay: Option<PathBuf>,
+    /// Expected canonical topology hash (hex) for `--replay`.
+    #[arg(long)]
+    expect_hash: Option<String>,
 }
 
 fn main() -> ExitCode {
     sandbox::init_tracing();
     let args = Args::parse();
+
+    if args.replay.is_some() {
+        return run_replay(args);
+    }
 
     if args.serve {
         return run_serve(args);
@@ -114,6 +138,17 @@ fn run_serve(args: Args) -> ExitCode {
         }
     };
 
+    let scene = match Scene::from_name(&args.scene) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "sandbox-server: unknown --scene `{}` (expected bridge-cut or cross-bridge-cut)",
+                args.scene
+            );
+            return ExitCode::from(2);
+        }
+    };
+
     let save = args.save.then(|| args.world.join("world.db"));
     if let Some(db) = &save
         && let Some(parent) = db.parent()
@@ -123,10 +158,10 @@ fn run_serve(args: Args) -> ExitCode {
 
     let config = ServeConfig {
         listen: args.listen,
-        scene: Scene::BridgeCut,
+        scene,
         join_token: token,
         max_ticks: args.ticks,
-        quiescence_ticks: 45,
+        quiescence_ticks: args.quiescence_ticks,
         min_clients: args.min_clients,
         max_clients: args.max_clients,
         startup_timeout: Duration::from_secs(30),
@@ -165,4 +200,62 @@ fn run_serve(args: Args) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `--replay <db>`: rebuild the world from the oldest checkpoint + the whole
+/// committed topology journal and compare its canonical hash to `--expect-hash`.
+fn run_replay(args: Args) -> ExitCode {
+    let db = args.replay.expect("checked by caller");
+    let cfg = spall_server::PersistConfig {
+        world_id: spall_server::serve::T10_WORLD_ID,
+        seed: args.seed,
+        generator_version: 1,
+    };
+    let (sim, events) = match spall_server::replay_from_base_builtin(&db, &cfg) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("sandbox-server: replay failed: {e}");
+            if let Some(path) = &args.summary_json {
+                let _ = write_replay_summary(path, "failed", 0, "", args.expect_hash.as_deref());
+            }
+            return ExitCode::from(1);
+        }
+    };
+    let hash = sim.world().world_hash().to_string();
+    let matches = args
+        .expect_hash
+        .as_deref()
+        .map(|h| h.eq_ignore_ascii_case(&hash))
+        .unwrap_or(true);
+    let result = if matches { "passed" } else { "failed" };
+    println!("sandbox-server: replay {result} topology_events={events} hash={hash}");
+    if let Some(path) = &args.summary_json {
+        let _ = write_replay_summary(path, result, events, &hash, args.expect_hash.as_deref());
+    }
+    if matches {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "sandbox-server: replay hash {hash} != expected {}",
+            args.expect_hash.as_deref().unwrap_or("<none>")
+        );
+        ExitCode::from(1)
+    }
+}
+
+fn write_replay_summary(
+    path: &std::path::Path,
+    result: &str,
+    events: u64,
+    hash: &str,
+    expected: Option<&str>,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let expected = expected.unwrap_or("");
+    let body = format!(
+        "{{\n  \"version\": 1,\n  \"result\": \"{result}\",\n  \"replayed_topology_events\": {events},\n  \"replayed_world_hash\": \"{hash}\",\n  \"expected_world_hash\": \"{expected}\"\n}}\n"
+    );
+    std::fs::write(path, body)
 }

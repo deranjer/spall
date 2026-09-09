@@ -12,7 +12,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use spall_client::{ClientNetConfig, ScriptedAction, cut_request, run_replication_client};
+use spall_client::{
+    BaselineScene, ClientNetConfig, ScriptedAction, cut_request, run_replication_client,
+};
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
 use spall_server::serve::{DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES};
 use spall_server::{Scene, ServeConfig, serve};
@@ -94,25 +96,31 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
             ScriptedAction {
                 at_tick: 4,
                 request: cut_request(1, 0, [10, 4, 1], 2),
+                target: spall_client::ScriptTarget::Terrain,
             },
             ScriptedAction {
                 at_tick: 20,
                 request: cut_request(2, 1, [3, 1, 1], 1),
+                target: spall_client::ScriptTarget::Terrain,
             },
             ScriptedAction {
                 at_tick: 40,
                 request: cut_request(3, 2, [5, 1, 1], 1),
+                target: spall_client::ScriptTarget::Terrain,
             },
             ScriptedAction {
                 at_tick: 60,
                 request: cut_request(4, 3, [7, 1, 1], 1),
+                target: spall_client::ScriptTarget::Terrain,
             },
             ScriptedAction {
                 at_tick: 80,
                 request: cut_request(5, 4, [9, 1, 1], 1),
+                target: spall_client::ScriptTarget::Terrain,
             },
         ],
         late_join: false,
+        baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 0,
         idle_grace: Duration::from_millis(800),
         overall_timeout: Duration::from_secs(35),
@@ -134,8 +142,10 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         script: vec![ScriptedAction {
             at_tick: 70,
             request: cut_request(1_000, 0, [12, 1, 1], 1),
+            target: spall_client::ScriptTarget::Terrain,
         }],
         late_join: true,
+        baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 0,
         idle_grace: Duration::from_millis(800),
         overall_timeout: Duration::from_secs(35),

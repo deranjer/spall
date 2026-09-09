@@ -5,8 +5,8 @@ pub mod net;
 pub mod replica;
 
 pub use net::{
-    ClientNetConfig, ClientNetError, ClientSummary, ScriptedAction, cut_request,
-    run_replication_client,
+    BaselineScene, ClientNetConfig, ClientNetError, ClientSummary, ScriptTarget, ScriptedAction,
+    cut_request, run_replication_client,
 };
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
 

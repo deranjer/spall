@@ -483,6 +483,66 @@ pub fn restore(
     ))
 }
 
+/// Full-history replay: recover from the **oldest** checkpoint in `db_path` (the
+/// original baseline, journal cursor 0) and replay the entire durable journal
+/// over it. Returns the rebuilt simulation and the number of committed topology
+/// transactions that were replayed.
+///
+/// This is the T11 "exact replay of committed topology events from the fixture
+/// baseline" check: the committed transaction stream, folded deterministically
+/// from world creation, must reproduce the live run's canonical topology hash.
+/// The suffix must be clean ([`RecoveryChoice::RequireClean`]).
+pub fn replay_from_base(
+    db_path: &std::path::Path,
+    cfg: &PersistConfig,
+    materials: MaterialManifest,
+    anchor: AnchorPlane,
+    physics: PhysicsConfig,
+) -> Result<(Simulation, u64), PersistError> {
+    let recovery = spall_store::recover_from_base(db_path)?;
+    replay_recovery(recovery, cfg, materials, anchor, physics)
+}
+
+/// [`replay_from_base`] with the built-in-scene redeployment config the sandbox
+/// host uses (`spall_sim::fixtures::stone_manifest()`, anchor plane `y = 0`,
+/// default physics). The manifest/anchor/physics are scene-independent for the
+/// two built-in scenes, so this covers both `bridge-cut` and `cross-bridge-cut`.
+pub fn replay_from_base_builtin(
+    db_path: &std::path::Path,
+    cfg: &PersistConfig,
+) -> Result<(Simulation, u64), PersistError> {
+    replay_from_base(
+        db_path,
+        cfg,
+        spall_sim::fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+}
+
+fn replay_recovery(
+    recovery: Recovery,
+    cfg: &PersistConfig,
+    materials: MaterialManifest,
+    anchor: AnchorPlane,
+    physics: PhysicsConfig,
+) -> Result<(Simulation, u64), PersistError> {
+    let topology_events = recovery
+        .journal
+        .iter()
+        .filter(|r| matches!(r.payload, JournalPayload::Topology { .. }))
+        .count() as u64;
+    let (sim, _seq) = restore(
+        &recovery,
+        cfg,
+        RecoveryChoice::RequireClean,
+        materials,
+        anchor,
+        physics,
+    )?;
+    Ok((sim, topology_events))
+}
+
 /// Validates the saved world metadata against the configured world identity and
 /// this build's algorithm/schema versions *before* any checkpoint or journal
 /// state is interpreted. Every branch returns without touching the database.

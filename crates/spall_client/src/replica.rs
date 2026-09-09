@@ -124,9 +124,11 @@ impl From<&MotionSnapshot> for MotionState {
 }
 
 /// Interpolation history for one replicated body: the two most recent accepted
-/// states.
+/// states, plus the first state ever accepted so a caller can measure how far
+/// the body has actually travelled.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MotionTrack {
+    first: Option<MotionState>,
     prev: Option<MotionState>,
     latest: Option<MotionState>,
 }
@@ -136,6 +138,9 @@ impl MotionTrack {
         match self.latest {
             Some(cur) if state.server_tick <= cur.server_tick => {}
             _ => {
+                if self.first.is_none() {
+                    self.first = Some(state);
+                }
                 self.prev = self.latest;
                 self.latest = Some(state);
             }
@@ -145,6 +150,22 @@ impl MotionTrack {
     /// The newest accepted server tick, if any.
     pub fn latest_tick(&self) -> Option<u64> {
         self.latest.map(|s| s.server_tick)
+    }
+
+    /// Straight-line distance (metres) between the first and newest accepted
+    /// body positions. `0.0` until at least one state has been seen — a body
+    /// that only ever reports one stationary pose therefore measures `0.0`.
+    fn displacement_from_start_m(&self) -> f64 {
+        match (self.first, self.latest) {
+            (Some(a), Some(b)) => {
+                let (p, q) = (a.pose.translation_m, b.pose.translation_m);
+                let dx = q[0] - p[0];
+                let dy = q[1] - p[1];
+                let dz = q[2] - p[2];
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            }
+            _ => 0.0,
+        }
     }
 }
 
@@ -506,6 +527,25 @@ impl ReplicaWorld {
     /// Current solid-cell total across the replica (conservation check helper).
     pub fn total_solid_cells(&self) -> u64 {
         self.volumes.values().map(solid_cells).sum()
+    }
+
+    /// Solid cells in the volume owned by `entity`, or `None` if that body is
+    /// not resident. Used to confirm a body-targeted cut actually removed
+    /// material from the body it claimed.
+    pub fn body_solid_cells(&self, entity: EntityId) -> Option<u64> {
+        let vol = self.volume_of_entity.get(&entity.get())?;
+        self.volumes.get(vol).map(solid_cells)
+    }
+
+    /// Largest straight-line distance (metres) any replicated body has moved
+    /// from its first observed position to its most recent one. `0.0` when no
+    /// body has produced two distinct poses — a body that only ever reports a
+    /// stationary snapshot does not count as motion.
+    pub fn max_body_displacement_m(&self) -> f64 {
+        self.bodies
+            .values()
+            .map(|b| b.track.displacement_from_start_m())
+            .fold(0.0_f64, f64::max)
     }
 
     // --- transaction application --------------------------------------------

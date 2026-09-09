@@ -1,6 +1,7 @@
 use clap::Parser;
 use spall_client::{
-    ClientConfig, ClientNetConfig, ScriptedAction, cut_request, run_replication_client,
+    BaselineScene, ClientConfig, ClientNetConfig, ScriptTarget, ScriptedAction, cut_request,
+    run_replication_client,
 };
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
@@ -33,7 +34,9 @@ struct Args {
     /// File holding the per-run join token (hex).
     #[arg(long)]
     join_token_file: Option<PathBuf>,
-    /// Scripted cut: `TICK:X,Y,Z:RADIUS` in terrain cell coordinates. Repeatable.
+    /// Scripted cut: `TICK:X,Y,Z:RADIUS` in the target volume's cell
+    /// coordinates, optionally `:body` to aim at the detached body instead of
+    /// terrain. Repeatable.
     #[arg(long = "cut", value_parser = parse_cut)]
     cuts: Vec<Cut>,
     /// This client's index in a multi-client session; namespaces request ids so
@@ -48,6 +51,10 @@ struct Args {
     /// topology with no edit replay.
     #[arg(long)]
     late_join: bool,
+    /// Fixed baseline scene a live replica installs; must match the server's
+    /// `--scene`. `bridge-cut` (default) or `cross-bridge-cut`.
+    #[arg(long, default_value = "bridge-cut")]
+    scene: String,
     /// T17: wait this long after the process starts before connecting, so a
     /// harness can stagger a late joiner behind an already-running client.
     #[arg(long, default_value_t = 0)]
@@ -64,12 +71,13 @@ struct Cut {
     tick: u64,
     cell: [i64; 3],
     radius: i64,
+    target: ScriptTarget,
 }
 
 fn parse_cut(s: &str) -> Result<Cut, String> {
     let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 3 {
-        return Err("expected TICK:X,Y,Z:RADIUS".into());
+    if !(3..=4).contains(&parts.len()) {
+        return Err("expected TICK:X,Y,Z:RADIUS[:body]".into());
     }
     let tick = parts[0].parse().map_err(|_| "bad tick")?;
     let xyz: Vec<i64> = parts[1]
@@ -80,10 +88,16 @@ fn parse_cut(s: &str) -> Result<Cut, String> {
         return Err("cell must be X,Y,Z".into());
     }
     let radius = parts[2].parse().map_err(|_| "bad radius")?;
+    let target = match parts.get(3) {
+        None | Some(&"terrain") => ScriptTarget::Terrain,
+        Some(&"body") => ScriptTarget::DetachedBody,
+        Some(other) => return Err(format!("unknown cut target `{other}` (want `body`)")),
+    };
     Ok(Cut {
         tick,
         cell: [xyz[0], xyz[1], xyz[2]],
         radius,
+        target,
     })
 }
 
@@ -146,6 +160,17 @@ fn run_replication(args: Args) -> ExitCode {
         }
     };
 
+    let baseline_scene = match BaselineScene::from_name(&args.scene) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "sandbox-client: unknown --scene `{}` (expected bridge-cut or cross-bridge-cut)",
+                args.scene
+            );
+            return ExitCode::from(2);
+        }
+    };
+
     if args.connect_delay_ms > 0 {
         std::thread::sleep(Duration::from_millis(args.connect_delay_ms));
     }
@@ -158,6 +183,7 @@ fn run_replication(args: Args) -> ExitCode {
         .map(|(i, c)| ScriptedAction {
             at_tick: c.tick,
             request: cut_request(id_base + i as u64, i as u64, c.cell, c.radius),
+            target: c.target,
         })
         .collect();
 
@@ -167,6 +193,7 @@ fn run_replication(args: Args) -> ExitCode {
         join_token: token,
         script,
         late_join: args.late_join,
+        baseline_scene,
         run_ticks: args.run_ticks,
         idle_grace: Duration::from_millis(500),
         overall_timeout: Duration::from_millis(args.timeout_ms),
@@ -177,10 +204,12 @@ fn run_replication(args: Args) -> ExitCode {
     match run_replication_client(config) {
         Ok(summary) => {
             println!(
-                "sandbox-client: {} applied={} motion={} repairs={} hash={}",
+                "sandbox-client: {} applied={} motion={} body_disp={:.2}m body_cut={} repairs={} hash={}",
                 summary.result,
                 summary.transactions_applied,
                 summary.motion_snapshots,
+                summary.max_body_displacement_m,
+                summary.body_cut_committed,
                 summary.repair_requests_sent,
                 summary.final_world_hash
             );
