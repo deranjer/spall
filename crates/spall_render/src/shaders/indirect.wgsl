@@ -6,6 +6,11 @@ struct IndirectGlobals {
     origin_cell_size: vec4<f32>,
     dimensions: vec4<u32>,
     sky: vec4<f32>,
+    // T14: the trace only recomputes cells in [trace_region_min, trace_region_max)
+    // (xyz). Cells outside keep their previous traced radiance, so a small edit
+    // costs a small dispatch. A full pass passes [0, dim).
+    trace_region_min: vec4<u32>,
+    trace_region_max: vec4<u32>,
 };
 
 @group(0) @binding(0) var<storage, read> cells: array<u32>;
@@ -43,11 +48,18 @@ fn direction(i: u32) -> vec3<f32> {
     return dirs[i];
 }
 
+fn in_trace_region(cell: vec3<i32>) -> bool {
+    let lo = vec3<i32>(globals.trace_region_min.xyz);
+    let hi = vec3<i32>(globals.trace_region_max.xyz);
+    return all(cell >= lo) && all(cell < hi);
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn trace_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dim = i32(globals.dimensions.x);
     let cell = vec3<i32>(gid);
     if !inside(cell, dim) { return; }
+    if !in_trace_region(cell) { return; }
     let output_index = index_of(cell, dim);
     let own_material = cells[output_index];
     if own_material != 0u {

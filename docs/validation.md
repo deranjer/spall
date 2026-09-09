@@ -15,7 +15,27 @@ cascades, a linear-HDR opaque pass, and fixed-exposure tone mapping. T13 adds
 `cargo xtask capture --scene colored-room`: open/closed colored-room captures
 with shaded and indirect-only PNGs, a fixed 128-cubed lighting cache, separate
 upload/trace/denoise timings, and deterministic closed/open and thin-wall
-probes. Dynamic cache updates and temporal history remain T14.
+probes.
+
+T14 adds incremental cache updates. `LightingUpdate` is a plain
+(non-simulation) description of what changed — world-space AABBs cleared to air
+plus solid regions refilled in order; `LightingVolume::apply_update` applies one
+and records a cell dirty only when its material actually changes, so a moving
+body vacates old cells and fills new ones with no separate clear step erasing
+overlapping geometry. `capture_lighting_sequence` renders a base
+`IndirectOnly` frame, then applies a list of updates, re-uploading only the
+dirty cells (`take_dirty`) and re-tracing only the dirty cell-AABB grown by a
+halo (`set_trace_region`); the denoise still runs full. Its `SequenceReport`
+records per step: `dirty_cells`, `retraced_cells`, `gpu_trace_millis` /
+`gpu_denoise_millis`, and the measured `band_luminance`. The
+`rapid_destruction` fixture (colored emitter scene, one represented 0.5 m
+occluder column removed) is exercised by
+`rapid_destruction_reexposes_the_band_with_a_bounded_retrace` in
+`spall_render/tests/capture_gpu.rs`: on the reference adapter the shadowed band
+brightens ~22.8 -> ~26.3 sRGB luminance in the next frame while the re-trace
+touches ~1.3 % of the cache (~1.43 ms -> ~0.11 ms). Temporal reprojection,
+moving-camera light-trail evidence, and edit-commit-to-lighting wall-clock
+latency remain later T14 increments; cross-GPU and p95 frame cost remain T15.
 Each run also writes `summary.json`; it exits 3 when no GPU adapter is available.
 The `summary.json` is schema `version: 4`. CPU and GPU costs are reported
 separately and must not be conflated: `gpu_render_millis` is a real device

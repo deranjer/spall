@@ -18,11 +18,14 @@ pub mod upload;
 pub mod vertex;
 
 pub use camera::{Aabb, Camera, Frustum};
-pub use capture::{CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, capture_scene};
+pub use capture::{
+    CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, LightingStep, SequenceReport,
+    SequenceStep, capture_lighting_sequence, capture_scene,
+};
 pub use context::{RenderContext, RenderError};
 pub use fixtures::{
-    EmitterOcclusionScenes, LightingFixture, LightingFixtureMetrics, colored_rooms,
-    emitter_occlusion_scenes,
+    EmitterOcclusionScenes, LightingFixture, LightingFixtureMetrics, OCCLUDER_MAX_M,
+    OCCLUDER_MIN_M, RapidDestruction, colored_rooms, emitter_occlusion_scenes, rapid_destruction,
 };
 pub use indirect::{
     LIGHT_CELL_SIZE_METRES, LIGHT_VOLUME_DIM, LightingRegion, LightingUpdate, LightingVolume,

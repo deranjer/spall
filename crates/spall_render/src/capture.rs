@@ -6,6 +6,7 @@ use std::time::Instant;
 use image::{ImageBuffer, Rgba};
 
 use crate::context::{RenderContext, RenderError};
+use crate::indirect::{LIGHT_VOLUME_DIM, LightingUpdate};
 use crate::pipeline::{CASCADE_COUNT, DebugView, PassTiming, ScenePipeline, default_sun_dir};
 use crate::scene::Scene;
 use crate::target::OffscreenTarget;
@@ -395,4 +396,339 @@ fn draw_meshes<'pass>(pass: &mut wgpu::RenderPass<'pass>, draws: &'pass [GpuMesh
         pass.set_index_buffer(gpu.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..gpu.index_count, 0, 0..1);
     }
+}
+
+/// One incremental world change to feed into [`capture_lighting_sequence`].
+#[derive(Debug, Clone)]
+pub struct LightingStep {
+    pub label: String,
+    pub update: LightingUpdate,
+}
+
+/// The lighting state rendered at one step of a [`capture_lighting_sequence`]
+/// run. Step 0 is the base scene; every later step is the result of applying
+/// one [`LightingStep`] on top of the previous state.
+#[derive(Debug, Clone)]
+pub struct SequenceStep {
+    pub label: String,
+    /// Cache cells whose material changed at this step (`0` for the base).
+    pub dirty_cells: usize,
+    /// Cache cells the trace recomputed this step: the dirty AABB grown by the
+    /// halo, or the whole cache for the base step.
+    pub retraced_cells: u64,
+    pub gpu_trace_millis: Option<f64>,
+    pub gpu_denoise_millis: Option<f64>,
+    /// Mean sRGB luminance of the measured image band in the `IndirectOnly`
+    /// render for this step.
+    pub band_luminance: f32,
+    pub indirect_image: PathBuf,
+}
+
+/// Result of rendering a base scene and then a sequence of incremental lighting
+/// updates, re-uploading only the dirty cells and re-tracing only the dirty
+/// region (plus a halo) at each step.
+#[derive(Debug, Clone)]
+pub struct SequenceReport {
+    pub adapter: String,
+    pub backend: String,
+    pub width: u32,
+    pub height: u32,
+    pub total_cells: u64,
+    /// Fractional image-x band `[x0, x1)` the `band_luminance` figures measure.
+    pub band: [f32; 2],
+    pub halo_cells: u32,
+    pub steps: Vec<SequenceStep>,
+}
+
+/// Render `scene` under `IndirectOnly`, then apply each [`LightingStep`] to the
+/// scene's lighting volume in turn — re-uploading only the changed cells and
+/// re-tracing only the changed region grown by `halo_cells` — and render again.
+///
+/// This is the T14 partial-update path exercised end to end: it proves an edit
+/// reaches the rendered indirect lighting in the next frame and reports how
+/// much of the cache each step actually touched. Temporal reprojection is a
+/// later increment; here each step is a single settled frame.
+pub fn capture_lighting_sequence(
+    ctx: &RenderContext,
+    scene: Scene,
+    band: [f32; 2],
+    halo_cells: u32,
+    exposure: f32,
+    steps: &[LightingStep],
+    out_dir: &Path,
+) -> Result<SequenceReport, RenderError> {
+    std::fs::create_dir_all(out_dir).map_err(|error| RenderError::Image {
+        path: out_dir.display().to_string(),
+        source: image::ImageError::IoError(error),
+    })?;
+
+    let mut volume = scene.lighting.clone().ok_or_else(|| {
+        RenderError::Gpu("capture_lighting_sequence needs a scene lighting volume".into())
+    })?;
+    let total_cells = (LIGHT_VOLUME_DIM as u64).pow(3);
+
+    let pipeline = ScenePipeline::new(&ctx.device);
+    let materials = pipeline.material_buffer(&ctx.device, &scene.materials);
+    let indirect = pipeline.indirect_resources(&ctx.device, &ctx.queue, Some(&volume), &materials);
+    let (width, height) = band_capture_dim(scene.camera.aspect, 720);
+    let target = OffscreenTarget::new(&ctx.device, width, height);
+
+    let frustum = scene.camera.frustum();
+    let mut draws = Vec::new();
+    for item in &scene.items {
+        if !frustum.intersects_aabb(item.world_bounds()) {
+            continue;
+        }
+        let (vertices, indices) = to_gpu(&item.mesh, item.model);
+        if indices.is_empty() {
+            continue;
+        }
+        draws.push(GpuMesh::create(
+            &ctx.device,
+            &vertices,
+            &indices,
+            UploadBudget::default(),
+        )?);
+    }
+
+    // Initialise the shadow cascades once. `IndirectOnly` ignores the sun, but
+    // sampling an uncleared depth texture is undefined.
+    let (light_matrices, _) = ScenePipeline::cascade_data(&scene.camera, default_sun_dir());
+    let mut shadow_encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("spall-t14-seq-shadow-encoder"),
+        });
+    for (cascade, matrix) in light_matrices.into_iter().enumerate() {
+        let bind = pipeline.shadow_bind_group(&ctx.device, &ctx.queue, cascade, matrix);
+        let mut pass = shadow_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("spall-t14-seq-shadow-pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: pipeline.shadow_layer(cascade),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline.shadow());
+        pass.set_bind_group(0, &bind, &[]);
+        draw_meshes(&mut pass, &draws);
+    }
+    ctx.queue.submit([shadow_encoder.finish()]);
+
+    let render_indirect = |step_index: usize,
+                           label: &str|
+     -> Result<(f32, Option<f64>, Option<f64>, PathBuf), RenderError> {
+        let timer = GpuTimer::new(ctx, 2);
+        let mut lighting_encoder =
+            ctx.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("spall-t14-seq-lighting-encoder"),
+                });
+        pipeline.dispatch_indirect(
+            &mut lighting_encoder,
+            &indirect,
+            timer.as_ref().map(|timer| timer.compute_writes(0)),
+            timer.as_ref().map(|timer| timer.compute_writes(1)),
+        );
+        ctx.queue.submit([lighting_encoder.finish()]);
+
+        let scene_bind = pipeline.scene_bind_group(
+            &ctx.device,
+            &ctx.queue,
+            &scene.camera,
+            DebugView::IndirectOnly,
+            exposure,
+            &materials,
+        );
+        let tone_bind =
+            pipeline.tone_bind_group(&ctx.device, &ctx.queue, target.hdr_view(), exposure, true);
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("spall-t14-seq-frame-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("spall-t14-seq-opaque-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target.hdr_view(),
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: scene.clear[0],
+                            g: scene.clear[1],
+                            b: scene.clear[2],
+                            a: scene.clear[3],
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: target.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline.opaque());
+            pass.set_bind_group(0, &scene_bind, &[]);
+            pass.set_bind_group(1, &indirect.display_bind, &[]);
+            draw_meshes(&mut pass, &draws);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("spall-t14-seq-tone-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target.color_view(),
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline.tone_map());
+            pass.set_bind_group(0, &tone_bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        target.copy_to_readback(&mut encoder);
+        ctx.queue.submit([encoder.finish()]);
+        ctx.wait();
+
+        let rgba = target.read_rgba(ctx)?;
+        let luminance = band_luminance(&rgba, target.width, target.height, band);
+        let image: ImageBuffer<Rgba<u8>, _> =
+            ImageBuffer::from_raw(target.width, target.height, rgba)
+                .expect("readback has width*height*4 bytes");
+        let path = out_dir.join(format!("{step_index:02}-{label}-indirect_only.png"));
+        image.save(&path).map_err(|source| RenderError::Image {
+            path: path.display().to_string(),
+            source,
+        })?;
+
+        let times = timer.and_then(|timer| timer.millis(ctx));
+        let (trace_ms, denoise_ms) = match times.as_deref() {
+            Some([trace, denoise, ..]) => (Some(*trace), Some(*denoise)),
+            _ => (None, None),
+        };
+        Ok((luminance, trace_ms, denoise_ms, path))
+    };
+
+    let mut report_steps = Vec::with_capacity(steps.len() + 1);
+    let (base_luma, base_trace, base_denoise, base_path) = render_indirect(0, "base")?;
+    report_steps.push(SequenceStep {
+        label: "base".to_string(),
+        dirty_cells: 0,
+        retraced_cells: total_cells,
+        gpu_trace_millis: base_trace,
+        gpu_denoise_millis: base_denoise,
+        band_luminance: base_luma,
+        indirect_image: base_path,
+    });
+
+    for (i, step) in steps.iter().enumerate() {
+        volume.apply_update(&step.update);
+        let dirty = volume.take_dirty();
+        indirect.upload_dirty(&ctx.queue, &dirty);
+
+        let (lo, hi) = trace_region(&dirty, halo_cells);
+        indirect.set_trace_region(&ctx.queue, lo, hi);
+        let retraced_cells = u64::from((hi.x - lo.x) * (hi.y - lo.y) * (hi.z - lo.z));
+
+        let slug = slugify(&step.label);
+        let (luma, trace_ms, denoise_ms, path) = render_indirect(i + 1, &slug)?;
+        report_steps.push(SequenceStep {
+            label: step.label.clone(),
+            dirty_cells: dirty.len(),
+            retraced_cells,
+            gpu_trace_millis: trace_ms,
+            gpu_denoise_millis: denoise_ms,
+            band_luminance: luma,
+            indirect_image: path,
+        });
+    }
+
+    // Leave the resources re-traceable in full for any later reuse.
+    indirect.set_full_trace_region(&ctx.queue);
+
+    Ok(SequenceReport {
+        adapter: ctx.adapter_name().to_string(),
+        backend: format!("{:?}", ctx.backend()),
+        width: target.width,
+        height: target.height,
+        total_cells,
+        band,
+        halo_cells,
+        steps: report_steps,
+    })
+}
+
+/// Capture size for a given aspect and target height, both even.
+fn band_capture_dim(aspect: f32, height: u32) -> (u32, u32) {
+    let height = height.max(2) & !1;
+    let width = ((height as f32 * aspect).round() as u32).max(2) & !1;
+    (width, height)
+}
+
+/// Clamped cell AABB `[lo, hi)` covering every dirty cell, grown by `halo` on
+/// each side. An empty dirty set yields a zero-volume region so the trace does
+/// nothing.
+fn trace_region(dirty: &[(u32, u32)], halo: u32) -> (glam::UVec3, glam::UVec3) {
+    let dim = LIGHT_VOLUME_DIM;
+    if dirty.is_empty() {
+        return (glam::UVec3::ZERO, glam::UVec3::ZERO);
+    }
+    let mut lo = glam::UVec3::splat(dim);
+    let mut hi = glam::UVec3::ZERO;
+    for &(idx, _) in dirty {
+        let cell = glam::UVec3::new(idx % dim, (idx / dim) % dim, idx / (dim * dim));
+        lo = lo.min(cell);
+        hi = hi.max(cell + glam::UVec3::ONE);
+    }
+    let lo = lo.saturating_sub(glam::UVec3::splat(halo));
+    let hi = (hi + glam::UVec3::splat(halo)).min(glam::UVec3::splat(dim));
+    (lo, hi)
+}
+
+fn band_luminance(rgba: &[u8], width: u32, height: u32, band: [f32; 2]) -> f32 {
+    let x0 = (band[0] * width as f32).round() as u32;
+    let x1 = ((band[1] * width as f32).round() as u32).min(width);
+    let mut sum = 0.0f64;
+    let mut count = 0u64;
+    for y in 0..height {
+        for x in x0..x1 {
+            let p = ((y * width + x) * 4) as usize;
+            sum += 0.2126 * f64::from(rgba[p])
+                + 0.7152 * f64::from(rgba[p + 1])
+                + 0.0722 * f64::from(rgba[p + 2]);
+            count += 1;
+        }
+    }
+    (sum / count.max(1) as f64) as f32
+}
+
+fn slugify(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
