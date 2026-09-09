@@ -7,6 +7,7 @@ use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
+use crate::indirect::{IndirectPipeline, IndirectResources};
 use crate::scene::Material;
 use crate::vertex::GpuVertex;
 
@@ -24,6 +25,8 @@ pub enum DebugView {
     Depth,
     ShadowCascades,
     Roughness,
+    /// T13 irradiance only: direct sun and T12 ambient are disabled.
+    IndirectOnly,
 }
 
 impl DebugView {
@@ -35,6 +38,7 @@ impl DebugView {
             Self::Albedo => 3.0,
             Self::ShadowCascades => 4.0,
             Self::Roughness => 5.0,
+            Self::IndirectOnly => 6.0,
         }
     }
 
@@ -46,12 +50,15 @@ impl DebugView {
             Self::Depth => "depth",
             Self::ShadowCascades => "shadow_cascades",
             Self::Roughness => "roughness",
+            Self::IndirectOnly => "indirect_only",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PassTiming {
+    pub indirect_trace_millis: f64,
+    pub indirect_denoise_millis: f64,
     pub shadow_millis: f64,
     pub opaque_millis: f64,
     pub tone_map_millis: f64,
@@ -59,7 +66,11 @@ pub struct PassTiming {
 
 impl PassTiming {
     pub fn total(self) -> f64 {
-        self.shadow_millis + self.opaque_millis + self.tone_map_millis
+        self.indirect_trace_millis
+            + self.indirect_denoise_millis
+            + self.shadow_millis
+            + self.opaque_millis
+            + self.tone_map_millis
     }
 }
 
@@ -112,6 +123,7 @@ pub struct ScenePipeline {
     shadow_layer_views: Vec<wgpu::TextureView>,
     shadow_sampler: wgpu::Sampler,
     linear_sampler: wgpu::Sampler,
+    indirect: IndirectPipeline,
     sun_dir: Vec3,
 }
 
@@ -192,7 +204,13 @@ impl ScenePipeline {
             ],
         });
 
-        let opaque = create_opaque_pipeline(device, &opaque_shader, &scene_layout);
+        let indirect = IndirectPipeline::new(device);
+        let opaque = create_opaque_pipeline(
+            device,
+            &opaque_shader,
+            &scene_layout,
+            indirect.display_layout(),
+        );
         let shadow = create_shadow_pipeline(device, &shadow_shader, &shadow_layout);
         let tone_map = create_tone_pipeline(device, &tone_shader, &tone_layout);
         let globals_buffer = uniform_buffer::<Globals>(device, "spall-t12-globals");
@@ -262,6 +280,7 @@ impl ScenePipeline {
             shadow_layer_views,
             shadow_sampler,
             linear_sampler,
+            indirect,
             sun_dir: default_sun_dir(),
         }
     }
@@ -279,6 +298,27 @@ impl ScenePipeline {
         &self.shadow_layer_views[index]
     }
 
+    pub(crate) fn indirect_resources(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        volume: Option<&crate::indirect::LightingVolume>,
+        materials: &wgpu::Buffer,
+    ) -> IndirectResources {
+        self.indirect.resources(device, queue, volume, materials)
+    }
+
+    pub(crate) fn dispatch_indirect<'a>(
+        &'a self,
+        encoder: &'a mut wgpu::CommandEncoder,
+        resources: &'a IndirectResources,
+        trace_timestamps: Option<wgpu::ComputePassTimestampWrites<'a>>,
+        denoise_timestamps: Option<wgpu::ComputePassTimestampWrites<'a>>,
+    ) {
+        self.indirect
+            .dispatch(encoder, resources, trace_timestamps, denoise_timestamps);
+    }
+
     pub fn material_buffer(&self, device: &wgpu::Device, materials: &[Material]) -> wgpu::Buffer {
         let fallback = [Material::new([0.5, 0.5, 0.5], 0.8, 0.0)];
         let source = if materials.is_empty() {
@@ -293,7 +333,7 @@ impl ScenePipeline {
                 params: [
                     m.roughness.clamp(0.04, 1.0),
                     m.metallic.clamp(0.0, 1.0),
-                    0.0,
+                    m.emissive.max(0.0),
                     0.0,
                 ],
             })
@@ -450,10 +490,11 @@ fn create_opaque_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
     layout: &wgpu::BindGroupLayout,
+    indirect_layout: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("spall-t12-opaque-layout"),
-        bind_group_layouts: &[layout],
+        bind_group_layouts: &[layout, indirect_layout],
         push_constant_ranges: &[],
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {

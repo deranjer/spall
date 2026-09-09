@@ -49,6 +49,8 @@ pub struct CaptureImage {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaptureTiming {
+    /// CPU wall time to allocate and upload the lighting cache.
+    pub cpu_lighting_upload_millis: f64,
     pub cpu_total_millis: f64,
     pub cpu_readback_millis: f64,
     pub cpu_encode_millis: f64,
@@ -70,6 +72,8 @@ pub struct CaptureReport {
     pub index_bytes: u64,
     pub adapter: String,
     pub backend: String,
+    pub indirect_enabled: bool,
+    pub indirect_cells: usize,
     pub timing: CaptureTiming,
 }
 
@@ -122,6 +126,14 @@ impl GpuTimer {
         }
     }
 
+    fn compute_writes(&self, index: u32) -> wgpu::ComputePassTimestampWrites<'_> {
+        wgpu::ComputePassTimestampWrites {
+            query_set: &self.set,
+            beginning_of_pass_write_index: Some(index * 2),
+            end_of_pass_write_index: Some(index * 2 + 1),
+        }
+    }
+
     fn millis(self, ctx: &RenderContext) -> Option<Vec<f64>> {
         let count = self.pairs * 2;
         let bytes = u64::from(count) * std::mem::size_of::<u64>() as u64;
@@ -168,6 +180,8 @@ pub fn capture_scene(
 
     let pipeline = ScenePipeline::new(&ctx.device);
     let materials = pipeline.material_buffer(&ctx.device, &scene.materials);
+    let indirect =
+        pipeline.indirect_resources(&ctx.device, &ctx.queue, scene.lighting.as_ref(), &materials);
     let target = OffscreenTarget::new(&ctx.device, opts.width, opts.height);
     let frustum = scene.camera.frustum();
     let mut draws = Vec::new();
@@ -188,20 +202,30 @@ pub fn capture_scene(
         draws.push(gpu);
     }
 
-    let pair_count = CASCADE_COUNT as u32 + opts.views.len() as u32 * 2;
+    let pair_count = 2 + CASCADE_COUNT as u32 + opts.views.len() as u32 * 2;
     let mut gpu_timer = GpuTimer::new(ctx, pair_count);
     let loop_start = Instant::now();
 
-    // Shadows are camera-dependent but view-independent, so render them once.
+    // Lighting and shadows are view-independent, so compute/render them once.
     let (light_matrices, _) = ScenePipeline::cascade_data(&scene.camera, default_sun_dir());
     let mut shadow_encoder = ctx
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("spall-shadow-encoder"),
         });
+    let trace_timestamps = gpu_timer.as_ref().map(|timer| timer.compute_writes(0));
+    let denoise_timestamps = gpu_timer.as_ref().map(|timer| timer.compute_writes(1));
+    pipeline.dispatch_indirect(
+        &mut shadow_encoder,
+        &indirect,
+        trace_timestamps,
+        denoise_timestamps,
+    );
     for (cascade, matrix) in light_matrices.into_iter().enumerate() {
         let bind = pipeline.shadow_bind_group(&ctx.device, &ctx.queue, cascade, matrix);
-        let timestamp_writes = gpu_timer.as_ref().map(|timer| timer.writes(cascade as u32));
+        let timestamp_writes = gpu_timer
+            .as_ref()
+            .map(|timer| timer.writes(2 + cascade as u32));
         let mut pass = shadow_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("spall-shadow-pass"),
             color_attachments: &[],
@@ -241,7 +265,7 @@ pub fn capture_scene(
             opts.exposure,
             view != DebugView::Shaded,
         );
-        let base_query = CASCADE_COUNT as u32 + view_index as u32 * 2;
+        let base_query = 2 + CASCADE_COUNT as u32 + view_index as u32 * 2;
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -277,6 +301,7 @@ pub fn capture_scene(
             });
             pass.set_pipeline(pipeline.opaque());
             pass.set_bind_group(0, &scene_bind, &[]);
+            pass.set_bind_group(1, &indirect.display_bind, &[]);
             draw_meshes(&mut pass, &draws);
         }
         {
@@ -325,10 +350,14 @@ pub fn capture_scene(
         .take()
         .and_then(|timer| timer.millis(ctx))
         .map(|times| {
-            let shadow_millis = times[..CASCADE_COUNT].iter().sum();
-            let opaque_millis = times[CASCADE_COUNT..].iter().step_by(2).sum();
-            let tone_map_millis = times[CASCADE_COUNT + 1..].iter().step_by(2).sum();
+            let shadow_start = 2;
+            let raster_start = shadow_start + CASCADE_COUNT;
+            let shadow_millis = times[shadow_start..raster_start].iter().sum();
+            let opaque_millis = times[raster_start..].iter().step_by(2).sum();
+            let tone_map_millis = times[raster_start + 1..].iter().step_by(2).sum();
             PassTiming {
+                indirect_trace_millis: times[0],
+                indirect_denoise_millis: times[1],
                 shadow_millis,
                 opaque_millis,
                 tone_map_millis,
@@ -347,7 +376,10 @@ pub fn capture_scene(
         index_bytes,
         adapter: ctx.adapter_name().to_string(),
         backend: format!("{:?}", ctx.backend()),
+        indirect_enabled: indirect.enabled,
+        indirect_cells: indirect.cells,
         timing: CaptureTiming {
+            cpu_lighting_upload_millis: indirect.upload_millis,
             cpu_total_millis,
             cpu_readback_millis: readback_millis,
             cpu_encode_millis: encode_millis,

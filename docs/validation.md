@@ -11,15 +11,20 @@ T05 implements `cargo xtask capture`: offscreen greedy-meshed renders of the
 acceptance shapes (cube, tunnel, checkerboard, negative coordinates, adjacent
 bricks, rotated hollow volume). T12 extends each capture to shaded, albedo,
 normal, linear-depth, shadow-cascade, and roughness PNGs using four sun-shadow
-cascades, a linear-HDR opaque pass, and fixed-exposure tone mapping.
+cascades, a linear-HDR opaque pass, and fixed-exposure tone mapping. T13 adds
+`cargo xtask capture --scene colored-room`: open/closed colored-room captures
+with shaded and indirect-only PNGs, a fixed 128-cubed lighting cache, separate
+upload/trace/denoise timings, and deterministic closed/open and thin-wall
+probes. Dynamic cache updates and temporal history remain T14.
 Each run also writes `summary.json`; it exits 3 when no GPU adapter is available.
-The colored-room/indirect-light fixture stays T13.
-The `summary.json` is schema `version: 3`. CPU and GPU costs are reported
+The `summary.json` is schema `version: 4`. CPU and GPU costs are reported
 separately and must not be conflated: `gpu_render_millis` is a real device
 measurement from render-pass timestamp queries and is `null` (with
 `gpu_timing_available: false`) on adapters that do not support them — it is
 never a CPU-derived figure. T12 also reports `gpu_shadow_millis`,
-`gpu_opaque_millis`, and `gpu_tone_map_millis`. `cpu_capture_millis` (whole render → readback →
+`gpu_opaque_millis`, and `gpu_tone_map_millis`; T13 adds
+`gpu_indirect_trace_millis`, `gpu_indirect_denoise_millis`, and
+`cpu_lighting_upload_millis`. `cpu_capture_millis` (whole render → readback →
 PNG-encode loop), `cpu_readback_millis`, and `cpu_encode_millis` are CPU
 wall-clock and include the synchronous readback map wait and PNG compression.
 The pre-`version: 2` `gpu_millis` field measured that CPU loop, not the GPU, and
@@ -120,7 +125,10 @@ cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 # T12: stable acceptance cameras with six views and per-pass GPU timing.
 # Needs a supported GPU/driver; exit 3 otherwise.
 cargo xtask capture --output .local/runs/t12-1080p --width 1920 --height 1080 --strategy greedy
-# T13 adds the named colored-room/indirect-light fixture.
+
+# T13: static one-bounce colored-room feasibility capture. Moving 120-frame
+# evidence remains T14/T15. See docs/lighting-decision.md.
+cargo xtask capture --scene colored-room --width 1920 --height 1080 --output .local/runs/t13-lighting
 
 # Release build, named fixture, fixed workload; emits machine-readable metrics.
 cargo xtask bench --suite engine-slice --clients 8 --warmup-seconds 30 --duration-seconds 120 --output .local/runs/bench

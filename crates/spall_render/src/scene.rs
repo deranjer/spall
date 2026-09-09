@@ -4,6 +4,7 @@ use glam::{Mat4, Vec3};
 use spall_mesh::Mesh;
 
 use crate::camera::{Aabb, Camera};
+use crate::indirect::LightingVolume;
 
 /// One placed mesh.
 pub struct SceneItem {
@@ -52,6 +53,8 @@ pub struct Scene {
     pub materials: Vec<Material>,
     /// Linear clear colour.
     pub clear: [f64; 4],
+    /// Optional derived occupancy/material cache used only by T13 lighting.
+    pub lighting: Option<LightingVolume>,
 }
 
 impl Scene {
@@ -61,7 +64,13 @@ impl Scene {
             items: Vec::new(),
             materials: default_materials(),
             clear: [0.017, 0.03, 0.06, 1.0],
+            lighting: None,
         }
+    }
+
+    pub fn with_lighting(mut self, lighting: LightingVolume) -> Self {
+        self.lighting = Some(lighting);
+        self
     }
 
     pub fn with_item(mut self, item: SceneItem) -> Self {
@@ -109,6 +118,8 @@ pub struct Material {
     pub roughness: f32,
     /// Metallic fraction in `[0, 1]`.
     pub metallic: f32,
+    /// Emissive radiance multiplier, using the material base colour.
+    pub emissive: f32,
 }
 
 impl Material {
@@ -117,7 +128,19 @@ impl Material {
             base_color,
             roughness,
             metallic,
+            emissive: 0.0,
         }
+    }
+
+    pub const fn emissive(mut self, radiance: f32) -> Self {
+        self.emissive = radiance;
+        self
+    }
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self::new([0.5, 0.5, 0.5], 0.8, 0.0)
     }
 }
 
@@ -133,6 +156,9 @@ pub fn default_materials() -> Vec<Material> {
         Material::new([0.70, 0.20, 0.16], 0.78, 0.0),  // 5 brick
         Material::new([0.14, 0.30, 0.55], 0.28, 0.82), // 6 metal
         Material::new([0.85, 0.85, 0.90], 0.96, 0.0),  // 7 chalk
+        Material::new([0.72, 0.08, 0.06], 0.88, 0.0),  // 8 red wall
+        Material::new([0.06, 0.12, 0.72], 0.88, 0.0),  // 9 blue wall
+        Material::new([1.0, 0.42, 0.08], 0.65, 0.0).emissive(5.0), // 10 emitter
     ]
 }
 
