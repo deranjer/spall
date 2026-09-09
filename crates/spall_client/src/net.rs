@@ -24,7 +24,7 @@ use std::time::Duration;
 use serde::Serialize;
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
 use spall_core::{
-    JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole, SphereBrush, VolumeId,
+    EntityId, JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole, SphereBrush, VolumeId,
 };
 use spall_net::{
     Connection, DatagramRecord, Fingerprint, JoinToken, TransportConfig, TransportError,
@@ -48,12 +48,24 @@ pub const T10_WORLD_ID: u128 = 0x5A11_0000_0000_7010;
 /// The T10 terrain volume id (`spall_sim` allocates volume 1 for terrain).
 pub const TERRAIN_VOLUME: u64 = 1;
 
+/// What a [`ScriptedAction`] aims at. `Terrain` uses the request verbatim;
+/// `DetachedBody` rewrites `claimed_target` to the sole live detached body at
+/// fire time (its entity id is not known when the script is built).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScriptTarget {
+    #[default]
+    Terrain,
+    DetachedBody,
+}
+
 /// One scripted tool use.
 #[derive(Debug, Clone)]
 pub struct ScriptedAction {
     /// Fire once the observed server tick is at least this.
     pub at_tick: u64,
     pub request: ActionRequest,
+    /// Retarget the request at the detached body before sending it.
+    pub target: ScriptTarget,
 }
 
 /// A `Cut` request with a sphere brush centred on `(cell_x, cell_y, cell_z)` in
@@ -130,6 +142,12 @@ pub struct ClientSummary {
     pub baseline_bricks: u64,
     /// T17: hash-repair baseline patches applied mid-session.
     pub repairs_applied: u64,
+    /// Farthest a replicated body moved from its first observed pose, metres.
+    /// A body that only ever reported a stationary snapshot reads `0.0`.
+    pub max_body_displacement_m: f64,
+    /// A `DetachedBody`-targeted scripted cut was sent and the body it named
+    /// lost solid cells afterwards (the body cut committed).
+    pub body_cut_committed: bool,
 }
 
 /// Anything that stops a client run before it can report.
@@ -187,6 +205,11 @@ struct Counters {
     patches: AtomicU64,
     /// Resident bricks in the installed late-join baseline (T17).
     baseline_bricks: AtomicU64,
+    /// Entity id (+1, so `0` means "never fired") a `DetachedBody` scripted cut
+    /// was aimed at, and that body's solid-cell count captured just before the
+    /// cut was sent. Together they let the run confirm the body cut committed.
+    body_cut_entity_plus1: AtomicU64,
+    body_cut_pre_cells: AtomicU64,
 }
 
 /// Receives one baseline transfer whose `BaselineBegin` has already been read:
@@ -471,6 +494,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let scripter = {
         let conn = conn.clone();
         let counters = counters.clone();
+        let replica = replica.clone();
         let mut script = config.script.clone();
         script.sort_by_key(|a| a.at_tick);
         let stop_rx = stop_rx.clone();
@@ -489,8 +513,46 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
+
+                let mut request = action.request.clone();
+                if action.target == ScriptTarget::DetachedBody {
+                    // Aim at the sole detached body. It only exists once an
+                    // earlier cut has detached it, so wait a bounded while for
+                    // it to appear; skip the action if it never does.
+                    let body_deadline = deadline + Duration::from_secs(3);
+                    let target = loop {
+                        if *stop_rx.borrow() {
+                            return;
+                        }
+                        let found = {
+                            let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                            guard
+                                .body_ids()
+                                .next()
+                                .map(|e| (e, guard.body_solid_cells(e)))
+                        };
+                        if let Some((entity, cells)) = found {
+                            break Some((entity, cells.unwrap_or(0)));
+                        }
+                        if tokio::time::Instant::now() >= body_deadline {
+                            break None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    };
+                    let Some((entity, pre_cells)) = target else {
+                        continue;
+                    };
+                    request.claimed_target = ClaimedTarget::Body(entity);
+                    counters
+                        .body_cut_entity_plus1
+                        .store(entity.get() + 1, Ordering::Relaxed);
+                    counters
+                        .body_cut_pre_cells
+                        .store(pre_cells, Ordering::Relaxed);
+                }
+
                 if conn
-                    .send_record(WireRecord::ActionRequest(action.request))
+                    .send_record(WireRecord::ActionRequest(request))
                     .await
                     .is_ok()
                 {
@@ -537,6 +599,18 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     // A plain late joiner that catches up entirely from the baseline (no cuts
     // after it joined) still passes; a live client must have applied something.
     let progressed = applied > 0 || (config.late_join && baseline_bricks > 0);
+    let max_body_displacement_m = guard.max_body_displacement_m();
+    let body_cut_committed = match counters.body_cut_entity_plus1.load(Ordering::Relaxed) {
+        0 => false,
+        raw => {
+            let entity = EntityId::new(raw - 1).expect("stored a valid entity id");
+            let pre = counters.body_cut_pre_cells.load(Ordering::Relaxed);
+            match guard.body_solid_cells(entity) {
+                Some(post) => post < pre,
+                None => pre > 0,
+            }
+        }
+    };
     let summary = ClientSummary {
         version: 1,
         result: if progressed { "passed" } else { "failed" }.to_string(),
@@ -553,6 +627,8 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         late_join: config.late_join,
         baseline_bricks,
         repairs_applied: counters.patches.load(Ordering::Relaxed),
+        max_body_displacement_m,
+        body_cut_committed,
     };
     drop(guard);
 

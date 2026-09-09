@@ -120,9 +120,16 @@ pub enum Scene {
 
 impl Scene {
     fn simulation(self) -> Simulation {
-        let setup = match self {
+        let mut setup = match self {
             Scene::BridgeCut => spall_sim::fixtures::bridged_terrain_setup(),
         };
+        // No detached body in these scenes enables per-body CCD, and the serve
+        // loop rebuilds the terrain collider on every committed cut. Rapier's
+        // CCD broad-phase BVH can keep a stale proxy for the just-removed
+        // collider and panic with "No element at index" mid-sweep when a body
+        // is still settling (repro: `cargo xtask scenario --name
+        // g1-networked-destruction`). Skip the CCD pass — a no-op here.
+        setup.physics.disable_ccd = true;
         Simulation::new(SimulationConfig::new(setup)).expect("built-in scene is valid")
     }
 }
