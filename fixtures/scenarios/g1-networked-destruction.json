@@ -11,6 +11,11 @@
   "minimum_detached_body_brick_span": 2,
   "minimum_reordered_snapshots": 4,
   "replay_check": true,
+  "latency_targets": {
+    "single_brick_commit_p95_ms": 100,
+    "structure_split_p95_ms": 500,
+    "large_collapse_p95_ms": 2000
+  },
   "cuts": [
     { "client": 0, "at_tick": 4,  "cell": [31, 4, 1], "radius": 3 },
     { "client": 1, "at_tick": 10, "cell": [21, 1, 1], "radius": 1 },

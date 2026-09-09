@@ -7,6 +7,7 @@
 //! motion snapshots.
 
 pub mod baseline;
+pub mod commit_latency;
 pub mod persist;
 pub mod persist_pipeline;
 pub mod replication;

@@ -352,6 +352,18 @@ renderer and gate workload are available. Measured results:
 
 For overload tests, requests beyond admission capacity may return busy. The report must distinguish requested, rejected, queued, and committed counts. Rejecting every expensive action does not satisfy the gate: all named mandatory edits must complete.
 
+**Commit latency + admission counts (ENG-62 / T11a increment 1).** `serve`
+(`ServeSummary` v3) measures server commit latency — admission of an
+`ActionRequest` to commit of its transaction — and reports a nearest-rank p95
+per commit shape (single-brick commit, ordinary structure split, large
+collapse) plus the requested / rejected / queued / committed breakdown. A
+scenario file's optional `latency_targets` block makes `cargo xtask scenario`
+assert each exercised bucket's p95 against the G1 targets (`<= 100 ms` /
+`<= 500 ms` / `<= 2000 ms`); the session summary's `admission` object carries
+the counts, the measured p95s, and `latency_targets_met`. The large-collapse
+bucket stays unexercised until the oversized-split (T17 baseline-blob) path
+lets a big detach commit — see `docs/reports/G1.md`.
+
 ### G2 — graphics quality and cost
 
 1920 x 1080, fixed exposure, recorded sun/camera/material settings. Test daylight terrain, a colored enclosed room, an emissive source behind an occluder, thin walls, moving debris, and rapid destruction. Capture both a settled frame and at least 120 consecutive moving frames.
