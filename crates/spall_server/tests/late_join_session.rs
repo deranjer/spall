@@ -78,6 +78,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         // dev-scenario path so this late-join plumbing test still runs.
         dev_unvalidated_actions: true,
         save_faults: None,
+        await_body_settle: false,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 

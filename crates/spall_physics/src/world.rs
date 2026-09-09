@@ -767,6 +767,77 @@ mod tests {
         })
     }
 
+    /// ENG-61: the authoritative serve loop rebuilds the *terrain* collider on
+    /// every committed cut. A body that is settling onto that terrain must still
+    /// come to rest on it — a rebuild that drops the broad-phase proxy and the
+    /// contact manifold each tick must not let a faller tunnel the floor or jitter
+    /// forever (CCD is disabled for the networked destruction scenes).
+    #[test]
+    fn a_body_settles_on_terrain_whose_collider_is_rebuilt_every_step() {
+        use crate::fixtures as phys_fx;
+
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            disable_ccd: true,
+            ..PhysicsConfig::default()
+        });
+
+        // Fixed floor: 4 cells (1.0 m) thick, top surface at y = 1.0 m.
+        let floor = phys_fx::floor_slab(VolumeId::new(1).unwrap(), 2, 2, 4);
+        let floor_grid = crate::occupancy::OccupancyGrid::from_volume(&floor)
+            .unwrap()
+            .unwrap();
+        let floor_id = world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: floor_grid.clone(),
+            cell_m: phys_fx::CELL_M,
+            density_kg_m3: phys_fx::STONE_DENSITY,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+
+        // A small cube released ~4 m up, so it reaches a real fall speed before
+        // it meets the floor whose collider is churning under it.
+        let piece = phys_fx::debris_pieces(50, 1, 2).pop().unwrap().1;
+        let grid = crate::occupancy::OccupancyGrid::from_volume(&piece)
+            .unwrap()
+            .unwrap();
+        let body = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::MergedCuboids,
+            grid,
+            cell_m: phys_fx::CELL_M,
+            density_kg_m3: phys_fx::STONE_DENSITY,
+            mass_properties: None,
+            translation_m: [4.0, 5.0, 4.0],
+            linvel_m_s: [0.0; 3],
+        });
+
+        for _ in 0..600 {
+            world.rebuild_collider(floor_id, &floor_grid, Representation::MergedCuboids);
+            world.step();
+            assert!(world.body_state(body).is_finite());
+        }
+
+        let st = world.body_state(body);
+        assert!(
+            st.translation_m[1] > 0.9,
+            "body tunnelled the rebuilt-every-step floor (top at y = 1.0 m, body at y = {})",
+            st.translation_m[1]
+        );
+        assert!(
+            st.speed_m_s() < 0.05,
+            "body never came to rest on the churning collider (speed = {} m/s)",
+            st.speed_m_s()
+        );
+        assert!(
+            world.max_penetration_m() < 0.1,
+            "resting body did not sink into the floor ({} m)",
+            world.max_penetration_m()
+        );
+    }
+
     #[test]
     fn installed_fine_grid_properties_reach_the_solver() {
         let grid = mixed_density_grid();

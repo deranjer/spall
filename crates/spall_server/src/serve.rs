@@ -106,6 +106,13 @@ pub const MAX_RELIABLE_BACKLOG: usize = 2048;
 /// Byte ceiling on that same per-client reliable queue.
 pub const MAX_RELIABLE_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
 
+/// ENG-61: with [`ServeConfig::await_body_settle`], how many consecutive ticks
+/// every detached body's origin must hold still (< 1 mm/tick) — on top of being
+/// asleep — before the run is allowed to stop on edit-quiescence. One second at
+/// 60 Hz: long enough that the reported rest is real, short enough to keep the
+/// gate fixture quick.
+pub const AWAIT_SETTLE_STABLE_TICKS: u64 = 60;
+
 /// Content-manifest tag both ends of a T10 session agree on out of band. Real
 /// manifest negotiation is T16/T17; this keeps the handshake honest meanwhile.
 pub const T10_CONTENT_TAG: &[u8] = b"spall-t10-bridge-v1";
@@ -227,6 +234,11 @@ pub struct ServeConfig {
     /// recovery / first checkpoint, so an injected disk fault lands on a
     /// periodic or clean-shutdown durable write. `None` in production.
     pub save_faults: Option<spall_store::FaultPlan>,
+    /// ENG-61: a gate scenario that must show a detached body *come to rest*
+    /// keeps stepping physics past edit-quiescence until every detached body is
+    /// asleep (still bounded by [`Self::max_ticks`]). Off by default so ordinary
+    /// runs still stop as soon as the edit pipeline is idle.
+    pub await_body_settle: bool,
 }
 
 impl ServeConfig {
@@ -254,6 +266,7 @@ impl ServeConfig {
             max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
             dev_unvalidated_actions: false,
             save_faults: None,
+            await_body_settle: false,
         }
     }
 }
@@ -276,6 +289,23 @@ pub struct ServeSummary {
     /// occupied at end of run. `>= 2` means a body's cells were owned across a
     /// brick boundary — the cross-brick ownership-transfer signal for T11.
     pub max_detached_body_brick_span: u64,
+    /// ENG-61: largest linear speed (m/s) of any detached body at end of run.
+    /// `0.0` when there is no detached body.
+    pub detached_body_max_final_speed_m_s: f64,
+    /// ENG-61: every detached body was asleep — at rest — at end of run. `true`
+    /// when there is no detached body.
+    pub detached_bodies_all_asleep: bool,
+    /// ENG-61: consecutive final ticks over which no detached body's origin
+    /// moved more than 1 mm on any axis — "vertical position stable for N ticks".
+    pub detached_body_stable_ticks: u64,
+    /// ENG-61: deepest contact penetration (m) anywhere in the physics world at
+    /// end of run. A body that came to rest *clipped through* the remaining
+    /// floor rather than on top of it shows up here.
+    pub max_contact_penetration_m: f64,
+    /// ENG-61: lowest detached-body origin Y (m) at end of run. A body that
+    /// free-fell instead of settling leaves this far below the floor. `0.0` when
+    /// there is no detached body.
+    pub detached_body_min_origin_y_m: f64,
     /// Engine checkpoints published this run (T16). `0` when `--save` is unset.
     pub checkpoints_published: u64,
     /// Topology journal records written this run.
@@ -666,6 +696,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let paced = config.paced;
     let max_ticks = config.max_ticks;
     let quiescence = config.quiescence_ticks;
+    let await_body_settle = config.await_body_settle;
     let scene = config.scene;
     let clients_for_sim = clients.clone();
     let save = config.save.clone();
@@ -712,6 +743,13 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
         let tick_dt = Duration::from_nanos(1_000_000_000 / 60);
+
+        // ENG-61: rolling "every detached body is holding still" window. Each
+        // tick we compare every body's origin Y against the previous tick; a run
+        // of ticks under 1 mm of movement is the "vertical position stable for N
+        // ticks" evidence the G1 body-at-rest case needs.
+        let mut prev_body_y: HashMap<u64, f64> = HashMap::new();
+        let mut body_stable_ticks = 0u64;
 
         // T17 late-join / reconnect state.
         let mut lj = LateJoin::new(catch_up_cap, max_join_retries);
@@ -855,6 +893,33 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             ticks_run += 1;
             let tick = sim.current_tick();
 
+            // ENG-61: fold this tick into the "bodies holding still" window.
+            // Only when the scenario asked for it — an ordinary run does no
+            // extra per-tick work, so its timing (and an impaired run's
+            // proxy-reordering outcome) is byte-for-byte unchanged.
+            if await_body_settle {
+                let mut max_dy = 0.0_f64;
+                let mut have_history = !prev_body_y.is_empty();
+                let mut seen = 0usize;
+                let mut next_body_y: HashMap<u64, f64> = HashMap::with_capacity(prev_body_y.len());
+                for b in sim.world().bodies() {
+                    seen += 1;
+                    let key = b.entity.map(|e| e.get()).unwrap_or(0);
+                    let y = b.pose.translation_m[1];
+                    match prev_body_y.get(&key) {
+                        Some(py) => max_dy = max_dy.max((y - py).abs()),
+                        None => have_history = false,
+                    }
+                    next_body_y.insert(key, y);
+                }
+                prev_body_y = next_body_y;
+                if seen > 0 && have_history && max_dy < 1.0e-3 {
+                    body_stable_ticks += 1;
+                } else {
+                    body_stable_ticks = 0;
+                }
+            }
+
             for tx in committed_transactions(&report).map(|(_, t)| t.clone()) {
                 committed_total += 1;
                 lj.fan_out_transaction(Arc::new(tx), &sim, &clients_for_sim);
@@ -941,7 +1006,17 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 idle_streak = 0;
             }
             if quiescence > 0 && committed_total > 0 && idle_streak >= quiescence {
-                break;
+                // ENG-61: when the scenario needs a detached body to come to
+                // rest, keep stepping physics past edit-quiescence until every
+                // detached body is asleep *and* has held its position still for
+                // a stretch of ticks (still bounded by `max_ticks`), so the run
+                // ends with real "came to rest" evidence rather than catching
+                // the body mid-fall.
+                let settled = sim.world().bodies().all(|b| b.sleeping)
+                    && body_stable_ticks >= AWAIT_SETTLE_STABLE_TICKS;
+                if !await_body_settle || settled {
+                    break;
+                }
             }
 
             if paced && let Some(rem) = tick_dt.checked_sub(started.elapsed()) {
@@ -1010,6 +1085,25 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 .map(|b| b.volume.resident_brick_coords().len() as u64)
                 .max()
                 .unwrap_or(0),
+            detached_body_max_final_speed_m_s: sim
+                .world()
+                .bodies()
+                .map(|b| {
+                    (b.linvel_m_s[0].powi(2) + b.linvel_m_s[1].powi(2) + b.linvel_m_s[2].powi(2))
+                        .sqrt()
+                })
+                .fold(0.0_f64, f64::max),
+            detached_bodies_all_asleep: sim.world().bodies().all(|b| b.sleeping),
+            detached_body_stable_ticks: body_stable_ticks,
+            max_contact_penetration_m: f64::from(sim.world().physics().max_penetration_m()),
+            detached_body_min_origin_y_m: {
+                let min_y = sim
+                    .world()
+                    .bodies()
+                    .map(|b| b.pose.translation_m[1])
+                    .fold(f64::INFINITY, f64::min);
+                if min_y.is_finite() { min_y } else { 0.0 }
+            },
             checkpoints_published,
             journal_records_written,
             persist_bytes_per_write,
@@ -1062,6 +1156,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         total_solid_cells: sim_result.total_solid_cells,
         body_count: sim_result.body_count,
         max_detached_body_brick_span: sim_result.max_detached_body_brick_span,
+        detached_body_max_final_speed_m_s: sim_result.detached_body_max_final_speed_m_s,
+        detached_bodies_all_asleep: sim_result.detached_bodies_all_asleep,
+        detached_body_stable_ticks: sim_result.detached_body_stable_ticks,
+        max_contact_penetration_m: sim_result.max_contact_penetration_m,
+        detached_body_min_origin_y_m: sim_result.detached_body_min_origin_y_m,
         checkpoints_published: sim_result.checkpoints_published,
         journal_records_written: sim_result.journal_records_written,
         persist_bytes_per_write: sim_result.persist_bytes_per_write,
@@ -1099,6 +1198,11 @@ struct SimResult {
     total_solid_cells: u64,
     body_count: usize,
     max_detached_body_brick_span: u64,
+    detached_body_max_final_speed_m_s: f64,
+    detached_bodies_all_asleep: bool,
+    detached_body_stable_ticks: u64,
+    max_contact_penetration_m: f64,
+    detached_body_min_origin_y_m: f64,
     checkpoints_published: u64,
     journal_records_written: u64,
     persist_bytes_per_write: f64,
@@ -1124,6 +1228,11 @@ impl SimResult {
             total_solid_cells: 0,
             body_count: 0,
             max_detached_body_brick_span: 0,
+            detached_body_max_final_speed_m_s: 0.0,
+            detached_bodies_all_asleep: true,
+            detached_body_stable_ticks: 0,
+            max_contact_penetration_m: 0.0,
+            detached_body_min_origin_y_m: 0.0,
             checkpoints_published: 0,
             journal_records_written: 0,
             persist_bytes_per_write: 0.0,

@@ -185,6 +185,24 @@ struct Scenario {
     /// moved, not merely that a (possibly stationary) snapshot arrived.
     #[serde(default)]
     minimum_body_displacement_m: f64,
+    /// ENG-61: require the server to report every detached body *at rest* on the
+    /// remaining structure at end of run. Also passes `--await-body-settle` to
+    /// the server so the run continues past edit-quiescence until the body
+    /// sleeps (bounded by `server_ticks`).
+    #[serde(default)]
+    require_body_settled: bool,
+    /// Largest final linear speed (m/s) a detached body may have and still count
+    /// as settled.
+    #[serde(default = "default_settle_speed_eps")]
+    body_settle_speed_epsilon_m_s: f64,
+    /// Consecutive final ticks the detached bodies' origins must have held still
+    /// (< 1 mm/tick) for the "position stable for N ticks" check.
+    #[serde(default = "default_settle_stable_ticks")]
+    body_settle_min_stable_ticks: u64,
+    /// Deepest contact penetration (m) tolerated at end of run — a body that
+    /// settled *through* the floor rather than on it exceeds this.
+    #[serde(default = "default_settle_penetration_m")]
+    body_settle_max_penetration_m: f64,
     /// T19: scripted movement paths keyed by client index. A client with a path
     /// predicts a player capsule; its `movement` summary is checked against
     /// `movement`.
@@ -208,6 +226,18 @@ fn default_quiescence() -> u64 {
 
 fn default_late_delay() -> u64 {
     900
+}
+
+fn default_settle_speed_eps() -> f64 {
+    0.05
+}
+
+fn default_settle_stable_ticks() -> u64 {
+    45
+}
+
+fn default_settle_penetration_m() -> f64 {
+    0.15
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -286,7 +316,7 @@ fn default_true() -> bool {
 
 // --- process summaries (subset of the server / client structs) ----------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 struct ServerSummary {
     result: String,
     ticks_run: u64,
@@ -294,6 +324,28 @@ struct ServerSummary {
     final_world_hash: String,
     #[serde(default)]
     max_detached_body_brick_span: u64,
+    // ENG-61 detached-body settle evidence.
+    #[serde(default)]
+    detached_body_max_final_speed_m_s: f64,
+    #[serde(default)]
+    detached_bodies_all_asleep: bool,
+    #[serde(default)]
+    detached_body_stable_ticks: u64,
+    #[serde(default)]
+    max_contact_penetration_m: f64,
+    #[serde(default)]
+    detached_body_min_origin_y_m: f64,
+}
+
+/// ENG-61: whether the server's end-of-run report shows every detached body at
+/// rest on the remaining structure — asleep, barely moving, its origin held
+/// still for a stretch of ticks, and not clipped down through the floor.
+fn body_settled(scenario: &Scenario, server: &ServerSummary) -> bool {
+    server.detached_bodies_all_asleep
+        && server.detached_body_max_final_speed_m_s <= scenario.body_settle_speed_epsilon_m_s
+        && server.detached_body_stable_ticks >= scenario.body_settle_min_stable_ticks
+        && server.max_contact_penetration_m <= scenario.body_settle_max_penetration_m
+        && server.detached_body_min_origin_y_m.is_finite()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -340,6 +392,16 @@ struct SessionSummary {
     transactions_committed: u64,
     /// Largest distinct-brick span of any detached body (server-authoritative).
     max_detached_body_brick_span: u64,
+    /// ENG-61: whether every detached body was reported at rest on the remaining
+    /// structure at end of run (see [`body_settled`]). Always computed; only
+    /// *required* for the session to pass when `require_body_settled` is set.
+    body_settled: bool,
+    /// ENG-61: largest final linear speed (m/s) of any detached body.
+    detached_body_max_final_speed_m_s: f64,
+    /// ENG-61: consecutive final ticks the detached bodies held still.
+    detached_body_stable_ticks: u64,
+    /// ENG-61: deepest contact penetration (m) at end of run.
+    max_contact_penetration_m: f64,
     /// T11 exact-replay check: whether it ran, whether the replayed baseline
     /// hash matched, and how many committed topology events were replayed.
     replay_checked: bool,
@@ -514,6 +576,62 @@ mod requirement_tests {
     }
 
     #[test]
+    fn body_settled_check_wants_asleep_slow_stable_and_unclipped() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 600,
+                "require_body_settled": true,
+                "body_settle_min_stable_ticks": 45
+            }"#,
+        )
+        .unwrap();
+
+        // A clean rest: asleep, ~stationary, held still, shallow penetration.
+        let settled = ServerSummary {
+            detached_bodies_all_asleep: true,
+            detached_body_max_final_speed_m_s: 0.004,
+            detached_body_stable_ticks: 120,
+            max_contact_penetration_m: 0.02,
+            detached_body_min_origin_y_m: -1.25,
+            ..Default::default()
+        };
+        assert!(body_settled(&scenario, &settled));
+
+        // Still drifting downward: not settled.
+        assert!(!body_settled(
+            &scenario,
+            &ServerSummary {
+                detached_body_max_final_speed_m_s: 2.5,
+                ..settled.clone()
+            }
+        ));
+        // Never came to a sustained stop.
+        assert!(!body_settled(
+            &scenario,
+            &ServerSummary {
+                detached_body_stable_ticks: 3,
+                ..settled.clone()
+            }
+        ));
+        // Awake / jittering.
+        assert!(!body_settled(
+            &scenario,
+            &ServerSummary {
+                detached_bodies_all_asleep: false,
+                ..settled.clone()
+            }
+        ));
+        // Rest, but sunk through the remaining floor.
+        assert!(!body_settled(
+            &scenario,
+            &ServerSummary {
+                max_contact_penetration_m: 0.9,
+                ..settled.clone()
+            }
+        ));
+    }
+
+    #[test]
     fn reordered_snapshot_requirement_only_bites_when_the_proxy_is_active() {
         let scenario: Scenario = serde_json::from_str(
             r#"{
@@ -631,6 +749,11 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         // produce; the harness is the authenticated dev-scenario path (ENG-47).
         "--dev-unvalidated-actions",
     ]);
+    if scenario.require_body_settled {
+        // ENG-61: run physics past edit-quiescence until the detached body sleeps
+        // so the run can actually show it come to rest.
+        server_cmd.arg("--await-body-settle");
+    }
     // T11 exact-replay check: journal every committed transaction to a world DB
     // and, after the run, replay the whole journal from the tick-0 baseline and
     // assert it reproduces the agreed hash.
@@ -784,6 +907,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     server_ticks_run: 0,
                     transactions_committed: 0,
                     max_detached_body_brick_span: 0,
+                    body_settled: false,
+                    detached_body_max_final_speed_m_s: 0.0,
+                    detached_body_stable_ticks: 0,
+                    max_contact_penetration_m: 0.0,
                     replay_checked: false,
                     replay_matches: false,
                     replayed_topology_events: 0,
@@ -880,6 +1007,13 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         requirements_met = false;
     }
 
+    // ENG-61: a "body comes to rest on remaining structure" fixture also requires
+    // the server's end-of-run report to show every detached body settled.
+    let body_settled = body_settled(&scenario, &server);
+    if scenario.require_body_settled && !body_settled {
+        requirements_met = false;
+    }
+
     // T11 exact replay: fold the committed topology-event stream from the tick-0
     // baseline and require the rebuilt canonical hash to equal the live hash.
     let replay = if scenario.replay_check {
@@ -904,6 +1038,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             server_ticks_run: server.ticks_run,
             transactions_committed: server.transactions_committed,
             max_detached_body_brick_span: server.max_detached_body_brick_span,
+            body_settled,
+            detached_body_max_final_speed_m_s: server.detached_body_max_final_speed_m_s,
+            detached_body_stable_ticks: server.detached_body_stable_ticks,
+            max_contact_penetration_m: server.max_contact_penetration_m,
             replay_checked: replay.is_some(),
             replay_matches: replay.as_ref().map(|r| r.ran && r.matches).unwrap_or(false),
             replayed_topology_events: replay.as_ref().map(|r| r.events).unwrap_or(0),

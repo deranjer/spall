@@ -80,6 +80,11 @@ struct Args {
     /// Lets a fixture harness script arbitrary cuts. Never use on a shared host.
     #[arg(long, hide = true)]
     dev_unvalidated_actions: bool,
+    /// ENG-61: keep stepping physics past edit-quiescence until every detached
+    /// body is asleep (bounded by `--ticks`). Used by the `body-rest-on-structure`
+    /// gate fixture so the run can show the detached beam actually come to rest.
+    #[arg(long)]
+    await_body_settle: bool,
 
     // --- T11 exact-replay check ---
     /// Instead of serving, recover from this world database's **oldest**
@@ -179,6 +184,7 @@ fn run_serve(args: Args) -> ExitCode {
         max_join_retries: args.max_join_retries,
         dev_unvalidated_actions: args.dev_unvalidated_actions,
         save_faults: None,
+        await_body_settle: args.await_body_settle,
     };
     match spall_server::serve(config) {
         Ok(summary) => {
