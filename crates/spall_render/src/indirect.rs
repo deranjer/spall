@@ -3,6 +3,7 @@
 //! The cache is deliberately a derived render resource. It is not a world
 //! format and it never feeds collision, support, or authoritative geometry.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
@@ -15,12 +16,71 @@ pub const LIGHT_VOLUME_DIM: u32 = 128;
 pub const LIGHT_CELL_SIZE_METRES: f32 = 0.5;
 const TRACE_WORKGROUP: u32 = 4;
 
+/// One solid axis-aligned fill applied during a [`LightingUpdate`], in world
+/// metres. `material` `0` clears the span to air.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LightingRegion {
+    pub min_m: Vec3,
+    pub max_m: Vec3,
+    pub material: u32,
+}
+
+/// A plain, engine-agnostic description of what changed in the world since the
+/// last lighting update, consumed by [`LightingVolume::apply_update`].
+///
+/// `spall_render` has no dependency on the simulation: the sandbox example
+/// translates committed edits and moving-body poses into this DTO. Every dirty
+/// bound is cleared to air first, then every region is filled in order — so a
+/// caller passes the union of an edit's old and new occupancy (and a moving
+/// body's old and new world bounds) as `dirty_world_bounds`, and the full solid
+/// state left inside those bounds as `regions`. Reconstructing occupancy for the
+/// whole dirty span this way is how a moving body vacates cells without a
+/// separate clear step erasing geometry that overlaps its old bounds.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LightingUpdate {
+    pub dirty_world_bounds: Vec<(Vec3, Vec3)>,
+    pub regions: Vec<LightingRegion>,
+}
+
+impl LightingUpdate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark a world-space AABB dirty. Its cells are cleared to air, then
+    /// recomputed from whatever [`regions`](Self::regions) cover them.
+    pub fn dirty_bound(mut self, min_m: Vec3, max_m: Vec3) -> Self {
+        self.dirty_world_bounds.push((min_m, max_m));
+        self
+    }
+
+    /// Add a solid fill, applied after every dirty bound has been cleared.
+    pub fn region(mut self, min_m: Vec3, max_m: Vec3, material: u32) -> Self {
+        self.regions.push(LightingRegion {
+            min_m,
+            max_m,
+            material,
+        });
+        self
+    }
+}
+
 /// CPU staging image for the 128^3 occupancy/material clipmap. Each cell is a
 /// material id; zero is air.
 #[derive(Debug, Clone)]
 pub struct LightingVolume {
     origin: Vec3,
     cells: Vec<u32>,
+    /// Flat indices whose material changed since the last [`take_dirty`], i.e.
+    /// the minimal set the GPU occupancy buffer must re-upload. Construction-
+    /// time fills ([`set`], [`fill_box`]) do not touch this; only
+    /// [`apply_update`] does.
+    ///
+    /// [`take_dirty`]: Self::take_dirty
+    /// [`set`]: Self::set
+    /// [`fill_box`]: Self::fill_box
+    /// [`apply_update`]: Self::apply_update
+    dirty: BTreeSet<u32>,
 }
 
 impl LightingVolume {
@@ -33,6 +93,7 @@ impl LightingVolume {
                     * LIGHT_VOLUME_DIM as usize
                     * LIGHT_VOLUME_DIM as usize
             ],
+            dirty: BTreeSet::new(),
         }
     }
 
@@ -75,6 +136,104 @@ impl LightingVolume {
     /// fixture probes and leakage quantification without requiring a GPU.
     pub fn probe_radiance(&self, world: Vec3, materials: &[Material]) -> Vec3 {
         trace_air_cell(self, self.world_to_cell(world), materials)
+    }
+
+    /// Apply an incremental world change: clear every dirty bound to air, then
+    /// fill every region in order. A cell is recorded dirty only if its
+    /// material actually changed, so re-filling a span with what was already
+    /// there costs nothing downstream. Returns the number of newly dirtied
+    /// cells.
+    ///
+    /// This is the T14 update path. Static fixture construction still uses the
+    /// plain [`set`](Self::set) / [`fill_box`](Self::fill_box) helpers and does
+    /// not dirty anything.
+    pub fn apply_update(&mut self, update: &LightingUpdate) -> usize {
+        let mut spans = Vec::new();
+        for &(min_m, max_m) in &update.dirty_world_bounds {
+            if let Some(span) = self.world_span(min_m, max_m) {
+                spans.push(span);
+            }
+        }
+        for region in &update.regions {
+            if let Some(span) = self.world_span(region.min_m, region.max_m) {
+                spans.push(span);
+            }
+        }
+
+        // Snapshot the original material of every affected cell once, before
+        // any mutation, so overlapping spans still compare against the true
+        // pre-update value.
+        let mut original: BTreeMap<u32, u32> = BTreeMap::new();
+        for [lo, hi] in &spans {
+            for z in lo.z..hi.z {
+                for y in lo.y..hi.y {
+                    for x in lo.x..hi.x {
+                        let idx = cell_index(IVec3::new(x, y, z)).expect("span is clamped") as u32;
+                        original.entry(idx).or_insert(self.cells[idx as usize]);
+                    }
+                }
+            }
+        }
+
+        for &(min_m, max_m) in &update.dirty_world_bounds {
+            self.write_span(min_m, max_m, 0);
+        }
+        for region in &update.regions {
+            self.write_span(region.min_m, region.max_m, region.material);
+        }
+
+        let mut changed = 0;
+        for (idx, old) in original {
+            if self.cells[idx as usize] != old {
+                self.dirty.insert(idx);
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    /// Drain the dirty set as `(flat cell index, current material)` pairs — the
+    /// minimal re-upload set for the GPU occupancy buffer.
+    pub fn take_dirty(&mut self) -> Vec<(u32, u32)> {
+        let drained: Vec<(u32, u32)> = self
+            .dirty
+            .iter()
+            .map(|&idx| (idx, self.cells[idx as usize]))
+            .collect();
+        self.dirty.clear();
+        drained
+    }
+
+    /// Number of cells currently pending re-upload.
+    pub fn dirty_len(&self) -> usize {
+        self.dirty.len()
+    }
+
+    /// Clamped half-open cell box `[lo, hi)` for a world-space AABB, or `None`
+    /// when the box misses the cache entirely.
+    fn world_span(&self, min_m: Vec3, max_m: Vec3) -> Option<[IVec3; 2]> {
+        let d = LIGHT_VOLUME_DIM as i32;
+        let lo = self.world_to_cell(min_m).max(IVec3::ZERO);
+        let hi =
+            (self.world_to_cell(max_m - Vec3::splat(1.0e-4)) + IVec3::ONE).min(IVec3::splat(d));
+        if lo.cmpge(hi).any() {
+            return None;
+        }
+        Some([lo, hi])
+    }
+
+    fn write_span(&mut self, min_m: Vec3, max_m: Vec3, material: u32) {
+        let Some([lo, hi]) = self.world_span(min_m, max_m) else {
+            return;
+        };
+        for z in lo.z..hi.z {
+            for y in lo.y..hi.y {
+                for x in lo.x..hi.x {
+                    let idx = cell_index(IVec3::new(x, y, z)).expect("span is clamped");
+                    self.cells[idx] = material;
+                }
+            }
+        }
     }
 }
 
@@ -411,5 +570,104 @@ mod tests {
             closed_luma < open_luma,
             "closed={closed_luma}, open={open_luma}"
         );
+    }
+
+    /// Flat cache index of the cell containing a world point.
+    fn cell_at(v: &LightingVolume, world: Vec3) -> usize {
+        cell_index(v.world_to_cell(world)).expect("point inside cache")
+    }
+
+    #[test]
+    fn apply_update_fills_and_dirties_only_the_changed_cells() {
+        let mut v = LightingVolume::empty(Vec3::splat(-32.0));
+        let update = LightingUpdate::new()
+            .dirty_bound(Vec3::ZERO, Vec3::ONE)
+            .region(Vec3::ZERO, Vec3::ONE, 5);
+
+        // A 1 m cube at the origin is 2x2x2 half-metre cells.
+        assert_eq!(v.apply_update(&update), 8);
+        assert_eq!(v.dirty_len(), 8);
+        assert_eq!(v.cells()[cell_at(&v, Vec3::splat(0.25))], 5);
+
+        let drained = v.take_dirty();
+        assert_eq!(drained.len(), 8);
+        assert!(drained.iter().all(|&(_, material)| material == 5));
+        assert_eq!(v.dirty_len(), 0);
+    }
+
+    #[test]
+    fn construction_fills_never_dirty_anything() {
+        let mut v = LightingVolume::empty(Vec3::splat(-32.0));
+        v.set(IVec3::new(10, 10, 10), 7);
+        v.fill_box(IVec3::splat(0), IVec3::splat(4), 3);
+        assert_eq!(v.dirty_len(), 0);
+        assert!(v.take_dirty().is_empty());
+    }
+
+    #[test]
+    fn refilling_a_span_with_the_same_material_dirties_nothing() {
+        let mut v = LightingVolume::empty(Vec3::splat(-32.0));
+        let fill = LightingUpdate::new()
+            .dirty_bound(Vec3::ZERO, Vec3::splat(1.5))
+            .region(Vec3::ZERO, Vec3::splat(1.5), 3);
+        v.apply_update(&fill);
+        v.take_dirty();
+
+        assert_eq!(v.apply_update(&fill), 0);
+        assert_eq!(v.dirty_len(), 0);
+    }
+
+    #[test]
+    fn moving_a_body_dirties_vacated_and_entered_cells_but_preserves_the_overlap() {
+        let mut v = LightingVolume::empty(Vec3::splat(-32.0));
+        let (a_min, a_max) = (Vec3::ZERO, Vec3::new(2.0, 1.0, 1.0));
+        v.apply_update(
+            &LightingUpdate::new()
+                .dirty_bound(a_min, a_max)
+                .region(a_min, a_max, 5),
+        );
+        v.take_dirty();
+
+        // Slide the body +1 m along X. Old and new bounds are both dirty; the
+        // caller re-asserts the body's solid geometry only at its new box.
+        let (b_min, b_max) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(3.0, 1.0, 1.0));
+        let changed = v.apply_update(
+            &LightingUpdate::new()
+                .dirty_bound(a_min, a_max)
+                .dirty_bound(b_min, b_max)
+                .region(b_min, b_max, 5),
+        );
+        // Vacated x in [0,1) and newly entered x in [2,3): 2x2x2 cells each.
+        // The x in [1,2) overlap keeps material 5 and stays clean.
+        assert_eq!(changed, 16);
+
+        let drained = v.take_dirty();
+        let overlap = cell_at(&v, Vec3::new(1.5, 0.5, 0.5));
+        assert!(!drained.iter().any(|&(idx, _)| idx as usize == overlap));
+        assert_eq!(
+            v.cells()[overlap],
+            5,
+            "overlap geometry must survive the move"
+        );
+        assert_eq!(
+            v.cells()[cell_at(&v, Vec3::new(0.5, 0.5, 0.5))],
+            0,
+            "vacated -> air"
+        );
+        assert_eq!(
+            v.cells()[cell_at(&v, Vec3::new(2.5, 0.5, 0.5))],
+            5,
+            "entered -> solid"
+        );
+    }
+
+    #[test]
+    fn apply_update_ignores_bounds_outside_the_cache() {
+        let mut v = LightingVolume::empty(Vec3::splat(-32.0));
+        let far = LightingUpdate::new()
+            .dirty_bound(Vec3::new(100.0, 0.0, 0.0), Vec3::new(110.0, 1.0, 1.0))
+            .region(Vec3::new(100.0, 0.0, 0.0), Vec3::new(110.0, 1.0, 1.0), 5);
+        assert_eq!(v.apply_update(&far), 0);
+        assert_eq!(v.dirty_len(), 0);
     }
 }
