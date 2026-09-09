@@ -86,6 +86,33 @@ struct Args {
     #[arg(long)]
     await_body_settle: bool,
 
+    // --- T20 interest + bandwidth scheduling ---
+    /// Enable per-client interest relevance + motion bandwidth budget. Without
+    /// it, one 20 Hz motion batch is broadcast unfiltered to every client
+    /// (the pre-T20 behaviour). The three `--motion-*` values below apply only
+    /// when this is set.
+    #[arg(long)]
+    motion_interest: bool,
+    /// Interest near radius (m): bodies within this of a client's anchor are
+    /// replicated every 20 Hz batch.
+    #[arg(long, default_value_t = 48.0)]
+    motion_near_m: f64,
+    /// Interest far radius (m): out to here bodies replicate on the
+    /// `--motion-far-interval` cadence; beyond it a non-player body is not
+    /// replicated to that client.
+    #[arg(long, default_value_t = 96.0)]
+    motion_far_m: f64,
+    /// Send `Far`-tier motion only every Nth 20 Hz batch (1 = every batch).
+    #[arg(long, default_value_t = 4)]
+    motion_far_interval: u64,
+    /// Per-client per-batch motion byte ceiling (0 = no ceiling).
+    #[arg(long, default_value_t = 0)]
+    motion_client_budget_bytes: usize,
+    /// Interest anchor `x,y,z` (m) for a client on a scene with no player
+    /// capsule (the bridge scenes). Omitted → those clients stay unfiltered.
+    #[arg(long)]
+    motion_static_anchor: Option<String>,
+
     // --- T11 exact-replay check ---
     /// Instead of serving, recover from this world database's **oldest**
     /// checkpoint and replay its entire committed topology journal, then print
@@ -162,6 +189,30 @@ fn run_serve(args: Args) -> ExitCode {
         let _ = std::fs::create_dir_all(parent);
     }
 
+    let motion_interest = if args.motion_interest {
+        let static_anchor_m = match args.motion_static_anchor.as_deref() {
+            None => None,
+            Some(s) => match parse_vec3(s) {
+                Some(v) => Some(v),
+                None => {
+                    eprintln!(
+                        "sandbox-server: --motion-static-anchor must be `x,y,z` metres, got `{s}`"
+                    );
+                    return ExitCode::from(2);
+                }
+            },
+        };
+        Some(spall_server::MotionInterest {
+            near_radius_m: args.motion_near_m,
+            far_radius_m: args.motion_far_m,
+            far_interval: args.motion_far_interval,
+            per_client_budget_bytes: args.motion_client_budget_bytes,
+            static_anchor_m,
+        })
+    } else {
+        None
+    };
+
     let config = ServeConfig {
         listen: args.listen,
         scene,
@@ -185,6 +236,7 @@ fn run_serve(args: Args) -> ExitCode {
         dev_unvalidated_actions: args.dev_unvalidated_actions,
         save_faults: None,
         await_body_settle: args.await_body_settle,
+        motion_interest,
     };
     match spall_server::serve(config) {
         Ok(summary) => {
@@ -248,6 +300,18 @@ fn run_replay(args: Args) -> ExitCode {
         );
         ExitCode::from(1)
     }
+}
+
+/// Parses a `x,y,z` triple of finite `f64` metres.
+fn parse_vec3(s: &str) -> Option<[f64; 3]> {
+    let mut it = s.split(',').map(|p| p.trim().parse::<f64>());
+    let x = it.next()?.ok()?;
+    let y = it.next()?.ok()?;
+    let z = it.next()?.ok()?;
+    if it.next().is_some() || !(x.is_finite() && y.is_finite() && z.is_finite()) {
+        return None;
+    }
+    Some([x, y, z])
 }
 
 fn write_replay_summary(

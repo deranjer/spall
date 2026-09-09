@@ -115,6 +115,50 @@ Budget example: 200 relevant bodies x 48 encoded bytes x 20 Hz = 192,000 bytes/s
 
 Never discard committed topology to meet the motion budget. Drop superseded unsent motion snapshots; cap cosmetic events; throttle expensive actions; repair or disconnect a client whose reliable backlog exceeds the bounded window. Record backlog bytes and age. The stress gate must show that the queue drains after a blast and a new player can join while the server continues running.
 
+## T20 interest and bandwidth scheduling (partial — increment 1)
+
+`spall_server::serve` gains an opt-in `ServeConfig::motion_interest`
+(`MotionInterest { near_radius_m, far_radius_m, far_interval,
+per_client_budget_bytes, static_anchor_m }`, CLI `--motion-interest` plus
+`--motion-near-m` / `--motion-far-m` / `--motion-far-interval` /
+`--motion-client-budget-bytes` / `--motion-static-anchor`). Unset, the host
+behaves exactly as before: one 20 Hz `MotionSnapshot` batch broadcast
+unfiltered to every client.
+
+Set, each **live** client (a client still pulling a late-join baseline keeps
+getting its catch-up keyframe, not the live feed) gets its own filtered batch:
+
+- **Relevance by bounds.** `crates/spall_server/src/replication.rs` classifies
+  every body/player against the client's `InterestSet` — anchored at the
+  client's player capsule on a player scene, else at `static_anchor_m`, else
+  `Global`. A body is `Near` (every batch) within `near_radius_m` of its
+  bounding-sphere *near face* (so a large body is relevant when its bounds
+  reach in, per "Large bodies are relevant if their bounds intersect
+  interest"), `Far` (reduced cadence) out to `far_radius_m`, and `Excluded`
+  beyond that plus a 1.25x outward hysteresis band. A player is never
+  `Excluded` — only slowed to the `Far` cadence.
+- **Motion-frequency tiers.** `Far`-tier snapshots are sent only every
+  `far_interval`-th batch; the batches between are deferred (superseded, so no
+  geometry is lost).
+- **Per-client byte budget.** `per_client_budget_bytes` caps one client's
+  motion per batch, accounted at a fixed 48 B/snapshot. Over budget, the
+  lowest-priority motion is deferred first: far, then near-sleeping, then
+  near-awake, then other players, then the client's own player.
+- **Egress accounting.** `ServeSummary` (now `version: 2`) reports
+  `motion_snapshots_sent` / `_interest_culled` / `_budget_deferred`,
+  `max_client_motion_batch_bytes`, and both `app_egress_bytes` (the
+  `spall_net` application-byte counter) and `transport_egress_bytes` (Quinn's
+  `udp_tx.bytes` — actual UDP payload including QUIC framing and
+  retransmission), summed over every client connection.
+
+Committed `TopologyTransaction`s are never interest-filtered or dropped here —
+the ENG-48 reliable-backlog bound remains the only thing that sheds them, and
+only by disconnecting the client so it re-baselines. Not yet in this
+increment: the eight-client separated-interest bandwidth scenario and its
+xtask acceptance assertions (needs a world larger than the current fixtures),
+per-body motion-frequency priority by velocity, and cross-region dependency
+baselines for an interest-crossing split.
+
 ## T01 wire encoding decisions (implemented)
 
 `spall_core` and `spall_protocol` implement the record families above. The

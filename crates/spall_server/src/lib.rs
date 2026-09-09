@@ -9,6 +9,7 @@
 pub mod baseline;
 pub mod persist;
 pub mod persist_pipeline;
+pub mod replication;
 pub mod residency;
 pub mod serve;
 
@@ -25,11 +26,15 @@ pub use persist_pipeline::{
     DEFAULT_QUEUE_CAPACITY, PersistPipeline, PipelineConfig, PipelineError, PipelineOutcome,
     PipelineStatus,
 };
+pub use replication::{
+    BodyDigest, ClientReplication, InterestSet, MOTION_SNAPSHOT_WIRE_BYTES, MotionBudget,
+    Relevance, SelectOutcome,
+};
 pub use residency::{
     BackingLoad, BodySpatialIndex, GraphBrickMeta, MemoryBackingError, MemoryBrickBacking,
     PartitionCoord, ResidencyBacking, ResidencyController, ResidencyError, StructuralResolution,
 };
-pub use serve::{Scene, ServeConfig, ServeError, ServeSummary, serve};
+pub use serve::{MotionInterest, Scene, ServeConfig, ServeError, ServeSummary, serve};
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};
 use std::{net::SocketAddr, path::PathBuf, thread, time::Duration};
