@@ -1,6 +1,4 @@
-//! Offscreen capture: render a [`Scene`] to PNG images (shaded plus normal and
-//! depth debug views) and return a report. The function renders, writes, and
-//! returns — nothing keeps running.
+//! Bounded offscreen capture for the explicit T12 shadow/HDR/tone-map passes.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -8,20 +6,20 @@ use std::time::Instant;
 use image::{ImageBuffer, Rgba};
 
 use crate::context::{RenderContext, RenderError};
-use crate::pipeline::{DebugView, ScenePipeline};
+use crate::pipeline::{CASCADE_COUNT, DebugView, PassTiming, ScenePipeline, default_sun_dir};
 use crate::scene::Scene;
 use crate::target::OffscreenTarget;
 use crate::upload::{GpuMesh, UploadBudget};
 use crate::vertex::to_gpu;
 
-/// Capture settings.
 #[derive(Debug, Clone)]
 pub struct CaptureOptions {
     pub width: u32,
     pub height: u32,
-    /// Which images to write. Defaults to all three.
     pub views: Vec<DebugView>,
     pub budget: UploadBudget,
+    /// Fixed linear exposure used by every acceptance capture.
+    pub exposure: f32,
 }
 
 impl Default for CaptureOptions {
@@ -29,45 +27,37 @@ impl Default for CaptureOptions {
         Self {
             width: 1280,
             height: 720,
-            views: vec![DebugView::Shaded, DebugView::Normals, DebugView::Depth],
+            views: vec![
+                DebugView::Shaded,
+                DebugView::Albedo,
+                DebugView::Normals,
+                DebugView::Depth,
+                DebugView::ShadowCascades,
+                DebugView::Roughness,
+            ],
             budget: UploadBudget::default(),
+            exposure: 1.0,
         }
     }
 }
 
-/// One written image.
 #[derive(Debug, Clone)]
 pub struct CaptureImage {
     pub view: DebugView,
     pub path: PathBuf,
 }
 
-/// Timings for one [`capture_scene`] call.
-///
-/// GPU and CPU costs are reported separately and must never be conflated. In
-/// particular `cpu_*` figures include the synchronous readback map wait and the
-/// PNG compression, neither of which is GPU work; `gpu_render_millis` is a real
-/// device measurement from timestamp queries or [`None`] when the adapter does
-/// not support them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaptureTiming {
-    /// Wall-clock time for the whole render → readback → PNG-encode loop,
-    /// measured on the CPU. This is *not* a GPU timing.
     pub cpu_total_millis: f64,
-    /// CPU wall-clock spent inside `map_async` readback + row unpadding, summed
-    /// over every captured view.
     pub cpu_readback_millis: f64,
-    /// CPU wall-clock spent in PNG compression and the file write, summed over
-    /// every captured view.
     pub cpu_encode_millis: f64,
-    /// GPU time spent inside the render passes, measured with timestamp queries
-    /// and summed over every captured view. [`None`] when the adapter/driver
-    /// does not support render-pass timestamp queries — callers must surface it
-    /// as "GPU timing unavailable" and never substitute a CPU figure.
+    /// Total measured device time for all shadow, opaque, and tone-map passes.
     pub gpu_render_millis: Option<f64>,
+    /// Device timing split by explicit pass family.
+    pub gpu_passes: Option<PassTiming>,
 }
 
-/// Result of [`capture_scene`].
 #[derive(Debug, Clone)]
 pub struct CaptureReport {
     pub images: Vec<CaptureImage>,
@@ -80,12 +70,9 @@ pub struct CaptureReport {
     pub index_bytes: u64,
     pub adapter: String,
     pub backend: String,
-    /// Separated CPU/GPU timings. See [`CaptureTiming`].
     pub timing: CaptureTiming,
 }
 
-/// Render-pass timestamp queries for the capture loop. One begin/end pair per
-/// captured view; resolved and read back once at the end.
 struct GpuTimer {
     set: wgpu::QuerySet,
     resolve: wgpu::Buffer,
@@ -95,8 +82,6 @@ struct GpuTimer {
 }
 
 impl GpuTimer {
-    /// Allocate a timer for `pairs` render passes, or `None` when the device has
-    /// no timestamp-query support.
     fn new(ctx: &RenderContext, pairs: u32) -> Option<Self> {
         if !ctx.supports_gpu_timestamps() || pairs == 0 {
             return None;
@@ -129,7 +114,6 @@ impl GpuTimer {
         })
     }
 
-    /// Timestamp writes for render pass number `index` (`0`-based).
     fn writes(&self, index: u32) -> wgpu::RenderPassTimestampWrites<'_> {
         wgpu::RenderPassTimestampWrites {
             query_set: &self.set,
@@ -138,71 +122,55 @@ impl GpuTimer {
         }
     }
 
-    /// Resolve and read the queries. Returns the summed GPU pass time in
-    /// milliseconds, or `None` if the driver produced no usable delta.
-    fn total_millis(self, ctx: &RenderContext) -> Option<f64> {
+    fn millis(self, ctx: &RenderContext) -> Option<Vec<f64>> {
         let count = self.pairs * 2;
+        let bytes = u64::from(count) * std::mem::size_of::<u64>() as u64;
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("spall-capture-timestamp-resolve-encoder"),
             });
         encoder.resolve_query_set(&self.set, 0..count, &self.resolve, 0);
-        encoder.copy_buffer_to_buffer(
-            &self.resolve,
-            0,
-            &self.readback,
-            0,
-            u64::from(count) * std::mem::size_of::<u64>() as u64,
-        );
+        encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, bytes);
         ctx.queue.submit([encoder.finish()]);
 
         let slice = self.readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
         });
         ctx.wait();
         rx.recv().ok()?.ok()?;
-
         let ticks: Vec<u64> = {
             let mapped = slice.get_mapped_range();
             bytemuck::cast_slice::<u8, u64>(&mapped).to_vec()
         };
         self.readback.unmap();
-
-        let mut total_ns = 0.0f64;
-        let mut usable = false;
-        for pair in ticks.chunks_exact(2) {
-            let delta = pair[1].saturating_sub(pair[0]);
-            if delta > 0 {
-                usable = true;
-                total_ns += delta as f64 * self.period_ns;
-            }
-        }
-        usable.then_some(total_ns / 1.0e6)
+        Some(
+            ticks
+                .chunks_exact(2)
+                .map(|pair| pair[1].saturating_sub(pair[0]) as f64 * self.period_ns / 1.0e6)
+                .collect(),
+        )
     }
 }
 
-/// Render `scene` to `<out_dir>/<view>.png` for each requested view.
 pub fn capture_scene(
     ctx: &RenderContext,
     scene: &Scene,
     out_dir: &Path,
     opts: &CaptureOptions,
 ) -> Result<CaptureReport, RenderError> {
-    std::fs::create_dir_all(out_dir).map_err(|e| RenderError::Image {
+    std::fs::create_dir_all(out_dir).map_err(|error| RenderError::Image {
         path: out_dir.display().to_string(),
-        source: image::ImageError::IoError(e),
+        source: image::ImageError::IoError(error),
     })?;
 
     let pipeline = ScenePipeline::new(&ctx.device);
-    let palette = pipeline.palette_buffer(&ctx.device, &scene.palette);
+    let materials = pipeline.material_buffer(&ctx.device, &scene.materials);
     let target = OffscreenTarget::new(&ctx.device, opts.width, opts.height);
-
-    // Frustum-cull, then upload every visible item once.
     let frustum = scene.camera.frustum();
-    let mut draws: Vec<GpuMesh> = Vec::new();
+    let mut draws = Vec::new();
     let mut triangles = 0u64;
     let (mut vertex_bytes, mut index_bytes) = (0u64, 0u64);
     for item in &scene.items {
@@ -220,37 +188,79 @@ pub fn capture_scene(
         draws.push(gpu);
     }
 
-    let clear = wgpu::Color {
-        r: scene.clear[0],
-        g: scene.clear[1],
-        b: scene.clear[2],
-        a: scene.clear[3],
-    };
-
-    let mut gpu_timer = GpuTimer::new(ctx, opts.views.len() as u32);
-
+    let pair_count = CASCADE_COUNT as u32 + opts.views.len() as u32 * 2;
+    let mut gpu_timer = GpuTimer::new(ctx, pair_count);
     let loop_start = Instant::now();
-    let mut readback_millis = 0.0f64;
-    let mut encode_millis = 0.0f64;
-    let mut images = Vec::new();
-    for (index, &view) in opts.views.iter().enumerate() {
-        let bind_group =
-            pipeline.frame_bind_group(&ctx.device, &ctx.queue, &scene.camera, view, &palette);
 
+    // Shadows are camera-dependent but view-independent, so render them once.
+    let (light_matrices, _) = ScenePipeline::cascade_data(&scene.camera, default_sun_dir());
+    let mut shadow_encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("spall-shadow-encoder"),
+        });
+    for (cascade, matrix) in light_matrices.into_iter().enumerate() {
+        let bind = pipeline.shadow_bind_group(&ctx.device, &ctx.queue, cascade, matrix);
+        let timestamp_writes = gpu_timer.as_ref().map(|timer| timer.writes(cascade as u32));
+        let mut pass = shadow_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("spall-shadow-pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: pipeline.shadow_layer(cascade),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline.shadow());
+        pass.set_bind_group(0, &bind, &[]);
+        draw_meshes(&mut pass, &draws);
+    }
+    ctx.queue.submit([shadow_encoder.finish()]);
+
+    let mut readback_millis = 0.0;
+    let mut encode_millis = 0.0;
+    let mut images = Vec::new();
+    for (view_index, &view) in opts.views.iter().enumerate() {
+        let scene_bind = pipeline.scene_bind_group(
+            &ctx.device,
+            &ctx.queue,
+            &scene.camera,
+            view,
+            opts.exposure,
+            &materials,
+        );
+        let tone_bind = pipeline.tone_bind_group(
+            &ctx.device,
+            &ctx.queue,
+            target.hdr_view(),
+            opts.exposure,
+            view != DebugView::Shaded,
+        );
+        let base_query = CASCADE_COUNT as u32 + view_index as u32 * 2;
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("spall-capture-encoder"),
+                label: Some("spall-t12-capture-encoder"),
             });
         {
-            let timestamp_writes = gpu_timer.as_ref().map(|t| t.writes(index as u32));
+            let timestamp_writes = gpu_timer.as_ref().map(|timer| timer.writes(base_query));
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("spall-capture-pass"),
+                label: Some("spall-hdr-opaque-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target.color_view(),
+                    view: target.hdr_view(),
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: scene.clear[0],
+                            g: scene.clear[1],
+                            b: scene.clear[2],
+                            a: scene.clear[3],
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -265,13 +275,29 @@ pub fn capture_scene(
                 timestamp_writes,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(pipeline.raw());
-            pass.set_bind_group(0, &bind_group, &[]);
-            for gpu in &draws {
-                pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
-                pass.set_index_buffer(gpu.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..gpu.index_count, 0, 0..1);
-            }
+            pass.set_pipeline(pipeline.opaque());
+            pass.set_bind_group(0, &scene_bind, &[]);
+            draw_meshes(&mut pass, &draws);
+        }
+        {
+            let timestamp_writes = gpu_timer.as_ref().map(|timer| timer.writes(base_query + 1));
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("spall-tone-map-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target.color_view(),
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline.tone_map());
+            pass.set_bind_group(0, &tone_bind, &[]);
+            pass.draw(0..3, 0..1);
         }
         target.copy_to_readback(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
@@ -280,7 +306,7 @@ pub fn capture_scene(
         let rgba = target.read_rgba(ctx)?;
         let image: ImageBuffer<Rgba<u8>, _> =
             ImageBuffer::from_raw(target.width, target.height, rgba)
-                .expect("readback buffer is exactly width*height*4");
+                .expect("readback has width*height*4 bytes");
         readback_millis += readback_start.elapsed().as_secs_f64() * 1000.0;
 
         let encode_start = Instant::now();
@@ -290,13 +316,25 @@ pub fn capture_scene(
             source,
         })?;
         encode_millis += encode_start.elapsed().as_secs_f64() * 1000.0;
-
         images.push(CaptureImage { view, path });
     }
     ctx.wait();
     let cpu_total_millis = loop_start.elapsed().as_secs_f64() * 1000.0;
 
-    let gpu_render_millis = gpu_timer.take().and_then(|t| t.total_millis(ctx));
+    let gpu_passes = gpu_timer
+        .take()
+        .and_then(|timer| timer.millis(ctx))
+        .map(|times| {
+            let shadow_millis = times[..CASCADE_COUNT].iter().sum();
+            let opaque_millis = times[CASCADE_COUNT..].iter().step_by(2).sum();
+            let tone_map_millis = times[CASCADE_COUNT + 1..].iter().step_by(2).sum();
+            PassTiming {
+                shadow_millis,
+                opaque_millis,
+                tone_map_millis,
+            }
+        });
+    let gpu_render_millis = gpu_passes.map(PassTiming::total);
 
     Ok(CaptureReport {
         images,
@@ -314,6 +352,15 @@ pub fn capture_scene(
             cpu_readback_millis: readback_millis,
             cpu_encode_millis: encode_millis,
             gpu_render_millis,
+            gpu_passes,
         },
     })
+}
+
+fn draw_meshes<'pass>(pass: &mut wgpu::RenderPass<'pass>, draws: &'pass [GpuMesh]) {
+    for gpu in draws {
+        pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
+        pass.set_index_buffer(gpu.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..gpu.index_count, 0, 0..1);
+    }
 }

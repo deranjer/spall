@@ -68,6 +68,9 @@ struct ShapeSummary {
     /// when the adapter/driver does not support them (see `gpu_timing_available`).
     /// Never a CPU-derived figure.
     gpu_render_millis: Option<f64>,
+    gpu_shadow_millis: Option<f64>,
+    gpu_opaque_millis: Option<f64>,
+    gpu_tone_map_millis: Option<f64>,
     /// `true` only when `gpu_render_millis` is a measured device timing.
     gpu_timing_available: bool,
     /// CPU wall-clock for the whole render → readback → PNG-encode loop,
@@ -82,7 +85,7 @@ struct ShapeSummary {
 
 #[derive(Serialize)]
 struct Summary {
-    /// Bumped to 2 when `gpu_millis` was split into separated CPU/GPU timings.
+    /// Version 3 adds the T12 pass timing breakdown and diagnostic images.
     version: u32,
     adapter: String,
     backend: String,
@@ -196,6 +199,9 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
             vertex_bytes: report.vertex_bytes,
             index_bytes: report.index_bytes,
             gpu_render_millis: timing.gpu_render_millis,
+            gpu_shadow_millis: timing.gpu_passes.map(|passes| passes.shadow_millis),
+            gpu_opaque_millis: timing.gpu_passes.map(|passes| passes.opaque_millis),
+            gpu_tone_map_millis: timing.gpu_passes.map(|passes| passes.tone_map_millis),
             gpu_timing_available: timing.gpu_render_millis.is_some(),
             cpu_capture_millis: timing.cpu_total_millis,
             cpu_readback_millis: timing.cpu_readback_millis,
@@ -209,7 +215,7 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
     }
 
     Ok(Summary {
-        version: 2,
+        version: 3,
         adapter,
         backend,
         gpu_timing_available,
