@@ -1,0 +1,20 @@
+{
+  "name": "g1-networked-destruction",
+  "description": "CPU-side G1 gate fixture: two clients cut a cross-brick bridge, excavate terrain concurrently, and continue edits while detached geometry is moving. Run with --loss-percent 2 for encrypted transport impairment.",
+  "server_ticks": 600,
+  "clients": 2,
+  "minimum_transactions": 6,
+  "minimum_motion_snapshots": 1,
+  "cuts": [
+    { "client": 0, "at_tick": 4,   "cell": [10, 4, 1], "radius": 2 },
+    { "client": 1, "at_tick": 8,   "cell": [3, 1, 1],  "radius": 1 },
+    { "client": 0, "at_tick": 30,  "cell": [5, 1, 1],  "radius": 1 },
+    { "client": 1, "at_tick": 60,  "cell": [7, 1, 1],  "radius": 1 },
+    { "client": 0, "at_tick": 90,  "cell": [9, 1, 1],  "radius": 1 },
+    { "client": 1, "at_tick": 120, "cell": [12, 1, 1], "radius": 1 },
+    { "client": 0, "at_tick": 180, "cell": [14, 1, 1], "radius": 1 },
+    { "client": 1, "at_tick": 240, "cell": [16, 1, 1], "radius": 1 },
+    { "client": 0, "at_tick": 300, "cell": [18, 1, 1], "radius": 1 },
+    { "client": 1, "at_tick": 360, "cell": [20, 1, 1], "radius": 1 }
+  ]
+}

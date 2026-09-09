@@ -147,6 +147,12 @@ struct Scenario {
     /// after the early clients have started cutting.
     #[serde(default = "default_late_delay")]
     late_join_connect_delay_ms: u64,
+    /// Minimum authoritative work required by a gate fixture.
+    #[serde(default)]
+    minimum_transactions: u64,
+    /// Minimum motion samples each client must receive.
+    #[serde(default)]
+    minimum_motion_snapshots: u64,
 }
 
 fn one() -> u64 {
@@ -201,6 +207,7 @@ struct SessionSummary {
     transactions_committed: u64,
     agreed_world_hash: String,
     all_hashes_match: bool,
+    requirements_met: bool,
     per_client: Vec<ClientRow>,
     note: &'static str,
 }
@@ -214,6 +221,56 @@ struct ClientRow {
     transactions_rejected: u64,
     motion_snapshots: u64,
     hash_matches_server: bool,
+}
+
+fn requirements_met(
+    scenario: &Scenario,
+    transactions_committed: u64,
+    clients: &[Option<ClientSummary>],
+) -> bool {
+    transactions_committed >= scenario.minimum_transactions
+        && clients.iter().all(|client| {
+            client.as_ref().is_some_and(|summary| {
+                summary.motion_snapshots >= scenario.minimum_motion_snapshots
+            })
+        })
+}
+
+#[cfg(test)]
+mod requirement_tests {
+    use super::*;
+
+    fn client(motion_snapshots: u64) -> ClientSummary {
+        ClientSummary {
+            result: "passed".into(),
+            transactions_applied: 1,
+            repair_requests_sent: 0,
+            transactions_rejected: 0,
+            motion_snapshots,
+            final_world_hash: String::new(),
+            late_join: false,
+            baseline_bricks: 0,
+        }
+    }
+
+    #[test]
+    fn gate_requirements_reject_insufficient_work_or_motion() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "minimum_transactions": 2,
+                "minimum_motion_snapshots": 1
+            }"#,
+        )
+        .unwrap();
+        assert!(!requirements_met(&scenario, 1, &[Some(client(2))]));
+        assert!(!requirements_met(&scenario, 2, &[Some(client(0))]));
+        assert!(requirements_met(
+            &scenario,
+            2,
+            &[Some(client(1)), Some(client(4))]
+        ));
+    }
 }
 
 // --- the run -----------------------------------------------------------------
@@ -419,6 +476,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     transactions_committed: 0,
                     agreed_world_hash: String::new(),
                     all_hashes_match: false,
+                    requirements_met: false,
                     per_client: Vec::new(),
                     note: "server produced no summary; inspect server.jsonl",
                 },
@@ -467,6 +525,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             }
         }
     }
+    let requirements_met =
+        requirements_met(&scenario, server.transactions_committed, &client_summaries);
+    all_match &= requirements_met;
     finish(
         &output,
         SessionSummary {
@@ -479,8 +540,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             transactions_committed: server.transactions_committed,
             agreed_world_hash: agreed,
             all_hashes_match: all_match,
+            requirements_met,
             per_client: rows,
-            note: "real OS processes over QUIC; encrypted-packet loss via per-client UDP proxy",
+            note: "real OS processes over QUIC; encrypted-packet loss via per-client UDP proxy; gate requirements are fixture-defined",
         },
     )
 }

@@ -117,6 +117,12 @@ cargo xtask scenario --name destruction-network --loss-percent 5 --output .local
 # pulls a baseline over a bulk transfer, and catches up to the server hash.
 cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 
+# T11 CPU-side G1 gate fixture. The full graphical capture portion remains
+# unavailable until T05/T12; this exercises two real OS clients, a detached
+# body observed in motion, concurrent terrain edits, and hash/conservation
+# checks. Add --loss-percent 2 for the impaired transport run.
+cargo xtask scenario --name g1-networked-destruction --loss-percent 0 --output .local/runs/g1
+
 # T12: stable acceptance cameras with six views and per-pass GPU timing.
 # Needs a supported GPU/driver; exit 3 otherwise.
 cargo xtask capture --output .local/runs/t12-1080p --width 1920 --height 1080 --strategy greedy
@@ -183,6 +189,13 @@ Clean checkout builds with the pinned toolchain. CPU checks need no display adap
 64 x 32 x 64 m world, 25 cm terrain cells. Include a 12 m hollow tower/bridge spanning brick boundaries, an excavatable slope, and a moving hollow test volume. Run 60 seconds at 60 server ticks/s; after initial cuts, drive 10 tool requests/s total across two clients. Include one cut affecting a 4 m diameter sphere and a 64-brick connected body stress case.
 
 Required: exact ownership/conservation, zero unrepaired topology mismatch at quiescence, all accepted work eventually completes within the stated budget, and no permanent hidden support. Normal single-brick edit server commit target: p95 <=100 ms without network delay. Ordinary structure split target: <=500 ms; designated large-collapse stress target <=2 s before consistent activation. These are gates to measure, not guarantees from the chosen algorithms.
+
+The tracked `g1-networked-destruction` fixture is the CPU-side T11 evidence
+surface. It requires at least six committed transactions and one motion
+sample per client in addition to final hash agreement. It does not claim the
+full 64 x 32 x 64 m / 60-second / 10-requests-per-second workload, graphical
+captures, or GPU timings; those remain explicit follow-up evidence until the
+renderer and gate workload are available.
 
 For overload tests, requests beyond admission capacity may return busy. The report must distinguish requested, rejected, queued, and committed counts. Rejecting every expensive action does not satisfy the gate: all named mandatory edits must complete.
 
