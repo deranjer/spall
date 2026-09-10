@@ -453,8 +453,27 @@ quiet (far-band flicker < 0.0001). No quality flags. CPU-only coverage:
 `spall_render` `capture::tests::{a_steady_trace_has_zero_flicker,
 flicker_index_is_mean_abs_step_over_mean_level,
 settle_index_finds_the_first_lasting_return_to_target}`. The GPU run is manual.
-Exterior terrain + a full active-collapse scene, a pipelined loop, and the
-freeze decision remain increment 4+.
+
+Increment 4 adds the open daylight-terrain scene (the sixth G2 scene category):
+
+```sh
+# T15 / G2 daylight terrain. An open sun-lit exterior (stepped terraces + tall
+# pillars casting long shadows) run through the persistent settled-frame loop
+# (settled + edit modes) plus a 120-frame static-noise stability pass.
+cargo xtask capture --scene g2-terrain --output .local/runs/g2-terrain
+```
+
+Measured (RTX 4080 SUPER / D3D12): settled frame GPU p95 0.24 ms / CPU p95 0.68
+ms / pipelined client p95 0.68 ms -- the cheapest G2 scene (a single sky/ground
+bounce vs the enclosed rooms' multi-bounce), all provisional targets met with
+the widest margin; 120-frame static-noise flicker 0.000000 (bit-stable); cast
+sun shadows + direct-light falloff read correctly. No quality flags. This
+completes the G2 scene matrix except a GI-lit rapid-destruction sequence
+(increment 5; ENG-62 `--scene destruction` covers the T12-raster version).
+CPU-only coverage: `spall_render`
+`fixtures::tests::daylight_terrain_is_open_lit_and_shadow_casting`. GPU run
+manual. A pipelined loop, cross-GPU review, and the freeze decision remain
+increment 5+.
 
 ### G3 — persistence, late join, and streaming
 

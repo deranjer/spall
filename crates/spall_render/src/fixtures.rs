@@ -237,6 +237,155 @@ pub fn panning_camera(aspect: f32) -> PanningCamera {
     }
 }
 
+/// The G2 "daylight terrain" case (T15 / ENG-22 increment 4): an open, sun-lit
+/// exterior — a stepped stone ground and three pillars under the default sun,
+/// with a bright sky clear colour. No enclosure, so the indirect term is a
+/// single sky/ground bounce, in deliberate contrast to the enclosed rooms.
+pub struct DaylightTerrainScene {
+    pub scene: Scene,
+    /// A fractional image-x band over sunlit open ground.
+    pub lit_band: [f32; 2],
+    /// A fractional image-x band that a pillar's cast shadow crosses.
+    pub shadow_band: [f32; 2],
+}
+
+/// Add an axis-aligned box (six quads, outward normals) to `mesh`.
+fn prism(mesh: &mut Mesh, min: Vec3, max: Vec3, material: u32) {
+    let (a, b) = (min, max);
+    // top / bottom
+    quad(
+        mesh,
+        [
+            Vec3::new(a.x, b.y, a.z),
+            Vec3::new(a.x, b.y, b.z),
+            Vec3::new(b.x, b.y, b.z),
+            Vec3::new(b.x, b.y, a.z),
+        ],
+        Vec3::Y,
+        material,
+    );
+    quad(
+        mesh,
+        [
+            Vec3::new(a.x, a.y, a.z),
+            Vec3::new(b.x, a.y, a.z),
+            Vec3::new(b.x, a.y, b.z),
+            Vec3::new(a.x, a.y, b.z),
+        ],
+        -Vec3::Y,
+        material,
+    );
+    // +x / -x
+    quad(
+        mesh,
+        [
+            Vec3::new(b.x, a.y, a.z),
+            Vec3::new(b.x, b.y, a.z),
+            Vec3::new(b.x, b.y, b.z),
+            Vec3::new(b.x, a.y, b.z),
+        ],
+        Vec3::X,
+        material,
+    );
+    quad(
+        mesh,
+        [
+            Vec3::new(a.x, a.y, b.z),
+            Vec3::new(a.x, b.y, b.z),
+            Vec3::new(a.x, b.y, a.z),
+            Vec3::new(a.x, a.y, a.z),
+        ],
+        -Vec3::X,
+        material,
+    );
+    // +z / -z
+    quad(
+        mesh,
+        [
+            Vec3::new(a.x, a.y, b.z),
+            Vec3::new(b.x, a.y, b.z),
+            Vec3::new(b.x, b.y, b.z),
+            Vec3::new(a.x, b.y, b.z),
+        ],
+        Vec3::Z,
+        material,
+    );
+    quad(
+        mesh,
+        [
+            Vec3::new(b.x, a.y, a.z),
+            Vec3::new(a.x, a.y, a.z),
+            Vec3::new(a.x, b.y, a.z),
+            Vec3::new(b.x, b.y, a.z),
+        ],
+        -Vec3::Z,
+        material,
+    );
+}
+
+pub fn daylight_terrain_scene(aspect: f32) -> DaylightTerrainScene {
+    let origin = Vec3::splat(-32.0);
+
+    // A stepped ground: four 8 m-deep terraces rising toward -x, plus three
+    // pillars whose long shadows rake across the flat front terrace.
+    let steps: [(f32, f32, f32); 4] = [
+        (8.0, 16.0, 0.0),
+        (0.0, 8.0, 0.6),
+        (-8.0, 0.0, 1.2),
+        (-16.0, -8.0, 1.8),
+    ];
+    // Tall pillars on the front (flat) terrace; the low sun rakes their
+    // shadows across the open ground.
+    let pillars: [(f32, f32); 4] = [(2.0, -2.0), (10.0, 4.0), (5.0, 9.0), (12.0, -6.0)];
+
+    let mut mesh = Mesh::default();
+    let mut volume = LightingVolume::empty(origin);
+    for (x0, x1, top) in steps {
+        prism(
+            &mut mesh,
+            Vec3::new(x0, top - 1.0, -16.0),
+            Vec3::new(x1, top, 16.0),
+            1,
+        );
+        fill_world_box(
+            &mut volume,
+            Vec3::new(x0, top - 1.0, -16.0),
+            Vec3::new(x1, top, 16.0),
+            1,
+        );
+    }
+    for (px, pz) in pillars {
+        let min = Vec3::new(px - 1.0, 0.0, pz - 1.0);
+        let max = Vec3::new(px + 1.0, 9.0, pz + 1.0);
+        prism(&mut mesh, min, max, 1);
+        fill_world_box(&mut volume, min, max, 1);
+    }
+
+    let camera = Camera {
+        aspect,
+        fov_y: 55_f32.to_radians(),
+        z_near: 0.1,
+        z_far: 120.0,
+        ..Default::default()
+    };
+
+    let mut scene = Scene::new(camera)
+        .with_item(SceneItem::new("terrain", mesh, Mat4::IDENTITY))
+        .with_lighting(volume);
+    scene.materials = default_materials();
+    // Daytime sky (linear).
+    scene.clear = [0.30, 0.44, 0.66, 1.0];
+    // Frame from the shadow side (opposite the sun) so the pillars' long cast
+    // shadows rake across the open ground toward the camera.
+    scene.frame_all(Vec3::new(-0.55, 0.5, -1.0));
+
+    DaylightTerrainScene {
+        scene,
+        lit_band: [0.20, 0.45],
+        shadow_band: [0.55, 0.85],
+    }
+}
+
 fn room_fixture(
     name: &'static str,
     closed: bool,
@@ -555,5 +704,28 @@ mod tests {
             (returned - with_body).abs() < 0.02,
             "returned state drifted from the original: {with_body} vs {returned}"
         );
+    }
+
+    #[test]
+    fn daylight_terrain_is_open_lit_and_shadow_casting() {
+        let t = daylight_terrain_scene(16.0 / 9.0);
+        assert!(!t.scene.items[0].mesh.vertices.is_empty());
+        let volume = t.scene.lighting.as_ref().expect("terrain lighting volume");
+        assert_eq!(volume.cells().len(), 128usize.pow(3));
+
+        // A pillar occupies solid cells; the sky straight above it is open air,
+        // so the scene is an exterior, not an enclosure.
+        let pillar = Vec3::new(2.0, 3.0, -2.0);
+        let sky = Vec3::new(2.0, 20.0, -2.0);
+        let at = |w: Vec3| {
+            let c = volume.world_to_cell(w);
+            volume.cells()[(c.x + 128 * (c.y + 128 * c.z)) as usize]
+        };
+        assert_eq!(at(pillar), 1, "pillar is solid");
+        assert_eq!(at(sky), 0, "open sky above the pillar");
+
+        // A bright daytime sky clear, unlike the near-black interior fixtures.
+        assert!(t.scene.clear[2] > 0.3, "sky clear: {:?}", t.scene.clear);
+        assert_ne!(t.lit_band, t.shadow_band);
     }
 }

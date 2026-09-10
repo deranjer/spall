@@ -188,11 +188,26 @@ evidence and open items.
   `capture::tests::{a_steady_trace_has_zero_flicker,
   flicker_index_is_mean_abs_step_over_mean_level,
   settle_index_finds_the_first_lasting_return_to_target}`; the GPU run is manual.
-- **Increment 4 (later).** Exterior daylight-terrain scene + a full
-  active-collapse scene (destruction sim wired into the motion loop); a
-  pipelined (threaded) client frame loop + the broader CPU frame-work budget; a
-  bounded denoise/temporal pass if a real scene tightens the budget; cross-GPU
-  capture + human review; the cell-size / renderer-direction freeze decision.
+- **Increment 4 (open daylight-terrain scene).** `spall_render::daylight_terrain_scene`
+  — the sixth G2 scene category: a sun-lit open exterior (stepped terraces + tall
+  pillars casting long shadows, bright sky), built entirely in `spall_render`.
+  `sandbox-capture --scene g2-terrain` (also `cargo xtask capture --scene
+  g2-terrain`) runs it through the increment-2 loop (`settled` + `edit`) + a
+  120-frame `static-noise` stability pass. Measured on the reference adapter:
+  settled frame GPU p95 0.24 ms / CPU p95 0.68 ms / pipelined client p95 0.68 ms
+  — the cheapest G2 scene (single sky/ground bounce), all provisional targets met
+  with the widest margin; static-noise flicker 0.000000; cast shadows +
+  direct-light falloff read correctly. **No quality flags.** Completes the G2
+  scene matrix except a GI-lit rapid-destruction sequence. Evidence:
+  `spall_render` `fixtures::tests::daylight_terrain_is_open_lit_and_shadow_casting`;
+  the GPU run is manual.
+- **Increment 5 (later).** A GI-lit rapid-destruction / active-collapse sequence
+  (ENG-62 `--scene destruction` lit with T13/T14 — sim terrain + body poses →
+  `LightingVolume` / `LightingUpdate`) in the G2 percentile + quality-flag
+  framework; a pipelined (threaded) client frame loop + the broader CPU
+  frame-work budget; a bounded denoise/temporal pass if a real scene tightens
+  the budget; cross-GPU capture + human review; the cell-size /
+  renderer-direction freeze decision.
 
 ## Persistence, scale, and game-ready slice
 

@@ -22,7 +22,7 @@ use spall_render::{
     OCCLUDER_MAX_M, OCCLUDER_MIN_M, ProbeBand, RECEIVER_MAX_M, RECEIVER_MIN_M, RenderContext,
     RenderError, Scene, SceneItem, SequenceOptions, capture_frame_loop, capture_frame_series,
     capture_lighting_sequence, capture_motion_sequence, capture_scene, colored_rooms,
-    emitter_occlusion_scenes, flicker_index, rapid_destruction,
+    daylight_terrain_scene, emitter_occlusion_scenes, flicker_index, rapid_destruction,
 };
 use spall_sim::{EditIntent, EditTarget, RequestId, Simulation, SimulationConfig, fixtures};
 use spall_voxel::Volume;
@@ -68,8 +68,9 @@ struct Args {
     only: Option<String>,
     /// Fixture scene: `colored-room` (T13), `lighting-sequence` (T14),
     /// `g2-frames` (T15 cold GPU frame-cost percentiles), `g2-loop` (T15
-    /// persistent-resource settled-frame GPU + CPU percentiles), or `g2-motion`
-    /// (T15 moving-frame sequences + ghosting / flicker / leakage flags).
+    /// persistent-resource settled-frame GPU + CPU percentiles), `g2-motion`
+    /// (T15 moving-frame sequences + ghosting / flicker / leakage flags), or
+    /// `g2-terrain` (T15 open daylight-terrain settled cost + stability).
     #[arg(long)]
     scene: Option<String>,
     /// `lighting-sequence` only: settle frames rendered after the edit so the
@@ -1429,6 +1430,156 @@ fn run_g2_motion(args: &Args) -> Result<G2MotionSummary, RenderError> {
     })
 }
 
+// --- `--scene g2-terrain` (T15 / ENG-22 increment 4) ----------------------
+
+#[derive(Serialize)]
+struct G2TerrainSummary {
+    /// Version 1: T15 increment 4 — open daylight-terrain scene.
+    version: u32,
+    mode: &'static str,
+    adapter: String,
+    backend: String,
+    width: u32,
+    height: u32,
+    indirect_cells: usize,
+    gpu_p95_target_millis: f64,
+    cpu_p95_target_millis: f64,
+    client_p95_target_millis: f64,
+    /// Settled-frame and per-frame-edit cost on the persistent-resource loop
+    /// (same shape as `g2-loop`).
+    settled: G2LoopRun,
+    edit: G2LoopRun,
+    /// 120-frame static-noise stability of the `Shaded` terrain frame.
+    lit_band_flicker: f32,
+    shadow_band_flicker: f32,
+    lit_band_max_step: f32,
+    shadow_band_max_step: f32,
+    quality_flags: Vec<String>,
+}
+
+fn run_g2_terrain(args: &Args) -> Result<G2TerrainSummary, RenderError> {
+    let ctx = RenderContext::headless()?;
+    let (width, height) = (1920u32, 1080u32);
+    let aspect = capture_aspect(width, height);
+    let terrain = daylight_terrain_scene(aspect);
+
+    let settled_opts = FrameLoopOptions {
+        width,
+        height,
+        exposure: 1.0,
+        warmup_frames: args.g2_loop_warmup,
+        measured_frames: args.g2_loop_frames,
+        retrace_edge_cells: 0,
+        temporal_weight: 0.1,
+    };
+    let edit_opts = FrameLoopOptions {
+        retrace_edge_cells: args.g2_loop_edit_edge,
+        ..settled_opts
+    };
+
+    let settled_report = capture_frame_loop(
+        &ctx,
+        &terrain.scene,
+        &args.out.join("settled"),
+        &settled_opts,
+    )?;
+    let indirect_cells = settled_report.indirect_cells;
+    let adapter = settled_report.adapter.clone();
+    let backend = settled_report.backend.clone();
+    let (settled, _) = g2_loop_run(settled_report, "settled");
+
+    let edit_report = capture_frame_loop(&ctx, &terrain.scene, &args.out.join("edit"), &edit_opts)?;
+    let (edit, _) = g2_loop_run(edit_report, "edit");
+
+    // Stability: 120 identical Shaded frames of the terrain.
+    let n = args.g2_motion_frames as usize;
+    let motion_opts = MotionSequenceOptions {
+        width,
+        height,
+        exposure: 1.0,
+        view: DebugView::Shaded,
+        temporal_weight: 0.1,
+        halo_cells: 12,
+        png_stride: (n / 4).max(1),
+    };
+    let frames: Vec<MotionFrame> = (0..n)
+        .map(|_| MotionFrame {
+            camera: terrain.scene.camera,
+            update: LightingUpdate::new(),
+        })
+        .collect();
+    let probes = [
+        ProbeBand {
+            name: "lit".into(),
+            band: terrain.lit_band,
+        },
+        ProbeBand {
+            name: "shadow".into(),
+            band: terrain.shadow_band,
+        },
+    ];
+    let noise = capture_motion_sequence(
+        &ctx,
+        &terrain.scene,
+        &frames,
+        &probes,
+        &args.out.join("static-noise"),
+        &motion_opts,
+    )?;
+    let lit = &noise.bands[0];
+    let shadow = &noise.bands[1];
+    let lit_band_flicker = flicker_index(&lit.luminance);
+    let shadow_band_flicker = flicker_index(&shadow.luminance);
+    let lit_band_max_step = spall_render::max_step_fraction(&lit.luminance);
+    let shadow_band_max_step = spall_render::max_step_fraction(&shadow.luminance);
+
+    let mut quality_flags = Vec::new();
+    for (mode, run) in [("settled", &settled), ("edit", &edit)] {
+        if run.gpu_p95_target_met == Some(false) {
+            quality_flags.push(format!(
+                "g2-terrain/{mode}: GPU frame p95 over the provisional target"
+            ));
+        }
+        if run.cpu_p95_target_met == Some(false) {
+            quality_flags.push(format!(
+                "g2-terrain/{mode}: CPU frame p95 over the provisional target"
+            ));
+        }
+        if run.client_p95_target_met == Some(false) {
+            quality_flags.push(format!(
+                "g2-terrain/{mode}: pipelined client-frame p95 over the provisional target"
+            ));
+        }
+    }
+    for (name, fi) in [("lit", lit_band_flicker), ("shadow", shadow_band_flicker)] {
+        if fi > G2_FLICKER_FLAG {
+            quality_flags.push(format!(
+                "g2-terrain: `{name}` band is not steady with nothing moving (flicker index {fi:.4} > {G2_FLICKER_FLAG}) — temporal noise / instability"
+            ));
+        }
+    }
+
+    Ok(G2TerrainSummary {
+        version: 1,
+        mode: "g2-terrain",
+        adapter,
+        backend,
+        width,
+        height,
+        indirect_cells,
+        gpu_p95_target_millis: G2_GPU_P95_TARGET_MS,
+        cpu_p95_target_millis: G2_CPU_FRAME_TARGET_MS,
+        client_p95_target_millis: G2_CLIENT_FRAME_TARGET_MS,
+        settled,
+        edit,
+        lit_band_flicker,
+        shadow_band_flicker,
+        lit_band_max_step,
+        shadow_band_max_step,
+        quality_flags,
+    })
+}
+
 /// Serialise `result` to `<out>/summary.json` and turn it into a process exit
 /// code, so every scene mode shares one write + error path.
 fn finish<T: Serialize>(out: &std::path::Path, result: Result<T, RenderError>) -> ExitCode {
@@ -1487,6 +1638,9 @@ fn main() -> ExitCode {
     }
     if args.scene.as_deref() == Some("g2-motion") {
         return finish(&args.out, run_g2_motion(&args));
+    }
+    if args.scene.as_deref() == Some("g2-terrain") {
+        return finish(&args.out, run_g2_terrain(&args));
     }
     finish(&args.out, run(&args))
 }
