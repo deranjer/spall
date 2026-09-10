@@ -310,6 +310,70 @@ pub fn walk_arena(id: VolumeId) -> Volume {
     v
 }
 
+/// Cell offset from the west structure to the east structure in
+/// [`separated_regions_scene`]: `+72` cells (`18 m`) on both `x` and `z`, so the
+/// two collapsible towers sit in distinct interest regions with clear ground
+/// between them.
+pub const SEPARATED_REGIONS_EAST_OFFSET: GlobalCell = GlobalCell::new(72, 0, 72);
+
+/// The T23 / G3 integrated-acceptance scene: **two independent collapsible
+/// structures** in a single bounded world, one near the world origin ("west")
+/// and one offset by [`SEPARATED_REGIONS_EAST_OFFSET`] ("east"). Each is a
+/// compact bridge — an anchored floor, one slender column, and a raised beam the
+/// column alone holds up — so cutting either column detaches that region's beam
+/// as one unsupported component without touching the other region. Used to drive
+/// geographically separated players and a multi-region collapse through the
+/// multi-process harness.
+///
+/// The volume is **bounded to `256 x 128 x 256 m`** (`32 x 16 x 32` bricks at
+/// `CellSizeCode::Quarter`) — the G3 operating envelope — but only the two
+/// regions are resident, so the structural analysis and collider rebuilds stay
+/// CPU-cheap. Wider physical separation and forced resident-cache eviction are
+/// tracked as open G3 items.
+///
+/// Per region (west shown; east is the same shifted by the offset):
+/// - floor:  `x 0..=23`, `z 0..=7`,  `y 0..=3`  — top surface at `y = 1.0 m`,
+///   anchored at `y = 0`
+/// - column: `x 10..=11`, `z 3..=4`, `y 4..=9`
+/// - beam:   `x 4..=20`, `z 3..=4`,  `y 10..=11`
+/// - air:    `x 0..=23`, `z 0..=7`,  `y 4..=19` — resident, written first
+pub fn separated_regions_scene(id: VolumeId) -> Volume {
+    // 256 m / 0.25 m = 1024 cells = 32 bricks per horizontal axis; 128 m = 16
+    // bricks vertically. Inclusive max brick coord is one less.
+    let bounds = BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(31, 15, 31))
+        .expect("valid G3 world bounds");
+    let mut v = Volume::bounded(id, CellSizeCode::Quarter, bounds);
+
+    let e = SEPARATED_REGIONS_EAST_OFFSET;
+
+    // One resident air envelope over both regions and the ground between them,
+    // written first so the solid writes below win. The terrain occupancy grid is
+    // extracted over the bounding box of the solid cells, and every brick in
+    // that box must be resident — a gap of absent bricks between the two regions
+    // would fail extraction.
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(23 + e.x, 19, 7 + e.z),
+        MaterialId::AIR,
+    ))
+    .expect("separated-regions air envelope");
+
+    let shift = |c: GlobalCell, by: GlobalCell| GlobalCell::new(c.x + by.x, c.y + by.y, c.z + by.z);
+    let region = [
+        (GlobalCell::new(0, 0, 0), GlobalCell::new(23, 3, 7), STONE),
+        (GlobalCell::new(10, 4, 3), GlobalCell::new(11, 9, 4), STONE),
+        (GlobalCell::new(4, 10, 3), GlobalCell::new(20, 11, 4), STONE),
+    ];
+    for by in [GlobalCell::new(0, 0, 0), e] {
+        for (a, b, m) in region {
+            v.apply_edit(&EditPlan::filled_box(id, shift(a, by), shift(b, by), m))
+                .expect("separated-regions scene edit");
+        }
+    }
+    v
+}
+
 /// BLAKE3 digest over a volume's resident bricks in canonical `(z, y, x)`
 /// order: cell size, then per brick `(coord, content hash, revision)`. Stable
 /// across runs and platforms for a given fixture; use it to pin fixtures in

@@ -161,6 +161,9 @@ pub enum BaselineScene {
     /// [`spall_voxel::fixtures::bulk_split_scene`] — a block whose detach
     /// overflows even the inline op-blob cap (T17 increment 2 / ENG-64).
     BulkSplit,
+    /// [`spall_voxel::fixtures::separated_regions_scene`] — two independent
+    /// collapsible structures in one bounded world (T23 / G3).
+    SeparatedRegions,
 }
 
 impl BaselineScene {
@@ -173,6 +176,7 @@ impl BaselineScene {
             }
             "checkerboard-split" | "oversized-split" => Some(Self::CheckerboardSplit),
             "bulk-split" | "giant-split" => Some(Self::BulkSplit),
+            "separated-regions" | "t23-g3" | "g3" => Some(Self::SeparatedRegions),
             _ => None,
         }
     }
@@ -183,6 +187,7 @@ impl BaselineScene {
             Self::CrossBridgeCut => spall_voxel::fixtures::cross_brick_bridge_scene(id),
             Self::CheckerboardSplit => spall_voxel::fixtures::checkerboard_split_scene(id),
             Self::BulkSplit => spall_voxel::fixtures::bulk_split_scene(id),
+            Self::SeparatedRegions => spall_voxel::fixtures::separated_regions_scene(id),
         }
     }
 }

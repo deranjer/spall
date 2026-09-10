@@ -315,6 +315,7 @@ At a gate, retain raw metrics alongside a concise report in `docs/reports/Gx.md`
 | destruction-network | Two clients agree with server geometry after cuts, duplicates, loss, reorder, and repair |
 | late-join-collapse | A third client obtains a consistent current world while objects split and move |
 | interest-crossing | A multi-region body remains one entity; entering clients receive required dependencies |
+| t23-g3 | Two regions of one bounded world collapse independently with separated players; a late joiner converges after heavy edits; the committed stream replays to the agreed hash and every beam rests |
 | save-air | Completely mined bricks remain empty after checkpoint, eviction, restart, and regeneration |
 | crash-transfer | Crash before/after source-removal/child-create commit cannot recover partial ownership |
 | malformed-input | Invalid lengths, huge coordinates, compressed bombs, invalid IDs/NaNs, excessive rates reject within bounds |
@@ -515,6 +516,21 @@ budget. `spall_client/tests/residency.rs` applies the same policy to replica
 terrain while retaining complete body geometry. These are correctness and
 bounded-accounting results, not the G3 memory, network, or join-duration gate;
 those measurements remain for T23.
+
+T23 lands in increments against `docs/reports/G3.md`. Increment 1 adds the
+`separated-regions` scene (`sandbox-server --serve --scene separated-regions` |
+`t23-g3`): one bounded 256 x 128 x 256 m world holding two independent
+collapsible structures 18 m apart, each connecting client given a capsule that
+spawns in alternating regions. Built-in `t23-g3` runs one server + three live
+clients + one `--late-join` replica; clients sever both regions' columns (a
+multi-region collapse), excavate each floor's ends, and the late client joins
+after those six edits. It passes headless and with `--loss-percent 3`: every
+scripted cut commits, all four clients and the server agree on one canonical
+hash, the committed stream replays from baseline to that hash, and both
+detached beams are reported at rest. CPU proof: `cargo test -p spall_sim --test
+separated_regions`. G3 rows still open (resident-cache eviction, save/restart +
+traversal, the full crash-injection matrix, the join-duration budget, and the
+whole G4 eight-client workload + soak) are tracked in `docs/reports/G3.md`.
 
 ### G4 — eight-client engine slice
 

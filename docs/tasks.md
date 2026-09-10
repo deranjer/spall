@@ -294,6 +294,11 @@ Run all correctness, crash, impairment, visual, and eight-client workload scenar
 
 Accept: validation.md gates pass or remaining failures are clearly recorded as open. Produce reproducible commands and raw evidence. This is the first game-ready engine slice, still without menus/editor/survival content.
 
+Lands in increments against `docs/reports/G3.md`.
+
+- **Increment 1 (separated regions, multi-region collapse, late join).** New `separated-regions` scene (`spall_voxel::fixtures::separated_regions_scene` / `spall_sim::fixtures::separated_regions_setup`, `Scene::SeparatedRegions`): one volume bounded to 256 x 128 x 256 m holding two independent collapsible bridge structures 18 m apart. Every connecting client gets a capsule; `SEPARATED_REGION_SPAWNS` puts even slots west and odd slots east (`Scene::player_spawns` replaces the unconditional `WALK_ARENA_SPAWNS`). Built-in scenario `t23-g3.json`: one server + three live clients + one `--late-join` replica; both regions' columns are severed (multi-region collapse), each floor's ends excavated, and the late client joins after those six edits. Passes headless and at `--loss-percent 3`: all seven cuts commit, all four clients + server converge to one hash, the committed stream replays from baseline to that hash, and both detached beams are reported at rest. Evidence: `cargo test -p spall_sim --test separated_regions`; `cargo xtask scenario --name t23-g3`. Open G3/G4 rows (resident-cache eviction, save/restart + traversal, the full persistence crash matrix, the join-duration budget, the eight-client workload + soak, measured interest/bandwidth separation) are enumerated in `docs/reports/G3.md`.
+- **Increment 2+ (later).** The open rows above.
+
 ### T24 — G5 larger-world feasibility
 
 Dependencies: T23. Own: separate architecture decision and scale prototype.

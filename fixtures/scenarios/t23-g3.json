@@ -1,0 +1,22 @@
+{
+  "name": "t23-g3",
+  "description": "T23 / G3 increment 1. One bounded 256x128x256 m world holds two independent collapsible structures. Four clients connect and each is given an authoritative player capsule; alternating slots spawn in the west and east regions, so the connected players start geographically separated. Client 0 severs the west column (~tick 40) and client 1 severs the east column (~tick 100) — a multi-region collapse detaching one beam per region. Clients then excavate each region's floor ends (outside the beam spans, so each beam keeps a floor to rest on). Client 3 is a --late-join replica that connects after those heavy edits, pulls a dependency-complete baseline over a real QUIC bulk transfer, drains the catch-up queue, and lands one cut of its own. The server and all four clients must converge to one canonical topology hash, the committed topology-event stream must replay from baseline to that same hash, and every detached body must be reported at rest. Open G3 items (persistence crash-matrix, save/restart + traversal, resident-cache eviction, G4 8-client bandwidth + soak, 4096 sleeping bodies) are tracked in docs/reports/G3.md.",
+  "scene": "separated-regions",
+  "server_ticks": 900,
+  "quiescence_ticks": 220,
+  "clients": 4,
+  "late_join_clients": [3],
+  "late_join_connect_delay_ms": 1200,
+  "minimum_transactions": 6,
+  "replay_check": true,
+  "require_body_settled": true,
+  "cuts": [
+    { "client": 0, "at_tick": 40,  "cell": [10, 6, 3],  "radius": 2 },
+    { "client": 1, "at_tick": 100, "cell": [82, 6, 75], "radius": 2 },
+    { "client": 0, "at_tick": 150, "cell": [1, 1, 3],   "radius": 1 },
+    { "client": 2, "at_tick": 175, "cell": [22, 1, 3],  "radius": 1 },
+    { "client": 1, "at_tick": 200, "cell": [73, 1, 75], "radius": 1 },
+    { "client": 1, "at_tick": 230, "cell": [94, 1, 75], "radius": 1 },
+    { "client": 3, "at_tick": 320, "cell": [22, 2, 6],  "radius": 1 }
+  ]
+}

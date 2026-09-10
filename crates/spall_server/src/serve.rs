@@ -38,7 +38,7 @@ use spall_protocol::{
     PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
     frame_input, recent_input, session_player_entity,
 };
-use spall_sim::fixtures::WALK_ARENA_SPAWNS;
+use spall_sim::fixtures::{SEPARATED_REGION_SPAWNS, WALK_ARENA_SPAWNS};
 use spall_sim::{
     Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
     SimulationConfig, action_statuses, fixtures,
@@ -147,6 +147,12 @@ pub enum Scene {
     /// so the commit ships a bulk `BaselineWorld` on a stream. See
     /// [`spall_sim::fixtures::bulk_split_setup`].
     BulkSplit,
+    /// T23 / G3 integrated acceptance: two independent collapsible bridge
+    /// structures in one bounded `256 x 128 x 256 m` world. Connecting clients
+    /// get a player capsule; alternating slots spawn in the two regions, so the
+    /// harness drives geographically separated players and a multi-region
+    /// collapse. See [`spall_sim::fixtures::separated_regions_setup`].
+    SeparatedRegions,
 }
 
 impl Scene {
@@ -161,6 +167,7 @@ impl Scene {
             "walk" | "walk-arena" | "player-movement" => Some(Scene::Walk),
             "checkerboard-split" | "oversized-split" => Some(Scene::CheckerboardSplit),
             "bulk-split" | "giant-split" => Some(Scene::BulkSplit),
+            "separated-regions" | "t23-g3" | "g3" => Some(Scene::SeparatedRegions),
             _ => None,
         }
     }
@@ -173,12 +180,23 @@ impl Scene {
             Scene::Walk => "walk",
             Scene::CheckerboardSplit => "checkerboard-split",
             Scene::BulkSplit => "bulk-split",
+            Scene::SeparatedRegions => "separated-regions",
         }
     }
 
     /// `true` if this scene gives every connecting client a player capsule.
     pub fn has_players(self) -> bool {
-        matches!(self, Scene::Walk)
+        matches!(self, Scene::Walk | Scene::SeparatedRegions)
+    }
+
+    /// Feet spawn positions (metres) for a player scene, indexed by connection
+    /// slot. Empty for a scene without players.
+    pub fn player_spawns(self) -> &'static [[f64; 3]] {
+        match self {
+            Scene::Walk => &WALK_ARENA_SPAWNS,
+            Scene::SeparatedRegions => &SEPARATED_REGION_SPAWNS,
+            _ => &[],
+        }
     }
 
     fn simulation(self) -> Simulation {
@@ -188,6 +206,7 @@ impl Scene {
             Scene::Walk => spall_sim::fixtures::walk_arena_setup(),
             Scene::CheckerboardSplit => spall_sim::fixtures::checkerboard_split_setup(),
             Scene::BulkSplit => spall_sim::fixtures::bulk_split_setup(),
+            Scene::SeparatedRegions => spall_sim::fixtures::separated_regions_setup(),
         };
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
@@ -922,9 +941,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         lj.on_joined(session);
                         // T19: give this connection an authoritative player
                         // capsule on a player scene (respawn on reconnect).
-                        if scene.has_players() {
+                        let spawns = scene.player_spawns();
+                        if !spawns.is_empty() {
                             let slot = session.slot().0 as usize;
-                            let spawn = WALK_ARENA_SPAWNS[slot.min(WALK_ARENA_SPAWNS.len() - 1)];
+                            let spawn = spawns[slot.min(spawns.len() - 1)];
                             sim.add_player(session_player_entity(session), spawn);
                         }
                     }
