@@ -768,19 +768,28 @@ fn scripted_bridge_cut() -> Simulation {
     let mut sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup()))
         .expect("bridge scene is valid");
     let h = BRUSH_UNIT / 2;
-    let brush = SphereBrush::new(
-        BrushPoint::from_units(10 * BRUSH_UNIT + h, 4 * BRUSH_UNIT + h, BRUSH_UNIT + h),
-        2 * BRUSH_UNIT,
-    )
-    .expect("brush is valid");
-    sim.submit(EditIntent::cut(
-        spall_protocol::RequestId(1),
-        EntityId::new(1).unwrap(),
-        EditTarget::Terrain,
-        brush,
-    ))
-    .expect("submit");
-    sim.run_until_idle(24).expect("run to idle");
+    let cell = |x: i64, y: i64, z: i64, r: i64| {
+        SphereBrush::new(
+            BrushPoint::from_units(x * BRUSH_UNIT + h, y * BRUSH_UNIT + h, z * BRUSH_UNIT + h),
+            r * BRUSH_UNIT,
+        )
+        .expect("brush is valid")
+    };
+
+    // Sever the column (detaches the beam), then excavate the floor ends
+    // *outside* the beam's x-span. Three separate committed transactions, so the
+    // durable journal has an interior record for the crash suite's gap case.
+    let cuts = [(10i64, 4i64, 1i64, 2i64), (1, 1, 1, 1), (22, 1, 1, 1)];
+    for (i, &(x, y, z, r)) in cuts.iter().enumerate() {
+        sim.submit(EditIntent::cut(
+            spall_protocol::RequestId(i as u64 + 1),
+            EntityId::new(1).unwrap(),
+            EditTarget::Terrain,
+            cell(x, y, z, r),
+        ))
+        .expect("submit");
+        sim.run_until_idle(24).expect("run to idle");
+    }
     sim
 }
 
@@ -817,6 +826,7 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
     let anchor = AnchorPlane::at(0);
 
     let fresh = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let fresh_hash = fresh.world().world_hash();
     let checkpoint0 = capture(&fresh, &cfg, 0)?;
     let checkpoint1 = capture(&scripted, &cfg, durable_seq)?;
     let checkpoint_bricks = checkpoint1.bricks.len();
@@ -1078,6 +1088,221 @@ pub fn run_crash_suite(scratch_dir: &std::path::Path) -> Result<CrashSuiteReport
             format!(
                 "failed={failed}, poisoned={poisoned}, refuses_more={refuses_more}, \
                  journal_suffix={}, durable_seq={seq}",
+                rec.journal.len()
+            ),
+        ));
+    }
+
+    // 8. Crash between the checkpoint's body/brick rows, before the cursor row —
+    //    the partial second checkpoint must be invisible; the journal still
+    //    recovers the split from checkpoint 0.
+    {
+        let db = next_db();
+        let mut w = spall_store::Writer::open(&db)?;
+        w.publish_checkpoint(&checkpoint0)?;
+        w.append_journal(&journal)?;
+        w.set_faults(FaultPlan::crash(CrashPoint::MidCheckpointRows));
+        let crashed = w.publish_checkpoint(&checkpoint1).is_err();
+        drop(w);
+        let rec = spall_store::recover(&db)?;
+        let (sim, _) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
+        scenarios.push(check(
+            "crash_mid_checkpoint_rows",
+            crashed
+                && rec.checkpoint.tick == checkpoint0.tick
+                && rec.journal.len() == journal.len()
+                && rec.corruption.is_empty()
+                && sim.world().world_hash() == post_cut_hash
+                && sim.world().body_count() == post_cut_bodies,
+            format!(
+                "recovered_cp_tick={}, journal_suffix={}, bodies={}",
+                rec.checkpoint.tick,
+                rec.journal.len(),
+                sim.world().body_count()
+            ),
+        ));
+    }
+
+    // 9. Crash immediately after the second checkpoint's COMMIT returns — the
+    //    caller never gets the ack, but the checkpoint IS durable, so recovery
+    //    resumes from it (not from checkpoint 0 + full journal).
+    {
+        let db = next_db();
+        let mut w = spall_store::Writer::open(&db)?;
+        w.publish_checkpoint(&checkpoint0)?;
+        w.append_journal(&journal)?;
+        w.set_faults(FaultPlan::crash(CrashPoint::AfterCheckpointCommit));
+        let crashed = w.publish_checkpoint(&checkpoint1).is_err();
+        drop(w);
+        let rec = spall_store::recover(&db)?;
+        let (sim, seq) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
+        scenarios.push(check(
+            "crash_after_checkpoint_commit",
+            crashed
+                && rec.checkpoint.tick == checkpoint1.tick
+                && rec.corruption.is_empty()
+                && seq == durable_seq
+                && sim.world().world_hash() == post_cut_hash
+                && sim.world().body_count() == post_cut_bodies,
+            format!(
+                "recovered_cp_tick={} (expected {}), journal_suffix={}, durable_seq={seq}",
+                rec.checkpoint.tick,
+                checkpoint1.tick,
+                rec.journal.len()
+            ),
+        ));
+    }
+
+    // 10. A CRC-failed journal record (bit-rot / torn write). Recovery must stop
+    //     the durable prefix before it and report the corruption; RequireClean
+    //     then fails closed, and AcceptDurablePrefix resumes from the clean
+    //     prefix — here, checkpoint 0 with no journal applied.
+    {
+        let db = next_db();
+        let mut w = spall_store::Writer::open(&db)?;
+        w.publish_checkpoint(&checkpoint0)?;
+        w.append_journal(&journal)?;
+        drop(w);
+        spall_store::inject::break_journal_crc(&db, journal[0].seq)?;
+        let rec = spall_store::recover(&db)?;
+        let fail_closed = matches!(
+            restore(
+                &rec,
+                &cfg,
+                RecoveryChoice::RequireClean,
+                manifest.clone(),
+                anchor,
+                PhysicsConfig::default(),
+            ),
+            Err(PersistError::UnrecoverableCorruption { .. })
+        );
+        let (sim, seq) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::AcceptDurablePrefix,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
+        scenarios.push(check(
+            "journal_crc_corruption_truncates_and_fails_closed",
+            !rec.corruption.is_empty()
+                && rec.journal.is_empty()
+                && fail_closed
+                && seq == 0
+                && sim.world().world_hash() == fresh_hash
+                && sim.world().body_count() == pre_cut_bodies,
+            format!(
+                "corruption_reports={}, fail_closed={fail_closed}, prefix_bodies={}",
+                rec.corruption.len(),
+                sim.world().body_count()
+            ),
+        ));
+    }
+
+    // 11. An interior journal gap (a lost record between two durable ones).
+    //     Recovery stops at the record before the gap. Needs >= 3 records; the
+    //     bridge-cut split may commit fewer, in which case this is n/a.
+    {
+        if journal.len() >= 3 {
+            let kept = journal.len() / 2;
+            let gap_at = journal[kept].seq;
+            let db = next_db();
+            let mut w = spall_store::Writer::open(&db)?;
+            w.publish_checkpoint(&checkpoint0)?;
+            w.append_journal(&journal)?;
+            drop(w);
+            spall_store::inject::remove_journal_row(&db, gap_at)?;
+            let rec = spall_store::recover(&db)?;
+            let fail_closed = matches!(
+                restore(
+                    &rec,
+                    &cfg,
+                    RecoveryChoice::RequireClean,
+                    manifest.clone(),
+                    anchor,
+                    PhysicsConfig::default(),
+                ),
+                Err(PersistError::UnrecoverableCorruption { .. })
+            );
+            let (_sim, _) = restore(
+                &rec,
+                &cfg,
+                RecoveryChoice::AcceptDurablePrefix,
+                manifest.clone(),
+                anchor,
+                PhysicsConfig::default(),
+            )?;
+            scenarios.push(check(
+                "interior_journal_gap_truncates_and_fails_closed",
+                !rec.corruption.is_empty() && rec.journal.len() == kept && fail_closed,
+                format!(
+                    "corruption_reports={}, durable_suffix={} (expected {kept}), fail_closed={fail_closed}",
+                    rec.corruption.len(),
+                    rec.journal.len()
+                ),
+            ));
+        } else {
+            scenarios.push(check(
+                "interior_journal_gap_truncates_and_fails_closed",
+                true,
+                format!(
+                    "n/a: the bridge-cut split committed only {} journal record(s)",
+                    journal.len()
+                ),
+            ));
+        }
+    }
+
+    // 12. Out of disk (SQLITE_FULL) on the second checkpoint commit — no false
+    //     success, writer poisoned, recovery falls back to checkpoint 0 + the
+    //     full journal.
+    {
+        let db = next_db();
+        let mut w = spall_store::Writer::open(&db)?;
+        w.publish_checkpoint(&checkpoint0)?;
+        w.append_journal(&journal)?;
+        w.set_faults(FaultPlan::disk_full());
+        let failed = matches!(
+            w.publish_checkpoint(&checkpoint1),
+            Err(spall_store::StoreError::Disk(_))
+        );
+        let poisoned = w.is_poisoned();
+        drop(w);
+        let rec = spall_store::recover(&db)?;
+        let (sim, _) = restore(
+            &rec,
+            &cfg,
+            RecoveryChoice::RequireClean,
+            manifest.clone(),
+            anchor,
+            PhysicsConfig::default(),
+        )?;
+        scenarios.push(check(
+            "disk_full_on_checkpoint",
+            failed
+                && poisoned
+                && rec.checkpoint.tick == checkpoint0.tick
+                && rec.journal.len() == journal.len()
+                && rec.corruption.is_empty()
+                && sim.world().world_hash() == post_cut_hash,
+            format!(
+                "failed={failed}, poisoned={poisoned}, recovered_cp_tick={}, journal_suffix={}",
+                rec.checkpoint.tick,
                 rec.journal.len()
             ),
         ));

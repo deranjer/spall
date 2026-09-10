@@ -111,13 +111,22 @@ save-record conversion and recovery). `sandbox-server --serve --save` recovers
 from `<world>/world.db` on start, journals every committed transaction, and
 checkpoints on `--checkpoint-interval-ticks` and clean shutdown. `cargo xtask
 crash-test --suite persistence` runs the in-process crash-point / disk-fault
-matrix through a real `Simulation` (bridge scene → column cut → beam detaches),
-including a genuine SQLite engine write failure, and writes `summary.json` with
-the measured bytes/write rate. Recovery after an **abrupt, unclean process
-kill** at the journal / checkpoint publication boundaries is a separate
-child-process harness: `cargo test -p spall_store --test abrupt_crash` (it kills
-real child processes and reopens from a fresh process). `summary.json`'s
-`unrun_here` field names what the in-process suite deliberately does not cover.
+matrix through a real `Simulation` (bridge scene → column cut → two floor
+excavations = three committed transactions) and writes `summary.json` with the
+measured bytes/write rate. Its 12 scenarios (T23 increment 3) cover **every**
+`CrashPoint` — before/after the journal commit, mid-checkpoint-rows,
+before/after the checkpoint commit (the after-commit case proves recovery
+resumes from a durable-but-unacked checkpoint) — plus a genuine SQLite engine
+write failure, an injected `SQLITE_FULL` (disk-full) on the checkpoint commit, a
+CRC-broken journal record, and a deleted interior journal record. The two
+corruption cases assert recovery reports it and truncates the durable prefix,
+that `RecoveryChoice::RequireClean` then fails closed, and that
+`AcceptDurablePrefix` resumes from the clean prefix. Recovery after an
+**abrupt, unclean process kill** at the journal / checkpoint publication
+boundaries is a separate child-process harness: `cargo test -p spall_store
+--test abrupt_crash` (it kills real child processes and reopens from a fresh
+process). `summary.json`'s `unrun_here` field names what the in-process suite
+deliberately does not cover.
 Durable writes go through `spall_server::persist_pipeline::PersistPipeline`: a
 single off-thread `Writer` fed a **bounded** queue of immutable
 snapshots/records, so a disk stall never stalls physics; a full backlog or a
@@ -531,10 +540,13 @@ detached beams are reported at rest. A `restart_check` flag then stops the
 server, cold-restarts a fresh `sandbox-server --serve --save` over the same
 `world.db` (recovery from the shutdown checkpoint + journal), and requires both
 the recovered server and a fresh `--late-join` client against it to reach the
-agreed hash. CPU proof: `cargo test -p spall_sim --test separated_regions`. G3
-rows still open (resident-cache eviction, traverse-away/back, the full
-crash-injection matrix, the join-duration budget, and the whole G4 eight-client
-workload + soak) are tracked in `docs/reports/G3.md`.
+agreed hash. Increment 3 brings `cargo xtask crash-test --suite persistence` to
+12 scenarios covering every `CrashPoint`, CRC / interior-gap journal
+corruption, and an injected `SQLITE_FULL`. CPU proof: `cargo test -p spall_sim
+--test separated_regions`. G3 rows still open (resident-cache eviction,
+traverse-away/back, the join-duration budget, the impaired-late-join
+bounded-failure assertion, and the whole G4 eight-client workload + soak) are
+tracked in `docs/reports/G3.md`.
 
 ### G4 — eight-client engine slice
 

@@ -255,6 +255,12 @@ impl Writer {
                 drop(tx); // rollback
                 return Err(StoreError::Disk("journal commit failed (injected)".into()));
             }
+            if std::mem::take(&mut faults.disk_full) {
+                drop(tx); // rollback
+                return Err(StoreError::Disk(
+                    "SQLITE_FULL: out of disk space on the journal commit (injected)".into(),
+                ));
+            }
 
             let started = Instant::now();
             tx.commit()?;
@@ -394,6 +400,12 @@ impl Writer {
                 drop(tx);
                 return Err(StoreError::Disk(
                     "checkpoint commit failed (injected)".into(),
+                ));
+            }
+            if std::mem::take(&mut faults.disk_full) {
+                drop(tx);
+                return Err(StoreError::Disk(
+                    "SQLITE_FULL: out of disk space on the checkpoint commit (injected)".into(),
                 ));
             }
 
