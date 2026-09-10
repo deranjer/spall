@@ -395,6 +395,107 @@ Required visual behavior: correct silhouettes/materials, soft/contact shadows, v
 
 Provisional target: client p95 frame <=16.7 ms at 1080p after warmup, with GPU p95 <=12 ms and CPU frame work p95 <=4 ms. CPU/GPU overlap; these are not additive proof of the total. Test lighting-only and combined collapse scenes. If indirect lighting cannot fit, record a revised quality/performance decision instead of quietly removing it.
 
+T15 (ENG-22) is delivered in increments; `docs/reports/G2.md` collects the
+evidence and the open items. Increment 1 adds the GPU frame-cost harness:
+
+```sh
+# T15 / G2 GPU frame-cost percentiles. Renders each still lighting fixture
+# (colored rooms, lit/occluded emitter) for 15 warm-up + 120 measured frames
+# at a fixed 1920x1080, exposure 1.0, Shaded view only, and reports nearest-rank
+# per-pass device-time percentiles plus the provisional GPU p95 <= 12 ms verdict.
+# See docs/reports/G2.md. Cold full-cache re-trace cost, not the amortised
+# client frame; exterior terrain, moving sequences, and the CPU/client frame
+# budget are increment 2.
+cargo xtask capture --scene g2-frames --output .local/runs/g2-frames
+```
+
+Measured (RTX 4080 SUPER / D3D12): frame-total GPU p50 ~12-13 ms, p95 ~32-38 ms
+across the four scenes -- but this is the cold full-cache re-trace with a
+per-frame pipeline rebuild, not a client frame (see increment 2).
+
+Increment 2 adds a persistent-resource settled-frame loop:
+
+```sh
+# T15 / G2 settled-frame cost. Builds every GPU resource once, then renders each
+# still fixture from a fixed camera for 15 warm-up + 120 measured frames at a
+# fixed 1920x1080 in two re-trace modes (settled = nothing re-traced;
+# edit = a 24^3 re-trace box/frame), reporting per-pass GPU device-time and
+# per-frame CPU encode percentiles + the provisional GPU/CPU/client p95 verdicts.
+cargo xtask capture --scene g2-loop --output .local/runs/g2-loop
+```
+
+Measured (RTX 4080 SUPER / D3D12): with resources built once and the T14
+bounded re-trace path, the settled frame is a ~0.3-0.9 ms GPU pass and ~0.6-0.8
+ms CPU encode; pipelined client-frame p95 estimate <= 2.9 ms across all four
+scenes in both modes -- the provisional GPU p95 <= 12 ms, CPU p95 <= 4 ms, and
+client p95 <= 16.7 ms targets are all met with margin. Increment 1's ~3x miss
+was a harness artefact (per-frame pipeline rebuild + full-cache re-trace).
+CPU-only coverage: `spall_render` `capture::tests::frame_stats_*` +
+`*_retrace_box_*`; `sandbox-capture`
+`tests::g2_frame_scenes_are_distinct_lit_and_framed`. The GPU run is manual.
+
+Increment 3 adds moving-frame sequences + quality flags:
+
+```sh
+# T15 / G2 moving-frame quality. Three 120-frame sequences on the emitter/
+# occluder fixture -- static-noise (Shaded, nothing moving), moving-occluder and
+# occluder-jump (IndirectOnly, the occluder leaves the light path and returns
+# smoothly / in two jumps). Samples luminance in probe bands every frame and
+# flags flicker / ghost residual / weak recovery "for review".
+cargo xtask capture --scene g2-motion --output .local/runs/g2-motion
+```
+
+Measured (RTX 4080 SUPER / D3D12): the settled indirect frame is bit-stable
+(band flicker 0.00000 for 120 frames); a moving occluder's shadow recovers ~26%
+when it leaves and returns to within 0.8% of its original level (no ghost / no
+trail); the smooth and discrete moves behave the same; the static region stays
+quiet (far-band flicker < 0.0001). No quality flags. CPU-only coverage:
+`spall_render` `capture::tests::{a_steady_trace_has_zero_flicker,
+flicker_index_is_mean_abs_step_over_mean_level,
+settle_index_finds_the_first_lasting_return_to_target}`. The GPU run is manual.
+
+Increment 4 adds the open daylight-terrain scene (the sixth G2 scene category):
+
+```sh
+# T15 / G2 daylight terrain. An open sun-lit exterior (stepped terraces + tall
+# pillars casting long shadows) run through the persistent settled-frame loop
+# (settled + edit modes) plus a 120-frame static-noise stability pass.
+cargo xtask capture --scene g2-terrain --output .local/runs/g2-terrain
+```
+
+Measured (RTX 4080 SUPER / D3D12): settled frame GPU p95 0.24 ms / CPU p95 0.68
+ms / pipelined client p95 0.68 ms -- the cheapest G2 scene (a single sky/ground
+bounce vs the enclosed rooms' multi-bounce), all provisional targets met with
+the widest margin; 120-frame static-noise flicker 0.000000 (bit-stable); cast
+sun shadows + direct-light falloff read correctly. No quality flags. This
+completes the G2 scene matrix except a GI-lit rapid-destruction sequence
+(increment 5). CPU-only coverage: `spall_render`
+`fixtures::tests::daylight_terrain_is_open_lit_and_shadow_casting`. GPU run
+manual.
+
+Increment 5 adds the GI-lit rapid-destruction scene (the sixth G2 category):
+
+```sh
+# T15 / G2 GI-lit destruction. Drives the authoritative spall_sim world on
+# cross_brick_bridge_scene through the g1-networked-destruction cut script; at
+# 13 ticks across the 200-tick collapse it meshes the live world AND rebuilds a
+# T13/T14 lighting clipmap from it (terrain occupancy + detached body AABBs), so
+# each frame is lit with indirect GI. Reports per-tick cold GPU cost + a
+# settled-frame stability pass + conservation.
+cargo xtask capture --scene g2-collapse --output .local/runs/g2-collapse
+```
+
+Measured (RTX 4080 SUPER / D3D12): 10/10 cut transactions commit; terrain solid
+cells 304 -> 243 monotone non-increasing (no mined-terrain regrowth); the GI-lit
+destruction renders correctly across the collapse; the settled frame is
+bit-stable (60-frame band flicker 0.000000). Per-tick GPU cost is the
+increment-1 cold full-retrace number (~12 ms p50), not a client frame -- the
+bounded per-tick destruction cost (sim -> incremental `LightingUpdate`) is
+increment 6. No quality flags. This completes the G2 scene matrix. CPU-only
+coverage: `sandbox-capture`
+`tests::sim_light_volume_tracks_terrain_occupancy_and_cuts`. GPU run manual. A
+pipelined loop, cross-GPU review, and the freeze decision remain increment 6+.
+
 ### G3 — persistence, late join, and streaming
 
 Use a 256 x 128 x 256 m bounded world with resident cache limits low enough to force eviction. Drive a collapse while a third client joins, then reconnect that client. Traverse away/back, save, and restart. Test crashes at every persistence transaction boundary plus truncated/corrupt data and disk-full injection.

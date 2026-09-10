@@ -140,6 +140,88 @@ Capture exterior, indoor colored-light, emissive, thin-wall, and active-collapse
 
 Accept: validation.md G2 evidence reviewed; freeze terrain/detail sizes and renderer direction before shipping persistent world compatibility. Record quality shortfalls explicitly. No assertion of Teardown-equivalent quality without reviewed evidence.
 
+Delivered in increments (ticket stays open until every G2 bullet has evidence
+and a graphics integrator has reviewed it); `docs/reports/G2.md` collects the
+evidence and open items.
+
+- **Increment 1 (GPU frame-cost percentiles).** `spall_render::capture_frame_series`
+  renders one scene for `warmup + measured` consecutive frames at a fixed size
+  and exposure (`Shaded` view only) and reduces each render pass family's
+  per-frame device time to nearest-rank percentiles.
+  `sandbox-capture --scene g2-frames` (also `cargo xtask capture --scene g2-frames`)
+  runs it over the still T13/T14 lighting fixtures at a fixed 1920x1080. Measured
+  on the RTX 4080 SUPER / D3D12 reference adapter: frame-total GPU p50 ~12-13 ms,
+  p95 ~32-38 ms -- the provisional GPU p95 <= 12 ms is missed ~3x, the full
+  128^3 indirect trace dominant. This is the cold full-retrace cost, not the
+  amortised client frame. Evidence: `spall_render`
+  `capture::tests::frame_stats_*`; `sandbox-capture`
+  `tests::g2_frame_scenes_are_distinct_lit_and_framed`; the GPU run is manual.
+- **Increment 2 (persistent-resource settled-frame loop).**
+  `spall_render::capture_frame_loop` builds every GPU resource once, then renders
+  a static scene from a fixed camera for `warmup + measured` frames (warm-up:
+  full re-trace; measured: a bounded `retrace_edge_cells` box or nothing, with
+  temporal accumulation), reporting per-pass GPU device-time and per-frame CPU
+  encode percentiles. Shadows are timed once. `sandbox-capture --scene g2-loop`
+  (also `cargo xtask capture --scene g2-loop`) runs it over the still T13/T14
+  fixtures in `settled` and `edit` (24^3 re-trace box) modes at a fixed
+  1920x1080. Measured on the reference adapter: settled frame ~0.3-0.9 ms GPU /
+  ~0.6-0.8 ms CPU, pipelined client-frame p95 estimate <= 2.9 ms in every
+  scene/mode -- the provisional GPU/CPU/client p95 targets are all met with
+  margin, and increment 1's ~3x miss is confirmed a harness artefact (per-frame
+  pipeline rebuild + full-cache re-trace). Evidence: `spall_render`
+  `capture::tests::a_zero_edge_retrace_box_has_no_volume` +
+  `a_retrace_box_is_centred_and_clamped_to_the_cache`; the GPU run is manual.
+- **Increment 3 (moving-frame sequences + quality flags).**
+  `spall_render::capture_motion_sequence` drives a scene through a per-frame
+  camera + lighting-update path on the increment-2 loop, sampling luminance in
+  probe bands every frame; pure `flicker_index` / `max_step_fraction` /
+  `settle_index` reduce the traces. `sandbox-capture --scene g2-motion` (also
+  `cargo xtask capture --scene g2-motion`) runs three 120-frame sequences on the
+  emitter/occluder fixture -- `static-noise` (Shaded, nothing moving),
+  `moving-occluder` and `occluder-jump` (IndirectOnly, occluder leaves the light
+  path and returns smoothly / in two jumps) -- and flags flicker / ghost
+  residual / weak recovery "for review". Measured on the reference adapter: the
+  settled indirect frame is bit-stable (flicker 0.00000 / 120 frames); the
+  moving occluder's shadow recovers ~26% and returns within 0.8% (no ghost /
+  trail); static regions stay quiet; smooth and discrete moves behave the same.
+  **No quality flags.** Evidence: `spall_render`
+  `capture::tests::{a_steady_trace_has_zero_flicker,
+  flicker_index_is_mean_abs_step_over_mean_level,
+  settle_index_finds_the_first_lasting_return_to_target}`; the GPU run is manual.
+- **Increment 4 (open daylight-terrain scene).** `spall_render::daylight_terrain_scene`
+  — the sixth G2 scene category: a sun-lit open exterior (stepped terraces + tall
+  pillars casting long shadows, bright sky), built entirely in `spall_render`.
+  `sandbox-capture --scene g2-terrain` (also `cargo xtask capture --scene
+  g2-terrain`) runs it through the increment-2 loop (`settled` + `edit`) + a
+  120-frame `static-noise` stability pass. Measured on the reference adapter:
+  settled frame GPU p95 0.24 ms / CPU p95 0.68 ms / pipelined client p95 0.68 ms
+  — the cheapest G2 scene (single sky/ground bounce), all provisional targets met
+  with the widest margin; static-noise flicker 0.000000; cast shadows +
+  direct-light falloff read correctly. **No quality flags.** Completes the G2
+  scene matrix except a GI-lit rapid-destruction sequence. Evidence:
+  `spall_render` `fixtures::tests::daylight_terrain_is_open_lit_and_shadow_casting`;
+  the GPU run is manual.
+- **Increment 5 (GI-lit rapid-destruction sequence).** `sandbox-capture --scene
+  g2-collapse` (also `cargo xtask capture --scene g2-collapse`) drives the
+  authoritative `spall_sim` world on `cross_brick_bridge_scene` through the
+  `g1-networked-destruction` cut script; at 13 ticks across the 200-tick collapse
+  it meshes the live world **and rebuilds a T13/T14 lighting clipmap from it**
+  (`sim_light_volume`: terrain occupancy sampled at the terrain cell size +
+  detached body AABBs filled solid) so each frame is lit with indirect GI.
+  Measured on the reference adapter: 10/10 cuts commit; terrain solid cells
+  304 → 243 monotone non-increasing (no regrowth); the GI-lit destruction
+  renders correctly; the settled frame is bit-stable (60-frame band flicker
+  0.000000). Per-tick GPU cost is the increment-1 cold full-retrace number
+  (~12 ms p50), not a client frame. **No quality flags.** Completes the G2 scene
+  matrix. Evidence: `sandbox-capture`
+  `tests::sim_light_volume_tracks_terrain_occupancy_and_cuts`; the GPU run is
+  manual.
+- **Increment 6 (later).** A bounded per-tick destruction cost (sim →
+  incremental `LightingUpdate` instead of a cold full re-trace); a pipelined
+  (threaded) client frame loop + the broader CPU frame-work budget; a bounded
+  denoise/temporal pass if a real scene tightens the budget; cross-GPU capture +
+  human review; the cell-size / renderer-direction freeze decision.
+
 ## Persistence, scale, and game-ready slice
 
 ### T16 — Durable world checkpoint and journal

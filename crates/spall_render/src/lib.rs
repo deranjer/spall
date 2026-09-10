@@ -19,15 +19,20 @@ pub mod vertex;
 
 pub use camera::{Aabb, Camera, Frustum};
 pub use capture::{
-    CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, LightingStep, SequenceOptions,
-    SequenceReport, SequenceStep, capture_lighting_sequence, capture_scene,
+    BandTrace, CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, CollapseFrame,
+    CollapseSequenceOptions, CollapseSequenceReport, FrameLoopOptions, FrameLoopReport,
+    FrameSeriesOptions, FrameSeriesPasses, FrameSeriesReport, FrameStats, LightingStep,
+    MotionFrame, MotionImage, MotionSequenceOptions, MotionSequenceReport, ProbeBand,
+    SequenceOptions, SequenceReport, SequenceStep, capture_collapse_sequence, capture_frame_loop,
+    capture_frame_series, capture_lighting_sequence, capture_motion_sequence, capture_scene,
+    flicker_index, max_step_fraction, settle_index,
 };
 pub use context::{RenderContext, RenderError};
 pub use fixtures::{
-    EmitterOcclusionScenes, LightingFixture, LightingFixtureMetrics, MovingBodyOverlap,
-    OCCLUDER_MAX_M, OCCLUDER_MIN_M, PanningCamera, RECEIVER_MAX_M, RECEIVER_MIN_M,
-    RapidDestruction, colored_rooms, emitter_occlusion_scenes, moving_body_overlap, panning_camera,
-    rapid_destruction,
+    DaylightTerrainScene, EmitterOcclusionScenes, LightingFixture, LightingFixtureMetrics,
+    MovingBodyOverlap, OCCLUDER_MAX_M, OCCLUDER_MIN_M, PanningCamera, RECEIVER_MAX_M,
+    RECEIVER_MIN_M, RapidDestruction, colored_rooms, daylight_terrain_scene,
+    emitter_occlusion_scenes, moving_body_overlap, panning_camera, rapid_destruction,
 };
 pub use indirect::{
     LIGHT_CELL_SIZE_METRES, LIGHT_VOLUME_DIM, LightingRegion, LightingUpdate, LightingVolume,
