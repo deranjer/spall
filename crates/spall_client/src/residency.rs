@@ -1,9 +1,9 @@
 //! Client application of the shared T18 residency policy.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use spall_core::{BrickCoord, VolumeId};
-use spall_protocol::RepairKey;
+use spall_core::{BrickCoord, GlobalCell, Revision, VolumeId};
+use spall_protocol::{Hash32, RepairKey, RepairRequest};
 use spall_voxel::{
     BrickCacheKey, CacheBudget, CollisionReadiness, InterestRadii, MemoryReport, ResidencyCache,
 };
@@ -141,5 +141,155 @@ impl ClientResidency {
                 .map(|coord| BrickCacheKey::new(volume, coord))
                 .collect()
         })
+    }
+}
+
+/// Consecutive steps a retained-digest brick that is back in interest waits
+/// between outbound `RepairRequest`s, so one lost / in-flight patch is not
+/// re-requested every mover iteration. The patch itself clears the digest
+/// (`EvictedBricks::drop_resident`), which stops the requests for good.
+const RELOAD_COOLDOWN_STEPS: u32 = 24;
+
+/// Consecutive steps a resident terrain brick must be out of the retain box
+/// before the pass evicts it. The hysteresis keeps the pass from dropping and
+/// re-pulling a brick as the player's predicted position jitters across a
+/// boundary.
+const EVICT_SETTLE_STEPS: u32 = 8;
+
+/// T23 / G3 row 7, slice E2 — the client-session terrain residency pass, run
+/// once per mover iteration against the predicted player capsule. Keeps a
+/// Chebyshev `radius`-brick box around the player resident, evicts the rest of
+/// the terrain after a hysteresis (retaining a digest, so `world_hash` is exact
+/// — slice B), and emits a rate-limited `RepairRequest` for every evicted brick
+/// that has come back into the box so the server re-sends it (slice E1's reload
+/// lifecycle drops the digest as the patch lands). Body volumes are never
+/// touched. `radius` must be wide enough to cover the predicted-collision
+/// region — the mover rebuilds its predicted collider from resident geometry
+/// only, so a brick under the player's near path must stay loaded.
+pub struct ClientResidencyPass {
+    radius: i64,
+    budget_bricks: usize,
+    /// Consecutive steps each resident, out-of-box brick has waited.
+    out_of_box: BTreeMap<BrickCoord, u32>,
+    reload_cooldown: BTreeMap<BrickCoord, u32>,
+    evictions_total: u64,
+    reloads_requested_total: u64,
+}
+
+impl ClientResidencyPass {
+    /// `radius` is the Chebyshev brick radius kept resident around the player;
+    /// `budget_bricks` is a reported ceiling only (the pass evicts by the box,
+    /// never below it).
+    pub fn new(budget_bricks: usize, radius: i64) -> Self {
+        Self {
+            radius: radius.max(0),
+            budget_bricks,
+            out_of_box: BTreeMap::new(),
+            reload_cooldown: BTreeMap::new(),
+            evictions_total: 0,
+            reloads_requested_total: 0,
+        }
+    }
+
+    pub fn evictions_total(&self) -> u64 {
+        self.evictions_total
+    }
+
+    pub fn reloads_requested_total(&self) -> u64 {
+        self.reloads_requested_total
+    }
+
+    /// Whether the run has held more resident terrain than `budget_bricks`
+    /// (informational — the box is never forced below what the player needs).
+    pub fn over_budget(&self, replica: &ReplicaWorld) -> bool {
+        replica
+            .volume(replica.terrain_volume_id())
+            .map(|v| v.resident_brick_count() > self.budget_bricks)
+            .unwrap_or(false)
+    }
+
+    fn box_around(&self, center: BrickCoord) -> BTreeSet<BrickCoord> {
+        let mut set = BTreeSet::new();
+        for dz in -self.radius..=self.radius {
+            for dy in -self.radius..=self.radius {
+                for dx in -self.radius..=self.radius {
+                    set.insert(BrickCoord::new(center.x + dx, center.y + dy, center.z + dz));
+                }
+            }
+        }
+        set
+    }
+
+    /// One pass. Returns the `RepairRequest`s the caller should send.
+    pub fn step(
+        &mut self,
+        replica: &mut ReplicaWorld,
+        player_feet_m: [f64; 3],
+    ) -> Vec<RepairRequest> {
+        let terrain = replica.terrain_volume_id();
+        let Some(cell_m) = replica.volume(terrain).map(|v| v.cell_size().metres()) else {
+            return Vec::new();
+        };
+        if cell_m <= 0.0 {
+            return Vec::new();
+        }
+        let center = GlobalCell::new(
+            (player_feet_m[0] / cell_m).floor() as i64,
+            (player_feet_m[1] / cell_m).floor() as i64,
+            (player_feet_m[2] / cell_m).floor() as i64,
+        )
+        .split()
+        .0;
+        let keep = self.box_around(center);
+
+        // Reload requests: retained-digest bricks back inside the box.
+        self.reload_cooldown.retain(|_, wait| {
+            *wait = wait.saturating_sub(1);
+            *wait > 0
+        });
+        let mut out = Vec::new();
+        let evicted_now: Vec<(BrickCoord, Revision)> = replica
+            .evicted(terrain)
+            .iter()
+            .map(|(c, d)| (c, d.revision))
+            .collect();
+        for (coord, revision) in evicted_now {
+            if keep.contains(&coord) && !self.reload_cooldown.contains_key(&coord) {
+                self.reload_cooldown.insert(coord, RELOAD_COOLDOWN_STEPS);
+                self.reloads_requested_total += 1;
+                out.push(RepairRequest {
+                    key: RepairKey::Brick {
+                        volume: terrain,
+                        coord,
+                    },
+                    expected_revision: revision,
+                    current_revision: Revision::ZERO,
+                    expected_hash: Hash32::ZERO,
+                    current_hash: Hash32::ZERO,
+                });
+            }
+        }
+
+        // Evict resident terrain bricks that have been out of the box for
+        // `EVICT_SETTLE_STEPS` consecutive steps.
+        let resident: Vec<BrickCoord> = replica
+            .volume(terrain)
+            .map(|v| v.resident_brick_coords())
+            .unwrap_or_default();
+        let resident_set: BTreeSet<BrickCoord> = resident.iter().copied().collect();
+        self.out_of_box.retain(|c, _| resident_set.contains(c));
+        for coord in resident {
+            if keep.contains(&coord) {
+                self.out_of_box.remove(&coord);
+                continue;
+            }
+            let waited = self.out_of_box.entry(coord).or_insert(0);
+            *waited += 1;
+            if *waited >= EVICT_SETTLE_STEPS && replica.evict_brick(terrain, coord) {
+                self.evictions_total += 1;
+                self.out_of_box.remove(&coord);
+            }
+        }
+        out
     }
 }

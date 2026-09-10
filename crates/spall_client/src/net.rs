@@ -41,6 +41,7 @@ use spall_protocol::{
 
 use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
+use crate::residency::ClientResidencyPass;
 
 /// One leg of a scripted movement path: hold `input` from tick `from` up to (not
 /// including) tick `to`.
@@ -164,6 +165,10 @@ pub enum BaselineScene {
     /// [`spall_voxel::fixtures::separated_regions_scene`] — two independent
     /// collapsible structures in one bounded world (T23 / G3).
     SeparatedRegions,
+    /// [`spall_voxel::fixtures::walk_arena`] — the flat 30 m movement lane
+    /// (T19 / T23 row 8b). A stationary client on this scene installs it as a
+    /// fixed baseline; a mover pulls it over a transfer.
+    Walk,
 }
 
 impl BaselineScene {
@@ -177,6 +182,7 @@ impl BaselineScene {
             "checkerboard-split" | "oversized-split" => Some(Self::CheckerboardSplit),
             "bulk-split" | "giant-split" => Some(Self::BulkSplit),
             "separated-regions" | "t23-g3" | "g3" => Some(Self::SeparatedRegions),
+            "walk" | "walk-arena" | "player-movement" => Some(Self::Walk),
             _ => None,
         }
     }
@@ -188,6 +194,7 @@ impl BaselineScene {
             Self::CheckerboardSplit => spall_voxel::fixtures::checkerboard_split_scene(id),
             Self::BulkSplit => spall_voxel::fixtures::bulk_split_scene(id),
             Self::SeparatedRegions => spall_voxel::fixtures::separated_regions_scene(id),
+            Self::Walk => spall_voxel::fixtures::walk_arena(id),
         }
     }
 }
@@ -221,6 +228,23 @@ pub struct ClientNetConfig {
     pub log_json: PathBuf,
     pub summary_json: Option<PathBuf>,
     pub transport: TransportConfig,
+    /// T23 / G3 row 7 slice E2: client-side terrain residency. `None` (the
+    /// default) keeps the replica fully resident — every prior run is
+    /// byte-unchanged. `Some` runs [`ClientResidencyPass`] in the mover loop:
+    /// it evicts terrain outside a brick box around the predicted player
+    /// capsule and pulls bricks back with `RepairRequest`s as the player
+    /// returns. Needs a `movement_script` (no mover, no pass).
+    pub client_residency: Option<ClientResidencyLimits>,
+}
+
+/// Client terrain-residency limits (slice E2).
+#[derive(Debug, Clone, Copy)]
+pub struct ClientResidencyLimits {
+    /// Resident-terrain-brick ceiling; the pass never forces it below the
+    /// interest box.
+    pub budget_bricks: usize,
+    /// Chebyshev brick radius kept resident around the predicted player.
+    pub interest_radius_bricks: i64,
 }
 
 /// Machine-readable result of a client run.
@@ -257,6 +281,13 @@ pub struct ClientSummary {
     /// client ran a `movement_script`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub movement: Option<PlayerMovementSummary>,
+    /// T23 / G3 row 7 slice E2: terrain bricks this client evicted around its
+    /// predicted player, and reload `RepairRequest`s it sent as the player
+    /// returned. Both `0` unless `client_residency` was set.
+    #[serde(default)]
+    pub client_residency_evictions: u64,
+    #[serde(default)]
+    pub client_residency_reloads_requested: u64,
 }
 
 /// Anything that stops a client run before it can report.
@@ -328,6 +359,11 @@ struct Counters {
     /// cut was sent. Together they let the run confirm the body cut committed.
     body_cut_entity_plus1: AtomicU64,
     body_cut_pre_cells: AtomicU64,
+    /// T23 / G3 row 7 slice E2: terrain bricks this replica evicted around the
+    /// predicted player, and `RepairRequest`s it sent to pull evicted bricks
+    /// back as the player returned. Both `0` unless `client_residency` is set.
+    residency_evictions: AtomicU64,
+    residency_reloads_requested: AtomicU64,
 }
 
 /// The `CharacterState` carried by a player [`MotionSnapshot`]. Orientation is
@@ -746,8 +782,14 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let script = config.movement_script.clone();
         let session = conn.session();
         let stop_rx = stop_rx.clone();
+        let client_residency = config.client_residency;
         tokio::spawn(async move {
             let end_tick = script_end_tick(&script);
+            // Slice E2: a scripted mover optionally evicts terrain outside a
+            // brick box around its predicted player and pulls it back with
+            // `RepairRequest`s as the player returns.
+            let mut residency = client_residency
+                .map(|l| ClientResidencyPass::new(l.budget_bricks, l.interest_radius_bricks));
             loop {
                 if *stop_rx.borrow() {
                     return;
@@ -760,8 +802,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     guard.terrain_hash().zip(guard.terrain_volume().cloned())
                 };
                 // All predictor-lock work happens in this non-async block, which
-                // returns the datagram to send once the guard is dropped.
-                let frame: Option<InputFrame> = {
+                // returns the datagram to send (and the predicted feet position
+                // for the residency pass) once the guard is dropped.
+                let (frame, feet): (Option<InputFrame>, Option<[f64; 3]>) = {
                     let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
                     let p: &mut Predictor = &mut guard;
                     if let Some((hash, volume)) = terrain
@@ -775,7 +818,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         }
                     }
 
-                    if p.player.is_some() && p.phys.has_terrain() {
+                    let frame = if p.player.is_some() && p.phys.has_terrain() {
                         let input = scripted_input(&script, tick);
                         p.input_seq += 1;
                         let seq = InputSeq(p.input_seq);
@@ -806,10 +849,29 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         })
                     } else {
                         None
-                    }
+                    };
+                    let feet = p.player.as_ref().map(|pl| pl.predicted().position_m);
+                    (frame, feet)
                 };
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
+                }
+
+                // Slice E2: evict / request-reload terrain around the player.
+                if let (Some(pass), Some(feet)) = (residency.as_mut(), feet) {
+                    let reqs = {
+                        let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                        pass.step(&mut guard, feet)
+                    };
+                    counters
+                        .residency_evictions
+                        .store(pass.evictions_total(), Ordering::Relaxed);
+                    counters
+                        .residency_reloads_requested
+                        .store(pass.reloads_requested_total(), Ordering::Relaxed);
+                    for req in reqs {
+                        let _ = conn.send_record(WireRecord::RepairRequest(req)).await;
+                    }
                 }
 
                 // Stop predicting a while after the script ends (the neutral
@@ -999,6 +1061,10 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         max_body_displacement_m,
         body_cut_committed,
         movement,
+        client_residency_evictions: counters.residency_evictions.load(Ordering::Relaxed),
+        client_residency_reloads_requested: counters
+            .residency_reloads_requested
+            .load(Ordering::Relaxed),
     };
     drop(guard);
 

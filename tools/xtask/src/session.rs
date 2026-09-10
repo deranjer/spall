@@ -207,6 +207,17 @@ struct Scenario {
     /// when `residency_budget_bricks` is set. Defaults to the server's default.
     #[serde(default)]
     residency_radius_bricks: Option<i64>,
+    /// T23 / G3 row 7, slice E2: run each **movement-scripted** client with
+    /// `--residency-budget-bricks` — the replica evicts terrain outside a brick
+    /// box around its predicted player and pulls it back with repair requests
+    /// as the player returns (row 8b traverse-away-and-back). The committed
+    /// world / agreed hash is unchanged.
+    #[serde(default)]
+    client_residency_budget_bricks: Option<usize>,
+    /// Chebyshev radius (bricks) kept resident around each scripted player when
+    /// `client_residency_budget_bricks` is set. Defaults to the client's default.
+    #[serde(default)]
+    client_residency_radius_bricks: Option<i64>,
     /// Minimum straight-line distance (metres) some replicated body must have
     /// travelled on every live client — proof the detached geometry actually
     /// moved, not merely that a (possibly stationary) snapshot arrived.
@@ -1058,7 +1069,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             }
             c.args(["--cut", &spec]);
         }
+        let mut client_moves = false;
         for path in scenario.player_paths.iter().filter(|p| p.client == i) {
+            client_moves = true;
             for leg in &path.legs {
                 c.args([
                     "--move",
@@ -1072,6 +1085,13 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                         leg.buttons
                     ),
                 ]);
+            }
+        }
+        // Slice E2: client terrain residency, only where there is a mover.
+        if client_moves && let Some(budget) = scenario.client_residency_budget_bricks {
+            c.args(["--residency-budget-bricks", &budget.to_string()]);
+            if let Some(r) = scenario.client_residency_radius_bricks {
+                c.args(["--residency-radius-bricks", &r.to_string()]);
             }
         }
         if scenario.late_join_clients.contains(&i) {

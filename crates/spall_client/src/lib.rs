@@ -7,12 +7,12 @@ pub mod replica;
 pub mod residency;
 
 pub use net::{
-    BaselineScene, ClientNetConfig, ClientNetError, ClientSummary, MovementStep, ScriptTarget,
-    ScriptedAction, cut_request, run_replication_client,
+    BaselineScene, ClientNetConfig, ClientNetError, ClientResidencyLimits, ClientSummary,
+    MovementStep, ScriptTarget, ScriptedAction, cut_request, run_replication_client,
 };
 pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
-pub use residency::ClientResidency;
+pub use residency::{ClientResidency, ClientResidencyPass};
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};
 use std::{path::PathBuf, sync::Arc};

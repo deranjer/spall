@@ -590,11 +590,19 @@ brick comes back (same revision on a traversal reload, newer on a repair patch),
 and `ClientResidency::wanted_reloads` to name evicted bricks back in interest.
 Proof: `cargo test -p spall_server --test client_residency` (a replica that
 evicted a region reloads it from server repair patches and converges; a cut into
-a fully-evicted replica region gaps then reloads-and-converges). Residency stays
-default-off for every other scenario; slice E2 (client residency in the live
-session + traverse-away/back, row 8b) remains open in `docs/reports/G3.md`,
-along with the join-duration budget and
-the G4 eight-client workload + soak.
+a fully-evicted replica region gaps then reloads-and-converges). Increment 11
+(slice E2 / **row 8b**) puts client residency in the live session:
+`spall_client::ClientResidencyPass` runs in the mover loop against the predicted
+player capsule — keep a brick box resident, evict the rest after a hysteresis,
+`RepairRequest` a retained-digest brick back in the box. Proof: `cargo xtask
+scenario --name t23-g3-traversal` — a client walks ~14.6 m out and part-way
+back on the `walk` lane, evicting 6 terrain bricks behind it and reloading 4;
+server residency also on; an edit lands in the region; server + both clients +
+exact replay + cold restart + reconnect all converge to one hash with no
+regrowth. Residency stays default-off for every other scenario. Remaining
+refinements (`ResidencyController` unification, durable-store backing,
+incremental capture, logical-terrain predicted collider) are follow-up tickets;
+the join-duration budget and the G4 eight-client workload + soak stay open.
 
 ### G4 — eight-client engine slice
 

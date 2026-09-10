@@ -70,6 +70,16 @@ struct Args {
     /// Whole-session deadline.
     #[arg(long, default_value_t = 30_000)]
     timeout_ms: u64,
+    /// T23 / G3 row 7 slice E2: client-side terrain residency. `0` (default)
+    /// keeps the replica fully resident. `> 0` runs the residency pass in the
+    /// mover loop (needs `--move`): it evicts terrain outside a brick box
+    /// around the predicted player and pulls bricks back with repair requests
+    /// as the player returns. The committed world / agreed hash is unchanged.
+    #[arg(long, default_value_t = 0)]
+    residency_budget_bricks: usize,
+    /// Chebyshev brick radius kept resident around the predicted player.
+    #[arg(long, default_value_t = 2)]
+    residency_radius_bricks: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -204,7 +214,7 @@ fn run_replication(args: Args) -> ExitCode {
         None if !args.moves.is_empty() => BaselineScene::default(),
         None => {
             eprintln!(
-                "sandbox-client: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, checkerboard-split, or bulk-split)",
+                "sandbox-client: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, checkerboard-split, bulk-split, separated-regions, or walk)",
                 args.scene
             );
             return ExitCode::from(2);
@@ -253,6 +263,12 @@ fn run_replication(args: Args) -> ExitCode {
         log_json: args.log_json,
         summary_json: args.summary_json.clone(),
         transport: TransportConfig::default(),
+        client_residency: (args.residency_budget_bricks > 0).then_some(
+            spall_client::ClientResidencyLimits {
+                budget_bricks: args.residency_budget_bricks,
+                interest_radius_bricks: args.residency_radius_bricks,
+            },
+        ),
     };
     match run_replication_client(config) {
         Ok(summary) => {
