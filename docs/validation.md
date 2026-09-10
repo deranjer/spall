@@ -551,13 +551,19 @@ a late client that either converged or ended in that bounded explicit failure
 (not a hang) while the live clients keep going — built-in
 `t23-g3-impaired-join` delays the late connect past server shutdown so the
 failure is deterministic. CPU proof: `cargo test -p spall_sim --test
-separated_regions`. Increment 5 is a design (`docs/reports/G3-residency-hash.md`)
-for the row-7 blocker: `world_hash()` folds resident bricks only, so live
-resident-cache eviction in `serve()` first needs a residency-aware hash that
-stays bit-identical to `world_hash()` when nothing is evicted. G3 rows still
-open (the residency wiring itself, traverse-away/back, the join-duration budget,
-and the whole G4 eight-client workload + soak) are tracked in
-`docs/reports/G3.md`.
+separated_regions`. Increment 6 (amending increment 5's design per the
+2026-09-10 review) freezes the row-7 contract in
+`docs/reports/G3-residency-hash.md` — one logical topology (resident bricks ∪
+retained evicted digests, each key once) folded by the unchanged
+`canonical_topology_hash` — and lands **slice A**: `spall_voxel::logical`
+(`BrickDigest`, `EvictedBricks` + lifecycle, `logical_bricks`,
+`logical_solid_cells`) and `spall_sim::canonical_logical_volume_for`. Proof:
+`cargo test -p spall_voxel --lib logical`; `cargo test -p spall_sim --test
+logical_hash` (the logical view is byte-identical to `canonical_volume_for` for
+any evicted subset in any order). Residency stays default-off; slices B–E (the
+commit/staging path, backing/capture, serve wiring, client residency +
+traverse-away/back) remain open in `docs/reports/G3.md`, along with the
+join-duration budget and the G4 eight-client workload + soak.
 
 ### G4 — eight-client engine slice
 

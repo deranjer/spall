@@ -23,6 +23,7 @@ pub mod brick;
 pub mod brush;
 pub mod edit;
 pub mod fixtures;
+pub mod logical;
 pub mod query;
 pub mod residency;
 pub mod transform;
@@ -37,6 +38,9 @@ mod random_parity;
 pub use accounting::MemoryReport;
 pub use brick::{Brick, BrickHash, BrickSnapshot, DENSE_LAYER_BYTES, LayerKind};
 pub use edit::{BrickRevisionRecord, CellEdit, EditError, EditOutcome, EditPlan};
+pub use logical::{
+    BrickDigest, DigestError, EvictedBricks, LogicalBrick, logical_bricks, logical_solid_cells,
+};
 pub use query::{
     Face, MissReason, Ray, RayConfig, RayError, RayHit, RayOutcome, cast_ray, cast_ray_world,
 };

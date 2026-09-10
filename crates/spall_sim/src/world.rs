@@ -1331,6 +1331,35 @@ pub fn volume_topology_hash_for(volume: &Volume, owner: CanonicalOwner) -> Hash3
     canonical_topology_hash(&[canonical_volume_for(volume, owner)])
 }
 
+/// [`canonical_volume_for`] over the **logical** brick set (T23 / G3 row 7):
+/// resident bricks plus retained evicted digests, each key once, canonical
+/// order. Byte-identical to `canonical_volume_for` when `evicted` is empty, and
+/// to the *pre-eviction* full volume for any subset of clean bricks moved into
+/// `evicted` — so cache placement never moves the topology hash.
+pub fn canonical_logical_volume_for(
+    volume: &Volume,
+    evicted: &spall_voxel::EvictedBricks,
+    owner: CanonicalOwner,
+) -> Result<CanonicalVolume, spall_voxel::DigestError> {
+    let bricks = spall_voxel::logical_bricks(volume, evicted)?
+        .into_iter()
+        .map(|b| CanonicalBrick {
+            coord: b.coord,
+            revision: b.revision,
+            layers: vec![CanonicalLayer {
+                kind: MATERIAL_LAYER_KIND,
+                bytes: spall_voxel::BrickHash::to_bytes(b.content_hash).to_vec(),
+            }],
+        })
+        .collect();
+    Ok(CanonicalVolume {
+        volume_id: volume.id(),
+        cell_size: volume.cell_size(),
+        owner,
+        bricks,
+    })
+}
+
 /// Count of solid cells in a volume (walks every resident brick).
 pub fn solid_cells(volume: &Volume) -> u64 {
     let mut total = 0u64;

@@ -79,4 +79,7 @@ pub use sim::{
 pub use stage::{StageError, StagedEdit, stage_edit};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
 pub use world::{RestoredBody, SimWorld, WorldError};
-pub use world::{WorldSetup, solid_cells};
+pub use world::{
+    WorldSetup, canonical_logical_volume_for, canonical_volume_for, solid_cells,
+    volume_topology_hash_for,
+};
