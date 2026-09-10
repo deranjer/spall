@@ -189,6 +189,14 @@ struct Scenario {
     /// baseline. Implies `replay_check`'s world DB (`--save`).
     #[serde(default)]
     restart_check: bool,
+    /// T23 / G3 row 10: a `late_join_clients` replica is allowed to end in a
+    /// **bounded explicit failure** (`result: "join-failed"`, a clean non-hang
+    /// exit) instead of converging — as long as it did not hang and the live
+    /// (non-late) clients plus the server still agree on one hash. Models
+    /// "retry/catch-up stress terminates with either a successful join or a
+    /// bounded explicit failure while connected clients continue".
+    #[serde(default)]
+    late_join_may_fail: bool,
     /// Minimum straight-line distance (metres) some replicated body must have
     /// travelled on every live client — proof the detached geometry actually
     /// moved, not merely that a (possibly stationary) snapshot arrived.
@@ -431,12 +439,17 @@ fn body_settled(scenario: &Scenario, server: &ServerSummary) -> bool {
 #[derive(Debug, Clone, Deserialize)]
 struct ClientSummary {
     result: String,
+    #[serde(default)]
     transactions_applied: u64,
+    #[serde(default)]
     repair_requests_sent: u64,
+    #[serde(default)]
     transactions_rejected: u64,
+    #[serde(default)]
     motion_snapshots: u64,
     #[serde(default)]
     motion_snapshots_out_of_order: u64,
+    #[serde(default)]
     final_world_hash: String,
     #[serde(default)]
     late_join: bool,
@@ -494,6 +507,10 @@ struct SessionSummary {
     restart_recovered_hash_matches: bool,
     restart_reconnect_hash_matches: bool,
     restart_recovered_world_hash: String,
+    /// T23 / G3 row 10: `late_join_may_fail` was set and an impaired late joiner
+    /// ended in an accepted bounded explicit failure (`join-failed`, real exit)
+    /// while the live clients + server still converged.
+    impaired_late_join_bounded_failure: bool,
     agreed_world_hash: String,
     all_hashes_match: bool,
     requirements_met: bool,
@@ -1093,6 +1110,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     restart_recovered_hash_matches: false,
                     restart_reconnect_hash_matches: false,
                     restart_recovered_world_hash: String::new(),
+                    impaired_late_join_bounded_failure: false,
                     agreed_world_hash: String::new(),
                     all_hashes_match: false,
                     requirements_met: false,
@@ -1107,12 +1125,23 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     let agreed = server.final_world_hash.clone();
     let mut all_match = server_ok && server.result == "passed";
     let mut rows = Vec::new();
+    let mut bounded_join_failure_seen = false;
     for (i, summary) in client_summaries.iter().enumerate() {
-        let exit_ok = statuses.get(&format!("client{i}")).copied().flatten() == Some(0);
+        let exit_code = statuses.get(&format!("client{i}")).copied().flatten();
+        let exit_ok = exit_code == Some(0);
         let is_mover = scenario.player_paths.iter().any(|p| p.client == i as u64);
+        let is_late = scenario.late_join_clients.contains(&(i as u64));
         match summary {
             Some(c) => {
                 let hash_ok = c.final_world_hash == agreed;
+                // T23 / G3 row 10: an impaired late joiner that ended in a
+                // *bounded explicit* failure — a "join-failed" summary and a
+                // real process exit (not a deadline kill) — is acceptable under
+                // `late_join_may_fail`; it need not match the agreed hash.
+                let bounded_join_failure = scenario.late_join_may_fail
+                    && is_late
+                    && c.result == "join-failed"
+                    && exit_code.is_some();
                 // A late joiner that caught up entirely from the baseline (no
                 // cuts after it joined) is still a pass.
                 let progressed = is_mover
@@ -1137,12 +1166,17 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 } else {
                     true
                 };
-                all_match &= exit_ok
-                    && c.result == "passed"
-                    && hash_ok
-                    && progressed
-                    && movement_ok
-                    && c.transactions_rejected == 0;
+                if bounded_join_failure {
+                    bounded_join_failure_seen = true;
+                }
+                let client_ok = bounded_join_failure
+                    || (exit_ok
+                        && c.result == "passed"
+                        && hash_ok
+                        && progressed
+                        && movement_ok
+                        && c.transactions_rejected == 0);
+                all_match &= client_ok;
                 rows.push(ClientRow {
                     index: i as u64,
                     result: c.result.clone(),
@@ -1273,6 +1307,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 .as_ref()
                 .map(|r| r.recovered_hash.clone())
                 .unwrap_or_default(),
+            impaired_late_join_bounded_failure: bounded_join_failure_seen,
             agreed_world_hash: agreed,
             all_hashes_match: all_match,
             requirements_met,

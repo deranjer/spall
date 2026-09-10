@@ -325,6 +325,7 @@ At a gate, retain raw metrics alongside a concise report in `docs/reports/Gx.md`
 | late-join-collapse | A third client obtains a consistent current world while objects split and move |
 | interest-crossing | A multi-region body remains one entity; entering clients receive required dependencies |
 | t23-g3 | Two regions of one bounded world collapse independently with separated players; a late joiner converges after heavy edits; the committed stream replays to the agreed hash and every beam rests |
+| t23-g3-impaired-join | A late joiner that cannot reach the (already shut-down) server ends in a bounded explicit `join-failed` — not a hang — while the live clients and server converge and replay |
 | save-air | Completely mined bricks remain empty after checkpoint, eviction, restart, and regeneration |
 | crash-transfer | Crash before/after source-removal/child-create commit cannot recover partial ownership |
 | malformed-input | Invalid lengths, huge coordinates, compressed bombs, invalid IDs/NaNs, excessive rates reject within bounds |
@@ -542,11 +543,17 @@ server, cold-restarts a fresh `sandbox-server --serve --save` over the same
 the recovered server and a fresh `--late-join` client against it to reach the
 agreed hash. Increment 3 brings `cargo xtask crash-test --suite persistence` to
 12 scenarios covering every `CrashPoint`, CRC / interior-gap journal
-corruption, and an injected `SQLITE_FULL`. CPU proof: `cargo test -p spall_sim
---test separated_regions`. G3 rows still open (resident-cache eviction,
-traverse-away/back, the join-duration budget, the impaired-late-join
-bounded-failure assertion, and the whole G4 eight-client workload + soak) are
-tracked in `docs/reports/G3.md`.
+corruption, and an injected `SQLITE_FULL`. Increment 4 covers the
+bounded-failure half of the impaired-late-join requirement: `sandbox-client`
+writes a `{"result":"join-failed"}` summary and exits `4` when a `--late-join`
+replica cannot get a baseline, and a `late_join_may_fail` scenario flag accepts
+a late client that either converged or ended in that bounded explicit failure
+(not a hang) while the live clients keep going — built-in
+`t23-g3-impaired-join` delays the late connect past server shutdown so the
+failure is deterministic. CPU proof: `cargo test -p spall_sim --test
+separated_regions`. G3 rows still open (resident-cache eviction,
+traverse-away/back, the join-duration budget, and the whole G4 eight-client
+workload + soak) are tracked in `docs/reports/G3.md`.
 
 ### G4 — eight-client engine slice
 

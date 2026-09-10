@@ -251,7 +251,7 @@ fn run_replication(args: Args) -> ExitCode {
         idle_grace: Duration::from_millis(500),
         overall_timeout: Duration::from_millis(args.timeout_ms),
         log_json: args.log_json,
-        summary_json: args.summary_json,
+        summary_json: args.summary_json.clone(),
         transport: TransportConfig::default(),
     };
     match run_replication_client(config) {
@@ -274,6 +274,33 @@ fn run_replication(args: Args) -> ExitCode {
         }
         Err(error) => {
             eprintln!("sandbox-client: {error}");
+            // T23 / G3 row 10: a `--late-join` replica that cannot obtain a
+            // baseline must terminate with a *bounded, explicit* failure — not a
+            // hang, not a silent partial state. Record it so the harness can
+            // accept it (under `late_join_may_fail`) while the connected clients
+            // carry on, and exit with a distinct code.
+            if args.late_join {
+                if let Some(path) = &args.summary_json {
+                    let body = serde_json::json!({
+                        "version": 1,
+                        "result": "join-failed",
+                        "connected": false,
+                        "late_join": true,
+                        "transactions_applied": 0,
+                        "repair_requests_sent": 0,
+                        "transactions_rejected": 0,
+                        "motion_snapshots": 0,
+                        "motion_snapshots_out_of_order": 0,
+                        "final_world_hash": "",
+                        "baseline_bricks": 0,
+                        "max_body_displacement_m": 0.0,
+                        "body_cut_committed": false,
+                        "detail": error.to_string(),
+                    });
+                    let _ = std::fs::write(path, serde_json::to_vec_pretty(&body).unwrap());
+                }
+                return ExitCode::from(4);
+            }
             ExitCode::from(1)
         }
     }
