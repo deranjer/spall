@@ -41,12 +41,26 @@ pub fn classify(bumped_epoch: bool, tx: &TopologyTransaction) -> CommitClass {
     if !bumped_epoch {
         return CommitClass::SingleBrick;
     }
+    // A split whose geometry travels as a compressed baseline blob (T17) was
+    // too big for the inline `CellRun` encoding — that is a large collapse by
+    // construction.
+    if tx.ops.iter().any(|op| {
+        matches!(
+            op,
+            TopologyOp::SplitOffBaseline { .. } | TopologyOp::SourcePatchBaseline { .. }
+        )
+    }) {
+        return CommitClass::LargeCollapse;
+    }
     let detached_cells: u64 = tx
         .ops
         .iter()
         .map(|op| match op {
             TopologyOp::CellRun { len, .. } => u64::from(*len),
-            TopologyOp::IntegerBrush { .. } | TopologyOp::SplitOff { .. } => 0,
+            TopologyOp::IntegerBrush { .. }
+            | TopologyOp::SplitOff { .. }
+            | TopologyOp::SplitOffBaseline { .. }
+            | TopologyOp::SourcePatchBaseline { .. } => 0,
         })
         .sum();
     if detached_cells >= LARGE_COLLAPSE_CELLS {

@@ -30,9 +30,9 @@ use spall_core::{
     VolumeId,
 };
 use spall_protocol::{
-    CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
-    Record, RepairKey, RepairRequest, SequenceGate, TopologyOp, TopologyTransaction,
-    canonical_topology_hash,
+    BaselineBrick, BaselineCells, BaselineVolume, CanonicalBrick, CanonicalLayer, CanonicalOwner,
+    CanonicalVolume, Hash32, MotionSnapshot, Record, RepairKey, RepairRequest, SequenceGate,
+    TopologyOp, TopologyTransaction, canonical_topology_hash,
 };
 use spall_voxel::{Brick, BrickHash, EditPlan, Volume};
 
@@ -974,6 +974,41 @@ fn replay_ops(
                         .push((GlobalCell::new(x, start.y, start.z), *material));
                 }
             }
+            // T17: an oversized split's child geometry arrives as a compressed
+            // `BaselineVolume` instead of inline `CellRun`s. Rebuild the child
+            // volume from it — same shape (bounded, authoritative revisions) as
+            // the `SplitOff` path — and register the new owner.
+            TopologyOp::SplitOffBaseline {
+                child,
+                child_entity,
+                blob,
+                ..
+            } => {
+                flush(pending.take(), candidate, cell_size)?;
+                let bv = BaselineVolume::decode_compressed(blob)
+                    .map_err(|e| format!("split baseline blob for volume {child}: {e}"))?;
+                let child_volume = volume_from_baseline_volume(&bv)?;
+                new_owner.push((*child, *child_entity));
+                candidate.insert(child.get(), child_volume);
+            }
+            // T17: the source side of an oversized split — overwrite the named
+            // source bricks in the candidate with their post-cut state.
+            TopologyOp::SourcePatchBaseline { source, blob } => {
+                flush(pending.take(), candidate, cell_size)?;
+                let bv = BaselineVolume::decode_compressed(blob)
+                    .map_err(|e| format!("source patch baseline blob for volume {source}: {e}"))?;
+                let volume = candidate
+                    .get_mut(&source.get())
+                    .ok_or_else(|| format!("source patch targets unknown volume {source}"))?;
+                for bb in &bv.bricks {
+                    volume
+                        .insert_brick(
+                            BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                            baseline_brick(bb)?,
+                        )
+                        .map_err(|e| format!("source patch brick insert failed: {e}"))?;
+                }
+            }
         }
     }
     flush(pending.take(), candidate, cell_size)
@@ -1041,6 +1076,58 @@ fn apply_writes(
         .apply_edit(&plan)
         .map(|_| ())
         .map_err(|e| format!("cell run replay failed: {e}"))
+}
+
+/// One [`BaselineBrick`] as a `spall_voxel::Brick` at its authoritative revision.
+/// Shared by the late-join install, the hash-repair patch, and the T17
+/// `SplitOffBaseline` / `SourcePatchBaseline` op replay.
+fn baseline_brick(bb: &BaselineBrick) -> Result<Brick, String> {
+    let cells: Vec<MaterialId> = match &bb.cells {
+        BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
+        BaselineCells::Dense(raw) => {
+            if raw.len() != spall_core::CELLS_PER_BRICK {
+                return Err(format!(
+                    "baseline brick has {} cells, expected {}",
+                    raw.len(),
+                    spall_core::CELLS_PER_BRICK
+                ));
+            }
+            raw.iter().copied().map(MaterialId).collect()
+        }
+    };
+    Ok(Brick::restored(&cells, Revision(bb.revision), bb.edited))
+}
+
+/// Rebuild a whole `Volume` from a decoded [`BaselineVolume`] — the T17
+/// `SplitOffBaseline` child. Bounded to the recorded brick bounds, every brick
+/// at its authoritative revision, so the canonical hash matches the server.
+fn volume_from_baseline_volume(bv: &BaselineVolume) -> Result<Volume, String> {
+    let cs = CellSizeCode::from_u8(bv.cell_size_code).ok_or_else(|| {
+        format!(
+            "split baseline unknown cell-size code {}",
+            bv.cell_size_code
+        )
+    })?;
+    let mut volume = match bv.bounds {
+        Some([mn, mx]) => {
+            let bb = spall_voxel::BrickBounds::new(
+                BrickCoord::new(mn[0], mn[1], mn[2]),
+                BrickCoord::new(mx[0], mx[1], mx[2]),
+            )
+            .ok_or("split baseline volume has inverted bounds")?;
+            Volume::bounded(bv.volume_id, cs, bb)
+        }
+        None => Volume::new(bv.volume_id, cs),
+    };
+    for bb in &bv.bricks {
+        volume
+            .insert_brick(
+                BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                baseline_brick(bb)?,
+            )
+            .map_err(|e| format!("split baseline brick insert failed: {e}"))?;
+    }
+    Ok(volume)
 }
 
 // --- canonical form (mirrors spall_sim::world::SimWorld::canonical_volume) ---

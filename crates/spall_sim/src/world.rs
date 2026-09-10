@@ -609,6 +609,72 @@ impl SimWorld {
         Ok(entity)
     }
 
+    /// Installs a replay-reconstructed child body: the fine-grid material mass
+    /// (so its Rapier mass / COM / inertia match the live split), a collider
+    /// region from its occupancy grid, and the participant snapshot's pose /
+    /// velocity / sleep. Shared by the `SplitOff` (inline `CellRun`) and
+    /// `SplitOffBaseline` (compressed blob) replay paths.
+    fn install_replayed_child(
+        &mut self,
+        child_entity: EntityId,
+        child: Volume,
+        src_cell_size: spall_core::CellSizeCode,
+        participants: &[MotionSnapshot],
+    ) -> Result<(), WorldError> {
+        let snap = participants.iter().find(|s| s.body == child_entity);
+        let pose = snap
+            .map(pose_from_snapshot)
+            .unwrap_or_else(BodyPose::identity);
+        let (linvel, angvel, sleeping) = snap
+            .map(|s| {
+                (
+                    s.linear_velocity.map(f64::from),
+                    s.angular_velocity.map(f64::from),
+                    s.sleeping,
+                )
+            })
+            .unwrap_or(([0.0; 3], [0.0; 3], false));
+        let grid = OccupancyGrid::from_volume(&child)?.ok_or(WorldError::EmptyBody)?;
+        let region = {
+            let o = grid.origin();
+            let d = grid.dims();
+            (
+                GlobalCell::new(o.x, o.y, o.z),
+                GlobalCell::new(
+                    o.x + d[0] as i64 - 1,
+                    o.y + d[1] as i64 - 1,
+                    o.z + d[2] as i64 - 1,
+                ),
+            )
+        };
+
+        // Representative density from the fine voxel grid's material mass,
+        // exactly as the live split does (`transfer::plan_child` + `commit`):
+        // mass / (solid-cell count * cell_m^3).
+        let cell_m = src_cell_size.metres();
+        let mp = analytic_mass_properties(&grid, cell_m, |m| self.density(m));
+        let cube_m3 = cell_m.powi(3);
+        let cell_count = solid_cells(&child) as f64;
+        let density_kg_m3 = if cell_count > 0.0 && cube_m3 > 0.0 {
+            (mp.mass_kg / (cell_count * cube_m3)) as f32
+        } else {
+            1.0
+        };
+
+        self.insert_restored_body(RestoredBody {
+            entity: child_entity,
+            volume: child,
+            pose,
+            linvel_m_s: linvel,
+            angvel_rad_s: angvel,
+            sleeping,
+            collider_revision: 1,
+            collider_region: region,
+            density_kg_m3,
+        })?;
+        Ok(())
+    }
+
     /// Applies the ops of one journalled [`spall_protocol::TopologyTransaction`]
     /// to the live world during recovery: brush / cell-run writes go to their
     /// named volume, and each `SplitOff` child is built from its canonical fill
@@ -693,60 +759,7 @@ impl SimWorld {
                 }
                 child.apply_edit(&plan)?;
 
-                let snap = participants.iter().find(|s| s.body == child_entity);
-                let pose = snap
-                    .map(pose_from_snapshot)
-                    .unwrap_or_else(BodyPose::identity);
-                let (linvel, angvel, sleeping) = snap
-                    .map(|s| {
-                        (
-                            s.linear_velocity.map(f64::from),
-                            s.angular_velocity.map(f64::from),
-                            s.sleeping,
-                        )
-                    })
-                    .unwrap_or(([0.0; 3], [0.0; 3], false));
-                let grid = OccupancyGrid::from_volume(&child)?.ok_or(WorldError::EmptyBody)?;
-                let region = {
-                    let o = grid.origin();
-                    let d = grid.dims();
-                    (
-                        GlobalCell::new(o.x, o.y, o.z),
-                        GlobalCell::new(
-                            o.x + d[0] as i64 - 1,
-                            o.y + d[1] as i64 - 1,
-                            o.z + d[2] as i64 - 1,
-                        ),
-                    )
-                };
-
-                // Representative density from the fine voxel grid's material
-                // mass, exactly as the live split does (`transfer::plan_child`
-                // + `commit`): mass / (solid-cell count * cell_m^3). Feeding
-                // this through the same collider plan reproduces the live
-                // Rapier mass / COM / inertia; a hard-coded `1.0` made the
-                // recovered body ~2600x too light.
-                let cell_m = src_cell_size.metres();
-                let mp = analytic_mass_properties(&grid, cell_m, |m| world.density(m));
-                let cube_m3 = cell_m.powi(3);
-                let cell_count = g.writes.len() as f64;
-                let density_kg_m3 = if cell_count > 0.0 && cube_m3 > 0.0 {
-                    (mp.mass_kg / (cell_count * cube_m3)) as f32
-                } else {
-                    1.0
-                };
-
-                world.insert_restored_body(RestoredBody {
-                    entity: child_entity,
-                    volume: child,
-                    pose,
-                    linvel_m_s: linvel,
-                    angvel_rad_s: angvel,
-                    sleeping,
-                    collider_revision: 1,
-                    collider_region: region,
-                    density_kg_m3,
-                })?;
+                world.install_replayed_child(child_entity, child, src_cell_size, participants)?;
                 new_children.push(child_entity);
                 touched.push(g.volume);
             } else {
@@ -820,6 +833,70 @@ impl SimWorld {
                     for x in start.x..=last_x {
                         g.writes
                             .push((GlobalCell::new(x, start.y, start.z), *material));
+                    }
+                }
+                // T17: an oversized split's child geometry, as a compressed
+                // `BaselineVolume`. Rebuild the child volume from it and install
+                // it exactly like the inline `SplitOff` + `CellRun` path.
+                TopologyOp::SplitOffBaseline {
+                    child,
+                    child_entity,
+                    blob,
+                    ..
+                } => {
+                    flush(self, group.take(), &mut touched, &mut new_children)?;
+                    split = true;
+                    let bv = spall_protocol::baseline::BaselineVolume::decode_compressed(blob)
+                        .map_err(|e| {
+                            WorldError::ReplayResultHash(format!(
+                                "split baseline blob for volume {}: {e}",
+                                child.get()
+                            ))
+                        })?;
+                    let child_volume = crate::replication::volume_from_baseline(&bv)
+                        .map_err(|e| WorldError::ReplayResultHash(e.to_string()))?;
+                    let cs = child_volume.cell_size();
+                    self.install_replayed_child(*child_entity, child_volume, cs, participants)?;
+                    new_children.push(*child_entity);
+                    touched.push(*child);
+                }
+                // T17: the source side of an oversized split — overwrite the
+                // named source bricks with their post-cut authoritative state.
+                TopologyOp::SourcePatchBaseline { source, blob } => {
+                    flush(self, group.take(), &mut touched, &mut new_children)?;
+                    let bv = spall_protocol::baseline::BaselineVolume::decode_compressed(blob)
+                        .map_err(|e| {
+                            WorldError::ReplayResultHash(format!(
+                                "source patch baseline blob for volume {}: {e}",
+                                source.get()
+                            ))
+                        })?;
+                    let vol = self
+                        .volume_body_mut(*source)
+                        .ok_or(WorldError::UnknownVolume(*source))?;
+                    for bb in &bv.bricks {
+                        let cells: Vec<MaterialId> = match &bb.cells {
+                            spall_protocol::baseline::BaselineCells::Uniform(id) => {
+                                vec![MaterialId(*id); spall_core::CELLS_PER_BRICK]
+                            }
+                            spall_protocol::baseline::BaselineCells::Dense(raw) => {
+                                raw.iter().copied().map(MaterialId).collect()
+                            }
+                        };
+                        vol.volume
+                            .insert_brick(
+                                BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                                Brick::restored(&cells, Revision(bb.revision), bb.edited),
+                            )
+                            .map_err(|e| {
+                                WorldError::ReplayResultHash(format!(
+                                    "source patch brick {:?}: {e}",
+                                    bb.coord
+                                ))
+                            })?;
+                    }
+                    if !touched.contains(source) {
+                        touched.push(*source);
                     }
                 }
             }

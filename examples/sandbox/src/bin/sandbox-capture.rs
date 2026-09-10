@@ -9,14 +9,19 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use serde::Serialize;
-use spall_mesh::MeshStrategy;
+use spall_core::units::{BRUSH_UNIT, BrushPoint};
+use spall_core::{EntityId, SphereBrush};
+use spall_jobs::{Generation, TopologyEpoch};
 use spall_mesh::fixtures::{AcceptanceShape, acceptance_shapes, mesh_shape};
+use spall_mesh::{MeshOptions, MeshStrategy, build_volume_mesh};
 use spall_render::{
-    CaptureOptions, DebugView, LightingStep, RenderContext, RenderError, Scene, SceneItem,
+    Camera, CaptureOptions, DebugView, LightingStep, RenderContext, RenderError, Scene, SceneItem,
     SequenceOptions, capture_lighting_sequence, capture_scene, colored_rooms, rapid_destruction,
 };
+use spall_sim::{EditIntent, EditTarget, RequestId, Simulation, SimulationConfig, fixtures};
+use spall_voxel::Volume;
 
 /// Nominal frame time used to turn `lighting-sequence` frame counts into
 /// milliseconds — the provisional G2 client-frame target.
@@ -185,7 +190,8 @@ fn run(args: &Args) -> Result<Summary, RenderError> {
                 "--scene and --only are mutually exclusive".into(),
             ));
         }
-        // `lighting-sequence` has its own summary shape and is handled in main.
+        // `lighting-sequence` and `destruction` have their own summary shapes
+        // and are handled in main.
         if scene != "colored-room" {
             return Err(RenderError::Gpu(format!(
                 "no fixture scene named {scene:?}"
@@ -484,6 +490,247 @@ fn run_lighting_sequence(args: &Args) -> Result<LightingSequenceSummary, RenderE
     })
 }
 
+// --- `--scene destruction` (T11a / ENG-62 increment 2) ----------------------
+
+/// A 3/4 view from front-left-above, aimed to keep the cross-brick bridge scene
+/// and the falling beam in frame.
+fn destruction_view_dir() -> Vec3 {
+    Vec3::new(-0.85, 0.5, 1.0)
+}
+
+/// The `g1-networked-destruction` cut script (`fixtures/scenarios/`), as
+/// `(at_tick, [x, y, z] cell, radius_cells)`. Every entry is driven against
+/// terrain here — the authoritative body-recut nuance is covered by the
+/// networked fixture; this run exists for the *visual* destruction evidence.
+const DESTRUCTION_SCRIPT: [(u64, [i64; 3], i64); 10] = [
+    (4, [31, 4, 1], 3),
+    (10, [21, 1, 1], 1),
+    (16, [32, 4, 2], 3),
+    (24, [43, 1, 1], 1),
+    (32, [24, 1, 1], 1),
+    (42, [41, 1, 1], 1),
+    (54, [30, 7, 1], 1),
+    (64, [39, 1, 3], 1),
+    (74, [26, 1, 3], 1),
+    (84, [22, 0, 0], 1),
+];
+
+/// Server ticks at which a frame is captured: before the first cut, mid-sever,
+/// just after the beam detaches, mid-fall, and settled.
+const DESTRUCTION_CAPTURE_TICKS: [u64; 5] = [3, 20, 45, 90, 190];
+
+const DESTRUCTION_TICKS: u64 = 200;
+
+fn brush_cell(cell: [i64; 3], radius_cells: i64) -> SphereBrush {
+    let h = BRUSH_UNIT / 2;
+    SphereBrush::new(
+        BrushPoint::from_units(
+            cell[0] * BRUSH_UNIT + h,
+            cell[1] * BRUSH_UNIT + h,
+            cell[2] * BRUSH_UNIT + h,
+        ),
+        radius_cells * BRUSH_UNIT,
+    )
+    .expect("scripted brush is valid")
+}
+
+fn volume_mesh(volume: &Volume, strategy: MeshStrategy) -> spall_mesh::VolumeMesh {
+    build_volume_mesh(
+        volume,
+        Generation(1),
+        TopologyEpoch::START,
+        MeshOptions {
+            strategy,
+            ..MeshOptions::default()
+        },
+    )
+    .expect("cross-brick bridge scene meshes within budget")
+}
+
+/// Mesh the live authoritative world (terrain + every detached body at its
+/// current pose) into a capture [`Scene`]. When `camera` is `None` the camera is
+/// framed on the initial scene; pass the framed camera back in for later frames
+/// so the beam is seen to fall against a fixed view.
+fn destruction_scene(
+    sim: &Simulation,
+    strategy: MeshStrategy,
+    aspect: f32,
+    camera: Option<Camera>,
+) -> Scene {
+    let mut scene = Scene::new(camera.unwrap_or(Camera {
+        aspect,
+        fov_y: 55_f32.to_radians(),
+        ..Default::default()
+    }));
+
+    let terrain = volume_mesh(&sim.world().terrain().volume, strategy);
+    if !terrain.mesh.vertices.is_empty() {
+        scene = scene.with_item(SceneItem::new("terrain", terrain.mesh, Mat4::IDENTITY));
+    }
+
+    for (i, body) in sim.world().bodies().enumerate() {
+        let vm = volume_mesh(&body.volume, strategy);
+        if vm.mesh.vertices.is_empty() {
+            continue;
+        }
+        let q = body.pose.rotation;
+        let t = body.pose.translation_m;
+        let model = Mat4::from_rotation_translation(
+            Quat::from_xyzw(q.x as f32, q.y as f32, q.z as f32, q.w as f32),
+            Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32),
+        );
+        scene = scene.with_item(SceneItem::new(format!("body_{i}"), vm.mesh, model));
+    }
+
+    scene.materials = spall_render::default_materials();
+    if camera.is_none() {
+        scene.frame_all(destruction_view_dir());
+    }
+    scene
+}
+
+#[derive(Serialize)]
+struct DestructionFrame {
+    tick: u64,
+    transactions_committed_so_far: u64,
+    body_count: usize,
+    detached_body_max_drop_m: f64,
+    items_drawn: usize,
+    triangles_rasterised: u64,
+    gpu_render_millis: Option<f64>,
+    gpu_shadow_millis: Option<f64>,
+    gpu_opaque_millis: Option<f64>,
+    gpu_tone_map_millis: Option<f64>,
+    cpu_capture_millis: f64,
+    image: String,
+}
+
+#[derive(Serialize)]
+struct DestructionSummary {
+    version: u32,
+    scene: &'static str,
+    adapter: String,
+    backend: String,
+    /// `true` only when the frames carry a measured GPU render-pass timing.
+    gpu_timing_available: bool,
+    width: u32,
+    height: u32,
+    server_ticks: u64,
+    transactions_committed: u64,
+    final_world_hash: String,
+    total_solid_cells_start: u64,
+    total_solid_cells_end: u64,
+    frames: Vec<DestructionFrame>,
+}
+
+/// T11a / ENG-62 increment 2: drive the authoritative `spall_sim` world on the
+/// `g1-networked-destruction` cross-brick scene through the cut script and
+/// render offscreen frames of the real destruction — terrain and detached
+/// bodies meshed from the live world — with measured GPU pass timings.
+fn run_destruction(args: &Args) -> Result<DestructionSummary, RenderError> {
+    let ctx = RenderContext::headless()?;
+    let strategy: MeshStrategy = args.strategy.into();
+    let aspect = capture_aspect(args.width, args.height);
+
+    let mut setup = fixtures::cross_brick_bridged_setup();
+    // Match the networked host: no body in this scene enables per-body CCD and
+    // the terrain collider is rebuilt on every cut, so the CCD sweep is skipped.
+    setup.physics.disable_ccd = true;
+    let mut sim = Simulation::new(SimulationConfig::new(setup))
+        .map_err(|e| RenderError::Gpu(format!("destruction sim setup failed: {e}")))?;
+    let actor = EntityId::new(1).expect("nonzero entity id");
+
+    let total_solid_cells_start = sim.world().total_solid_cells();
+    let opts = CaptureOptions {
+        width: args.width,
+        height: args.height,
+        views: vec![DebugView::Shaded],
+        ..Default::default()
+    };
+
+    let mut next_cut = 0usize;
+    let mut request_id = 1u64;
+    let mut committed = 0u64;
+    let mut camera: Option<Camera> = None;
+    let (mut adapter, mut backend) = (String::new(), String::new());
+    let mut gpu_timing_available = false;
+    let mut frames = Vec::new();
+
+    for tick in 1..=DESTRUCTION_TICKS {
+        while next_cut < DESTRUCTION_SCRIPT.len() && DESTRUCTION_SCRIPT[next_cut].0 == tick {
+            let (_, cell, radius) = DESTRUCTION_SCRIPT[next_cut];
+            let _ = sim.submit(EditIntent::cut(
+                RequestId(request_id),
+                actor,
+                EditTarget::Terrain,
+                brush_cell(cell, radius),
+            ));
+            request_id += 1;
+            next_cut += 1;
+        }
+
+        let report = sim
+            .tick()
+            .map_err(|e| RenderError::Gpu(format!("destruction sim tick {tick} failed: {e}")))?;
+        committed += report.committed.len() as u64;
+
+        if DESTRUCTION_CAPTURE_TICKS.contains(&tick) {
+            let scene = destruction_scene(&sim, strategy, aspect, camera);
+            if camera.is_none() {
+                camera = Some(scene.camera);
+            }
+            let out_dir = args.out.join(format!("tick_{tick:03}"));
+            let cap_start = std::time::Instant::now();
+            let report_img = capture_scene(&ctx, &scene, &out_dir, &opts)?;
+            let cpu_capture_millis = cap_start.elapsed().as_secs_f64() * 1_000.0;
+            adapter = report_img.adapter.clone();
+            backend = report_img.backend.clone();
+            gpu_timing_available |= report_img.timing.gpu_render_millis.is_some();
+
+            let max_drop = sim
+                .world()
+                .bodies()
+                .map(|b| -b.pose.translation_m[1])
+                .fold(0.0_f64, f64::max);
+            let passes = report_img.timing.gpu_passes;
+            frames.push(DestructionFrame {
+                tick,
+                transactions_committed_so_far: committed,
+                body_count: sim.world().body_count(),
+                detached_body_max_drop_m: max_drop,
+                items_drawn: report_img.items_drawn,
+                triangles_rasterised: report_img.triangles,
+                gpu_render_millis: report_img.timing.gpu_render_millis,
+                gpu_shadow_millis: passes.map(|p| p.shadow_millis),
+                gpu_opaque_millis: passes.map(|p| p.opaque_millis),
+                gpu_tone_map_millis: passes.map(|p| p.tone_map_millis),
+                cpu_capture_millis,
+                image: report_img
+                    .images
+                    .first()
+                    .map(|i| i.path.display().to_string())
+                    .unwrap_or_default(),
+            });
+        }
+    }
+
+    Ok(DestructionSummary {
+        version: 1,
+        scene: "destruction",
+        adapter,
+        backend,
+        gpu_timing_available,
+        width: args.width,
+        height: args.height,
+        server_ticks: DESTRUCTION_TICKS,
+        transactions_committed: committed,
+        final_world_hash: sim.world().world_hash().to_string(),
+        total_solid_cells_start,
+        total_solid_cells_end: sim.world().total_solid_cells(),
+        frames,
+    })
+}
+
 /// Serialise `result` to `<out>/summary.json` and turn it into a process exit
 /// code, so every scene mode shares one write + error path.
 fn finish<T: Serialize>(out: &std::path::Path, result: Result<T, RenderError>) -> ExitCode {
@@ -531,6 +778,9 @@ fn main() -> ExitCode {
     if args.scene.as_deref() == Some("lighting-sequence") {
         return finish(&args.out, run_lighting_sequence(&args));
     }
+    if args.scene.as_deref() == Some("destruction") {
+        return finish(&args.out, run_destruction(&args));
+    }
     finish(&args.out, run(&args))
 }
 
@@ -577,6 +827,66 @@ mod tests {
         assert!((capture_aspect(1280, 720) - 16.0 / 9.0).abs() < 1e-6);
         assert!((capture_aspect(240, 240) - 1.0).abs() < 1e-6);
         assert!((capture_aspect(320, 240) - 4.0 / 3.0).abs() < 1e-6);
+    }
+
+    /// The destruction capture's scene builder (GPU-free): drive the authoritative
+    /// world through the cut script, and at each capture tick it must mesh the
+    /// live terrain plus every detached body into a framed scene.
+    #[test]
+    fn destruction_scene_meshes_the_live_world_and_frames_it() {
+        use spall_sim::{
+            EditIntent, EditTarget, RequestId, Simulation, SimulationConfig, fixtures,
+        };
+
+        let mut setup = fixtures::cross_brick_bridged_setup();
+        setup.physics.disable_ccd = true;
+        let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
+        let actor = spall_core::EntityId::new(1).unwrap();
+
+        let mut next_cut = 0usize;
+        let mut request_id = 1u64;
+        let mut camera = None;
+        let mut saw_body_item = false;
+
+        for tick in 1..=90u64 {
+            while next_cut < DESTRUCTION_SCRIPT.len() && DESTRUCTION_SCRIPT[next_cut].0 == tick {
+                let (_, cell, radius) = DESTRUCTION_SCRIPT[next_cut];
+                let _ = sim.submit(EditIntent::cut(
+                    RequestId(request_id),
+                    actor,
+                    EditTarget::Terrain,
+                    brush_cell(cell, radius),
+                ));
+                request_id += 1;
+                next_cut += 1;
+            }
+            sim.tick().unwrap();
+
+            if DESTRUCTION_CAPTURE_TICKS.contains(&tick) {
+                let scene = destruction_scene(&sim, MeshStrategy::Greedy, 16.0 / 9.0, camera);
+                assert!(
+                    scene.items.iter().any(|i| i.name == "terrain"),
+                    "tick {tick}: terrain is always meshed"
+                );
+                if camera.is_none() {
+                    // First capture: the camera was framed on the scene bounds.
+                    assert!(scene.world_bounds().is_some());
+                    camera = Some(scene.camera);
+                }
+                if sim.world().body_count() > 0 {
+                    saw_body_item |= scene.items.iter().any(|i| i.name.starts_with("body_"));
+                }
+            }
+        }
+
+        assert!(
+            sim.world().body_count() > 0,
+            "the cut script detaches the cross-brick beam"
+        );
+        assert!(
+            saw_body_item,
+            "a detached body is meshed into the capture scene at its pose"
+        );
     }
 
     #[test]

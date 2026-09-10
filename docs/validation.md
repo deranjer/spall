@@ -232,6 +232,13 @@ cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 # docs/reports/G1.md.
 cargo xtask scenario --name g1-networked-destruction --loss-percent 0 --output .local/runs/g1
 
+# T17 / ENG-64: a cut that detaches a 24^3 checkerboard block — a component too
+# fragmented to encode as inline CellRuns. The commit falls back to compressed
+# SplitOffBaseline / SourcePatchBaseline op blobs; server + both live replicas
+# converge on one hash and the tick-0 baseline replay reproduces it. Before this
+# ticket the same cut was rejected (ReplicationError::SplitTooLarge).
+cargo xtask scenario --name oversized-split --loss-percent 0 --output .local/runs/oversized-split
+
 # T19: one `walk` server + two scripted player capsules that predict movement,
 # send InputFrame datagrams, and reconcile against the server's player snapshots.
 # Passes on bounded corrections, ground contact, travel distance, and no hover.
@@ -249,6 +256,12 @@ cargo xtask capture --scene colored-room --width 1920 --height 1080 --output .lo
 # per-frame band luminance, per-step re-trace counts, and edit/convergence
 # latency (frames and ms). See docs/reports/G2-lighting.md.
 cargo xtask capture --scene lighting-sequence --width 1920 --height 1080 --output .local/runs/t14-sequence
+
+# T11a: offscreen frames of the authoritative g1-networked-destruction cut
+# sequence (terrain + detached bodies meshed from the live world, at ticks
+# 3/20/45/90/190) with measured GPU render-pass timings. Exit 3 without a GPU.
+# See docs/reports/G1.md.
+cargo xtask capture --scene destruction --width 1920 --height 1080 --output .local/runs/g1-destruction
 
 # Release build, named fixture, fixed workload; emits machine-readable metrics.
 cargo xtask bench --suite engine-slice --clients 8 --warmup-seconds 30 --duration-seconds 120 --output .local/runs/bench
@@ -345,10 +358,11 @@ and end-of-run contact penetration `<= body_settle_max_penetration_m` (it settle
 `spall_sim` `body_rest_on_structure` integration test.
 
 Neither fixture yet covers the full 64 x 32 x 64 m / 60-second /
-10-requests-per-second workload, 64-brick collapse stress case, graphical
-captures, or GPU timings; those remain explicit follow-up evidence until the
-renderer and gate workload are available. Measured results:
-`docs/reports/G1.md`.
+10-requests-per-second workload or the 64-brick collapse stress case; those
+remain explicit follow-up evidence until procedural world generation and the
+oversized-split path are available. `cargo xtask capture --scene destruction`
+(below) renders the authoritative cut sequence offscreen through the T12
+pipeline with real GPU pass timings. Measured results: `docs/reports/G1.md`.
 
 For overload tests, requests beyond admission capacity may return busy. The report must distinguish requested, rejected, queued, and committed counts. Rejecting every expensive action does not satisfy the gate: all named mandatory edits must complete.
 
