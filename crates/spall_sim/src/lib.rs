@@ -76,7 +76,7 @@ pub use sim::{
     CONTACT_DAMAGE_ACTOR_ID, ContactDamageReport, SERVER_REQUEST_ID_BAND, Simulation,
     SimulationConfig, TICK_DT_S, TickError,
 };
-pub use stage::{StageError, StagedEdit, stage_edit};
+pub use stage::{StageError, StageInput, StagedEdit, stage_edit};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
 pub use world::{RestoredBody, SimWorld, WorldError};
 pub use world::{

@@ -209,6 +209,7 @@ impl EditPipeline {
                 &queued.intent,
                 queued.volume_id,
                 snapshot,
+                world.evicted(queued.volume_id).clone(),
                 world.anchor(),
                 generation,
                 epoch,

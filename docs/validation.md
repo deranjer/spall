@@ -560,10 +560,17 @@ retained evicted digests, each key once) folded by the unchanged
 `logical_solid_cells`) and `spall_sim::canonical_logical_volume_for`. Proof:
 `cargo test -p spall_voxel --lib logical`; `cargo test -p spall_sim --test
 logical_hash` (the logical view is byte-identical to `canonical_volume_for` for
-any evicted subset in any order). Residency stays default-off; slices B–E (the
-commit/staging path, backing/capture, serve wiring, client residency +
-traverse-away/back) remain open in `docs/reports/G3.md`, along with the
-join-duration budget and the G4 eight-client workload + soak.
+any evicted subset in any order). Increment 7 (slice B) makes the transaction
+`result_hash`, the replica candidate-hash validator, `total_solid_cells`, and
+staging conservation all fold that logical view — a server and a replica with
+**different** bricks evicted still converge — and makes an edit that needs
+unloaded evicted geometry a hard `EvictedGeometryRequired` error rather than a
+silent corruption. Proof: `cargo test -p spall_sim --test logical_commit`;
+`cargo test -p spall_client --test logical_residency`. Residency stays
+default-off; slices C–E (backing/capture + dependency-complete reload, serve
+wiring, client residency + traverse-away/back) remain open in
+`docs/reports/G3.md`, along with the join-duration budget and the G4
+eight-client workload + soak.
 
 ### G4 — eight-client engine slice
 

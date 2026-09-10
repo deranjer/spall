@@ -219,6 +219,11 @@ pub struct ReplicaWorld {
     repair_requests_inflight: BTreeMap<(u64, i64, i64, i64), u64>,
     /// Highest server tick the client has observed on any record.
     now_tick: u64,
+    /// T23 / G3 row 7, slice B: per-volume digests of bricks evicted from this
+    /// replica's cache. Empty by default (client eviction is off until a later
+    /// slice), so `world_hash` / transaction validation are byte-identical to
+    /// today. Keyed by raw volume id. See `docs/reports/G3-residency-hash.md`.
+    evicted: BTreeMap<u64, spall_voxel::EvictedBricks>,
 }
 
 impl ReplicaWorld {
@@ -248,6 +253,7 @@ impl ReplicaWorld {
             bulk_split_worlds: BTreeMap::new(),
             repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
+            evicted: BTreeMap::new(),
         }
     }
 
@@ -272,6 +278,7 @@ impl ReplicaWorld {
             bulk_split_worlds: BTreeMap::new(),
             repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
+            evicted: BTreeMap::new(),
         }
     }
 
@@ -387,6 +394,9 @@ impl ReplicaWorld {
         self.pending_bulk_split_txns = BTreeMap::new();
         self.bulk_split_worlds = BTreeMap::new();
         self.repair_requests_inflight = BTreeMap::new();
+        // A full baseline replaces the whole logical state, digest namespace
+        // included (G3-residency-hash.md lifecycle).
+        self.evicted = BTreeMap::new();
         self.now_tick = world.checkpoint_tick;
         Ok(())
     }
@@ -554,7 +564,7 @@ impl ReplicaWorld {
         let volumes: Vec<CanonicalVolume> = self
             .volumes
             .values()
-            .map(|v| canonical_volume(v, self.owner[&v.id().get()]))
+            .map(|v| canonical_logical_volume(v, self.evicted(v.id()), self.owner[&v.id().get()]))
             .collect();
         canonical_topology_hash(&volumes)
     }
@@ -562,8 +572,9 @@ impl ReplicaWorld {
     /// The canonical hash of one volume.
     pub fn volume_hash(&self, volume: VolumeId) -> Option<Hash32> {
         let v = self.volumes.get(&volume.get())?;
-        Some(canonical_topology_hash(&[canonical_volume(
+        Some(canonical_topology_hash(&[canonical_logical_volume(
             v,
+            self.evicted(volume),
             self.owner[&volume.get()],
         )]))
     }
@@ -590,17 +601,35 @@ impl ReplicaWorld {
         self.bodies.values().map(|b| (b.entity, b.volume_id))
     }
 
-    /// Evicts one client brick. Authoritative transactions that later depend on
-    /// it take the existing bounded repair/baseline path; absence is not air.
+    /// Evicts one client brick, retaining its `(revision, content_hash)` digest
+    /// so `world_hash` / transaction validation still see it. Authoritative
+    /// transactions that later *edit* it take the existing bounded
+    /// repair/baseline path; absence is not air.
     pub fn evict_brick(&mut self, volume: VolumeId, coord: BrickCoord) -> bool {
         let Some(v) = self.volumes.get_mut(&volume.get()) else {
             return false;
         };
-        let resident = v.brick_revision(coord).ok().flatten().is_some();
-        if resident {
-            v.evict_brick(coord);
+        let Ok(digest) = spall_voxel::BrickDigest::capture(v, coord) else {
+            return false; // not resident
+        };
+        if self
+            .evicted
+            .entry(volume.get())
+            .or_default()
+            .record(coord, digest)
+            .is_err()
+        {
+            return false;
         }
-        resident
+        v.evict_brick(coord);
+        true
+    }
+
+    /// Retained evicted-brick digests for `volume` (empty by default).
+    pub fn evicted(&self, volume: VolumeId) -> &spall_voxel::EvictedBricks {
+        self.evicted
+            .get(&volume.get())
+            .unwrap_or_else(|| empty_evicted())
     }
 
     /// The canonical hash of the terrain volume — a cheap dirty check for
@@ -777,7 +806,17 @@ impl ReplicaWorld {
                     reason: format!("result hash names missing volume {}", vh.volume),
                 };
             };
-            if canonical_topology_hash(&[canonical_volume(v, owner)]) != vh.hash {
+            // Over the logical brick set: an untouched brick this replica has
+            // evicted still contributes its retained digest, so a server /
+            // client cache-placement difference does not fail validation. The
+            // replay above never wrote an evicted brick (a `before` naming one
+            // takes the repair path first).
+            if canonical_topology_hash(&[canonical_logical_volume(
+                v,
+                self.evicted(vh.volume),
+                owner,
+            )]) != vh.hash
+            {
                 return ApplyOutcome::Rejected {
                     reason: format!("result hash mismatch for volume {}", vh.volume),
                 };
@@ -1255,25 +1294,37 @@ fn volume_from_baseline_volume(bv: &BaselineVolume) -> Result<Volume, String> {
     Ok(volume)
 }
 
-// --- canonical form (mirrors spall_sim::world::SimWorld::canonical_volume) ---
+// --- canonical form (mirrors spall_sim::world canonical_volume adapters) ---
 
-fn canonical_volume(v: &Volume, owner: CanonicalOwner) -> CanonicalVolume {
-    let mut bricks = Vec::new();
-    for coord in v.resident_brick_coords() {
-        let snap = v
-            .snapshot_brick(coord)
-            .ok()
-            .flatten()
-            .expect("coord came from the resident set");
-        bricks.push(CanonicalBrick {
-            coord,
-            revision: snap.revision(),
+/// A shared empty digest set for [`ReplicaWorld::evicted`].
+fn empty_evicted() -> &'static spall_voxel::EvictedBricks {
+    static EMPTY: std::sync::OnceLock<spall_voxel::EvictedBricks> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(spall_voxel::EvictedBricks::new)
+}
+
+/// The canonical `spall.topology.v1` record for `v` over its **logical** brick
+/// set: `v`'s resident bricks plus `evicted`'s retained digests, each key once,
+/// canonical `(z, y, x)` order. Byte-identical to a resident-only walk when
+/// `evicted` is empty, and to the pre-eviction full volume for any subset of
+/// clean bricks moved into it — so `world_hash` never moves when cache contents
+/// differ. Mirrors `spall_sim::canonical_logical_volume_for`.
+fn canonical_logical_volume(
+    v: &Volume,
+    evicted: &spall_voxel::EvictedBricks,
+    owner: CanonicalOwner,
+) -> CanonicalVolume {
+    let bricks = spall_voxel::logical_bricks(v, evicted)
+        .expect("logical volume: resident/evicted digest invariant holds")
+        .into_iter()
+        .map(|b| CanonicalBrick {
+            coord: b.coord,
+            revision: b.revision,
             layers: vec![CanonicalLayer {
                 kind: MATERIAL_LAYER_KIND,
-                bytes: BrickHash::to_bytes(snap.content_hash()).to_vec(),
+                bytes: BrickHash::to_bytes(b.content_hash).to_vec(),
             }],
-        });
-    }
+        })
+        .collect();
     CanonicalVolume {
         volume_id: v.id(),
         cell_size: v.cell_size(),
