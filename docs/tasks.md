@@ -156,12 +156,28 @@ evidence and open items.
   amortised client frame. Evidence: `spall_render`
   `capture::tests::frame_stats_*`; `sandbox-capture`
   `tests::g2_frame_scenes_are_distinct_lit_and_framed`; the GPU run is manual.
-- **Increment 2 (later).** Exterior daylight-terrain scene + moving-debris /
-  active-collapse scenes; >= 120 consecutive moving frames; a persistent-resource
-  client frame loop with the CPU frame-work p95 and the combined client p95;
-  bounded-retrace (T14) steady-state cost; quality flags (leakage, ghosting,
-  noise, shadow instability); cross-GPU capture + human review; the cell-size /
-  renderer-direction freeze decision.
+- **Increment 2 (persistent-resource settled-frame loop).**
+  `spall_render::capture_frame_loop` builds every GPU resource once, then renders
+  a static scene from a fixed camera for `warmup + measured` frames (warm-up:
+  full re-trace; measured: a bounded `retrace_edge_cells` box or nothing, with
+  temporal accumulation), reporting per-pass GPU device-time and per-frame CPU
+  encode percentiles. Shadows are timed once. `sandbox-capture --scene g2-loop`
+  (also `cargo xtask capture --scene g2-loop`) runs it over the still T13/T14
+  fixtures in `settled` and `edit` (24^3 re-trace box) modes at a fixed
+  1920x1080. Measured on the reference adapter: settled frame ~0.3-0.9 ms GPU /
+  ~0.6-0.8 ms CPU, pipelined client-frame p95 estimate <= 2.9 ms in every
+  scene/mode -- the provisional GPU/CPU/client p95 targets are all met with
+  margin, and increment 1's ~3x miss is confirmed a harness artefact (per-frame
+  pipeline rebuild + full-cache re-trace). Evidence: `spall_render`
+  `capture::tests::a_zero_edge_retrace_box_has_no_volume` +
+  `a_retrace_box_is_centred_and_clamped_to_the_cache`; the GPU run is manual.
+- **Increment 3 (later).** Exterior daylight-terrain scene + moving-debris /
+  active-collapse scenes; >= 120 consecutive *moving* frames (camera pan +
+  moving debris + rapid destruction) with the settled-vs-moving comparison; a
+  pipelined (threaded) client frame loop + the broader CPU frame-work budget;
+  a bounded denoise/temporal pass if a real scene tightens the budget; quality
+  flags (leakage, ghosting, noise, shadow instability); cross-GPU capture +
+  human review; the cell-size / renderer-direction freeze decision.
 
 ## Persistence, scale, and game-ready slice
 

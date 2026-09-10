@@ -410,10 +410,30 @@ cargo xtask capture --scene g2-frames --output .local/runs/g2-frames
 ```
 
 Measured (RTX 4080 SUPER / D3D12): frame-total GPU p50 ~12-13 ms, p95 ~32-38 ms
-across the four scenes -- the provisional GPU p95 <= 12 ms target is missed by
-~3x, with the full 128^3 indirect trace the dominant cost. CPU-only coverage:
-`spall_render` `capture::tests::frame_stats_*` and `sandbox-capture`
-`tests::g2_frame_scenes_are_distinct_lit_and_framed`; the GPU run is manual.
+across the four scenes -- but this is the cold full-cache re-trace with a
+per-frame pipeline rebuild, not a client frame (see increment 2).
+
+Increment 2 adds a persistent-resource settled-frame loop:
+
+```sh
+# T15 / G2 settled-frame cost. Builds every GPU resource once, then renders each
+# still fixture from a fixed camera for 15 warm-up + 120 measured frames at a
+# fixed 1920x1080 in two re-trace modes (settled = nothing re-traced;
+# edit = a 24^3 re-trace box/frame), reporting per-pass GPU device-time and
+# per-frame CPU encode percentiles + the provisional GPU/CPU/client p95 verdicts.
+cargo xtask capture --scene g2-loop --output .local/runs/g2-loop
+```
+
+Measured (RTX 4080 SUPER / D3D12): with resources built once and the T14
+bounded re-trace path, the settled frame is a ~0.3-0.9 ms GPU pass and ~0.6-0.8
+ms CPU encode; pipelined client-frame p95 estimate <= 2.9 ms across all four
+scenes in both modes -- the provisional GPU p95 <= 12 ms, CPU p95 <= 4 ms, and
+client p95 <= 16.7 ms targets are all met with margin. Increment 1's ~3x miss
+was a harness artefact (per-frame pipeline rebuild + full-cache re-trace). Real
+motion, exterior terrain, a pipelined loop, and quality flags remain increment
+3. CPU-only coverage: `spall_render` `capture::tests::frame_stats_*` +
+`*_retrace_box_*`; `sandbox-capture`
+`tests::g2_frame_scenes_are_distinct_lit_and_framed`. The GPU run is manual.
 
 ### G3 — persistence, late join, and streaming
 

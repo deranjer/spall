@@ -17,10 +17,10 @@ use spall_jobs::{Generation, TopologyEpoch};
 use spall_mesh::fixtures::{AcceptanceShape, acceptance_shapes, mesh_shape};
 use spall_mesh::{MeshOptions, MeshStrategy, build_volume_mesh};
 use spall_render::{
-    Camera, CaptureOptions, DebugView, FrameSeriesOptions, FrameStats, LightingStep, RenderContext,
-    RenderError, Scene, SceneItem, SequenceOptions, capture_frame_series,
-    capture_lighting_sequence, capture_scene, colored_rooms, emitter_occlusion_scenes,
-    rapid_destruction,
+    Camera, CaptureOptions, DebugView, FrameLoopOptions, FrameSeriesOptions, FrameStats,
+    LightingStep, RenderContext, RenderError, Scene, SceneItem, SequenceOptions,
+    capture_frame_loop, capture_frame_series, capture_lighting_sequence, capture_scene,
+    colored_rooms, emitter_occlusion_scenes, rapid_destruction,
 };
 use spall_sim::{EditIntent, EditTarget, RequestId, Simulation, SimulationConfig, fixtures};
 use spall_voxel::Volume;
@@ -64,8 +64,9 @@ struct Args {
     /// Render only this shape (by name). Omit to render every acceptance shape.
     #[arg(long)]
     only: Option<String>,
-    /// Fixture scene: `colored-room` (T13), `lighting-sequence` (T14), or
-    /// `g2-frames` (T15 GPU frame-cost percentiles).
+    /// Fixture scene: `colored-room` (T13), `lighting-sequence` (T14),
+    /// `g2-frames` (T15 cold GPU frame-cost percentiles), or `g2-loop` (T15
+    /// persistent-resource settled-frame GPU + CPU percentiles).
     #[arg(long)]
     scene: Option<String>,
     /// `lighting-sequence` only: settle frames rendered after the edit so the
@@ -78,6 +79,15 @@ struct Args {
     /// `g2-frames` only: frames folded into the per-pass percentiles.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=600))]
     g2_measured_frames: u32,
+    /// `g2-loop` only: full-retrace frames rendered and discarded before measurement.
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u32).range(0..=240))]
+    g2_loop_warmup: u32,
+    /// `g2-loop` only: measured frames per scene per re-trace mode.
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..=600))]
+    g2_loop_frames: u32,
+    /// `g2-loop` only: cache-cell edge of the per-frame incremental re-trace box.
+    #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(1..=128))]
+    g2_loop_edit_edge: u32,
 }
 
 #[derive(Serialize)]
@@ -891,6 +901,181 @@ fn run_g2_frames(args: &Args) -> Result<G2FramesSummary, RenderError> {
     })
 }
 
+// --- `--scene g2-loop` (T15 / ENG-22 increment 2) --------------------------
+
+/// Provisional G2 client / GPU / CPU frame p95 targets (`docs/validation.md` "G2").
+const G2_CLIENT_FRAME_TARGET_MS: f64 = 16.7;
+const G2_CPU_FRAME_TARGET_MS: f64 = 4.0;
+
+#[derive(Serialize)]
+struct G2LoopRun {
+    /// `settled` (nothing re-traced) or `edit` (a per-frame re-trace box).
+    mode: &'static str,
+    retrace_edge_cells: u32,
+    temporal_weight: f32,
+    gpu_timing_available: bool,
+    /// One-off shadow-cascade render; a settled frame does not re-cast it.
+    shadow_once_millis: Option<f64>,
+    /// Per measured frame: indirect trace + denoise + temporal + opaque + tone map.
+    gpu_frame: Option<G2StatBlock>,
+    gpu_indirect_trace: Option<G2StatBlock>,
+    gpu_indirect_denoise: Option<G2StatBlock>,
+    gpu_indirect_temporal: Option<G2StatBlock>,
+    gpu_opaque: Option<G2StatBlock>,
+    gpu_tone_map: Option<G2StatBlock>,
+    /// Renderer per-frame CPU encode cost (no wait, no readback).
+    cpu_frame: Option<G2StatBlock>,
+    /// `max(gpu_frame.p95, cpu_frame.p95)` — a pipelined client's frame p95
+    /// lower bound (CPU frame N+1 overlaps GPU frame N).
+    client_frame_p95_pipelined_ms: Option<f64>,
+    /// `gpu_frame.p95 + cpu_frame.p95` — this serial harness's frame p95, an
+    /// upper bound on a pipelined client.
+    client_frame_p95_serial_ms: Option<f64>,
+    gpu_p95_target_met: Option<bool>,
+    cpu_p95_target_met: Option<bool>,
+    /// Pipelined client-frame p95 estimate <= 16.7 ms.
+    client_p95_target_met: Option<bool>,
+    first_image: String,
+    last_image: String,
+}
+
+#[derive(Serialize)]
+struct G2LoopSceneSummary {
+    name: String,
+    indirect_cells: usize,
+    runs: Vec<G2LoopRun>,
+}
+
+#[derive(Serialize)]
+struct G2LoopSummary {
+    /// Version 1: T15 increment 2 — persistent-resource settled-frame loop.
+    version: u32,
+    mode: &'static str,
+    adapter: String,
+    backend: String,
+    width: u32,
+    height: u32,
+    exposure: f32,
+    warmup_frames: u32,
+    measured_frames: u32,
+    gpu_timing_available: bool,
+    gpu_p95_target_millis: f64,
+    cpu_p95_target_millis: f64,
+    client_p95_target_millis: f64,
+    /// Worst pipelined client-frame p95 estimate across every scene/mode.
+    worst_client_frame_p95_pipelined_ms: Option<f64>,
+    /// `true` iff every scene/mode with GPU timing met the pipelined client p95.
+    client_p95_target_met: Option<bool>,
+    scenes: Vec<G2LoopSceneSummary>,
+}
+
+fn g2_loop_run(r: spall_render::FrameLoopReport, mode: &'static str) -> (G2LoopRun, Option<f64>) {
+    let gpu_p95 = r.gpu_frame.map(|s| s.p95_millis);
+    let cpu_p95 = r.cpu_frame.map(|s| s.p95_millis);
+    let pipelined = match (gpu_p95, cpu_p95) {
+        (Some(g), Some(c)) => Some(g.max(c)),
+        _ => None,
+    };
+    let serial = match (gpu_p95, cpu_p95) {
+        (Some(g), Some(c)) => Some(g + c),
+        _ => None,
+    };
+    let run = G2LoopRun {
+        mode,
+        retrace_edge_cells: r.retrace_edge_cells,
+        temporal_weight: r.temporal_weight,
+        gpu_timing_available: r.gpu_timing_available,
+        shadow_once_millis: r.shadow_once_millis,
+        gpu_frame: r.gpu_frame.map(Into::into),
+        gpu_indirect_trace: r.gpu_indirect_trace.map(Into::into),
+        gpu_indirect_denoise: r.gpu_indirect_denoise.map(Into::into),
+        gpu_indirect_temporal: r.gpu_indirect_temporal.map(Into::into),
+        gpu_opaque: r.gpu_opaque.map(Into::into),
+        gpu_tone_map: r.gpu_tone_map.map(Into::into),
+        cpu_frame: r.cpu_frame.map(Into::into),
+        client_frame_p95_pipelined_ms: pipelined,
+        client_frame_p95_serial_ms: serial,
+        gpu_p95_target_met: gpu_p95.map(|v| v <= G2_GPU_P95_TARGET_MS),
+        cpu_p95_target_met: cpu_p95.map(|v| v <= G2_CPU_FRAME_TARGET_MS),
+        client_p95_target_met: pipelined.map(|v| v <= G2_CLIENT_FRAME_TARGET_MS),
+        first_image: r.first_image.display().to_string(),
+        last_image: r.last_image.display().to_string(),
+    };
+    (run, pipelined)
+}
+
+fn run_g2_loop(args: &Args) -> Result<G2LoopSummary, RenderError> {
+    let ctx = RenderContext::headless()?;
+    // The gate fixes 1920x1080; `--width`/`--height` do not apply to this mode.
+    let (width, height) = (1920u32, 1080u32);
+    let aspect = capture_aspect(width, height);
+
+    let base = FrameLoopOptions {
+        width,
+        height,
+        exposure: 1.0,
+        warmup_frames: args.g2_loop_warmup,
+        measured_frames: args.g2_loop_frames,
+        retrace_edge_cells: 0,
+        temporal_weight: 0.1,
+    };
+    // Two re-trace modes per scene: a settled frame with no lighting change, and
+    // a per-frame incremental edit box (a stand-in for moving debris / an edit).
+    let modes: [(&'static str, u32); 2] = [("settled", 0), ("edit", args.g2_loop_edit_edge)];
+
+    let mut scene_summaries = Vec::new();
+    let (mut adapter, mut backend) = (String::new(), String::new());
+    let mut worst_pipelined: Option<f64> = None;
+    let mut any_timed = false;
+    let mut all_met = true;
+
+    for (name, scene) in g2_frame_scenes(aspect) {
+        let mut runs = Vec::new();
+        let mut indirect_cells = 0usize;
+        for (mode, edge) in modes {
+            let opts = FrameLoopOptions {
+                retrace_edge_cells: edge,
+                ..base
+            };
+            let report = capture_frame_loop(&ctx, &scene, &args.out.join(&name).join(mode), &opts)?;
+            adapter = report.adapter.clone();
+            backend = report.backend.clone();
+            indirect_cells = report.indirect_cells;
+            let (run, pipelined) = g2_loop_run(report, mode);
+            if let Some(p) = pipelined {
+                any_timed = true;
+                worst_pipelined = Some(worst_pipelined.map_or(p, |w| w.max(p)));
+                all_met &= p <= G2_CLIENT_FRAME_TARGET_MS;
+            }
+            runs.push(run);
+        }
+        scene_summaries.push(G2LoopSceneSummary {
+            name,
+            indirect_cells,
+            runs,
+        });
+    }
+
+    Ok(G2LoopSummary {
+        version: 1,
+        mode: "g2-loop",
+        adapter,
+        backend,
+        width,
+        height,
+        exposure: 1.0,
+        warmup_frames: base.warmup_frames,
+        measured_frames: base.measured_frames,
+        gpu_timing_available: any_timed,
+        gpu_p95_target_millis: G2_GPU_P95_TARGET_MS,
+        cpu_p95_target_millis: G2_CPU_FRAME_TARGET_MS,
+        client_p95_target_millis: G2_CLIENT_FRAME_TARGET_MS,
+        worst_client_frame_p95_pipelined_ms: worst_pipelined,
+        client_p95_target_met: any_timed.then_some(all_met),
+        scenes: scene_summaries,
+    })
+}
+
 /// Serialise `result` to `<out>/summary.json` and turn it into a process exit
 /// code, so every scene mode shares one write + error path.
 fn finish<T: Serialize>(out: &std::path::Path, result: Result<T, RenderError>) -> ExitCode {
@@ -943,6 +1128,9 @@ fn main() -> ExitCode {
     }
     if args.scene.as_deref() == Some("g2-frames") {
         return finish(&args.out, run_g2_frames(&args));
+    }
+    if args.scene.as_deref() == Some("g2-loop") {
+        return finish(&args.out, run_g2_loop(&args));
     }
     finish(&args.out, run(&args))
 }
