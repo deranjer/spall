@@ -12,19 +12,21 @@ use clap::{Parser, ValueEnum};
 use glam::{Mat4, Quat, Vec3};
 use serde::Serialize;
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
-use spall_core::{EntityId, SphereBrush};
+use spall_core::{EntityId, GlobalCell, SphereBrush};
 use spall_jobs::{Generation, TopologyEpoch};
 use spall_mesh::fixtures::{AcceptanceShape, acceptance_shapes, mesh_shape};
 use spall_mesh::{MeshOptions, MeshStrategy, build_volume_mesh};
 use spall_render::{
     Camera, CaptureOptions, DebugView, FrameLoopOptions, FrameSeriesOptions, FrameStats,
-    LightingRegion, LightingStep, LightingUpdate, MotionFrame, MotionSequenceOptions,
-    OCCLUDER_MAX_M, OCCLUDER_MIN_M, ProbeBand, RECEIVER_MAX_M, RECEIVER_MIN_M, RenderContext,
-    RenderError, Scene, SceneItem, SequenceOptions, capture_frame_loop, capture_frame_series,
-    capture_lighting_sequence, capture_motion_sequence, capture_scene, colored_rooms,
-    daylight_terrain_scene, emitter_occlusion_scenes, flicker_index, rapid_destruction,
+    LightingRegion, LightingStep, LightingUpdate, LightingVolume, MotionFrame,
+    MotionSequenceOptions, OCCLUDER_MAX_M, OCCLUDER_MIN_M, ProbeBand, RECEIVER_MAX_M,
+    RECEIVER_MIN_M, RenderContext, RenderError, Scene, SceneItem, SequenceOptions,
+    capture_frame_loop, capture_frame_series, capture_lighting_sequence, capture_motion_sequence,
+    capture_scene, colored_rooms, daylight_terrain_scene, emitter_occlusion_scenes, flicker_index,
+    rapid_destruction,
 };
 use spall_sim::{EditIntent, EditTarget, RequestId, Simulation, SimulationConfig, fixtures};
+use spall_voxel::Sample;
 use spall_voxel::Volume;
 
 /// Nominal frame time used to turn `lighting-sequence` frame counts into
@@ -69,8 +71,9 @@ struct Args {
     /// Fixture scene: `colored-room` (T13), `lighting-sequence` (T14),
     /// `g2-frames` (T15 cold GPU frame-cost percentiles), `g2-loop` (T15
     /// persistent-resource settled-frame GPU + CPU percentiles), `g2-motion`
-    /// (T15 moving-frame sequences + ghosting / flicker / leakage flags), or
-    /// `g2-terrain` (T15 open daylight-terrain settled cost + stability).
+    /// (T15 moving-frame sequences + ghosting / flicker / leakage flags),
+    /// `g2-terrain` (T15 open daylight-terrain settled cost + stability), or
+    /// `g2-collapse` (T15 GI-lit rapid-destruction sequence).
     #[arg(long)]
     scene: Option<String>,
     /// `lighting-sequence` only: settle frames rendered after the edit so the
@@ -754,6 +757,332 @@ fn run_destruction(args: &Args) -> Result<DestructionSummary, RenderError> {
         total_solid_cells_start,
         total_solid_cells_end: sim.world().total_solid_cells(),
         frames,
+    })
+}
+
+// --- `--scene g2-collapse` (T15 / ENG-22 increment 5) ---------------------
+
+/// Server ticks a lit frame is captured at across the 200-tick collapse:
+/// before the first cut, through the sever, the detach, the fall, and settled.
+const G2_COLLAPSE_CAPTURE_TICKS: [u64; 13] = [3, 8, 16, 24, 32, 45, 60, 75, 92, 115, 140, 170, 198];
+
+/// Terrain-cell world size for `cross_brick_bridged_setup` (`CellSizeCode::Quarter`).
+const TERRAIN_CELL_M: f32 = 0.25;
+
+fn mesh_world_aabb(mesh: &spall_mesh::Mesh) -> (Vec3, Vec3) {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for v in &mesh.vertices {
+        let p = Vec3::from_array(v.position);
+        min = min.min(p);
+        max = max.max(p);
+    }
+    (min, max)
+}
+
+/// Sample a `spall_voxel` terrain volume's occupancy into a fresh lighting
+/// clipmap: step through its world AABB at the terrain cell size and set every
+/// clipmap cell whose centre lands in a filled terrain cell.
+fn terrain_light_volume(
+    terrain: &spall_voxel::Volume,
+    origin: Vec3,
+    strategy: MeshStrategy,
+) -> LightingVolume {
+    let mut v = LightingVolume::empty(origin);
+    let step = TERRAIN_CELL_M;
+    let tmesh = volume_mesh(terrain, strategy);
+    if tmesh.mesh.vertices.is_empty() {
+        return v;
+    }
+    let (mn, mx) = mesh_world_aabb(&tmesh.mesh);
+    let mut y = mn.y - step;
+    while y <= mx.y + step {
+        let mut x = mn.x - step;
+        while x <= mx.x + step {
+            let mut z = mn.z - step;
+            while z <= mx.z + step {
+                let p = Vec3::new(x, y, z);
+                let g = GlobalCell::new(
+                    (p.x / TERRAIN_CELL_M).floor() as i64,
+                    (p.y / TERRAIN_CELL_M).floor() as i64,
+                    (p.z / TERRAIN_CELL_M).floor() as i64,
+                );
+                if let Ok(Sample::Filled(_)) = terrain.sample(g) {
+                    v.set(v.world_to_cell(p), 1);
+                }
+                z += step;
+            }
+            x += step;
+        }
+        y += step;
+    }
+    v
+}
+
+/// Build a T13/T14 lighting clipmap from the live authoritative world: the
+/// terrain occupancy (see [`terrain_light_volume`]) plus every detached body's
+/// world AABB filled solid (a box approximation of the debris, consistent with
+/// how T14 `moving_box` treats a moving body).
+fn sim_light_volume(sim: &Simulation, origin: Vec3, strategy: MeshStrategy) -> LightingVolume {
+    let mut v = terrain_light_volume(&sim.world().terrain().volume, origin, strategy);
+
+    for body in sim.world().bodies() {
+        let bm = volume_mesh(&body.volume, strategy);
+        if bm.mesh.vertices.is_empty() {
+            continue;
+        }
+        let q = body.pose.rotation;
+        let t = body.pose.translation_m;
+        let model = Mat4::from_rotation_translation(
+            Quat::from_xyzw(q.x as f32, q.y as f32, q.z as f32, q.w as f32),
+            Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32),
+        );
+        let mut mn = Vec3::splat(f32::INFINITY);
+        let mut mx = Vec3::splat(f32::NEG_INFINITY);
+        for vtx in &bm.mesh.vertices {
+            let p = model.transform_point3(Vec3::from_array(vtx.position));
+            mn = mn.min(p);
+            mx = mx.max(p);
+        }
+        let lo = v.world_to_cell(mn);
+        let hi = v.world_to_cell(mx) + glam::IVec3::ONE;
+        v.fill_box(lo, hi, 1);
+    }
+    v
+}
+
+/// Mesh the live world (terrain + bodies) into a capture [`Scene`] and attach a
+/// clipmap rebuilt from it, so `capture_scene` lights the frame with T13/T14
+/// indirect. A daytime sky clear gives the open scene an ambient term.
+fn g2_collapse_scene(
+    sim: &Simulation,
+    strategy: MeshStrategy,
+    aspect: f32,
+    camera: Option<Camera>,
+) -> Scene {
+    let mut scene = destruction_scene(sim, strategy, aspect, camera);
+    scene.clear = [0.25, 0.38, 0.58, 1.0];
+    scene.with_lighting(sim_light_volume(sim, Vec3::splat(-32.0), strategy))
+}
+
+#[derive(Serialize)]
+struct G2CollapseFrame {
+    tick: u64,
+    transactions_committed_so_far: u64,
+    solid_cells: u64,
+    body_count: usize,
+    detached_body_max_drop_m: f64,
+    indirect_cells: usize,
+    /// Full per-tick re-trace GPU cost (cold — `capture_scene` re-traces the
+    /// whole clipmap every call; the bounded per-tick path needs a
+    /// sim → `LightingUpdate` translation, increment 6).
+    gpu_render_millis: Option<f64>,
+    gpu_indirect_trace_millis: Option<f64>,
+    gpu_indirect_denoise_millis: Option<f64>,
+    gpu_shadow_millis: Option<f64>,
+    gpu_opaque_millis: Option<f64>,
+    gpu_tone_map_millis: Option<f64>,
+    image: String,
+}
+
+#[derive(Serialize)]
+struct G2CollapseSummary {
+    /// Version 1: T15 increment 5 — GI-lit rapid-destruction sequence.
+    version: u32,
+    mode: &'static str,
+    adapter: String,
+    backend: String,
+    width: u32,
+    height: u32,
+    gpu_timing_available: bool,
+    server_ticks: u64,
+    transactions_committed: u64,
+    final_world_hash: String,
+    solid_cells_start: u64,
+    solid_cells_end: u64,
+    /// Per-tick cold full-retrace GPU cost, percentiles over the captured ticks.
+    gpu_render: Option<G2StatBlock>,
+    gpu_indirect_trace: Option<G2StatBlock>,
+    gpu_indirect_denoise: Option<G2StatBlock>,
+    /// Settled-frame (last capture tick) 60-frame static-noise flicker of a
+    /// region away from the collapse, and of a region the fallen beam shadows.
+    settled_stable_band_flicker: f32,
+    settled_shadow_band_flicker: f32,
+    frames: Vec<G2CollapseFrame>,
+    quality_flags: Vec<String>,
+}
+
+fn run_g2_collapse(args: &Args) -> Result<G2CollapseSummary, RenderError> {
+    let ctx = RenderContext::headless()?;
+    let strategy: MeshStrategy = args.strategy.into();
+    let (width, height) = (1920u32, 1080u32);
+    let aspect = capture_aspect(width, height);
+
+    let mut setup = fixtures::cross_brick_bridged_setup();
+    setup.physics.disable_ccd = true;
+    let mut sim = Simulation::new(SimulationConfig::new(setup))
+        .map_err(|e| RenderError::Gpu(format!("collapse sim setup failed: {e}")))?;
+    let actor = EntityId::new(1).expect("nonzero entity id");
+    let solid_cells_start = sim.world().total_solid_cells();
+
+    let opts = CaptureOptions {
+        width,
+        height,
+        views: vec![DebugView::Shaded],
+        ..Default::default()
+    };
+
+    let mut next_cut = 0usize;
+    let mut request_id = 1u64;
+    let mut committed = 0u64;
+    let mut camera: Option<Camera> = None;
+    let (mut adapter, mut backend) = (String::new(), String::new());
+    let mut gpu_timing_available = false;
+    let mut frames: Vec<G2CollapseFrame> = Vec::new();
+    let mut render_ms = Vec::new();
+    let mut trace_ms = Vec::new();
+    let mut denoise_ms = Vec::new();
+    let mut last_solid = solid_cells_start;
+    let mut quality_flags = Vec::new();
+    let mut last_scene: Option<Scene> = None;
+
+    for tick in 1..=DESTRUCTION_TICKS {
+        while next_cut < DESTRUCTION_SCRIPT.len() && DESTRUCTION_SCRIPT[next_cut].0 == tick {
+            let (_, cell, radius) = DESTRUCTION_SCRIPT[next_cut];
+            let _ = sim.submit(EditIntent::cut(
+                RequestId(request_id),
+                actor,
+                EditTarget::Terrain,
+                brush_cell(cell, radius),
+            ));
+            request_id += 1;
+            next_cut += 1;
+        }
+        let report = sim
+            .tick()
+            .map_err(|e| RenderError::Gpu(format!("collapse sim tick {tick} failed: {e}")))?;
+        committed += report.committed.len() as u64;
+
+        if !G2_COLLAPSE_CAPTURE_TICKS.contains(&tick) {
+            continue;
+        }
+        let scene = g2_collapse_scene(&sim, strategy, aspect, camera);
+        if camera.is_none() {
+            camera = Some(scene.camera);
+        }
+        let out_dir = args.out.join(format!("tick_{tick:03}"));
+        let img = capture_scene(&ctx, &scene, &out_dir, &opts)?;
+        adapter = img.adapter.clone();
+        backend = img.backend.clone();
+        gpu_timing_available |= img.timing.gpu_render_millis.is_some();
+
+        let solid_cells = sim.world().total_solid_cells();
+        if solid_cells > last_solid {
+            quality_flags.push(format!(
+                "g2-collapse: solid cell count rose {last_solid} -> {solid_cells} at tick {tick} — mined terrain regrew"
+            ));
+        }
+        last_solid = solid_cells;
+
+        let passes = img.timing.gpu_passes;
+        if let Some(p) = passes {
+            render_ms.push(p.total());
+            trace_ms.push(p.indirect_trace_millis);
+            denoise_ms.push(p.indirect_denoise_millis);
+        }
+        let max_drop = sim
+            .world()
+            .bodies()
+            .map(|b| -b.pose.translation_m[1])
+            .fold(0.0_f64, f64::max);
+        frames.push(G2CollapseFrame {
+            tick,
+            transactions_committed_so_far: committed,
+            solid_cells,
+            body_count: sim.world().body_count(),
+            detached_body_max_drop_m: max_drop,
+            indirect_cells: img.indirect_cells,
+            gpu_render_millis: img.timing.gpu_render_millis,
+            gpu_indirect_trace_millis: passes.map(|p| p.indirect_trace_millis),
+            gpu_indirect_denoise_millis: passes.map(|p| p.indirect_denoise_millis),
+            gpu_shadow_millis: passes.map(|p| p.shadow_millis),
+            gpu_opaque_millis: passes.map(|p| p.opaque_millis),
+            gpu_tone_map_millis: passes.map(|p| p.tone_map_millis),
+            image: img
+                .images
+                .first()
+                .map(|i| i.path.display().to_string())
+                .unwrap_or_default(),
+        });
+        last_scene = Some(scene);
+    }
+
+    // Settled-frame stability: 60 identical Shaded frames of the last captured
+    // tick's lit world.
+    let (mut settled_stable_band_flicker, mut settled_shadow_band_flicker) = (0.0, 0.0);
+    if let Some(scene) = last_scene {
+        let motion_opts = MotionSequenceOptions {
+            width,
+            height,
+            exposure: 1.0,
+            view: DebugView::Shaded,
+            temporal_weight: 0.1,
+            halo_cells: 12,
+            png_stride: 30,
+        };
+        let mframes: Vec<MotionFrame> = (0..60)
+            .map(|_| MotionFrame {
+                camera: scene.camera,
+                update: LightingUpdate::new(),
+            })
+            .collect();
+        let probes = [
+            ProbeBand {
+                name: "stable".into(),
+                band: [0.05, 0.30],
+            },
+            ProbeBand {
+                name: "shadow".into(),
+                band: [0.40, 0.70],
+            },
+        ];
+        let noise = capture_motion_sequence(
+            &ctx,
+            &scene,
+            &mframes,
+            &probes,
+            &args.out.join("settled-noise"),
+            &motion_opts,
+        )?;
+        settled_stable_band_flicker = flicker_index(&noise.bands[0].luminance);
+        settled_shadow_band_flicker = flicker_index(&noise.bands[1].luminance);
+        if settled_stable_band_flicker > G2_FLICKER_FLAG {
+            quality_flags.push(format!(
+                "g2-collapse: settled `stable` band is not steady (flicker index {settled_stable_band_flicker:.4} > {G2_FLICKER_FLAG}) — temporal noise / instability"
+            ));
+        }
+    }
+
+    Ok(G2CollapseSummary {
+        version: 1,
+        mode: "g2-collapse",
+        adapter,
+        backend,
+        width,
+        height,
+        gpu_timing_available,
+        server_ticks: DESTRUCTION_TICKS,
+        transactions_committed: committed,
+        final_world_hash: sim.world().world_hash().to_string(),
+        solid_cells_start,
+        solid_cells_end: sim.world().total_solid_cells(),
+        gpu_render: FrameStats::from_samples(&render_ms).map(Into::into),
+        gpu_indirect_trace: FrameStats::from_samples(&trace_ms).map(Into::into),
+        gpu_indirect_denoise: FrameStats::from_samples(&denoise_ms).map(Into::into),
+        settled_stable_band_flicker,
+        settled_shadow_band_flicker,
+        frames,
+        quality_flags,
     })
 }
 
@@ -1642,6 +1971,9 @@ fn main() -> ExitCode {
     if args.scene.as_deref() == Some("g2-terrain") {
         return finish(&args.out, run_g2_terrain(&args));
     }
+    if args.scene.as_deref() == Some("g2-collapse") {
+        return finish(&args.out, run_g2_collapse(&args));
+    }
     finish(&args.out, run(&args))
 }
 
@@ -1747,6 +2079,64 @@ mod tests {
         assert!(
             saw_body_item,
             "a detached body is meshed into the capture scene at its pose"
+        );
+    }
+
+    /// The GI-lit collapse scene's clipmap (GPU-free): terrain occupancy is
+    /// sampled into solid clipmap cells, the open sky above stays air, and a
+    /// terrain cut removes solid cells from the clipmap on the next rebuild.
+    #[test]
+    fn sim_light_volume_tracks_terrain_occupancy_and_cuts() {
+        let mut setup = fixtures::cross_brick_bridged_setup();
+        setup.physics.disable_ccd = true;
+        let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
+        let origin = Vec3::splat(-32.0);
+        let terrain_solids = |sim: &Simulation| {
+            terrain_light_volume(&sim.world().terrain().volume, origin, MeshStrategy::Greedy)
+                .cells()
+                .iter()
+                .filter(|&&m| m != 0)
+                .count()
+        };
+
+        let before = sim_light_volume(&sim, origin, MeshStrategy::Greedy);
+        let solid_before = terrain_solids(&sim);
+        assert!(
+            solid_before > 0,
+            "the bridge terrain fills solid clipmap cells"
+        );
+
+        // Well above the tallest geometry is open air, so this is an exterior.
+        let sky = before.world_to_cell(Vec3::new(4.0, 40.0, 4.0));
+        let dim = spall_render::LIGHT_VOLUME_DIM as i32;
+        let flat = |c: glam::IVec3| (c.x + dim * (c.y + dim * c.z)) as usize;
+        assert_eq!(before.cells()[flat(sky)], 0, "open sky above the scene");
+
+        let actor = spall_core::EntityId::new(1).unwrap();
+        let mut next_cut = 0usize;
+        let mut committed = 0u64;
+        for tick in 1..=40u64 {
+            while next_cut < DESTRUCTION_SCRIPT.len() && DESTRUCTION_SCRIPT[next_cut].0 == tick {
+                let (_, cell, radius) = DESTRUCTION_SCRIPT[next_cut];
+                let _ = sim.submit(EditIntent::cut(
+                    RequestId(next_cut as u64 + 1),
+                    actor,
+                    EditTarget::Terrain,
+                    brush_cell(cell, radius),
+                ));
+                next_cut += 1;
+            }
+            committed += sim.tick().unwrap().committed.len() as u64;
+        }
+        assert!(
+            committed > 0,
+            "the cut script commits terrain damage by tick 40"
+        );
+
+        let solid_after = terrain_solids(&sim);
+        assert!(
+            solid_after < solid_before,
+            "cuts remove solid terrain clipmap cells: {solid_before} -> {solid_after}"
         );
     }
 

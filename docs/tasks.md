@@ -201,13 +201,26 @@ evidence and open items.
   scene matrix except a GI-lit rapid-destruction sequence. Evidence:
   `spall_render` `fixtures::tests::daylight_terrain_is_open_lit_and_shadow_casting`;
   the GPU run is manual.
-- **Increment 5 (later).** A GI-lit rapid-destruction / active-collapse sequence
-  (ENG-62 `--scene destruction` lit with T13/T14 — sim terrain + body poses →
-  `LightingVolume` / `LightingUpdate`) in the G2 percentile + quality-flag
-  framework; a pipelined (threaded) client frame loop + the broader CPU
-  frame-work budget; a bounded denoise/temporal pass if a real scene tightens
-  the budget; cross-GPU capture + human review; the cell-size /
-  renderer-direction freeze decision.
+- **Increment 5 (GI-lit rapid-destruction sequence).** `sandbox-capture --scene
+  g2-collapse` (also `cargo xtask capture --scene g2-collapse`) drives the
+  authoritative `spall_sim` world on `cross_brick_bridge_scene` through the
+  `g1-networked-destruction` cut script; at 13 ticks across the 200-tick collapse
+  it meshes the live world **and rebuilds a T13/T14 lighting clipmap from it**
+  (`sim_light_volume`: terrain occupancy sampled at the terrain cell size +
+  detached body AABBs filled solid) so each frame is lit with indirect GI.
+  Measured on the reference adapter: 10/10 cuts commit; terrain solid cells
+  304 → 243 monotone non-increasing (no regrowth); the GI-lit destruction
+  renders correctly; the settled frame is bit-stable (60-frame band flicker
+  0.000000). Per-tick GPU cost is the increment-1 cold full-retrace number
+  (~12 ms p50), not a client frame. **No quality flags.** Completes the G2 scene
+  matrix. Evidence: `sandbox-capture`
+  `tests::sim_light_volume_tracks_terrain_occupancy_and_cuts`; the GPU run is
+  manual.
+- **Increment 6 (later).** A bounded per-tick destruction cost (sim →
+  incremental `LightingUpdate` instead of a cold full re-trace); a pipelined
+  (threaded) client frame loop + the broader CPU frame-work budget; a bounded
+  denoise/temporal pass if a real scene tightens the budget; cross-GPU capture +
+  human review; the cell-size / renderer-direction freeze decision.
 
 ## Persistence, scale, and game-ready slice
 

@@ -469,11 +469,32 @@ bounce vs the enclosed rooms' multi-bounce), all provisional targets met with
 the widest margin; 120-frame static-noise flicker 0.000000 (bit-stable); cast
 sun shadows + direct-light falloff read correctly. No quality flags. This
 completes the G2 scene matrix except a GI-lit rapid-destruction sequence
-(increment 5; ENG-62 `--scene destruction` covers the T12-raster version).
-CPU-only coverage: `spall_render`
+(increment 5). CPU-only coverage: `spall_render`
 `fixtures::tests::daylight_terrain_is_open_lit_and_shadow_casting`. GPU run
-manual. A pipelined loop, cross-GPU review, and the freeze decision remain
-increment 5+.
+manual.
+
+Increment 5 adds the GI-lit rapid-destruction scene (the sixth G2 category):
+
+```sh
+# T15 / G2 GI-lit destruction. Drives the authoritative spall_sim world on
+# cross_brick_bridge_scene through the g1-networked-destruction cut script; at
+# 13 ticks across the 200-tick collapse it meshes the live world AND rebuilds a
+# T13/T14 lighting clipmap from it (terrain occupancy + detached body AABBs), so
+# each frame is lit with indirect GI. Reports per-tick cold GPU cost + a
+# settled-frame stability pass + conservation.
+cargo xtask capture --scene g2-collapse --output .local/runs/g2-collapse
+```
+
+Measured (RTX 4080 SUPER / D3D12): 10/10 cut transactions commit; terrain solid
+cells 304 -> 243 monotone non-increasing (no mined-terrain regrowth); the GI-lit
+destruction renders correctly across the collapse; the settled frame is
+bit-stable (60-frame band flicker 0.000000). Per-tick GPU cost is the
+increment-1 cold full-retrace number (~12 ms p50), not a client frame -- the
+bounded per-tick destruction cost (sim -> incremental `LightingUpdate`) is
+increment 6. No quality flags. This completes the G2 scene matrix. CPU-only
+coverage: `sandbox-capture`
+`tests::sim_light_volume_tracks_terrain_occupancy_and_cuts`. GPU run manual. A
+pipelined loop, cross-GPU review, and the freeze decision remain increment 6+.
 
 ### G3 — persistence, late join, and streaming
 
