@@ -464,6 +464,7 @@ pub fn commit(
             linvel_m_s: child.linvel_m_s,
             angvel_rad_s: child.angvel_rad_s,
             sleeping: false,
+            dormant: false,
             collider_revision: 1,
             coarsen_k: child.collider_plan.coarsen_k,
             phys,

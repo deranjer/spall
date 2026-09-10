@@ -8,16 +8,31 @@
 //! player capsules (T19). Contact-to-intent conversion (T21), replication (T10)
 //! and persistence (T16) are handled by the integrator, not here.
 
+use std::collections::HashSet;
+
 use spall_core::{EntityId, IdError, PlayerInput, Tick};
 use spall_physics::{CharacterParams, CharacterState};
 use spall_protocol::{ActionStatus, InputSeq, RequestId};
 
 use crate::commit::CommitError;
-use crate::intent::{EditIntent, IntentError};
+use crate::contact_damage::{ContactDamagePlan, ContactDamagePolicy, ContactEvent};
+use crate::dormancy::{ActiveRegion, BodyDormancyInput, DormancyPlan, DormancyPolicy};
+use crate::intent::{EditIntent, EditTarget, IntentError};
 use crate::journal::JournalSink;
 use crate::player::transaction_world_box;
 use crate::schedule::{EditPipeline, TickReport};
 use crate::world::{SimWorld, WorldSetup};
+
+/// Reserved high bit for a server-authored [`RequestId`]. Contact-damage cuts
+/// (T21) are minted by the server, not a client, so their request ids sit in a
+/// band a wire `RequestId` never reaches — a client action claiming a value at
+/// or above this is rejected at ingress.
+pub const SERVER_REQUEST_ID_BAND: u64 = 1 << 62;
+
+/// Journal provenance for a server-authored contact-damage cut. Authority is the
+/// server's; `actor` is only journal provenance. Sits above the per-session
+/// `actor_for` band and below the reserved player band (`1 << 48`).
+pub const CONTACT_DAMAGE_ACTOR_ID: u64 = 1 << 40;
 
 /// The fixed server timestep: 60 Hz (`docs/architecture.md`).
 pub const TICK_DT_S: f32 = 1.0 / 60.0;
@@ -56,6 +71,19 @@ pub enum TickError {
     TickExhausted,
 }
 
+/// What one [`Simulation::apply_contact_damage`] pass did: the pure
+/// [`ContactDamagePlan`] plus how its cuts fared at admission.
+#[derive(Debug, Clone, Default)]
+pub struct ContactDamageReport {
+    /// The policy's decision for this tick.
+    pub plan: ContactDamagePlan,
+    /// Planned cuts accepted into the edit pipeline.
+    pub submitted: usize,
+    /// Planned cuts refused admission (pipeline queue full) — bounded
+    /// backpressure, not an error.
+    pub rejected: usize,
+}
+
 /// The authoritative simulation.
 pub struct Simulation {
     world: SimWorld,
@@ -63,6 +91,7 @@ pub struct Simulation {
     journal: JournalSink,
     tick: Tick,
     next_control_seq: u64,
+    next_damage_seq: u64,
 }
 
 impl Simulation {
@@ -74,6 +103,7 @@ impl Simulation {
             journal: JournalSink::new(),
             tick: Tick::ZERO,
             next_control_seq: 1,
+            next_damage_seq: 0,
         })
     }
 
@@ -92,6 +122,7 @@ impl Simulation {
             journal: JournalSink::new(),
             tick,
             next_control_seq: 1,
+            next_damage_seq: 0,
         }
     }
 
@@ -154,7 +185,16 @@ impl Simulation {
 
     /// Admits an edit intent for staging, or replays the stored status for a
     /// duplicate request id.
+    ///
+    /// An intent that targets a **dormant** body (T21) reactivates it first, so
+    /// the edit always stages and commits against a live body — "sleeping
+    /// bodies retain [...] future destructibility" (`docs/architecture.md`).
     pub fn submit(&mut self, intent: EditIntent) -> Result<ActionStatus, IntentError> {
+        if let EditTarget::Body(entity) = intent.target
+            && self.world.body_is_dormant(entity)
+        {
+            self.world.reactivate_body(entity);
+        }
         self.pipeline.submit_intent(intent, &self.world)
     }
 
@@ -174,6 +214,183 @@ impl Simulation {
         self.world.step_physics();
         self.advance_players(&report);
         Ok(report)
+    }
+
+    /// Converts this tick's solver contacts into bounded terrain-damage cuts and
+    /// admits them (T21, increment 1). Call **after** [`Self::tick`], passing the
+    /// [`TickReport`] it returned so a body created this tick is excluded from
+    /// the recursion guard.
+    ///
+    /// This is deliberately *not* run by [`Self::tick`]: the integrator opts in,
+    /// owns the [`ContactDamagePolicy`] (its cooldown state), and decides the
+    /// cadence. Admitted cuts stage off-tick and commit on a later tick, exactly
+    /// like a client edit — so a contact can never mutate world state inside the
+    /// physics step, and a damage cut cannot cascade into another cut the same
+    /// tick.
+    ///
+    /// Increment 1 damages **terrain only**: body-on-body contacts are counted
+    /// (`plan.suppressed_*` do not include them; they are simply skipped here)
+    /// and left for a later increment together with the region-sleep policy.
+    pub fn apply_contact_damage(
+        &mut self,
+        policy: &mut ContactDamagePolicy,
+        report: &TickReport,
+    ) -> ContactDamageReport {
+        let mut out = ContactDamageReport::default();
+        if self.world.body_count() == 0 {
+            return out;
+        }
+
+        let terrain_volume = self.world.terrain_volume_id();
+        let terrain_phys = self.world.terrain().phys;
+        let cell_m = self.world.terrain().cell_size().metres();
+        let g = {
+            let a = self.world.physics().gravity_m_s2();
+            (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
+        };
+        let dt = TICK_DT_S;
+
+        let born_this_tick: HashSet<u64> = report
+            .committed
+            .iter()
+            .flat_map(|(_, c)| c.children.iter().map(|e| e.get()))
+            .collect();
+
+        let mut events: Vec<ContactEvent> = Vec::new();
+        for contact in self.world.physics().contact_impulses() {
+            // Increment 1: exactly one side dynamic, the other side terrain.
+            let striker_idx = match (contact.dynamic[0], contact.dynamic[1]) {
+                (true, false) => 0,
+                (false, true) => 1,
+                _ => continue,
+            };
+            let fixed_idx = 1 - striker_idx;
+            if contact.bodies[fixed_idx] != terrain_phys {
+                continue;
+            }
+            if !contact.point_m.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let striker_phys = contact.bodies[striker_idx];
+            let Some(striker) = self.world.body_by_phys(striker_phys).and_then(|b| b.entity) else {
+                continue;
+            };
+            let mass = self.world.physics().body_state(striker_phys).mass_kg;
+
+            events.push(ContactEvent {
+                target_volume: terrain_volume,
+                point_m: contact.point_m.map(f64::from),
+                normal: contact.normal.map(f64::from),
+                impulse_n_s: contact.normal_impulse_n_s,
+                resting_impulse_n_s: mass * g * dt,
+                striker_born_this_tick: born_this_tick.contains(&striker.get()),
+            });
+        }
+
+        let plan = policy.plan(self.tick.get(), cell_m, &events);
+        let actor = EntityId::new(CONTACT_DAMAGE_ACTOR_ID).expect("non-zero reserved actor id");
+        for cut in &plan.damage {
+            debug_assert_eq!(cut.target, EditTarget::Terrain);
+            let request_id = RequestId(SERVER_REQUEST_ID_BAND | self.next_damage_seq);
+            self.next_damage_seq += 1;
+            let mut intent = EditIntent::cut(request_id, actor, cut.target, cut.brush);
+            if let Some(explosion) = cut.explosion {
+                intent = intent.with_explosion(explosion);
+            }
+            match self.pipeline.submit_intent(intent, &self.world) {
+                Ok(_) => out.submitted += 1,
+                Err(_) => out.rejected += 1,
+            }
+        }
+        out.plan = plan;
+        out
+    }
+
+    /// Runs the T21 region-dormancy policy for the current tick and applies its
+    /// decisions: settled detached bodies with a quiet interaction region are
+    /// deactivated (dropped from the physics step, record kept), and dormant
+    /// bodies a player or an awake body has approached are reactivated.
+    ///
+    /// Opt-in, like [`Self::apply_contact_damage`]: the integrator owns the
+    /// [`DormancyPolicy`] and the cadence, and it is *not* run by [`Self::tick`].
+    /// Dormancy never changes authoritative geometry, ownership, or damage, so
+    /// [`SimWorld::world_hash`](crate::world::SimWorld::world_hash),
+    /// conservation, and the checkpoint set are unaffected. An edit that targets
+    /// a dormant body still wakes it immediately through [`Self::submit`],
+    /// independent of this pass.
+    pub fn apply_dormancy(&mut self, policy: &mut DormancyPolicy) -> DormancyPlan {
+        if self.world.body_count() == 0 {
+            return DormancyPlan::default();
+        }
+
+        // Active interaction regions: every player capsule, plus every body that
+        // is genuinely moving (an approaching / rolling piece — "active body
+        // trajectories", docs/architecture.md).
+        let still_speed = policy.config().still_speed_m_s;
+        let mut regions: Vec<ActiveRegion> = Vec::new();
+        for player in self.world.players() {
+            let (lo, hi) = player.capsule_aabb_m();
+            let centre = [
+                0.5 * (lo[0] + hi[0]),
+                0.5 * (lo[1] + hi[1]),
+                0.5 * (lo[2] + hi[2]),
+            ];
+            let radius = 0.5
+                * ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2))
+                    .sqrt();
+            regions.push(ActiveRegion {
+                centre_m: centre,
+                radius_m: radius,
+            });
+        }
+        for body in self.world.bodies() {
+            if body.dormant {
+                continue;
+            }
+            let speed = {
+                let v = body.linvel_m_s;
+                (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+            };
+            if speed > still_speed {
+                let (centre_m, radius_m) = body.world_bounding_sphere();
+                regions.push(ActiveRegion { centre_m, radius_m });
+            }
+        }
+
+        let inputs: Vec<BodyDormancyInput> = self
+            .world
+            .bodies()
+            .filter_map(|body| {
+                let entity = body.entity?;
+                let (centre_m, radius_m) = body.world_bounding_sphere();
+                let speed = {
+                    let v = body.linvel_m_s;
+                    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+                };
+                Some(BodyDormancyInput {
+                    entity,
+                    centre_m,
+                    radius_m,
+                    sleeping: body.sleeping,
+                    speed_m_s: speed,
+                    dormant: body.dormant,
+                    // A body-targeted edit wakes its target through `submit`
+                    // before it is ever staged, so by here no dormant body has a
+                    // pending edit against it. Terrain edits adjacent to a
+                    // dormant neighbour waking it is increment 3.
+                    hard_wake: false,
+                })
+            })
+            .collect();
+
+        let plan = policy.plan(self.tick.get(), &inputs, &regions);
+        for &entity in &plan.deactivate {
+            self.world.deactivate_body(entity);
+        }
+        for &entity in &plan.reactivate {
+            self.world.reactivate_body(entity);
+        }
+        plan
     }
 
     /// Advances the player capsules after the physics step, so the character

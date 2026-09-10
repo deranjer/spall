@@ -319,6 +319,7 @@ At a gate, retain raw metrics alongside a concise report in `docs/reports/Gx.md`
 | crash-transfer | Crash before/after source-removal/child-create commit cannot recover partial ownership |
 | malformed-input | Invalid lengths, huge coordinates, compressed bombs, invalid IDs/NaNs, excessive rates reject within bounds |
 | cantilever-strength | Material capacity changes failure outcome; damage/bonds survive restart and replication |
+| contact-damage | A falling body craters the terrain it strikes; a body at rest never re-fractures the floor under it; per-tick damage-intent count and pipeline depth stay bounded; conversion is deterministic |
 | sleep-wake | Settled persistent rubble wakes before nearby interaction and remains destructible |
 | scene-switch | Old asynchronous results never enter a new world/session at reused coordinates |
 | player-movement | A scripted capsule walks and stays grounded; a 100 ms link keeps corrections bounded; removing a floor cannot leave the player hovering; a lost button release stops it within 250 ms |
@@ -436,6 +437,25 @@ Targets on the recorded reference hardware:
 A second burst test exceeds ordinary load to verify explicit admission/backpressure. It need not maintain the same throughput but must not corrupt state, delete solid matter, leak memory, or make every subsequent join impossible. Publish target misses and the bottleneck; never rewrite fixture values to conceal failure.
 
 Material strength, contact damage, local player prediction, reliable repairs, full save/recovery, and destructible terrain/body parity are functional requirements of this gate. GPU and server gates may run on separate machines; localhost eight-client runs are correctness evidence, not a substitute for realistic network/performance measurement.
+
+Contact damage CPU-side proof (T21 increment 1): `spall_physics` unit test
+`contact_impulses_spike_on_impact_then_decay_to_the_resting_load` and the
+`spall_sim` `contact_damage` integration test
+(`falling_body_damages_terrain`, `a_settled_body_stops_damaging_the_floor`,
+`contact_damage_is_bounded_and_deterministic`).
+
+Region dormancy CPU-side proof (T21 increment 2, the `sleep-wake` fixture):
+`spall_physics` unit test
+`a_dormant_body_leaves_the_step_set_and_reactivates_at_its_pose` and the
+`spall_sim` `dormancy` integration test
+(`settled_debris_deactivates_without_changing_the_world`,
+`an_edit_wakes_dormant_rubble_and_it_stays_destructible`,
+`a_player_approaching_wakes_dormant_rubble`,
+`dormancy_is_invisible_to_the_authoritative_state`). A settled body with a quiet
+interaction region is deactivated (dropped from the physics step, record
+frozen); an edit or an approaching player reactivates it before it is touched;
+`world_hash` and conservation are identical to a run without the dormancy pass.
+Body-on-body contact fracture is the next T21 increment.
 
 ### G5 — larger world
 
