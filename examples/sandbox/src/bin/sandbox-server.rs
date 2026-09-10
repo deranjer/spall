@@ -175,7 +175,7 @@ fn run_serve(args: Args) -> ExitCode {
         Some(s) => s,
         None => {
             eprintln!(
-                "sandbox-server: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, or walk)",
+                "sandbox-server: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, walk, or checkerboard-split)",
                 args.scene
             );
             return ExitCode::from(2);

@@ -22,23 +22,21 @@
 //! to a [`spall_protocol::RepairRequest`].
 
 use glam::DQuat;
-use spall_core::{CELLS_PER_BRICK, GlobalCell, LocalCell, MaterialId, Revision, Tick, VolumeId};
+use spall_core::{
+    BrickCoord, CELLS_PER_BRICK, CellSizeCode, GlobalCell, LocalCell, MaterialId, Revision, Tick,
+    VolumeId,
+};
+use spall_protocol::baseline::{BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume};
 use spall_protocol::{
     ActionOutcome, ActionStatus, MotionSnapshot, RepairKey, RepairRequest, RequestId, SnapshotSeq,
     TopologyOp, TopologyTransaction,
 };
 use spall_structure::{CellSpanX, ComponentMembership};
-use spall_voxel::{Sample, Volume};
+use spall_voxel::{Brick, BrickBounds, Sample, Volume};
 
 use crate::body::BodyPose;
 use crate::schedule::TickReport;
 use crate::world::SimWorld;
-
-/// Inline cell-run encoding budget for one split. A split whose canonical runs
-/// would push a transaction past [`spall_protocol::limits::MAX_TRANSACTION_OPS`]
-/// needs a baseline blob instead (T17); until then the commit fails loudly
-/// rather than emitting a transaction a replica cannot fully apply.
-pub const MAX_SPLIT_RUN_OPS: usize = spall_protocol::limits::MAX_TRANSACTION_OPS - 8;
 
 /// Largest cell count in one encoded [`TopologyOp::CellRun`].
 const MAX_RUN_LEN: i64 = spall_protocol::limits::MAX_CELL_RUN_LEN as i64;
@@ -47,21 +45,138 @@ const MAX_RUN_LEN: i64 = spall_protocol::limits::MAX_CELL_RUN_LEN as i64;
 /// transaction.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicationError {
+    /// The inline `CellRun` encoding overflowed the wire, and the compressed
+    /// baseline-blob alternative (T17 increment 1) is *also* over
+    /// [`spall_protocol::limits::MAX_SPLIT_BASELINE_BLOB`] — a giant collapse
+    /// that needs the bulk-stream baseline path (T17 increment 2).
     #[error(
-        "split needs {ops} cell-run ops; inline encoding budget is {budget} (baseline blob is T17)"
+        "split geometry is too large to replicate: {blob_bytes} compressed baseline bytes for \
+         volume {volume}, cap is {cap} (giant split needs the bulk-stream baseline path)"
     )]
-    SplitTooLarge { ops: usize, budget: usize },
+    SplitTooLarge {
+        volume: u64,
+        blob_bytes: usize,
+        cap: usize,
+    },
+    /// A split baseline op blob could not be decoded on the apply/replay side.
+    #[error("split baseline op blob for volume {volume} is invalid: {reason}")]
+    BadBaselineBlob { volume: u64, reason: String },
 }
 
-/// Fails if `ops` would not fit the inline transaction budget.
-pub fn check_op_budget(ops: usize) -> Result<(), ReplicationError> {
-    if ops > spall_protocol::limits::MAX_TRANSACTION_OPS {
-        Err(ReplicationError::SplitTooLarge {
-            ops,
-            budget: spall_protocol::limits::MAX_TRANSACTION_OPS,
-        })
+/// Whether a fully-built [`TopologyTransaction`] fits one reliable control
+/// record when encoded — the real replication budget (op *count* alone misses
+/// that ~1300 `CellRun`s already blow the 64 KiB frame).
+pub fn inline_wire_fits(topology: &TopologyTransaction) -> bool {
+    spall_protocol::encode_control(topology).is_ok()
+}
+
+/// One brick's cells as [`BaselineCells`] — `Uniform` when every cell matches,
+/// else a `Dense` 32768-entry layer. Mirrors `spall_server::baseline::cells_of`.
+fn baseline_cells(snap: &spall_voxel::BrickSnapshot) -> BaselineCells {
+    let first = snap
+        .get(LocalCell::from_linear_index(0).expect("0 < 32768"))
+        .raw();
+    let mut dense = vec![0u16; CELLS_PER_BRICK];
+    let mut uniform = true;
+    for (i, slot) in dense.iter_mut().enumerate() {
+        let raw = snap
+            .get(LocalCell::from_linear_index(i as u16).expect("i < CELLS_PER_BRICK"))
+            .raw();
+        *slot = raw;
+        uniform &= raw == first;
+    }
+    if uniform {
+        BaselineCells::Uniform(first)
     } else {
-        Ok(())
+        BaselineCells::Dense(dense)
+    }
+}
+
+/// A [`BaselineVolume`] over `volume`'s resident bricks (all of them when
+/// `only` is `None`, else just those coords), each at its authoritative
+/// revision + edited flag + material layer. This is the same payload T17
+/// late-join uses; a `SplitOffBaseline` op carries the whole child volume and a
+/// `SourcePatchBaseline` op carries the source's post-cut affected bricks.
+pub fn baseline_volume_of(
+    volume: &Volume,
+    owner: BaselineOwner,
+    only: Option<&[BrickCoord]>,
+) -> BaselineVolume {
+    let coords: Vec<BrickCoord> = match only {
+        Some(list) => list.to_vec(),
+        None => volume.resident_brick_coords(),
+    };
+    let mut bricks: Vec<BaselineBrick> = coords
+        .into_iter()
+        .filter_map(|coord| {
+            let snap = volume.snapshot_brick(coord).ok().flatten()?;
+            Some(BaselineBrick {
+                coord: [coord.x, coord.y, coord.z],
+                revision: snap.revision().get(),
+                edited: snap.is_edited(),
+                cells: baseline_cells(&snap),
+            })
+        })
+        .collect();
+    bricks.sort_by_key(|b| (b.coord[2], b.coord[1], b.coord[0]));
+    BaselineVolume {
+        volume_id: volume.id(),
+        cell_size_code: volume.cell_size().to_u8(),
+        owner,
+        bounds: volume
+            .bounds()
+            .map(|b| [[b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z]]),
+        bricks,
+    }
+}
+
+/// Rebuild a `spall_voxel::Volume` from a decoded [`BaselineVolume`] — bounded to
+/// the recorded brick bounds, every brick restored at its authoritative
+/// revision. Mirrors `spall_client::replica::install_baseline_world`'s per-volume
+/// loop so the canonical hash matches.
+pub fn volume_from_baseline(bv: &BaselineVolume) -> Result<Volume, ReplicationError> {
+    let bad = |reason: String| ReplicationError::BadBaselineBlob {
+        volume: bv.volume_id.get(),
+        reason,
+    };
+    let cs = CellSizeCode::from_u8(bv.cell_size_code)
+        .ok_or_else(|| bad(format!("unknown cell-size code {}", bv.cell_size_code)))?;
+    let mut volume = match bv.bounds {
+        Some([mn, mx]) => {
+            let bounds = BrickBounds::new(
+                BrickCoord::new(mn[0], mn[1], mn[2]),
+                BrickCoord::new(mx[0], mx[1], mx[2]),
+            )
+            .ok_or_else(|| bad("baseline bounds min > max".into()))?;
+            Volume::bounded(bv.volume_id, cs, bounds)
+        }
+        None => Volume::new(bv.volume_id, cs),
+    };
+    for bb in &bv.bricks {
+        let cells: Vec<MaterialId> = match &bb.cells {
+            BaselineCells::Uniform(id) => vec![MaterialId(*id); CELLS_PER_BRICK],
+            BaselineCells::Dense(raw) => {
+                if raw.len() != CELLS_PER_BRICK {
+                    return Err(bad(format!("dense brick has {} cells", raw.len())));
+                }
+                raw.iter().copied().map(MaterialId).collect()
+            }
+        };
+        volume
+            .insert_brick(
+                BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                Brick::restored(&cells, Revision(bb.revision), bb.edited),
+            )
+            .map_err(|e| bad(format!("insert brick {:?}: {e}", bb.coord)))?;
+    }
+    Ok(volume)
+}
+
+/// [`BaselineOwner`] twin of a [`spall_protocol::CanonicalOwner`].
+pub fn baseline_owner(owner: spall_protocol::CanonicalOwner) -> BaselineOwner {
+    match owner {
+        spall_protocol::CanonicalOwner::Terrain => BaselineOwner::Terrain,
+        spall_protocol::CanonicalOwner::Body(e) => BaselineOwner::Body(e),
     }
 }
 

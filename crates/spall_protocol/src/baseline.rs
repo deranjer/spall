@@ -15,7 +15,9 @@
 //! `docs/protocol.md` step 4 of "Late join" describes.
 
 use serde::{Deserialize, Serialize};
-use spall_core::{CELLS_PER_BRICK, EntityId, VolumeId};
+use spall_core::{CELLS_PER_BRICK, EntityId, MaterialId, VolumeId};
+
+use crate::limits::{MAX_SPLIT_BASELINE_BLOB, MAX_SPLIT_BASELINE_DECOMPRESSED};
 
 /// Schema version of the [`BaselineWorld`] payload. Independent of the wire
 /// record schema and the save schema (`docs/protocol.md`: "Version the wire
@@ -89,6 +91,10 @@ pub enum BaselineDecodeError {
     EmptyVolume(u64),
     #[error("baseline volumes are not sorted / unique by id")]
     Unsorted,
+    #[error("split baseline blob is {bytes} compressed bytes; the cap is {cap}")]
+    BlobTooLarge { bytes: usize, cap: usize },
+    #[error("zstd: {0}")]
+    Zstd(String),
 }
 
 impl BaselineWorld {
@@ -118,16 +124,7 @@ impl BaselineWorld {
                 return Err(BaselineDecodeError::Unsorted);
             }
             last_id = v.volume_id.get();
-            if v.bricks.is_empty() {
-                return Err(BaselineDecodeError::EmptyVolume(v.volume_id.get()));
-            }
-            for b in &v.bricks {
-                if let BaselineCells::Dense(cells) = &b.cells
-                    && cells.len() != CELLS_PER_BRICK
-                {
-                    return Err(BaselineDecodeError::BrickLen(cells.len()));
-                }
-            }
+            v.validate()?;
         }
         Ok(())
     }
@@ -136,6 +133,78 @@ impl BaselineWorld {
     /// the transfer/catch-up limits).
     pub fn brick_count(&self) -> usize {
         self.volumes.iter().map(|v| v.bricks.len()).sum()
+    }
+}
+
+impl BaselineVolume {
+    /// Structural checks for one volume: at least one brick, and every `Dense`
+    /// brick exactly [`CELLS_PER_BRICK`] long.
+    pub fn validate(&self) -> Result<(), BaselineDecodeError> {
+        if self.bricks.is_empty() {
+            return Err(BaselineDecodeError::EmptyVolume(self.volume_id.get()));
+        }
+        for b in &self.bricks {
+            if let BaselineCells::Dense(cells) = &b.cells
+                && cells.len() != CELLS_PER_BRICK
+            {
+                return Err(BaselineDecodeError::BrickLen(cells.len()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every distinct material id referenced by this volume's bricks — used to
+    /// validate a split baseline op blob against the world manifest.
+    pub fn material_ids(&self) -> impl Iterator<Item = MaterialId> + '_ {
+        self.bricks.iter().flat_map(|b| match &b.cells {
+            BaselineCells::Uniform(id) => vec![MaterialId(*id)],
+            BaselineCells::Dense(ids) => {
+                let mut seen: Vec<u16> = ids.to_vec();
+                seen.sort_unstable();
+                seen.dedup();
+                seen.into_iter().map(MaterialId).collect()
+            }
+        })
+    }
+
+    /// zstd-compressed postcard bytes for a `SplitOffBaseline` /
+    /// `SourcePatchBaseline` op blob. Panics only on an internal encoder error
+    /// (the input is a plain owned struct).
+    pub fn encode_compressed(&self) -> Vec<u8> {
+        let raw = postcard::to_stdvec(self).expect("BaselineVolume serializes");
+        zstd::stream::encode_all(raw.as_slice(), 0).expect("zstd encodes")
+    }
+
+    /// Decompress + decode + validate a split baseline op blob. Enforces the
+    /// compressed cap ([`MAX_SPLIT_BASELINE_BLOB`]) and a decompressed DoS bound
+    /// ([`MAX_SPLIT_BASELINE_DECOMPRESSED`]) before trusting the payload.
+    pub fn decode_compressed(bytes: &[u8]) -> Result<Self, BaselineDecodeError> {
+        use std::io::Read;
+        if bytes.len() > MAX_SPLIT_BASELINE_BLOB {
+            return Err(BaselineDecodeError::BlobTooLarge {
+                bytes: bytes.len(),
+                cap: MAX_SPLIT_BASELINE_BLOB,
+            });
+        }
+        // Bounded decode: stop reading decompressed output at the DoS cap + 1 so
+        // a compression bomb can never allocate past the limit.
+        let decoder = zstd::stream::Decoder::new(bytes)
+            .map_err(|e| BaselineDecodeError::Zstd(e.to_string()))?;
+        let mut raw = Vec::new();
+        decoder
+            .take(MAX_SPLIT_BASELINE_DECOMPRESSED as u64 + 1)
+            .read_to_end(&mut raw)
+            .map_err(|e| BaselineDecodeError::Zstd(e.to_string()))?;
+        if raw.len() > MAX_SPLIT_BASELINE_DECOMPRESSED {
+            return Err(BaselineDecodeError::BlobTooLarge {
+                bytes: raw.len(),
+                cap: MAX_SPLIT_BASELINE_DECOMPRESSED,
+            });
+        }
+        let volume: Self =
+            postcard::from_bytes(&raw).map_err(|e| BaselineDecodeError::Postcard(e.to_string()))?;
+        volume.validate()?;
+        Ok(volume)
     }
 }
 
@@ -202,6 +271,68 @@ mod tests {
         assert!(matches!(
             BaselineWorld::decode(&bytes),
             Err(BaselineDecodeError::Unsorted)
+        ));
+    }
+
+    fn a_volume() -> BaselineVolume {
+        BaselineVolume {
+            volume_id: VolumeId::new(7).unwrap(),
+            cell_size_code: 2,
+            owner: BaselineOwner::Body(EntityId::new(9).unwrap()),
+            bounds: Some([[0, 0, 0], [1, 1, 1]]),
+            bricks: vec![
+                BaselineBrick {
+                    coord: [0, 0, 0],
+                    revision: 3,
+                    edited: true,
+                    cells: BaselineCells::Uniform(1),
+                },
+                BaselineBrick {
+                    coord: [1, 1, 1],
+                    revision: 4,
+                    edited: true,
+                    cells: BaselineCells::Dense({
+                        let mut c = vec![0u16; CELLS_PER_BRICK];
+                        c[0] = 2;
+                        c
+                    }),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn split_baseline_volume_compressed_round_trips() {
+        let v = a_volume();
+        let blob = v.encode_compressed();
+        assert!(
+            blob.len() < MAX_SPLIT_BASELINE_BLOB,
+            "sparse volume compresses small"
+        );
+        assert_eq!(BaselineVolume::decode_compressed(&blob).unwrap(), v);
+
+        let ids: Vec<u16> = v.material_ids().map(|m| m.raw()).collect();
+        assert!(ids.contains(&0) && ids.contains(&1) && ids.contains(&2));
+    }
+
+    #[test]
+    fn split_baseline_blob_rejects_garbage_and_over_cap() {
+        assert!(matches!(
+            BaselineVolume::decode_compressed(&[0xAB; 32]),
+            Err(BaselineDecodeError::Zstd(_))
+        ));
+        assert!(matches!(
+            BaselineVolume::decode_compressed(&vec![0u8; MAX_SPLIT_BASELINE_BLOB + 1]),
+            Err(BaselineDecodeError::BlobTooLarge { .. })
+        ));
+
+        // A structurally-invalid volume (empty bricks) is refused on decode.
+        let mut v = a_volume();
+        v.bricks.clear();
+        let blob = v.encode_compressed();
+        assert!(matches!(
+            BaselineVolume::decode_compressed(&blob),
+            Err(BaselineDecodeError::EmptyVolume(7))
         ));
     }
 }

@@ -204,7 +204,7 @@ fn run_replication(args: Args) -> ExitCode {
         None if !args.moves.is_empty() => BaselineScene::default(),
         None => {
             eprintln!(
-                "sandbox-client: unknown --scene `{}` (expected bridge-cut or cross-bridge-cut)",
+                "sandbox-client: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, or checkerboard-split)",
                 args.scene
             );
             return ExitCode::from(2);

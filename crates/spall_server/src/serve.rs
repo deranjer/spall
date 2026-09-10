@@ -136,6 +136,12 @@ pub enum Scene {
     /// client is given an authoritative player capsule; clients script movement
     /// and predict it locally. See [`spall_sim::fixtures::walk_arena_setup`].
     Walk,
+    /// T17 / ENG-64: an anchored floor holds a `24³` checkerboard block through
+    /// one column; cutting the column detaches a component whose ~13.8k
+    /// single-cell runs overflow the inline `CellRun` budget, so the commit
+    /// falls back to the compressed-baseline-blob op path. See
+    /// [`spall_sim::fixtures::checkerboard_split_setup`].
+    CheckerboardSplit,
 }
 
 impl Scene {
@@ -148,6 +154,7 @@ impl Scene {
                 Some(Scene::CrossBridgeCut)
             }
             "walk" | "walk-arena" | "player-movement" => Some(Scene::Walk),
+            "checkerboard-split" | "oversized-split" => Some(Scene::CheckerboardSplit),
             _ => None,
         }
     }
@@ -158,6 +165,7 @@ impl Scene {
             Scene::BridgeCut => "bridge-cut",
             Scene::CrossBridgeCut => "cross-bridge-cut",
             Scene::Walk => "walk",
+            Scene::CheckerboardSplit => "checkerboard-split",
         }
     }
 
@@ -171,6 +179,7 @@ impl Scene {
             Scene::BridgeCut => spall_sim::fixtures::bridged_terrain_setup(),
             Scene::CrossBridgeCut => spall_sim::fixtures::cross_brick_bridged_setup(),
             Scene::Walk => spall_sim::fixtures::walk_arena_setup(),
+            Scene::CheckerboardSplit => spall_sim::fixtures::checkerboard_split_setup(),
         };
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
@@ -563,7 +572,17 @@ impl OutboundQueue {
 fn reliable_msg_bytes(msg: &Outbound) -> usize {
     match msg {
         Outbound::Transaction(tx) => {
+            let blob_bytes: usize = tx
+                .ops
+                .iter()
+                .map(|op| match op {
+                    spall_protocol::TopologyOp::SplitOffBaseline { blob, .. }
+                    | spall_protocol::TopologyOp::SourcePatchBaseline { blob, .. } => blob.len(),
+                    _ => 0,
+                })
+                .sum();
             128 + tx.ops.len() * 48
+                + blob_bytes
                 + tx.before.len() * 24
                 + tx.after.len() * 24
                 + tx.dependencies.len() * 16

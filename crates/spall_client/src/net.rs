@@ -155,6 +155,9 @@ pub enum BaselineScene {
     /// [`spall_voxel::fixtures::cross_brick_bridge_scene`] — column + beam cross
     /// the `x = 32` brick boundary.
     CrossBridgeCut,
+    /// [`spall_voxel::fixtures::checkerboard_split_scene`] — a fragmented block
+    /// whose detach overflows the inline `CellRun` budget (T17 / ENG-64).
+    CheckerboardSplit,
 }
 
 impl BaselineScene {
@@ -165,6 +168,7 @@ impl BaselineScene {
             "cross-bridge-cut" | "cross-brick-bridge" | "crossbridgecut" => {
                 Some(Self::CrossBridgeCut)
             }
+            "checkerboard-split" | "oversized-split" => Some(Self::CheckerboardSplit),
             _ => None,
         }
     }
@@ -173,6 +177,7 @@ impl BaselineScene {
         match self {
             Self::BridgeCut => spall_voxel::fixtures::bridge_scene(id),
             Self::CrossBridgeCut => spall_voxel::fixtures::cross_brick_bridge_scene(id),
+            Self::CheckerboardSplit => spall_voxel::fixtures::checkerboard_split_scene(id),
         }
     }
 }
