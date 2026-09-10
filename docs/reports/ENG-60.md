@@ -124,3 +124,33 @@ moves off the wgpu 24 pin (T14/T15 or a dedicated upgrade task); the
 ignored test in `tests/capture_gpu.rs` are the regression checks. Restore Vulkan
 as an accepted backend only once `case:pipelines` and the `capture_gpu` suite
 both pass on it.
+
+## Regression watch — hardening (2026-09-10)
+
+The 2026-09-09 reporting audit flagged that the merged
+`windows_vulkan_backend_still_crashes_compiling_t12_pipelines` test asserted only
+`!status.success()` on a `cargo run`, so a compile error, a missing adapter, a
+hang, or an ordinary Rust panic would all have counted as "the crash still
+reproduces". The test now separates those cases:
+
+1. **Build the probe as its own step.** A build failure fails the test with a
+   "this is a build failure, not a Vulkan result" message instead of being
+   folded into the crash assertion.
+2. **Run the built binary directly**, not through `cargo run`, so cargo's own
+   exit status can never stand in for the child's.
+3. **Wall-clock deadline (120 s).** The documented fault is a *fast* native crash
+   during pipeline compilation; a hang is killed and reported as a distinct
+   failure to investigate, not a pass.
+4. **Exact exit code.** Exit `2` (probe's "no usable adapter") → inconclusive
+   skip. Success → the crash is gone, fail loudly. Non-zero must equal the
+   documented native `STATUS_ACCESS_VIOLATION` (`0xC0000005` /
+   `-1_073_741_819`); a Rust panic (`101`) or any other code fails with "the
+   failure mode has changed".
+5. **Crash site.** The probe's fsync'd `SPALL_PROBE_LOG` must end on the
+   `ScenePipeline::new (...)` marker — proof the fault is still at
+   pipeline creation and not earlier (adapter enumeration, device creation).
+
+A green run of this test remains confirmation of a *known* failure on the pinned
+toolchain, never Vulkan acceptance. Acceptance still requires the full
+`capture_gpu` suite and 1080p six-view captures to pass on both D3D12 **and**
+Vulkan, which needs the `wgpu`/`naga` upgrade this report recommends.
