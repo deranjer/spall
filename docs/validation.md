@@ -429,11 +429,32 @@ bounded re-trace path, the settled frame is a ~0.3-0.9 ms GPU pass and ~0.6-0.8
 ms CPU encode; pipelined client-frame p95 estimate <= 2.9 ms across all four
 scenes in both modes -- the provisional GPU p95 <= 12 ms, CPU p95 <= 4 ms, and
 client p95 <= 16.7 ms targets are all met with margin. Increment 1's ~3x miss
-was a harness artefact (per-frame pipeline rebuild + full-cache re-trace). Real
-motion, exterior terrain, a pipelined loop, and quality flags remain increment
-3. CPU-only coverage: `spall_render` `capture::tests::frame_stats_*` +
+was a harness artefact (per-frame pipeline rebuild + full-cache re-trace).
+CPU-only coverage: `spall_render` `capture::tests::frame_stats_*` +
 `*_retrace_box_*`; `sandbox-capture`
 `tests::g2_frame_scenes_are_distinct_lit_and_framed`. The GPU run is manual.
+
+Increment 3 adds moving-frame sequences + quality flags:
+
+```sh
+# T15 / G2 moving-frame quality. Three 120-frame sequences on the emitter/
+# occluder fixture -- static-noise (Shaded, nothing moving), moving-occluder and
+# occluder-jump (IndirectOnly, the occluder leaves the light path and returns
+# smoothly / in two jumps). Samples luminance in probe bands every frame and
+# flags flicker / ghost residual / weak recovery "for review".
+cargo xtask capture --scene g2-motion --output .local/runs/g2-motion
+```
+
+Measured (RTX 4080 SUPER / D3D12): the settled indirect frame is bit-stable
+(band flicker 0.00000 for 120 frames); a moving occluder's shadow recovers ~26%
+when it leaves and returns to within 0.8% of its original level (no ghost / no
+trail); the smooth and discrete moves behave the same; the static region stays
+quiet (far-band flicker < 0.0001). No quality flags. CPU-only coverage:
+`spall_render` `capture::tests::{a_steady_trace_has_zero_flicker,
+flicker_index_is_mean_abs_step_over_mean_level,
+settle_index_finds_the_first_lasting_return_to_target}`. The GPU run is manual.
+Exterior terrain + a full active-collapse scene, a pipelined loop, and the
+freeze decision remain increment 4+.
 
 ### G3 — persistence, late join, and streaming
 

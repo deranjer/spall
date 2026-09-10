@@ -77,8 +77,9 @@ struct CaptureArgs {
     /// `destruction` (T11a — offscreen frames of the authoritative
     /// `g1-networked-destruction` cut sequence with GPU pass timings),
     /// `g2-frames` (T15 — cold per-pass GPU frame-cost percentiles over the
-    /// still lighting fixtures at a fixed 1920x1080), or `g2-loop` (T15 —
-    /// persistent-resource settled-frame GPU + CPU percentiles).
+    /// still lighting fixtures at a fixed 1920x1080), `g2-loop` (T15 —
+    /// persistent-resource settled-frame GPU + CPU percentiles), or `g2-motion`
+    /// (T15 — 120-frame moving sequences + ghosting / flicker / noise flags).
     #[arg(long)]
     scene: Option<String>,
     #[arg(long, default_value_t = 300_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]

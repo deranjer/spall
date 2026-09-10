@@ -18,9 +18,11 @@ use spall_mesh::fixtures::{AcceptanceShape, acceptance_shapes, mesh_shape};
 use spall_mesh::{MeshOptions, MeshStrategy, build_volume_mesh};
 use spall_render::{
     Camera, CaptureOptions, DebugView, FrameLoopOptions, FrameSeriesOptions, FrameStats,
-    LightingStep, RenderContext, RenderError, Scene, SceneItem, SequenceOptions,
-    capture_frame_loop, capture_frame_series, capture_lighting_sequence, capture_scene,
-    colored_rooms, emitter_occlusion_scenes, rapid_destruction,
+    LightingRegion, LightingStep, LightingUpdate, MotionFrame, MotionSequenceOptions,
+    OCCLUDER_MAX_M, OCCLUDER_MIN_M, ProbeBand, RECEIVER_MAX_M, RECEIVER_MIN_M, RenderContext,
+    RenderError, Scene, SceneItem, SequenceOptions, capture_frame_loop, capture_frame_series,
+    capture_lighting_sequence, capture_motion_sequence, capture_scene, colored_rooms,
+    emitter_occlusion_scenes, flicker_index, rapid_destruction,
 };
 use spall_sim::{EditIntent, EditTarget, RequestId, Simulation, SimulationConfig, fixtures};
 use spall_voxel::Volume;
@@ -65,8 +67,9 @@ struct Args {
     #[arg(long)]
     only: Option<String>,
     /// Fixture scene: `colored-room` (T13), `lighting-sequence` (T14),
-    /// `g2-frames` (T15 cold GPU frame-cost percentiles), or `g2-loop` (T15
-    /// persistent-resource settled-frame GPU + CPU percentiles).
+    /// `g2-frames` (T15 cold GPU frame-cost percentiles), `g2-loop` (T15
+    /// persistent-resource settled-frame GPU + CPU percentiles), or `g2-motion`
+    /// (T15 moving-frame sequences + ghosting / flicker / leakage flags).
     #[arg(long)]
     scene: Option<String>,
     /// `lighting-sequence` only: settle frames rendered after the edit so the
@@ -88,6 +91,9 @@ struct Args {
     /// `g2-loop` only: cache-cell edge of the per-frame incremental re-trace box.
     #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(1..=128))]
     g2_loop_edit_edge: u32,
+    /// `g2-motion` only: consecutive frames per sequence (>= 120 per the gate).
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(24..=600))]
+    g2_motion_frames: u32,
 }
 
 #[derive(Serialize)]
@@ -1076,6 +1082,353 @@ fn run_g2_loop(args: &Args) -> Result<G2LoopSummary, RenderError> {
     })
 }
 
+// --- `--scene g2-motion` (T15 / ENG-22 increment 3) -----------------------
+
+/// Mean abs frame-to-frame change over mean level above which a band is flagged
+/// for review as unstable / noisy.
+const G2_FLICKER_FLAG: f32 = 0.03;
+/// Fractional gap from the pre-disturbance level above which the band is flagged
+/// as a ghost / light trail.
+const G2_GHOST_RESIDUAL_FLAG: f32 = 0.05;
+/// Minimum fractional brightening of the shadow band when the occluder leaves;
+/// below it the lighting cache is not tracking the move.
+const G2_RECOVERY_MIN_GAIN: f32 = 0.05;
+
+fn mean(xs: &[f32]) -> f32 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.iter().copied().sum::<f32>() / xs.len() as f32
+}
+
+fn lerp_box(a: (Vec3, Vec3), b: (Vec3, Vec3), t: f32) -> (Vec3, Vec3) {
+    (a.0.lerp(b.0, t), a.1.lerp(b.1, t))
+}
+
+#[derive(Serialize)]
+struct G2BandTrace {
+    name: String,
+    band: [f32; 2],
+    flicker_index: f32,
+    max_step_fraction: f32,
+    luminance: Vec<f32>,
+}
+
+#[derive(Serialize)]
+struct G2MotionRun {
+    /// `static-noise`, `moving-occluder` (smooth), or `occluder-jump` (discrete).
+    name: &'static str,
+    /// `shaded` (the real client frame) or `indirect-only` (transported indirect
+    /// radiance isolated — the sensitive view for a lighting change).
+    view: &'static str,
+    frames: usize,
+    gpu_timing_available: bool,
+    gpu_frame: Option<G2StatBlock>,
+    cpu_frame: Option<G2StatBlock>,
+    bands: Vec<G2BandTrace>,
+    /// `moving-occluder` only: shadow-band level with the occluder in / out of
+    /// the light path, and after it returns.
+    occluded_level: Option<f32>,
+    clear_level: Option<f32>,
+    return_level: Option<f32>,
+    /// `(clear - occluded) / occluded` — the shadow band must brighten when the
+    /// occluder leaves.
+    recovery_gain: Option<f32>,
+    /// `|return - occluded| / occluded` — must be ~0 (shadow re-forms exactly).
+    return_residual: Option<f32>,
+    /// First frame the shadow band reached and held near `clear_level`.
+    settle_frames_out: Option<usize>,
+    images: Vec<String>,
+    /// Anything crossing a documented threshold, phrased for the gate reviewer.
+    quality_flags: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct G2MotionSummary {
+    /// Version 1: T15 increment 3 — moving-frame sequences + quality flags.
+    version: u32,
+    mode: &'static str,
+    adapter: String,
+    backend: String,
+    width: u32,
+    height: u32,
+    frames: u32,
+    flicker_flag_threshold: f32,
+    ghost_residual_flag_threshold: f32,
+    recovery_min_gain: f32,
+    /// Every run's `quality_flags`, flattened. Empty ⇒ nothing to review.
+    quality_flags: Vec<String>,
+    runs: Vec<G2MotionRun>,
+}
+
+fn g2_band_trace(t: &spall_render::BandTrace) -> G2BandTrace {
+    G2BandTrace {
+        name: t.name.clone(),
+        band: t.band,
+        flicker_index: flicker_index(&t.luminance),
+        max_step_fraction: spall_render::max_step_fraction(&t.luminance),
+        luminance: t.luminance.clone(),
+    }
+}
+
+fn run_g2_motion(args: &Args) -> Result<G2MotionSummary, RenderError> {
+    let ctx = RenderContext::headless()?;
+    let (width, height) = (1920u32, 1080u32);
+    let aspect = capture_aspect(width, height);
+    let n = args.g2_motion_frames as usize;
+    // The static-noise run renders the real `Shaded` frame; the occluder runs
+    // render `IndirectOnly` so the moving shadow is not swamped by direct light.
+    let shaded_opts = MotionSequenceOptions {
+        width,
+        height,
+        exposure: 1.0,
+        view: DebugView::Shaded,
+        temporal_weight: 0.1,
+        halo_cells: 12,
+        png_stride: (n / 6).max(1),
+    };
+    let indirect_opts = MotionSequenceOptions {
+        view: DebugView::IndirectOnly,
+        ..shaded_opts
+    };
+
+    let scenes = emitter_occlusion_scenes(aspect);
+    let shadow_band = scenes.receiver_band;
+    let lit_band = [0.55_f32, 0.92];
+    let far_band = [0.78_f32, 0.98];
+
+    let mut runs = Vec::new();
+    let mut all_flags = Vec::new();
+    let adapter;
+    let backend;
+
+    // --- Run 1: a static camera and world for `n` identical frames. With
+    // nothing moving, any frame-to-frame band change is temporal noise /
+    // instability in the trace + denoise + temporal pipeline.
+    {
+        let base = emitter_occlusion_scenes(aspect).occluded;
+        let frames: Vec<MotionFrame> = (0..n)
+            .map(|_| MotionFrame {
+                camera: base.camera,
+                update: LightingUpdate::new(),
+            })
+            .collect();
+        let probes = [
+            ProbeBand {
+                name: "shadow".into(),
+                band: shadow_band,
+            },
+            ProbeBand {
+                name: "lit".into(),
+                band: lit_band,
+            },
+        ];
+        let report = capture_motion_sequence(
+            &ctx,
+            &base,
+            &frames,
+            &probes,
+            &args.out.join("static-noise"),
+            &shaded_opts,
+        )?;
+        adapter = report.adapter.clone();
+        backend = report.backend.clone();
+
+        let mut flags = Vec::new();
+        for band in &report.bands {
+            let fi = flicker_index(&band.luminance);
+            if fi > G2_FLICKER_FLAG {
+                flags.push(format!(
+                    "static-noise: `{}` band is not steady with nothing moving (flicker index {fi:.4} > {G2_FLICKER_FLAG}) — temporal noise / instability",
+                    band.name
+                ));
+            }
+        }
+        all_flags.extend(flags.iter().cloned());
+        runs.push(G2MotionRun {
+            name: "static-noise",
+            view: "shaded",
+            frames: report.frames,
+            gpu_timing_available: report.gpu_timing_available,
+            gpu_frame: report.gpu_frame.map(Into::into),
+            cpu_frame: report.cpu_frame.map(Into::into),
+            bands: report.bands.iter().map(g2_band_trace).collect(),
+            occluded_level: None,
+            clear_level: None,
+            return_level: None,
+            recovery_gain: None,
+            return_residual: None,
+            settle_frames_out: None,
+            images: report
+                .images
+                .iter()
+                .map(|i| i.path.display().to_string())
+                .collect(),
+            quality_flags: flags,
+        });
+    }
+
+    // --- Runs 2 & 3: an occluder leaves the emitter -> receiver path and
+    // returns, once as a smooth per-frame move (bounded re-trace follows a
+    // narrow moving slice) and once as two discrete jumps (each `moving_box`
+    // dirties the whole vacated corridor). Comparing the two isolates whether a
+    // stale shadow is the documented halo limit or a real defect.
+    let in_path = (OCCLUDER_MIN_M, OCCLUDER_MAX_M);
+    let clear = (
+        OCCLUDER_MIN_M + Vec3::new(-14.0, 0.0, 0.0),
+        OCCLUDER_MAX_M + Vec3::new(-14.0, 0.0, 0.0),
+    );
+    let receiver = LightingRegion {
+        min_m: RECEIVER_MIN_M,
+        max_m: RECEIVER_MAX_M,
+        material: 1,
+    };
+    let occluder_probes = [
+        ProbeBand {
+            name: "shadow".into(),
+            band: shadow_band,
+        },
+        ProbeBand {
+            name: "far".into(),
+            band: far_band,
+        },
+    ];
+
+    // Smooth: box position eased out over 0..40%, held, eased back 50..90%, held.
+    let smooth_t = |i: usize| -> f32 {
+        let f = i as f32 / (n.max(2) - 1) as f32;
+        let t = if f < 0.40 {
+            f / 0.40
+        } else if f < 0.50 {
+            1.0
+        } else if f < 0.90 {
+            1.0 - (f - 0.50) / 0.40
+        } else {
+            0.0
+        };
+        t.clamp(0.0, 1.0)
+    };
+    // Discrete: fully out at 20%, fully back at 70% — one big `moving_box` each.
+    let jump_t = |i: usize| -> f32 {
+        let f = i as f32 / (n.max(2) - 1) as f32;
+        if (0.20..0.70).contains(&f) { 1.0 } else { 0.0 }
+    };
+
+    for (name, dir) in [
+        ("moving-occluder", &smooth_t as &dyn Fn(usize) -> f32),
+        ("occluder-jump", &jump_t as &dyn Fn(usize) -> f32),
+    ] {
+        let base = emitter_occlusion_scenes(aspect).occluded;
+        let cam = base.camera;
+        let frames: Vec<MotionFrame> = (0..n)
+            .map(|i| {
+                let prev = lerp_box(in_path, clear, dir(i.saturating_sub(1)));
+                let next = lerp_box(in_path, clear, dir(i));
+                MotionFrame {
+                    camera: cam,
+                    update: LightingUpdate::moving_box(prev, next, 1, &[receiver]),
+                }
+            })
+            .collect();
+        let report = capture_motion_sequence(
+            &ctx,
+            &base,
+            &frames,
+            &occluder_probes,
+            &args.out.join(name),
+            &indirect_opts,
+        )?;
+
+        let shadow = &report.bands[0].luminance;
+        let far = &report.bands[1].luminance;
+        let win = |lo: f32, hi: f32| -> f32 {
+            let lo = (lo * n as f32) as usize;
+            let hi = ((hi * n as f32) as usize).clamp(lo + 1, shadow.len());
+            mean(&shadow[lo..hi])
+        };
+        let occluded_level = win(0.0, 0.06);
+        // Sample the shadow band mid-way through each "held clear" window.
+        let clear_level = if name == "occluder-jump" {
+            win(0.40, 0.55)
+        } else {
+            win(0.42, 0.49)
+        };
+        let return_level = win(0.94, 1.0);
+        let frac = |num: f32| {
+            if occluded_level.abs() > f32::EPSILON {
+                num / occluded_level
+            } else {
+                0.0
+            }
+        };
+        let recovery_gain = frac(clear_level - occluded_level);
+        let return_residual = frac((return_level - occluded_level).abs());
+        // Frames for the shadow band to reach and hold near `clear_level`,
+        // measured over the first half (before the occluder starts back).
+        let settle_frames_out = spall_render::settle_index(
+            &shadow[..(n / 2).min(shadow.len())],
+            clear_level,
+            0.06,
+            (0.06 * n as f32) as usize,
+        );
+        let far_flicker = flicker_index(far);
+
+        let mut flags = Vec::new();
+        if recovery_gain < G2_RECOVERY_MIN_GAIN {
+            flags.push(format!(
+                "{name}: shadow band barely brightened when the occluder left (recovery gain {recovery_gain:.4} < {G2_RECOVERY_MIN_GAIN})"
+            ));
+        }
+        if return_residual > G2_GHOST_RESIDUAL_FLAG {
+            flags.push(format!(
+                "{name}: shadow band did not return after the occluder came back (residual {return_residual:.4} > {G2_GHOST_RESIDUAL_FLAG}) — possible ghost / light trail"
+            ));
+        }
+        if far_flicker > G2_FLICKER_FLAG {
+            flags.push(format!(
+                "{name}: static `far` band flickers during the move (flicker index {far_flicker:.4} > {G2_FLICKER_FLAG}) — temporal noise"
+            ));
+        }
+        all_flags.extend(flags.iter().cloned());
+        runs.push(G2MotionRun {
+            name,
+            view: "indirect-only",
+            frames: report.frames,
+            gpu_timing_available: report.gpu_timing_available,
+            gpu_frame: report.gpu_frame.map(Into::into),
+            cpu_frame: report.cpu_frame.map(Into::into),
+            bands: report.bands.iter().map(g2_band_trace).collect(),
+            occluded_level: Some(occluded_level),
+            clear_level: Some(clear_level),
+            return_level: Some(return_level),
+            recovery_gain: Some(recovery_gain),
+            return_residual: Some(return_residual),
+            settle_frames_out,
+            images: report
+                .images
+                .iter()
+                .map(|i| i.path.display().to_string())
+                .collect(),
+            quality_flags: flags,
+        });
+    }
+
+    Ok(G2MotionSummary {
+        version: 1,
+        mode: "g2-motion",
+        adapter,
+        backend,
+        width,
+        height,
+        frames: args.g2_motion_frames,
+        flicker_flag_threshold: G2_FLICKER_FLAG,
+        ghost_residual_flag_threshold: G2_GHOST_RESIDUAL_FLAG,
+        recovery_min_gain: G2_RECOVERY_MIN_GAIN,
+        quality_flags: all_flags,
+        runs,
+    })
+}
+
 /// Serialise `result` to `<out>/summary.json` and turn it into a process exit
 /// code, so every scene mode shares one write + error path.
 fn finish<T: Serialize>(out: &std::path::Path, result: Result<T, RenderError>) -> ExitCode {
@@ -1131,6 +1484,9 @@ fn main() -> ExitCode {
     }
     if args.scene.as_deref() == Some("g2-loop") {
         return finish(&args.out, run_g2_loop(&args));
+    }
+    if args.scene.as_deref() == Some("g2-motion") {
+        return finish(&args.out, run_g2_motion(&args));
     }
     finish(&args.out, run(&args))
 }

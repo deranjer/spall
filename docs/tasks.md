@@ -171,13 +171,28 @@ evidence and open items.
   pipeline rebuild + full-cache re-trace). Evidence: `spall_render`
   `capture::tests::a_zero_edge_retrace_box_has_no_volume` +
   `a_retrace_box_is_centred_and_clamped_to_the_cache`; the GPU run is manual.
-- **Increment 3 (later).** Exterior daylight-terrain scene + moving-debris /
-  active-collapse scenes; >= 120 consecutive *moving* frames (camera pan +
-  moving debris + rapid destruction) with the settled-vs-moving comparison; a
-  pipelined (threaded) client frame loop + the broader CPU frame-work budget;
-  a bounded denoise/temporal pass if a real scene tightens the budget; quality
-  flags (leakage, ghosting, noise, shadow instability); cross-GPU capture +
-  human review; the cell-size / renderer-direction freeze decision.
+- **Increment 3 (moving-frame sequences + quality flags).**
+  `spall_render::capture_motion_sequence` drives a scene through a per-frame
+  camera + lighting-update path on the increment-2 loop, sampling luminance in
+  probe bands every frame; pure `flicker_index` / `max_step_fraction` /
+  `settle_index` reduce the traces. `sandbox-capture --scene g2-motion` (also
+  `cargo xtask capture --scene g2-motion`) runs three 120-frame sequences on the
+  emitter/occluder fixture -- `static-noise` (Shaded, nothing moving),
+  `moving-occluder` and `occluder-jump` (IndirectOnly, occluder leaves the light
+  path and returns smoothly / in two jumps) -- and flags flicker / ghost
+  residual / weak recovery "for review". Measured on the reference adapter: the
+  settled indirect frame is bit-stable (flicker 0.00000 / 120 frames); the
+  moving occluder's shadow recovers ~26% and returns within 0.8% (no ghost /
+  trail); static regions stay quiet; smooth and discrete moves behave the same.
+  **No quality flags.** Evidence: `spall_render`
+  `capture::tests::{a_steady_trace_has_zero_flicker,
+  flicker_index_is_mean_abs_step_over_mean_level,
+  settle_index_finds_the_first_lasting_return_to_target}`; the GPU run is manual.
+- **Increment 4 (later).** Exterior daylight-terrain scene + a full
+  active-collapse scene (destruction sim wired into the motion loop); a
+  pipelined (threaded) client frame loop + the broader CPU frame-work budget; a
+  bounded denoise/temporal pass if a real scene tightens the budget; cross-GPU
+  capture + human review; the cell-size / renderer-direction freeze decision.
 
 ## Persistence, scale, and game-ready slice
 

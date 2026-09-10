@@ -1395,9 +1395,448 @@ pub fn capture_frame_loop(
     })
 }
 
+// --- G2 / T15 moving-frame sequence + quality metrics (increment 3) --------
+//
+// Increment 2 measured a *static* settled frame. The G2 gate also asks for "at
+// least 120 consecutive moving frames" and for light leakage, ghosting, noise
+// and shadow instability to be flagged for review. This path renders a scene
+// through a caller-supplied per-frame camera + lighting-update path on the
+// increment-2 persistent-resource loop, samples luminance in named probe bands
+// every frame, and the caller reduces those traces to quality metrics.
+
+/// One frame of a [`capture_motion_sequence`] run: where the camera is and what
+/// changed in the world since the previous frame. An empty `update` re-renders
+/// the same lighting from a new camera pose (a pan).
+#[derive(Debug, Clone)]
+pub struct MotionFrame {
+    pub camera: Camera,
+    pub update: LightingUpdate,
+}
+
+/// A fractional image-x band `[x0, x1)` (full height) whose mean sRGB luminance
+/// is sampled every frame.
+#[derive(Debug, Clone)]
+pub struct ProbeBand {
+    pub name: String,
+    pub band: [f32; 2],
+}
+
+/// Per-band luminance trace over a [`capture_motion_sequence`] run.
+#[derive(Debug, Clone)]
+pub struct BandTrace {
+    pub name: String,
+    pub band: [f32; 2],
+    /// One mean sRGB luminance per rendered frame.
+    pub luminance: Vec<f32>,
+}
+
+/// A frame kept as a PNG during a [`capture_motion_sequence`] run.
+#[derive(Debug, Clone)]
+pub struct MotionImage {
+    pub frame: usize,
+    pub path: PathBuf,
+}
+
+/// Settings for a [`capture_motion_sequence`] run.
+#[derive(Debug, Clone, Copy)]
+pub struct MotionSequenceOptions {
+    pub width: u32,
+    pub height: u32,
+    pub exposure: f32,
+    /// Which view each frame renders. `Shaded` is the real client frame;
+    /// `IndirectOnly` isolates transported indirect radiance, so a lighting
+    /// change (a moving occluder's shadow) is not swamped by direct light —
+    /// the sensitive view for ghosting / trail detection.
+    pub view: DebugView,
+    /// Temporal accumulation weight applied every frame (`1.0` disables it).
+    pub temporal_weight: f32,
+    /// Cells added on each side of a frame's dirty cell-AABB before re-tracing.
+    pub halo_cells: u32,
+    /// Save every `png_stride`-th frame as a PNG (plus the first and last).
+    /// `0` keeps only the first and last.
+    pub png_stride: usize,
+}
+
+impl Default for MotionSequenceOptions {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            exposure: 1.0,
+            view: DebugView::Shaded,
+            temporal_weight: 0.1,
+            halo_cells: 12,
+            png_stride: 20,
+        }
+    }
+}
+
+/// Result of a [`capture_motion_sequence`] run.
+#[derive(Debug, Clone)]
+pub struct MotionSequenceReport {
+    pub adapter: String,
+    pub backend: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames: usize,
+    pub bands: Vec<BandTrace>,
+    pub gpu_timing_available: bool,
+    /// Per-frame GPU device time (trace + denoise + temporal + opaque + tone map).
+    pub gpu_frame: Option<FrameStats>,
+    /// Per-frame renderer CPU encode cost (no GPU wait; the readback is excluded).
+    pub cpu_frame: Option<FrameStats>,
+    pub indirect_cells: usize,
+    pub images: Vec<MotionImage>,
+}
+
+/// Mean absolute frame-to-frame change of `samples`, as a fraction of their
+/// mean level — a temporal-instability / flicker index. `0.0` for a perfectly
+/// steady trace; a noisy or unstable band pushes it up.
+pub fn flicker_index(samples: &[f32]) -> f32 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+    let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
+    if mean.abs() < f32::EPSILON {
+        return 0.0;
+    }
+    let step_sum: f32 = samples.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+    (step_sum / (samples.len() - 1) as f32) / mean
+}
+
+/// Largest single-frame absolute change in `samples`, as a fraction of their
+/// mean level.
+pub fn max_step_fraction(samples: &[f32]) -> f32 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+    let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
+    if mean.abs() < f32::EPSILON {
+        return 0.0;
+    }
+    let max_step = samples
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(0.0_f32, f32::max);
+    max_step / mean
+}
+
+/// First index at or after `from` where `samples` is within `tol_frac` of
+/// `target` (relative to `target`) and stays within it through the end of the
+/// trace. `None` if it never settles.
+pub fn settle_index(samples: &[f32], target: f32, tol_frac: f32, from: usize) -> Option<usize> {
+    if target.abs() < f32::EPSILON {
+        return None;
+    }
+    let tol = (target * tol_frac).abs();
+    let within = |v: f32| (v - target).abs() <= tol;
+    (from..samples.len()).find(|&i| samples[i..].iter().all(|&v| within(v)))
+}
+
+/// Render `scene` through `frames` on the persistent-resource loop, sampling
+/// each [`ProbeBand`] every frame. `scene.lighting` is required when any frame
+/// carries a non-empty `update`; a pan (empty updates) works without it too but
+/// then no lighting cache is bound, so pass a lit scene.
+///
+/// Warm-up: one full-cache re-trace from `frames[0].camera` before the sequence
+/// so the history is seeded. Each frame then re-uploads only its dirty cells and
+/// re-traces only the dirty cell-AABB grown by `halo_cells` (nothing for an
+/// empty update), exactly like a live client.
+pub fn capture_motion_sequence(
+    ctx: &RenderContext,
+    scene: &Scene,
+    frames: &[MotionFrame],
+    probes: &[ProbeBand],
+    out_dir: &Path,
+    opts: &MotionSequenceOptions,
+) -> Result<MotionSequenceReport, RenderError> {
+    std::fs::create_dir_all(out_dir).map_err(|error| RenderError::Image {
+        path: out_dir.display().to_string(),
+        source: image::ImageError::IoError(error),
+    })?;
+    if frames.is_empty() {
+        return Err(RenderError::Gpu(
+            "capture_motion_sequence needs frames".into(),
+        ));
+    }
+
+    let mut volume = scene.lighting.clone();
+    let pipeline = ScenePipeline::new(&ctx.device);
+    let materials = pipeline.material_buffer(&ctx.device, &scene.materials);
+    let indirect =
+        pipeline.indirect_resources(&ctx.device, &ctx.queue, volume.as_ref(), &materials);
+    let (width, height) = (even(opts.width), even(opts.height));
+    let target = OffscreenTarget::new(&ctx.device, width, height);
+
+    // Union of every frame's camera frustum is hard to bound cheaply, so upload
+    // every scene item (the fixtures are small) and let the passes cull.
+    let mut draws = Vec::new();
+    for item in &scene.items {
+        let (vertices, indices) = to_gpu(&item.mesh, item.model);
+        if indices.is_empty() {
+            continue;
+        }
+        draws.push(GpuMesh::create(
+            &ctx.device,
+            &vertices,
+            &indices,
+            UploadBudget::default(),
+        )?);
+    }
+
+    // Shadow cascades once, framed on the first camera.
+    let (light_matrices, _) = ScenePipeline::cascade_data(&frames[0].camera, default_sun_dir());
+    let mut shadow_encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("spall-g2-motion-shadow-encoder"),
+        });
+    for (cascade, matrix) in light_matrices.into_iter().enumerate() {
+        let bind = pipeline.shadow_bind_group(&ctx.device, &ctx.queue, cascade, matrix);
+        let mut pass = shadow_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("spall-g2-motion-shadow-pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: pipeline.shadow_layer(cascade),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline.shadow());
+        pass.set_bind_group(0, &bind, &[]);
+        draw_meshes(&mut pass, &draws);
+    }
+    ctx.queue.submit([shadow_encoder.finish()]);
+
+    let tone_bind = pipeline.tone_bind_group(
+        &ctx.device,
+        &ctx.queue,
+        target.hdr_view(),
+        opts.exposure,
+        opts.view != DebugView::Shaded,
+    );
+
+    // Warm-up: one full-cache re-trace + history seed from the first camera.
+    indirect.set_full_trace_region(&ctx.queue);
+    indirect.set_temporal(&ctx.queue, 1.0, TEMPORAL_SLACK);
+    render_motion_frame(
+        ctx,
+        &pipeline,
+        &indirect,
+        &target,
+        &materials,
+        &draws,
+        scene,
+        &frames[0].camera,
+        opts.view,
+        opts.exposure,
+        &tone_bind,
+        None,
+    )?;
+
+    indirect.set_temporal(&ctx.queue, opts.temporal_weight, TEMPORAL_SLACK);
+
+    let mut traces: Vec<BandTrace> = probes
+        .iter()
+        .map(|p| BandTrace {
+            name: p.name.clone(),
+            band: p.band,
+            luminance: Vec::with_capacity(frames.len()),
+        })
+        .collect();
+    let mut gpu_ms = Vec::with_capacity(frames.len());
+    let mut cpu_ms = Vec::with_capacity(frames.len());
+    let mut images = Vec::new();
+
+    for (i, frame) in frames.iter().enumerate() {
+        if !frame.update.regions.is_empty() || !frame.update.dirty_world_bounds.is_empty() {
+            if let Some(volume) = volume.as_mut() {
+                volume.apply_update(&frame.update);
+                let dirty = volume.take_dirty();
+                indirect.upload_dirty(&ctx.queue, &dirty);
+                let (lo, hi) = trace_region(&dirty, opts.halo_cells);
+                indirect.set_trace_region(&ctx.queue, lo, hi);
+            }
+        } else {
+            indirect.set_trace_region(&ctx.queue, glam::UVec3::ZERO, glam::UVec3::ZERO);
+        }
+
+        let timer = GpuTimer::new(ctx, 5);
+        let cpu_start = Instant::now();
+        render_motion_frame(
+            ctx,
+            &pipeline,
+            &indirect,
+            &target,
+            &materials,
+            &draws,
+            scene,
+            &frame.camera,
+            opts.view,
+            opts.exposure,
+            &tone_bind,
+            timer.as_ref(),
+        )?;
+        let frame_cpu_millis = cpu_start.elapsed().as_secs_f64() * 1000.0;
+
+        let rgba = target.read_rgba(ctx)?;
+        for (probe, trace) in probes.iter().zip(traces.iter_mut()) {
+            trace.luminance.push(band_luminance(
+                &rgba,
+                target.width,
+                target.height,
+                probe.band,
+            ));
+        }
+
+        let keep_png =
+            i == 0 || i + 1 == frames.len() || (opts.png_stride > 0 && i % opts.png_stride == 0);
+        if keep_png {
+            let image: ImageBuffer<Rgba<u8>, _> =
+                ImageBuffer::from_raw(target.width, target.height, rgba)
+                    .expect("readback has width*height*4 bytes");
+            let path = out_dir.join(format!("frame_{i:04}.png"));
+            image.save(&path).map_err(|source| RenderError::Image {
+                path: path.display().to_string(),
+                source,
+            })?;
+            images.push(MotionImage { frame: i, path });
+        }
+
+        cpu_ms.push(frame_cpu_millis);
+        if let Some([trace, denoise, temporal, opaque, tone, ..]) =
+            timer.and_then(|timer| timer.millis(ctx)).as_deref()
+        {
+            gpu_ms.push(trace + denoise + temporal + opaque + tone);
+        }
+    }
+    indirect.set_full_trace_region(&ctx.queue);
+
+    let gpu_frame = FrameStats::from_samples(&gpu_ms);
+    Ok(MotionSequenceReport {
+        gpu_timing_available: gpu_frame.is_some(),
+        adapter: ctx.adapter_name().to_string(),
+        backend: format!("{:?}", ctx.backend()),
+        width: target.width,
+        height: target.height,
+        frames: frames.len(),
+        bands: traces,
+        gpu_frame,
+        cpu_frame: FrameStats::from_samples(&cpu_ms),
+        indirect_cells: indirect.cells,
+        images,
+    })
+}
+
+/// One frame of a motion sequence: dispatch indirect + temporal, then opaque +
+/// tone map (in `view`) into `target`, always copying the result to the
+/// readback buffer. Returns nothing; the caller reads `target` back.
+#[allow(clippy::too_many_arguments)]
+fn render_motion_frame(
+    ctx: &RenderContext,
+    pipeline: &ScenePipeline,
+    indirect: &crate::indirect::IndirectResources,
+    target: &OffscreenTarget,
+    materials: &wgpu::Buffer,
+    draws: &[GpuMesh],
+    scene: &Scene,
+    camera: &Camera,
+    view: DebugView,
+    exposure: f32,
+    tone_bind: &wgpu::BindGroup,
+    timer: Option<&GpuTimer>,
+) -> Result<(), RenderError> {
+    let mut lighting_encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("spall-g2-motion-lighting-encoder"),
+        });
+    pipeline.dispatch_indirect(
+        &mut lighting_encoder,
+        indirect,
+        timer.map(|t| t.compute_writes(0)),
+        timer.map(|t| t.compute_writes(1)),
+    );
+    pipeline.dispatch_indirect_temporal(
+        &mut lighting_encoder,
+        indirect,
+        timer.map(|t| t.compute_writes(2)),
+    );
+    ctx.queue.submit([lighting_encoder.finish()]);
+
+    let scene_bind =
+        pipeline.scene_bind_group(&ctx.device, &ctx.queue, camera, view, exposure, materials);
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("spall-g2-motion-frame-encoder"),
+        });
+    {
+        let timestamp_writes = timer.map(|t| t.writes(3));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("spall-g2-motion-opaque-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target.hdr_view(),
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: scene.clear[0],
+                        g: scene.clear[1],
+                        b: scene.clear[2],
+                        a: scene.clear[3],
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: target.depth_view(),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline.opaque());
+        pass.set_bind_group(0, &scene_bind, &[]);
+        pass.set_bind_group(1, &indirect.history_display_bind, &[]);
+        draw_meshes(&mut pass, draws);
+    }
+    {
+        let timestamp_writes = timer.map(|t| t.writes(4));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("spall-g2-motion-tone-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target.color_view(),
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline.tone_map());
+        pass.set_bind_group(0, tone_bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+    target.copy_to_readback(&mut encoder);
+    ctx.queue.submit([encoder.finish()]);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FrameStats, centered_cell_box};
+    use super::{FrameStats, centered_cell_box, flicker_index, max_step_fraction, settle_index};
     use crate::indirect::LIGHT_VOLUME_DIM;
 
     #[test]
@@ -1458,5 +1897,43 @@ mod tests {
         let (lo, hi) = centered_cell_box(dim * 4);
         assert_eq!(lo, glam::UVec3::ZERO);
         assert_eq!(hi, glam::UVec3::splat(dim));
+    }
+
+    #[test]
+    fn a_steady_trace_has_zero_flicker() {
+        let flat = [12.0_f32; 40];
+        assert_eq!(flicker_index(&flat), 0.0);
+        assert_eq!(max_step_fraction(&flat), 0.0);
+        assert_eq!(flicker_index(&[7.0]), 0.0);
+    }
+
+    #[test]
+    fn flicker_index_is_mean_abs_step_over_mean_level() {
+        // Alternates 10, 12, 10, 12, ... : every step is 2, mean level is 11.
+        let saw: Vec<f32> = (0..20)
+            .map(|i| if i % 2 == 0 { 10.0 } else { 12.0 })
+            .collect();
+        assert!((flicker_index(&saw) - 2.0 / 11.0).abs() < 1e-6);
+        // One 5.0 spike dominates the max step (mean stays ~10.25).
+        let mut spike = vec![10.0_f32; 20];
+        spike[10] = 15.0;
+        let mean = spike.iter().sum::<f32>() / 20.0;
+        assert!((max_step_fraction(&spike) - 5.0 / mean).abs() < 1e-6);
+    }
+
+    #[test]
+    fn settle_index_finds_the_first_lasting_return_to_target() {
+        // Disturbed to ~28 for a while, then back to ~22 and stays there.
+        let mut s = vec![22.0_f32; 60];
+        for v in s.iter_mut().take(30).skip(10) {
+            *v = 28.0;
+        }
+        // 5% of 22 is 1.1; the trace is within tolerance from frame 30 on.
+        assert_eq!(settle_index(&s, 22.0, 0.05, 0), Some(30));
+        // The final frame past tolerance means it never settles.
+        s[59] = 25.0;
+        assert_eq!(settle_index(&s, 22.0, 0.05, 0), None);
+        // A zero target is undefined.
+        assert_eq!(settle_index(&s, 0.0, 0.05, 0), None);
     }
 }
