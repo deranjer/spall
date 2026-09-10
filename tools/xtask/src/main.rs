@@ -73,12 +73,14 @@ struct CaptureArgs {
     /// Render only the named acceptance shape.
     #[arg(long)]
     only: Option<String>,
-    /// Fixture scene: `colored-room` (T13), `lighting-sequence` (T14), or
+    /// Fixture scene: `colored-room` (T13), `lighting-sequence` (T14),
     /// `destruction` (T11a — offscreen frames of the authoritative
-    /// `g1-networked-destruction` cut sequence with GPU pass timings).
+    /// `g1-networked-destruction` cut sequence with GPU pass timings), or
+    /// `g2-frames` (T15 — per-pass GPU frame-cost percentiles over the still
+    /// lighting fixtures at a fixed 1920x1080).
     #[arg(long)]
     scene: Option<String>,
-    #[arg(long, default_value_t = 120_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]
+    #[arg(long, default_value_t = 300_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]
     timeout_ms: u64,
 }
 

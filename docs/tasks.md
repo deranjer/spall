@@ -140,6 +140,29 @@ Capture exterior, indoor colored-light, emissive, thin-wall, and active-collapse
 
 Accept: validation.md G2 evidence reviewed; freeze terrain/detail sizes and renderer direction before shipping persistent world compatibility. Record quality shortfalls explicitly. No assertion of Teardown-equivalent quality without reviewed evidence.
 
+Delivered in increments (ticket stays open until every G2 bullet has evidence
+and a graphics integrator has reviewed it); `docs/reports/G2.md` collects the
+evidence and open items.
+
+- **Increment 1 (GPU frame-cost percentiles).** `spall_render::capture_frame_series`
+  renders one scene for `warmup + measured` consecutive frames at a fixed size
+  and exposure (`Shaded` view only) and reduces each render pass family's
+  per-frame device time to nearest-rank percentiles.
+  `sandbox-capture --scene g2-frames` (also `cargo xtask capture --scene g2-frames`)
+  runs it over the still T13/T14 lighting fixtures at a fixed 1920x1080. Measured
+  on the RTX 4080 SUPER / D3D12 reference adapter: frame-total GPU p50 ~12-13 ms,
+  p95 ~32-38 ms -- the provisional GPU p95 <= 12 ms is missed ~3x, the full
+  128^3 indirect trace dominant. This is the cold full-retrace cost, not the
+  amortised client frame. Evidence: `spall_render`
+  `capture::tests::frame_stats_*`; `sandbox-capture`
+  `tests::g2_frame_scenes_are_distinct_lit_and_framed`; the GPU run is manual.
+- **Increment 2 (later).** Exterior daylight-terrain scene + moving-debris /
+  active-collapse scenes; >= 120 consecutive moving frames; a persistent-resource
+  client frame loop with the CPU frame-work p95 and the combined client p95;
+  bounded-retrace (T14) steady-state cost; quality flags (leakage, ghosting,
+  noise, shadow instability); cross-GPU capture + human review; the cell-size /
+  renderer-direction freeze decision.
+
 ## Persistence, scale, and game-ready slice
 
 ### T16 — Durable world checkpoint and journal

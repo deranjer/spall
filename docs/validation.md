@@ -395,6 +395,26 @@ Required visual behavior: correct silhouettes/materials, soft/contact shadows, v
 
 Provisional target: client p95 frame <=16.7 ms at 1080p after warmup, with GPU p95 <=12 ms and CPU frame work p95 <=4 ms. CPU/GPU overlap; these are not additive proof of the total. Test lighting-only and combined collapse scenes. If indirect lighting cannot fit, record a revised quality/performance decision instead of quietly removing it.
 
+T15 (ENG-22) is delivered in increments; `docs/reports/G2.md` collects the
+evidence and the open items. Increment 1 adds the GPU frame-cost harness:
+
+```sh
+# T15 / G2 GPU frame-cost percentiles. Renders each still lighting fixture
+# (colored rooms, lit/occluded emitter) for 15 warm-up + 120 measured frames
+# at a fixed 1920x1080, exposure 1.0, Shaded view only, and reports nearest-rank
+# per-pass device-time percentiles plus the provisional GPU p95 <= 12 ms verdict.
+# See docs/reports/G2.md. Cold full-cache re-trace cost, not the amortised
+# client frame; exterior terrain, moving sequences, and the CPU/client frame
+# budget are increment 2.
+cargo xtask capture --scene g2-frames --output .local/runs/g2-frames
+```
+
+Measured (RTX 4080 SUPER / D3D12): frame-total GPU p50 ~12-13 ms, p95 ~32-38 ms
+across the four scenes -- the provisional GPU p95 <= 12 ms target is missed by
+~3x, with the full 128^3 indirect trace the dominant cost. CPU-only coverage:
+`spall_render` `capture::tests::frame_stats_*` and `sandbox-capture`
+`tests::g2_frame_scenes_are_distinct_lit_and_framed`; the GPU run is manual.
+
 ### G3 — persistence, late join, and streaming
 
 Use a 256 x 128 x 256 m bounded world with resident cache limits low enough to force eviction. Drive a collapse while a third client joins, then reconnect that client. Traverse away/back, save, and restart. Test crashes at every persistence transaction boundary plus truncated/corrupt data and disk-full injection.

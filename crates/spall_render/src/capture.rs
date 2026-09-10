@@ -821,3 +821,252 @@ fn slugify(label: &str) -> String {
         })
         .collect()
 }
+
+// --- G2 / T15 frame-cost harness ------------------------------------------
+//
+// The G2 graphics gate (`docs/validation.md` "G2") asks for each render pass's
+// timing and the total frame-cost percentiles at a fixed 1920x1080 with fixed
+// exposure/sun/camera/material settings. [`capture_scene`] renders one settled
+// frame and reports a single-frame [`PassTiming`]; this path renders the same
+// scene for many consecutive frames and reduces the per-pass device timings to
+// nearest-rank percentiles.
+
+/// Nearest-rank percentile summary of a set of millisecond samples.
+///
+/// The percentile convention matches `spall_server::commit_latency`: sort
+/// ascending, take the sample at rank `ceil(q * n)` clamped to `[1, n]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameStats {
+    pub samples: usize,
+    pub min_millis: f64,
+    pub p50_millis: f64,
+    pub p95_millis: f64,
+    pub p99_millis: f64,
+    pub max_millis: f64,
+    pub mean_millis: f64,
+}
+
+impl FrameStats {
+    /// Reduce raw millisecond samples to a percentile summary. `None` for an
+    /// empty set.
+    pub fn from_samples(samples: &[f64]) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<f64> = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len();
+        let rank = |q: f64| -> f64 {
+            let r = ((q * n as f64).ceil() as usize).clamp(1, n);
+            sorted[r - 1]
+        };
+        let sum: f64 = sorted.iter().sum();
+        Some(Self {
+            samples: n,
+            min_millis: sorted[0],
+            p50_millis: rank(0.50),
+            p95_millis: rank(0.95),
+            p99_millis: rank(0.99),
+            max_millis: sorted[n - 1],
+            mean_millis: sum / n as f64,
+        })
+    }
+}
+
+/// Settings for a [`capture_frame_series`] run.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameSeriesOptions {
+    pub width: u32,
+    pub height: u32,
+    /// Fixed linear exposure, held across every frame.
+    pub exposure: f32,
+    /// Frames rendered and discarded before measurement so shader/pipeline
+    /// warm-up and first-use allocations stay out of the percentiles.
+    pub warmup_frames: u32,
+    /// Frames folded into the percentiles.
+    pub measured_frames: u32,
+}
+
+impl Default for FrameSeriesOptions {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            exposure: 1.0,
+            warmup_frames: 10,
+            measured_frames: 60,
+        }
+    }
+}
+
+/// Per-pass-family GPU percentile blocks for a [`capture_frame_series`] run.
+/// Every field is `None` when the adapter has no timestamp queries.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameSeriesPasses {
+    /// Sum of every measured pass family for the frame.
+    pub gpu_total: Option<FrameStats>,
+    pub indirect_trace: Option<FrameStats>,
+    pub indirect_denoise: Option<FrameStats>,
+    pub shadow: Option<FrameStats>,
+    pub opaque: Option<FrameStats>,
+    pub tone_map: Option<FrameStats>,
+}
+
+/// Result of a [`capture_frame_series`] run.
+#[derive(Debug, Clone)]
+pub struct FrameSeriesReport {
+    pub adapter: String,
+    pub backend: String,
+    pub width: u32,
+    pub height: u32,
+    pub warmup_frames: u32,
+    pub measured_frames: u32,
+    /// `true` iff the measured frames carry real device timings.
+    pub gpu_timing_available: bool,
+    pub passes: FrameSeriesPasses,
+    pub indirect_enabled: bool,
+    pub indirect_cells: usize,
+    /// First measured frame, kept for the visual acceptance record.
+    pub first_image: PathBuf,
+    /// Last measured frame.
+    pub last_image: PathBuf,
+}
+
+/// Render `scene` for `warmup_frames + measured_frames` consecutive frames at a
+/// fixed size and exposure — only the `Shaded` view, i.e. the passes the G2
+/// frame target is about: indirect trace + denoise, the shadow cascades, one
+/// opaque pass and one tone-map pass — and report nearest-rank percentiles of
+/// each pass family's device time over the measured frames.
+///
+/// This is the G2 / T15 GPU frame-cost path: it measures the device-time
+/// distribution of a settled frame. It does **not** model a persistent-resource
+/// client frame loop or the CPU frame budget — each frame here rebuilds the
+/// pipeline and re-uploads the scene, so the CPU-side numbers from the inner
+/// [`capture_scene`] calls are not representative and are not reported. A
+/// representative client-frame loop and the CPU p95 remain later T15 increments.
+pub fn capture_frame_series(
+    ctx: &RenderContext,
+    scene: &Scene,
+    out_dir: &Path,
+    opts: &FrameSeriesOptions,
+) -> Result<FrameSeriesReport, RenderError> {
+    std::fs::create_dir_all(out_dir).map_err(|error| RenderError::Image {
+        path: out_dir.display().to_string(),
+        source: image::ImageError::IoError(error),
+    })?;
+    let scratch = out_dir.join("_frame");
+    let capture_opts = CaptureOptions {
+        width: opts.width,
+        height: opts.height,
+        views: vec![DebugView::Shaded],
+        budget: UploadBudget::default(),
+        exposure: opts.exposure,
+    };
+
+    let total = opts.warmup_frames.saturating_add(opts.measured_frames);
+    let mut total_ms = Vec::new();
+    let mut trace_ms = Vec::new();
+    let mut denoise_ms = Vec::new();
+    let mut shadow_ms = Vec::new();
+    let mut opaque_ms = Vec::new();
+    let mut tone_ms = Vec::new();
+    let (mut adapter, mut backend) = (String::new(), String::new());
+    let (mut indirect_enabled, mut indirect_cells) = (false, 0usize);
+    let first_image = out_dir.join("first.png");
+    let last_image = out_dir.join("last.png");
+
+    for frame in 0..total {
+        let report = capture_scene(ctx, scene, &scratch, &capture_opts)?;
+        adapter = report.adapter.clone();
+        backend = report.backend.clone();
+        indirect_enabled = report.indirect_enabled;
+        indirect_cells = report.indirect_cells;
+
+        let shaded = scratch.join("shaded.png");
+        if frame == opts.warmup_frames {
+            let _ = std::fs::copy(&shaded, &first_image);
+        }
+        if frame + 1 == total {
+            let _ = std::fs::copy(&shaded, &last_image);
+        }
+        if frame < opts.warmup_frames {
+            continue;
+        }
+        if let Some(passes) = report.timing.gpu_passes {
+            total_ms.push(passes.total());
+            trace_ms.push(passes.indirect_trace_millis);
+            denoise_ms.push(passes.indirect_denoise_millis);
+            shadow_ms.push(passes.shadow_millis);
+            opaque_ms.push(passes.opaque_millis);
+            tone_ms.push(passes.tone_map_millis);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    let passes = FrameSeriesPasses {
+        gpu_total: FrameStats::from_samples(&total_ms),
+        indirect_trace: FrameStats::from_samples(&trace_ms),
+        indirect_denoise: FrameStats::from_samples(&denoise_ms),
+        shadow: FrameStats::from_samples(&shadow_ms),
+        opaque: FrameStats::from_samples(&opaque_ms),
+        tone_map: FrameStats::from_samples(&tone_ms),
+    };
+    Ok(FrameSeriesReport {
+        gpu_timing_available: passes.gpu_total.is_some(),
+        adapter,
+        backend,
+        width: capture_opts.width,
+        height: capture_opts.height,
+        warmup_frames: opts.warmup_frames,
+        measured_frames: opts.measured_frames,
+        passes,
+        indirect_enabled,
+        indirect_cells,
+        first_image,
+        last_image,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameStats;
+
+    #[test]
+    fn frame_stats_are_empty_for_no_samples() {
+        assert!(FrameStats::from_samples(&[]).is_none());
+    }
+
+    #[test]
+    fn frame_stats_use_nearest_rank_percentiles() {
+        // 1..=100, deliberately shuffled.
+        let mut samples: Vec<f64> = (1..=100).map(f64::from).collect();
+        samples.swap(0, 99);
+        samples.swap(10, 40);
+        let stats = FrameStats::from_samples(&samples).expect("100 samples");
+
+        assert_eq!(stats.samples, 100);
+        assert_eq!(stats.min_millis, 1.0);
+        assert_eq!(stats.max_millis, 100.0);
+        // nearest-rank: ceil(0.50*100)=50, ceil(0.95*100)=95, ceil(0.99*100)=99
+        assert_eq!(stats.p50_millis, 50.0);
+        assert_eq!(stats.p95_millis, 95.0);
+        assert_eq!(stats.p99_millis, 99.0);
+        assert!((stats.mean_millis - 50.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn frame_stats_single_sample_collapses_to_that_value() {
+        let stats = FrameStats::from_samples(&[7.5]).expect("one sample");
+        assert_eq!(stats.samples, 1);
+        for v in [
+            stats.min_millis,
+            stats.p50_millis,
+            stats.p95_millis,
+            stats.p99_millis,
+            stats.max_millis,
+            stats.mean_millis,
+        ] {
+            assert_eq!(v, 7.5);
+        }
+    }
+}

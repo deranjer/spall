@@ -17,8 +17,10 @@ use spall_jobs::{Generation, TopologyEpoch};
 use spall_mesh::fixtures::{AcceptanceShape, acceptance_shapes, mesh_shape};
 use spall_mesh::{MeshOptions, MeshStrategy, build_volume_mesh};
 use spall_render::{
-    Camera, CaptureOptions, DebugView, LightingStep, RenderContext, RenderError, Scene, SceneItem,
-    SequenceOptions, capture_lighting_sequence, capture_scene, colored_rooms, rapid_destruction,
+    Camera, CaptureOptions, DebugView, FrameSeriesOptions, FrameStats, LightingStep, RenderContext,
+    RenderError, Scene, SceneItem, SequenceOptions, capture_frame_series,
+    capture_lighting_sequence, capture_scene, colored_rooms, emitter_occlusion_scenes,
+    rapid_destruction,
 };
 use spall_sim::{EditIntent, EditTarget, RequestId, Simulation, SimulationConfig, fixtures};
 use spall_voxel::Volume;
@@ -62,13 +64,20 @@ struct Args {
     /// Render only this shape (by name). Omit to render every acceptance shape.
     #[arg(long)]
     only: Option<String>,
-    /// Fixture scene: `colored-room` (T13) or `lighting-sequence` (T14).
+    /// Fixture scene: `colored-room` (T13), `lighting-sequence` (T14), or
+    /// `g2-frames` (T15 GPU frame-cost percentiles).
     #[arg(long)]
     scene: Option<String>,
     /// `lighting-sequence` only: settle frames rendered after the edit so the
     /// temporal history's convergence latency can be measured.
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=120))]
     settle_frames: u32,
+    /// `g2-frames` only: frames rendered and discarded before measurement.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(0..=240))]
+    g2_warmup_frames: u32,
+    /// `g2-frames` only: frames folded into the per-pass percentiles.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=600))]
+    g2_measured_frames: u32,
 }
 
 #[derive(Serialize)]
@@ -731,6 +740,157 @@ fn run_destruction(args: &Args) -> Result<DestructionSummary, RenderError> {
     })
 }
 
+// --- `--scene g2-frames` (T15 / ENG-22 increment 1) ------------------------
+
+/// Provisional G2 GPU frame p95 target (`docs/validation.md` "G2").
+const G2_GPU_P95_TARGET_MS: f64 = 12.0;
+
+#[derive(Serialize)]
+struct G2StatBlock {
+    samples: usize,
+    min_millis: f64,
+    p50_millis: f64,
+    p95_millis: f64,
+    p99_millis: f64,
+    max_millis: f64,
+    mean_millis: f64,
+}
+
+impl From<FrameStats> for G2StatBlock {
+    fn from(s: FrameStats) -> Self {
+        Self {
+            samples: s.samples,
+            min_millis: s.min_millis,
+            p50_millis: s.p50_millis,
+            p95_millis: s.p95_millis,
+            p99_millis: s.p99_millis,
+            max_millis: s.max_millis,
+            mean_millis: s.mean_millis,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct G2SceneSummary {
+    name: String,
+    indirect_cells: usize,
+    /// `true` only when the blocks below are measured device timings.
+    gpu_timing_available: bool,
+    /// Sum of every measured pass family per frame.
+    gpu_total: Option<G2StatBlock>,
+    gpu_indirect_trace: Option<G2StatBlock>,
+    gpu_indirect_denoise: Option<G2StatBlock>,
+    gpu_shadow: Option<G2StatBlock>,
+    gpu_opaque: Option<G2StatBlock>,
+    gpu_tone_map: Option<G2StatBlock>,
+    /// `gpu_total` p95 <= the provisional target; `null` without GPU timing.
+    gpu_p95_target_met: Option<bool>,
+    first_image: String,
+    last_image: String,
+}
+
+#[derive(Serialize)]
+struct G2FramesSummary {
+    /// Version 1: T15 increment 1 — GPU frame-cost percentiles on the existing
+    /// T13/T14 lighting fixtures.
+    version: u32,
+    mode: &'static str,
+    adapter: String,
+    backend: String,
+    width: u32,
+    height: u32,
+    exposure: f32,
+    warmup_frames: u32,
+    measured_frames: u32,
+    gpu_timing_available: bool,
+    gpu_p95_target_millis: f64,
+    /// Worst `gpu_total` p95 across every measured scene; `null` without GPU
+    /// timing.
+    worst_gpu_total_p95_millis: Option<f64>,
+    /// `true` iff every scene with GPU timing met the p95 target.
+    gpu_p95_target_met: Option<bool>,
+    scenes: Vec<G2SceneSummary>,
+}
+
+/// The G2 still scenes covered by increment 1. Exterior daylight terrain and
+/// the moving-debris / active-collapse sequences are increment 2.
+fn g2_frame_scenes(aspect: f32) -> Vec<(String, Scene)> {
+    let mut scenes: Vec<(String, Scene)> = Vec::new();
+    for room in colored_rooms(aspect) {
+        scenes.push((room.name.to_string(), room.scene));
+    }
+    let eo = emitter_occlusion_scenes(aspect);
+    scenes.push(("emitter_occlusion_lit".to_string(), eo.lit));
+    scenes.push(("emitter_occlusion_occluded".to_string(), eo.occluded));
+    scenes
+}
+
+fn run_g2_frames(args: &Args) -> Result<G2FramesSummary, RenderError> {
+    let ctx = RenderContext::headless()?;
+    // The gate fixes 1920x1080; `--width`/`--height` do not apply to this mode.
+    let (width, height) = (1920u32, 1080u32);
+    let aspect = capture_aspect(width, height);
+    let opts = FrameSeriesOptions {
+        width,
+        height,
+        exposure: 1.0,
+        warmup_frames: args.g2_warmup_frames,
+        measured_frames: args.g2_measured_frames,
+    };
+
+    let mut scene_summaries = Vec::new();
+    let (mut adapter, mut backend) = (String::new(), String::new());
+    let mut worst_p95: Option<f64> = None;
+    let mut any_timed = false;
+    let mut all_met = true;
+
+    for (name, scene) in g2_frame_scenes(aspect) {
+        let report = capture_frame_series(&ctx, &scene, &args.out.join(&name), &opts)?;
+        adapter = report.adapter.clone();
+        backend = report.backend.clone();
+
+        let scene_met = report.passes.gpu_total.map(|t| {
+            any_timed = true;
+            worst_p95 = Some(worst_p95.map_or(t.p95_millis, |w| w.max(t.p95_millis)));
+            let met = t.p95_millis <= G2_GPU_P95_TARGET_MS;
+            all_met &= met;
+            met
+        });
+
+        scene_summaries.push(G2SceneSummary {
+            name,
+            indirect_cells: report.indirect_cells,
+            gpu_timing_available: report.gpu_timing_available,
+            gpu_total: report.passes.gpu_total.map(Into::into),
+            gpu_indirect_trace: report.passes.indirect_trace.map(Into::into),
+            gpu_indirect_denoise: report.passes.indirect_denoise.map(Into::into),
+            gpu_shadow: report.passes.shadow.map(Into::into),
+            gpu_opaque: report.passes.opaque.map(Into::into),
+            gpu_tone_map: report.passes.tone_map.map(Into::into),
+            gpu_p95_target_met: scene_met,
+            first_image: report.first_image.display().to_string(),
+            last_image: report.last_image.display().to_string(),
+        });
+    }
+
+    Ok(G2FramesSummary {
+        version: 1,
+        mode: "g2-frames",
+        adapter,
+        backend,
+        width,
+        height,
+        exposure: 1.0,
+        warmup_frames: opts.warmup_frames,
+        measured_frames: opts.measured_frames,
+        gpu_timing_available: any_timed,
+        gpu_p95_target_millis: G2_GPU_P95_TARGET_MS,
+        worst_gpu_total_p95_millis: worst_p95,
+        gpu_p95_target_met: any_timed.then_some(all_met),
+        scenes: scene_summaries,
+    })
+}
+
 /// Serialise `result` to `<out>/summary.json` and turn it into a process exit
 /// code, so every scene mode shares one write + error path.
 fn finish<T: Serialize>(out: &std::path::Path, result: Result<T, RenderError>) -> ExitCode {
@@ -780,6 +940,9 @@ fn main() -> ExitCode {
     }
     if args.scene.as_deref() == Some("destruction") {
         return finish(&args.out, run_destruction(&args));
+    }
+    if args.scene.as_deref() == Some("g2-frames") {
+        return finish(&args.out, run_g2_frames(&args));
     }
     finish(&args.out, run(&args))
 }
@@ -916,6 +1079,32 @@ mod tests {
             (ratio - 0.75).abs() < 0.03,
             "expected the mismatched projection to squash to ~0.75, got {ratio}"
         );
+    }
+
+    #[test]
+    fn g2_frame_scenes_are_distinct_lit_and_framed() {
+        let scenes = g2_frame_scenes(1920.0 / 1080.0);
+        assert_eq!(
+            scenes.len(),
+            4,
+            "increment 1 covers the two rooms and the lit/occluded emitter scenes"
+        );
+        let names: Vec<&str> = scenes.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"colored_room_open"));
+        assert!(names.contains(&"colored_room_closed"));
+        assert!(names.contains(&"emitter_occlusion_lit"));
+        assert!(names.contains(&"emitter_occlusion_occluded"));
+        for (name, scene) in &scenes {
+            assert!(!scene.items.is_empty(), "{name}: has geometry to draw");
+            assert!(
+                scene.lighting.is_some(),
+                "{name}: carries a lighting volume"
+            );
+            assert!(
+                scene.world_bounds().is_some(),
+                "{name}: framed onto its bounds"
+            );
+        }
     }
 
     #[test]

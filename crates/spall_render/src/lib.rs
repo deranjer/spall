@@ -19,8 +19,9 @@ pub mod vertex;
 
 pub use camera::{Aabb, Camera, Frustum};
 pub use capture::{
-    CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, LightingStep, SequenceOptions,
-    SequenceReport, SequenceStep, capture_lighting_sequence, capture_scene,
+    CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, FrameSeriesOptions,
+    FrameSeriesPasses, FrameSeriesReport, FrameStats, LightingStep, SequenceOptions,
+    SequenceReport, SequenceStep, capture_frame_series, capture_lighting_sequence, capture_scene,
 };
 pub use context::{RenderContext, RenderError};
 pub use fixtures::{
