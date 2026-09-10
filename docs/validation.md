@@ -551,9 +551,13 @@ a late client that either converged or ended in that bounded explicit failure
 (not a hang) while the live clients keep going — built-in
 `t23-g3-impaired-join` delays the late connect past server shutdown so the
 failure is deterministic. CPU proof: `cargo test -p spall_sim --test
-separated_regions`. G3 rows still open (resident-cache eviction,
-traverse-away/back, the join-duration budget, and the whole G4 eight-client
-workload + soak) are tracked in `docs/reports/G3.md`.
+separated_regions`. Increment 5 is a design (`docs/reports/G3-residency-hash.md`)
+for the row-7 blocker: `world_hash()` folds resident bricks only, so live
+resident-cache eviction in `serve()` first needs a residency-aware hash that
+stays bit-identical to `world_hash()` when nothing is evicted. G3 rows still
+open (the residency wiring itself, traverse-away/back, the join-duration budget,
+and the whole G4 eight-client workload + soak) are tracked in
+`docs/reports/G3.md`.
 
 ### G4 — eight-client engine slice
 
