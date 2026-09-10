@@ -16,6 +16,19 @@ use spall_voxel::{EditPlan, Volume};
 use crate::body::BodyPose;
 use crate::world::WorldSetup;
 
+/// Physics config for the fixtures: rapier's CCD solver pass off, matching
+/// `spall_server::serve` (`setup.physics.disable_ccd = true`). No authoritative
+/// body ever enables per-body CCD, and the CCD broad-phase BVH can otherwise
+/// retain a stale proxy for a collider a voxel edit removed and re-inserted in
+/// the same step, then panic mid-sweep — reachable now that body-on-body
+/// fracture (T21 increment 3) rebuilds a dynamic collider under a live impact.
+fn sim_physics_config() -> PhysicsConfig {
+    PhysicsConfig {
+        disable_ccd: true,
+        ..PhysicsConfig::default()
+    }
+}
+
 /// Fixture stone: id 1, 2600 kg/m³.
 pub const STONE: MaterialId = MaterialId(1);
 /// Fixture dirt: id 2, 1500 kg/m³.
@@ -103,7 +116,7 @@ pub fn flat_terrain_setup() -> WorldSetup {
         terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(23, 9, 23)),
         materials: stone_manifest(),
         anchor: AnchorPlane::at(0),
-        physics: PhysicsConfig::default(),
+        physics: sim_physics_config(),
     }
 }
 
@@ -121,7 +134,7 @@ pub fn bridged_terrain_setup() -> WorldSetup {
         terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(23, 15, 3)),
         materials: stone_manifest(),
         anchor: AnchorPlane::at(0),
-        physics: PhysicsConfig::default(),
+        physics: sim_physics_config(),
     }
 }
 
@@ -137,7 +150,7 @@ pub fn cross_brick_bridged_setup() -> WorldSetup {
         terrain_collider_region: (GlobalCell::new(20, 0, 0), GlobalCell::new(44, 15, 3)),
         materials: stone_manifest(),
         anchor: AnchorPlane::at(0),
-        physics: PhysicsConfig::default(),
+        physics: sim_physics_config(),
     }
 }
 
@@ -154,7 +167,7 @@ pub fn checkerboard_split_setup() -> WorldSetup {
         terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(31, 31, 31)),
         materials: stone_manifest(),
         anchor: AnchorPlane::at(0),
-        physics: PhysicsConfig::default(),
+        physics: sim_physics_config(),
     }
 }
 
@@ -171,7 +184,7 @@ pub fn bulk_split_setup() -> WorldSetup {
         terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(63, 63, 63)),
         materials: stone_manifest(),
         anchor: AnchorPlane::at(0),
-        physics: PhysicsConfig::default(),
+        physics: sim_physics_config(),
     }
 }
 
@@ -186,7 +199,7 @@ pub fn walk_arena_setup() -> WorldSetup {
         terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(119, 13, 15)),
         materials: stone_manifest(),
         anchor: AnchorPlane::at(0),
-        physics: PhysicsConfig::default(),
+        physics: sim_physics_config(),
     }
 }
 
@@ -407,7 +420,7 @@ pub fn far_bridged_terrain_setup() -> WorldSetup {
         terrain_collider_region: (GlobalCell::new(24, 0, 0), GlobalCell::new(39, 20, 2)),
         materials: stone_manifest(),
         anchor: AnchorPlane::at(0),
-        physics: PhysicsConfig::default(),
+        physics: sim_physics_config(),
     }
 }
 
@@ -439,7 +452,7 @@ pub fn far_raised_block_setup() -> WorldSetup {
         terrain_collider_region: (GlobalCell::new(24, 6, 0), GlobalCell::new(43, 20, 3)),
         materials: stone_manifest(),
         anchor: AnchorPlane::at(8),
-        physics: PhysicsConfig::default(),
+        physics: sim_physics_config(),
     }
 }
 
