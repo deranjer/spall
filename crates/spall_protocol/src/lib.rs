@@ -51,8 +51,8 @@ pub use records::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, BaselineAck, BaselineBegin,
     BaselineEnd, BaselinePart, BaselineRegion, BrickRevision, ClaimedTarget, ControlSeq,
     DurableThrough, InputFrame, InputSeq, InterestEpoch, MotionSnapshot, RecentInput, Record,
-    RecordError, RepairKey, RepairRequest, RequestId, SnapshotSeq, TopologyOp, TopologyTransaction,
-    TransferId, VolumeHash, WIRE_SCHEMA_VERSION, WireTag,
+    RecordError, RepairKey, RepairRequest, RequestId, SPLIT_BULK_TRANSFER_ID_BIT, SnapshotSeq,
+    TopologyOp, TopologyTransaction, TransferId, VolumeHash, WIRE_SCHEMA_VERSION, WireTag,
 };
 pub use session::{
     GenerationExhausted, SeqVerdict, SequenceGate, SessionId, SessionRegistry, SlotId,

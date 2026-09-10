@@ -158,6 +158,9 @@ pub enum BaselineScene {
     /// [`spall_voxel::fixtures::checkerboard_split_scene`] — a fragmented block
     /// whose detach overflows the inline `CellRun` budget (T17 / ENG-64).
     CheckerboardSplit,
+    /// [`spall_voxel::fixtures::bulk_split_scene`] — a block whose detach
+    /// overflows even the inline op-blob cap (T17 increment 2 / ENG-64).
+    BulkSplit,
 }
 
 impl BaselineScene {
@@ -169,6 +172,7 @@ impl BaselineScene {
                 Some(Self::CrossBridgeCut)
             }
             "checkerboard-split" | "oversized-split" => Some(Self::CheckerboardSplit),
+            "bulk-split" | "giant-split" => Some(Self::BulkSplit),
             _ => None,
         }
     }
@@ -178,6 +182,7 @@ impl BaselineScene {
             Self::BridgeCut => spall_voxel::fixtures::bridge_scene(id),
             Self::CrossBridgeCut => spall_voxel::fixtures::cross_brick_bridge_scene(id),
             Self::CheckerboardSplit => spall_voxel::fixtures::checkerboard_split_scene(id),
+            Self::BulkSplit => spall_voxel::fixtures::bulk_split_scene(id),
         }
     }
 }
@@ -308,6 +313,9 @@ struct Counters {
     last_tick: AtomicU64,
     /// Hash-repair baseline patches applied mid-session (T17).
     patches: AtomicU64,
+    /// Giant bulk-split `BaselineWorld`s received and applied mid-session
+    /// (T17 increment 2).
+    bulk_splits: AtomicU64,
     /// Resident bricks in the installed late-join baseline (T17).
     baseline_bricks: AtomicU64,
     /// Entity id (+1, so `0` means "never fired") a `DetachedBody` scripted cut
@@ -379,6 +387,28 @@ async fn receive_baseline_body(conn: &Connection) -> Option<BaselineWorld> {
             Ok(Some(_)) => continue,
             Ok(None) | Err(_) => return None,
         }
+    }
+}
+
+/// Forwards one [`ApplyOutcome`] from the control reader: counts a publish,
+/// sends each `RepairRequest` of a `NeedsRepair`, counts a rejection. A
+/// `Duplicate` or an `AwaitingBulkSplit` hold needs nothing — the blob's
+/// `BaselineBegin` will retry it.
+async fn forward_outcome(conn: &Connection, counters: &Counters, outcome: ApplyOutcome) {
+    match outcome {
+        ApplyOutcome::Published { .. } => {
+            counters.applied.fetch_add(1, Ordering::Relaxed);
+        }
+        ApplyOutcome::NeedsRepair(reqs) => {
+            for req in reqs {
+                let _ = conn.send_record(WireRecord::RepairRequest(req)).await;
+                counters.repairs.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        ApplyOutcome::Rejected { .. } => {
+            counters.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        ApplyOutcome::Duplicate | ApplyOutcome::AwaitingBulkSplit { .. } => {}
     }
 }
 
@@ -559,31 +589,31 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             }
                         }
                         for outcome in outcomes {
-                            match outcome {
-                                ApplyOutcome::Published { .. } => {
-                                    counters.applied.fetch_add(1, Ordering::Relaxed);
-                                }
-                                ApplyOutcome::NeedsRepair(reqs) => {
-                                    for req in reqs {
-                                        let _ =
-                                            conn.send_record(WireRecord::RepairRequest(req)).await;
-                                        counters.repairs.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                                ApplyOutcome::Rejected { .. } => {
-                                    counters.rejected.fetch_add(1, Ordering::Relaxed);
-                                }
-                                ApplyOutcome::Duplicate => {}
-                            }
+                            forward_outcome(&conn, &counters, outcome).await;
                         }
                     }
-                    Ok(Some(WireRecord::BaselineBegin(_))) => {
-                        // A mid-session hash-repair patch: one-brick baseline
-                        // transfer, merged into the live replica. ENG-49: after
-                        // it lands, retry every transaction that was held
-                        // pending this gap so no committed ops are lost, and
-                        // forward any fresh repair requests those retries raise.
+                    Ok(Some(WireRecord::BaselineBegin(begin))) => {
+                        // T17 increment 2: a `transfer_id` with the reserved high
+                        // bit is a giant bulk split's `BaselineWorld` — hand it
+                        // to the replica and retry the marker transaction held on
+                        // it. Otherwise it is a mid-session hash-repair patch
+                        // (one-brick baseline), merged into the live replica,
+                        // after which every `before`-gapped held transaction is
+                        // retried (ENG-49).
+                        let is_split =
+                            begin.transfer_id.0 & spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT != 0;
                         match receive_baseline_body(&conn).await {
+                            Some(world) if is_split => {
+                                let retried = {
+                                    let mut guard =
+                                        replica.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.provide_bulk_split_world(begin.transfer_id.0, world)
+                                };
+                                counters.bulk_splits.fetch_add(1, Ordering::Relaxed);
+                                for (_, outcome) in retried {
+                                    forward_outcome(&conn, &counters, outcome).await;
+                                }
+                            }
                             Some(patch) => {
                                 let (applied, retried) = {
                                     let mut guard =
@@ -598,23 +628,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                     counters.patches.fetch_add(1, Ordering::Relaxed);
                                 }
                                 for (_, outcome) in retried {
-                                    match outcome {
-                                        ApplyOutcome::Published { .. } => {
-                                            counters.applied.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        ApplyOutcome::NeedsRepair(reqs) => {
-                                            for req in reqs {
-                                                let _ = conn
-                                                    .send_record(WireRecord::RepairRequest(req))
-                                                    .await;
-                                                counters.repairs.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                        }
-                                        ApplyOutcome::Rejected { .. } => {
-                                            counters.rejected.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        ApplyOutcome::Duplicate => {}
-                                    }
+                                    forward_outcome(&conn, &counters, outcome).await;
                                 }
                             }
                             None => break,

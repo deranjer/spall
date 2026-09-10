@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use spall_protocol::baseline::{BaselineDecodeError, BaselineWorld};
 use spall_protocol::{
     CodecError, MotionSnapshot, TopologyTransaction, decode_control, encode_control,
 };
@@ -22,6 +23,12 @@ use spall_protocol::{
 /// this module. A database written by a newer schema is rejected on open
 /// without modification (`docs/protocol.md`: "Unknown newer schemas are
 /// rejected without modifying the database").
+///
+/// **Deliberately kept at 1 for the T17-increment-2 `JournalPayload::TopologyBulkSplit`
+/// addition (ENG-64):** appending a `postcard` enum variant leaves every existing
+/// `Topology` / `PoseBatch` row fully decodable, this repo has no deployed older
+/// binary, and no migration harness exists — bumping would reject every existing
+/// world database on open with `SchemaTooOld`.
 pub const STORE_SCHEMA_VERSION: u32 = 1;
 
 /// Largest accepted stored brick payload, compressed. `docs/protocol.md` caps a
@@ -37,6 +44,8 @@ pub enum DtoError {
     Postcard(#[from] postcard::Error),
     #[error("protocol codec: {0}")]
     Codec(#[from] CodecError),
+    #[error("bulk split baseline: {0}")]
+    Baseline(#[from] BaselineDecodeError),
 }
 
 /// Encode a save record to its postcard bytes.
@@ -181,6 +190,22 @@ pub enum JournalPayload {
         /// `encode_control(&MotionSnapshot)` bytes.
         snapshots: Vec<Vec<u8>>,
     },
+    /// T17 increment 2 (ENG-64): a giant split whose geometry did not fit even a
+    /// compressed inline op blob. `transaction` decodes to a
+    /// `TopologyTransaction` whose ops are `SplitOffBulkBaseline` /
+    /// `SourcePatchBulkBaseline` markers only; `baseline` is
+    /// `BaselineWorld::encode_compressed()` — every child volume plus the
+    /// source's post-cut affected bricks — replayed exactly like the bulk
+    /// transfer a live replica assembles. **Appended variant:** older `Topology`
+    /// / `PoseBatch` rows keep their discriminant indices and still decode.
+    TopologyBulkSplit {
+        /// `encode_control(&TopologyTransaction)` bytes (marker ops only, small).
+        transaction: Vec<u8>,
+        /// `encode_control(&MotionSnapshot)` bytes, one per participant body.
+        participants: Vec<Vec<u8>>,
+        /// `BaselineWorld::encode_compressed()` bytes (zstd).
+        baseline: Vec<u8>,
+    },
 }
 
 impl JournalPayload {
@@ -196,6 +221,48 @@ impl JournalPayload {
                 .map(encode_control)
                 .collect::<Result<_, _>>()?,
         })
+    }
+
+    /// Build a `TopologyBulkSplit` payload: the marker transaction, its
+    /// participants, and the out-of-band `BaselineWorld` (T17 increment 2).
+    pub fn topology_bulk_split(
+        transaction: &TopologyTransaction,
+        participants: &[MotionSnapshot],
+        baseline: &BaselineWorld,
+    ) -> Result<Self, DtoError> {
+        Ok(Self::TopologyBulkSplit {
+            transaction: encode_control(transaction)?,
+            participants: participants
+                .iter()
+                .map(encode_control)
+                .collect::<Result<_, _>>()?,
+            baseline: baseline.encode_compressed(),
+        })
+    }
+
+    /// Decode a `TopologyBulkSplit` payload. Returns `None` for any other
+    /// variant.
+    #[allow(clippy::type_complexity)]
+    pub fn as_topology_bulk_split(
+        &self,
+    ) -> Option<Result<(TopologyTransaction, Vec<MotionSnapshot>, BaselineWorld), DtoError>> {
+        let Self::TopologyBulkSplit {
+            transaction,
+            participants,
+            baseline,
+        } = self
+        else {
+            return None;
+        };
+        Some((|| {
+            let tx = decode_control::<TopologyTransaction>(transaction)?;
+            let parts = participants
+                .iter()
+                .map(|b| decode_control::<MotionSnapshot>(b))
+                .collect::<Result<Vec<_>, _>>()?;
+            let world = BaselineWorld::decode_compressed(baseline)?;
+            Ok((tx, parts, world))
+        })())
     }
 
     /// Build a `PoseBatch` payload from live protocol records.
@@ -276,6 +343,56 @@ mod tests {
         assert_eq!(tx, a_tx());
         assert!(parts.is_empty());
         assert!(payload.as_pose_batch().is_none());
+    }
+
+    fn a_baseline_world() -> BaselineWorld {
+        use spall_protocol::baseline::{
+            BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume,
+        };
+        BaselineWorld {
+            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            checkpoint_tick: 9,
+            volumes: vec![BaselineVolume {
+                volume_id: VolumeId::new(2).unwrap(),
+                cell_size_code: 2,
+                owner: BaselineOwner::Body(spall_core::EntityId::new(5).unwrap()),
+                bounds: Some([[0, 0, 0], [0, 0, 0]]),
+                bricks: vec![BaselineBrick {
+                    coord: [0, 0, 0],
+                    revision: 2,
+                    edited: true,
+                    cells: BaselineCells::Uniform(1),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn journal_topology_bulk_split_round_trips() {
+        let world = a_baseline_world();
+        let payload = JournalPayload::topology_bulk_split(&a_tx(), &[], &world).unwrap();
+        let (tx, parts, w) = payload.as_topology_bulk_split().unwrap().unwrap();
+        assert_eq!(tx, a_tx());
+        assert!(parts.is_empty());
+        assert_eq!(w, world);
+        // The variant is disjoint from the other accessors.
+        assert!(payload.as_topology().is_none());
+        assert!(payload.as_pose_batch().is_none());
+    }
+
+    #[test]
+    fn appending_the_bulk_split_variant_keeps_old_rows_decodable() {
+        // A `Topology` row encoded before the new variant existed still round
+        // trips (postcard variant-append is one-way compatible; keep
+        // STORE_SCHEMA_VERSION at 1).
+        let payload = JournalPayload::Topology {
+            transaction: encode_control(&a_tx()).unwrap(),
+            participants: vec![],
+        };
+        let bytes = encode(&payload).unwrap();
+        let back: JournalPayload = decode(&bytes).unwrap();
+        assert_eq!(back, payload);
+        assert_eq!(STORE_SCHEMA_VERSION, 1);
     }
 
     #[test]

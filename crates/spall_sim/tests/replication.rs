@@ -117,7 +117,10 @@ impl Replica {
                 }
                 // This mini-applier only covers the inline-encoded scenes it
                 // drives; the compressed-blob split path (T17) has its own tests.
-                TopologyOp::SplitOffBaseline { .. } | TopologyOp::SourcePatchBaseline { .. } => {
+                TopologyOp::SplitOffBaseline { .. }
+                | TopologyOp::SourcePatchBaseline { .. }
+                | TopologyOp::SplitOffBulkBaseline { .. }
+                | TopologyOp::SourcePatchBulkBaseline { .. } => {
                     panic!("test applier does not handle split baseline ops")
                 }
             }

@@ -256,10 +256,18 @@ pub fn journal_records(entries: &[JournalEntry]) -> Result<Vec<JournalRecord>, P
     entries
         .iter()
         .map(|e| {
+            let payload = match &e.bulk_baseline {
+                // T17 increment 2: a giant split's marker transaction plus its
+                // out-of-band `BaselineWorld`.
+                Some(world) => {
+                    JournalPayload::topology_bulk_split(&e.transaction, &e.participants, world)?
+                }
+                None => JournalPayload::topology(&e.transaction, &e.participants)?,
+            };
             Ok(JournalRecord {
                 seq: e.seq.0,
                 tick: e.transaction.server_tick.get(),
-                payload: JournalPayload::topology(&e.transaction, &e.participants)?,
+                payload,
             })
         })
         .collect()
@@ -437,45 +445,62 @@ pub fn restore(
             });
         }
         durable_tick = record.tick;
-        match &record.payload {
-            JournalPayload::Topology { .. } => {
-                let (tx, participants) =
-                    record.payload.as_topology().expect("payload is Topology")?;
-                if tx.algorithm_version != INTEGER_BRUSH_VERSION {
-                    return Err(PersistError::AlgorithmVersionMismatch {
-                        field: "journal transaction.algorithm_version",
-                        checkpoint: tx.algorithm_version,
-                        runtime: INTEGER_BRUSH_VERSION,
-                    });
-                }
-                world.replay_transaction(&tx, &participants)?;
-                max_tx = max_tx.max(tx.transaction_id.get());
-                for op in &tx.ops {
-                    let child_ids = match op {
-                        TopologyOp::SplitOff {
-                            child,
-                            child_entity,
-                            ..
-                        }
-                        | TopologyOp::SplitOffBaseline {
-                            child,
-                            child_entity,
-                            ..
-                        } => Some((child.get(), child_entity.get())),
-                        _ => None,
-                    };
-                    if let Some((child, child_entity)) = child_ids {
-                        max_entity = max_entity.max(child_entity);
-                        max_volume = max_volume.max(child);
-                    }
-                }
-            }
+        // A giant-split record (T17 increment 2) carries the same marker
+        // transaction plus an out-of-band `BaselineWorld`; ordinary topology
+        // records replay with `None`.
+        let topology = match &record.payload {
+            JournalPayload::Topology { .. } => record
+                .payload
+                .as_topology()
+                .expect("payload is Topology")
+                .map(|(tx, p)| (tx, p, None))?,
+            JournalPayload::TopologyBulkSplit { .. } => record
+                .payload
+                .as_topology_bulk_split()
+                .expect("payload is TopologyBulkSplit")
+                .map(|(tx, p, w)| (tx, p, Some(w)))?,
             JournalPayload::PoseBatch { .. } => {
                 let snaps = record
                     .payload
                     .as_pose_batch()
                     .expect("payload is PoseBatch")?;
                 world.apply_pose_batch(&snaps);
+                last_seq = record.seq;
+                continue;
+            }
+        };
+        let (tx, participants, bulk) = topology;
+        if tx.algorithm_version != INTEGER_BRUSH_VERSION {
+            return Err(PersistError::AlgorithmVersionMismatch {
+                field: "journal transaction.algorithm_version",
+                checkpoint: tx.algorithm_version,
+                runtime: INTEGER_BRUSH_VERSION,
+            });
+        }
+        world.replay_transaction(&tx, &participants, bulk.as_ref())?;
+        max_tx = max_tx.max(tx.transaction_id.get());
+        for op in &tx.ops {
+            let child_ids = match op {
+                TopologyOp::SplitOff {
+                    child,
+                    child_entity,
+                    ..
+                }
+                | TopologyOp::SplitOffBaseline {
+                    child,
+                    child_entity,
+                    ..
+                }
+                | TopologyOp::SplitOffBulkBaseline {
+                    child,
+                    child_entity,
+                    ..
+                } => Some((child.get(), child_entity.get())),
+                _ => None,
+            };
+            if let Some((child, child_entity)) = child_ids {
+                max_entity = max_entity.max(child_entity);
+                max_volume = max_volume.max(child);
             }
         }
         last_seq = record.seq;
@@ -538,7 +563,12 @@ fn replay_recovery(
     let topology_events = recovery
         .journal
         .iter()
-        .filter(|r| matches!(r.payload, JournalPayload::Topology { .. }))
+        .filter(|r| {
+            matches!(
+                r.payload,
+                JournalPayload::Topology { .. } | JournalPayload::TopologyBulkSplit { .. }
+            )
+        })
         .count() as u64;
     let (sim, _seq) = restore(
         &recovery,

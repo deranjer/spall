@@ -157,6 +157,23 @@ pub fn checkerboard_split_setup() -> WorldSetup {
     }
 }
 
+/// T17 increment 2 / ENG-64: a scene whose detached component is too large for
+/// even a compressed inline op blob. An anchored floor holds a `40³`
+/// hash-patterned `STONE`/`DIRT` block through one column; cutting the column
+/// detaches the whole block, whose compressed `BaselineVolume` exceeds
+/// `MAX_SPLIT_BASELINE_BLOB`, forcing the bulk-stream baseline commit path. See
+/// [`spall_voxel::fixtures::bulk_split_scene`].
+pub fn bulk_split_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: spall_voxel::fixtures::bulk_split_scene(id),
+        terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(63, 63, 63)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
 /// The T19 movement arena: a flat anchored floor + a 0.5 m step ledge + a
 /// resident air ceiling ([`spall_voxel::fixtures::walk_arena`]). Scripted
 /// players walk this lane; [`WALK_ARENA_SPAWNS`] gives feet positions in metres

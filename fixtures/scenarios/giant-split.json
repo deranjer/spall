@@ -1,0 +1,15 @@
+{
+  "name": "giant-split",
+  "scene": "bulk-split",
+  "description": "T17 increment 2 / ENG-64. An anchored floor holds a 54x46x54 splitmix64-patterned STONE/DIRT block through one column. Client 0 cuts the column; the whole block detaches as one component whose compressed BaselineVolume exceeds MAX_SPLIT_BASELINE_BLOB (28 KiB), so the commit ships a marker transaction (SplitOffBulkBaseline + SourcePatchBulkBaseline) plus one out-of-band BaselineWorld on a bulk stream to every live client. Each replica holds the marker transaction until its blob assembles, then applies it. Passes only if the cut commits (it was rejected before this increment), the server and both live replicas agree on one canonical topology hash, each live client sees the block move, and the committed topology-event stream replayed from the tick-0 baseline (with the journalled bulk BaselineWorld) reproduces the same hash.",
+  "server_ticks": 240,
+  "quiescence_ticks": 60,
+  "clients": 2,
+  "minimum_transactions": 1,
+  "minimum_motion_snapshots": 1,
+  "minimum_body_displacement_m": 0.3,
+  "replay_check": true,
+  "cuts": [
+    { "client": 0, "at_tick": 6, "cell": [31, 8, 31], "radius": 8 }
+  ]
+}

@@ -59,6 +59,13 @@ pub struct Committed {
     pub children: Vec<spall_core::EntityId>,
     /// Whether the commit advanced the topology epoch (it did iff it split).
     pub bumped_epoch: bool,
+    /// T17 increment 2: a giant split whose geometry did not fit even a
+    /// compressed inline op blob. `topology.ops` are `SplitOffBulkBaseline` /
+    /// `SourcePatchBulkBaseline` markers only; this is the out-of-band
+    /// `BaselineWorld` (every child volume + the source's post-cut affected
+    /// bricks) the host must deliver on a bulk stream and journal alongside the
+    /// transaction. `None` for every ordinary commit.
+    pub bulk_baseline: Option<spall_protocol::baseline::BaselineWorld>,
 }
 
 impl Committed {
@@ -347,13 +354,15 @@ pub fn commit(
     };
 
     // T17: an oversized split whose inline `CellRun` list overflows one reliable
-    // control record is re-encoded as `[IntegerBrush, SplitOffBaseline*,
-    // SourcePatchBaseline]` — the child geometry and the source's post-cut
-    // affected bricks travel as compressed baseline blobs instead. `before` /
-    // `after` / `result_hashes` are unchanged and remain the replica's
-    // acceptance check.
+    // control record is re-encoded so the child geometry and the source's
+    // post-cut affected bricks travel as baseline blobs — compressed *inside*
+    // `tx.ops` when each fits `MAX_SPLIT_BASELINE_BLOB` (increment 1), otherwise
+    // as marker ops plus one out-of-band `BaselineWorld` on a bulk stream
+    // (increment 2). `before` / `after` / `result_hashes` are unchanged and
+    // remain the replica's acceptance check.
+    let mut bulk_baseline = None;
     if !crate::replication::inline_wire_fits(&topology) {
-        topology.ops = build_split_baseline_ops(
+        match build_split_baseline_ops(
             vid,
             brush_op,
             parent_owner,
@@ -362,7 +371,15 @@ pub fn commit(
             &child_ids,
             &children,
             staged.splits(),
-        )?;
+            transaction_id,
+            server_tick,
+        )? {
+            SplitEncoding::Inline(ops) => topology.ops = ops,
+            SplitEncoding::Bulk { ops, baseline } => {
+                topology.ops = ops;
+                bulk_baseline = Some(baseline);
+            }
+        }
     }
     topology.validate()?;
 
@@ -464,6 +481,7 @@ pub fn commit(
         seq: journal_seq,
         transaction: topology.clone(),
         participants,
+        bulk_baseline: bulk_baseline.clone(),
     });
 
     Ok(CommitOutcome::Committed(Committed {
@@ -472,15 +490,33 @@ pub fn commit(
         topology,
         children: child_entities,
         bumped_epoch,
+        bulk_baseline,
     }))
 }
 
-/// T17: re-encode an oversized split as `[IntegerBrush, SplitOffBaseline*,
-/// SourcePatchBaseline]`. Each child's whole geometry and the source's post-cut
-/// affected bricks travel as a compressed [`spall_protocol::baseline::BaselineVolume`]
-/// blob. Fails with [`crate::replication::ReplicationError::SplitTooLarge`] if a
-/// blob is still over [`spall_protocol::limits::MAX_SPLIT_BASELINE_BLOB`] — that
-/// giant collapse needs the bulk-stream baseline path (T17 increment 2).
+/// How an oversized split's geometry is carried once the inline `CellRun` list
+/// no longer fits one reliable control record.
+enum SplitEncoding {
+    /// `[IntegerBrush, SplitOffBaseline*, SourcePatchBaseline]` — each geometry
+    /// blob compressed inside `tx.ops` (T17 increment 1).
+    Inline(Vec<TopologyOp>),
+    /// `[IntegerBrush, SplitOffBulkBaseline*, SourcePatchBulkBaseline]` markers
+    /// plus one out-of-band [`BaselineWorld`] (T17 increment 2), for a split
+    /// whose compressed geometry exceeds
+    /// [`spall_protocol::limits::MAX_SPLIT_BASELINE_BLOB`].
+    Bulk {
+        ops: Vec<TopologyOp>,
+        baseline: spall_protocol::baseline::BaselineWorld,
+    },
+}
+
+/// T17: re-encode an oversized split. Builds a
+/// [`spall_protocol::baseline::BaselineVolume`] for every detached child and for
+/// the source's post-cut affected bricks; if every compressed blob fits
+/// `MAX_SPLIT_BASELINE_BLOB` it emits the inline
+/// `SplitOffBaseline` / `SourcePatchBaseline` form, otherwise the bulk-marker
+/// form plus the assembled [`BaselineWorld`]. Fails only if the assembled world
+/// exceeds the bulk-transfer ceilings.
 #[allow(clippy::too_many_arguments)]
 fn build_split_baseline_ops(
     source: VolumeId,
@@ -491,35 +527,22 @@ fn build_split_baseline_ops(
     child_ids: &[(spall_core::EntityId, VolumeId)],
     children: &[ChildBody],
     splits: bool,
-) -> Result<Vec<TopologyOp>, CommitError> {
-    use spall_protocol::baseline::BaselineOwner;
-    use spall_protocol::limits::MAX_SPLIT_BASELINE_BLOB;
+    transaction_id: spall_core::TransactionId,
+    server_tick: Tick,
+) -> Result<SplitEncoding, CommitError> {
+    use spall_protocol::baseline::{BaselineOwner, BaselineWorld};
+    use spall_protocol::limits::{MAX_ASSEMBLED_TRANSFER, MAX_BULK_PART, MAX_SPLIT_BASELINE_BLOB};
 
-    let too_large = |volume: u64, blob_bytes: usize| {
-        CommitError::Replication(crate::replication::ReplicationError::SplitTooLarge {
-            volume,
-            blob_bytes,
-            cap: MAX_SPLIT_BASELINE_BLOB,
-        })
-    };
-
-    let mut ops = vec![brush_op];
-    for ((entity, child_vid), child) in child_ids.iter().zip(children) {
+    // Every volume the split produces, plus its compressed blob.
+    let mut volumes: Vec<(spall_protocol::baseline::BaselineVolume, Vec<u8>)> = Vec::new();
+    for ((entity, _child_vid), child) in child_ids.iter().zip(children) {
         let bv = crate::replication::baseline_volume_of(
             &child.volume,
             BaselineOwner::Body(*entity),
             None,
         );
         let blob = bv.encode_compressed();
-        if blob.len() > MAX_SPLIT_BASELINE_BLOB {
-            return Err(too_large(child_vid.get(), blob.len()));
-        }
-        ops.push(TopologyOp::SplitOffBaseline {
-            source,
-            child: *child_vid,
-            child_entity: *entity,
-            blob,
-        });
+        volumes.push((bv, blob));
     }
     if splits {
         let bv = crate::replication::baseline_volume_of(
@@ -528,12 +551,71 @@ fn build_split_baseline_ops(
             Some(affected),
         );
         let blob = bv.encode_compressed();
-        if blob.len() > MAX_SPLIT_BASELINE_BLOB {
-            return Err(too_large(source.get(), blob.len()));
-        }
-        ops.push(TopologyOp::SourcePatchBaseline { source, blob });
+        volumes.push((bv, blob));
     }
-    Ok(ops)
+
+    // Inline path: every compressed blob fits one op.
+    if volumes
+        .iter()
+        .all(|(_, blob)| blob.len() <= MAX_SPLIT_BASELINE_BLOB)
+    {
+        let mut ops = vec![brush_op];
+        let mut it = volumes.into_iter();
+        for ((entity, child_vid), _child) in child_ids.iter().zip(children) {
+            let (_, blob) = it.next().expect("one blob per child");
+            ops.push(TopologyOp::SplitOffBaseline {
+                source,
+                child: *child_vid,
+                child_entity: *entity,
+                blob,
+            });
+        }
+        if splits {
+            let (_, blob) = it.next().expect("source-patch blob");
+            ops.push(TopologyOp::SourcePatchBaseline { source, blob });
+        }
+        return Ok(SplitEncoding::Inline(ops));
+    }
+
+    // Bulk path: marker ops + one out-of-band `BaselineWorld` keyed by
+    // `transfer_id` (the split's `TransactionId` with the reserved high bit set).
+    let transfer_id = transaction_id.get() | spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT;
+    let mut ops = vec![brush_op];
+    for ((entity, child_vid), _child) in child_ids.iter().zip(children) {
+        ops.push(TopologyOp::SplitOffBulkBaseline {
+            source,
+            child: *child_vid,
+            child_entity: *entity,
+            transfer_id,
+        });
+    }
+    if splits {
+        ops.push(TopologyOp::SourcePatchBulkBaseline {
+            source,
+            transfer_id,
+        });
+    }
+
+    let mut world_volumes: Vec<_> = volumes.into_iter().map(|(bv, _)| bv).collect();
+    world_volumes.sort_by_key(|v| v.volume_id.get());
+    let baseline = BaselineWorld {
+        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        checkpoint_tick: server_tick.get(),
+        volumes: world_volumes,
+    };
+    let encoded_len = baseline.encode().len();
+    if encoded_len > MAX_ASSEMBLED_TRANSFER
+        || encoded_len.div_ceil(MAX_BULK_PART) > spall_protocol::limits::MAX_BASELINE_PARTS
+    {
+        return Err(CommitError::Replication(
+            crate::replication::ReplicationError::SplitTooLarge {
+                volume: source.get(),
+                blob_bytes: encoded_len,
+                cap: MAX_ASSEMBLED_TRANSFER,
+            },
+        ));
+    }
+    Ok(SplitEncoding::Bulk { ops, baseline })
 }
 
 /// A `MotionSnapshot` for every dynamic body that took part in the transaction:

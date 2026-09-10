@@ -239,6 +239,14 @@ cargo xtask scenario --name g1-networked-destruction --loss-percent 0 --output .
 # ticket the same cut was rejected (ReplicationError::SplitTooLarge).
 cargo xtask scenario --name oversized-split --loss-percent 0 --output .local/runs/oversized-split
 
+# T17 increment 2 / ENG-64: a cut that detaches a 54x46x54 hash-patterned block
+# whose compressed geometry exceeds even the inline op-blob cap. The commit ships
+# marker SplitOffBulkBaseline / SourcePatchBulkBaseline ops plus one out-of-band
+# BaselineWorld on a bulk stream; each replica holds the marker transaction until
+# the blob assembles. Server + both replicas converge; the tick-0 baseline replay
+# (from the journalled TopologyBulkSplit payload) reproduces the hash.
+cargo xtask scenario --name giant-split --loss-percent 0 --output .local/runs/giant-split
+
 # T19: one `walk` server + two scripted player capsules that predict movement,
 # send InputFrame datagrams, and reconcile against the server's player snapshots.
 # Passes on bounded corrections, ground contact, travel distance, and no hover.

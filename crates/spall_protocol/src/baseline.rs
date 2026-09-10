@@ -134,6 +134,34 @@ impl BaselineWorld {
     pub fn brick_count(&self) -> usize {
         self.volumes.iter().map(|v| v.bricks.len()).sum()
     }
+
+    /// zstd-compressed postcard bytes — the form a giant bulk split's geometry
+    /// is stored in a `spall_store` `TopologyBulkSplit` journal payload (T17
+    /// increment 2). Panics only on an internal encoder error.
+    pub fn encode_compressed(&self) -> Vec<u8> {
+        zstd::stream::encode_all(self.encode().as_slice(), 0).expect("zstd encodes")
+    }
+
+    /// Decompress + decode + validate. Bounded by
+    /// [`crate::limits::MAX_ASSEMBLED_TRANSFER`] decompressed (the same ceiling
+    /// the bulk transfer path enforces).
+    pub fn decode_compressed(bytes: &[u8]) -> Result<Self, BaselineDecodeError> {
+        use std::io::Read;
+        let decoder = zstd::stream::Decoder::new(bytes)
+            .map_err(|e| BaselineDecodeError::Zstd(e.to_string()))?;
+        let mut raw = Vec::new();
+        decoder
+            .take(crate::limits::MAX_ASSEMBLED_TRANSFER as u64 + 1)
+            .read_to_end(&mut raw)
+            .map_err(|e| BaselineDecodeError::Zstd(e.to_string()))?;
+        if raw.len() > crate::limits::MAX_ASSEMBLED_TRANSFER {
+            return Err(BaselineDecodeError::BlobTooLarge {
+                bytes: raw.len(),
+                cap: crate::limits::MAX_ASSEMBLED_TRANSFER,
+            });
+        }
+        Self::decode(&raw)
+    }
 }
 
 impl BaselineVolume {
