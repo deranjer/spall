@@ -94,7 +94,7 @@ fn oversized_split_commits_via_baseline_blob_ops_and_replays_exactly() {
     for e in entries {
         replay
             .world_mut()
-            .replay_transaction(&e.transaction, &e.participants)
+            .replay_transaction(&e.transaction, &e.participants, e.bulk_baseline.as_ref())
             .expect("journalled oversized split replays from baseline");
     }
     assert_eq!(

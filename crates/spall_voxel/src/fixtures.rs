@@ -183,6 +183,71 @@ pub fn checkerboard_split_scene(id: VolumeId) -> Volume {
     v
 }
 
+/// A replication scene whose detached component's geometry is too large for
+/// even a **compressed inline** op blob (T17 increment 2 / ENG-64): an anchored
+/// floor, one column, and a raised `54 x 46 x 54` cell block whose material is
+/// `STONE` / `DIRT` by a splitmix64 hash — a per-cell coin flip, so the
+/// material layer is genuinely incompressible. Cutting the column detaches the
+/// whole block as one body; its compressed `BaselineVolume` exceeds
+/// `MAX_SPLIT_BASELINE_BLOB` (28 KiB), so the commit ships it out of band as a
+/// bulk `BaselineWorld` on a stream.
+///
+/// - floor:  `x 0..=63`, `z 0..=63`, `y 0..=1`   (anchored at `y = 0`)
+/// - column: `x 28..=35`, `z 28..=35`, `y 2..=13`
+/// - block:  `x 6..=59`, `z 6..=59`, `y 14..=59`  (hash-patterned STONE/DIRT)
+pub fn bulk_split_scene(id: VolumeId) -> Volume {
+    let bounds = BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(1, 1, 1))
+        .expect("valid bulk-split bounds");
+    let mut v = Volume::bounded(id, CellSizeCode::Quarter, bounds);
+    for z in 0..=1 {
+        for y in 0..=1 {
+            for x in 0..=1 {
+                v.insert_brick(
+                    BrickCoord::new(x, y, z),
+                    Brick::uniform(MaterialId::AIR, Revision(1)),
+                )
+                .expect("in bounds");
+            }
+        }
+    }
+    let mut plan = EditPlan::new(id);
+    for z in 0..=63 {
+        for x in 0..=63 {
+            plan.set(GlobalCell::new(x, 0, z), STONE);
+            plan.set(GlobalCell::new(x, 1, z), STONE);
+        }
+    }
+    for z in 28..=35 {
+        for y in 2..=13 {
+            for x in 28..=35 {
+                plan.set(GlobalCell::new(x, y, z), STONE);
+            }
+        }
+    }
+    for z in 6..=59 {
+        for y in 14..=59 {
+            for x in 6..=59 {
+                // splitmix64 finalizer → `h & 1` is a per-cell coin flip, so the
+                // block's material layer is genuinely incompressible and the
+                // child blob overruns the inline op cap.
+                let mut h = (x as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+                    .wrapping_add((z as u64).wrapping_mul(0x1656_67B1_9E37_79F9));
+                h ^= h >> 30;
+                h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                h ^= h >> 27;
+                h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+                h ^= h >> 31;
+                let m = if h & 1 == 0 { STONE } else { DIRT };
+                plan.set(GlobalCell::new(x, y, z), m);
+            }
+        }
+    }
+    v.apply_edit(&plan).expect("bulk-split scene edit");
+    v
+}
+
 /// Like [`bridge_scene`], but shifted and widened so the load-bearing geometry
 /// **crosses the `x = 32` brick boundary**. A single column straddling the seam
 /// holds up a beam that also spans both bricks; cutting the column must detach
@@ -316,6 +381,32 @@ mod tests {
     }
 
     #[test]
+    fn bulk_split_scene_block_is_a_large_high_entropy_component() {
+        let v = bulk_split_scene(vid(1));
+        assert_eq!(
+            v.sample(GlobalCell::new(0, 0, 0)).unwrap(),
+            Sample::Filled(STONE),
+            "anchored floor"
+        );
+        assert_eq!(
+            v.sample(GlobalCell::new(31, 6, 31)).unwrap(),
+            Sample::Filled(STONE),
+            "column"
+        );
+        // The block spans brick seams on every axis and mixes materials.
+        assert!(
+            v.resident_brick_coords()
+                .iter()
+                .any(|c| c.x == 1 && c.y == 1 && c.z == 1),
+            "block reaches brick (1,1,1)"
+        );
+        let a = v.sample(GlobalCell::new(20, 20, 20)).unwrap();
+        let b = v.sample(GlobalCell::new(21, 20, 20)).unwrap();
+        assert!(matches!(a, Sample::Filled(_)) && matches!(b, Sample::Filled(_)));
+        assert_eq!(digest_hex(&v), BULK_SPLIT_DIGEST);
+    }
+
+    #[test]
     fn fixture_digest_is_independent_of_volume_id_and_run() {
         assert_eq!(
             digest(&hollow_tower(vid(1))),
@@ -440,4 +531,6 @@ mod tests {
     const SLOPE_DIGEST: &str = "30023f777e4a2c0cc1f0515785581b6d4cd95dd3d304a8e7bdc51e1d50ec5862";
     const CHECKERBOARD_SPLIT_DIGEST: &str =
         "46de0b892ccac5b223bf95a3d8ddd4dc6db64234787d958276bd9da4f9239434";
+    const BULK_SPLIT_DIGEST: &str =
+        "03f5ef01144a1d927f4caf372181c052cd375cbd4b644f6f3e504838982aceea";
 }

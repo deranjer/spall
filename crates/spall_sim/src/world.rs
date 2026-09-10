@@ -675,6 +675,58 @@ impl SimWorld {
         Ok(())
     }
 
+    /// Rebuild a split child `Volume` from a [`spall_protocol::baseline::BaselineVolume`]
+    /// (inline blob, T17 increment 1, or the out-of-band bulk world, increment 2)
+    /// and install it as a body. Shared by both replay paths.
+    fn install_baseline_child(
+        &mut self,
+        child_entity: EntityId,
+        child_volume_id: VolumeId,
+        bv: &spall_protocol::baseline::BaselineVolume,
+        participants: &[MotionSnapshot],
+        touched: &mut Vec<VolumeId>,
+    ) -> Result<(), WorldError> {
+        let child = crate::replication::volume_from_baseline(bv)
+            .map_err(|e| WorldError::ReplayResultHash(e.to_string()))?;
+        let cs = child.cell_size();
+        self.install_replayed_child(child_entity, child, cs, participants)?;
+        touched.push(child_volume_id);
+        Ok(())
+    }
+
+    /// Overwrite `source`'s named bricks with the post-cut authoritative state
+    /// from a [`spall_protocol::baseline::BaselineVolume`]. Shared by the inline
+    /// (`SourcePatchBaseline`) and bulk (`SourcePatchBulkBaseline`) replay paths.
+    fn patch_source_from_baseline(
+        &mut self,
+        source: VolumeId,
+        bv: &spall_protocol::baseline::BaselineVolume,
+        touched: &mut Vec<VolumeId>,
+    ) -> Result<(), WorldError> {
+        use spall_protocol::baseline::BaselineCells;
+        let vol = self
+            .volume_body_mut(source)
+            .ok_or(WorldError::UnknownVolume(source))?;
+        for bb in &bv.bricks {
+            let cells: Vec<MaterialId> = match &bb.cells {
+                BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
+                BaselineCells::Dense(raw) => raw.iter().copied().map(MaterialId).collect(),
+            };
+            vol.volume
+                .insert_brick(
+                    BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                    Brick::restored(&cells, Revision(bb.revision), bb.edited),
+                )
+                .map_err(|e| {
+                    WorldError::ReplayResultHash(format!("source patch brick {:?}: {e}", bb.coord))
+                })?;
+        }
+        if !touched.contains(&source) {
+            touched.push(source);
+        }
+        Ok(())
+    }
+
     /// Applies the ops of one journalled [`spall_protocol::TopologyTransaction`]
     /// to the live world during recovery: brush / cell-run writes go to their
     /// named volume, and each `SplitOff` child is built from its canonical fill
@@ -696,8 +748,24 @@ impl SimWorld {
         &mut self,
         tx: &spall_protocol::TopologyTransaction,
         participants: &[MotionSnapshot],
+        bulk: Option<&spall_protocol::baseline::BaselineWorld>,
     ) -> Result<(), WorldError> {
         use spall_protocol::TopologyOp;
+
+        // T17 increment 2: a giant split's `SplitOffBulkBaseline` /
+        // `SourcePatchBulkBaseline` markers get their geometry from this
+        // out-of-band world, delivered as a `spall_store` `TopologyBulkSplit`
+        // journal payload (or the bulk transfer, on a live replica).
+        let bulk_volume =
+            |id: VolumeId| -> Result<&spall_protocol::baseline::BaselineVolume, WorldError> {
+                bulk.and_then(|w| w.volumes.iter().find(|v| v.volume_id == id))
+                    .ok_or_else(|| {
+                        WorldError::ReplayResultHash(format!(
+                            "transaction {} bulk split baseline is missing volume {id}",
+                            tx.transaction_id.get()
+                        ))
+                    })
+            };
 
         self.check_replay_preconditions(tx)?;
 
@@ -836,8 +904,9 @@ impl SimWorld {
                     }
                 }
                 // T17: an oversized split's child geometry, as a compressed
-                // `BaselineVolume`. Rebuild the child volume from it and install
-                // it exactly like the inline `SplitOff` + `CellRun` path.
+                // `BaselineVolume` inline (increment 1) or from the out-of-band
+                // bulk world (increment 2). Rebuild + install exactly like the
+                // inline `SplitOff` + `CellRun` path.
                 TopologyOp::SplitOffBaseline {
                     child,
                     child_entity,
@@ -853,12 +922,31 @@ impl SimWorld {
                                 child.get()
                             ))
                         })?;
-                    let child_volume = crate::replication::volume_from_baseline(&bv)
-                        .map_err(|e| WorldError::ReplayResultHash(e.to_string()))?;
-                    let cs = child_volume.cell_size();
-                    self.install_replayed_child(*child_entity, child_volume, cs, participants)?;
+                    self.install_baseline_child(
+                        *child_entity,
+                        *child,
+                        &bv,
+                        participants,
+                        &mut touched,
+                    )?;
                     new_children.push(*child_entity);
-                    touched.push(*child);
+                }
+                TopologyOp::SplitOffBulkBaseline {
+                    child,
+                    child_entity,
+                    ..
+                } => {
+                    flush(self, group.take(), &mut touched, &mut new_children)?;
+                    split = true;
+                    let bv = bulk_volume(*child)?;
+                    self.install_baseline_child(
+                        *child_entity,
+                        *child,
+                        bv,
+                        participants,
+                        &mut touched,
+                    )?;
+                    new_children.push(*child_entity);
                 }
                 // T17: the source side of an oversized split — overwrite the
                 // named source bricks with their post-cut authoritative state.
@@ -871,33 +959,12 @@ impl SimWorld {
                                 source.get()
                             ))
                         })?;
-                    let vol = self
-                        .volume_body_mut(*source)
-                        .ok_or(WorldError::UnknownVolume(*source))?;
-                    for bb in &bv.bricks {
-                        let cells: Vec<MaterialId> = match &bb.cells {
-                            spall_protocol::baseline::BaselineCells::Uniform(id) => {
-                                vec![MaterialId(*id); spall_core::CELLS_PER_BRICK]
-                            }
-                            spall_protocol::baseline::BaselineCells::Dense(raw) => {
-                                raw.iter().copied().map(MaterialId).collect()
-                            }
-                        };
-                        vol.volume
-                            .insert_brick(
-                                BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
-                                Brick::restored(&cells, Revision(bb.revision), bb.edited),
-                            )
-                            .map_err(|e| {
-                                WorldError::ReplayResultHash(format!(
-                                    "source patch brick {:?}: {e}",
-                                    bb.coord
-                                ))
-                            })?;
-                    }
-                    if !touched.contains(source) {
-                        touched.push(*source);
-                    }
+                    self.patch_source_from_baseline(*source, &bv, &mut touched)?;
+                }
+                TopologyOp::SourcePatchBulkBaseline { source, .. } => {
+                    flush(self, group.take(), &mut touched, &mut new_children)?;
+                    let bv = bulk_volume(*source)?;
+                    self.patch_source_from_baseline(*source, bv, &mut touched)?;
                 }
             }
         }

@@ -41,7 +41,7 @@ use spall_protocol::{
 use spall_sim::fixtures::WALK_ARENA_SPAWNS;
 use spall_sim::{
     Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
-    SimulationConfig, action_statuses, committed_transactions, fixtures,
+    SimulationConfig, action_statuses, fixtures,
 };
 use spall_store::Writer;
 use spall_structure::AnchorPlane;
@@ -142,6 +142,11 @@ pub enum Scene {
     /// falls back to the compressed-baseline-blob op path. See
     /// [`spall_sim::fixtures::checkerboard_split_setup`].
     CheckerboardSplit,
+    /// T17 increment 2 / ENG-64: like [`Scene::CheckerboardSplit`] but the
+    /// detached block's compressed geometry exceeds even the inline op-blob cap,
+    /// so the commit ships a bulk `BaselineWorld` on a stream. See
+    /// [`spall_sim::fixtures::bulk_split_setup`].
+    BulkSplit,
 }
 
 impl Scene {
@@ -155,6 +160,7 @@ impl Scene {
             }
             "walk" | "walk-arena" | "player-movement" => Some(Scene::Walk),
             "checkerboard-split" | "oversized-split" => Some(Scene::CheckerboardSplit),
+            "bulk-split" | "giant-split" => Some(Scene::BulkSplit),
             _ => None,
         }
     }
@@ -166,6 +172,7 @@ impl Scene {
             Scene::CrossBridgeCut => "cross-bridge-cut",
             Scene::Walk => "walk",
             Scene::CheckerboardSplit => "checkerboard-split",
+            Scene::BulkSplit => "bulk-split",
         }
     }
 
@@ -180,6 +187,7 @@ impl Scene {
             Scene::CrossBridgeCut => spall_sim::fixtures::cross_brick_bridged_setup(),
             Scene::Walk => spall_sim::fixtures::walk_arena_setup(),
             Scene::CheckerboardSplit => spall_sim::fixtures::checkerboard_split_setup(),
+            Scene::BulkSplit => spall_sim::fixtures::bulk_split_setup(),
         };
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
@@ -1065,13 +1073,33 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
-            for tx in committed_transactions(&report).map(|(_, t)| t.clone()) {
-                committed_total += 1;
-                lj.fan_out_transaction(Arc::new(tx), &sim, &clients_for_sim);
-            }
-            // T11a / ENG-62: bucket each commit's server-side latency (admission
-            // → commit) by whether it split and how much geometry detached.
             for (rid, committed) in &report.committed {
+                committed_total += 1;
+                // T17 increment 2: a giant split ships its geometry out of band
+                // as a `BaselineTransfer`, keyed to the transaction by
+                // `transfer_id` (= the split's `TransactionId` | high bit).
+                let split_transfer = committed.bulk_baseline.as_ref().and_then(|world| {
+                    let id = TransferId(
+                        committed.transaction.get() | spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT,
+                    );
+                    baseline::transfer_from_world(
+                        world.clone(),
+                        id,
+                        InterestEpoch(1),
+                        JournalSeq(sim.journal_cursor()),
+                    )
+                    .ok()
+                    .map(Arc::new)
+                });
+                lj.fan_out_transaction(
+                    Arc::new(committed.topology.clone()),
+                    split_transfer,
+                    &sim,
+                    &clients_for_sim,
+                );
+                // T11a / ENG-62: bucket each commit's server-side latency
+                // (admission → commit) by whether it split and how much
+                // geometry detached.
                 if let Some(started_at) = submitted_at.remove(rid) {
                     let class =
                         commit_latency::classify(committed.bumped_epoch, &committed.topology);
@@ -1485,6 +1513,14 @@ impl SimResult {
 // --- T17 late-join / catch-up / session renewal ---------------------------
 
 /// How the server is currently treating one connected client.
+/// One entry in a joining client's catch-up queue. A giant split (T17
+/// increment 2) enqueues its marker transaction *and* the out-of-band
+/// `BaselineTransfer` that carries its geometry, drained in order.
+enum QueuedItem {
+    Tx(Arc<TopologyTransaction>),
+    Blob(Arc<BaselineTransfer>),
+}
+
 enum Phase {
     /// Normal replication: every committed transaction is pushed immediately.
     Live,
@@ -1493,7 +1529,7 @@ enum Phase {
     /// past the cap cancels and re-captures a fresher baseline.
     Joining {
         transfer_id: TransferId,
-        queue: VecDeque<Arc<TopologyTransaction>>,
+        queue: VecDeque<QueuedItem>,
         retries: u32,
     },
 }
@@ -1631,15 +1667,18 @@ impl LateJoin {
         if !matches {
             return; // stale / duplicate ack
         }
-        let drained: Vec<Arc<TopologyTransaction>> = match self.links.get_mut(&session.raw()) {
+        let drained: Vec<QueuedItem> = match self.links.get_mut(&session.raw()) {
             Some(ClientLink {
                 phase: Phase::Joining { queue, .. },
                 ..
             }) => queue.drain(..).collect(),
             _ => Vec::new(),
         };
-        for tx in drained {
-            send_to(clients, session, Outbound::Transaction(tx));
+        for item in drained {
+            match item {
+                QueuedItem::Tx(tx) => send_to(clients, session, Outbound::Transaction(tx)),
+                QueuedItem::Blob(t) => send_to(clients, session, Outbound::Baseline(t)),
+            }
         }
         // A current motion keyframe for every body (`docs/protocol.md` step 4).
         let keyframe = motion.snapshots(sim.world(), sim.current_tick());
@@ -1655,20 +1694,34 @@ impl LateJoin {
     /// Routes one committed transaction: live clients get it now; joining
     /// clients get it queued, and a queue past the cap triggers a bounded
     /// re-capture (or an explicit drop once the retry budget is spent).
+    ///
+    /// `split_transfer` is the out-of-band `BaselineWorld` for a giant split
+    /// (T17 increment 2): a live client also gets it as an `Outbound::Baseline`
+    /// right after the marker transaction; a joining client gets both queued.
     fn fan_out_transaction(
         &mut self,
         tx: Arc<TopologyTransaction>,
+        split_transfer: Option<Arc<BaselineTransfer>>,
         sim: &Simulation,
         clients: &ClientMap,
     ) {
+        if let Some(t) = &split_transfer {
+            self.baseline_bytes += t.payload_bytes() as u64;
+        }
         let mut overflowed: Vec<u64> = Vec::new();
         for (raw, link) in self.links.iter_mut() {
             match &mut link.phase {
                 Phase::Live => {
                     send_to(clients, link.session, Outbound::Transaction(tx.clone()));
+                    if let Some(t) = &split_transfer {
+                        send_to(clients, link.session, Outbound::Baseline(t.clone()));
+                    }
                 }
                 Phase::Joining { queue, .. } => {
-                    queue.push_back(tx.clone());
+                    queue.push_back(QueuedItem::Tx(tx.clone()));
+                    if let Some(t) = &split_transfer {
+                        queue.push_back(QueuedItem::Blob(t.clone()));
+                    }
                     if queue.len() > self.catch_up_cap {
                         overflowed.push(*raw);
                     }
@@ -2857,14 +2910,14 @@ mod tests {
 
         // Fill past the cap → first overflow → one re-capture (retry 1).
         for _ in 0..3 {
-            lj.fan_out_transaction(tx(), &sim, &clients);
+            lj.fan_out_transaction(tx(), None, &sim, &clients);
         }
         assert_eq!(lj.retries, 1);
         assert!(lj.links.contains_key(&joiner.raw()));
 
         // Fill the fresh queue past the cap again → retry 2 > budget → dropped.
         for _ in 0..3 {
-            lj.fan_out_transaction(tx(), &sim, &clients);
+            lj.fan_out_transaction(tx(), None, &sim, &clients);
         }
         assert_eq!(lj.failed, 1);
         assert!(
@@ -2893,6 +2946,7 @@ mod tests {
                     ops: vec![],
                     result_hashes: vec![],
                 }),
+                None,
                 &sim,
                 &clients,
             );
