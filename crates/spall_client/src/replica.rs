@@ -458,6 +458,17 @@ impl ReplicaWorld {
         for (vid, volume) in staged {
             self.volumes.insert(vid, volume);
         }
+        // T23 / G3 row 7, slice E: a repair patch is authoritative for every
+        // brick it carries. If this replica had evicted one of them (digest
+        // retained), the patch supersedes that digest — drop it so the reloaded
+        // brick counts as resident, not double-counted through `logical_bricks`.
+        for bv in &world.volumes {
+            if let Some(ev) = self.evicted.get_mut(&bv.volume_id.get())
+                && let Some(v) = self.volumes.get(&bv.volume_id.get())
+            {
+                ev.drop_resident(v);
+            }
+        }
         // These repair keys are now resolved; a later gap on the same brick may
         // request again immediately.
         for bv in &world.volumes {
@@ -825,6 +836,15 @@ impl ReplicaWorld {
 
         // 4. Commit the candidate. Nothing above mutated live state.
         self.volumes = candidate;
+        // slice E: a committed op that wrote into a brick this replica had
+        // evicted (its `before` gap was healed by a repair patch just before
+        // this retry) makes that brick resident again — its retained digest is
+        // superseded by the committed geometry.
+        for (vid, ev) in self.evicted.iter_mut() {
+            if let Some(v) = self.volumes.get(vid) {
+                ev.drop_resident(v);
+            }
+        }
         for (vid, entity) in &new_owner {
             self.owner.insert(vid.get(), CanonicalOwner::Body(*entity));
             self.volume_of_entity.insert(entity.get(), vid.get());

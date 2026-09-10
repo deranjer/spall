@@ -583,9 +583,17 @@ paths with that backing. Proof: `cargo test -p spall_server --test
 residency_pass` (residency-on reaches the same committed world as off, with real
 evictions); `cargo xtask scenario --name t23-g3-residency` (`t23-g3` under a
 6-brick budget — server + 4 clients + exact replay + cold restart all converge
-to the residency-off agreed hash with 56 evictions). Residency stays default-off
-for every other scenario; slice E (client residency + traverse-away/back, row
-8b) remains open in `docs/reports/G3.md`, along with the join-duration budget and
+to the residency-off agreed hash with 56 evictions). Increment 10 (slice E1)
+adds the client reload digest lifecycle: `EvictedBricks::drop_resident` plus
+`ReplicaWorld` reload paths that supersede a retained digest atomically as the
+brick comes back (same revision on a traversal reload, newer on a repair patch),
+and `ClientResidency::wanted_reloads` to name evicted bricks back in interest.
+Proof: `cargo test -p spall_server --test client_residency` (a replica that
+evicted a region reloads it from server repair patches and converges; a cut into
+a fully-evicted replica region gaps then reloads-and-converges). Residency stays
+default-off for every other scenario; slice E2 (client residency in the live
+session + traverse-away/back, row 8b) remains open in `docs/reports/G3.md`,
+along with the join-duration budget and
 the G4 eight-client workload + soak.
 
 ### G4 — eight-client engine slice

@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use spall_core::{BrickCoord, VolumeId};
+use spall_protocol::RepairKey;
 use spall_voxel::{
     BrickCacheKey, CacheBudget, CollisionReadiness, InterestRadii, MemoryReport, ResidencyCache,
 };
@@ -95,6 +96,36 @@ impl ClientResidency {
             }
         }
         evicted
+    }
+
+    /// T23 / G3 row 7, slice E: retained-digest **terrain** bricks that have
+    /// come back inside the enter-radius of `center` and should be pulled back
+    /// with a bounded `RepairRequest`. The digest stays retained until the
+    /// patch lands (`docs/reports/G3-residency-hash.md` reload lifecycle), so
+    /// `world_hash` is exact throughout. Nearest-first, at most `max_bricks`.
+    /// Empty when nothing is evicted or the box would exceed `max_bricks`.
+    pub fn wanted_reloads(
+        replica: &ReplicaWorld,
+        center: BrickCoord,
+        enter_radius: i64,
+        max_bricks: usize,
+    ) -> Vec<RepairKey> {
+        let terrain = replica.terrain_volume_id();
+        let evicted = replica.evicted(terrain);
+        if evicted.is_empty() {
+            return Vec::new();
+        }
+        let Some(desired) = ResidencyCache::desired_coords(center, enter_radius, max_bricks) else {
+            return Vec::new();
+        };
+        desired
+            .into_iter()
+            .filter(|coord| evicted.contains(*coord))
+            .map(|coord| RepairKey::Brick {
+                volume: terrain,
+                coord,
+            })
+            .collect()
     }
 
     pub fn desired_terrain(

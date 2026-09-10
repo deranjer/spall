@@ -218,6 +218,19 @@ impl EvictedBricks {
             .ok_or(DigestError::NoRetained(coord))
     }
 
+    /// **Repair / commit** lifecycle: drop every retained digest whose brick is
+    /// now resident in `volume` again — the live geometry supersedes it, whether
+    /// it came back at the same revision (a traversal reload) or a newer one (an
+    /// authoritative repair patch that healed a `before` gap). Returns how many
+    /// digests were dropped. Idempotent; no error when nothing overlapped.
+    pub fn drop_resident(&mut self, volume: &Volume) -> usize {
+        let before = self.digests.len();
+        for coord in volume.resident_brick_coords() {
+            self.digests.remove(&coord);
+        }
+        before - self.digests.len()
+    }
+
     /// **Edit / split** lifecycle: a validated resident write legitimately
     /// replaces an older retained digest for the same coord. Unlike [`record`],
     /// this overwrites without a conflict error, but only for a coord that *is*
@@ -571,6 +584,33 @@ mod tests {
         assert_eq!(e.supersede(c, d), Err(DigestError::NoRetained(c)));
         e.record(c, d).unwrap();
         assert!(e.supersede(c, d).is_ok());
+    }
+
+    #[test]
+    fn drop_resident_clears_only_digests_whose_brick_is_back() {
+        let mut v = scene();
+        let coords = v.resident_brick_coords();
+        let (a, b) = (coords[0], coords[1]);
+
+        let mut e = EvictedBricks::new();
+        // `a` still has its geometry (a reload landed); `b` is genuinely gone.
+        e.record_from(&v, a).unwrap();
+        e.record_from(&v, b).unwrap();
+        v.evict_brick(b);
+        assert_eq!(e.len(), 2);
+        // `a` resident *and* retained is exactly the invariant `drop_resident`
+        // repairs after a reload path forgets to clear the digest.
+        assert!(matches!(
+            logical_bricks(&v, &e),
+            Err(DigestError::ResidentEvictedConflict(c)) if c == a
+        ));
+
+        assert_eq!(e.drop_resident(&v), 1);
+        assert!(!e.contains(a));
+        assert!(e.contains(b));
+        assert!(logical_bricks(&v, &e).is_ok());
+        // Idempotent — a second pass finds nothing to drop.
+        assert_eq!(e.drop_resident(&v), 0);
     }
 
     // --- test helpers ---------------------------------------------------------
