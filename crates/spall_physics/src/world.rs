@@ -129,6 +129,30 @@ pub struct StepTiming {
     pub pipeline: Duration,
 }
 
+/// The solved normal impulse over one contact pair after a step — the raw
+/// physical input the T21 contact-damage rules threshold and convert into
+/// bounded server edit intents. Read *after* [`PhysicsWorld::step`]; the values
+/// are the accumulated solver impulses for the step just run. This adapter never
+/// mutates anything in a contact callback: it only reports.
+#[derive(Debug, Clone, Copy)]
+pub struct ContactImpulse {
+    /// The two bodies in contact (adapter ids, not Rapier handles).
+    pub bodies: [BodyId; 2],
+    /// Whether each of `bodies` is a dynamic (simulated) body. `false` is a
+    /// fixed body — terrain. A dynamic/fixed pair is a body striking terrain; a
+    /// dynamic/dynamic pair is debris-on-debris.
+    pub dynamic: [bool; 2],
+    /// World-space contact point, metres — the mean of the manifold points,
+    /// suitable as a damage brush centre.
+    pub point_m: [f32; 3],
+    /// World-space contact normal (unit), pointing from body 0 toward body 1.
+    pub normal: [f32; 3],
+    /// Accumulated normal impulse over the pair this step, newton-seconds
+    /// (always `>= 0`). A resting body contributes roughly `m · g · dt` every
+    /// step; a hard impact spikes well above that.
+    pub normal_impulse_n_s: f32,
+}
+
 struct Entry {
     body: RigidBodyHandle,
     collider: ColliderHandle,
@@ -563,6 +587,13 @@ impl PhysicsWorld {
         self.narrow_phase.contact_pairs().count()
     }
 
+    /// The configured gravity vector, m/s². Callers converting contact impulses
+    /// into damage (T21) use its magnitude for the `m·g·dt` resting-load
+    /// reference.
+    pub fn gravity_m_s2(&self) -> [f32; 3] {
+        [self.gravity.x, self.gravity.y, self.gravity.z]
+    }
+
     /// Deepest current contact penetration across all pairs, metres (0 if none).
     pub fn max_penetration_m(&self) -> f32 {
         let mut worst = 0.0_f32;
@@ -576,6 +607,103 @@ impl PhysicsWorld {
             }
         }
         worst
+    }
+
+    /// The [`RigidBodyHandle`] for `id`, mapped back to a [`BodyId`], if `id` is
+    /// a live (non-retired) body this world owns.
+    fn body_id_of(&self, handle: RigidBodyHandle) -> Option<BodyId> {
+        self.entries
+            .iter()
+            .position(|e| !e.retired && e.body == handle)
+            .map(|i| BodyId(i as u32))
+    }
+
+    /// Every contact pair with a non-zero solved normal impulse this step, as
+    /// [`ContactImpulse`] records in a deterministic order (by body-id pair).
+    /// This is the T21 input surface: the caller thresholds these, applies
+    /// per-region cooldowns, and converts survivors into bounded edit intents
+    /// for a *later* tick — nothing here mutates world state.
+    ///
+    /// Call after [`Self::step`]. Pairs with no active solver contact, pairs
+    /// touching a retired or world-detached body, and pairs whose accumulated
+    /// normal impulse is not positive are omitted.
+    pub fn contact_impulses(&self) -> Vec<ContactImpulse> {
+        let mut out: Vec<ContactImpulse> = Vec::new();
+        for pair in self.narrow_phase.contact_pairs() {
+            if !pair.has_any_active_contact() {
+                continue;
+            }
+            let impulse = pair.total_impulse_magnitude();
+            if impulse <= 0.0 || !impulse.is_finite() {
+                continue;
+            }
+
+            // Body handles + world contact normal live on the manifold data.
+            let Some(manifold) = pair.manifolds.first() else {
+                continue;
+            };
+            let (Some(rb1), Some(rb2)) = (manifold.data.rigid_body1, manifold.data.rigid_body2)
+            else {
+                continue;
+            };
+            let (Some(b1), Some(b2)) = (self.body_id_of(rb1), self.body_id_of(rb2)) else {
+                continue;
+            };
+            let n = manifold.data.normal;
+            let nlen = (n.x * n.x + n.y * n.y + n.z * n.z).sqrt();
+            let normal = if nlen > f32::EPSILON {
+                [n.x / nlen, n.y / nlen, n.z / nlen]
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+
+            // Mean of every manifold contact point. In the pipeline's manifolds
+            // `local_p1` / `local_p2` are the touch points on each body's surface
+            // expressed relative to that body's centre of mass, in its local
+            // frame; lift both to world space (world COM + body rotation · point)
+            // and average — a stable brush centre for the hit.
+            let rb1 = &self.bodies[rb1];
+            let rb2 = &self.bodies[rb2];
+            let (com1, rot1) = (rb1.center_of_mass(), *rb1.rotation());
+            let (com2, rot2) = (rb2.center_of_mass(), *rb2.rotation());
+            let mut point_sum = [0.0_f64; 3];
+            let mut point_n = 0.0_f64;
+            for m in &pair.manifolds {
+                for p in &m.points {
+                    let w1 = com1 + rot1 * p.local_p1;
+                    let w2 = com2 + rot2 * p.local_p2;
+                    point_sum[0] += 0.5 * f64::from(w1.x + w2.x);
+                    point_sum[1] += 0.5 * f64::from(w1.y + w2.y);
+                    point_sum[2] += 0.5 * f64::from(w1.z + w2.z);
+                    point_n += 1.0;
+                }
+            }
+            if point_n == 0.0 {
+                continue;
+            }
+            let inv = 1.0 / point_n;
+            out.push(ContactImpulse {
+                bodies: [b1, b2],
+                dynamic: [
+                    self.bodies[self.entries[b1.0 as usize].body].is_dynamic(),
+                    self.bodies[self.entries[b2.0 as usize].body].is_dynamic(),
+                ],
+                point_m: [
+                    (point_sum[0] * inv) as f32,
+                    (point_sum[1] * inv) as f32,
+                    (point_sum[2] * inv) as f32,
+                ],
+                normal,
+                normal_impulse_n_s: impulse,
+            });
+        }
+        out.sort_by_key(|c| {
+            (
+                c.bodies[0].0.min(c.bodies[1].0),
+                c.bodies[0].0.max(c.bodies[1].0),
+            )
+        });
+        out
     }
 
     /// Sets a body's world pose. `rotation` is a quaternion `[x, y, z, w]`
@@ -835,6 +963,114 @@ mod tests {
             world.max_penetration_m() < 0.1,
             "resting body did not sink into the floor ({} m)",
             world.max_penetration_m()
+        );
+    }
+
+    /// T21 input surface: [`PhysicsWorld::contact_impulses`] must spike on a real
+    /// impact and then fall back to roughly the resting weight-support impulse
+    /// (`m·g·dt`) once the body settles — the separation the contact-damage rules
+    /// threshold on so a resting body never keeps fracturing the floor.
+    #[test]
+    fn contact_impulses_spike_on_impact_then_decay_to_the_resting_load() {
+        use crate::fixtures as phys_fx;
+
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            disable_ccd: true,
+            ..PhysicsConfig::default()
+        });
+
+        let floor = phys_fx::floor_slab(VolumeId::new(1).unwrap(), 2, 2, 4);
+        let floor_grid = crate::occupancy::OccupancyGrid::from_volume(&floor)
+            .unwrap()
+            .unwrap();
+        let floor_id = world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: floor_grid.clone(),
+            cell_m: phys_fx::CELL_M,
+            density_kg_m3: phys_fx::STONE_DENSITY,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+
+        let piece = phys_fx::debris_pieces(50, 1, 3).pop().unwrap().1;
+        let grid = crate::occupancy::OccupancyGrid::from_volume(&piece)
+            .unwrap()
+            .unwrap();
+        let body = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::MergedCuboids,
+            grid,
+            cell_m: phys_fx::CELL_M,
+            density_kg_m3: phys_fx::STONE_DENSITY,
+            mass_properties: None,
+            translation_m: [4.0, 4.0, 4.0],
+            linvel_m_s: [0.0; 3],
+        });
+        let mass = world.body_state(body).mass_kg;
+
+        let mut peak_impact = 0.0_f32;
+        let mut resting = 0.0_f32;
+        for step in 0..500 {
+            world.step();
+            let contacts = world.contact_impulses();
+            let pair_impulse: f32 = contacts
+                .iter()
+                .filter(|c| c.bodies.contains(&body))
+                .map(|c| c.normal_impulse_n_s)
+                .sum();
+            if step < 200 {
+                peak_impact = peak_impact.max(pair_impulse);
+            } else {
+                resting = pair_impulse;
+            }
+        }
+
+        let st = world.body_state(body);
+        assert!(
+            st.speed_m_s() < 0.1,
+            "body settled (speed {})",
+            st.speed_m_s()
+        );
+
+        // Resting support impulse is on the order of m·g·dt; the impact was a
+        // multiple of it (a real fall from ~2.5 m onto a rigid floor).
+        let weight_impulse = mass * 9.81 * world.params.dt;
+        assert!(
+            resting > 0.0 && resting < 4.0 * weight_impulse,
+            "settled contact impulse ({resting} N·s) is near the resting load \
+             (m·g·dt = {weight_impulse} N·s)"
+        );
+        assert!(
+            peak_impact > 8.0 * resting.max(weight_impulse),
+            "impact impulse ({peak_impact} N·s) spikes well above the resting \
+             load ({resting} N·s)"
+        );
+
+        // The settled pair is body-vs-terrain: exactly one side is dynamic.
+        let contact = world
+            .contact_impulses()
+            .into_iter()
+            .find(|c| c.bodies.contains(&body))
+            .expect("a resting body keeps a tracked contact with the floor");
+        assert_ne!(
+            contact.dynamic[0], contact.dynamic[1],
+            "a falling body resting on fixed terrain: one dynamic, one fixed"
+        );
+        assert!(
+            contact.bodies.contains(&floor_id),
+            "the other side of the contact is the floor"
+        );
+        assert!(
+            (contact.point_m[1] - 1.0).abs() < 0.2,
+            "contact point sits on the floor top (y = 1.0 m), got {}",
+            contact.point_m[1]
+        );
+        assert!(
+            (contact.point_m[0] - 4.375).abs() < 0.6 && (contact.point_m[2] - 4.375).abs() < 0.6,
+            "contact point is under the body (~x/z 4.375 m), got {:?}",
+            contact.point_m
         );
     }
 

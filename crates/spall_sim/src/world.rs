@@ -278,6 +278,13 @@ impl SimWorld {
         self.bodies.get(&entity.get())
     }
 
+    /// The detached body owning physics handle `phys`, if any (never terrain).
+    /// Used by T21 contact-damage conversion to map a solver contact back to an
+    /// authoritative entity.
+    pub fn body_by_phys(&self, phys: spall_physics::BodyId) -> Option<&Body> {
+        self.bodies.values().find(|b| b.phys == phys)
+    }
+
     /// The body owning `volume`, terrain or detached.
     pub fn volume_body(&self, volume: VolumeId) -> Option<&Body> {
         if volume == self.terrain.volume_id {

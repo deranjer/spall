@@ -190,6 +190,11 @@ Convert contact impulses to bounded server damage intents using documented thres
 
 Accept: repeated resting contacts do not continuously fracture floors; a falling body can damage terrain; sleeping rubble can be excavated and wake; fragment counts and pending jobs stay bounded with explicit admission behavior.
 
+Delivered in increments (ticket stays open until all acceptance bullets have evidence):
+
+- **Increment 1 (contact → terrain damage).** `spall_physics::PhysicsWorld::contact_impulses` exposes per-pair solved normal impulse / contact point / normal after each step (read-only, no callback mutation). `spall_sim::contact_damage::ContactDamagePolicy` is the pure filter: impulse must exceed `impact_ratio ×` the striking body's `m·g·dt` resting support impulse *and* an absolute floor (a body at rest never qualifies); per-brick cooldown blocks repeats; a world-wide per-tick cap drops (and counts) the excess instead of queueing it; a body born on the same tick is skipped (recursion guard). `Simulation::apply_contact_damage` submits the cuts against the terrain volume with server-authored request ids (`1 << 62` band); they stage off-tick and commit later like a client edit. Covers "repeated resting contacts do not fracture floors", "a falling body can damage terrain", and "bounded fragment counts / pending jobs". Evidence: `spall_physics` `contact_impulses_spike_on_impact_then_decay_to_the_resting_load`; `spall_sim` `contact_damage` integration test.
+- **Increment 2 (later).** Body-on-body contact fracture, and the region sleep/wake policy — settled distant regions persisted and deactivated only when their whole interaction region is dormant, reactivated before contact or edits ("sleeping rubble can be excavated and wake"; the `sleep-wake` fixture).
+
 ### T22 — Material-dependent structural strength
 
 Dependencies: T07, T08, T16. Own: strength design and spall_structure extension.
