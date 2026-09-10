@@ -9,6 +9,7 @@
   "late_join_connect_delay_ms": 1200,
   "minimum_transactions": 6,
   "replay_check": true,
+  "restart_check": true,
   "require_body_settled": true,
   "cuts": [
     { "client": 0, "at_tick": 40,  "cell": [10, 6, 3],  "radius": 2 },

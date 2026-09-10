@@ -527,10 +527,14 @@ multi-region collapse), excavate each floor's ends, and the late client joins
 after those six edits. It passes headless and with `--loss-percent 3`: every
 scripted cut commits, all four clients and the server agree on one canonical
 hash, the committed stream replays from baseline to that hash, and both
-detached beams are reported at rest. CPU proof: `cargo test -p spall_sim --test
-separated_regions`. G3 rows still open (resident-cache eviction, save/restart +
-traversal, the full crash-injection matrix, the join-duration budget, and the
-whole G4 eight-client workload + soak) are tracked in `docs/reports/G3.md`.
+detached beams are reported at rest. A `restart_check` flag then stops the
+server, cold-restarts a fresh `sandbox-server --serve --save` over the same
+`world.db` (recovery from the shutdown checkpoint + journal), and requires both
+the recovered server and a fresh `--late-join` client against it to reach the
+agreed hash. CPU proof: `cargo test -p spall_sim --test separated_regions`. G3
+rows still open (resident-cache eviction, traverse-away/back, the full
+crash-injection matrix, the join-duration budget, and the whole G4 eight-client
+workload + soak) are tracked in `docs/reports/G3.md`.
 
 ### G4 — eight-client engine slice
 
