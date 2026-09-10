@@ -70,6 +70,16 @@ struct Args {
     /// Whole-session deadline.
     #[arg(long, default_value_t = 30_000)]
     timeout_ms: u64,
+    /// T23 / G3 row 7 slice E2: client-side terrain residency. `0` (default)
+    /// keeps the replica fully resident. `> 0` runs the residency pass in the
+    /// mover loop (needs `--move`): it evicts terrain outside a brick box
+    /// around the predicted player and pulls bricks back with repair requests
+    /// as the player returns. The committed world / agreed hash is unchanged.
+    #[arg(long, default_value_t = 0)]
+    residency_budget_bricks: usize,
+    /// Chebyshev brick radius kept resident around the predicted player.
+    #[arg(long, default_value_t = 2)]
+    residency_radius_bricks: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -204,7 +214,7 @@ fn run_replication(args: Args) -> ExitCode {
         None if !args.moves.is_empty() => BaselineScene::default(),
         None => {
             eprintln!(
-                "sandbox-client: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, checkerboard-split, or bulk-split)",
+                "sandbox-client: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, checkerboard-split, bulk-split, separated-regions, or walk)",
                 args.scene
             );
             return ExitCode::from(2);
@@ -251,8 +261,14 @@ fn run_replication(args: Args) -> ExitCode {
         idle_grace: Duration::from_millis(500),
         overall_timeout: Duration::from_millis(args.timeout_ms),
         log_json: args.log_json,
-        summary_json: args.summary_json,
+        summary_json: args.summary_json.clone(),
         transport: TransportConfig::default(),
+        client_residency: (args.residency_budget_bricks > 0).then_some(
+            spall_client::ClientResidencyLimits {
+                budget_bricks: args.residency_budget_bricks,
+                interest_radius_bricks: args.residency_radius_bricks,
+            },
+        ),
     };
     match run_replication_client(config) {
         Ok(summary) => {
@@ -274,6 +290,33 @@ fn run_replication(args: Args) -> ExitCode {
         }
         Err(error) => {
             eprintln!("sandbox-client: {error}");
+            // T23 / G3 row 10: a `--late-join` replica that cannot obtain a
+            // baseline must terminate with a *bounded, explicit* failure — not a
+            // hang, not a silent partial state. Record it so the harness can
+            // accept it (under `late_join_may_fail`) while the connected clients
+            // carry on, and exit with a distinct code.
+            if args.late_join {
+                if let Some(path) = &args.summary_json {
+                    let body = serde_json::json!({
+                        "version": 1,
+                        "result": "join-failed",
+                        "connected": false,
+                        "late_join": true,
+                        "transactions_applied": 0,
+                        "repair_requests_sent": 0,
+                        "transactions_rejected": 0,
+                        "motion_snapshots": 0,
+                        "motion_snapshots_out_of_order": 0,
+                        "final_world_hash": "",
+                        "baseline_bricks": 0,
+                        "max_body_displacement_m": 0.0,
+                        "body_cut_committed": false,
+                        "detail": error.to_string(),
+                    });
+                    let _ = std::fs::write(path, serde_json::to_vec_pretty(&body).unwrap());
+                }
+                return ExitCode::from(4);
+            }
             ExitCode::from(1)
         }
     }

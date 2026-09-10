@@ -599,6 +599,36 @@ fn real_sqlite_write_failure_on_checkpoint_poisons_and_keeps_prior_checkpoint() 
 }
 
 #[test]
+fn disk_full_on_checkpoint_poisons_and_keeps_prior_checkpoint() {
+    let s = Scratch::new("disk_full_cp");
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(100, 0)).unwrap();
+        w.append_journal(&[pose_batch(1, 1)]).unwrap();
+        w.set_faults(FaultPlan::disk_full());
+        let err = w.publish_checkpoint(&checkpoint(200, 1)).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Disk(_)),
+            "expected an out-of-disk error, got {err:?}"
+        );
+        assert!(
+            w.is_poisoned(),
+            "an out-of-disk write must poison the writer"
+        );
+    }
+    let rec = recover(s.db()).unwrap();
+    assert_eq!(
+        rec.checkpoint.tick, 100,
+        "the checkpoint that ran out of disk never became visible"
+    );
+    assert_eq!(rec.durable_through, 1);
+    assert!(
+        rec.corruption.is_empty(),
+        "the failed write rolled back cleanly"
+    );
+}
+
+#[test]
 fn metrics_expose_bytes_and_commit_rate() {
     let s = Scratch::new("metrics");
     let mut w = Writer::open(s.db()).unwrap();

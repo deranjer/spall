@@ -38,7 +38,7 @@ use spall_protocol::{
     PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
     frame_input, recent_input, session_player_entity,
 };
-use spall_sim::fixtures::WALK_ARENA_SPAWNS;
+use spall_sim::fixtures::{SEPARATED_REGION_SPAWNS, WALK_ARENA_SPAWNS};
 use spall_sim::{
     Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
     SimulationConfig, action_statuses, fixtures,
@@ -147,6 +147,12 @@ pub enum Scene {
     /// so the commit ships a bulk `BaselineWorld` on a stream. See
     /// [`spall_sim::fixtures::bulk_split_setup`].
     BulkSplit,
+    /// T23 / G3 integrated acceptance: two independent collapsible bridge
+    /// structures in one bounded `256 x 128 x 256 m` world. Connecting clients
+    /// get a player capsule; alternating slots spawn in the two regions, so the
+    /// harness drives geographically separated players and a multi-region
+    /// collapse. See [`spall_sim::fixtures::separated_regions_setup`].
+    SeparatedRegions,
 }
 
 impl Scene {
@@ -161,6 +167,7 @@ impl Scene {
             "walk" | "walk-arena" | "player-movement" => Some(Scene::Walk),
             "checkerboard-split" | "oversized-split" => Some(Scene::CheckerboardSplit),
             "bulk-split" | "giant-split" => Some(Scene::BulkSplit),
+            "separated-regions" | "t23-g3" | "g3" => Some(Scene::SeparatedRegions),
             _ => None,
         }
     }
@@ -173,12 +180,23 @@ impl Scene {
             Scene::Walk => "walk",
             Scene::CheckerboardSplit => "checkerboard-split",
             Scene::BulkSplit => "bulk-split",
+            Scene::SeparatedRegions => "separated-regions",
         }
     }
 
     /// `true` if this scene gives every connecting client a player capsule.
     pub fn has_players(self) -> bool {
-        matches!(self, Scene::Walk)
+        matches!(self, Scene::Walk | Scene::SeparatedRegions)
+    }
+
+    /// Feet spawn positions (metres) for a player scene, indexed by connection
+    /// slot. Empty for a scene without players.
+    pub fn player_spawns(self) -> &'static [[f64; 3]] {
+        match self {
+            Scene::Walk => &WALK_ARENA_SPAWNS,
+            Scene::SeparatedRegions => &SEPARATED_REGION_SPAWNS,
+            _ => &[],
+        }
     }
 
     fn simulation(self) -> Simulation {
@@ -188,6 +206,7 @@ impl Scene {
             Scene::Walk => spall_sim::fixtures::walk_arena_setup(),
             Scene::CheckerboardSplit => spall_sim::fixtures::checkerboard_split_setup(),
             Scene::BulkSplit => spall_sim::fixtures::bulk_split_setup(),
+            Scene::SeparatedRegions => spall_sim::fixtures::separated_regions_setup(),
         };
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
@@ -264,6 +283,13 @@ pub struct ServeConfig {
     /// its interest set, tiers `Far` bodies onto a reduced cadence, and caps
     /// each client's per-batch motion bytes.
     pub motion_interest: Option<MotionInterest>,
+    /// T23 / G3 row 7, slice D: default-off resident-cache eviction. `None`
+    /// keeps every brick resident (byte-identical to every prior run). `Some(_)`
+    /// installs a durable in-memory backing, evicts terrain bricks outside a
+    /// per-player interest box each tick, and reloads them on demand for edits
+    /// (`crate::residency_pass`). The committed world is unchanged — see
+    /// `docs/reports/G3-residency-hash.md`.
+    pub residency: Option<crate::ResidencyLimits>,
 }
 
 /// T20 per-client interest + motion bandwidth policy for a [`serve`] run.
@@ -325,6 +351,7 @@ impl ServeConfig {
             save_faults: None,
             await_body_settle: false,
             motion_interest: None,
+            residency: None,
         }
     }
 }
@@ -433,6 +460,17 @@ pub struct ServeSummary {
     pub structure_split_samples: u64,
     pub large_collapse_p95_ms: f64,
     pub large_collapse_samples: u64,
+    /// T23 / G3 row 7, slice D: residency pass activity. All `0` when
+    /// `ServeConfig.residency` is `None` (the default).
+    pub residency_evictions_total: u64,
+    pub residency_reloads_total: u64,
+    /// Fewest / most / final resident terrain bricks the pass observed.
+    pub resident_terrain_bricks_min: u64,
+    pub resident_terrain_bricks_max: u64,
+    pub resident_terrain_bricks_final: u64,
+    /// Ticks the resident-brick count exceeded `budget_bricks` (a player's
+    /// interest set is larger than the declared budget).
+    pub residency_budget_miss_ticks: u64,
 }
 
 /// Anything that stops a [`serve`] run.
@@ -833,6 +871,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let catch_up_cap = config.catch_up_cap.max(1);
     let max_join_retries = config.max_join_retries;
     let dev_unvalidated_actions = config.dev_unvalidated_actions;
+    let residency_limits = config.residency;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
@@ -859,6 +898,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             }
         };
         let mut journal_records_written: u64 = 0;
+
+        // T23 / G3 row 7, slice D: default-off residency pass. `None` -> the
+        // world stays fully resident and every counter below is `0`.
+        let terrain_vid = sim.world().terrain_volume_id();
+        let mut residency =
+            residency_limits.map(|limits| crate::ResidencyPass::install(sim.world_mut(), limits));
 
         let mut motion = MotionPublisher::new(60, 20);
         let mut committed_total = 0u64;
@@ -899,6 +944,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
         // T17 late-join / reconnect state.
         let mut lj = LateJoin::new(catch_up_cap, max_join_retries);
+        // T23 / G3 row 7, slice D: a late-join baseline or repair patch over a
+        // brick the residency pass has evicted is filled from its durable
+        // backing.
+        lj.backing = residency.as_ref().map(|p| p.backing());
 
         for _ in 0..max_ticks {
             let started = std::time::Instant::now();
@@ -922,9 +971,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         lj.on_joined(session);
                         // T19: give this connection an authoritative player
                         // capsule on a player scene (respawn on reconnect).
-                        if scene.has_players() {
+                        let spawns = scene.player_spawns();
+                        if !spawns.is_empty() {
                             let slot = session.slot().0 as usize;
-                            let spawn = WALK_ARENA_SPAWNS[slot.min(WALK_ARENA_SPAWNS.len() - 1)];
+                            let spawn = spawns[slot.min(spawns.len() - 1)];
                             sim.add_player(session_player_entity(session), spawn);
                         }
                     }
@@ -1105,6 +1155,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         commit_latency::classify(committed.bumped_epoch, &committed.topology);
                     commit_latency.record(class, started_at.elapsed());
                 }
+                // Slice D: keep the durable backing current for the terrain
+                // bricks this edit changed, so a later reload gets this
+                // revision.
+                if let Some(pass) = &residency {
+                    pass.on_commit(
+                        sim.world(),
+                        committed
+                            .topology
+                            .after
+                            .iter()
+                            .filter(|br| br.volume == terrain_vid)
+                            .map(|br| br.coord),
+                    );
+                }
             }
             for status in action_statuses(&report) {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
@@ -1179,6 +1243,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 // journal prefix behind it. Retain right after, so disk use
                 // stays bounded during the run — not only at shutdown.
                 if checkpoint_interval > 0 && tick.get().is_multiple_of(checkpoint_interval) {
+                    // Slice D: a checkpoint is a full-world snapshot — reload any
+                    // evicted terrain first so `persist::capture` sees it all.
+                    if let Some(pass) = &mut residency {
+                        pass.reload_all(sim.world_mut());
+                    }
                     match persist::capture(&sim, &persist_cfg, journalled_through) {
                         Ok(cp) => {
                             if let Err(e) = pipe
@@ -1203,6 +1272,16 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 if let Some(err) = pipe.error() {
                     return SimResult::error(format!("persistence failed: {err}"), ticks_run);
                 }
+            }
+
+            // Slice D: post-tick residency pass. Evicts terrain bricks outside
+            // every player's interest box, reloads any back in interest. The
+            // committed world (hash, conservation, result_hashes) is unchanged;
+            // an edit that needs an evicted brick reloads it via the pipeline.
+            if let Some(pass) = &mut residency {
+                let player_feet: Vec<[f64; 3]> =
+                    sim.world().players().map(|p| p.state.position_m).collect();
+                pass.run(sim.world_mut(), &player_feet);
             }
 
             // Quiesce only after the pipeline is drained *and* no client has
@@ -1244,6 +1323,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut persist_bytes_per_write = 0.0;
         let mut persist_commit_bytes_per_sec = 0.0;
         let mut shutdown_error: Option<String> = None;
+        // Slice D: reload every evicted brick before the shutdown snapshot so
+        // the final checkpoint and the reported world hash are the complete
+        // world.
+        if let Some(pass) = &mut residency {
+            pass.reload_all(sim.world_mut());
+        }
         if let Some(pipe) = pipeline.take() {
             let final_tick = sim.current_tick().get();
             let tail = tick_journal_batch(&mut sim, &mut journalled_through, None, final_tick)
@@ -1331,6 +1416,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             actions_staged,
             actions_queued_unresolved: submitted_at.len() as u64,
             latency: commit_latency.report(),
+            residency: residency.as_ref().map(|p| p.stats()),
         }
     });
 
@@ -1374,7 +1460,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     ))?;
 
     let summary = ServeSummary {
-        version: 3,
+        version: 4,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -1417,6 +1503,24 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         structure_split_samples: sim_result.latency.structure_split_samples,
         large_collapse_p95_ms: sim_result.latency.large_collapse_p95_ms,
         large_collapse_samples: sim_result.latency.large_collapse_samples,
+        residency_evictions_total: sim_result.residency.map(|r| r.evictions_total).unwrap_or(0),
+        residency_reloads_total: sim_result.residency.map(|r| r.reloads_total).unwrap_or(0),
+        resident_terrain_bricks_min: sim_result
+            .residency
+            .map(|r| r.resident_terrain_bricks_min as u64)
+            .unwrap_or(0),
+        resident_terrain_bricks_max: sim_result
+            .residency
+            .map(|r| r.resident_terrain_bricks_max as u64)
+            .unwrap_or(0),
+        resident_terrain_bricks_final: sim_result
+            .residency
+            .map(|r| r.resident_terrain_bricks_final as u64)
+            .unwrap_or(0),
+        residency_budget_miss_ticks: sim_result
+            .residency
+            .map(|r| r.budget_miss_ticks)
+            .unwrap_or(0),
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -1468,6 +1572,7 @@ struct SimResult {
     actions_staged: u64,
     actions_queued_unresolved: u64,
     latency: commit_latency::LatencyReport,
+    residency: Option<crate::ResidencyStats>,
 }
 
 impl SimResult {
@@ -1506,6 +1611,7 @@ impl SimResult {
             actions_staged: 0,
             actions_queued_unresolved: 0,
             latency: commit_latency::LatencyReport::default(),
+            residency: None,
         }
     }
 }
@@ -1556,6 +1662,10 @@ struct LateJoin {
     failed: u64,
     expired_actions: u64,
     baseline_bytes: u64,
+    /// T23 / G3 row 7, slice D: the residency pass's durable backing, so a
+    /// late-join baseline / repair patch can fill a brick the server has
+    /// evicted. `None` when residency is off.
+    backing: Option<std::sync::Arc<spall_sim::MemoryBacking>>,
 }
 
 impl LateJoin {
@@ -1571,7 +1681,14 @@ impl LateJoin {
             failed: 0,
             expired_actions: 0,
             baseline_bytes: 0,
+            backing: None,
         }
+    }
+
+    fn backing_ref(&self) -> Option<&dyn spall_sim::BrickBacking> {
+        self.backing
+            .as_deref()
+            .map(|b| b as &dyn spall_sim::BrickBacking)
     }
 
     fn on_joined(&mut self, session: SessionId) {
@@ -1641,7 +1758,7 @@ impl LateJoin {
 
         if want_baseline {
             let id = self.next_id();
-            match capture_for(sim, id) {
+            match self.capture_for(sim, id) {
                 Some(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&session.raw()) {
@@ -1747,7 +1864,7 @@ impl LateJoin {
             }
             self.retries += 1;
             let id = self.next_id();
-            match capture_for(sim, id) {
+            match self.capture_for(sim, id) {
                 Some(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&raw) {
@@ -1777,7 +1894,7 @@ impl LateJoin {
         sim: &Simulation,
         clients: &ClientMap,
     ) {
-        let Some(world) = baseline::brick_repair_patch(sim, req) else {
+        let Some(world) = baseline::logical_brick_repair_patch(sim, req, self.backing_ref()) else {
             return;
         };
         let id = self.next_id();
@@ -1787,12 +1904,15 @@ impl LateJoin {
             send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
         }
     }
-}
 
-/// Captures a baseline transfer at the current tick / journal cursor.
-fn capture_for(sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
-    let cursor = JournalSeq(sim.journal_cursor());
-    baseline::capture_transfer(sim, id, InterestEpoch(1), cursor).ok()
+    /// Captures a baseline transfer at the current tick / journal cursor, over
+    /// the logical brick set (evicted bricks filled from the residency
+    /// backing when one is installed).
+    fn capture_for(&self, sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
+        let cursor = JournalSeq(sim.journal_cursor());
+        baseline::logical_capture_transfer(sim, self.backing_ref(), id, InterestEpoch(1), cursor)
+            .ok()
+    }
 }
 
 /// Complete checkpoints kept on disk at each retention pass. Older ones — and

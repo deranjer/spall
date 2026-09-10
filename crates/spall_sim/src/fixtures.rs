@@ -198,6 +198,39 @@ pub const WALK_ARENA_SPAWNS: [[f64; 3]; 4] = [
     [1.0, 1.0, 3.0],
 ];
 
+/// The T23 / G3 integrated-acceptance world
+/// ([`spall_voxel::fixtures::separated_regions_scene`]): two independent
+/// collapsible bridge structures in one bounded `256 x 128 x 256 m` world, a
+/// "west" region at the origin and an "east" region offset by
+/// [`spall_voxel::fixtures::SEPARATED_REGIONS_EAST_OFFSET`]. Cutting one region's
+/// column detaches only that region's beam, so the harness can drive a
+/// multi-region collapse with geographically separated players
+/// ([`SEPARATED_REGION_SPAWNS`] puts alternating slots in the two regions).
+pub fn separated_regions_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: spall_voxel::fixtures::separated_regions_scene(id),
+        // Union box over both regions; only the two structures are resident, so
+        // the collider grid is bounded by that, not the full world envelope.
+        terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(95, 19, 79)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
+/// Feet spawn positions (metres) for [`separated_regions_setup`]; index is the
+/// player / connection slot. Even slots stand in the west region, odd slots in
+/// the east region (offset `+18 m` on `x` and `z`), so connected players start
+/// geographically separated. Floor top is `y = 1.0 m`; all positions clear the
+/// column footprint.
+pub const SEPARATED_REGION_SPAWNS: [[f64; 3]; 4] = [
+    [1.0, 1.0, 1.0],
+    [18.5, 1.0, 18.5],
+    [2.0, 1.0, 1.5],
+    [19.25, 1.0, 18.0],
+];
+
 /// Like [`bridged_terrain_setup`], but the whole scene is translated so its
 /// occupancy's minimum corner is far from the world origin, and the floor sits
 /// **only under the beam's own x-range**. A detached beam whose collider is

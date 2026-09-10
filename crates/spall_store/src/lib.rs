@@ -26,6 +26,7 @@ pub mod brick;
 pub mod db;
 pub mod dto;
 pub mod fault;
+pub mod inject;
 pub mod metrics;
 pub mod recover;
 mod schema;

@@ -180,6 +180,44 @@ struct Scenario {
     /// hash must equal the live run's agreed hash (T11 exact replay).
     #[serde(default)]
     replay_check: bool,
+    /// T23 / G3: after the run, stop the server, launch a **fresh**
+    /// `sandbox-server --serve --save` over the same world DB (a cold restart
+    /// that recovers from the shutdown checkpoint + durable journal), and
+    /// require its recovered `final_world_hash` to equal the agreed hash. A
+    /// fresh `--late-join` client then connects to the restarted server and must
+    /// converge to the same hash — the recovered world serves a correct
+    /// baseline. Implies `replay_check`'s world DB (`--save`).
+    #[serde(default)]
+    restart_check: bool,
+    /// T23 / G3 row 10: a `late_join_clients` replica is allowed to end in a
+    /// **bounded explicit failure** (`result: "join-failed"`, a clean non-hang
+    /// exit) instead of converging — as long as it did not hang and the live
+    /// (non-late) clients plus the server still agree on one hash. Models
+    /// "retry/catch-up stress terminates with either a successful join or a
+    /// bounded explicit failure while connected clients continue".
+    #[serde(default)]
+    late_join_may_fail: bool,
+    /// T23 / G3 row 7, slice D: run the server with `--residency-budget-bricks`
+    /// set — evict terrain bricks outside every player's interest box, reload on
+    /// demand for edits. The committed world / agreed hash is unchanged; a run
+    /// with this set exercises the eviction path end to end.
+    #[serde(default)]
+    residency_budget_bricks: Option<usize>,
+    /// Chebyshev radius (bricks) of the kept-resident box around each player
+    /// when `residency_budget_bricks` is set. Defaults to the server's default.
+    #[serde(default)]
+    residency_radius_bricks: Option<i64>,
+    /// T23 / G3 row 7, slice E2: run each **movement-scripted** client with
+    /// `--residency-budget-bricks` — the replica evicts terrain outside a brick
+    /// box around its predicted player and pulls it back with repair requests
+    /// as the player returns (row 8b traverse-away-and-back). The committed
+    /// world / agreed hash is unchanged.
+    #[serde(default)]
+    client_residency_budget_bricks: Option<usize>,
+    /// Chebyshev radius (bricks) kept resident around each scripted player when
+    /// `client_residency_budget_bricks` is set. Defaults to the client's default.
+    #[serde(default)]
+    client_residency_radius_bricks: Option<i64>,
     /// Minimum straight-line distance (metres) some replicated body must have
     /// travelled on every live client — proof the detached geometry actually
     /// moved, not merely that a (possibly stationary) snapshot arrived.
@@ -422,12 +460,17 @@ fn body_settled(scenario: &Scenario, server: &ServerSummary) -> bool {
 #[derive(Debug, Clone, Deserialize)]
 struct ClientSummary {
     result: String,
+    #[serde(default)]
     transactions_applied: u64,
+    #[serde(default)]
     repair_requests_sent: u64,
+    #[serde(default)]
     transactions_rejected: u64,
+    #[serde(default)]
     motion_snapshots: u64,
     #[serde(default)]
     motion_snapshots_out_of_order: u64,
+    #[serde(default)]
     final_world_hash: String,
     #[serde(default)]
     late_join: bool,
@@ -478,6 +521,17 @@ struct SessionSummary {
     replay_checked: bool,
     replay_matches: bool,
     replayed_topology_events: u64,
+    /// T23 / G3 cold-restart check: whether it ran, whether a fresh server
+    /// recovered the agreed hash from the world DB, and whether a fresh
+    /// `--late-join` client against the restarted server converged to it.
+    restart_checked: bool,
+    restart_recovered_hash_matches: bool,
+    restart_reconnect_hash_matches: bool,
+    restart_recovered_world_hash: String,
+    /// T23 / G3 row 10: `late_join_may_fail` was set and an impaired late joiner
+    /// ended in an accepted bounded explicit failure (`join-failed`, real exit)
+    /// while the live clients + server still converged.
+    impaired_late_join_bounded_failure: bool,
     agreed_world_hash: String,
     all_hashes_match: bool,
     requirements_met: bool,
@@ -910,12 +964,21 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         // so the run can actually show it come to rest.
         server_cmd.arg("--await-body-settle");
     }
-    // T11 exact-replay check: journal every committed transaction to a world DB
-    // and, after the run, replay the whole journal from the tick-0 baseline and
-    // assert it reproduces the agreed hash.
+    if let Some(budget) = scenario.residency_budget_bricks {
+        server_cmd.args(["--residency-budget-bricks", &budget.to_string()]);
+        if let Some(r) = scenario.residency_radius_bricks {
+            server_cmd.args(["--residency-radius-bricks", &r.to_string()]);
+        }
+    }
+    // T11 exact-replay check (and the T23 cold-restart check) both journal every
+    // committed transaction to a world DB. Replay rebuilds from the tick-0
+    // baseline; restart recovers a fresh server from the shutdown checkpoint.
     let replay_db = output.join("world.db");
-    if scenario.replay_check {
+    if scenario.replay_check || scenario.restart_check {
         let _ = fs::remove_file(&replay_db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(output.join(format!("world.db{suffix}")));
+        }
         server_cmd.args([
             "--world",
             &output.display().to_string(),
@@ -1006,7 +1069,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             }
             c.args(["--cut", &spec]);
         }
+        let mut client_moves = false;
         for path in scenario.player_paths.iter().filter(|p| p.client == i) {
+            client_moves = true;
             for leg in &path.legs {
                 c.args([
                     "--move",
@@ -1020,6 +1085,13 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                         leg.buttons
                     ),
                 ]);
+            }
+        }
+        // Slice E2: client terrain residency, only where there is a mover.
+        if client_moves && let Some(budget) = scenario.client_residency_budget_bricks {
+            c.args(["--residency-budget-bricks", &budget.to_string()]);
+            if let Some(r) = scenario.client_residency_radius_bricks {
+                c.args(["--residency-radius-bricks", &r.to_string()]);
             }
         }
         if scenario.late_join_clients.contains(&i) {
@@ -1070,6 +1142,11 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     replay_checked: false,
                     replay_matches: false,
                     replayed_topology_events: 0,
+                    restart_checked: false,
+                    restart_recovered_hash_matches: false,
+                    restart_reconnect_hash_matches: false,
+                    restart_recovered_world_hash: String::new(),
+                    impaired_late_join_bounded_failure: false,
                     agreed_world_hash: String::new(),
                     all_hashes_match: false,
                     requirements_met: false,
@@ -1084,12 +1161,23 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     let agreed = server.final_world_hash.clone();
     let mut all_match = server_ok && server.result == "passed";
     let mut rows = Vec::new();
+    let mut bounded_join_failure_seen = false;
     for (i, summary) in client_summaries.iter().enumerate() {
-        let exit_ok = statuses.get(&format!("client{i}")).copied().flatten() == Some(0);
+        let exit_code = statuses.get(&format!("client{i}")).copied().flatten();
+        let exit_ok = exit_code == Some(0);
         let is_mover = scenario.player_paths.iter().any(|p| p.client == i as u64);
+        let is_late = scenario.late_join_clients.contains(&(i as u64));
         match summary {
             Some(c) => {
                 let hash_ok = c.final_world_hash == agreed;
+                // T23 / G3 row 10: an impaired late joiner that ended in a
+                // *bounded explicit* failure — a "join-failed" summary and a
+                // real process exit (not a deadline kill) — is acceptable under
+                // `late_join_may_fail`; it need not match the agreed hash.
+                let bounded_join_failure = scenario.late_join_may_fail
+                    && is_late
+                    && c.result == "join-failed"
+                    && exit_code.is_some();
                 // A late joiner that caught up entirely from the baseline (no
                 // cuts after it joined) is still a pass.
                 let progressed = is_mover
@@ -1114,12 +1202,17 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 } else {
                     true
                 };
-                all_match &= exit_ok
-                    && c.result == "passed"
-                    && hash_ok
-                    && progressed
-                    && movement_ok
-                    && c.transactions_rejected == 0;
+                if bounded_join_failure {
+                    bounded_join_failure_seen = true;
+                }
+                let client_ok = bounded_join_failure
+                    || (exit_ok
+                        && c.result == "passed"
+                        && hash_ok
+                        && progressed
+                        && movement_ok
+                        && c.transactions_rejected == 0);
+                all_match &= client_ok;
                 rows.push(ClientRow {
                     index: i as u64,
                     result: c.result.clone(),
@@ -1183,6 +1276,19 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         None
     };
 
+    // T23 / G3: cold-restart a fresh server over the same world DB (recovery
+    // from the shutdown checkpoint + journal), then a fresh `--late-join` client
+    // against it. Both must reach the agreed hash.
+    let restart = if scenario.restart_check {
+        let r = run_restart_check(&output, &scenario.scene, &token_file, &agreed, run.timeout);
+        if !(r.ran && r.recovered_matches && r.reconnect_matches) {
+            requirements_met = false;
+        }
+        Some(r)
+    } else {
+        None
+    };
+
     // T11a / ENG-62: assert the measured commit-latency p95s against the G1 gate
     // targets when the scenario configured them.
     let latency_ok = latency_targets_met(&scenario, &server);
@@ -1224,6 +1330,20 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             replay_checked: replay.is_some(),
             replay_matches: replay.as_ref().map(|r| r.ran && r.matches).unwrap_or(false),
             replayed_topology_events: replay.as_ref().map(|r| r.events).unwrap_or(0),
+            restart_checked: restart.is_some(),
+            restart_recovered_hash_matches: restart
+                .as_ref()
+                .map(|r| r.ran && r.recovered_matches)
+                .unwrap_or(false),
+            restart_reconnect_hash_matches: restart
+                .as_ref()
+                .map(|r| r.ran && r.reconnect_matches)
+                .unwrap_or(false),
+            restart_recovered_world_hash: restart
+                .as_ref()
+                .map(|r| r.recovered_hash.clone())
+                .unwrap_or_default(),
+            impaired_late_join_bounded_failure: bounded_join_failure_seen,
             agreed_world_hash: agreed,
             all_hashes_match: all_match,
             requirements_met,
@@ -1287,6 +1407,141 @@ fn run_replay_check(db: &Path, expected: &str, output: &Path) -> ReplayCheck {
 struct ReplaySummary {
     #[serde(default)]
     replayed_topology_events: u64,
+}
+
+struct RestartCheck {
+    ran: bool,
+    recovered_hash: String,
+    recovered_matches: bool,
+    reconnect_matches: bool,
+}
+
+/// T23 / G3 cold restart. Launches a **fresh** `sandbox-server --serve --save`
+/// over the world DB the run just journalled — a cold recovery from the
+/// shutdown checkpoint plus the durable journal, no client edit replay — and
+/// requires its recovered `final_world_hash` to equal `expected`. A fresh
+/// `--late-join` client then connects to the restarted server and must converge
+/// to the same hash, proving the recovered world serves a correct baseline.
+fn run_restart_check(
+    output: &Path,
+    scene: &str,
+    token_file: &Path,
+    expected: &str,
+    deadline: Duration,
+) -> RestartCheck {
+    let miss = RestartCheck {
+        ran: false,
+        recovered_hash: String::new(),
+        recovered_matches: false,
+        reconnect_matches: false,
+    };
+    if !output.join("world.db").exists() {
+        return miss;
+    }
+
+    let fp = output.join("restart.fingerprint");
+    let addr = output.join("restart.addr");
+    let srv_summary = output.join("restart.server.summary.json");
+    let cl_summary = output.join("restart.client.summary.json");
+    for p in [&fp, &addr, &srv_summary, &cl_summary] {
+        let _ = fs::remove_file(p);
+    }
+
+    let mut guard = ChildGuard::default();
+    let mut srv = Command::new(sandbox_binary("sandbox-server"));
+    srv.args([
+        "--serve",
+        "--listen",
+        "127.0.0.1:0",
+        "--join-token-file",
+        &token_file.display().to_string(),
+        "--fingerprint-out",
+        &fp.display().to_string(),
+        "--addr-out",
+        &addr.display().to_string(),
+        "--summary-json",
+        &srv_summary.display().to_string(),
+        "--log-json",
+        &output.join("restart.server.jsonl").display().to_string(),
+        // A short bounded run: the recovering server has no edits to make, it
+        // just needs to be up long enough to serve one late-join baseline.
+        "--ticks",
+        "300",
+        "--min-clients",
+        "0",
+        "--max-clients",
+        "1",
+        "--scene",
+        scene,
+        "--quiescence-ticks",
+        "0",
+        "--paced",
+        "--world",
+        &output.display().to_string(),
+        "--save",
+        "--checkpoint-interval-ticks",
+        "0",
+        "--dev-unvalidated-actions",
+    ]);
+    hide_console(&mut srv);
+    let Ok(child) = srv.spawn() else {
+        return miss;
+    };
+    guard.push("server".into(), child);
+
+    let Ok(bound) = wait_for_addr(&addr, &mut guard, Duration::from_secs(20)) else {
+        return miss;
+    };
+
+    let client_timeout = deadline.saturating_sub(Duration::from_secs(3)).as_millis() as u64;
+    let mut cl = Command::new(sandbox_binary("sandbox-client"));
+    cl.args([
+        "--connect",
+        &bound,
+        "--server-fingerprint",
+        &fp.display().to_string(),
+        "--join-token-file",
+        &token_file.display().to_string(),
+        "--summary-json",
+        &cl_summary.display().to_string(),
+        "--log-json",
+        &output.join("restart.client.jsonl").display().to_string(),
+        "--timeout-ms",
+        &client_timeout.to_string(),
+        "--client-index",
+        "0",
+        "--scene",
+        scene,
+        "--late-join",
+        "--connect-delay-ms",
+        "300",
+    ]);
+    hide_console(&mut cl);
+    let Ok(child) = cl.spawn() else {
+        return miss;
+    };
+    guard.push("restart-client".into(), child);
+
+    let _ = guard.wait_all(deadline);
+
+    let server = read_json::<ServerSummary>(&srv_summary);
+    let recovered_hash = server
+        .as_ref()
+        .map(|s| s.final_world_hash.clone())
+        .unwrap_or_default();
+    let recovered_matches = server
+        .map(|s| s.result == "passed" && s.final_world_hash == expected)
+        .unwrap_or(false);
+    let reconnect_matches = read_json::<ClientSummary>(&cl_summary)
+        .map(|c| c.result == "passed" && c.final_world_hash == expected)
+        .unwrap_or(false);
+
+    RestartCheck {
+        ran: true,
+        recovered_hash,
+        recovered_matches,
+        reconnect_matches,
+    }
 }
 
 fn finish(output: &Path, summary: SessionSummary) -> Result<(), XtaskError> {

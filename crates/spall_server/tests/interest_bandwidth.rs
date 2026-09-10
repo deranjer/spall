@@ -76,6 +76,7 @@ fn base_config(
         save_faults: None,
         await_body_settle: false,
         motion_interest: Some(motion_interest),
+        residency: None,
     }
 }
 
@@ -103,6 +104,7 @@ fn column_cut_client(
         log_json: dir.join("client.jsonl"),
         summary_json: Some(dir.join("client.summary.json")),
         transport: TransportConfig::for_tests(),
+        client_residency: None,
     }
 }
 

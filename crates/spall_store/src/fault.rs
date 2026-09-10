@@ -56,6 +56,12 @@ pub struct FaultPlan {
     /// the staged `INSERT`/`COMMIT` returns an actual `rusqlite::Error`. One
     /// shot; consumed when reached.
     pub real_write_failure: bool,
+    /// Fail the next journal or checkpoint `COMMIT` as an **out-of-disk**
+    /// (`SQLITE_FULL`) error: the transaction rolls back and the writer is
+    /// poisoned, exactly as for a real ENOSPC. Modelled the same way as
+    /// `fail_*_commit` (a pre-`COMMIT` short-circuit), with a disk-full label.
+    /// One shot; consumed when reached.
+    pub disk_full: bool,
 }
 
 impl FaultPlan {
@@ -87,6 +93,15 @@ impl FaultPlan {
     pub fn real_sqlite_write_failure() -> Self {
         Self {
             real_write_failure: true,
+            ..Self::default()
+        }
+    }
+
+    /// A plan that fails the next journal or checkpoint commit as an
+    /// out-of-disk (`SQLITE_FULL`) error.
+    pub fn disk_full() -> Self {
+        Self {
+            disk_full: true,
             ..Self::default()
         }
     }

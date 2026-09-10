@@ -13,10 +13,9 @@ use spall_structure::{
     AnchorPlane, CancelToken, ComponentMembership, ConservationLedger, Interrupted, ResidencyMode,
     SearchBudget, StructureIndex, SupportReport,
 };
-use spall_voxel::{BrickState, EditError, EditOutcome, EditPlan, Volume};
+use spall_voxel::{BrickState, EditError, EditOutcome, EditPlan, EvictedBricks, Volume};
 
 use crate::intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse};
-use crate::world::solid_cells;
 
 /// The immutable inputs to one staging pass — a cheap clone bundle captured when
 /// the job is submitted.
@@ -28,6 +27,12 @@ pub struct StageInput {
     pub volume_id: VolumeId,
     /// Snapshot of the target volume.
     pub volume: Volume,
+    /// T23 / G3 row 7, slice B: the target volume's retained evicted-brick
+    /// digests. Empty by default (residency is off until slice D), so every
+    /// path below is byte-identical to today. When non-empty, staging refuses
+    /// an edit whose structural analysis would read an evicted brick as empty —
+    /// the caller must reload it and re-stage.
+    pub evicted: EvictedBricks,
     pub anchor: AnchorPlane,
     pub generation: Generation,
     pub topology_epoch: TopologyEpoch,
@@ -37,11 +42,14 @@ pub struct StageInput {
 }
 
 impl StageInput {
-    /// Builds staging inputs for `intent` against `snapshot`.
+    /// Builds staging inputs for `intent` against `snapshot`. `evicted` is the
+    /// target volume's retained evicted-brick digests (`EvictedBricks::new()`
+    /// when residency is off).
     pub fn new(
         intent: &EditIntent,
         volume_id: VolumeId,
         snapshot: Volume,
+        evicted: EvictedBricks,
         anchor: AnchorPlane,
         generation: Generation,
         topology_epoch: TopologyEpoch,
@@ -52,6 +60,7 @@ impl StageInput {
             target: intent.target,
             volume_id,
             volume: snapshot,
+            evicted,
             anchor,
             generation,
             topology_epoch,
@@ -117,6 +126,11 @@ pub enum StageError {
     Structure(#[from] Interrupted),
     #[error("dry-run edit failed: {0}")]
     Edit(#[from] EditError),
+    #[error(
+        "edit needs evicted geometry that is not loaded (bricks {0:?}); \
+         the caller must reload it and re-stage"
+    )]
+    EvictedGeometryRequired(Vec<BrickCoord>),
 }
 
 /// Prepares `input` into a [`StagedEdit`].
@@ -155,7 +169,12 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         }
     }
 
-    let pre_solid = solid_cells(&input.volume);
+    // Conservation is over the *logical* solid-cell count (resident + retained
+    // evicted digests), so eviction never shifts the ledger regardless of where
+    // the evicted bricks are. Identical to a resident-only walk when nothing is
+    // evicted.
+    let pre_solid = spall_voxel::logical_solid_cells(&input.volume, &input.evicted)
+        .map_err(|_| StageError::EvictedGeometryRequired(Vec::new()))?;
 
     // Dry-run the edit and re-classify support on the result.
     let mut post = input.volume.clone();
@@ -179,7 +198,43 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         EditTarget::Body(_) => detached_from_body(&index),
     };
 
-    let post_solid = report.total_solid_cells;
+    // T23 / G3 row 7, slice B: the structural analysis ran `AllResident`, which
+    // reads an absent brick as known-empty. If an *evicted* brick (holds
+    // durable geometry) is inside — or a face neighbour of — the region this
+    // edit actually changes (its written bricks, and every component it
+    // detaches), the classification for this transaction is unsound: refuse, so
+    // the caller reloads that geometry and re-stages. An evicted brick far from
+    // the edit, bordering unrelated geometry, does not affect this
+    // transaction's `before` / `after` / `result_hashes` and is left alone
+    // (conservation below uses the logical count regardless). Dependency-
+    // complete reload-and-retry is the residency pass's job (slice C/D).
+    if !input.evicted.is_empty() {
+        let mut region: Vec<BrickCoord> = touched_brick_coords(&plan);
+        for m in &memberships {
+            for cell in m.cells() {
+                region.push(cell.split().0);
+            }
+        }
+        let mut needed: Vec<BrickCoord> = Vec::new();
+        for brick in region {
+            for c in std::iter::once(brick).chain(face_neighbours(brick)) {
+                if input.evicted.contains(c) && !needed.contains(&c) {
+                    needed.push(c);
+                }
+            }
+        }
+        if !needed.is_empty() {
+            needed.sort_by_key(|c| c.sort_key());
+            needed.dedup();
+            return Err(StageError::EvictedGeometryRequired(needed));
+        }
+    }
+
+    // Post-edit solid count, over the logical brick set: the evicted bricks are
+    // untouched by the edit, so their digests still hold, and `destroyed` stays
+    // exact no matter where they are.
+    let post_solid = spall_voxel::logical_solid_cells(&post, &input.evicted)
+        .map_err(|_| StageError::EvictedGeometryRequired(Vec::new()))?;
     let child_cells: u64 = memberships.iter().map(|m| m.cell_count).sum();
     let ledger = ConservationLedger {
         source_occupied: pre_solid,
@@ -236,6 +291,19 @@ fn touched_brick_coords(plan: &EditPlan) -> Vec<BrickCoord> {
     coords
 }
 
+/// The six face-adjacent brick coordinates of `c` (T23 / G3 row 7 slice B
+/// evicted-geometry check).
+fn face_neighbours(c: BrickCoord) -> [BrickCoord; 6] {
+    [
+        BrickCoord::new(c.x - 1, c.y, c.z),
+        BrickCoord::new(c.x + 1, c.y, c.z),
+        BrickCoord::new(c.x, c.y - 1, c.z),
+        BrickCoord::new(c.x, c.y + 1, c.z),
+        BrickCoord::new(c.x, c.y, c.z - 1),
+        BrickCoord::new(c.x, c.y, c.z + 1),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +350,7 @@ mod tests {
             &intent,
             vid,
             terrain,
+            spall_voxel::EvictedBricks::new(),
             AnchorPlane::at(0),
             Generation::START,
             TopologyEpoch::START,
@@ -325,6 +394,7 @@ mod tests {
             &intent,
             vid,
             terrain,
+            spall_voxel::EvictedBricks::new(),
             AnchorPlane::at(0),
             Generation::START,
             TopologyEpoch::START,

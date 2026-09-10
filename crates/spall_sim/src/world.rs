@@ -23,7 +23,7 @@ use spall_protocol::{
     canonical_topology_hash,
 };
 use spall_structure::AnchorPlane;
-use spall_voxel::{Brick, BrickBounds, BrickState, EditPlan, Volume};
+use spall_voxel::{Brick, BrickBounds, BrickState, EditPlan, EvictedBricks, Volume};
 
 use crate::body::{Body, BodyKind, BodyPose};
 use crate::collider::plan_collider;
@@ -123,6 +123,23 @@ pub struct SimWorld {
     /// (T19). Not bodies: no volume, never split, never in the dynamic set.
     players: BTreeMap<u64, Player>,
     physics: PhysicsWorld,
+    /// T23 / G3 row 7, slice B: per-volume digests of bricks that have been
+    /// evicted from the live cache. Empty unless the residency pass (slice D)
+    /// populates it, so every logical path is byte-identical to today by
+    /// default. Keyed by raw volume id.
+    evicted: BTreeMap<u64, EvictedBricks>,
+    /// T23 / G3 row 7, slice C: durable source used to reload an evicted brick's
+    /// cells when an edit needs them. `None` unless the residency pass installs
+    /// one; with `None`, an edit that needs evicted geometry is rejected rather
+    /// than reloaded.
+    backing: Option<std::sync::Arc<dyn crate::backing::BrickBacking>>,
+}
+
+/// A shared empty digest set, so [`SimWorld::evicted`] can return a reference
+/// for a volume that has nothing evicted without allocating.
+fn empty_evicted() -> &'static EvictedBricks {
+    static EMPTY: std::sync::OnceLock<EvictedBricks> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(EvictedBricks::new)
 }
 
 impl SimWorld {
@@ -178,7 +195,143 @@ impl SimWorld {
             volume_owner: BTreeMap::new(),
             players: BTreeMap::new(),
             physics,
+            evicted: BTreeMap::new(),
+            backing: None,
         })
+    }
+
+    /// The retained evicted-brick digests for `volume` (empty by default —
+    /// residency is off until slice D). See `docs/reports/G3-residency-hash.md`.
+    pub fn evicted(&self, volume: VolumeId) -> &EvictedBricks {
+        self.evicted
+            .get(&volume.get())
+            .unwrap_or_else(|| empty_evicted())
+    }
+
+    /// Mutable digest set for `volume`, created empty if absent. The residency
+    /// pass keeps this consistent with the live volume under the digest
+    /// lifecycle contract.
+    pub fn evicted_mut(&mut self, volume: VolumeId) -> &mut EvictedBricks {
+        self.evicted.entry(volume.get()).or_default()
+    }
+
+    /// Replaces `volume`'s digest set wholesale (a full baseline / recovery
+    /// transition, or a test fixture).
+    pub fn set_evicted(&mut self, volume: VolumeId, digests: EvictedBricks) {
+        if digests.is_empty() {
+            self.evicted.remove(&volume.get());
+        } else {
+            self.evicted.insert(volume.get(), digests);
+        }
+    }
+
+    /// `true` if any volume has retained evicted digests.
+    pub fn has_evicted(&self) -> bool {
+        self.evicted.values().any(|e| !e.is_empty())
+    }
+
+    /// Evicts one brick of `volume` from the live cache, retaining its exact
+    /// `(revision, content_hash, solid_cells)` digest so `world_hash`,
+    /// conservation, and `result_hashes` still see it (the digest-lifecycle
+    /// "evict" transition). `Ok(false)` if the brick is not resident. The
+    /// residency pass (slice D) is the real caller; also used by tests.
+    pub fn evict_brick(
+        &mut self,
+        volume: VolumeId,
+        coord: BrickCoord,
+    ) -> Result<bool, spall_voxel::DigestError> {
+        let Some(vol) = self.volume_ref(volume) else {
+            return Ok(false);
+        };
+        let digest = match spall_voxel::BrickDigest::capture(vol, coord) {
+            Ok(d) => d,
+            Err(spall_voxel::DigestError::NotResident(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        self.evicted_mut(volume).record(coord, digest)?;
+        self.volume_body_mut(volume)
+            .expect("volume_ref matched")
+            .volume
+            .evict_brick(coord);
+        Ok(true)
+    }
+
+    /// Reload lifecycle: after geometry has been reinstalled at `coord`, verify
+    /// it matches the retained digest and drop the digest. `Err` leaves the
+    /// digest in place (the reload stays pending/failed).
+    pub fn clear_evicted_after_reload(
+        &mut self,
+        volume: VolumeId,
+        coord: BrickCoord,
+    ) -> Result<(), spall_voxel::DigestError> {
+        let vol = self
+            .volume_ref(volume)
+            .ok_or(spall_voxel::DigestError::NoRetained(coord))?;
+        self.evicted(volume).verify_reload(vol, coord)?;
+        self.evicted_mut(volume).clear(coord)?;
+        Ok(())
+    }
+
+    /// Installs the durable brick source used by [`Self::reload_brick`].
+    pub fn set_backing(&mut self, backing: std::sync::Arc<dyn crate::backing::BrickBacking>) {
+        self.backing = Some(backing);
+    }
+
+    /// `true` once a durable brick source is installed.
+    pub fn has_backing(&self) -> bool {
+        self.backing.is_some()
+    }
+
+    /// Reloads one evicted brick's cells from the backing, reinstalls it,
+    /// verifies it against the retained digest, and drops the digest. `Ok(true)`
+    /// if the brick is now resident (including "was never evicted"); `Ok(false)`
+    /// if no backing is installed or the durable record is unavailable — the
+    /// caller then rejects the edit with a bounded explicit failure.
+    pub fn reload_brick(
+        &mut self,
+        volume: VolumeId,
+        coord: BrickCoord,
+    ) -> Result<bool, spall_voxel::DigestError> {
+        if !self.evicted(volume).contains(coord) {
+            return Ok(true);
+        }
+        let Some(backing) = self.backing.clone() else {
+            return Ok(false);
+        };
+        // The retained digest's exact (revision, content_hash) is checked by
+        // `clear_evicted_after_reload` -> `verify_reload` below, so a wrong
+        // backing record is rejected without dropping the digest.
+        let brick = match backing.load(volume, coord) {
+            crate::backing::BackingBrick::Loaded(brick) => brick,
+            crate::backing::BackingBrick::KnownEmpty { revision, edited } => {
+                spall_voxel::Brick::restored(
+                    &[spall_core::MaterialId::AIR; spall_core::CELLS_PER_BRICK],
+                    revision,
+                    edited,
+                )
+            }
+            crate::backing::BackingBrick::Unavailable => return Ok(false),
+        };
+        self.volume_body_mut(volume)
+            .ok_or(spall_voxel::DigestError::NoRetained(coord))?
+            .volume
+            .insert_brick(coord, brick)?;
+        self.clear_evicted_after_reload(volume, coord)?;
+        Ok(true)
+    }
+
+    /// Reloads every coord in `coords`. Returns `Ok(true)` only if every one is
+    /// now resident.
+    pub fn reload_bricks(
+        &mut self,
+        volume: VolumeId,
+        coords: impl IntoIterator<Item = BrickCoord>,
+    ) -> Result<bool, spall_voxel::DigestError> {
+        let mut all = true;
+        for coord in coords {
+            all &= self.reload_brick(volume, coord)?;
+        }
+        Ok(all)
     }
 
     pub fn anchor(&self) -> AnchorPlane {
@@ -1235,7 +1388,13 @@ impl SimWorld {
                 CanonicalOwner::Body(body.entity.expect("detached body has an entity")),
             )
         };
-        Some(canonical_volume_for(v, owner))
+        // Over the *logical* brick set (resident ∪ retained evicted digests), so
+        // the value never moves when cache contents differ. Identical to
+        // `canonical_volume_for` when nothing is evicted.
+        Some(
+            canonical_logical_volume_for(v, self.evicted(volume), owner)
+                .expect("logical volume: resident/evicted digest invariant holds"),
+        )
     }
 
     /// Canonical topology hash of just `volume`.
@@ -1260,11 +1419,18 @@ impl SimWorld {
     }
 
     /// Total solid cells across terrain and every body — the conservation
-    /// invariant's left-hand side over the whole world.
+    /// invariant's left-hand side over the whole world. Over the **logical**
+    /// brick set (resident cells + retained evicted digests' `solid_cells`), so
+    /// eviction never changes the conservation accounting. Identical to a
+    /// resident-only walk when nothing is evicted.
     pub fn total_solid_cells(&self) -> u64 {
-        let mut total = solid_cells(&self.terrain.volume);
+        let logical = |vol: &Volume, vid: VolumeId| {
+            spall_voxel::logical_solid_cells(vol, self.evicted(vid))
+                .expect("logical solid count: resident/evicted digest invariant holds")
+        };
+        let mut total = logical(&self.terrain.volume, self.terrain.volume_id);
         for body in self.bodies.values() {
-            total += solid_cells(&body.volume);
+            total += logical(&body.volume, body.volume_id);
         }
         total
     }
@@ -1329,6 +1495,35 @@ pub fn canonical_volume_for(volume: &Volume, owner: CanonicalOwner) -> Canonical
 /// candidate can compute its result hashes before publishing.
 pub fn volume_topology_hash_for(volume: &Volume, owner: CanonicalOwner) -> Hash32 {
     canonical_topology_hash(&[canonical_volume_for(volume, owner)])
+}
+
+/// [`canonical_volume_for`] over the **logical** brick set (T23 / G3 row 7):
+/// resident bricks plus retained evicted digests, each key once, canonical
+/// order. Byte-identical to `canonical_volume_for` when `evicted` is empty, and
+/// to the *pre-eviction* full volume for any subset of clean bricks moved into
+/// `evicted` — so cache placement never moves the topology hash.
+pub fn canonical_logical_volume_for(
+    volume: &Volume,
+    evicted: &spall_voxel::EvictedBricks,
+    owner: CanonicalOwner,
+) -> Result<CanonicalVolume, spall_voxel::DigestError> {
+    let bricks = spall_voxel::logical_bricks(volume, evicted)?
+        .into_iter()
+        .map(|b| CanonicalBrick {
+            coord: b.coord,
+            revision: b.revision,
+            layers: vec![CanonicalLayer {
+                kind: MATERIAL_LAYER_KIND,
+                bytes: spall_voxel::BrickHash::to_bytes(b.content_hash).to_vec(),
+            }],
+        })
+        .collect();
+    Ok(CanonicalVolume {
+        volume_id: volume.id(),
+        cell_size: volume.cell_size(),
+        owner,
+        bricks,
+    })
 }
 
 /// Count of solid cells in a volume (walks every resident brick).

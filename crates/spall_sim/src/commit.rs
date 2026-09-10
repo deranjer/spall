@@ -44,7 +44,7 @@ use crate::collider::plan_collider;
 use crate::journal::{JournalEntry, JournalSink};
 use crate::stage::StagedEdit;
 use crate::transfer::{self, ChildBody, ParentState};
-use crate::world::{SimWorld, volume_topology_hash_for};
+use crate::world::{SimWorld, canonical_logical_volume_for, volume_topology_hash_for};
 
 /// Structural algorithm version stamped into every transaction.
 pub const ALGORITHM_VERSION: u32 = 1;
@@ -107,6 +107,14 @@ pub enum CommitError {
     Record(#[from] RecordError),
     #[error("commit cannot be encoded for replication: {0}")]
     Replication(#[from] crate::replication::ReplicationError),
+    #[error(
+        "commit needs evicted geometry that is not loaded (volume {volume}, bricks {bricks:?}); \
+         the caller must reload it and re-stage"
+    )]
+    EvictedGeometryRequired {
+        volume: VolumeId,
+        bricks: Vec<spall_core::BrickCoord>,
+    },
 }
 
 impl From<crate::transfer::PlanChildError> for CommitError {
@@ -199,6 +207,40 @@ pub fn commit(
     }
 
     // 4. Apply the brush to a clone of the target volume.
+    //
+    //    T23 / G3 row 7: the candidate is a clone of the *live* volume, which
+    //    does not hold evicted bricks. If the plan (or a detaching child) would
+    //    touch an evicted brick, `apply_edit` would silently recreate it as
+    //    empty — dropping durable geometry and producing a wrong `result_hash`.
+    //    Staging refuses an edit whose structural analysis needs evicted
+    //    geometry; this guards the direct-overlap case. Reloading the bricks is
+    //    the residency pass's job (slice C/D); until then this is a hard error,
+    //    never a silent corruption.
+    let evicted = world.evicted(vid);
+    if !evicted.is_empty() {
+        let mut needed: Vec<spall_core::BrickCoord> = staged
+            .touched_bricks()
+            .into_iter()
+            .filter(|c| evicted.contains(*c))
+            .collect();
+        for membership in &staged.memberships {
+            for cell in membership.cells() {
+                let brick = cell.split().0;
+                if evicted.contains(brick) && !needed.contains(&brick) {
+                    needed.push(brick);
+                }
+            }
+        }
+        if !needed.is_empty() {
+            needed.sort_by_key(|c| c.sort_key());
+            needed.dedup();
+            return Err(CommitError::EvictedGeometryRequired {
+                volume: vid,
+                bricks: needed,
+            });
+        }
+    }
+
     let mut parent_candidate: Volume = world
         .volume_ref(vid)
         .ok_or(CommitError::UnknownVolume(vid))?
@@ -248,7 +290,27 @@ pub fn commit(
     //    a terrain parent has no solver mass) (`ENG-41`). A fragmented parent
     //    with no exact active collider fails the commit here, before publish
     //    (`ENG-42`).
-    let parent_rebuild = match OccupancyGrid::from_volume(&parent_candidate)? {
+    // T23 / G3 row 7, slice B: the collider rebuild samples every cell in the
+    // candidate's solid bounding box. If that box reaches an evicted brick, the
+    // rebuild cannot see its geometry — refuse (the residency pass reloads it
+    // and re-stages). Loading collider dependencies on demand is slice C.
+    //
+    // `ExtractError::Unresident` names one cell, but the bounding box may reach
+    // several evicted bricks; reporting them one per retry lets the residency
+    // pass re-evict an already-reloaded one before the set is ever whole. Ask
+    // for every evicted brick in the volume at once so a single reload makes the
+    // candidate's whole bounding box resident and the retry commits next tick.
+    let occupancy = match OccupancyGrid::from_volume(&parent_candidate) {
+        Ok(o) => o,
+        Err(spall_physics::ExtractError::Unresident(_)) if !world.evicted(vid).is_empty() => {
+            return Err(CommitError::EvictedGeometryRequired {
+                volume: vid,
+                bricks: world.evicted(vid).iter().map(|(c, _)| c).collect(),
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let parent_rebuild = match occupancy {
         Some(grid) => {
             let plan = plan_collider(&grid)?;
             let mass_properties = (!parent_is_terrain).then(|| {
@@ -301,11 +363,25 @@ pub fn commit(
         Some(entity) => CanonicalOwner::Body(entity),
         None => CanonicalOwner::Terrain,
     };
+    // The parent result hash is over the **logical** brick set: the post-cut
+    // candidate's resident bricks plus the parent volume's retained evicted
+    // digests (unchanged — the guard above proved the edit touched none of
+    // them). A replica that holds those bricks resident computes the same value.
+    // Identical to `volume_topology_hash_for` when nothing is evicted.
+    let parent_result_hash =
+        spall_protocol::canonical_topology_hash(&[canonical_logical_volume_for(
+            &parent_candidate,
+            world.evicted(vid),
+            parent_owner,
+        )
+        .expect("logical candidate volume: digest invariant holds")]);
     let mut result_hashes = vec![VolumeHash {
         volume: vid,
-        hash: volume_topology_hash_for(&parent_candidate, parent_owner),
+        hash: parent_result_hash,
     }];
     for child in &children {
+        // Children are freshly detached solid components built from the
+        // (fully resident, guard-checked) candidate — no evicted digests apply.
         result_hashes.push(VolumeHash {
             volume: child.volume_id,
             hash: volume_topology_hash_for(&child.volume, CanonicalOwner::Body(child.entity)),

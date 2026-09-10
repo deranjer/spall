@@ -111,13 +111,22 @@ save-record conversion and recovery). `sandbox-server --serve --save` recovers
 from `<world>/world.db` on start, journals every committed transaction, and
 checkpoints on `--checkpoint-interval-ticks` and clean shutdown. `cargo xtask
 crash-test --suite persistence` runs the in-process crash-point / disk-fault
-matrix through a real `Simulation` (bridge scene → column cut → beam detaches),
-including a genuine SQLite engine write failure, and writes `summary.json` with
-the measured bytes/write rate. Recovery after an **abrupt, unclean process
-kill** at the journal / checkpoint publication boundaries is a separate
-child-process harness: `cargo test -p spall_store --test abrupt_crash` (it kills
-real child processes and reopens from a fresh process). `summary.json`'s
-`unrun_here` field names what the in-process suite deliberately does not cover.
+matrix through a real `Simulation` (bridge scene → column cut → two floor
+excavations = three committed transactions) and writes `summary.json` with the
+measured bytes/write rate. Its 12 scenarios (T23 increment 3) cover **every**
+`CrashPoint` — before/after the journal commit, mid-checkpoint-rows,
+before/after the checkpoint commit (the after-commit case proves recovery
+resumes from a durable-but-unacked checkpoint) — plus a genuine SQLite engine
+write failure, an injected `SQLITE_FULL` (disk-full) on the checkpoint commit, a
+CRC-broken journal record, and a deleted interior journal record. The two
+corruption cases assert recovery reports it and truncates the durable prefix,
+that `RecoveryChoice::RequireClean` then fails closed, and that
+`AcceptDurablePrefix` resumes from the clean prefix. Recovery after an
+**abrupt, unclean process kill** at the journal / checkpoint publication
+boundaries is a separate child-process harness: `cargo test -p spall_store
+--test abrupt_crash` (it kills real child processes and reopens from a fresh
+process). `summary.json`'s `unrun_here` field names what the in-process suite
+deliberately does not cover.
 Durable writes go through `spall_server::persist_pipeline::PersistPipeline`: a
 single off-thread `Writer` fed a **bounded** queue of immutable
 snapshots/records, so a disk stall never stalls physics; a full backlog or a
@@ -315,6 +324,8 @@ At a gate, retain raw metrics alongside a concise report in `docs/reports/Gx.md`
 | destruction-network | Two clients agree with server geometry after cuts, duplicates, loss, reorder, and repair |
 | late-join-collapse | A third client obtains a consistent current world while objects split and move |
 | interest-crossing | A multi-region body remains one entity; entering clients receive required dependencies |
+| t23-g3 | Two regions of one bounded world collapse independently with separated players; a late joiner converges after heavy edits; the committed stream replays to the agreed hash and every beam rests |
+| t23-g3-impaired-join | A late joiner that cannot reach the (already shut-down) server ends in a bounded explicit `join-failed` — not a hang — while the live clients and server converge and replay |
 | save-air | Completely mined bricks remain empty after checkpoint, eviction, restart, and regeneration |
 | crash-transfer | Crash before/after source-removal/child-create commit cannot recover partial ownership |
 | malformed-input | Invalid lengths, huge coordinates, compressed bombs, invalid IDs/NaNs, excessive rates reject within bounds |
@@ -515,6 +526,83 @@ budget. `spall_client/tests/residency.rs` applies the same policy to replica
 terrain while retaining complete body geometry. These are correctness and
 bounded-accounting results, not the G3 memory, network, or join-duration gate;
 those measurements remain for T23.
+
+T23 lands in increments against `docs/reports/G3.md`. Increment 1 adds the
+`separated-regions` scene (`sandbox-server --serve --scene separated-regions` |
+`t23-g3`): one bounded 256 x 128 x 256 m world holding two independent
+collapsible structures 18 m apart, each connecting client given a capsule that
+spawns in alternating regions. Built-in `t23-g3` runs one server + three live
+clients + one `--late-join` replica; clients sever both regions' columns (a
+multi-region collapse), excavate each floor's ends, and the late client joins
+after those six edits. It passes headless and with `--loss-percent 3`: every
+scripted cut commits, all four clients and the server agree on one canonical
+hash, the committed stream replays from baseline to that hash, and both
+detached beams are reported at rest. A `restart_check` flag then stops the
+server, cold-restarts a fresh `sandbox-server --serve --save` over the same
+`world.db` (recovery from the shutdown checkpoint + journal), and requires both
+the recovered server and a fresh `--late-join` client against it to reach the
+agreed hash. Increment 3 brings `cargo xtask crash-test --suite persistence` to
+12 scenarios covering every `CrashPoint`, CRC / interior-gap journal
+corruption, and an injected `SQLITE_FULL`. Increment 4 covers the
+bounded-failure half of the impaired-late-join requirement: `sandbox-client`
+writes a `{"result":"join-failed"}` summary and exits `4` when a `--late-join`
+replica cannot get a baseline, and a `late_join_may_fail` scenario flag accepts
+a late client that either converged or ended in that bounded explicit failure
+(not a hang) while the live clients keep going — built-in
+`t23-g3-impaired-join` delays the late connect past server shutdown so the
+failure is deterministic. CPU proof: `cargo test -p spall_sim --test
+separated_regions`. Increment 6 (amending increment 5's design per the
+2026-09-10 review) freezes the row-7 contract in
+`docs/reports/G3-residency-hash.md` — one logical topology (resident bricks ∪
+retained evicted digests, each key once) folded by the unchanged
+`canonical_topology_hash` — and lands **slice A**: `spall_voxel::logical`
+(`BrickDigest`, `EvictedBricks` + lifecycle, `logical_bricks`,
+`logical_solid_cells`) and `spall_sim::canonical_logical_volume_for`. Proof:
+`cargo test -p spall_voxel --lib logical`; `cargo test -p spall_sim --test
+logical_hash` (the logical view is byte-identical to `canonical_volume_for` for
+any evicted subset in any order). Increment 7 (slice B) makes the transaction
+`result_hash`, the replica candidate-hash validator, `total_solid_cells`, and
+staging conservation all fold that logical view — a server and a replica with
+**different** bricks evicted still converge — and makes an edit that needs
+unloaded evicted geometry a hard `EvictedGeometryRequired` error rather than a
+silent corruption. Proof: `cargo test -p spall_sim --test logical_commit`;
+`cargo test -p spall_client --test logical_residency`. Increment 8 (slice C)
+adds `spall_sim::BrickBacking` + `SimWorld::reload_brick` so an edit that needs
+an evicted brick's cells reloads it and re-stages (no backing → a bounded
+explicit rejection), and `spall_server::logical_world_baseline` /
+`logical_brick_repair_patch` fill evicted bricks from the backing so a late
+joiner / repair still reaches the exact hash. Proof: `cargo test -p spall_sim
+--test logical_reload`; `cargo test -p spall_server --test logical_baseline`.
+Increment 9 (slice D) wires it into `serve()` behind a **default-off**
+`ServeConfig.residency` knob (`sandbox-server --residency-budget-bricks` /
+`--residency-radius-bricks`): `spall_server::residency_pass::ResidencyPass`
+keeps a brick box around every player capsule resident, evicts out-of-interest
+terrain after a settle hysteresis, refreshes the backing on commit, and reloads
+everything before each checkpoint; late-join and repair capture use the logical
+paths with that backing. Proof: `cargo test -p spall_server --test
+residency_pass` (residency-on reaches the same committed world as off, with real
+evictions); `cargo xtask scenario --name t23-g3-residency` (`t23-g3` under a
+6-brick budget — server + 4 clients + exact replay + cold restart all converge
+to the residency-off agreed hash with 56 evictions). Increment 10 (slice E1)
+adds the client reload digest lifecycle: `EvictedBricks::drop_resident` plus
+`ReplicaWorld` reload paths that supersede a retained digest atomically as the
+brick comes back (same revision on a traversal reload, newer on a repair patch),
+and `ClientResidency::wanted_reloads` to name evicted bricks back in interest.
+Proof: `cargo test -p spall_server --test client_residency` (a replica that
+evicted a region reloads it from server repair patches and converges; a cut into
+a fully-evicted replica region gaps then reloads-and-converges). Increment 11
+(slice E2 / **row 8b**) puts client residency in the live session:
+`spall_client::ClientResidencyPass` runs in the mover loop against the predicted
+player capsule — keep a brick box resident, evict the rest after a hysteresis,
+`RepairRequest` a retained-digest brick back in the box. Proof: `cargo xtask
+scenario --name t23-g3-traversal` — a client walks ~14.6 m out and part-way
+back on the `walk` lane, evicting 6 terrain bricks behind it and reloading 4;
+server residency also on; an edit lands in the region; server + both clients +
+exact replay + cold restart + reconnect all converge to one hash with no
+regrowth. Residency stays default-off for every other scenario. Remaining
+refinements (`ResidencyController` unification, durable-store backing,
+incremental capture, logical-terrain predicted collider) are follow-up tickets;
+the join-duration budget and the G4 eight-client workload + soak stay open.
 
 ### G4 — eight-client engine slice
 

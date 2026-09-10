@@ -12,10 +12,12 @@ pub mod persist;
 pub mod persist_pipeline;
 pub mod replication;
 pub mod residency;
+pub mod residency_pass;
 pub mod serve;
 
 pub use baseline::{
     BaselineError, BaselineTransfer, brick_repair_patch, capture_transfer, chunk_payload,
+    logical_brick_repair_patch, logical_capture_transfer, logical_world_baseline,
     transfer_from_world, world_baseline,
 };
 pub use persist::{
@@ -35,6 +37,7 @@ pub use residency::{
     BackingLoad, BodySpatialIndex, GraphBrickMeta, MemoryBackingError, MemoryBrickBacking,
     PartitionCoord, ResidencyBacking, ResidencyController, ResidencyError, StructuralResolution,
 };
+pub use residency_pass::{PassTick, ResidencyLimits, ResidencyPass, ResidencyStats};
 pub use serve::{MotionInterest, Scene, ServeConfig, ServeError, ServeSummary, serve};
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};

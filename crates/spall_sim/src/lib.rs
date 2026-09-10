@@ -35,6 +35,7 @@
 //! [`sim::Simulation`] wires all of that together and exposes a single
 //! [`sim::Simulation::tick`].
 
+pub mod backing;
 pub mod body;
 pub mod collider;
 pub mod commit;
@@ -55,6 +56,7 @@ pub mod world;
 /// Re-exported so game/example code names one `RequestId` type, not a copy.
 pub use spall_protocol::RequestId;
 
+pub use backing::{BackingBrick, BrickBacking, MemoryBacking};
 pub use body::{Body, BodyKind, BodyPose};
 pub use collider::{
     ColliderInfeasible, ColliderPlan, MAX_ACTIVE_COLLIDER_CELLS, PRIMITIVE_BUDGET, plan_collider,
@@ -76,7 +78,10 @@ pub use sim::{
     CONTACT_DAMAGE_ACTOR_ID, ContactDamageReport, SERVER_REQUEST_ID_BAND, Simulation,
     SimulationConfig, TICK_DT_S, TickError,
 };
-pub use stage::{StageError, StagedEdit, stage_edit};
+pub use stage::{StageError, StageInput, StagedEdit, stage_edit};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
 pub use world::{RestoredBody, SimWorld, WorldError};
-pub use world::{WorldSetup, solid_cells};
+pub use world::{
+    WorldSetup, canonical_logical_volume_for, canonical_volume_for, solid_cells,
+    volume_topology_hash_for,
+};
