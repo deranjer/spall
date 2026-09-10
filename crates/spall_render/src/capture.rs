@@ -7,7 +7,7 @@ use image::{ImageBuffer, Rgba};
 
 use crate::camera::Camera;
 use crate::context::{RenderContext, RenderError};
-use crate::indirect::{LIGHT_VOLUME_DIM, LightingUpdate};
+use crate::indirect::{LIGHT_VOLUME_DIM, LightingUpdate, LightingVolume};
 use crate::pipeline::{CASCADE_COUNT, DebugView, PassTiming, ScenePipeline, default_sun_dir};
 use crate::scene::Scene;
 use crate::target::OffscreenTarget;
@@ -1117,6 +1117,14 @@ pub struct FrameLoopReport {
     /// frame — no GPU wait, no readback. The renderer's per-frame encode cost,
     /// not a full client CPU frame (no simulation / culling / input).
     pub cpu_frame: Option<FrameStats>,
+    /// Per measured frame: that frame's own CPU encode cost **plus** that same
+    /// frame's own GPU device total — the directly-paired serial
+    /// submit-then-sync frame duration, percentiled over the measured frames.
+    /// This is a true measured upper bound on a pipelined client (which overlaps
+    /// the two); `max(cpu_frame.p95, gpu_frame.p95)` is the matching lower
+    /// bound. It is **not** `cpu_frame.p95 + gpu_frame.p95` — a sum of marginal
+    /// percentiles is neither measured nor a valid bound on the p95 of the sum.
+    pub serial_frame: Option<FrameStats>,
     pub first_image: PathBuf,
     pub last_image: PathBuf,
 }
@@ -1242,6 +1250,7 @@ pub fn capture_frame_loop(
     let mut tone_ms = Vec::new();
     let mut frame_ms = Vec::new();
     let mut cpu_ms = Vec::new();
+    let mut serial_ms = Vec::new();
 
     for frame in 0..total {
         if frame == opts.warmup_frames {
@@ -1362,7 +1371,9 @@ pub fn capture_frame_loop(
                 temporal_ms.push(*temporal);
                 opaque_ms.push(*opaque);
                 tone_ms.push(*tone);
-                frame_ms.push(trace + denoise + temporal + opaque + tone);
+                let gpu_total = trace + denoise + temporal + opaque + tone;
+                frame_ms.push(gpu_total);
+                serial_ms.push(frame_cpu_millis + gpu_total);
             }
         }
     }
@@ -1390,6 +1401,7 @@ pub fn capture_frame_loop(
         gpu_opaque: FrameStats::from_samples(&opaque_ms),
         gpu_tone_map: FrameStats::from_samples(&tone_ms),
         cpu_frame: FrameStats::from_samples(&cpu_ms),
+        serial_frame: FrameStats::from_samples(&serial_ms),
         first_image,
         last_image,
     })
@@ -1832,6 +1844,344 @@ fn render_motion_frame(
     target.copy_to_readback(&mut encoder);
     ctx.queue.submit([encoder.finish()]);
     Ok(())
+}
+
+// --- G2 / T15 bounded per-tick destruction sequence (increment 6) ----------
+//
+// Increment 5 (`--scene g2-collapse`) lights each captured collapse tick with a
+// *cold* full re-trace of a clipmap rebuilt from scratch — the increment-1 cost
+// (~12 ms p50), explicitly not a client frame. This path runs the collapse on
+// the increment-2 persistent-resource loop: GPU resources are built once, and
+// each tick's committed cuts and moving-body poses arrive as a bounded
+// [`LightingUpdate`] (translated by the caller from the authoritative sim), so
+// only the changed cells re-upload and only the changed region (grown by a
+// halo) re-traces. It reports the per-pass device timings, the directly-paired
+// per-frame serial total, the bounded re-upload / re-trace sizes, and the
+// per-probe luminance trace the caller checks for stale vacated shadows and
+// against a full-refresh reference.
+
+/// One tick of a [`capture_collapse_sequence`] run: the camera, the freshly
+/// meshed world (terrain + every detached body at its current pose), and the
+/// bounded lighting delta since the previous tick.
+pub struct CollapseFrame {
+    pub camera: Camera,
+    /// Terrain + body meshes for this tick, re-uploaded before the frame.
+    pub items: Vec<crate::scene::SceneItem>,
+    /// Committed cuts + moving-body poses since the previous tick, as the T14
+    /// partial-update DTO. Empty for a tick with no world change.
+    pub update: LightingUpdate,
+}
+
+/// Settings for a [`capture_collapse_sequence`] run.
+#[derive(Debug, Clone, Copy)]
+pub struct CollapseSequenceOptions {
+    pub width: u32,
+    pub height: u32,
+    pub exposure: f32,
+    /// Temporal accumulation weight applied every tick (`1.0` disables it).
+    pub temporal_weight: f32,
+    /// Cells added on each side of a tick's dirty cell-AABB before re-tracing.
+    pub halo_cells: u32,
+    /// Save every `png_stride`-th frame as a PNG (plus the first and last).
+    /// `0` keeps only the first and last.
+    pub png_stride: usize,
+}
+
+impl Default for CollapseSequenceOptions {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            exposure: 1.0,
+            temporal_weight: 0.1,
+            halo_cells: 12,
+            png_stride: 20,
+        }
+    }
+}
+
+/// Result of a [`capture_collapse_sequence`] run.
+#[derive(Debug, Clone)]
+pub struct CollapseSequenceReport {
+    pub adapter: String,
+    pub backend: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames: usize,
+    pub bands: Vec<BandTrace>,
+    /// Newly-dirtied clipmap cells per tick — the bounded GPU re-upload set.
+    pub dirty_cells: Vec<usize>,
+    /// Clipmap cells the trace recomputed per tick (dirty AABB + halo; `0` for a
+    /// tick with no lighting change).
+    pub retraced_cells: Vec<u64>,
+    pub total_cells: u64,
+    pub gpu_timing_available: bool,
+    /// Per timed tick: total GPU device time (trace + denoise + temporal +
+    /// opaque + tone map). Empty when the adapter has no timestamp queries;
+    /// otherwise one entry per rendered tick — index-aligned with `dirty_cells`.
+    pub gpu_frame_millis: Vec<f64>,
+    /// Per timed tick: the lighting cost only (trace + denoise + temporal).
+    pub gpu_lighting_millis: Vec<f64>,
+    /// Per timed tick: that tick's CPU encode + its own GPU device total.
+    pub serial_frame_millis: Vec<f64>,
+    /// Per tick: indirect trace + denoise + temporal + opaque + tone map.
+    pub gpu_frame: Option<FrameStats>,
+    /// Per tick: the lighting cost only (trace + denoise + temporal).
+    pub gpu_lighting: Option<FrameStats>,
+    pub gpu_indirect_trace: Option<FrameStats>,
+    pub gpu_indirect_denoise: Option<FrameStats>,
+    pub gpu_indirect_temporal: Option<FrameStats>,
+    /// Per-tick renderer CPU encode cost (no GPU wait, no readback).
+    pub cpu_frame: Option<FrameStats>,
+    /// Per tick: that tick's own CPU encode cost plus its own GPU device total —
+    /// the directly-paired serial submit-then-sync frame duration, percentiled.
+    /// A measured upper bound on a pipelined client; not a sum of marginal
+    /// percentiles.
+    pub serial_frame: Option<FrameStats>,
+    pub indirect_cells: usize,
+    /// The persistent clipmap after the last tick — the caller diffs it against
+    /// a from-scratch resample of the final world to catch stale/erased cells.
+    pub final_lighting: LightingVolume,
+    pub images: Vec<MotionImage>,
+}
+
+fn upload_items(
+    ctx: &RenderContext,
+    items: &[crate::scene::SceneItem],
+) -> Result<Vec<GpuMesh>, RenderError> {
+    let mut draws = Vec::new();
+    for item in items {
+        let (vertices, indices) = to_gpu(&item.mesh, item.model);
+        if indices.is_empty() {
+            continue;
+        }
+        draws.push(GpuMesh::create(
+            &ctx.device,
+            &vertices,
+            &indices,
+            UploadBudget::default(),
+        )?);
+    }
+    Ok(draws)
+}
+
+/// Build every GPU resource once from `base` (its `lighting` volume is the seed
+/// clipmap, its `clear`/`materials` are held constant), warm up with one
+/// full-cache re-trace + history seed, then render each [`CollapseFrame`] in
+/// turn: re-upload that tick's meshes, apply its bounded [`LightingUpdate`] to
+/// the persistent clipmap (re-uploading only the changed cells, re-tracing only
+/// the changed cell-AABB grown by `halo_cells`), render `Shaded`, and sample
+/// every [`ProbeBand`].
+///
+/// This is the increment-6 half of the G2 / T15 destruction evidence — the
+/// bounded per-tick cost of an active collapse on the persistent loop, as
+/// opposed to increment 5's cold full re-trace per captured tick. It still runs
+/// a serial submit-then-sync loop (no pipelined CPU/GPU overlap) and the
+/// broader CPU frame budget (simulation, culling, entity update) is out of
+/// scope — `cpu_frame` is renderer encode only.
+pub fn capture_collapse_sequence(
+    ctx: &RenderContext,
+    base: &Scene,
+    frames: Vec<CollapseFrame>,
+    probes: &[ProbeBand],
+    out_dir: &Path,
+    opts: &CollapseSequenceOptions,
+) -> Result<CollapseSequenceReport, RenderError> {
+    std::fs::create_dir_all(out_dir).map_err(|error| RenderError::Image {
+        path: out_dir.display().to_string(),
+        source: image::ImageError::IoError(error),
+    })?;
+    if frames.is_empty() {
+        return Err(RenderError::Gpu(
+            "capture_collapse_sequence needs frames".into(),
+        ));
+    }
+    let mut volume = base.lighting.clone().ok_or_else(|| {
+        RenderError::Gpu("capture_collapse_sequence needs a seed lighting volume".into())
+    })?;
+    let total_cells = (LIGHT_VOLUME_DIM as u64).pow(3);
+
+    let pipeline = ScenePipeline::new(&ctx.device);
+    let materials = pipeline.material_buffer(&ctx.device, &base.materials);
+    let indirect = pipeline.indirect_resources(&ctx.device, &ctx.queue, Some(&volume), &materials);
+    let (width, height) = (even(opts.width), even(opts.height));
+    let target = OffscreenTarget::new(&ctx.device, width, height);
+
+    // Shadow cascades once, framed on the first tick's camera (static sun).
+    let warm_draws = upload_items(ctx, &frames[0].items)?;
+    let (light_matrices, _) = ScenePipeline::cascade_data(&frames[0].camera, default_sun_dir());
+    let mut shadow_encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("spall-g2-collapse-shadow-encoder"),
+        });
+    for (cascade, matrix) in light_matrices.into_iter().enumerate() {
+        let bind = pipeline.shadow_bind_group(&ctx.device, &ctx.queue, cascade, matrix);
+        let mut pass = shadow_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("spall-g2-collapse-shadow-pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: pipeline.shadow_layer(cascade),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline.shadow());
+        pass.set_bind_group(0, &bind, &[]);
+        draw_meshes(&mut pass, &warm_draws);
+    }
+    ctx.queue.submit([shadow_encoder.finish()]);
+
+    let tone_bind = pipeline.tone_bind_group(
+        &ctx.device,
+        &ctx.queue,
+        target.hdr_view(),
+        opts.exposure,
+        false,
+    );
+
+    // Warm-up: full-cache re-trace + history seed from the first tick.
+    indirect.set_full_trace_region(&ctx.queue);
+    indirect.set_temporal(&ctx.queue, 1.0, TEMPORAL_SLACK);
+    render_motion_frame(
+        ctx,
+        &pipeline,
+        &indirect,
+        &target,
+        &materials,
+        &warm_draws,
+        base,
+        &frames[0].camera,
+        DebugView::Shaded,
+        opts.exposure,
+        &tone_bind,
+        None,
+    )?;
+    let _ = target.read_rgba(ctx)?;
+    indirect.set_temporal(&ctx.queue, opts.temporal_weight, TEMPORAL_SLACK);
+
+    let mut traces: Vec<BandTrace> = probes
+        .iter()
+        .map(|p| BandTrace {
+            name: p.name.clone(),
+            band: p.band,
+            luminance: Vec::with_capacity(frames.len()),
+        })
+        .collect();
+    let mut dirty_cells = Vec::with_capacity(frames.len());
+    let mut retraced_cells = Vec::with_capacity(frames.len());
+    let mut trace_ms = Vec::new();
+    let mut denoise_ms = Vec::new();
+    let mut temporal_ms = Vec::new();
+    let mut lighting_ms = Vec::new();
+    let mut gpu_ms = Vec::new();
+    let mut cpu_ms = Vec::new();
+    let mut serial_ms = Vec::new();
+    let mut images = Vec::new();
+    let frame_count = frames.len();
+
+    for (i, frame) in frames.into_iter().enumerate() {
+        let changed = volume.apply_update(&frame.update);
+        let dirty = volume.take_dirty();
+        indirect.upload_dirty(&ctx.queue, &dirty);
+        let (lo, hi) = trace_region(&dirty, opts.halo_cells);
+        indirect.set_trace_region(&ctx.queue, lo, hi);
+        let retraced = u64::from((hi.x - lo.x) * (hi.y - lo.y) * (hi.z - lo.z));
+
+        let draws = upload_items(ctx, &frame.items)?;
+        let timer = GpuTimer::new(ctx, 5);
+        let cpu_start = Instant::now();
+        render_motion_frame(
+            ctx,
+            &pipeline,
+            &indirect,
+            &target,
+            &materials,
+            &draws,
+            base,
+            &frame.camera,
+            DebugView::Shaded,
+            opts.exposure,
+            &tone_bind,
+            timer.as_ref(),
+        )?;
+        let frame_cpu_millis = cpu_start.elapsed().as_secs_f64() * 1000.0;
+
+        let rgba = target.read_rgba(ctx)?;
+        for (probe, trace) in probes.iter().zip(traces.iter_mut()) {
+            trace.luminance.push(band_luminance(
+                &rgba,
+                target.width,
+                target.height,
+                probe.band,
+            ));
+        }
+
+        let keep_png =
+            i == 0 || i + 1 == frame_count || (opts.png_stride > 0 && i % opts.png_stride == 0);
+        if keep_png {
+            let image: ImageBuffer<Rgba<u8>, _> =
+                ImageBuffer::from_raw(target.width, target.height, rgba)
+                    .expect("readback has width*height*4 bytes");
+            let path = out_dir.join(format!("tick_{i:04}.png"));
+            image.save(&path).map_err(|source| RenderError::Image {
+                path: path.display().to_string(),
+                source,
+            })?;
+            images.push(MotionImage { frame: i, path });
+        }
+
+        dirty_cells.push(changed);
+        retraced_cells.push(retraced);
+        cpu_ms.push(frame_cpu_millis);
+        if let Some([tr, dn, tp, op, tn, ..]) = timer.and_then(|timer| timer.millis(ctx)).as_deref()
+        {
+            trace_ms.push(*tr);
+            denoise_ms.push(*dn);
+            temporal_ms.push(*tp);
+            let lighting = tr + dn + tp;
+            let gpu_total = lighting + op + tn;
+            lighting_ms.push(lighting);
+            gpu_ms.push(gpu_total);
+            serial_ms.push(frame_cpu_millis + gpu_total);
+        }
+    }
+    indirect.set_full_trace_region(&ctx.queue);
+    let gpu_frame_millis = gpu_ms.clone();
+    let gpu_lighting_millis = lighting_ms.clone();
+    let serial_frame_millis = serial_ms.clone();
+
+    let gpu_frame = FrameStats::from_samples(&gpu_ms);
+    Ok(CollapseSequenceReport {
+        gpu_timing_available: gpu_frame.is_some(),
+        adapter: ctx.adapter_name().to_string(),
+        backend: format!("{:?}", ctx.backend()),
+        width: target.width,
+        height: target.height,
+        frames: frame_count,
+        bands: traces,
+        dirty_cells,
+        retraced_cells,
+        total_cells,
+        gpu_frame_millis,
+        gpu_lighting_millis,
+        serial_frame_millis,
+        gpu_frame,
+        gpu_lighting: FrameStats::from_samples(&lighting_ms),
+        gpu_indirect_trace: FrameStats::from_samples(&trace_ms),
+        gpu_indirect_denoise: FrameStats::from_samples(&denoise_ms),
+        gpu_indirect_temporal: FrameStats::from_samples(&temporal_ms),
+        cpu_frame: FrameStats::from_samples(&cpu_ms),
+        serial_frame: FrameStats::from_samples(&serial_ms),
+        indirect_cells: indirect.cells,
+        final_lighting: volume,
+        images,
+    })
 }
 
 #[cfg(test)]

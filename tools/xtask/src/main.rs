@@ -80,8 +80,10 @@ struct CaptureArgs {
     /// still lighting fixtures at a fixed 1920x1080), `g2-loop` (T15 —
     /// persistent-resource settled-frame GPU + CPU percentiles), `g2-motion`
     /// (T15 — 120-frame moving sequences + ghosting / flicker / noise flags),
-    /// `g2-terrain` (T15 — open daylight-terrain settled cost + stability), or
-    /// `g2-collapse` (T15 — GI-lit rapid-destruction sequence).
+    /// `g2-terrain` (T15 — open daylight-terrain settled cost + stability),
+    /// `g2-collapse` (T15 — GI-lit rapid-destruction sequence, cold per-tick
+    /// re-trace), or `g2-bounded-collapse` (T15 increment 6 — the same collapse
+    /// on the persistent loop with a bounded per-tick `LightingUpdate`).
     #[arg(long)]
     scene: Option<String>,
     #[arg(long, default_value_t = 300_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]

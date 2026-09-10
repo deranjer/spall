@@ -19,12 +19,13 @@ pub mod vertex;
 
 pub use camera::{Aabb, Camera, Frustum};
 pub use capture::{
-    BandTrace, CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, FrameLoopOptions,
-    FrameLoopReport, FrameSeriesOptions, FrameSeriesPasses, FrameSeriesReport, FrameStats,
-    LightingStep, MotionFrame, MotionImage, MotionSequenceOptions, MotionSequenceReport, ProbeBand,
-    SequenceOptions, SequenceReport, SequenceStep, capture_frame_loop, capture_frame_series,
-    capture_lighting_sequence, capture_motion_sequence, capture_scene, flicker_index,
-    max_step_fraction, settle_index,
+    BandTrace, CaptureImage, CaptureOptions, CaptureReport, CaptureTiming, CollapseFrame,
+    CollapseSequenceOptions, CollapseSequenceReport, FrameLoopOptions, FrameLoopReport,
+    FrameSeriesOptions, FrameSeriesPasses, FrameSeriesReport, FrameStats, LightingStep,
+    MotionFrame, MotionImage, MotionSequenceOptions, MotionSequenceReport, ProbeBand,
+    SequenceOptions, SequenceReport, SequenceStep, capture_collapse_sequence, capture_frame_loop,
+    capture_frame_series, capture_lighting_sequence, capture_motion_sequence, capture_scene,
+    flicker_index, max_step_fraction, settle_index,
 };
 pub use context::{RenderContext, RenderError};
 pub use fixtures::{

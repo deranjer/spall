@@ -17,15 +17,16 @@ use spall_jobs::{Generation, TopologyEpoch};
 use spall_mesh::fixtures::{AcceptanceShape, acceptance_shapes, mesh_shape};
 use spall_mesh::{MeshOptions, MeshStrategy, build_volume_mesh};
 use spall_render::{
-    Camera, CaptureOptions, DebugView, FrameLoopOptions, FrameSeriesOptions, FrameStats,
-    LightingRegion, LightingStep, LightingUpdate, LightingVolume, MotionFrame,
-    MotionSequenceOptions, OCCLUDER_MAX_M, OCCLUDER_MIN_M, ProbeBand, RECEIVER_MAX_M,
-    RECEIVER_MIN_M, RenderContext, RenderError, Scene, SceneItem, SequenceOptions,
-    capture_frame_loop, capture_frame_series, capture_lighting_sequence, capture_motion_sequence,
-    capture_scene, colored_rooms, daylight_terrain_scene, emitter_occlusion_scenes, flicker_index,
+    Camera, CaptureOptions, CollapseFrame, CollapseSequenceOptions, DebugView, FrameLoopOptions,
+    FrameSeriesOptions, FrameStats, LIGHT_CELL_SIZE_METRES, LightingRegion, LightingStep,
+    LightingUpdate, LightingVolume, MotionFrame, MotionSequenceOptions, OCCLUDER_MAX_M,
+    OCCLUDER_MIN_M, ProbeBand, RECEIVER_MAX_M, RECEIVER_MIN_M, RenderContext, RenderError, Scene,
+    SceneItem, SequenceOptions, capture_collapse_sequence, capture_frame_loop,
+    capture_frame_series, capture_lighting_sequence, capture_motion_sequence, capture_scene,
+    colored_rooms, daylight_terrain_scene, emitter_occlusion_scenes, flicker_index,
     rapid_destruction,
 };
-use spall_sim::{EditIntent, EditTarget, RequestId, Simulation, SimulationConfig, fixtures};
+use spall_sim::{Body, EditIntent, EditTarget, RequestId, Simulation, SimulationConfig, fixtures};
 use spall_voxel::Sample;
 use spall_voxel::Volume;
 
@@ -72,8 +73,10 @@ struct Args {
     /// `g2-frames` (T15 cold GPU frame-cost percentiles), `g2-loop` (T15
     /// persistent-resource settled-frame GPU + CPU percentiles), `g2-motion`
     /// (T15 moving-frame sequences + ghosting / flicker / leakage flags),
-    /// `g2-terrain` (T15 open daylight-terrain settled cost + stability), or
-    /// `g2-collapse` (T15 GI-lit rapid-destruction sequence).
+    /// `g2-terrain` (T15 open daylight-terrain settled cost + stability),
+    /// `g2-collapse` (T15 GI-lit rapid-destruction sequence, cold per-tick
+    /// re-trace), or `g2-bounded-collapse` (T15 increment 6: the same collapse
+    /// on the persistent loop with a bounded per-tick `LightingUpdate`).
     #[arg(long)]
     scene: Option<String>,
     /// `lighting-sequence` only: settle frames rendered after the edit so the
@@ -98,6 +101,10 @@ struct Args {
     /// `g2-motion` only: consecutive frames per sequence (>= 120 per the gate).
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(24..=600))]
     g2_motion_frames: u32,
+    /// `g2-bounded-collapse` only: consecutive collapse ticks rendered on the
+    /// persistent loop (one frame per tick; >= 120 per the gate).
+    #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u64).range(120..=600))]
+    g2_bounded_collapse_ticks: u64,
 }
 
 #[derive(Serialize)]
@@ -819,31 +826,41 @@ fn terrain_light_volume(
     v
 }
 
+/// World-space AABB of a detached body's meshed volume at its current pose, or
+/// `None` when the body has no geometry. This is the box the clipmap fills
+/// solid for the debris (a box approximation, consistent with how T14
+/// `moving_box` treats a moving body).
+fn body_world_aabb(body: &Body, strategy: MeshStrategy) -> Option<(Vec3, Vec3)> {
+    let bm = volume_mesh(&body.volume, strategy);
+    if bm.mesh.vertices.is_empty() {
+        return None;
+    }
+    let q = body.pose.rotation;
+    let t = body.pose.translation_m;
+    let model = Mat4::from_rotation_translation(
+        Quat::from_xyzw(q.x as f32, q.y as f32, q.z as f32, q.w as f32),
+        Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32),
+    );
+    let mut mn = Vec3::splat(f32::INFINITY);
+    let mut mx = Vec3::splat(f32::NEG_INFINITY);
+    for vtx in &bm.mesh.vertices {
+        let p = model.transform_point3(Vec3::from_array(vtx.position));
+        mn = mn.min(p);
+        mx = mx.max(p);
+    }
+    Some((mn, mx))
+}
+
 /// Build a T13/T14 lighting clipmap from the live authoritative world: the
 /// terrain occupancy (see [`terrain_light_volume`]) plus every detached body's
-/// world AABB filled solid (a box approximation of the debris, consistent with
-/// how T14 `moving_box` treats a moving body).
+/// world AABB filled solid (see [`body_world_aabb`]).
 fn sim_light_volume(sim: &Simulation, origin: Vec3, strategy: MeshStrategy) -> LightingVolume {
     let mut v = terrain_light_volume(&sim.world().terrain().volume, origin, strategy);
 
     for body in sim.world().bodies() {
-        let bm = volume_mesh(&body.volume, strategy);
-        if bm.mesh.vertices.is_empty() {
+        let Some((mn, mx)) = body_world_aabb(body, strategy) else {
             continue;
-        }
-        let q = body.pose.rotation;
-        let t = body.pose.translation_m;
-        let model = Mat4::from_rotation_translation(
-            Quat::from_xyzw(q.x as f32, q.y as f32, q.z as f32, q.w as f32),
-            Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32),
-        );
-        let mut mn = Vec3::splat(f32::INFINITY);
-        let mut mx = Vec3::splat(f32::NEG_INFINITY);
-        for vtx in &bm.mesh.vertices {
-            let p = model.transform_point3(Vec3::from_array(vtx.position));
-            mn = mn.min(p);
-            mx = mx.max(p);
-        }
+        };
         let lo = v.world_to_cell(mn);
         let hi = v.world_to_cell(mx) + glam::IVec3::ONE;
         v.fill_box(lo, hi, 1);
@@ -1086,6 +1103,618 @@ fn run_g2_collapse(args: &Args) -> Result<G2CollapseSummary, RenderError> {
     })
 }
 
+// --- `--scene g2-bounded-collapse` (T15 / ENG-22 increment 6) ------------
+
+/// Lighting-clipmap world origin for the collapse fixture (matches increment 5).
+const G2_COLLAPSE_LIGHT_ORIGIN: Vec3 = Vec3::splat(-32.0);
+
+/// Ticks the bounded per-tick path is checked against a cold full-refresh
+/// clipmap of the same world — spaced across the sever, detach, fall and settle.
+const G2_BOUNDED_CONVERGENCE_TICKS: [u64; 5] = [8, 24, 45, 92, 170];
+
+/// Max accepted relative luminance gap between the bounded per-tick path and a
+/// cold full-refresh reference at a convergence checkpoint. Above this, a stale
+/// vacated shadow or an erased overlapping occupancy is the likely cause.
+const G2_BOUNDED_CONVERGENCE_FLAG: f32 = 0.12;
+
+/// Min accepted cell-for-cell agreement between the bounded path's final clipmap
+/// and a from-scratch resample of the final world.
+const G2_BOUNDED_FINAL_AGREEMENT_FLAG: f32 = 0.98;
+
+/// Distinct clipmap cells that carry filled terrain inside a world-space box,
+/// sampled at the terrain cell size exactly as [`terrain_light_volume`] does.
+fn terrain_solid_light_cells_in(
+    terrain: &Volume,
+    origin: Vec3,
+    box_min: Vec3,
+    box_max: Vec3,
+) -> std::collections::BTreeSet<(i32, i32, i32)> {
+    let mut cells = std::collections::BTreeSet::new();
+    let step = TERRAIN_CELL_M;
+    let mut y = box_min.y;
+    while y <= box_max.y {
+        let mut x = box_min.x;
+        while x <= box_max.x {
+            let mut z = box_min.z;
+            while z <= box_max.z {
+                let g = GlobalCell::new(
+                    (x / TERRAIN_CELL_M).floor() as i64,
+                    (y / TERRAIN_CELL_M).floor() as i64,
+                    (z / TERRAIN_CELL_M).floor() as i64,
+                );
+                if let Ok(Sample::Filled(_)) = terrain.sample(g) {
+                    let c = ((Vec3::new(x, y, z) - origin) / LIGHT_CELL_SIZE_METRES).floor();
+                    cells.insert((c.x as i32, c.y as i32, c.z as i32));
+                }
+                z += step;
+            }
+            x += step;
+        }
+        y += step;
+    }
+    cells
+}
+
+/// A single-cell solid `LightingRegion` for clipmap cell `cell`.
+fn light_cell_region(origin: Vec3, cell: (i32, i32, i32)) -> LightingRegion {
+    let lo =
+        origin + Vec3::new(cell.0 as f32, cell.1 as f32, cell.2 as f32) * LIGHT_CELL_SIZE_METRES;
+    LightingRegion {
+        min_m: lo,
+        max_m: lo + Vec3::splat(LIGHT_CELL_SIZE_METRES),
+        material: 1,
+    }
+}
+
+/// World-space AABB of a scripted terrain cut brush (script cells are terrain
+/// cells), padded by one clipmap cell so the cleared span covers the sphere.
+fn cut_world_aabb(cell: [i64; 3], radius_cells: i64) -> (Vec3, Vec3) {
+    let centre = Vec3::new(
+        cell[0] as f32 + 0.5,
+        cell[1] as f32 + 0.5,
+        cell[2] as f32 + 0.5,
+    ) * TERRAIN_CELL_M;
+    let pad = Vec3::splat(radius_cells as f32 * TERRAIN_CELL_M + LIGHT_CELL_SIZE_METRES);
+    (centre - pad, centre + pad)
+}
+
+/// Translate one tick's committed terrain cuts and moving-body poses into the
+/// engine-agnostic [`LightingUpdate`] the persistent loop consumes: every
+/// changed world box is marked dirty, then the terrain still solid inside it
+/// (and every body at its new pose) is re-asserted so nothing overlapping is
+/// erased. This is the "translate committed cuts and old/new body bounds into
+/// the existing lighting DTOs" step the G2 follow-up calls for.
+fn collapse_tick_update(
+    terrain: &Volume,
+    origin: Vec3,
+    cuts_this_tick: &[([i64; 3], i64)],
+    prev_bodies: &[(Vec3, Vec3)],
+    cur_bodies: &[(Vec3, Vec3)],
+) -> LightingUpdate {
+    let mut update = LightingUpdate::new();
+
+    for &(cell, radius) in cuts_this_tick {
+        let (bmin, bmax) = cut_world_aabb(cell, radius);
+        update = update.dirty_bound(bmin, bmax);
+        for c in terrain_solid_light_cells_in(terrain, origin, bmin, bmax) {
+            update = update.with_region(light_cell_region(origin, c));
+        }
+    }
+
+    let n = prev_bodies.len().max(cur_bodies.len());
+    for i in 0..n {
+        let prev = prev_bodies.get(i).copied();
+        let next = cur_bodies.get(i).copied();
+        let (dmin, dmax) = match (prev, next) {
+            (Some(p), Some(nx)) => {
+                update = update.dirty_bound(p.0, p.1).dirty_bound(nx.0, nx.1);
+                (p.0.min(nx.0), p.1.max(nx.1))
+            }
+            (Some(p), None) => {
+                update = update.dirty_bound(p.0, p.1);
+                (p.0, p.1)
+            }
+            (None, Some(nx)) => {
+                update = update.dirty_bound(nx.0, nx.1);
+                (nx.0, nx.1)
+            }
+            (None, None) => continue,
+        };
+        for c in terrain_solid_light_cells_in(terrain, origin, dmin, dmax) {
+            update = update.with_region(light_cell_region(origin, c));
+        }
+        if let Some(nx) = next {
+            update = update.region(nx.0, nx.1, 1);
+        }
+    }
+
+    update
+}
+
+/// Cold full-refresh reference probe luminances for `scene`: seed the history
+/// with one full-cache trace, hold it (no accumulation), and read the bands.
+fn reference_probe_bands(
+    ctx: &RenderContext,
+    scene: &Scene,
+    probes: &[ProbeBand],
+    out_dir: &std::path::Path,
+) -> Result<Vec<f32>, RenderError> {
+    let frames = vec![
+        MotionFrame {
+            camera: scene.camera,
+            update: LightingUpdate::new(),
+        },
+        MotionFrame {
+            camera: scene.camera,
+            update: LightingUpdate::new(),
+        },
+    ];
+    let opts = MotionSequenceOptions {
+        width: 1920,
+        height: 1080,
+        exposure: 1.0,
+        view: DebugView::Shaded,
+        temporal_weight: 1.0,
+        halo_cells: 12,
+        png_stride: 0,
+    };
+    let r = capture_motion_sequence(ctx, scene, &frames, probes, out_dir, &opts)?;
+    Ok(r.bands
+        .iter()
+        .map(|b| b.luminance.last().copied().unwrap_or(0.0))
+        .collect())
+}
+
+#[derive(Serialize)]
+struct G2ProbeDelta {
+    probe: String,
+    bounded_luminance: f32,
+    reference_luminance: f32,
+    rel_delta: f32,
+}
+
+#[derive(Serialize)]
+struct G2ConvergenceCheck {
+    tick: u64,
+    frame: usize,
+    max_rel_delta: f32,
+    probes: Vec<G2ProbeDelta>,
+}
+
+#[derive(Serialize)]
+struct G2BoundedCollapseFrame {
+    tick: u64,
+    transactions_committed_so_far: u64,
+    body_count: usize,
+    detached_body_max_drop_m: f64,
+    /// Clipmap cells re-uploaded this tick (the bounded GPU upload set).
+    dirty_light_cells: usize,
+    /// Clipmap cells the trace recomputed this tick (dirty AABB + halo).
+    retraced_light_cells: u64,
+    gpu_frame_millis: Option<f64>,
+    gpu_lighting_millis: Option<f64>,
+    serial_frame_millis: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct G2BoundedCollapseSummary {
+    /// Version 1: T15 increment 6 — bounded per-tick destruction on the
+    /// persistent-resource loop.
+    version: u32,
+    mode: &'static str,
+    adapter: String,
+    backend: String,
+    width: u32,
+    height: u32,
+    gpu_timing_available: bool,
+    server_ticks: u64,
+    frames_rendered: usize,
+    transactions_committed: u64,
+    final_world_hash: String,
+    solid_cells_start: u64,
+    solid_cells_end: u64,
+    gpu_p95_target_millis: f64,
+    cpu_p95_target_millis: f64,
+    client_p95_target_millis: f64,
+    /// Per rendered tick: trace + denoise + temporal + opaque + tone map.
+    gpu_frame: Option<G2StatBlock>,
+    /// Per rendered tick: the lighting cost only (trace + denoise + temporal).
+    gpu_lighting: Option<G2StatBlock>,
+    gpu_indirect_trace: Option<G2StatBlock>,
+    gpu_indirect_denoise: Option<G2StatBlock>,
+    gpu_indirect_temporal: Option<G2StatBlock>,
+    /// Renderer per-tick CPU encode cost (no GPU wait, no readback).
+    cpu_frame: Option<G2StatBlock>,
+    /// Directly-paired per-tick CPU encode + GPU device total, percentiled — a
+    /// measured serial frame upper bound, not a sum of marginal percentiles.
+    serial_frame: Option<G2StatBlock>,
+    gpu_p95_target_met: Option<bool>,
+    cpu_p95_target_met: Option<bool>,
+    client_p95_target_met: Option<bool>,
+    /// Bounded re-upload / re-trace sizes over the collapse.
+    dirty_light_cells_p50: u64,
+    dirty_light_cells_p95: u64,
+    dirty_light_cells_max: u64,
+    retraced_light_cells_p50: u64,
+    retraced_light_cells_p95: u64,
+    retraced_light_cells_max: u64,
+    total_light_cells: u64,
+    /// Structural edit-to-visible latency of the T14 partial-update path.
+    edit_to_visible_frames: u32,
+    edit_visible_within_one_frame: bool,
+    /// Index of the first rendered tick that dirtied clipmap cells (first
+    /// committed cut / first body motion).
+    first_edit_frame: Option<usize>,
+    /// Bounded vs cold full-refresh at the convergence checkpoints.
+    convergence_checks: Vec<G2ConvergenceCheck>,
+    convergence_max_rel_delta: f32,
+    convergence_ok: bool,
+    /// Final persistent clipmap vs a from-scratch resample of the final world.
+    final_clipmap_cell_agreement: f32,
+    final_solid_cells_bounded: u64,
+    final_solid_cells_full_refresh: u64,
+    /// 60-frame static-noise flicker of the settled final tick, per probe band.
+    settled_band_flicker: Vec<f32>,
+    frames: Vec<G2BoundedCollapseFrame>,
+    quality_flags: Vec<String>,
+    images: Vec<String>,
+}
+
+/// Nearest-rank percentile of a `u64` sample set (same convention as `FrameStats`).
+fn u64_percentile(samples: &[u64], q: f64) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let rank = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    sorted[rank - 1]
+}
+
+/// T15 increment 6: run the `g1-networked-destruction` collapse on the
+/// persistent-resource loop, translating each tick's committed cuts and
+/// moving-body poses into a bounded [`LightingUpdate`], and report the per-tick
+/// cost, the bounded re-trace sizes, convergence against a cold full-refresh,
+/// and the stale-shadow / erased-occupancy checks.
+fn run_g2_bounded_collapse(args: &Args) -> Result<G2BoundedCollapseSummary, RenderError> {
+    let ctx = RenderContext::headless()?;
+    let strategy: MeshStrategy = args.strategy.into();
+    let (width, height) = (1920u32, 1080u32);
+    let aspect = capture_aspect(width, height);
+    let origin = G2_COLLAPSE_LIGHT_ORIGIN;
+    let ticks = args.g2_bounded_collapse_ticks;
+
+    let mut setup = fixtures::cross_brick_bridged_setup();
+    setup.physics.disable_ccd = true;
+    let mut sim = Simulation::new(SimulationConfig::new(setup))
+        .map_err(|e| RenderError::Gpu(format!("bounded-collapse sim setup failed: {e}")))?;
+    let actor = EntityId::new(1).expect("nonzero entity id");
+    let solid_cells_start = sim.world().total_solid_cells();
+
+    // Frame 0 = the world at rest; its full clipmap seeds the persistent loop.
+    let base_scene = g2_collapse_scene(&sim, strategy, aspect, None);
+    let camera = base_scene.camera;
+
+    let probes = [
+        ProbeBand {
+            name: "sky".into(),
+            band: [0.05, 0.28],
+        },
+        ProbeBand {
+            name: "notch".into(),
+            band: [0.36, 0.62],
+        },
+        ProbeBand {
+            name: "ground".into(),
+            band: [0.68, 0.95],
+        },
+    ];
+
+    let mut collapse_frames: Vec<CollapseFrame> = Vec::with_capacity(ticks as usize);
+    let mut frame_meta: Vec<(u64, u64, usize, f64)> = Vec::with_capacity(ticks as usize);
+    let mut checkpoints: Vec<(usize, u64, Scene)> = Vec::new();
+
+    let mut next_cut = 0usize;
+    let mut request_id = 1u64;
+    let mut committed = 0u64;
+    let mut pending_cuts: Vec<(u64, [i64; 3], i64)> = Vec::new();
+    let mut prev_bodies: Vec<(Vec3, Vec3)> = Vec::new();
+
+    for tick in 1..=ticks {
+        while next_cut < DESTRUCTION_SCRIPT.len() && DESTRUCTION_SCRIPT[next_cut].0 == tick {
+            let (_, cell, radius) = DESTRUCTION_SCRIPT[next_cut];
+            let _ = sim.submit(EditIntent::cut(
+                RequestId(request_id),
+                actor,
+                EditTarget::Terrain,
+                brush_cell(cell, radius),
+            ));
+            pending_cuts.push((request_id, cell, radius));
+            request_id += 1;
+            next_cut += 1;
+        }
+        let report = sim.tick().map_err(|e| {
+            RenderError::Gpu(format!("bounded-collapse sim tick {tick} failed: {e}"))
+        })?;
+        committed += report.committed.len() as u64;
+
+        let mut cuts_this_tick: Vec<([i64; 3], i64)> = Vec::new();
+        if !report.committed.is_empty() {
+            let landed: std::collections::HashSet<u64> =
+                report.committed.iter().map(|(id, _)| id.0).collect();
+            pending_cuts.retain(|&(id, cell, radius)| {
+                if landed.contains(&id) {
+                    cuts_this_tick.push((cell, radius));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        let cur_bodies: Vec<(Vec3, Vec3)> = sim
+            .world()
+            .bodies()
+            .filter_map(|b| body_world_aabb(b, strategy))
+            .collect();
+        let update = collapse_tick_update(
+            &sim.world().terrain().volume,
+            origin,
+            &cuts_this_tick,
+            &prev_bodies,
+            &cur_bodies,
+        );
+        prev_bodies = cur_bodies;
+
+        let max_drop = sim
+            .world()
+            .bodies()
+            .map(|b| -b.pose.translation_m[1])
+            .fold(0.0_f64, f64::max);
+        frame_meta.push((tick, committed, sim.world().body_count(), max_drop));
+
+        if G2_BOUNDED_CONVERGENCE_TICKS.contains(&tick) {
+            checkpoints.push((
+                collapse_frames.len(),
+                tick,
+                g2_collapse_scene(&sim, strategy, aspect, Some(camera)),
+            ));
+        }
+
+        let items = destruction_scene(&sim, strategy, aspect, Some(camera)).items;
+        collapse_frames.push(CollapseFrame {
+            camera,
+            items,
+            update,
+        });
+    }
+
+    let opts = CollapseSequenceOptions {
+        width,
+        height,
+        exposure: 1.0,
+        temporal_weight: 0.1,
+        halo_cells: 12,
+        png_stride: 15,
+    };
+    let report = capture_collapse_sequence(
+        &ctx,
+        &base_scene,
+        collapse_frames,
+        &probes,
+        &args.out.join("ticks"),
+        &opts,
+    )?;
+
+    let mut quality_flags: Vec<String> = Vec::new();
+
+    // Convergence: bounded per-tick path vs a cold full-refresh at checkpoints.
+    let mut convergence_checks: Vec<G2ConvergenceCheck> = Vec::new();
+    let mut convergence_max_rel_delta = 0.0_f32;
+    for (frame_idx, tick, ref_scene) in &checkpoints {
+        let ref_bands = reference_probe_bands(
+            &ctx,
+            ref_scene,
+            &probes,
+            &args.out.join(format!("ref_{tick:03}")),
+        )?;
+        let mut deltas = Vec::new();
+        let mut check_max = 0.0_f32;
+        for (p, rb) in ref_bands.iter().enumerate() {
+            let bounded = report
+                .bands
+                .get(p)
+                .and_then(|b| b.luminance.get(*frame_idx))
+                .copied()
+                .unwrap_or(0.0);
+            let rel = (bounded - rb).abs() / rb.abs().max(1e-3);
+            check_max = check_max.max(rel);
+            convergence_max_rel_delta = convergence_max_rel_delta.max(rel);
+            deltas.push(G2ProbeDelta {
+                probe: probes[p].name.clone(),
+                bounded_luminance: bounded,
+                reference_luminance: *rb,
+                rel_delta: rel,
+            });
+        }
+        convergence_checks.push(G2ConvergenceCheck {
+            tick: *tick,
+            frame: *frame_idx,
+            max_rel_delta: check_max,
+            probes: deltas,
+        });
+    }
+    let convergence_ok = convergence_max_rel_delta <= G2_BOUNDED_CONVERGENCE_FLAG;
+    if !convergence_ok {
+        quality_flags.push(format!(
+            "g2-bounded-collapse: bounded path diverges from the full-refresh reference (max rel delta {convergence_max_rel_delta:.3} > {G2_BOUNDED_CONVERGENCE_FLAG}) — possible stale vacated shadow or erased overlapping occupancy"
+        ));
+    }
+
+    // Final clipmap vs a from-scratch resample of the final world.
+    let full_final = sim_light_volume(&sim, origin, strategy);
+    let (mut agree, mut total) = (0u64, 0u64);
+    let (mut bounded_solid, mut refresh_solid) = (0u64, 0u64);
+    for (a, b) in report
+        .final_lighting
+        .cells()
+        .iter()
+        .zip(full_final.cells().iter())
+    {
+        total += 1;
+        if a == b {
+            agree += 1;
+        }
+        if *a != 0 {
+            bounded_solid += 1;
+        }
+        if *b != 0 {
+            refresh_solid += 1;
+        }
+    }
+    let final_agreement = agree as f32 / total.max(1) as f32;
+    if final_agreement < G2_BOUNDED_FINAL_AGREEMENT_FLAG {
+        quality_flags.push(format!(
+            "g2-bounded-collapse: final bounded clipmap disagrees with a from-scratch resample in {:.2}% of cells (< {:.2}% agreement) — stale or erased occupancy",
+            (1.0 - final_agreement) * 100.0,
+            G2_BOUNDED_FINAL_AGREEMENT_FLAG * 100.0
+        ));
+    }
+
+    // Edit-to-visible latency: the T14 partial-update path programs frame N's
+    // trace region from frame N's own dirty cells *before* frame N renders — one
+    // frame by construction. Corroborated end to end by the bounded path (which
+    // applies exactly one tick's edit per rendered frame) staying within
+    // tolerance of the full-refresh reference at every checkpoint from the first
+    // cut onward: a missed edit would drift the accumulated state progressively,
+    // not hold a flat offset.
+    let first_edit_frame = report.dirty_cells.iter().position(|&d| d > 0);
+    let edit_visible_within_one_frame = first_edit_frame.is_some()
+        && report.retraced_cells.iter().any(|&r| r > 0)
+        && convergence_ok;
+    if !edit_visible_within_one_frame {
+        quality_flags.push(
+            "g2-bounded-collapse: bounded edits did not track the full-refresh reference — edit-to-visible latency not corroborated".into(),
+        );
+    }
+
+    // Settled stability of the final tick, matching increment 5.
+    let settled_scene = g2_collapse_scene(&sim, strategy, aspect, Some(camera));
+    let mframes: Vec<MotionFrame> = (0..60)
+        .map(|_| MotionFrame {
+            camera,
+            update: LightingUpdate::new(),
+        })
+        .collect();
+    let noise = capture_motion_sequence(
+        &ctx,
+        &settled_scene,
+        &mframes,
+        &probes,
+        &args.out.join("settled-noise"),
+        &MotionSequenceOptions {
+            width,
+            height,
+            exposure: 1.0,
+            view: DebugView::Shaded,
+            temporal_weight: 0.1,
+            halo_cells: 12,
+            png_stride: 30,
+        },
+    )?;
+    let settled_band_flicker: Vec<f32> = noise
+        .bands
+        .iter()
+        .map(|b| flicker_index(&b.luminance))
+        .collect();
+    for (band, &f) in probes.iter().zip(settled_band_flicker.iter()) {
+        if f > G2_FLICKER_FLAG {
+            quality_flags.push(format!(
+                "g2-bounded-collapse: settled `{}` band is not steady (flicker index {f:.4} > {G2_FLICKER_FLAG})",
+                band.name
+            ));
+        }
+    }
+
+    let retraced_u64: Vec<u64> = report.retraced_cells.clone();
+    let dirty_u64: Vec<u64> = report.dirty_cells.iter().map(|&d| d as u64).collect();
+    let timed = report.gpu_frame_millis.len() == report.frames;
+    let frames: Vec<G2BoundedCollapseFrame> = frame_meta
+        .iter()
+        .enumerate()
+        .map(
+            |(i, &(tick, committed_so_far, body_count, max_drop))| G2BoundedCollapseFrame {
+                tick,
+                transactions_committed_so_far: committed_so_far,
+                body_count,
+                detached_body_max_drop_m: max_drop,
+                dirty_light_cells: report.dirty_cells.get(i).copied().unwrap_or(0),
+                retraced_light_cells: report.retraced_cells.get(i).copied().unwrap_or(0),
+                gpu_frame_millis: timed.then(|| report.gpu_frame_millis[i]),
+                gpu_lighting_millis: timed.then(|| report.gpu_lighting_millis[i]),
+                serial_frame_millis: timed.then(|| report.serial_frame_millis[i]),
+            },
+        )
+        .collect();
+
+    let gpu_p95 = report.gpu_frame.map(|s| s.p95_millis);
+    let cpu_p95 = report.cpu_frame.map(|s| s.p95_millis);
+    let serial_p95 = report.serial_frame.map(|s| s.p95_millis);
+
+    Ok(G2BoundedCollapseSummary {
+        version: 1,
+        mode: "g2-bounded-collapse",
+        adapter: report.adapter.clone(),
+        backend: report.backend.clone(),
+        width,
+        height,
+        gpu_timing_available: report.gpu_timing_available,
+        server_ticks: ticks,
+        frames_rendered: report.frames,
+        transactions_committed: committed,
+        final_world_hash: sim.world().world_hash().to_string(),
+        solid_cells_start,
+        solid_cells_end: sim.world().total_solid_cells(),
+        gpu_p95_target_millis: G2_GPU_P95_TARGET_MS,
+        cpu_p95_target_millis: G2_CPU_FRAME_TARGET_MS,
+        client_p95_target_millis: G2_CLIENT_FRAME_TARGET_MS,
+        gpu_frame: report.gpu_frame.map(Into::into),
+        gpu_lighting: report.gpu_lighting.map(Into::into),
+        gpu_indirect_trace: report.gpu_indirect_trace.map(Into::into),
+        gpu_indirect_denoise: report.gpu_indirect_denoise.map(Into::into),
+        gpu_indirect_temporal: report.gpu_indirect_temporal.map(Into::into),
+        cpu_frame: report.cpu_frame.map(Into::into),
+        serial_frame: report.serial_frame.map(Into::into),
+        gpu_p95_target_met: gpu_p95.map(|v| v <= G2_GPU_P95_TARGET_MS),
+        cpu_p95_target_met: cpu_p95.map(|v| v <= G2_CPU_FRAME_TARGET_MS),
+        client_p95_target_met: serial_p95.map(|v| v <= G2_CLIENT_FRAME_TARGET_MS),
+        dirty_light_cells_p50: u64_percentile(&dirty_u64, 0.50),
+        dirty_light_cells_p95: u64_percentile(&dirty_u64, 0.95),
+        dirty_light_cells_max: dirty_u64.iter().copied().max().unwrap_or(0),
+        retraced_light_cells_p50: u64_percentile(&retraced_u64, 0.50),
+        retraced_light_cells_p95: u64_percentile(&retraced_u64, 0.95),
+        retraced_light_cells_max: retraced_u64.iter().copied().max().unwrap_or(0),
+        total_light_cells: report.total_cells,
+        edit_to_visible_frames: 1,
+        edit_visible_within_one_frame,
+        first_edit_frame,
+        convergence_checks,
+        convergence_max_rel_delta,
+        convergence_ok,
+        final_clipmap_cell_agreement: final_agreement,
+        final_solid_cells_bounded: bounded_solid,
+        final_solid_cells_full_refresh: refresh_solid,
+        settled_band_flicker,
+        frames,
+        quality_flags,
+        images: report
+            .images
+            .iter()
+            .map(|i| i.path.display().to_string())
+            .collect(),
+    })
+}
+
 // --- `--scene g2-frames` (T15 / ENG-22 increment 1) ------------------------
 
 /// Provisional G2 GPU frame p95 target (`docs/validation.md` "G2").
@@ -1261,15 +1890,20 @@ struct G2LoopRun {
     gpu_tone_map: Option<G2StatBlock>,
     /// Renderer per-frame CPU encode cost (no wait, no readback).
     cpu_frame: Option<G2StatBlock>,
+    /// Directly-paired per-frame CPU encode + GPU device total (each frame's own
+    /// two measurements summed, then percentiled) — the measured serial
+    /// submit-then-sync frame duration. p99 / max included for the tail.
+    serial_frame: Option<G2StatBlock>,
     /// `max(gpu_frame.p95, cpu_frame.p95)` — a pipelined client's frame p95
-    /// lower bound (CPU frame N+1 overlaps GPU frame N).
+    /// lower bound (CPU frame N+1 overlaps GPU frame N). Estimate, not evidence.
     client_frame_p95_pipelined_ms: Option<f64>,
-    /// `gpu_frame.p95 + cpu_frame.p95` — this serial harness's frame p95, an
-    /// upper bound on a pipelined client.
+    /// `serial_frame.p95` — the measured serial frame p95, a true upper bound on
+    /// a pipelined client. This is **not** `gpu_frame.p95 + cpu_frame.p95`; a
+    /// sum of marginal percentiles is neither measured nor a valid bound.
     client_frame_p95_serial_ms: Option<f64>,
     gpu_p95_target_met: Option<bool>,
     cpu_p95_target_met: Option<bool>,
-    /// Pipelined client-frame p95 estimate <= 16.7 ms.
+    /// Measured serial client-frame p95 <= 16.7 ms.
     client_p95_target_met: Option<bool>,
     first_image: String,
     last_image: String,
@@ -1298,9 +1932,10 @@ struct G2LoopSummary {
     gpu_p95_target_millis: f64,
     cpu_p95_target_millis: f64,
     client_p95_target_millis: f64,
-    /// Worst pipelined client-frame p95 estimate across every scene/mode.
-    worst_client_frame_p95_pipelined_ms: Option<f64>,
-    /// `true` iff every scene/mode with GPU timing met the pipelined client p95.
+    /// Worst measured serial client-frame p95 across every scene/mode.
+    worst_client_frame_p95_serial_ms: Option<f64>,
+    /// `true` iff every scene/mode with GPU timing met the measured serial
+    /// client-frame p95 target.
     client_p95_target_met: Option<bool>,
     scenes: Vec<G2LoopSceneSummary>,
 }
@@ -1312,10 +1947,9 @@ fn g2_loop_run(r: spall_render::FrameLoopReport, mode: &'static str) -> (G2LoopR
         (Some(g), Some(c)) => Some(g.max(c)),
         _ => None,
     };
-    let serial = match (gpu_p95, cpu_p95) {
-        (Some(g), Some(c)) => Some(g + c),
-        _ => None,
-    };
+    // The measured serial frame p95 — each frame's own CPU + GPU total,
+    // percentiled — not a sum of the two marginal p95 values.
+    let serial = r.serial_frame.map(|s| s.p95_millis);
     let run = G2LoopRun {
         mode,
         retrace_edge_cells: r.retrace_edge_cells,
@@ -1329,15 +1963,16 @@ fn g2_loop_run(r: spall_render::FrameLoopReport, mode: &'static str) -> (G2LoopR
         gpu_opaque: r.gpu_opaque.map(Into::into),
         gpu_tone_map: r.gpu_tone_map.map(Into::into),
         cpu_frame: r.cpu_frame.map(Into::into),
+        serial_frame: r.serial_frame.map(Into::into),
         client_frame_p95_pipelined_ms: pipelined,
         client_frame_p95_serial_ms: serial,
         gpu_p95_target_met: gpu_p95.map(|v| v <= G2_GPU_P95_TARGET_MS),
         cpu_p95_target_met: cpu_p95.map(|v| v <= G2_CPU_FRAME_TARGET_MS),
-        client_p95_target_met: pipelined.map(|v| v <= G2_CLIENT_FRAME_TARGET_MS),
+        client_p95_target_met: serial.map(|v| v <= G2_CLIENT_FRAME_TARGET_MS),
         first_image: r.first_image.display().to_string(),
         last_image: r.last_image.display().to_string(),
     };
-    (run, pipelined)
+    (run, serial)
 }
 
 fn run_g2_loop(args: &Args) -> Result<G2LoopSummary, RenderError> {
@@ -1361,7 +1996,7 @@ fn run_g2_loop(args: &Args) -> Result<G2LoopSummary, RenderError> {
 
     let mut scene_summaries = Vec::new();
     let (mut adapter, mut backend) = (String::new(), String::new());
-    let mut worst_pipelined: Option<f64> = None;
+    let mut worst_serial: Option<f64> = None;
     let mut any_timed = false;
     let mut all_met = true;
 
@@ -1377,10 +2012,10 @@ fn run_g2_loop(args: &Args) -> Result<G2LoopSummary, RenderError> {
             adapter = report.adapter.clone();
             backend = report.backend.clone();
             indirect_cells = report.indirect_cells;
-            let (run, pipelined) = g2_loop_run(report, mode);
-            if let Some(p) = pipelined {
+            let (run, serial) = g2_loop_run(report, mode);
+            if let Some(p) = serial {
                 any_timed = true;
-                worst_pipelined = Some(worst_pipelined.map_or(p, |w| w.max(p)));
+                worst_serial = Some(worst_serial.map_or(p, |w| w.max(p)));
                 all_met &= p <= G2_CLIENT_FRAME_TARGET_MS;
             }
             runs.push(run);
@@ -1406,7 +2041,7 @@ fn run_g2_loop(args: &Args) -> Result<G2LoopSummary, RenderError> {
         gpu_p95_target_millis: G2_GPU_P95_TARGET_MS,
         cpu_p95_target_millis: G2_CPU_FRAME_TARGET_MS,
         client_p95_target_millis: G2_CLIENT_FRAME_TARGET_MS,
-        worst_client_frame_p95_pipelined_ms: worst_pipelined,
+        worst_client_frame_p95_serial_ms: worst_serial,
         client_p95_target_met: any_timed.then_some(all_met),
         scenes: scene_summaries,
     })
@@ -1876,7 +2511,7 @@ fn run_g2_terrain(args: &Args) -> Result<G2TerrainSummary, RenderError> {
         }
         if run.client_p95_target_met == Some(false) {
             quality_flags.push(format!(
-                "g2-terrain/{mode}: pipelined client-frame p95 over the provisional target"
+                "g2-terrain/{mode}: measured serial client-frame p95 over the provisional target"
             ));
         }
     }
@@ -1973,6 +2608,9 @@ fn main() -> ExitCode {
     }
     if args.scene.as_deref() == Some("g2-collapse") {
         return finish(&args.out, run_g2_collapse(&args));
+    }
+    if args.scene.as_deref() == Some("g2-bounded-collapse") {
+        return finish(&args.out, run_g2_bounded_collapse(&args));
     }
     finish(&args.out, run(&args))
 }
@@ -2137,6 +2775,105 @@ mod tests {
         assert!(
             solid_after < solid_before,
             "cuts remove solid terrain clipmap cells: {solid_before} -> {solid_after}"
+        );
+    }
+
+    /// Increment 6 (GPU-free): a clipmap fed only bounded per-tick
+    /// [`collapse_tick_update`]s — seeded once, then never fully resampled —
+    /// must still agree cell-for-cell with a from-scratch resample of the
+    /// evolving world. Disagreement would be a stale vacated shadow or an
+    /// erased overlapping occupancy.
+    #[test]
+    fn bounded_collapse_update_tracks_the_full_resample() {
+        let mut setup = fixtures::cross_brick_bridged_setup();
+        setup.physics.disable_ccd = true;
+        let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
+        let origin = G2_COLLAPSE_LIGHT_ORIGIN;
+        let strategy = MeshStrategy::Greedy;
+        let actor = spall_core::EntityId::new(1).unwrap();
+
+        let mut mirror = sim_light_volume(&sim, origin, strategy);
+        let seed_solid = mirror.cells().iter().filter(|&&m| m != 0).count();
+
+        let mut next_cut = 0usize;
+        let mut request_id = 1u64;
+        let mut pending: Vec<(u64, [i64; 3], i64)> = Vec::new();
+        let mut prev_bodies: Vec<(Vec3, Vec3)> = Vec::new();
+        let mut applied_any_cut = false;
+        let mut saw_body = false;
+
+        for tick in 1..=60u64 {
+            while next_cut < DESTRUCTION_SCRIPT.len() && DESTRUCTION_SCRIPT[next_cut].0 == tick {
+                let (_, cell, radius) = DESTRUCTION_SCRIPT[next_cut];
+                let _ = sim.submit(EditIntent::cut(
+                    RequestId(request_id),
+                    actor,
+                    EditTarget::Terrain,
+                    brush_cell(cell, radius),
+                ));
+                pending.push((request_id, cell, radius));
+                request_id += 1;
+                next_cut += 1;
+            }
+            let report = sim.tick().unwrap();
+            let landed: std::collections::HashSet<u64> =
+                report.committed.iter().map(|(id, _)| id.0).collect();
+            let mut cuts_this_tick = Vec::new();
+            pending.retain(|&(id, cell, radius)| {
+                if landed.contains(&id) {
+                    cuts_this_tick.push((cell, radius));
+                    false
+                } else {
+                    true
+                }
+            });
+            applied_any_cut |= !cuts_this_tick.is_empty();
+
+            let cur_bodies: Vec<(Vec3, Vec3)> = sim
+                .world()
+                .bodies()
+                .filter_map(|b| body_world_aabb(b, strategy))
+                .collect();
+            saw_body |= !cur_bodies.is_empty();
+            let update = collapse_tick_update(
+                &sim.world().terrain().volume,
+                origin,
+                &cuts_this_tick,
+                &prev_bodies,
+                &cur_bodies,
+            );
+            prev_bodies = cur_bodies;
+            mirror.apply_update(&update);
+            let _ = mirror.take_dirty();
+
+            let solid_now = mirror.cells().iter().filter(|&&m| m != 0).count();
+            assert!(
+                solid_now <= seed_solid + 8,
+                "tick {tick}: bounded clipmap solid count {solid_now} rose above the seed {seed_solid} — over-filled occupancy"
+            );
+        }
+
+        assert!(
+            applied_any_cut,
+            "the cut script commits terrain damage by tick 60"
+        );
+        assert!(
+            saw_body,
+            "the cut script detaches the cross-brick beam by tick 60"
+        );
+
+        let full = sim_light_volume(&sim, origin, strategy);
+        let (agree, total) = mirror
+            .cells()
+            .iter()
+            .zip(full.cells().iter())
+            .fold((0u64, 0u64), |(a, t), (m, f)| {
+                (a + u64::from(m == f), t + 1)
+            });
+        let frac = agree as f32 / total as f32;
+        assert!(
+            frac > 0.995,
+            "bounded per-tick clipmap tracks a full resample: {frac:.4} cell agreement"
         );
     }
 
