@@ -128,6 +128,11 @@ pub struct SimWorld {
     /// populates it, so every logical path is byte-identical to today by
     /// default. Keyed by raw volume id.
     evicted: BTreeMap<u64, EvictedBricks>,
+    /// T23 / G3 row 7, slice C: durable source used to reload an evicted brick's
+    /// cells when an edit needs them. `None` unless the residency pass installs
+    /// one; with `None`, an edit that needs evicted geometry is rejected rather
+    /// than reloaded.
+    backing: Option<std::sync::Arc<dyn crate::backing::BrickBacking>>,
 }
 
 /// A shared empty digest set, so [`SimWorld::evicted`] can return a reference
@@ -191,6 +196,7 @@ impl SimWorld {
             players: BTreeMap::new(),
             physics,
             evicted: BTreeMap::new(),
+            backing: None,
         })
     }
 
@@ -264,6 +270,68 @@ impl SimWorld {
         self.evicted(volume).verify_reload(vol, coord)?;
         self.evicted_mut(volume).clear(coord)?;
         Ok(())
+    }
+
+    /// Installs the durable brick source used by [`Self::reload_brick`].
+    pub fn set_backing(&mut self, backing: std::sync::Arc<dyn crate::backing::BrickBacking>) {
+        self.backing = Some(backing);
+    }
+
+    /// `true` once a durable brick source is installed.
+    pub fn has_backing(&self) -> bool {
+        self.backing.is_some()
+    }
+
+    /// Reloads one evicted brick's cells from the backing, reinstalls it,
+    /// verifies it against the retained digest, and drops the digest. `Ok(true)`
+    /// if the brick is now resident (including "was never evicted"); `Ok(false)`
+    /// if no backing is installed or the durable record is unavailable — the
+    /// caller then rejects the edit with a bounded explicit failure.
+    pub fn reload_brick(
+        &mut self,
+        volume: VolumeId,
+        coord: BrickCoord,
+    ) -> Result<bool, spall_voxel::DigestError> {
+        if !self.evicted(volume).contains(coord) {
+            return Ok(true);
+        }
+        let Some(backing) = self.backing.clone() else {
+            return Ok(false);
+        };
+        // The retained digest's exact (revision, content_hash) is checked by
+        // `clear_evicted_after_reload` -> `verify_reload` below, so a wrong
+        // backing record is rejected without dropping the digest.
+        let brick = match backing.load(volume, coord) {
+            crate::backing::BackingBrick::Loaded(brick) => brick,
+            crate::backing::BackingBrick::KnownEmpty { revision, edited } => {
+                spall_voxel::Brick::restored(
+                    &[spall_core::MaterialId::AIR; spall_core::CELLS_PER_BRICK],
+                    revision,
+                    edited,
+                )
+            }
+            crate::backing::BackingBrick::Unavailable => return Ok(false),
+        };
+        self.volume_body_mut(volume)
+            .ok_or(spall_voxel::DigestError::NoRetained(coord))?
+            .volume
+            .insert_brick(coord, brick)?;
+        self.clear_evicted_after_reload(volume, coord)?;
+        Ok(true)
+    }
+
+    /// Reloads every coord in `coords`. Returns `Ok(true)` only if every one is
+    /// now resident.
+    pub fn reload_bricks(
+        &mut self,
+        volume: VolumeId,
+        coords: impl IntoIterator<Item = BrickCoord>,
+    ) -> Result<bool, spall_voxel::DigestError> {
+        let mut all = true;
+        for coord in coords {
+            all &= self.reload_brick(volume, coord)?;
+        }
+        Ok(all)
     }
 
     pub fn anchor(&self) -> AnchorPlane {

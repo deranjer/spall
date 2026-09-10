@@ -566,11 +566,16 @@ staging conservation all fold that logical view — a server and a replica with
 **different** bricks evicted still converge — and makes an edit that needs
 unloaded evicted geometry a hard `EvictedGeometryRequired` error rather than a
 silent corruption. Proof: `cargo test -p spall_sim --test logical_commit`;
-`cargo test -p spall_client --test logical_residency`. Residency stays
-default-off; slices C–E (backing/capture + dependency-complete reload, serve
-wiring, client residency + traverse-away/back) remain open in
-`docs/reports/G3.md`, along with the join-duration budget and the G4
-eight-client workload + soak.
+`cargo test -p spall_client --test logical_residency`. Increment 8 (slice C)
+adds `spall_sim::BrickBacking` + `SimWorld::reload_brick` so an edit that needs
+an evicted brick's cells reloads it and re-stages (no backing → a bounded
+explicit rejection), and `spall_server::logical_world_baseline` /
+`logical_brick_repair_patch` fill evicted bricks from the backing so a late
+joiner / repair still reaches the exact hash. Proof: `cargo test -p spall_sim
+--test logical_reload`; `cargo test -p spall_server --test logical_baseline`.
+Residency stays default-off; slice D (serve-loop wiring) and slice E (client
+residency + traverse-away/back) remain open in `docs/reports/G3.md`, along with
+the join-duration budget and the G4 eight-client workload + soak.
 
 ### G4 — eight-client engine slice
 

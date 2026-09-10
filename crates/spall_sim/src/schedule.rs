@@ -259,6 +259,28 @@ impl EditPipeline {
 
             let staged = match entry.output {
                 Ok(staged) => staged,
+                // T23 / G3 row 7, slice C: the edit needs an evicted brick's
+                // cells. Reload it from the backing and re-stage next tick; if
+                // no backing has it, reject with a bounded explicit failure.
+                Err(StageError::EvictedGeometryRequired(bricks)) => {
+                    self.conflicts.remove(&region);
+                    match world.reload_bricks(queued.volume_id, bricks.iter().copied()) {
+                        Ok(true) => {
+                            report.retried.push(request);
+                            self.pending.push_back(QueuedIntent {
+                                attempts: queued.attempts + 1,
+                                ..queued
+                            });
+                        }
+                        _ => {
+                            let reason =
+                                format!("evicted geometry unavailable for reload: {bricks:?}");
+                            self.record_rejection(request, reason.clone());
+                            report.rejected.push((request, reason));
+                        }
+                    }
+                    continue;
+                }
                 Err(err) => {
                     let reason = err.to_string();
                     self.record_rejection(request, reason.clone());
@@ -280,6 +302,27 @@ impl EditPipeline {
                     self.committed.insert(request.0, done.clone());
                     self.statuses.insert(request.0, done.action_status(request));
                     report.committed.push((request, done));
+                }
+                // T23 / G3 row 7, slice C: the collider rebuild needs an evicted
+                // brick's cells. Reload from the backing and re-commit next
+                // tick; reject if unavailable.
+                Err(CommitError::EvictedGeometryRequired { volume, bricks }) => {
+                    self.conflicts.remove(&region);
+                    match world.reload_bricks(volume, bricks.iter().copied()) {
+                        Ok(true) => {
+                            report.retried.push(request);
+                            self.pending.push_back(QueuedIntent {
+                                attempts: queued.attempts + 1,
+                                ..queued
+                            });
+                        }
+                        _ => {
+                            let reason =
+                                format!("evicted geometry unavailable for reload: {bricks:?}");
+                            self.record_rejection(request, reason.clone());
+                            report.rejected.push((request, reason));
+                        }
+                    }
                 }
                 Err(err) => {
                     // The commit candidate failed a fallible step (id exhaustion,

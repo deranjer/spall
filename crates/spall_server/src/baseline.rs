@@ -20,8 +20,8 @@ use spall_protocol::{
     BaselineRegion, BaselineVolume, BaselineWorld, Hash32, InterestEpoch, RepairKey, RepairRequest,
     TransferId, limits,
 };
-use spall_sim::{Body, Simulation};
-use spall_voxel::BrickSnapshot;
+use spall_sim::{Body, BrickBacking, Simulation};
+use spall_voxel::{BrickSnapshot, EvictedBricks};
 
 /// World/content schema versions stamped into a `BaselineBegin`. These mirror
 /// the T10 bridge session's fixed values; real negotiation is a later task.
@@ -59,13 +59,37 @@ pub enum BaselineError {
 }
 
 /// Snapshots `sim`'s live world into an immutable [`BaselineWorld`] coherent
-/// with the current tick.
+/// with the current tick. Equivalent to [`logical_world_baseline`] with no
+/// backing — valid only while nothing is evicted.
 pub fn world_baseline(sim: &Simulation) -> BaselineWorld {
+    logical_world_baseline(sim, None)
+}
+
+/// [`world_baseline`] over the **logical** brick set: every resident brick plus,
+/// for each brick this server has evicted, its durable geometry from `backing`.
+/// A late joiner therefore receives a complete world regardless of the server's
+/// cache contents. Panics if a volume has evicted bricks and `backing` is
+/// `None` or cannot supply one — a partial baseline is never emitted
+/// (`docs/reports/G3-residency-hash.md` lifecycle).
+pub fn logical_world_baseline(
+    sim: &Simulation,
+    backing: Option<&dyn BrickBacking>,
+) -> BaselineWorld {
     let world = sim.world();
-    let mut volumes = vec![baseline_volume(world.terrain(), BaselineOwner::Terrain)];
+    let mut volumes = vec![baseline_volume(
+        world.terrain(),
+        BaselineOwner::Terrain,
+        world.evicted(world.terrain().volume_id),
+        backing,
+    )];
     for body in world.bodies() {
         let entity = body.entity.expect("a detached body carries an entity id");
-        volumes.push(baseline_volume(body, BaselineOwner::Body(entity)));
+        volumes.push(baseline_volume(
+            body,
+            BaselineOwner::Body(entity),
+            world.evicted(body.volume_id),
+            backing,
+        ));
     }
     volumes.sort_by_key(|v| v.volume_id.get());
     BaselineWorld {
@@ -85,8 +109,20 @@ pub fn capture_transfer(
     interest_epoch: InterestEpoch,
     journal_cursor: JournalSeq,
 ) -> Result<BaselineTransfer, BaselineError> {
+    logical_capture_transfer(sim, None, transfer_id, interest_epoch, journal_cursor)
+}
+
+/// [`capture_transfer`] over the logical brick set — pulls evicted bricks from
+/// `backing` so the transfer is complete even when this server has evictions.
+pub fn logical_capture_transfer(
+    sim: &Simulation,
+    backing: Option<&dyn BrickBacking>,
+    transfer_id: TransferId,
+    interest_epoch: InterestEpoch,
+    journal_cursor: JournalSeq,
+) -> Result<BaselineTransfer, BaselineError> {
     transfer_from_world(
-        world_baseline(sim),
+        logical_world_baseline(sim, backing),
         transfer_id,
         interest_epoch,
         journal_cursor,
@@ -180,15 +216,50 @@ pub fn assemble(
 /// `CellRun` replay cannot (`docs/protocol.md`: "hash repairs"). `None` for a
 /// body repair or a brick the world does not hold.
 pub fn brick_repair_patch(sim: &Simulation, request: &RepairRequest) -> Option<BaselineWorld> {
+    logical_brick_repair_patch(sim, request, None)
+}
+
+/// [`brick_repair_patch`] that can also patch a brick this server has evicted,
+/// pulling its cells from `backing`.
+pub fn logical_brick_repair_patch(
+    sim: &Simulation,
+    request: &RepairRequest,
+    backing: Option<&dyn BrickBacking>,
+) -> Option<BaselineWorld> {
     let RepairKey::Brick { volume, coord } = request.key else {
         return None;
     };
     let world = sim.world();
     let vol = world.volume_ref(volume)?;
-    let snap = vol.snapshot_brick(coord).ok().flatten()?;
     let owner = match world.volume_body(volume)?.entity {
         Some(entity) => BaselineOwner::Body(entity),
         None => BaselineOwner::Terrain,
+    };
+    let brick = if let Ok(Some(snap)) = vol.snapshot_brick(coord) {
+        BaselineBrick {
+            coord: [coord.x, coord.y, coord.z],
+            revision: snap.revision().get(),
+            edited: snap.is_edited(),
+            cells: cells_of(&snap),
+        }
+    } else if world.evicted(volume).contains(coord) {
+        match backing?.load(volume, coord) {
+            spall_sim::BackingBrick::Loaded(b) => BaselineBrick {
+                coord: [coord.x, coord.y, coord.z],
+                revision: b.revision().get(),
+                edited: b.is_edited(),
+                cells: cells_of(&b.snapshot()),
+            },
+            spall_sim::BackingBrick::KnownEmpty { revision, edited } => BaselineBrick {
+                coord: [coord.x, coord.y, coord.z],
+                revision: revision.get(),
+                edited,
+                cells: BaselineCells::Uniform(spall_core::MaterialId::AIR.raw()),
+            },
+            spall_sim::BackingBrick::Unavailable => return None,
+        }
+    } else {
+        return None;
     };
     let bv = BaselineVolume {
         volume_id: volume,
@@ -197,12 +268,7 @@ pub fn brick_repair_patch(sim: &Simulation, request: &RepairRequest) -> Option<B
         bounds: vol
             .bounds()
             .map(|b| [[b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z]]),
-        bricks: vec![BaselineBrick {
-            coord: [coord.x, coord.y, coord.z],
-            revision: snap.revision().get(),
-            edited: snap.is_edited(),
-            cells: cells_of(&snap),
-        }],
+        bricks: vec![brick],
     };
     Some(BaselineWorld {
         schema: spall_protocol::BASELINE_WORLD_SCHEMA,
@@ -211,19 +277,49 @@ pub fn brick_repair_patch(sim: &Simulation, request: &RepairRequest) -> Option<B
     })
 }
 
-fn baseline_volume(body: &Body, owner: BaselineOwner) -> BaselineVolume {
+fn baseline_volume(
+    body: &Body,
+    owner: BaselineOwner,
+    evicted: &EvictedBricks,
+    backing: Option<&dyn BrickBacking>,
+) -> BaselineVolume {
     let v = &body.volume;
-    let mut bricks: Vec<BaselineBrick> = v
-        .resident_brick_coords()
+    let mut bricks: Vec<BaselineBrick> = spall_voxel::logical_bricks(v, evicted)
+        .expect("logical volume: resident/evicted digest invariant holds")
         .into_iter()
-        .filter_map(|coord| {
-            let snap = v.snapshot_brick(coord).ok().flatten()?;
-            Some(BaselineBrick {
-                coord: [coord.x, coord.y, coord.z],
-                revision: snap.revision().get(),
-                edited: snap.is_edited(),
-                cells: cells_of(&snap),
-            })
+        .map(|lb| {
+            let coord = lb.coord;
+            if let Ok(Some(snap)) = v.snapshot_brick(coord) {
+                return BaselineBrick {
+                    coord: [coord.x, coord.y, coord.z],
+                    revision: snap.revision().get(),
+                    edited: snap.is_edited(),
+                    cells: cells_of(&snap),
+                };
+            }
+            // Evicted: its cells come from the durable backing.
+            let backing =
+                backing.expect("a baseline over evicted geometry needs a durable backing");
+            match backing.load(v.id(), coord) {
+                spall_sim::BackingBrick::Loaded(brick) => BaselineBrick {
+                    coord: [coord.x, coord.y, coord.z],
+                    revision: brick.revision().get(),
+                    edited: brick.is_edited(),
+                    cells: cells_of(&brick.snapshot()),
+                },
+                spall_sim::BackingBrick::KnownEmpty { revision, edited } => BaselineBrick {
+                    coord: [coord.x, coord.y, coord.z],
+                    revision: revision.get(),
+                    edited,
+                    cells: BaselineCells::Uniform(spall_core::MaterialId::AIR.raw()),
+                },
+                spall_sim::BackingBrick::Unavailable => {
+                    panic!(
+                        "baseline: durable brick {coord:?} of volume {} is unavailable",
+                        v.id()
+                    )
+                }
+            }
         })
         .collect();
     bricks.sort_by_key(|b| (b.coord[2], b.coord[1], b.coord[0]));

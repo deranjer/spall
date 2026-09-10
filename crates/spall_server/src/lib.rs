@@ -16,7 +16,8 @@ pub mod serve;
 
 pub use baseline::{
     BaselineError, BaselineTransfer, brick_repair_patch, capture_transfer, chunk_payload,
-    transfer_from_world, world_baseline,
+    logical_brick_repair_patch, logical_capture_transfer, logical_world_baseline, transfer_from_world,
+    world_baseline,
 };
 pub use persist::{
     CrashSuiteReport, PersistConfig, PersistError, RecoveryChoice, ScenarioResult, capture,
