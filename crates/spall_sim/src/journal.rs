@@ -19,6 +19,7 @@
 //! `O(log n)` tail lookup so a per-tick flush never rescans the whole history.
 
 use spall_core::JournalSeq;
+use spall_protocol::baseline::BaselineWorld;
 use spall_protocol::{MotionSnapshot, TopologyTransaction};
 
 /// One journal record: a committed transaction and the state of every body it
@@ -29,6 +30,12 @@ pub struct JournalEntry {
     pub transaction: TopologyTransaction,
     /// State of every participant body (source and any children) at commit.
     pub participants: Vec<MotionSnapshot>,
+    /// T17 increment 2: for a giant split whose `transaction.ops` are
+    /// `SplitOffBulkBaseline` / `SourcePatchBulkBaseline` markers only, the
+    /// out-of-band `BaselineWorld` the durable store must persist alongside the
+    /// transaction so exact-replay and recovery can reconstruct it. `None` for
+    /// every ordinary entry.
+    pub bulk_baseline: Option<BaselineWorld>,
 }
 
 /// An in-memory append-only journal of the *retained* suffix. Ordered by
@@ -137,6 +144,7 @@ mod tests {
                 result_hashes: vec![],
             },
             participants: vec![],
+            bulk_baseline: None,
         }
     }
 

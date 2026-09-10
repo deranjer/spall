@@ -293,6 +293,11 @@ pub struct VolumeHash {
     pub hash: Hash32,
 }
 
+/// Set on a bulk split's `transfer_id` (T17 increment 2) so it can never
+/// collide with a late-join / repair transfer id (which are small, allocated by
+/// the server's own counter). The low 63 bits are the split's `TransactionId`.
+pub const SPLIT_BULK_TRANSFER_ID_BIT: u64 = 1 << 63;
+
 /// One ordered operation inside a transaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TopologyOp {
@@ -333,6 +338,37 @@ pub enum TopologyOp {
     /// the source volume's post-cut **affected** bricks, at their authoritative
     /// revisions. Replaces the inline source-removal `CellRun`s.
     SourcePatchBaseline { source: VolumeId, blob: Vec<u8> },
+    /// A split whose geometry is too large even for a compressed inline blob
+    /// (T17 increment 2 / ENG-64): a *marker only*. The child volume travels
+    /// out of band — as a [`crate::baseline::BaselineWorld`] on a bulk stream to
+    /// replicas, and as a journal `TopologyBulkSplit` payload to disk — keyed by
+    /// `transfer_id` (the [`crate::BaselineBegin::transfer_id`] of that
+    /// transfer). The replica **holds** this transaction until the matching
+    /// blob assembles.
+    SplitOffBulkBaseline {
+        source: VolumeId,
+        child: VolumeId,
+        child_entity: EntityId,
+        transfer_id: u64,
+    },
+    /// The source side of a bulk-delivered oversized split (T17 increment 2): a
+    /// marker. The source volume's post-cut affected bricks are in the same
+    /// out-of-band [`crate::baseline::BaselineWorld`] as the
+    /// [`TopologyOp::SplitOffBulkBaseline`] children, under the same
+    /// `transfer_id`.
+    SourcePatchBulkBaseline { source: VolumeId, transfer_id: u64 },
+}
+
+impl TopologyOp {
+    /// The bulk-baseline `transfer_id` this op references, if any (T17
+    /// increment 2). Every op of one bulk-delivered split carries the same id.
+    pub fn bulk_transfer_id(&self) -> Option<u64> {
+        match self {
+            TopologyOp::SplitOffBulkBaseline { transfer_id, .. }
+            | TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => Some(*transfer_id),
+            _ => None,
+        }
+    }
 }
 
 /// `TopologyTransaction`: the authoritative record of one committed edit.
@@ -428,7 +464,11 @@ impl TopologyTransaction {
             let material = match op {
                 TopologyOp::IntegerBrush { material, .. } => *material,
                 TopologyOp::CellRun { material, .. } => *material,
-                TopologyOp::SplitOff { .. } => continue,
+                // Markers carry no geometry inline: the bulk `BaselineWorld` is
+                // material-checked where it decodes.
+                TopologyOp::SplitOff { .. }
+                | TopologyOp::SplitOffBulkBaseline { .. }
+                | TopologyOp::SourcePatchBulkBaseline { .. } => continue,
                 // A split baseline blob carries whole bricks: decode it and
                 // check every material it names against the manifest.
                 TopologyOp::SplitOffBaseline { blob, .. }
@@ -938,6 +978,49 @@ mod tests {
             blob: Vec::new(),
         };
         assert!(matches!(tx.validate(), Err(RecordError::OutOfRange { .. })));
+    }
+
+    #[test]
+    fn bulk_split_marker_ops_round_trip_and_carry_one_transfer_id() {
+        let tid = 42 | SPLIT_BULK_TRANSFER_ID_BIT;
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(42).unwrap(),
+            server_tick: Tick(9),
+            control_seq: ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![
+                TopologyOp::IntegerBrush {
+                    volume: VolumeId::new(1).unwrap(),
+                    brush: SphereBrush::new(BrushPoint::from_cells(0, 0, 0).unwrap(), 8).unwrap(),
+                    material: MaterialId::AIR,
+                },
+                TopologyOp::SplitOffBulkBaseline {
+                    source: VolumeId::new(1).unwrap(),
+                    child: VolumeId::new(2).unwrap(),
+                    child_entity: EntityId::new(5).unwrap(),
+                    transfer_id: tid,
+                },
+                TopologyOp::SourcePatchBulkBaseline {
+                    source: VolumeId::new(1).unwrap(),
+                    transfer_id: tid,
+                },
+            ],
+            result_hashes: vec![],
+        };
+        assert!(tx.validate().is_ok());
+        let bytes = crate::encode_control(&tx).unwrap();
+        assert_eq!(
+            crate::decode_control::<TopologyTransaction>(&bytes).unwrap(),
+            tx
+        );
+
+        let ids: std::collections::BTreeSet<u64> =
+            tx.ops.iter().filter_map(|o| o.bulk_transfer_id()).collect();
+        assert_eq!(ids, std::collections::BTreeSet::from([tid]));
+        assert_ne!(tid & SPLIT_BULK_TRANSFER_ID_BIT, 0);
     }
 
     #[test]

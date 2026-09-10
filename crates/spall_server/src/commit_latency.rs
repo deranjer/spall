@@ -47,7 +47,10 @@ pub fn classify(bumped_epoch: bool, tx: &TopologyTransaction) -> CommitClass {
     if tx.ops.iter().any(|op| {
         matches!(
             op,
-            TopologyOp::SplitOffBaseline { .. } | TopologyOp::SourcePatchBaseline { .. }
+            TopologyOp::SplitOffBaseline { .. }
+                | TopologyOp::SourcePatchBaseline { .. }
+                | TopologyOp::SplitOffBulkBaseline { .. }
+                | TopologyOp::SourcePatchBulkBaseline { .. }
         )
     }) {
         return CommitClass::LargeCollapse;
@@ -60,7 +63,9 @@ pub fn classify(bumped_epoch: bool, tx: &TopologyTransaction) -> CommitClass {
             TopologyOp::IntegerBrush { .. }
             | TopologyOp::SplitOff { .. }
             | TopologyOp::SplitOffBaseline { .. }
-            | TopologyOp::SourcePatchBaseline { .. } => 0,
+            | TopologyOp::SourcePatchBaseline { .. }
+            | TopologyOp::SplitOffBulkBaseline { .. }
+            | TopologyOp::SourcePatchBulkBaseline { .. } => 0,
         })
         .sum();
     if detached_cells >= LARGE_COLLAPSE_CELLS {

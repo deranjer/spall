@@ -94,6 +94,11 @@ pub enum ApplyOutcome {
     /// A `before` revision did not match; nothing was applied. The caller should
     /// send these rate-limited and wait for repair, not replay.
     NeedsRepair(Vec<RepairRequest>),
+    /// T17 increment 2: a giant split whose geometry (`transfer_id`) has not yet
+    /// arrived on a bulk stream. The transaction is held; nothing was applied.
+    /// The caller does nothing — [`ReplicaWorld::provide_bulk_split_world`]
+    /// retries it once the blob assembles.
+    AwaitingBulkSplit { transfer_id: u64 },
     /// The candidate failed to build or its result hash did not match. The live
     /// replica is unchanged.
     Rejected { reason: String },
@@ -199,6 +204,15 @@ pub struct ReplicaWorld {
     /// silently drop a committed transaction's ops. Bounded by
     /// `config.max_pending_repair_txns`.
     pending_repair_txns: BTreeMap<u64, TopologyTransaction>,
+    /// T17 increment 2: a giant-split marker transaction held (keyed by its
+    /// `transfer_id`) until the out-of-band `BaselineWorld` for that
+    /// `transfer_id` arrives on a bulk stream. Bounded by
+    /// `config.max_pending_repair_txns`.
+    pending_bulk_split_txns: BTreeMap<u64, TopologyTransaction>,
+    /// T17 increment 2: an assembled bulk-split `BaselineWorld` waiting for its
+    /// marker transaction (or retained briefly after applying it), keyed by
+    /// `transfer_id`.
+    bulk_split_worlds: BTreeMap<u64, spall_protocol::baseline::BaselineWorld>,
     /// ENG-49: brick repair keys already asked about and not yet resolved →
     /// the `now_tick` the `RepairRequest` was emitted, so an identical gap
     /// inside `config.repair_request_cooldown_ticks` is not re-requested.
@@ -230,6 +244,8 @@ impl ReplicaWorld {
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
             pending_repair_txns: BTreeMap::new(),
+            pending_bulk_split_txns: BTreeMap::new(),
+            bulk_split_worlds: BTreeMap::new(),
             repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
         }
@@ -252,6 +268,8 @@ impl ReplicaWorld {
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
             pending_repair_txns: BTreeMap::new(),
+            pending_bulk_split_txns: BTreeMap::new(),
+            bulk_split_worlds: BTreeMap::new(),
             repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
         }
@@ -364,8 +382,10 @@ impl ReplicaWorld {
         self.control_gate = SequenceGate::new();
         self.pending_snapshots = BTreeMap::new();
         // A fresh baseline supersedes any transaction that was held pending a
-        // repair against the old world.
+        // repair or a bulk-split blob against the old world.
         self.pending_repair_txns = BTreeMap::new();
+        self.pending_bulk_split_txns = BTreeMap::new();
+        self.bulk_split_worlds = BTreeMap::new();
         self.repair_requests_inflight = BTreeMap::new();
         self.now_tick = world.checkpoint_tick;
         Ok(())
@@ -471,6 +491,45 @@ impl ReplicaWorld {
     /// Transactions currently held awaiting a repair patch (diagnostics).
     pub fn pending_repair_txn_count(&self) -> usize {
         self.pending_repair_txns.len()
+    }
+
+    /// T17 increment 2: hand the replica the assembled out-of-band
+    /// [`spall_protocol::baseline::BaselineWorld`] for a giant split's
+    /// `transfer_id`, then retry the marker transaction that was held on it.
+    /// Returns the retry outcome (empty if none was held).
+    pub fn provide_bulk_split_world(
+        &mut self,
+        transfer_id: u64,
+        world: spall_protocol::baseline::BaselineWorld,
+    ) -> Vec<(TransactionId, ApplyOutcome)> {
+        self.bulk_split_worlds.insert(transfer_id, world);
+        let Some(tx) = self.pending_bulk_split_txns.get(&transfer_id).cloned() else {
+            return Vec::new();
+        };
+        let tid = tx.transaction_id;
+        let outcome = self.apply_transaction(&tx);
+        if !matches!(outcome, ApplyOutcome::AwaitingBulkSplit { .. }) {
+            self.pending_bulk_split_txns.remove(&transfer_id);
+        }
+        vec![(tid, outcome)]
+    }
+
+    /// Giant-split marker transactions currently held awaiting their bulk blob
+    /// (diagnostics).
+    pub fn pending_bulk_split_txn_count(&self) -> usize {
+        self.pending_bulk_split_txns.len()
+    }
+
+    /// Holds a giant-split marker transaction keyed by `transfer_id`, bounded
+    /// like the repair-hold set.
+    fn retain_pending_bulk_split_txn(&mut self, transfer_id: u64, tx: TopologyTransaction) {
+        self.pending_bulk_split_txns.insert(transfer_id, tx);
+        while self.pending_bulk_split_txns.len() > self.config.max_pending_repair_txns {
+            let Some((&oldest, _)) = self.pending_bulk_split_txns.iter().next() else {
+                break;
+            };
+            self.pending_bulk_split_txns.remove(&oldest);
+        }
     }
 
     /// Adds a body that exists in the baseline scene.
@@ -610,6 +669,17 @@ impl ReplicaWorld {
             };
         }
 
+        // T17 increment 2: a giant-split marker transaction carries no geometry
+        // inline — its child volumes and source patch are in an out-of-band
+        // `BaselineWorld` delivered on a bulk stream under `transfer_id`. Hold
+        // the whole transaction until that blob has assembled.
+        if let Some(transfer_id) = tx.ops.iter().find_map(|op| op.bulk_transfer_id())
+            && !self.bulk_split_worlds.contains_key(&transfer_id)
+        {
+            self.retain_pending_bulk_split_txn(transfer_id, tx.clone());
+            return ApplyOutcome::AwaitingBulkSplit { transfer_id };
+        }
+
         // 1. Every `before` revision must match the live replica exactly. A
         //    `before` entry of `Revision::ZERO` means the brick was absent
         //    server-side, so an absent replica brick is a match.
@@ -680,7 +750,12 @@ impl ReplicaWorld {
         };
         let mut candidate: BTreeMap<u64, Volume> = self.volumes.clone();
         let mut new_owner: Vec<(VolumeId, EntityId)> = Vec::new();
-        if let Err(reason) = replay_ops(&tx.ops, &mut candidate, &mut new_owner, cell_size) {
+        let bulk = tx
+            .ops
+            .iter()
+            .find_map(|op| op.bulk_transfer_id())
+            .and_then(|tid| self.bulk_split_worlds.get(&tid));
+        if let Err(reason) = replay_ops(&tx.ops, &mut candidate, &mut new_owner, cell_size, bulk) {
             return ApplyOutcome::Rejected { reason };
         }
 
@@ -729,6 +804,11 @@ impl ReplicaWorld {
         // hold and clear any repair keys its `before` bricks were blocked on so
         // a genuine later gap on the same brick can re-request at once.
         self.pending_repair_txns.remove(&tx.transaction_id.get());
+        // T17 increment 2: release the giant-split hold and its (large) blob.
+        if let Some(tid) = tx.ops.iter().find_map(|op| op.bulk_transfer_id()) {
+            self.pending_bulk_split_txns.remove(&tid);
+            self.bulk_split_worlds.remove(&tid);
+        }
         for br in &tx.before {
             self.repair_requests_inflight.remove(&(
                 br.volume.get(),
@@ -918,7 +998,14 @@ fn replay_ops(
     candidate: &mut BTreeMap<u64, Volume>,
     new_owner: &mut Vec<(VolumeId, EntityId)>,
     cell_size: CellSizeCode,
+    bulk: Option<&spall_protocol::baseline::BaselineWorld>,
 ) -> Result<(), String> {
+    // T17 increment 2: the out-of-band `BaselineVolume` for one volume of a
+    // giant bulk split.
+    let bulk_volume = |id: VolumeId| -> Result<&BaselineVolume, String> {
+        bulk.and_then(|w| w.volumes.iter().find(|v| v.volume_id == id))
+            .ok_or_else(|| format!("bulk split baseline is missing volume {id}"))
+    };
     let mut pending: Option<PendingGroup> = None;
 
     for op in ops {
@@ -975,9 +1062,9 @@ fn replay_ops(
                 }
             }
             // T17: an oversized split's child geometry arrives as a compressed
-            // `BaselineVolume` instead of inline `CellRun`s. Rebuild the child
-            // volume from it — same shape (bounded, authoritative revisions) as
-            // the `SplitOff` path — and register the new owner.
+            // `BaselineVolume` — inline (increment 1) or from the out-of-band
+            // bulk world (increment 2). Rebuild the child volume from it — same
+            // shape (bounded, authoritative revisions) as the `SplitOff` path.
             TopologyOp::SplitOffBaseline {
                 child,
                 child_entity,
@@ -987,9 +1074,16 @@ fn replay_ops(
                 flush(pending.take(), candidate, cell_size)?;
                 let bv = BaselineVolume::decode_compressed(blob)
                     .map_err(|e| format!("split baseline blob for volume {child}: {e}"))?;
-                let child_volume = volume_from_baseline_volume(&bv)?;
-                new_owner.push((*child, *child_entity));
-                candidate.insert(child.get(), child_volume);
+                install_split_child(candidate, new_owner, *child, *child_entity, &bv)?;
+            }
+            TopologyOp::SplitOffBulkBaseline {
+                child,
+                child_entity,
+                ..
+            } => {
+                flush(pending.take(), candidate, cell_size)?;
+                let bv = bulk_volume(*child)?;
+                install_split_child(candidate, new_owner, *child, *child_entity, bv)?;
             }
             // T17: the source side of an oversized split — overwrite the named
             // source bricks in the candidate with their post-cut state.
@@ -997,21 +1091,52 @@ fn replay_ops(
                 flush(pending.take(), candidate, cell_size)?;
                 let bv = BaselineVolume::decode_compressed(blob)
                     .map_err(|e| format!("source patch baseline blob for volume {source}: {e}"))?;
-                let volume = candidate
-                    .get_mut(&source.get())
-                    .ok_or_else(|| format!("source patch targets unknown volume {source}"))?;
-                for bb in &bv.bricks {
-                    volume
-                        .insert_brick(
-                            BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
-                            baseline_brick(bb)?,
-                        )
-                        .map_err(|e| format!("source patch brick insert failed: {e}"))?;
-                }
+                patch_split_source(candidate, *source, &bv)?;
+            }
+            TopologyOp::SourcePatchBulkBaseline { source, .. } => {
+                flush(pending.take(), candidate, cell_size)?;
+                let bv = bulk_volume(*source)?;
+                patch_split_source(candidate, *source, bv)?;
             }
         }
     }
     flush(pending.take(), candidate, cell_size)
+}
+
+/// Insert a split child `Volume` (rebuilt from a `BaselineVolume`) into the
+/// candidate and register its new owner.
+fn install_split_child(
+    candidate: &mut BTreeMap<u64, Volume>,
+    new_owner: &mut Vec<(VolumeId, EntityId)>,
+    child: VolumeId,
+    child_entity: EntityId,
+    bv: &BaselineVolume,
+) -> Result<(), String> {
+    let child_volume = volume_from_baseline_volume(bv)?;
+    new_owner.push((child, child_entity));
+    candidate.insert(child.get(), child_volume);
+    Ok(())
+}
+
+/// Overwrite a split source's affected bricks in the candidate from a
+/// `BaselineVolume`.
+fn patch_split_source(
+    candidate: &mut BTreeMap<u64, Volume>,
+    source: VolumeId,
+    bv: &BaselineVolume,
+) -> Result<(), String> {
+    let volume = candidate
+        .get_mut(&source.get())
+        .ok_or_else(|| format!("source patch targets unknown volume {source}"))?;
+    for bb in &bv.bricks {
+        volume
+            .insert_brick(
+                BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                baseline_brick(bb)?,
+            )
+            .map_err(|e| format!("source patch brick insert failed: {e}"))?;
+    }
+    Ok(())
 }
 
 fn flush(
