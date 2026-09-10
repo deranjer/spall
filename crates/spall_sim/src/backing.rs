@@ -12,6 +12,7 @@
 //! [`MemoryBacking`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 use spall_core::{BrickCoord, CELLS_PER_BRICK, LocalCell, MaterialId, Revision, VolumeId};
 use spall_voxel::{Brick, Volume};
@@ -37,72 +38,96 @@ pub trait BrickBacking: Send + Sync {
     fn load(&self, volume: VolumeId, coord: BrickCoord) -> BackingBrick;
 }
 
-/// In-memory backing for fixtures and tests: an owned [`Brick`] per key.
-#[derive(Debug, Default, Clone)]
-pub struct MemoryBacking {
-    bricks: BTreeMap<(u64, i64, i64, i64), Brick>,
-    known_empty: BTreeMap<(u64, i64, i64, i64), (Revision, bool)>,
-    unavailable: BTreeSet<(u64, i64, i64, i64)>,
+type Key = (u64, i64, i64, i64);
+
+fn key(volume: VolumeId, coord: BrickCoord) -> Key {
+    (volume.get(), coord.x, coord.y, coord.z)
 }
 
-fn key(volume: VolumeId, coord: BrickCoord) -> (u64, i64, i64, i64) {
-    (volume.get(), coord.x, coord.y, coord.z)
+#[derive(Debug, Default)]
+struct MemoryBackingInner {
+    bricks: BTreeMap<Key, Brick>,
+    known_empty: BTreeMap<Key, (Revision, bool)>,
+    unavailable: BTreeSet<Key>,
+}
+
+/// In-memory brick source for fixtures, tests, and the default-off serve
+/// residency pass. Interior-mutable so the pass (which updates it on every
+/// commit) and [`SimWorld`](crate::SimWorld) (which reads it on reload) can
+/// share one `Arc`.
+#[derive(Debug, Default)]
+pub struct MemoryBacking {
+    inner: Mutex<MemoryBackingInner>,
 }
 
 impl MemoryBacking {
     /// Captures every resident brick of `volume` as a reload record — the
     /// durable state a checkpoint would hold.
     pub fn from_volume(volume: &Volume) -> Self {
-        let mut backing = Self::default();
+        let backing = Self::default();
         for coord in volume.resident_brick_coords() {
-            let snap = volume
-                .snapshot_brick(coord)
-                .ok()
-                .flatten()
-                .expect("coord came from the resident set");
-            let cells: Vec<MaterialId> = (0..CELLS_PER_BRICK as u16)
-                .map(|i| snap.get(LocalCell::from_linear_index(i).expect("i < 32768")))
-                .collect();
-            backing.bricks.insert(
-                key(volume.id(), coord),
-                Brick::restored(&cells, snap.revision(), snap.is_edited()),
-            );
+            backing.capture(volume, coord);
         }
         backing
     }
 
-    pub fn insert(&mut self, volume: VolumeId, coord: BrickCoord, brick: Brick) {
-        self.bricks.insert(key(volume, coord), brick);
+    /// Records `volume`'s current geometry at `coord` (must be resident). Called
+    /// after every committed edit so a later reload gets the current revision.
+    pub fn capture(&self, volume: &Volume, coord: BrickCoord) {
+        let Ok(Some(snap)) = volume.snapshot_brick(coord) else {
+            return;
+        };
+        let cells: Vec<MaterialId> = (0..CELLS_PER_BRICK as u16)
+            .map(|i| snap.get(LocalCell::from_linear_index(i).expect("i < 32768")))
+            .collect();
+        self.insert(
+            volume.id(),
+            coord,
+            Brick::restored(&cells, snap.revision(), snap.is_edited()),
+        );
+    }
+
+    pub fn insert(&self, volume: VolumeId, coord: BrickCoord, brick: Brick) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.unavailable.remove(&key(volume, coord));
+        g.known_empty.remove(&key(volume, coord));
+        g.bricks.insert(key(volume, coord), brick);
     }
 
     pub fn mark_known_empty(
-        &mut self,
+        &self,
         volume: VolumeId,
         coord: BrickCoord,
         rev: Revision,
         edited: bool,
     ) {
-        self.bricks.remove(&key(volume, coord));
-        self.known_empty.insert(key(volume, coord), (rev, edited));
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.bricks.remove(&key(volume, coord));
+        g.known_empty.insert(key(volume, coord), (rev, edited));
     }
 
     /// Force `load` to report `Unavailable` for this key (a lost / corrupt
     /// durable record).
-    pub fn mark_unavailable(&mut self, volume: VolumeId, coord: BrickCoord) {
-        self.unavailable.insert(key(volume, coord));
+    pub fn mark_unavailable(&self, volume: VolumeId, coord: BrickCoord) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unavailable
+            .insert(key(volume, coord));
     }
 }
 
 impl BrickBacking for MemoryBacking {
     fn load(&self, volume: VolumeId, coord: BrickCoord) -> BackingBrick {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let k = key(volume, coord);
-        if self.unavailable.contains(&k) {
+        if g.unavailable.contains(&k) {
             return BackingBrick::Unavailable;
         }
-        if let Some(brick) = self.bricks.get(&k) {
+        if let Some(brick) = g.bricks.get(&k) {
             return BackingBrick::Loaded(brick.clone());
         }
-        if let Some(&(revision, edited)) = self.known_empty.get(&k) {
+        if let Some(&(revision, edited)) = g.known_empty.get(&k) {
             return BackingBrick::KnownEmpty { revision, edited };
         }
         BackingBrick::Unavailable

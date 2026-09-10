@@ -86,6 +86,17 @@ struct Args {
     #[arg(long)]
     await_body_settle: bool,
 
+    // --- T23 / G3 row 7: default-off resident-cache eviction ---
+    /// Enable the residency pass: evict terrain bricks outside every player's
+    /// interest box (this many resident bricks is the reported ceiling), reload
+    /// them on demand for edits. The committed world / hash is unchanged.
+    /// `0` (default) keeps everything resident.
+    #[arg(long, default_value_t = 0)]
+    residency_budget_bricks: usize,
+    /// Chebyshev radius (bricks) of the kept-resident box around each player.
+    #[arg(long, default_value_t = 2)]
+    residency_radius_bricks: i64,
+
     // --- T20 interest + bandwidth scheduling ---
     /// Enable per-client interest relevance + motion bandwidth budget. Without
     /// it, one 20 Hz motion batch is broadcast unfiltered to every client
@@ -237,6 +248,10 @@ fn run_serve(args: Args) -> ExitCode {
         save_faults: None,
         await_body_settle: args.await_body_settle,
         motion_interest,
+        residency: (args.residency_budget_bricks > 0).then_some(spall_server::ResidencyLimits {
+            budget_bricks: args.residency_budget_bricks,
+            interest_radius_bricks: args.residency_radius_bricks,
+        }),
     };
     match spall_server::serve(config) {
         Ok(summary) => {

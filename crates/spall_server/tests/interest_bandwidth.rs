@@ -76,6 +76,7 @@ fn base_config(
         save_faults: None,
         await_body_settle: false,
         motion_interest: Some(motion_interest),
+        residency: None,
     }
 }
 

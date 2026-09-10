@@ -573,9 +573,20 @@ explicit rejection), and `spall_server::logical_world_baseline` /
 `logical_brick_repair_patch` fill evicted bricks from the backing so a late
 joiner / repair still reaches the exact hash. Proof: `cargo test -p spall_sim
 --test logical_reload`; `cargo test -p spall_server --test logical_baseline`.
-Residency stays default-off; slice D (serve-loop wiring) and slice E (client
-residency + traverse-away/back) remain open in `docs/reports/G3.md`, along with
-the join-duration budget and the G4 eight-client workload + soak.
+Increment 9 (slice D) wires it into `serve()` behind a **default-off**
+`ServeConfig.residency` knob (`sandbox-server --residency-budget-bricks` /
+`--residency-radius-bricks`): `spall_server::residency_pass::ResidencyPass`
+keeps a brick box around every player capsule resident, evicts out-of-interest
+terrain after a settle hysteresis, refreshes the backing on commit, and reloads
+everything before each checkpoint; late-join and repair capture use the logical
+paths with that backing. Proof: `cargo test -p spall_server --test
+residency_pass` (residency-on reaches the same committed world as off, with real
+evictions); `cargo xtask scenario --name t23-g3-residency` (`t23-g3` under a
+6-brick budget — server + 4 clients + exact replay + cold restart all converge
+to the residency-off agreed hash with 56 evictions). Residency stays default-off
+for every other scenario; slice E (client residency + traverse-away/back, row
+8b) remains open in `docs/reports/G3.md`, along with the join-duration budget and
+the G4 eight-client workload + soak.
 
 ### G4 — eight-client engine slice
 

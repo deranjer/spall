@@ -106,7 +106,7 @@ fn a_wrong_backing_record_is_refused_and_keeps_the_digest() {
 
     // Backing that has the *wrong* geometry for `victim` (a different brick's
     // cells).
-    let mut backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
+    let backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
     let other = sim
         .world()
         .terrain()

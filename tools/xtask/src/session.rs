@@ -197,6 +197,16 @@ struct Scenario {
     /// bounded explicit failure while connected clients continue".
     #[serde(default)]
     late_join_may_fail: bool,
+    /// T23 / G3 row 7, slice D: run the server with `--residency-budget-bricks`
+    /// set — evict terrain bricks outside every player's interest box, reload on
+    /// demand for edits. The committed world / agreed hash is unchanged; a run
+    /// with this set exercises the eviction path end to end.
+    #[serde(default)]
+    residency_budget_bricks: Option<usize>,
+    /// Chebyshev radius (bricks) of the kept-resident box around each player
+    /// when `residency_budget_bricks` is set. Defaults to the server's default.
+    #[serde(default)]
+    residency_radius_bricks: Option<i64>,
     /// Minimum straight-line distance (metres) some replicated body must have
     /// travelled on every live client — proof the detached geometry actually
     /// moved, not merely that a (possibly stationary) snapshot arrived.
@@ -942,6 +952,12 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         // ENG-61: run physics past edit-quiescence until the detached body sleeps
         // so the run can actually show it come to rest.
         server_cmd.arg("--await-body-settle");
+    }
+    if let Some(budget) = scenario.residency_budget_bricks {
+        server_cmd.args(["--residency-budget-bricks", &budget.to_string()]);
+        if let Some(r) = scenario.residency_radius_bricks {
+            server_cmd.args(["--residency-radius-bricks", &r.to_string()]);
+        }
     }
     // T11 exact-replay check (and the T23 cold-restart check) both journal every
     // committed transaction to a world DB. Replay rebuilds from the tick-0

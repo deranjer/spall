@@ -294,16 +294,18 @@ pub fn commit(
     // candidate's solid bounding box. If that box reaches an evicted brick, the
     // rebuild cannot see its geometry — refuse (the residency pass reloads it
     // and re-stages). Loading collider dependencies on demand is slice C.
+    //
+    // `ExtractError::Unresident` names one cell, but the bounding box may reach
+    // several evicted bricks; reporting them one per retry lets the residency
+    // pass re-evict an already-reloaded one before the set is ever whole. Ask
+    // for every evicted brick in the volume at once so a single reload makes the
+    // candidate's whole bounding box resident and the retry commits next tick.
     let occupancy = match OccupancyGrid::from_volume(&parent_candidate) {
         Ok(o) => o,
-        Err(spall_physics::ExtractError::Unresident(cell)) if !world.evicted(vid).is_empty() => {
+        Err(spall_physics::ExtractError::Unresident(_)) if !world.evicted(vid).is_empty() => {
             return Err(CommitError::EvictedGeometryRequired {
                 volume: vid,
-                bricks: vec![
-                    spall_core::GlobalCell::new(cell[0], cell[1], cell[2])
-                        .split()
-                        .0,
-                ],
+                bricks: world.evicted(vid).iter().map(|(c, _)| c).collect(),
             });
         }
         Err(e) => return Err(e.into()),
