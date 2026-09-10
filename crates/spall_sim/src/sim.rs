@@ -16,6 +16,7 @@ use spall_protocol::{ActionStatus, InputSeq, RequestId};
 
 use crate::commit::CommitError;
 use crate::contact_damage::{ContactDamagePlan, ContactDamagePolicy, ContactEvent};
+use crate::dormancy::{ActiveRegion, BodyDormancyInput, DormancyPlan, DormancyPolicy};
 use crate::intent::{EditIntent, EditTarget, IntentError};
 use crate::journal::JournalSink;
 use crate::player::transaction_world_box;
@@ -184,7 +185,16 @@ impl Simulation {
 
     /// Admits an edit intent for staging, or replays the stored status for a
     /// duplicate request id.
+    ///
+    /// An intent that targets a **dormant** body (T21) reactivates it first, so
+    /// the edit always stages and commits against a live body — "sleeping
+    /// bodies retain [...] future destructibility" (`docs/architecture.md`).
     pub fn submit(&mut self, intent: EditIntent) -> Result<ActionStatus, IntentError> {
+        if let EditTarget::Body(entity) = intent.target
+            && self.world.body_is_dormant(entity)
+        {
+            self.world.reactivate_body(entity);
+        }
         self.pipeline.submit_intent(intent, &self.world)
     }
 
@@ -294,6 +304,93 @@ impl Simulation {
         }
         out.plan = plan;
         out
+    }
+
+    /// Runs the T21 region-dormancy policy for the current tick and applies its
+    /// decisions: settled detached bodies with a quiet interaction region are
+    /// deactivated (dropped from the physics step, record kept), and dormant
+    /// bodies a player or an awake body has approached are reactivated.
+    ///
+    /// Opt-in, like [`Self::apply_contact_damage`]: the integrator owns the
+    /// [`DormancyPolicy`] and the cadence, and it is *not* run by [`Self::tick`].
+    /// Dormancy never changes authoritative geometry, ownership, or damage, so
+    /// [`SimWorld::world_hash`](crate::world::SimWorld::world_hash),
+    /// conservation, and the checkpoint set are unaffected. An edit that targets
+    /// a dormant body still wakes it immediately through [`Self::submit`],
+    /// independent of this pass.
+    pub fn apply_dormancy(&mut self, policy: &mut DormancyPolicy) -> DormancyPlan {
+        if self.world.body_count() == 0 {
+            return DormancyPlan::default();
+        }
+
+        // Active interaction regions: every player capsule, plus every body that
+        // is genuinely moving (an approaching / rolling piece — "active body
+        // trajectories", docs/architecture.md).
+        let still_speed = policy.config().still_speed_m_s;
+        let mut regions: Vec<ActiveRegion> = Vec::new();
+        for player in self.world.players() {
+            let (lo, hi) = player.capsule_aabb_m();
+            let centre = [
+                0.5 * (lo[0] + hi[0]),
+                0.5 * (lo[1] + hi[1]),
+                0.5 * (lo[2] + hi[2]),
+            ];
+            let radius = 0.5
+                * ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2))
+                    .sqrt();
+            regions.push(ActiveRegion {
+                centre_m: centre,
+                radius_m: radius,
+            });
+        }
+        for body in self.world.bodies() {
+            if body.dormant {
+                continue;
+            }
+            let speed = {
+                let v = body.linvel_m_s;
+                (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+            };
+            if speed > still_speed {
+                let (centre_m, radius_m) = body.world_bounding_sphere();
+                regions.push(ActiveRegion { centre_m, radius_m });
+            }
+        }
+
+        let inputs: Vec<BodyDormancyInput> = self
+            .world
+            .bodies()
+            .filter_map(|body| {
+                let entity = body.entity?;
+                let (centre_m, radius_m) = body.world_bounding_sphere();
+                let speed = {
+                    let v = body.linvel_m_s;
+                    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+                };
+                Some(BodyDormancyInput {
+                    entity,
+                    centre_m,
+                    radius_m,
+                    sleeping: body.sleeping,
+                    speed_m_s: speed,
+                    dormant: body.dormant,
+                    // A body-targeted edit wakes its target through `submit`
+                    // before it is ever staged, so by here no dormant body has a
+                    // pending edit against it. Terrain edits adjacent to a
+                    // dormant neighbour waking it is increment 3.
+                    hard_wake: false,
+                })
+            })
+            .collect();
+
+        let plan = policy.plan(self.tick.get(), &inputs, &regions);
+        for &entity in &plan.deactivate {
+            self.world.deactivate_body(entity);
+        }
+        for &entity in &plan.reactivate {
+            self.world.reactivate_body(entity);
+        }
+        plan
     }
 
     /// Advances the player capsules after the physics step, so the character

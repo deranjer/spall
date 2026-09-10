@@ -160,6 +160,7 @@ impl SimWorld {
             linvel_m_s: [0.0; 3],
             angvel_rad_s: [0.0; 3],
             sleeping: true,
+            dormant: false,
             collider_revision: 1,
             coarsen_k: plan.coarsen_k,
             phys,
@@ -223,11 +224,16 @@ impl SimWorld {
     }
 
     /// Advances physics one fixed step and refreshes every dynamic body's
-    /// extracted pose / velocity / sleep state from the solver.
+    /// extracted pose / velocity / sleep state from the solver. Dormant bodies
+    /// (T21) have no physics body and are skipped — their stored pose stays
+    /// authoritative until [`Self::reactivate_body`].
     pub fn step_physics(&mut self) {
         self.physics.step();
         let physics = &self.physics;
         for body in self.bodies.values_mut() {
+            if body.dormant {
+                continue;
+            }
             let st = physics.body_state(body.phys);
             body.pose = BodyPose::new(
                 DQuat::from_xyzw(
@@ -485,6 +491,7 @@ impl SimWorld {
             linvel_m_s,
             angvel_rad_s,
             sleeping: false,
+            dormant: false,
             collider_revision: 1,
             coarsen_k: plan.coarsen_k,
             phys,
@@ -530,6 +537,71 @@ impl SimWorld {
             self.physics.retire_body(body.phys);
         }
         self.volume_owner.remove(&volume.get());
+    }
+
+    // --- dormancy (T21) ---------------------------------------------------
+    //
+    // Deactivating a settled body drops its physics rigid body / collider to
+    // save step cost while keeping the authoritative `Body` record intact
+    // (volume, pose, damage, identity) — so `world_hash`, conservation, and the
+    // checkpoint set are all unchanged. It must be reactivated before any edit
+    // targeting it or any nearby interaction.
+
+    /// Number of bodies currently dormant.
+    pub fn dormant_body_count(&self) -> usize {
+        self.bodies.values().filter(|b| b.dormant).count()
+    }
+
+    /// Whether the detached body `entity` is dormant.
+    pub fn body_is_dormant(&self, entity: EntityId) -> bool {
+        self.bodies.get(&entity.get()).is_some_and(|b| b.dormant)
+    }
+
+    /// Deactivates a settled detached body: its physics rigid body and collider
+    /// are removed, its record is frozen (`sleeping = true`, zero velocity), and
+    /// its pose stays authoritative. Returns `false` for terrain, an unknown
+    /// body, or one already dormant.
+    pub fn deactivate_body(&mut self, entity: EntityId) -> bool {
+        let Some(body) = self.bodies.get_mut(&entity.get()) else {
+            return false;
+        };
+        if body.kind != BodyKind::Dynamic || body.dormant {
+            return false;
+        }
+        let phys = body.phys;
+        body.dormant = true;
+        body.sleeping = true;
+        body.linvel_m_s = [0.0; 3];
+        body.angvel_rad_s = [0.0; 3];
+        self.physics.deactivate_body(phys);
+        true
+    }
+
+    /// Restores a dormant body to the physics world at its stored pose (awake;
+    /// the solver re-sleeps it on the next quiet step). Returns `false` for an
+    /// unknown or non-dormant body, or if its volume could not be gridded.
+    pub fn reactivate_body(&mut self, entity: EntityId) -> bool {
+        let Some(body) = self.bodies.get(&entity.get()) else {
+            return false;
+        };
+        if !body.dormant {
+            return false;
+        }
+        let phys = body.phys;
+        let grid = match OccupancyGrid::from_volume(&body.volume) {
+            Ok(Some(grid)) => grid,
+            _ => return false,
+        };
+        let t = body.pose.translation_m;
+        let trans = [t[0] as f32, t[1] as f32, t[2] as f32];
+        let r = body.pose.rotation;
+        let rot = [r.x as f32, r.y as f32, r.z as f32, r.w as f32];
+        self.physics
+            .reactivate_body(phys, &grid, trans, rot, [0.0; 3], [0.0; 3]);
+        if let Some(body) = self.bodies.get_mut(&entity.get()) {
+            body.dormant = false;
+        }
+        true
     }
 
     // --- save recovery (T16) ------------------------------------------------
@@ -606,6 +678,7 @@ impl SimWorld {
             linvel_m_s: spec.linvel_m_s,
             angvel_rad_s: spec.angvel_rad_s,
             sleeping: spec.sleeping,
+            dormant: false,
             collider_revision: spec.collider_revision,
             coarsen_k: plan.coarsen_k,
             phys,

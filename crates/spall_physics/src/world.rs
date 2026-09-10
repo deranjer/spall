@@ -176,6 +176,12 @@ struct Entry {
     /// kept so other bodies' ids do not shift; every accessor for it is now a
     /// guarded no-op.
     retired: bool,
+    /// Set while the body is **dormant** (T21): a settled body whose whole
+    /// interaction region went quiet has had its Rapier rigid body and collider
+    /// removed to save step cost, but — unlike [`Self::retired`] — this is
+    /// reversible. [`PhysicsWorld::reactivate_body`] rebuilds it in this same
+    /// slot from the caller's grid and stored pose before any contact or edit.
+    dormant: bool,
 }
 
 /// The body-local offset that places a tight occupancy grid's cell `(0, 0, 0)`
@@ -271,8 +277,13 @@ impl PhysicsWorld {
         }
     }
 
-    /// Adds a body and returns its stable id.
-    pub fn add_body(&mut self, spec: BodySpec) -> BodyId {
+    /// Builds a Rapier rigid body + attached collider from `spec` and inserts
+    /// both, returning their handles and the grid-origin collider offset. Shared
+    /// by [`Self::add_body`] and [`Self::reactivate_body`].
+    fn insert_rapier_body(
+        &mut self,
+        spec: &BodySpec,
+    ) -> (RigidBodyHandle, ColliderHandle, [f32; 3]) {
         let rb = match spec.kind {
             BodyKind::Fixed => RigidBodyBuilder::fixed(),
             BodyKind::Dynamic { ccd } => RigidBodyBuilder::dynamic()
@@ -313,6 +324,12 @@ impl PhysicsWorld {
             rb.set_additional_mass_properties(rapier_mass_properties(props, offset), false);
             rb.recompute_mass_properties_from_colliders(&self.colliders);
         }
+        (body, collider, offset)
+    }
+
+    /// Adds a body and returns its stable id.
+    pub fn add_body(&mut self, spec: BodySpec) -> BodyId {
+        let (body, collider, offset) = self.insert_rapier_body(&spec);
 
         let id = BodyId(self.entries.len() as u32);
         self.entries.push(Entry {
@@ -324,6 +341,7 @@ impl PhysicsWorld {
             collider_offset_m: offset,
             mass_properties: spec.mass_properties,
             retired: false,
+            dormant: false,
         });
         id
     }
@@ -445,6 +463,87 @@ impl PhysicsWorld {
         self.entries[id.0 as usize].retired
     }
 
+    /// Deactivates a **dormant** body (T21): removes its Rapier rigid body and
+    /// collider so it costs nothing to step and cannot be contacted or swept,
+    /// but keeps its [`BodyId`] slot and every rebuild parameter
+    /// (`cell_m` / representation / density / mass properties) so
+    /// [`Self::reactivate_body`] can restore it. The caller owns the frozen
+    /// pose / velocity and passes them back on reactivation. Idempotent; a no-op
+    /// on a retired body.
+    pub fn deactivate_body(&mut self, id: BodyId) {
+        let entry = &mut self.entries[id.0 as usize];
+        if entry.retired || entry.dormant {
+            return;
+        }
+        entry.dormant = true;
+        let body = entry.body;
+        self.bodies.remove(
+            body,
+            &mut self.islands,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            true,
+        );
+        // See `retire_body`: drop the CCD fixed-target cache so it cannot keep a
+        // dangling handle to the collider just removed.
+        self.ccd_solver = CCDSolver::new();
+    }
+
+    /// Restores a body deactivated by [`Self::deactivate_body`] into its
+    /// original slot: rebuilds the Rapier rigid body + collider from `grid` and
+    /// the stored rebuild parameters, at `translation_m` / `rotation` (xyzw)
+    /// with `linvel_m_s` / `angvel_rad_s`. The body starts awake; the solver
+    /// re-sleeps it on the next quiet step. A no-op on a retired body or one
+    /// that is not dormant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reactivate_body(
+        &mut self,
+        id: BodyId,
+        grid: &OccupancyGrid,
+        translation_m: [f32; 3],
+        rotation: [f32; 4],
+        linvel_m_s: [f32; 3],
+        angvel_rad_s: [f32; 3],
+    ) {
+        let entry = &self.entries[id.0 as usize];
+        if entry.retired || !entry.dormant {
+            return;
+        }
+        let spec = BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: entry.representation,
+            grid: grid.clone(),
+            cell_m: entry.cell_m,
+            density_kg_m3: entry.density,
+            mass_properties: entry.mass_properties,
+            translation_m,
+            linvel_m_s,
+        };
+        let (body, collider, offset) = self.insert_rapier_body(&spec);
+        let entry = &mut self.entries[id.0 as usize];
+        entry.body = body;
+        entry.collider = collider;
+        entry.collider_offset_m = offset;
+        entry.dormant = false;
+        self.set_body_pose(id, translation_m, rotation);
+        self.set_body_velocity(id, linvel_m_s, angvel_rad_s);
+    }
+
+    /// Whether `id` is currently dormant (deactivated by [`Self::deactivate_body`]).
+    pub fn is_dormant(&self, id: BodyId) -> bool {
+        self.entries[id.0 as usize].dormant
+    }
+
+    /// Bodies that are neither retired nor dormant — the set the solver actually
+    /// steps.
+    pub fn active_body_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| !e.retired && !e.dormant)
+            .count()
+    }
+
     /// Removes just a body's attached collider, keeping the rigid body itself.
     /// Used when a *terrain* ownership's volume becomes empty (`ENG-56`): the
     /// fixed body stays so a later refill can rebuild a collider on it, but
@@ -549,12 +648,15 @@ impl PhysicsWorld {
         self.entries[id.0 as usize].representation
     }
 
-    /// Kinematic snapshot of a body. A retired body (its volume became empty)
-    /// has no Rapier body left; it reports an all-zero, non-sleeping state.
+    /// Kinematic snapshot of a body. A retired body (its volume became empty) or
+    /// a dormant one (T21, deactivated pending reactivation) has no Rapier body
+    /// left; it reports an all-zero, non-sleeping state and the caller is
+    /// expected to hold the authoritative pose itself.
     pub fn body_state(&self, id: BodyId) -> BodyState {
         let entry = &self.entries[id.0 as usize];
         debug_assert!(!entry.retired, "body_state on a retired body");
-        if entry.retired {
+        debug_assert!(!entry.dormant, "body_state on a dormant body");
+        if entry.retired || entry.dormant {
             return BodyState {
                 translation_m: [0.0; 3],
                 rotation: [0.0, 0.0, 0.0, 1.0],
@@ -1072,6 +1174,89 @@ mod tests {
             "contact point is under the body (~x/z 4.375 m), got {:?}",
             contact.point_m
         );
+    }
+
+    /// T21 dormancy: deactivating a settled body drops it out of the stepped
+    /// set, and reactivating it into the same slot restores its pose so it
+    /// resumes physics from where it was.
+    #[test]
+    fn a_dormant_body_leaves_the_step_set_and_reactivates_at_its_pose() {
+        use crate::fixtures as phys_fx;
+
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            disable_ccd: true,
+            ..PhysicsConfig::default()
+        });
+        let floor = phys_fx::floor_slab(VolumeId::new(1).unwrap(), 2, 2, 4);
+        let floor_grid = crate::occupancy::OccupancyGrid::from_volume(&floor)
+            .unwrap()
+            .unwrap();
+        world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: floor_grid,
+            cell_m: phys_fx::CELL_M,
+            density_kg_m3: phys_fx::STONE_DENSITY,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+        let piece = phys_fx::debris_pieces(50, 1, 3).pop().unwrap().1;
+        let grid = crate::occupancy::OccupancyGrid::from_volume(&piece)
+            .unwrap()
+            .unwrap();
+        let body = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::MergedCuboids,
+            grid: grid.clone(),
+            cell_m: phys_fx::CELL_M,
+            density_kg_m3: phys_fx::STONE_DENSITY,
+            mass_properties: None,
+            translation_m: [4.0, 2.0, 4.0],
+            linvel_m_s: [0.0; 3],
+        });
+
+        for _ in 0..400 {
+            world.step();
+        }
+        let settled = world.body_state(body);
+        assert!(settled.sleeping, "body settled to sleep");
+        assert_eq!(world.active_body_count(), 2);
+
+        world.deactivate_body(body);
+        assert!(world.is_dormant(body));
+        assert_eq!(world.active_body_count(), 1, "dormant body is not stepped");
+        // Stepping the world for a while does nothing to the dormant body.
+        for _ in 0..120 {
+            world.step();
+        }
+
+        world.reactivate_body(
+            body,
+            &grid,
+            settled.translation_m,
+            settled.rotation,
+            [0.0; 3],
+            [0.0; 3],
+        );
+        assert!(!world.is_dormant(body));
+        assert_eq!(world.active_body_count(), 2);
+        let back = world.body_state(body);
+        for axis in 0..3 {
+            assert!(
+                (back.translation_m[axis] - settled.translation_m[axis]).abs() < 1e-4,
+                "reactivated at the frozen pose (axis {axis}: {} vs {})",
+                back.translation_m[axis],
+                settled.translation_m[axis]
+            );
+        }
+        // It stays put on the floor after reactivation — no fall, no explosion.
+        for _ in 0..200 {
+            world.step();
+        }
+        let after = world.body_state(body);
+        assert!(after.is_finite() && after.speed_m_s() < 0.1);
+        assert!((after.translation_m[1] - settled.translation_m[1]).abs() < 0.05);
     }
 
     #[test]
