@@ -8,7 +8,8 @@ pub mod residency;
 
 pub use net::{
     BaselineScene, ClientNetConfig, ClientNetError, ClientResidencyLimits, ClientSummary,
-    MovementStep, ScriptTarget, ScriptedAction, cut_request, run_replication_client,
+    MovementStep, ReplicaReadyHook, ScriptTarget, ScriptedAction, cut_request,
+    run_replication_client,
 };
 pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};

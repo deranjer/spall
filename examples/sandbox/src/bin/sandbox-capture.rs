@@ -767,6 +767,361 @@ fn run_destruction(args: &Args) -> Result<DestructionSummary, RenderError> {
     })
 }
 
+// --- `--scene destruction-networked` (T11a / ENG-62 increment 3) ---------
+
+/// Mesh a **replicated** world (terrain + every known body, at its latest
+/// replicated pose) into a capture [`Scene`] — the [`destruction_scene`]
+/// sibling for a [`spall_client::ReplicaWorld`] instead of an authoritative
+/// [`Simulation`]. `camera` behaves the same way: `None` frames on the
+/// initial scene, `Some` reuses a fixed camera for later frames.
+fn destruction_scene_from_replica(
+    replica: &spall_client::ReplicaWorld,
+    strategy: MeshStrategy,
+    aspect: f32,
+    camera: Option<Camera>,
+) -> Scene {
+    let mut scene = Scene::new(camera.unwrap_or(Camera {
+        aspect,
+        fov_y: 55_f32.to_radians(),
+        ..Default::default()
+    }));
+
+    if let Some(terrain) = replica.terrain_volume() {
+        let vm = volume_mesh(terrain, strategy);
+        if !vm.mesh.vertices.is_empty() {
+            scene = scene.with_item(SceneItem::new("terrain", vm.mesh, Mat4::IDENTITY));
+        }
+    }
+
+    let render_tick = replica.now_tick() as f64;
+    for (i, (entity, volume_id)) in replica.body_volumes().enumerate() {
+        let Some(volume) = replica.volume(volume_id) else {
+            continue;
+        };
+        let vm = volume_mesh(volume, strategy);
+        if vm.mesh.vertices.is_empty() {
+            continue;
+        }
+        let model = match replica.interpolated_pose(entity, render_tick) {
+            Some(pose) => {
+                let [x, y, z, w] = pose.rotation.to_unit().unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                let t = pose.translation_m;
+                Mat4::from_rotation_translation(
+                    Quat::from_xyzw(x, y, z, w),
+                    Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32),
+                )
+            }
+            // No motion snapshot yet for this body (it detached this
+            // instant, before the 20 Hz batch caught up): draw it at its
+            // volume-local origin rather than skip it.
+            None => Mat4::IDENTITY,
+        };
+        scene = scene.with_item(SceneItem::new(format!("body_{i}"), vm.mesh, model));
+    }
+
+    scene.materials = spall_render::default_materials();
+    if camera.is_none() {
+        scene.frame_all(destruction_view_dir());
+    }
+    scene
+}
+
+/// T11a / ENG-62 increment 3: the same cut script and capture ticks as
+/// [`run_destruction`], but this time driven over **real QUIC**: a real
+/// `spall_server::serve` host, a real plain scripted client that performs
+/// every cut, and a real second "observer" client that never edits — only
+/// connects, replicates, and is the one this function meshes and renders.
+/// Proves the destruction capture path against genuinely network-replicated
+/// state (`spall_client::ReplicaWorld`), not the authoritative
+/// `spall_sim::Simulation` directly (contrast [`run_destruction`]). Server
+/// and both clients run as real Tokio-driven QUIC endpoints on background
+/// threads in this process — the same pattern `spall_server`'s own
+/// `replication_session` / `late_join_session` integration tests use, real
+/// wire serialization and transport over loopback, just not separate OS
+/// processes.
+fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderError> {
+    use spall_client::{
+        BaselineScene, ClientNetConfig, ReplicaWorld, ScriptTarget, ScriptedAction, cut_request,
+        run_replication_client,
+    };
+    use spall_net::{Fingerprint, JoinToken, TransportConfig};
+    use spall_server::{Scene as ServerScene, ServeConfig, serve};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let ctx = RenderContext::headless()?;
+    let strategy: MeshStrategy = args.strategy.into();
+    let aspect = capture_aspect(args.width, args.height);
+
+    let dir = std::env::temp_dir().join(format!(
+        "spall-capture-destruction-networked-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| RenderError::Gpu(format!("scratch dir {}: {e}", dir.display())))?;
+    let token = JoinToken::generate().expect("join token");
+    let fp_path = dir.join("server.fingerprint");
+    let addr_path = dir.join("server.addr");
+
+    let server_cfg = ServeConfig {
+        listen: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        scene: ServerScene::CrossBridgeCut,
+        join_token: token,
+        max_ticks: DESTRUCTION_TICKS,
+        quiescence_ticks: 0,
+        min_clients: 2,
+        max_clients: 2,
+        startup_timeout: Duration::from_secs(20),
+        // Real-time pacing, matching `spall_server`'s own networked
+        // integration tests: the scripted client's `at_tick` actions are
+        // timed off wall-clock, so the server must actually advance at
+        // 60 Hz for them to land near the intended tick.
+        paced: true,
+        log_json: dir.join("server.jsonl"),
+        summary_json: Some(dir.join("server.summary.json")),
+        fingerprint_out: Some(fp_path.clone()),
+        addr_out: Some(addr_path.clone()),
+        transport: TransportConfig::for_tests(),
+        save: None,
+        checkpoint_interval_ticks: 0,
+        seed: 0,
+        catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
+        max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        dev_unvalidated_actions: true,
+        save_faults: None,
+        await_body_settle: false,
+        motion_interest: None,
+        residency: None,
+    };
+    let server_thread = std::thread::spawn(move || serve(server_cfg));
+
+    let wait_for_file = |path: &PathBuf, deadline: Duration| -> Result<String, RenderError> {
+        let start = Instant::now();
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path)
+                && !s.trim().is_empty()
+            {
+                return Ok(s.trim().to_string());
+            }
+            if start.elapsed() >= deadline {
+                return Err(RenderError::Gpu(format!(
+                    "timed out waiting for {}",
+                    path.display()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let fp_hex = wait_for_file(&fp_path, Duration::from_secs(15))?;
+    let addr_str = wait_for_file(&addr_path, Duration::from_secs(15))?;
+    let fingerprint = Fingerprint::from_hex(&fp_hex)
+        .ok_or_else(|| RenderError::Gpu("invalid server fingerprint".into()))?;
+    let connect_addr = addr_str
+        .parse()
+        .map_err(|e| RenderError::Gpu(format!("invalid server addr {addr_str}: {e}")))?;
+
+    // The plain scripted client: performs every `DESTRUCTION_SCRIPT` cut
+    // against terrain, same as `run_destruction`'s authoritative loop, but
+    // as a real `ActionRequest` over the wire.
+    let cutter_cfg = ClientNetConfig {
+        connect_addr,
+        server_fingerprint: fingerprint,
+        join_token: token,
+        script: DESTRUCTION_SCRIPT
+            .iter()
+            .enumerate()
+            .map(|(i, &(at_tick, cell, radius))| ScriptedAction {
+                at_tick,
+                request: cut_request(i as u64 + 1, 0, cell, radius),
+                target: ScriptTarget::Terrain,
+            })
+            .collect(),
+        movement_script: Vec::new(),
+        late_join: false,
+        baseline_scene: BaselineScene::CrossBridgeCut,
+        run_ticks: DESTRUCTION_TICKS,
+        idle_grace: Duration::from_secs(5),
+        overall_timeout: Duration::from_secs(30),
+        log_json: dir.join("cutter.jsonl"),
+        summary_json: Some(dir.join("cutter.summary.json")),
+        transport: TransportConfig::for_tests(),
+        client_residency: None,
+        on_replica_ready: None,
+    };
+    let cutter_thread = std::thread::spawn(move || run_replication_client(cutter_cfg));
+
+    // The observer client: no script of its own, `on_replica_ready` hands
+    // this thread the live, network-replicated world the instant its
+    // baseline is installed, so the capture loop below can poll it on its
+    // own schedule — completely decoupled from the client's own
+    // receive/apply loop.
+    let replica_slot: Arc<Mutex<Option<Arc<Mutex<ReplicaWorld>>>>> = Arc::new(Mutex::new(None));
+    let replica_slot_hook = replica_slot.clone();
+    let observer_cfg = ClientNetConfig {
+        connect_addr,
+        server_fingerprint: fingerprint,
+        join_token: token,
+        script: Vec::new(),
+        movement_script: Vec::new(),
+        late_join: false,
+        baseline_scene: BaselineScene::CrossBridgeCut,
+        run_ticks: DESTRUCTION_TICKS,
+        idle_grace: Duration::from_secs(5),
+        overall_timeout: Duration::from_secs(30),
+        log_json: dir.join("observer.jsonl"),
+        summary_json: Some(dir.join("observer.summary.json")),
+        transport: TransportConfig::for_tests(),
+        client_residency: None,
+        on_replica_ready: Some(Arc::new(move |r| {
+            *replica_slot_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+        })),
+    };
+    let observer_thread = std::thread::spawn(move || run_replication_client(observer_cfg));
+
+    let replica = {
+        let start = Instant::now();
+        loop {
+            if let Some(r) = replica_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                break r;
+            }
+            if start.elapsed() >= Duration::from_secs(15) {
+                return Err(RenderError::Gpu(
+                    "observer client never reported its replica ready".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // Poll the live replica for each capture tick, in order. Reaching a tick
+    // is "the replica has observed at least this server tick" — real network
+    // delay means that can lag real wall-clock time, but never runs
+    // backwards, so waiting it out (bounded) is always correct, just not
+    // instant.
+    let opts = CaptureOptions {
+        width: args.width,
+        height: args.height,
+        views: vec![DebugView::Shaded],
+        ..Default::default()
+    };
+    let mut camera: Option<Camera> = None;
+    let (mut adapter, mut backend) = (String::new(), String::new());
+    let mut gpu_timing_available = false;
+    let mut frames = Vec::new();
+    let total_solid_cells_start = {
+        let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+        guard.total_solid_cells()
+    };
+
+    for &tick in &DESTRUCTION_CAPTURE_TICKS {
+        let start = Instant::now();
+        loop {
+            let reached = replica.lock().unwrap_or_else(|e| e.into_inner()).now_tick() >= tick;
+            if reached {
+                break;
+            }
+            if start.elapsed() >= Duration::from_secs(20) {
+                return Err(RenderError::Gpu(format!(
+                    "observer replica never reached tick {tick} (network run stalled)"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let scene = {
+            let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+            destruction_scene_from_replica(&guard, strategy, aspect, camera)
+        };
+        if camera.is_none() {
+            camera = Some(scene.camera);
+        }
+        let out_dir = args.out.join(format!("tick_{tick:03}"));
+        let cap_start = Instant::now();
+        let report_img = capture_scene(&ctx, &scene, &out_dir, &opts)?;
+        let cpu_capture_millis = cap_start.elapsed().as_secs_f64() * 1_000.0;
+        adapter = report_img.adapter.clone();
+        backend = report_img.backend.clone();
+        gpu_timing_available |= report_img.timing.gpu_render_millis.is_some();
+
+        let max_drop = {
+            let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+            let render_tick = guard.now_tick() as f64;
+            guard
+                .body_volumes()
+                .filter_map(|(e, _)| guard.interpolated_pose(e, render_tick))
+                .map(|p| -p.translation_m[1])
+                .fold(0.0_f64, f64::max)
+        };
+        let body_count = replica
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .body_volumes()
+            .count();
+        let passes = report_img.timing.gpu_passes;
+        frames.push(DestructionFrame {
+            tick,
+            transactions_committed_so_far: 0, // not tracked client-side; see final_world_hash
+            body_count,
+            detached_body_max_drop_m: max_drop,
+            items_drawn: report_img.items_drawn,
+            triangles_rasterised: report_img.triangles,
+            gpu_render_millis: report_img.timing.gpu_render_millis,
+            gpu_shadow_millis: passes.map(|p| p.shadow_millis),
+            gpu_opaque_millis: passes.map(|p| p.opaque_millis),
+            gpu_tone_map_millis: passes.map(|p| p.tone_map_millis),
+            cpu_capture_millis,
+            image: report_img
+                .images
+                .first()
+                .map(|i| i.path.display().to_string())
+                .unwrap_or_default(),
+        });
+    }
+
+    let (final_world_hash, total_solid_cells_end) = {
+        let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.world_hash().to_string(), guard.total_solid_cells())
+    };
+
+    let cutter = cutter_thread
+        .join()
+        .map_err(|_| RenderError::Gpu("cutter client thread panicked".into()))?
+        .map_err(|e| RenderError::Gpu(format!("cutter client failed: {e}")))?;
+    let transactions_committed = cutter.transactions_applied;
+    let server = server_thread
+        .join()
+        .map_err(|_| RenderError::Gpu("server thread panicked".into()))?
+        .map_err(|e| RenderError::Gpu(format!("server failed: {e}")))?;
+    let _ = observer_thread.join();
+
+    if server.final_world_hash != final_world_hash {
+        return Err(RenderError::Gpu(format!(
+            "observer replica hash {final_world_hash} != server hash {} — replication did not converge",
+            server.final_world_hash
+        )));
+    }
+
+    Ok(DestructionSummary {
+        version: 1,
+        scene: "destruction-networked",
+        adapter,
+        backend,
+        gpu_timing_available,
+        width: args.width,
+        height: args.height,
+        server_ticks: DESTRUCTION_TICKS,
+        transactions_committed,
+        final_world_hash,
+        total_solid_cells_start,
+        total_solid_cells_end,
+        frames,
+    })
+}
+
 // --- `--scene g2-collapse` (T15 / ENG-22 increment 5) ---------------------
 
 /// Server ticks a lit frame is captured at across the 200-tick collapse:
@@ -2593,6 +2948,9 @@ fn main() -> ExitCode {
     }
     if args.scene.as_deref() == Some("destruction") {
         return finish(&args.out, run_destruction(&args));
+    }
+    if args.scene.as_deref() == Some("destruction-networked") {
+        return finish(&args.out, run_destruction_networked(&args));
     }
     if args.scene.as_deref() == Some("g2-frames") {
         return finish(&args.out, run_g2_frames(&args));

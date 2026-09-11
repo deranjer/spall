@@ -377,12 +377,22 @@ and end-of-run contact penetration `<= body_settle_max_penetration_m` (it settle
 *on* the floor, not through it). CPU-side proof:
 `spall_sim` `body_rest_on_structure` integration test.
 
-Neither fixture yet covers the full 64 x 32 x 64 m / 60-second /
-10-requests-per-second workload or the 64-brick collapse stress case; those
-remain explicit follow-up evidence until procedural world generation and the
-oversized-split path are available. `cargo xtask capture --scene destruction`
-(below) renders the authoritative cut sequence offscreen through the T12
-pipeline with real GPU pass timings. Measured results: `docs/reports/G1.md`.
+Neither fixture yet covers the full 60-second / 10-requests-per-second
+sustained two-client workload or the 64-brick collapse stress case; those
+remain explicit follow-up evidence pending a sustained-request-rate driver
+(the oversized-split path itself is available — T17 / ENG-64). The full
+`64 x 32 x 64 m` envelope itself is built (ENG-62 / T11a increment 3):
+`spall_sim::fixtures::g1_full_envelope_setup` (`--scene g1-full-envelope`) is
+real, resident, walkable terrain across the whole footprint — not just
+isolated structures — plus a hollow tower/bridge spanning brick boundaries, an
+excavatable ramp, and a moving hollow test-volume body, standing up and
+stepping well inside the 60 Hz tick budget. `cargo xtask scenario --name
+g1-full-envelope` runs it networked (two real `--late-join` clients); `cargo
+xtask capture --scene destruction` (below) renders the authoritative cut
+sequence offscreen through the T12 pipeline with real GPU pass timings, and
+`--scene destruction-networked` renders the same sequence from a real
+network-replicated client instead of the authoritative sim. Measured results:
+`docs/reports/G1.md`.
 
 For overload tests, requests beyond admission capacity may return busy. The report must distinguish requested, rejected, queued, and committed counts. Rejecting every expensive action does not satisfy the gate: all named mandatory edits must complete.
 

@@ -105,6 +105,7 @@ fn column_cut_client(
         summary_json: Some(dir.join("client.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        on_replica_ready: None,
     }
 }
 

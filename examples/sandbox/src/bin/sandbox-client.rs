@@ -214,7 +214,7 @@ fn run_replication(args: Args) -> ExitCode {
         None if !args.moves.is_empty() => BaselineScene::default(),
         None => {
             eprintln!(
-                "sandbox-client: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, checkerboard-split, bulk-split, separated-regions, separated-regions-far, g4-workload, or walk)",
+                "sandbox-client: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, checkerboard-split, bulk-split, separated-regions, separated-regions-far, g4-workload, walk, or g1-full-envelope)",
                 args.scene
             );
             return ExitCode::from(2);
@@ -269,6 +269,7 @@ fn run_replication(args: Args) -> ExitCode {
                 interest_radius_bricks: args.residency_radius_bricks,
             },
         ),
+        on_replica_ready: None,
     };
     match run_replication_client(config) {
         Ok(summary) => {
