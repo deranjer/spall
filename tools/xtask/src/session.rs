@@ -257,6 +257,61 @@ struct Scenario {
     /// exercise (0 samples) is not asserted.
     #[serde(default)]
     latency_targets: Option<LatencyTargets>,
+    /// T23 / G3 row 11: when set, the named `late_join_clients` entry connects
+    /// through a shaped proxy (bandwidth + RTT + loss) instead of the plain
+    /// per-`loss_percent` one, and its measured compressed baseline size /
+    /// time-to-ready are asserted against the configured budget. Every other
+    /// client gets an unshaped (transparent) proxy so the workload that builds
+    /// the edit history is not itself bandwidth-limited.
+    #[serde(default)]
+    join_budget: Option<JoinBudget>,
+}
+
+/// T23 / G3 row 11 join-budget network profile + acceptance budget. Defaults
+/// are the `docs/validation.md` G3 numbers: "dependency-complete near-player
+/// baseline <=16 MiB compressed, ready within 30 seconds on an imposed
+/// 1 MiB/s transfer budget with 100 ms RTT and 2% packet loss".
+#[derive(Debug, Clone, Deserialize)]
+struct JoinBudget {
+    /// Which `late_join_clients` entry this budget is measured against.
+    #[serde(default)]
+    client: u64,
+    #[serde(default = "default_join_budget_bandwidth")]
+    bandwidth_bytes_per_sec: u64,
+    #[serde(default = "default_join_budget_rtt_ms")]
+    rtt_ms: u64,
+    #[serde(default = "default_join_budget_jitter_ms")]
+    jitter_ms: u64,
+    #[serde(default = "default_join_budget_loss_percent")]
+    loss_percent: u8,
+    #[serde(default = "default_join_budget_seed")]
+    seed: u64,
+    #[serde(default = "default_max_baseline_compressed_bytes")]
+    max_baseline_compressed_bytes: u64,
+    #[serde(default = "default_max_ready_ms")]
+    max_ready_ms: u64,
+}
+
+fn default_join_budget_bandwidth() -> u64 {
+    1024 * 1024 // 1 MiB/s
+}
+fn default_join_budget_rtt_ms() -> u64 {
+    100
+}
+fn default_join_budget_jitter_ms() -> u64 {
+    20
+}
+fn default_join_budget_loss_percent() -> u8 {
+    2
+}
+fn default_join_budget_seed() -> u64 {
+    0x5A11_0000_0000_0B11
+}
+fn default_max_baseline_compressed_bytes() -> u64 {
+    16 * 1024 * 1024 // 16 MiB
+}
+fn default_max_ready_ms() -> u64 {
+    30_000 // 30 s
 }
 
 /// G1 commit-latency p95 ceilings (milliseconds). Defaults are the
@@ -520,6 +575,14 @@ struct ClientSummary {
     client_residency_budget_miss_steps: u64,
     #[serde(default)]
     client_residency_evicted_transaction_gaps: u64,
+    #[serde(default)]
+    late_join_baseline_compressed_bytes: u64,
+    #[serde(default)]
+    late_join_baseline_install_ms: u64,
+    #[serde(default)]
+    late_join_ready_ms: u64,
+    #[serde(default)]
+    late_join_ready_confirmed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -578,6 +641,11 @@ struct SessionSummary {
     /// T11a / ENG-62: the gate's requested / rejected / queued / committed
     /// breakdown (server-authoritative) and the measured commit-latency p95s.
     admission: AdmissionRow,
+    /// T23 / G3 row 11: the configured join-budget network profile / ceilings
+    /// alongside the measured compressed baseline size and time-to-ready.
+    /// `configured: false` (all other fields zeroed) when no `join_budget`
+    /// scenario block is set.
+    join_budget: JoinBudgetRow,
     per_client: Vec<ClientRow>,
     note: &'static str,
 }
@@ -640,6 +708,90 @@ struct ClientRow {
     client_residency_budget_miss_steps: u64,
     client_residency_evicted_transaction_gaps: u64,
     hash_matches_server: bool,
+    late_join_baseline_compressed_bytes: u64,
+    late_join_baseline_install_ms: u64,
+    late_join_ready_ms: u64,
+    late_join_ready_confirmed: bool,
+}
+
+/// T23 / G3 row 11: measured join-budget evidence for the configured client,
+/// plus whether it met the configured budget. `None` fields mean the run
+/// produced no client summary to measure.
+#[derive(Debug, Serialize)]
+struct JoinBudgetRow {
+    configured: bool,
+    client: u64,
+    bandwidth_bytes_per_sec: u64,
+    rtt_ms: u64,
+    loss_percent: u8,
+    max_baseline_compressed_bytes: u64,
+    max_ready_ms: u64,
+    measured_baseline_compressed_bytes: u64,
+    measured_ready_ms: u64,
+    ready_confirmed: bool,
+    within_budget: bool,
+}
+
+impl JoinBudgetRow {
+    fn unconfigured() -> Self {
+        Self {
+            configured: false,
+            client: 0,
+            bandwidth_bytes_per_sec: 0,
+            rtt_ms: 0,
+            loss_percent: 0,
+            max_baseline_compressed_bytes: 0,
+            max_ready_ms: 0,
+            measured_baseline_compressed_bytes: 0,
+            measured_ready_ms: 0,
+            ready_confirmed: false,
+            within_budget: true,
+        }
+    }
+}
+
+/// T23 / G3 row 11: whether the configured `join_budget` client's measured
+/// compressed baseline size and time-to-ready both stayed within budget, and
+/// it actually converged (a hash mismatch or an unconfirmed "ready" signal is
+/// not a passing join no matter how small/fast the transfer was). `true` when
+/// no `join_budget` is configured.
+fn join_budget_requirements_met(scenario: &Scenario, clients: &[Option<ClientSummary>]) -> bool {
+    let Some(budget) = &scenario.join_budget else {
+        return true;
+    };
+    let Some(client) = clients.get(budget.client as usize).and_then(Option::as_ref) else {
+        return false;
+    };
+    client.result == "passed"
+        && client.late_join_ready_confirmed
+        && client.late_join_baseline_compressed_bytes > 0
+        && client.late_join_baseline_compressed_bytes <= budget.max_baseline_compressed_bytes
+        && client.late_join_ready_ms > 0
+        && client.late_join_ready_ms <= budget.max_ready_ms
+}
+
+/// The `JoinBudgetRow` reported in `summary.json` regardless of pass/fail —
+/// always the measured numbers, never estimates.
+fn join_budget_row(scenario: &Scenario, clients: &[Option<ClientSummary>]) -> JoinBudgetRow {
+    let Some(budget) = &scenario.join_budget else {
+        return JoinBudgetRow::unconfigured();
+    };
+    let client = clients.get(budget.client as usize).and_then(Option::as_ref);
+    JoinBudgetRow {
+        configured: true,
+        client: budget.client,
+        bandwidth_bytes_per_sec: budget.bandwidth_bytes_per_sec,
+        rtt_ms: budget.rtt_ms,
+        loss_percent: budget.loss_percent,
+        max_baseline_compressed_bytes: budget.max_baseline_compressed_bytes,
+        max_ready_ms: budget.max_ready_ms,
+        measured_baseline_compressed_bytes: client
+            .map(|c| c.late_join_baseline_compressed_bytes)
+            .unwrap_or(0),
+        measured_ready_ms: client.map(|c| c.late_join_ready_ms).unwrap_or(0),
+        ready_confirmed: client.is_some_and(|c| c.late_join_ready_confirmed),
+        within_budget: join_budget_requirements_met(scenario, clients),
+    }
 }
 
 fn residency_requirements_met(
@@ -743,6 +895,10 @@ mod requirement_tests {
             client_residency_reloads_completed: 0,
             client_residency_budget_miss_steps: 0,
             client_residency_evicted_transaction_gaps: 0,
+            late_join_baseline_compressed_bytes: 0,
+            late_join_baseline_install_ms: 0,
+            late_join_ready_ms: 0,
+            late_join_ready_confirmed: false,
         }
     }
 
@@ -999,6 +1155,92 @@ mod requirement_tests {
         server.structure_split_p95_ms = 9_999.0;
         assert!(latency_targets_met(&no_targets, &server));
     }
+
+    /// T23 / G3 row 11: `join_budget_requirements_met` / `join_budget_row` are
+    /// pure functions over already-measured `ClientSummary` fields — this pins
+    /// their pass/fail logic deterministically, with no network involved.
+    #[test]
+    fn join_budget_requirements_pass_only_within_the_configured_size_and_time_ceiling() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "late_join_clients": [1],
+                "join_budget": {
+                    "client": 1,
+                    "max_baseline_compressed_bytes": 1000,
+                    "max_ready_ms": 5000
+                }
+            }"#,
+        )
+        .unwrap();
+        let budget = scenario.join_budget.as_ref().unwrap();
+        assert_eq!(
+            budget.bandwidth_bytes_per_sec,
+            1024 * 1024,
+            "default 1 MiB/s"
+        );
+        assert_eq!(budget.rtt_ms, 100, "default 100 ms RTT");
+        assert_eq!(budget.loss_percent, 2, "default 2% loss");
+
+        // No summary at all for the configured client: fails closed.
+        assert!(!join_budget_requirements_met(&scenario, &[]));
+
+        let mut joiner = client(2);
+        joiner.late_join = true;
+        joiner.late_join_baseline_compressed_bytes = 900;
+        joiner.late_join_ready_ms = 4000;
+        joiner.late_join_ready_confirmed = true;
+        let clients = [Some(client(2)), Some(joiner.clone())];
+        assert!(
+            join_budget_requirements_met(&scenario, &clients),
+            "under both ceilings and confirmed ready should pass"
+        );
+        let row = join_budget_row(&scenario, &clients);
+        assert!(row.configured && row.within_budget);
+        assert_eq!(row.measured_baseline_compressed_bytes, 900);
+        assert_eq!(row.measured_ready_ms, 4000);
+
+        // Over the compressed-size ceiling: fails.
+        let mut too_big = joiner.clone();
+        too_big.late_join_baseline_compressed_bytes = 1001;
+        assert!(!join_budget_requirements_met(
+            &scenario,
+            &[Some(client(2)), Some(too_big)]
+        ));
+
+        // Over the time-to-ready ceiling: fails.
+        let mut too_slow = joiner.clone();
+        too_slow.late_join_ready_ms = 5001;
+        assert!(!join_budget_requirements_met(
+            &scenario,
+            &[Some(client(2)), Some(too_slow)]
+        ));
+
+        // A small, fast baseline that never actually confirmed "ready" (a
+        // motion-keyframe wait that timed out) does not count as a pass —
+        // small/fast is not the same as caught up and converged.
+        let mut unconfirmed = joiner.clone();
+        unconfirmed.late_join_ready_confirmed = false;
+        assert!(!join_budget_requirements_met(
+            &scenario,
+            &[Some(client(2)), Some(unconfirmed)]
+        ));
+
+        // A hash mismatch (`result != "passed"`) is never a passing join no
+        // matter how small/fast the transfer was — do not count a failed join
+        // as satisfying the budget.
+        let mut mismatched = joiner.clone();
+        mismatched.result = "failed".into();
+        assert!(!join_budget_requirements_met(
+            &scenario,
+            &[Some(client(2)), Some(mismatched)]
+        ));
+
+        // No `join_budget` configured: always passes (nothing to measure).
+        let unconfigured: Scenario = serde_json::from_str(r#"{ "server_ticks": 1 }"#).unwrap();
+        assert!(join_budget_requirements_met(&unconfigured, &[]));
+        assert!(!join_budget_row(&unconfigured, &[]).configured);
+    }
 }
 
 // --- the run -----------------------------------------------------------------
@@ -1132,8 +1374,26 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         .parse()
         .map_err(|_| XtaskError::Capability("server wrote an unparseable bound address".into()))?;
 
-    // Optional per-client encrypted-packet proxies.
-    let proxies = if run.loss_percent > 0 {
+    // Optional per-client encrypted-packet proxies. T23 / G3 row 11: a
+    // configured `join_budget` shapes only its named client (bandwidth + RTT +
+    // loss) — every other client gets a transparent proxy so the workload
+    // that builds the edit history is not itself bandwidth-limited. Otherwise
+    // every client shares the uniform `--loss-percent` profile (unchanged).
+    let proxies = if let Some(budget) = &scenario.join_budget {
+        let mut plans: Vec<PacketFaultPlan> = (0..clients)
+            .map(|i| PacketFaultPlan::transparent(run.seed ^ (i + 1)))
+            .collect();
+        let shaped = PacketFaultPlan {
+            delay: Duration::from_millis(budget.rtt_ms / 2),
+            jitter: Duration::from_millis(budget.jitter_ms),
+            loss_ratio: f64::from(budget.loss_percent) / 100.0,
+            ..PacketFaultPlan::shaped(budget.seed, budget.bandwidth_bytes_per_sec)
+        };
+        if let Some(slot) = plans.get_mut(budget.client as usize) {
+            *slot = shaped;
+        }
+        Some(ProxyFarm::spawn_with_plans(bound, plans)?)
+    } else if run.loss_percent > 0 {
         Some(ProxyFarm::spawn(
             bound,
             clients as usize,
@@ -1257,7 +1517,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             return finish(
                 &output,
                 SessionSummary {
-                    version: 2,
+                    version: 3,
                     result: "failed",
                     scenario: scenario.name.clone(),
                     clients,
@@ -1281,6 +1541,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     all_hashes_match: false,
                     requirements_met: false,
                     admission: AdmissionRow::empty(),
+                    join_budget: JoinBudgetRow::unconfigured(),
                     per_client: Vec::new(),
                     note: "server produced no summary; inspect server.jsonl",
                 },
@@ -1360,6 +1621,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     client_residency_evicted_transaction_gaps: c
                         .client_residency_evicted_transaction_gaps,
                     hash_matches_server: hash_ok,
+                    late_join_baseline_compressed_bytes: c.late_join_baseline_compressed_bytes,
+                    late_join_baseline_install_ms: c.late_join_baseline_install_ms,
+                    late_join_ready_ms: c.late_join_ready_ms,
+                    late_join_ready_confirmed: c.late_join_ready_confirmed,
                 });
             }
             None => {
@@ -1380,6 +1645,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     client_residency_budget_miss_steps: 0,
                     client_residency_evicted_transaction_gaps: 0,
                     hash_matches_server: false,
+                    late_join_baseline_compressed_bytes: 0,
+                    late_join_baseline_install_ms: 0,
+                    late_join_ready_ms: 0,
+                    late_join_ready_confirmed: false,
                 });
             }
         }
@@ -1388,9 +1657,16 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         &scenario,
         server.transactions_committed,
         &client_summaries,
-        run.loss_percent > 0,
+        run.loss_percent > 0 || scenario.join_budget.is_some(),
     );
     if !residency_requirements_met(&scenario, &server, &client_summaries) {
+        requirements_met = false;
+    }
+    // T23 / G3 row 11: the configured client's measured compressed baseline
+    // size and time-to-ready must both stay within budget, and it must have
+    // actually converged — small/fast is not a pass if the join itself failed.
+    let join_budget = join_budget_row(&scenario, &client_summaries);
+    if scenario.join_budget.is_some() && !join_budget.within_budget {
         requirements_met = false;
     }
     // Cross-brick ownership transfer: a detached body's cells must have been
@@ -1459,7 +1735,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     finish(
         &output,
         SessionSummary {
-            version: 2,
+            version: 3,
             result: if all_match { "passed" } else { "failed" },
             scenario: scenario.name,
             clients,
@@ -1492,6 +1768,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             all_hashes_match: all_match,
             requirements_met,
             admission,
+            join_budget,
             per_client: rows,
             note: "real OS processes over QUIC; encrypted-packet loss via per-client UDP proxy; gate requirements are fixture-defined: every scripted cut commits, each live client sees real body displacement, any body-targeted cut lands, and (when enabled) the committed topology-event stream replays from baseline to the same hash",
         },
@@ -1852,11 +2129,43 @@ struct ProxyFarm {
 }
 
 impl ProxyFarm {
+    /// The uniform `--loss-percent` profile: every client gets the same
+    /// loss/delay/jitter/reorder proxy.
     fn spawn(
         upstream: SocketAddr,
         count: usize,
         loss_percent: u8,
         seed: u64,
+    ) -> Result<Self, XtaskError> {
+        let plans = (0..count)
+            .map(|i| {
+                // Deterministic reordering: every 3rd server->client datagram
+                // is held past the 20 Hz (50 ms) snapshot spacing so the next
+                // one overtakes it — the "reordered snapshots" half of T11,
+                // which the harness asserts the live clients observed. Light
+                // `jitter` on top keeps timing irregular without the heavy lag
+                // that made a late scripted cut miss the run.
+                PacketFaultPlan {
+                    seed: seed ^ (i as u64 + 1),
+                    loss_ratio: f64::from(loss_percent) / 100.0,
+                    duplicate_ratio: 0.0,
+                    delay: Duration::from_millis(3),
+                    jitter: Duration::from_millis(15),
+                    reorder_period: 3,
+                    rate_limit_bytes_per_sec: 0,
+                }
+            })
+            .collect();
+        Self::spawn_with_plans(upstream, plans)
+    }
+
+    /// One proxy per entry of `plans`, each independently configured — used by
+    /// T23 / G3 row 11's join budget to shape only the late-join client's link
+    /// (bandwidth + RTT + loss) while every other client stays on a
+    /// transparent proxy.
+    fn spawn_with_plans(
+        upstream: SocketAddr,
+        plans: Vec<PacketFaultPlan>,
     ) -> Result<Self, XtaskError> {
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
@@ -1874,21 +2183,7 @@ impl ProxyFarm {
             rt.block_on(async move {
                 let mut proxies = Vec::new();
                 let mut addrs = Vec::new();
-                for i in 0..count {
-                    // Deterministic reordering: every 3rd server->client datagram
-                    // is held past the 20 Hz (50 ms) snapshot spacing so the
-                    // next one overtakes it — the "reordered snapshots" half of
-                    // T11, which the harness asserts the live clients observed.
-                    // Light `jitter` on top keeps timing irregular without the
-                    // heavy lag that made a late scripted cut miss the run.
-                    let plan = PacketFaultPlan {
-                        seed: seed ^ (i as u64 + 1),
-                        loss_ratio: f64::from(loss_percent) / 100.0,
-                        duplicate_ratio: 0.0,
-                        delay: Duration::from_millis(3),
-                        jitter: Duration::from_millis(15),
-                        reorder_period: 3,
-                    };
+                for plan in plans {
                     match UdpProxy::spawn(upstream, plan).await {
                         Ok(p) => {
                             addrs.push(p.local_addr());

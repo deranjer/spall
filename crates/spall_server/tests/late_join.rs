@@ -41,7 +41,7 @@ fn assemble(parts: &[spall_protocol::BaselinePart]) -> BaselineWorld {
     for p in parts {
         bytes.extend_from_slice(&p.payload);
     }
-    BaselineWorld::decode(&bytes).expect("assembled baseline decodes")
+    BaselineWorld::decode_compressed(&bytes).expect("assembled baseline decompresses/decodes")
 }
 
 #[test]
