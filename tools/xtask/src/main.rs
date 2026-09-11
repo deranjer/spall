@@ -457,6 +457,10 @@ fn capture(args: CaptureArgs) -> Result<(), XtaskError> {
 }
 
 fn sandbox_binary(name: &str) -> PathBuf {
+    sandbox_binary_profile(name, "debug")
+}
+
+pub(crate) fn sandbox_binary_profile(name: &str, profile: &str) -> PathBuf {
     let executable = if cfg!(windows) {
         format!("{name}.exe")
     } else {
@@ -468,7 +472,7 @@ fn sandbox_binary(name: &str) -> PathBuf {
     // Cargo runs from workspace_root(), so relative overrides use that same
     // base even when this executable was launched from another directory.
     let target = workspace_root().join(target);
-    target.join("debug").join(executable)
+    target.join(profile).join(executable)
 }
 
 fn unique_output() -> PathBuf {

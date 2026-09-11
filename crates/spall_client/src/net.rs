@@ -204,6 +204,9 @@ impl BaselineScene {
             Self::CheckerboardSplit => spall_voxel::fixtures::checkerboard_split_scene(id),
             Self::BulkSplit => spall_voxel::fixtures::bulk_split_scene(id),
             Self::SeparatedRegions => spall_voxel::fixtures::separated_regions_scene(id),
+            Self::SeparatedRegionsFar => {
+                spall_voxel::fixtures::separated_regions_full_envelope_scene(id)
+            }
             Self::Walk => spall_voxel::fixtures::walk_arena(id),
         }
     }

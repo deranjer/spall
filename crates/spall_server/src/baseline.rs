@@ -22,6 +22,7 @@ use spall_protocol::{
 };
 use spall_sim::{Body, BrickBacking, Simulation};
 use spall_voxel::{BrickSnapshot, EvictedBricks};
+use std::sync::Arc;
 
 /// World/content schema versions stamped into a `BaselineBegin`. These mirror
 /// the T10 bridge session's fixed values; real negotiation is a later task.
@@ -33,16 +34,62 @@ pub const BASELINE_CONTENT_VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 pub struct BaselineTransfer {
     pub begin: BaselineBegin,
-    pub parts: Vec<BaselinePart>,
+    pub parts: Arc<[BaselinePart]>,
     pub end: BaselineEnd,
     /// The decoded payload, retained for server-side assertions / metrics.
-    pub world: BaselineWorld,
+    pub world: Arc<BaselineWorld>,
+}
+
+/// Immutable, copy-on-write geometry handed from the authoritative tick to a
+/// background baseline encoder. It deliberately contains no runtime physics or
+/// ECS handles.
+#[derive(Debug, Clone)]
+pub struct BaselineSnapshot {
+    pub checkpoint_tick: u64,
+    pub journal_cursor: JournalSeq,
+    volumes: Vec<BaselineSnapshotVolume>,
+}
+
+#[derive(Debug, Clone)]
+struct BaselineSnapshotVolume {
+    volume_id: spall_core::VolumeId,
+    cell_size_code: u8,
+    owner: BaselineOwner,
+    bounds: Option<[[i64; 3]; 2]>,
+    bricks: Vec<(BrickCoord, BrickSnapshot)>,
 }
 
 impl BaselineTransfer {
     /// Total bulk payload bytes (excludes the small control markers).
     pub fn payload_bytes(&self) -> usize {
         self.parts.iter().map(|p| p.payload.len()).sum()
+    }
+
+    /// Reissues immutable baseline geometry under a fresh transfer id. The
+    /// snapshot's cursor remains its honest capture cursor; the receiver drains
+    /// all later topology records before it is promoted to live replication.
+    /// This prevents a burst of simultaneous joiners from repeatedly blocking
+    /// the authoritative tick thread serializing identical topology.
+    pub fn reissue(&self, transfer_id: TransferId) -> Self {
+        let mut begin = self.begin.clone();
+        begin.transfer_id = transfer_id;
+        let mut end = self.end;
+        end.transfer_id = transfer_id;
+        let parts = self
+            .parts
+            .iter()
+            .cloned()
+            .map(|mut part| {
+                part.transfer_id = transfer_id;
+                part
+            })
+            .collect();
+        Self {
+            begin,
+            parts,
+            end,
+            world: Arc::clone(&self.world),
+        }
     }
 }
 
@@ -63,6 +110,82 @@ pub enum BaselineError {
 /// backing — valid only while nothing is evicted.
 pub fn world_baseline(sim: &Simulation) -> BaselineWorld {
     logical_world_baseline(sim, None)
+}
+
+/// Captures a stable, cheap copy-on-write view at a tick boundary. Expanding
+/// snapshots into protocol cell vectors and compressing them is intentionally
+/// deferred to [`transfer_from_snapshot`], which may run on a worker.
+pub fn snapshot_world(sim: &Simulation) -> BaselineSnapshot {
+    let world = sim.world();
+    let mut volumes = Vec::with_capacity(world.body_count() + 1);
+    let mut push = |body: &Body, owner| {
+        let volume = &body.volume;
+        let mut bricks = spall_voxel::logical_bricks(volume, world.evicted(volume.id()))
+            .expect("baseline snapshot logical invariant")
+            .into_iter()
+            .map(|logical| {
+                let coord = logical.coord;
+                let snapshot = volume
+                    .snapshot_brick(coord)
+                    .expect("baseline snapshot bounds")
+                    .expect("background snapshots require resident geometry");
+                (coord, snapshot)
+            })
+            .collect::<Vec<_>>();
+        bricks.sort_by_key(|(coord, _)| (coord.z, coord.y, coord.x));
+        volumes.push(BaselineSnapshotVolume {
+            volume_id: volume.id(),
+            cell_size_code: volume.cell_size().to_u8(),
+            owner,
+            bounds: volume
+                .bounds()
+                .map(|b| [[b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z]]),
+            bricks,
+        });
+    };
+    push(world.terrain(), BaselineOwner::Terrain);
+    for body in world.bodies() {
+        push(body, BaselineOwner::Body(body.entity.expect("body entity")));
+    }
+    volumes.sort_by_key(|volume| volume.volume_id.get());
+    BaselineSnapshot {
+        checkpoint_tick: sim.current_tick().get(),
+        journal_cursor: JournalSeq(sim.journal_cursor()),
+        volumes,
+    }
+}
+
+/// Expands an immutable tick-boundary snapshot and packages it for one client.
+pub fn transfer_from_snapshot(
+    snapshot: BaselineSnapshot,
+    transfer_id: TransferId,
+    interest_epoch: InterestEpoch,
+) -> Result<BaselineTransfer, BaselineError> {
+    let world = BaselineWorld {
+        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        checkpoint_tick: snapshot.checkpoint_tick,
+        volumes: snapshot
+            .volumes
+            .into_iter()
+            .map(|volume| BaselineVolume {
+                volume_id: volume.volume_id,
+                cell_size_code: volume.cell_size_code,
+                owner: volume.owner,
+                bounds: volume.bounds,
+                bricks: volume
+                    .bricks
+                    .into_iter()
+                    .map(|(coord, snap)| BaselineBrick {
+                        coord: [coord.x, coord.y, coord.z],
+                        revision: snap.revision().get(),
+                        edited: snap.is_edited(),
+                        cells: cells_of(&snap),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    transfer_from_world(world, transfer_id, interest_epoch, snapshot.journal_cursor)
 }
 
 /// [`world_baseline`] over the **logical** brick set: every resident brick plus,
@@ -144,10 +267,10 @@ pub fn transfer_from_world(
     // bigger world still needs region splitting (T18) regardless of how well
     // it compresses.
     let raw = world.encode();
-    if raw.len() > limits::MAX_ASSEMBLED_TRANSFER {
+    if raw.len() > limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED {
         return Err(BaselineError::TooLarge {
             bytes: raw.len(),
-            cap: limits::MAX_ASSEMBLED_TRANSFER,
+            cap: limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED,
         });
     }
     let assembled_hash = Hash32::of(&raw);
@@ -157,7 +280,7 @@ pub fn transfer_from_world(
     // `decode_compressed`.
     let payload = world.encode_compressed();
 
-    let parts = chunk_payload(&payload, transfer_id);
+    let parts: Arc<[BaselinePart]> = chunk_payload(&payload, transfer_id).into();
     if parts.len() > limits::MAX_BASELINE_PARTS {
         return Err(BaselineError::TooManyParts {
             parts: parts.len(),
@@ -189,7 +312,7 @@ pub fn transfer_from_world(
         begin,
         parts,
         end,
-        world,
+        world: Arc::new(world),
     })
 }
 
@@ -437,9 +560,22 @@ mod tests {
 
         // Reassembly reproduces the captured world exactly.
         let rebuilt = assemble(&transfer.parts).unwrap();
-        assert_eq!(rebuilt, transfer.world);
+        assert_eq!(rebuilt, *transfer.world);
         assert_eq!(rebuilt.volumes.len(), sim.world().body_count() + 1);
         assert_eq!(Hash32::of(&rebuilt.encode()), transfer.end.assembled_hash);
+    }
+
+    #[test]
+    fn immutable_snapshot_encodes_the_same_baseline_as_the_live_tick() {
+        let sim = spall_sim::Simulation::new(spall_sim::SimulationConfig::new(
+            spall_sim::fixtures::bridged_terrain_setup(),
+        ))
+        .unwrap();
+        let live = capture_transfer(&sim, TransferId(11), InterestEpoch(1), JournalSeq(0)).unwrap();
+        let detached =
+            transfer_from_snapshot(snapshot_world(&sim), TransferId(12), InterestEpoch(1)).unwrap();
+        assert_eq!(*live.world, *detached.world);
+        assert_eq!(live.begin.journal_cursor, detached.begin.journal_cursor);
     }
 
     /// T23 / G3 row 11: the wire payload a late-join transfer actually ships
