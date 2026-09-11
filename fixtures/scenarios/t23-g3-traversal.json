@@ -12,12 +12,22 @@
   "residency_radius_bricks": 1,
   "client_residency_budget_bricks": 4,
   "client_residency_radius_bricks": 1,
+  "residency_assertions": {
+    "client": 0,
+    "min_server_evictions": 1,
+    "min_server_reloads": 1,
+    "min_client_evictions": 1,
+    "min_client_reloads_completed": 1,
+    "min_evicted_transaction_gaps": 1,
+    "min_outbound_distance_m": 20.0,
+    "max_return_distance_m": 12.0
+  },
   "player_paths": [
     {
       "client": 0,
       "legs": [
         { "from": 20, "to": 340, "movement": [0.0, 0.0, 1.0] },
-        { "from": 360, "to": 480, "movement": [0.0, 0.0, -1.0] }
+        { "from": 360, "to": 540, "movement": [0.0, 0.0, -1.0] }
       ]
     }
   ],

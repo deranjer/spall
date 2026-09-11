@@ -298,9 +298,10 @@ impl SimWorld {
         let Some(backing) = self.backing.clone() else {
             return Ok(false);
         };
-        // The retained digest's exact (revision, content_hash) is checked by
-        // `clear_evicted_after_reload` -> `verify_reload` below, so a wrong
-        // backing record is rejected without dropping the digest.
+        // Validate the candidate before publication. A wrong backing record
+        // must leave the brick nonresident and the retained digest intact;
+        // otherwise the logical view contains the same key twice and later
+        // hash/conservation queries fail.
         let brick = match backing.load(volume, coord) {
             crate::backing::BackingBrick::Loaded(brick) => brick,
             crate::backing::BackingBrick::KnownEmpty { revision, edited } => {
@@ -312,11 +313,12 @@ impl SimWorld {
             }
             crate::backing::BackingBrick::Unavailable => return Ok(false),
         };
+        self.evicted(volume).verify_candidate(coord, &brick)?;
         self.volume_body_mut(volume)
             .ok_or(spall_voxel::DigestError::NoRetained(coord))?
             .volume
             .insert_brick(coord, brick)?;
-        self.clear_evicted_after_reload(volume, coord)?;
+        self.evicted_mut(volume).clear(coord)?;
         Ok(true)
     }
 

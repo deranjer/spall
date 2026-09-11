@@ -150,6 +150,11 @@ impl ClientResidency {
 /// (`EvictedBricks::drop_resident`), which stops the requests for good.
 const RELOAD_COOLDOWN_STEPS: u32 = 24;
 
+/// Global request ceiling for one mover iteration. Per-brick cooldown alone is
+/// insufficient: entering a wide interest box could otherwise enqueue every
+/// missing brick in one burst and starve prediction/control traffic.
+pub const MAX_RELOAD_REQUESTS_PER_STEP: usize = 4;
+
 /// Consecutive steps a resident terrain brick must be out of the retain box
 /// before the pass evicts it. The hysteresis keeps the pass from dropping and
 /// re-pulling a brick as the player's predicted position jitters across a
@@ -172,8 +177,11 @@ pub struct ClientResidencyPass {
     /// Consecutive steps each resident, out-of-box brick has waited.
     out_of_box: BTreeMap<BrickCoord, u32>,
     reload_cooldown: BTreeMap<BrickCoord, u32>,
+    pending_reloads: BTreeSet<BrickCoord>,
     evictions_total: u64,
     reloads_requested_total: u64,
+    reloads_completed_total: u64,
+    budget_miss_steps_total: u64,
 }
 
 impl ClientResidencyPass {
@@ -186,8 +194,11 @@ impl ClientResidencyPass {
             budget_bricks,
             out_of_box: BTreeMap::new(),
             reload_cooldown: BTreeMap::new(),
+            pending_reloads: BTreeSet::new(),
             evictions_total: 0,
             reloads_requested_total: 0,
+            reloads_completed_total: 0,
+            budget_miss_steps_total: 0,
         }
     }
 
@@ -197,6 +208,14 @@ impl ClientResidencyPass {
 
     pub fn reloads_requested_total(&self) -> u64 {
         self.reloads_requested_total
+    }
+
+    pub fn reloads_completed_total(&self) -> u64 {
+        self.reloads_completed_total
+    }
+
+    pub fn budget_miss_steps_total(&self) -> u64 {
+        self.budget_miss_steps_total
     }
 
     /// Whether the run has held more resident terrain than `budget_bricks`
@@ -242,6 +261,20 @@ impl ClientResidencyPass {
         .0;
         let keep = self.box_around(center);
 
+        // A repair completes when the patch atomically reinstalls the brick and
+        // drops its retained digest. Count completions, not merely requests.
+        let completed: Vec<_> = self
+            .pending_reloads
+            .iter()
+            .copied()
+            .filter(|coord| !replica.evicted(terrain).contains(*coord))
+            .collect();
+        for coord in completed {
+            self.pending_reloads.remove(&coord);
+            self.reload_cooldown.remove(&coord);
+            self.reloads_completed_total += 1;
+        }
+
         // Reload requests: retained-digest bricks back inside the box.
         self.reload_cooldown.retain(|_, wait| {
             *wait = wait.saturating_sub(1);
@@ -254,8 +287,12 @@ impl ClientResidencyPass {
             .map(|(c, d)| (c, d.revision))
             .collect();
         for (coord, revision) in evicted_now {
+            if out.len() >= MAX_RELOAD_REQUESTS_PER_STEP {
+                break;
+            }
             if keep.contains(&coord) && !self.reload_cooldown.contains_key(&coord) {
                 self.reload_cooldown.insert(coord, RELOAD_COOLDOWN_STEPS);
+                self.pending_reloads.insert(coord);
                 self.reloads_requested_total += 1;
                 out.push(RepairRequest {
                     key: RepairKey::Brick {
@@ -289,6 +326,9 @@ impl ClientResidencyPass {
                 self.evictions_total += 1;
                 self.out_of_box.remove(&coord);
             }
+        }
+        if self.over_budget(replica) {
+            self.budget_miss_steps_total += 1;
         }
         out
     }

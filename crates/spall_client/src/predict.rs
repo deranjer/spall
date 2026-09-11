@@ -118,6 +118,7 @@ pub struct PredictedPlayer {
     acked: InputSeq,
     history: VecDeque<Record>,
     start_pos_m: [f64; 3],
+    max_distance_from_start_m: f64,
 
     // --- metrics -------------------------------------------------------------
     /// Snapshots whose predicted-at-ack state differed from authoritative.
@@ -141,6 +142,7 @@ impl PredictedPlayer {
             acked: InputSeq(0),
             history: VecDeque::new(),
             start_pos_m: spawn.position_m,
+            max_distance_from_start_m: 0.0,
             corrections: 0,
             max_correction_m: 0.0,
             total_ticks: 0,
@@ -182,6 +184,9 @@ impl PredictedPlayer {
         if self.predicted.grounded {
             self.grounded_ticks += 1;
         }
+        self.max_distance_from_start_m = self
+            .max_distance_from_start_m
+            .max(self.distance_travelled_m());
         self.predicted
     }
 
@@ -258,6 +263,7 @@ impl PredictedPlayer {
         PlayerMovementSummary {
             ticks: self.total_ticks,
             distance_travelled_m: self.distance_travelled_m(),
+            max_distance_from_start_m: self.max_distance_from_start_m,
             final_prediction_error_m: self.prediction_error_m(),
             corrections: self.corrections,
             max_correction_m: self.max_correction_m,
@@ -275,6 +281,9 @@ impl PredictedPlayer {
 pub struct PlayerMovementSummary {
     pub ticks: u64,
     pub distance_travelled_m: f64,
+    /// Farthest horizontal displacement reached at any predicted tick. Paired
+    /// with the final displacement to prove an outbound-and-return traversal.
+    pub max_distance_from_start_m: f64,
     pub final_prediction_error_m: f64,
     pub corrections: u64,
     pub max_correction_m: f64,

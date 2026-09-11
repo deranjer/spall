@@ -649,6 +649,17 @@ impl ReplicaWorld {
         self.volume_hash(self.terrain_id)
     }
 
+    /// Canonical hash of the terrain bricks that are resident *right now*.
+    /// Unlike [`Self::terrain_hash`], this intentionally changes on cache
+    /// eviction/reload and is used only to invalidate derived client collision.
+    pub fn terrain_resident_hash(&self) -> Option<Hash32> {
+        let volume = self.volume(self.terrain_id)?;
+        let owner = *self.owner.get(&self.terrain_id.get())?;
+        Some(canonical_topology_hash(&[canonical_resident_volume(
+            volume, owner,
+        )]))
+    }
+
     /// Whether a transaction id has already been applied.
     pub fn has_applied(&self, transaction: TransactionId) -> bool {
         self.applied_tx.contains(&transaction.get())
@@ -1342,6 +1353,33 @@ fn canonical_logical_volume(
             layers: vec![CanonicalLayer {
                 kind: MATERIAL_LAYER_KIND,
                 bytes: BrickHash::to_bytes(b.content_hash).to_vec(),
+            }],
+        })
+        .collect();
+    CanonicalVolume {
+        volume_id: v.id(),
+        cell_size: v.cell_size(),
+        owner,
+        bricks,
+    }
+}
+
+fn canonical_resident_volume(v: &Volume, owner: CanonicalOwner) -> CanonicalVolume {
+    let bricks = v
+        .resident_brick_coords()
+        .into_iter()
+        .filter_map(|coord| {
+            v.snapshot_brick(coord)
+                .ok()
+                .flatten()
+                .map(|snap| (coord, snap))
+        })
+        .map(|(coord, snap)| CanonicalBrick {
+            coord,
+            revision: snap.revision(),
+            layers: vec![CanonicalLayer {
+                kind: MATERIAL_LAYER_KIND,
+                bytes: BrickHash::to_bytes(snap.content_hash()).to_vec(),
             }],
         })
         .collect();

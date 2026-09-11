@@ -114,6 +114,7 @@ fn evicting_a_replica_brick_does_not_move_its_world_hash() {
     let mut replica = fresh_replica();
     let terrain = replica.terrain_volume_id();
     let before = replica.world_hash();
+    let resident_before = replica.terrain_resident_hash();
 
     for c in east_bricks(&replica) {
         assert!(replica.evict_brick(terrain, c));
@@ -122,5 +123,10 @@ fn evicting_a_replica_brick_does_not_move_its_world_hash() {
         replica.world_hash(),
         before,
         "replica world_hash moved when a clean brick was evicted"
+    );
+    assert_ne!(
+        replica.terrain_resident_hash(),
+        resident_before,
+        "the collision-facing resident hash did not invalidate after eviction"
     );
 }
