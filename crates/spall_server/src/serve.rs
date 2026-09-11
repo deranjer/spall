@@ -956,6 +956,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut actions_requested = 0u64;
         let mut actions_staged = 0u64;
         let mut submitted_at: HashMap<RequestId, std::time::Instant> = HashMap::new();
+        // The session that staged each still-pending request, so the tick-report
+        // outcome (`action_statuses`) can be routed back to only that client
+        // instead of every connected client.
+        let mut submitted_by: HashMap<RequestId, SessionId> = HashMap::new();
         let mut commit_latency = CommitLatency::default();
 
         let mut idle_streak = 0u64;
@@ -1076,6 +1080,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                     submitted_at
                                         .entry(req.request_id)
                                         .or_insert_with(std::time::Instant::now);
+                                    submitted_by.entry(req.request_id).or_insert(session);
                                     actions_staged += 1;
                                     send_to(
                                         &clients_for_sim,
@@ -1208,7 +1213,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
                     rejected_total += 1;
                 }
-                broadcast(&clients_for_sim, Outbound::Status(Arc::new(status)));
+                // A tick-resolved outcome (commit or deterministic staging
+                // rejection) belongs to whichever session staged it — route it
+                // there only. `submitted_by` is best-effort bookkeeping (cleared
+                // here on first resolution); an untracked request (there
+                // shouldn't be one) falls back to the old broadcast so a status
+                // is never silently dropped.
+                match submitted_by.remove(&status.request_id) {
+                    Some(session) => send_to(
+                        &clients_for_sim,
+                        session,
+                        Outbound::Status(Arc::new(status)),
+                    ),
+                    None => broadcast(&clients_for_sim, Outbound::Status(Arc::new(status))),
+                }
             }
             // The 20 Hz motion batch: send it to replicas *and* keep the full
             // batch for the durable pose journal below (durability is never
