@@ -13,6 +13,7 @@ use spall_physics::PhysicsConfig;
 use spall_structure::AnchorPlane;
 use spall_voxel::{EditPlan, Volume};
 
+use crate::body::BodyPose;
 use crate::world::WorldSetup;
 
 /// Fixture stone: id 1, 2600 kg/m³.
@@ -444,6 +445,241 @@ pub fn mixed_material_split_body() -> impl FnOnce(VolumeId) -> Volume {
         ))
         .unwrap();
         v
+    }
+}
+
+/// Feet spawn positions (metres) for the T23 / G4 eight-client workload
+/// ([`g4_workload_setup`]): two four-player clusters sharing the west/east
+/// regions' floors from [`separated_regions_setup`]. Each cluster is
+/// **clustered** (its four players within ~1.4 m of each other, exercising
+/// dense interest-management overlap); the two clusters are **separated** by
+/// the region offset (`>=18 m`, the same floor `SEPARATED_REGION_SPAWNS`
+/// uses). Full-envelope (`>100 m`) player separation is a distinct open item
+/// (G3.md row 2) this increment does not depend on.
+pub const G4_WORKLOAD_SPAWNS: [[f64; 3]; 8] = [
+    // West cluster.
+    [1.0, 1.0, 1.0],
+    [2.0, 1.0, 1.0],
+    [1.0, 1.0, 2.0],
+    [2.0, 1.0, 2.0],
+    // East cluster (region offset applied: +18 m on x and z).
+    [19.0, 1.0, 19.0],
+    [20.0, 1.0, 19.0],
+    [19.0, 1.0, 20.0],
+    [20.0, 1.0, 20.0],
+];
+
+/// The T23 / G4 eight-client workload world (row 12): identical terrain to
+/// [`separated_regions_setup`] — two independent collapsible bridge structures
+/// in one bounded `256 x 128 x 256 m` world. The workload's body population
+/// ([`spawn_g4_workload_bodies`]) is added separately after the [`Simulation`]
+/// is constructed: bodies are independent volumes placed by world-space
+/// transform, not terrain cells, so they need no additional terrain
+/// residency — the terrain footprint stays exactly the `separated-regions`
+/// scene.
+///
+/// [`Simulation`]: crate::Simulation
+pub fn g4_workload_setup() -> WorldSetup {
+    separated_regions_setup()
+}
+
+/// Fixture debris density (kg/m³) for every [`spawn_g4_workload_bodies`] body —
+/// the same stone density as the rest of this module's fixtures.
+const G4_BODY_DENSITY_KG_M3: f32 = 2600.0;
+
+/// Total **active** (awake) debris bodies required by the G4 workload, row 12:
+/// "256 active bodies (64 near one observer)".
+pub const G4_ACTIVE_BODY_COUNT: usize = 256;
+/// Of the active bodies, how many sit within [`G4_NEAR_OBSERVER_RADIUS_M`] of
+/// the observer position.
+pub const G4_NEAR_OBSERVER_BODY_COUNT: usize = 64;
+/// "Near one observer" radius (metres) the 64-body sub-cluster is built
+/// within. A chosen interest-adjacent distance for this fixture; the actual
+/// T20 per-connection interest radius is a separate, unwired CLI knob (G3.md
+/// row 14 stays open).
+pub const G4_NEAR_OBSERVER_RADIUS_M: f64 = 12.0;
+/// **Sleeping** (dormant, persisted) debris population required by row 12.
+pub const G4_SLEEPING_BODY_COUNT: usize = 4096;
+
+/// What [`spawn_g4_workload_bodies`] actually built — returned so a caller
+/// (the server scene, CPU tests) can assert on the real counts rather than
+/// just the requested ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct G4BodyCounts {
+    /// Awake bodies spawned (never deactivated).
+    pub active_total: usize,
+    /// Of `active_total`, how many were placed within the near-observer
+    /// radius.
+    pub active_near_observer: usize,
+    /// Bodies spawned then immediately deactivated (T21 dormancy): they exist
+    /// and are persisted, but carry no physics-step cost.
+    pub sleeping_total: usize,
+}
+
+/// Populates the T23 / G4 workload's debris population (row 12: "256 active
+/// bodies (64 near one observer), 4096 sleeping persistent bodies") on an
+/// already-constructed [`crate::world::SimWorld`]. `observer` is the world
+/// position the 64-body near-cluster is centred on — typically
+/// [`G4_WORKLOAD_SPAWNS`]`[0]`.
+///
+/// Every body is a small `2x2x2`-cell (8-cell) solid stone cube
+/// ([`solid_block`]) — deliberately minimal but genuinely multi-cell,
+/// collidable geometry (`docs/validation.md`: "Geometry fixtures must specify
+/// occupied cells and collider complexity, not only body count"), so spawning
+/// ~4.3k of them stays inside CPU-CI cost.
+///
+/// The 64 near-observer bodies sit on a grid centred on `observer`, elevated
+/// so they drop past head height without starting inside a spawned player
+/// capsule. The rest of the active population and every sleeping body are
+/// spread over two separate open-air fields, well clear of both terrain
+/// regions and of each other, so nothing starts overlapping. Active bodies are
+/// simply dropped with no floor beneath them: under gravity they remain part
+/// of the physics step for the whole run, which *is* "active" for a proof run
+/// of this length. Sleeping bodies are spawned then immediately
+/// [`crate::world::SimWorld::deactivate_body`]d (T21 dormancy): a dormant body
+/// carries zero physics-step cost while its authoritative record stays
+/// resident and persisted, exactly matching "sleeping (dormant but
+/// persistent)".
+pub fn spawn_g4_workload_bodies(
+    world: &mut crate::world::SimWorld,
+    observer: [f64; 3],
+) -> G4BodyCounts {
+    let mut counts = G4BodyCounts::default();
+
+    // 64 active bodies clustered near the observer: an 8x8 grid at 1 m
+    // spacing, elevated 6 m above the observer's feet. Half-diagonal extent is
+    // ~4 m, well inside G4_NEAR_OBSERVER_RADIUS_M once the 6 m rise is folded
+    // in (~8.2 m 3-D distance at the grid corners).
+    let near_side = 8usize; // 8 * 8 = G4_NEAR_OBSERVER_BODY_COUNT
+    debug_assert_eq!(near_side * near_side, G4_NEAR_OBSERVER_BODY_COUNT);
+    for i in 0..near_side {
+        for j in 0..near_side {
+            let x = observer[0] + (i as f64 - near_side as f64 / 2.0) * 1.0;
+            let z = observer[2] + (j as f64 - near_side as f64 / 2.0) * 1.0;
+            let y = observer[1] + 6.0;
+            spawn_one(
+                world,
+                [x, y, z],
+                BodyKindWanted::ActiveNearObserver,
+                &mut counts,
+            );
+        }
+    }
+
+    // The rest of the active population: a separate open-air field far from
+    // the terrain regions and the near-observer cluster.
+    let remaining_active = G4_ACTIVE_BODY_COUNT - counts.active_near_observer;
+    spawn_grid(
+        world,
+        remaining_active,
+        [400.0, 60.0, 400.0],
+        BodyKindWanted::Active,
+        &mut counts,
+    );
+
+    // Every sleeping body: another separate field.
+    spawn_grid(
+        world,
+        G4_SLEEPING_BODY_COUNT,
+        [700.0, 60.0, 700.0],
+        BodyKindWanted::Sleeping,
+        &mut counts,
+    );
+
+    counts
+}
+
+/// Which counter [`spawn_one`] should bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyKindWanted {
+    /// Awake, and counted toward the near-observer sub-cluster.
+    ActiveNearObserver,
+    /// Awake, not near the observer.
+    Active,
+    /// Spawned then immediately deactivated (T21 dormancy).
+    Sleeping,
+}
+
+fn spawn_grid(
+    world: &mut crate::world::SimWorld,
+    count: usize,
+    origin: [f64; 3],
+    kind: BodyKindWanted,
+    counts: &mut G4BodyCounts,
+) {
+    if count == 0 {
+        return;
+    }
+    let side = (count as f64).sqrt().ceil() as usize + 1;
+    let spacing = 1.0;
+    let mut placed = 0usize;
+    'outer: for i in 0..side {
+        for j in 0..side {
+            if placed >= count {
+                break 'outer;
+            }
+            let x = origin[0] + i as f64 * spacing;
+            let z = origin[2] + j as f64 * spacing;
+            let y = origin[1];
+            spawn_one(world, [x, y, z], kind, counts);
+            placed += 1;
+        }
+    }
+    debug_assert_eq!(placed, count);
+}
+
+fn spawn_one(
+    world: &mut crate::world::SimWorld,
+    at: [f64; 3],
+    kind: BodyKindWanted,
+    counts: &mut G4BodyCounts,
+) {
+    let entity = world
+        .spawn_body(
+            solid_block(2),
+            BodyPose::new(DQuat::IDENTITY, at),
+            [0.0; 3],
+            [0.0; 3],
+            G4_BODY_DENSITY_KG_M3,
+            0,
+        )
+        .expect("g4 workload debris body spawns");
+    match kind {
+        BodyKindWanted::ActiveNearObserver => {
+            counts.active_total += 1;
+            counts.active_near_observer += 1;
+        }
+        BodyKindWanted::Active => {
+            counts.active_total += 1;
+        }
+        BodyKindWanted::Sleeping => {
+            let deactivated = world.deactivate_body(entity);
+            debug_assert!(deactivated, "a freshly spawned body always deactivates");
+            counts.sleeping_total += 1;
+        }
+    }
+}
+
+/// T23 / G4 row 12's "one 64-brick connected collapse" attempted in isolation:
+/// [`spall_voxel::fixtures::giant_collapse_scene`] holds the anchored floor,
+/// column, and 64-brick block on its own — not merged into
+/// [`g4_workload_setup`]'s world, because a terrain split's resident-air
+/// envelope must be contiguous across everything else resident in the same
+/// volume (`separated_regions_scene`'s doc comment), and placing a
+/// 128-cell-per-axis structure far enough from the west/east regions to avoid
+/// spatial overlap would force a multi-hundred-million-cell resident air fill
+/// via the per-cell `EditPlan` path — infeasible to build at all, let alone in
+/// CPU CI. Isolating the attempt makes its real outcome (commit or a specific,
+/// evidenced failure) unambiguous and keeps the attempt reproducible on its
+/// own.
+pub fn giant_collapse_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: spall_voxel::fixtures::giant_collapse_scene(id),
+        terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(127, 159, 127)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
     }
 }
 
