@@ -374,6 +374,44 @@ pub fn separated_regions_scene(id: VolumeId) -> Volume {
     v
 }
 
+/// East-region offset for the full-envelope T23 scene: 110 m on the x axis.
+pub const SEPARATED_REGIONS_FAR_EAST_OFFSET: GlobalCell = GlobalCell::new(440, 0, 0);
+
+/// Two separated regions joined by a continuous, narrow stone causeway.
+pub fn separated_regions_full_envelope_scene(id: VolumeId) -> Volume {
+    let bounds = BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(31, 15, 31))
+        .expect("valid G3 world bounds");
+    let mut v = Volume::bounded(id, CellSizeCode::Quarter, bounds);
+    let e = SEPARATED_REGIONS_FAR_EAST_OFFSET;
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(23 + e.x, 19, 7),
+        MaterialId::AIR,
+    ))
+    .expect("far-scene air envelope");
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(24, 0, 0),
+        GlobalCell::new(e.x - 1, 3, 7),
+        STONE,
+    ))
+    .expect("far-scene causeway");
+    let region = [
+        (GlobalCell::new(0, 0, 0), GlobalCell::new(23, 3, 7), STONE),
+        (GlobalCell::new(10, 4, 3), GlobalCell::new(11, 9, 4), STONE),
+        (GlobalCell::new(4, 10, 3), GlobalCell::new(20, 11, 4), STONE),
+    ];
+    for offset in [GlobalCell::new(0, 0, 0), e] {
+        for (a, b, material) in region {
+            let shift = |c: GlobalCell| GlobalCell::new(c.x + offset.x, c.y, c.z + offset.z);
+            v.apply_edit(&EditPlan::filled_box(id, shift(a), shift(b), material))
+                .expect("far-scene region edit");
+        }
+    }
+    v
+}
+
 /// Bricks per axis of [`giant_collapse_scene`]'s detachable block —
 /// `4^3 = 64`, the literal G1/G4 "64-brick connected body" stress case
 /// (`docs/collision-decision.md`, `docs/validation.md` G1/G4: "Include ... a

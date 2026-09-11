@@ -1,0 +1,34 @@
+{
+  "name": "t23-g3-full-envelope",
+  "description": "T23 / G3 open item row 2 (full-envelope separation). Like t23-g3, but the east region is 110 m (> 100 m) from the west region along x alone (scene separated-regions-far), joined by a continuous stone causeway. Four clients connect; alternating slots spawn in the west and east regions, genuinely > 100 m apart. Client 0 severs the west column (tick 40) and excavates a west floor end (tick 150); client 1 severs the east column (tick 100) and excavates both east floor ends (ticks 200/230) -- the same multi-region collapse as increment 1, at full-envelope distance. Client 2 excavates the other west floor end (tick 175). Client 3 is a --late-join replica that connects after those edits and lands one more west cut (tick 320) -- the same late-join-after-heavy-edits behaviour as increment 1. While all of that runs, client 0 also walks the causeway from its west spawn (x = 7 m, not x = 1 m -- see SEPARATED_REGION_FAR_SPAWNS's doc comment for why) toward the east region's footprint (a real movement script, not a teleport), covering > 100 m and exercising interest management and replication across the full separation distance. The server and all four clients must converge to one canonical topology hash, the committed stream must replay to it, every detached beam must be reported at rest, and a cold restart + fresh late-join must recover the same hash.",
+  "scene": "separated-regions-far",
+  "server_ticks": 2200,
+  "quiescence_ticks": 220,
+  "clients": 4,
+  "late_join_clients": [3],
+  "late_join_connect_delay_ms": 1200,
+  "minimum_transactions": 6,
+  "replay_check": true,
+  "restart_check": true,
+  "require_body_settled": true,
+  "player_paths": [
+    {
+      "client": 0,
+      "legs": [
+        { "from": 180, "to": 1780, "movement": [0.0, 0.0, 1.0] }
+      ]
+    }
+  ],
+  "movement": {
+    "min_distance_m": 100.0
+  },
+  "cuts": [
+    { "client": 0, "at_tick": 40,  "cell": [10, 6, 3],   "radius": 2 },
+    { "client": 1, "at_tick": 100, "cell": [450, 6, 3],  "radius": 2 },
+    { "client": 0, "at_tick": 150, "cell": [1, 1, 3],    "radius": 1 },
+    { "client": 2, "at_tick": 175, "cell": [22, 1, 3],   "radius": 1 },
+    { "client": 1, "at_tick": 200, "cell": [441, 1, 3],  "radius": 1 },
+    { "client": 1, "at_tick": 230, "cell": [462, 1, 3],  "radius": 1 },
+    { "client": 3, "at_tick": 320, "cell": [22, 2, 6],   "radius": 1 }
+  ]
+}
