@@ -260,6 +260,18 @@ struct Scenario {
     /// exercise (0 samples) is not asserted.
     #[serde(default)]
     latency_targets: Option<LatencyTargets>,
+    /// T21 / ENG-28 increment 4 (3c): run the server with `--dormancy` — a
+    /// settled body with nothing active nearby deactivates, and a dormant body
+    /// a player or edit approaches reactivates. Never combine with
+    /// `require_body_settled`: a deactivated body leaves the live physics
+    /// world that reads from.
+    #[serde(default)]
+    dormancy: bool,
+    /// T21 / ENG-28 increment 4: require the server's end-of-run report to
+    /// show at least this many dormancy deactivations / reactivations —
+    /// real end-to-end proof the pass ran, not just that `dormancy` was set.
+    #[serde(default)]
+    dormancy_assertions: Option<DormancyAssertions>,
     /// T23 / G3 row 11: when set, the named `late_join_clients` entry connects
     /// through a shaped proxy (bandwidth + RTT + loss) instead of the plain
     /// per-`loss_percent` one, and its measured compressed baseline size /
@@ -460,6 +472,16 @@ struct ResidencyAssertions {
     max_return_distance_m: Option<f64>,
 }
 
+/// T21 / ENG-28 increment 4 (3c): minimum dormancy pass activity the server's
+/// end-of-run report must show.
+#[derive(Debug, Clone, Deserialize)]
+struct DormancyAssertions {
+    #[serde(default = "one")]
+    min_deactivations: u64,
+    #[serde(default = "one")]
+    min_reactivations: u64,
+}
+
 impl Default for MovementAcceptance {
     fn default() -> Self {
         Self {
@@ -530,6 +552,10 @@ struct ServerSummary {
     residency_evictions_total: u64,
     #[serde(default)]
     residency_reloads_total: u64,
+    #[serde(default)]
+    dormancy_deactivations_total: u64,
+    #[serde(default)]
+    dormancy_reactivations_total: u64,
 }
 
 /// ENG-61: whether the server's end-of-run report shows every detached body at
@@ -836,6 +862,17 @@ fn residency_requirements_met(
         && movement_ok
 }
 
+/// T21 / ENG-28 increment 4 (3c): when the scenario configured
+/// `dormancy_assertions`, require the server's reported deactivation /
+/// reactivation counts to clear the floor. `true` when unconfigured.
+fn dormancy_requirements_met(scenario: &Scenario, server: &ServerSummary) -> bool {
+    let Some(required) = &scenario.dormancy_assertions else {
+        return true;
+    };
+    server.dormancy_deactivations_total >= required.min_deactivations
+        && server.dormancy_reactivations_total >= required.min_reactivations
+}
+
 fn requirements_met(
     scenario: &Scenario,
     transactions_committed: u64,
@@ -916,6 +953,40 @@ mod requirement_tests {
             action_requests_rejected: 0,
             action_reject_reasons: Vec::new(),
         }
+    }
+
+    #[test]
+    fn dormancy_assertions_require_both_a_deactivation_and_a_reactivation() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "dormancy_assertions": {
+                    "min_deactivations": 1,
+                    "min_reactivations": 1
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut server = ServerSummary::default();
+        assert!(!dormancy_requirements_met(&scenario, &server));
+
+        server.dormancy_deactivations_total = 1;
+        assert!(
+            !dormancy_requirements_met(&scenario, &server),
+            "a deactivation with no matching reactivation is not enough"
+        );
+
+        server.dormancy_reactivations_total = 1;
+        assert!(dormancy_requirements_met(&scenario, &server));
+    }
+
+    #[test]
+    fn dormancy_assertions_are_met_trivially_when_unconfigured() {
+        let scenario: Scenario = serde_json::from_str(r#"{ "server_ticks": 10 }"#).unwrap();
+        assert!(dormancy_requirements_met(
+            &scenario,
+            &ServerSummary::default()
+        ));
     }
 
     #[test]
@@ -1372,6 +1443,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             server_cmd.args(["--residency-radius-bricks", &r.to_string()]);
         }
     }
+    if scenario.dormancy {
+        server_cmd.arg("--dormancy");
+    }
     // T11 exact-replay check (and the T23 cold-restart check) both journal every
     // committed transaction to a world DB. Replay rebuilds from the tick-0
     // baseline; restart recovers a fresh server from the shutdown checkpoint.
@@ -1694,6 +1768,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         run.loss_percent > 0 || scenario.join_budget.is_some(),
     );
     if !residency_requirements_met(&scenario, &server, &client_summaries) {
+        requirements_met = false;
+    }
+    if !dormancy_requirements_met(&scenario, &server) {
         requirements_met = false;
     }
     // T23 / G3 row 11: the configured client's measured compressed baseline

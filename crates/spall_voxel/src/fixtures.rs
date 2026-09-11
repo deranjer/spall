@@ -310,6 +310,32 @@ pub fn walk_arena(id: VolumeId) -> Volume {
     v
 }
 
+/// [`walk_arena`] plus a small column-and-beam near the spawn end, in the
+/// player lane (`z 6..=7`, alongside the `x = 1.5 m` spawn row) — T21 /
+/// ENG-28 increment 4's networked sleep-wake evidence needs real detached
+/// rubble to deactivate and reactivate, not a scene-spawned body.
+///
+/// - column: `x 60..=61`, `z 6..=7`, `y 4..=9` — `15.0 m` from spawn, well
+///   outside the default dormancy wake margin.
+/// - beam:   `x 54..=70`, `z 6..=7`, `y 10..=11` — the column alone holds it
+///   up; cutting the column detaches it as one unsupported body that falls
+///   `~1.5 m` onto the existing floor and settles.
+pub fn sleep_wake_arena(id: VolumeId) -> Volume {
+    let mut v = walk_arena(id);
+    for (a, b, m) in [
+        (GlobalCell::new(60, 4, 6), GlobalCell::new(61, 9, 7), STONE),
+        (
+            GlobalCell::new(54, 10, 6),
+            GlobalCell::new(70, 11, 7),
+            STONE,
+        ),
+    ] {
+        v.apply_edit(&EditPlan::filled_box(id, a, b, m))
+            .expect("sleep-wake arena edit");
+    }
+    v
+}
+
 /// Cell offset from the west structure to the east structure in
 /// [`separated_regions_scene`]: `+72` cells (`18 m`) on both `x` and `z`, so the
 /// two collapsible towers sit in distinct interest regions with clear ground

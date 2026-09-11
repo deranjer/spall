@@ -170,6 +170,10 @@ pub enum Scene {
     /// [`spall_sim::fixtures::g1_full_envelope_setup`] /
     /// [`spall_sim::fixtures::spawn_g1_hollow_test_volume`].
     G1FullEnvelope,
+    /// T21 / ENG-28 increment 4 (3c): [`Scene::Walk`]'s arena with a small
+    /// column-and-beam in the player lane. See
+    /// [`spall_sim::fixtures::sleep_wake_setup`].
+    SleepWake,
 }
 
 impl Scene {
@@ -190,6 +194,7 @@ impl Scene {
                 Some(Scene::SeparatedRegionsFar)
             }
             "g1-full-envelope" | "g1-full-workload" | "g1" => Some(Scene::G1FullEnvelope),
+            "sleep-wake" | "sleepwake" | "t21-sleep-wake" => Some(Scene::SleepWake),
             _ => None,
         }
     }
@@ -206,6 +211,7 @@ impl Scene {
             Scene::G4Workload => "g4-workload",
             Scene::SeparatedRegionsFar => "separated-regions-far",
             Scene::G1FullEnvelope => "g1-full-envelope",
+            Scene::SleepWake => "sleep-wake",
         }
     }
 
@@ -218,6 +224,7 @@ impl Scene {
                 | Scene::G4Workload
                 | Scene::SeparatedRegionsFar
                 | Scene::G1FullEnvelope
+                | Scene::SleepWake
         )
     }
 
@@ -230,6 +237,7 @@ impl Scene {
             Scene::G4Workload => &G4_WORKLOAD_SPAWNS,
             Scene::SeparatedRegionsFar => &SEPARATED_REGION_FAR_SPAWNS,
             Scene::G1FullEnvelope => &spall_sim::fixtures::G1_WORKLOAD_SPAWNS,
+            Scene::SleepWake => &WALK_ARENA_SPAWNS,
             _ => &[],
         }
     }
@@ -247,6 +255,7 @@ impl Scene {
                 spall_sim::fixtures::separated_regions_full_envelope_setup()
             }
             Scene::G1FullEnvelope => spall_sim::fixtures::g1_full_envelope_setup(),
+            Scene::SleepWake => spall_sim::fixtures::sleep_wake_setup(),
         };
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
@@ -344,6 +353,28 @@ pub struct ServeConfig {
     /// (`crate::residency_pass`). The committed world is unchanged — see
     /// `docs/reports/G3-residency-hash.md`.
     pub residency: Option<crate::ResidencyLimits>,
+    /// T21 / ENG-28 increment 4 (3c): default-off contact-to-terrain/body
+    /// damage pass. `None` keeps every prior run byte-identical (the pass is
+    /// never invoked, exactly like every scene before this increment).
+    /// `Some(_)` runs [`spall_sim::Simulation::apply_contact_damage`] every
+    /// tick with this config, so a hard enough impact carves a cut into
+    /// terrain or a struck body — a normal committed transaction that changes
+    /// the committed hash. Never enable on a fixture a hash-replaying gate
+    /// scenario depends on unless that scenario has accepted the resulting
+    /// hash (`docs/reports/ENG-28-increment-3-handoff.md` "3c").
+    pub contact_damage: Option<spall_sim::ContactDamageConfig>,
+    /// T21 / ENG-28 increment 4 (3c): default-off region-dormancy pass. `None`
+    /// keeps every body live in physics forever, byte-identical to every
+    /// prior run. `Some(_)` runs [`spall_sim::Simulation::apply_dormancy`]
+    /// every tick with this config: a settled body with no active region
+    /// nearby is deactivated (dropped from the physics step, record kept),
+    /// and a dormant body a player or edit approaches is reactivated.
+    /// Dormancy never changes authoritative geometry, ownership, damage, or
+    /// `world_hash`, but a deactivated body **leaves the live physics world**
+    /// — a gate scenario that reads physics state directly (e.g.
+    /// [`Self::await_body_settle`]'s `max_penetration_m`) must keep this off,
+    /// which is why it defaults to `None` for every existing gate fixture.
+    pub dormancy: Option<spall_sim::DormancyConfig>,
 }
 
 /// T20 per-client interest + motion bandwidth policy for a [`serve`] run.
@@ -406,6 +437,8 @@ impl ServeConfig {
             await_body_settle: false,
             motion_interest: None,
             residency: None,
+            contact_damage: None,
+            dormancy: None,
         }
     }
 }
@@ -525,6 +558,20 @@ pub struct ServeSummary {
     /// Ticks the resident-brick count exceeded `budget_bricks` (a player's
     /// interest set is larger than the declared budget).
     pub residency_budget_miss_ticks: u64,
+    /// T21 / ENG-28 increment 4: contact-damage cuts admitted into the edit
+    /// pipeline this run. `0` when `ServeConfig.contact_damage` is `None`.
+    pub contact_damage_cuts_submitted: u64,
+    /// T21 / ENG-28 increment 4: contact-damage cuts the pipeline refused
+    /// (queue full — bounded backpressure, not an error). `0` when
+    /// `ServeConfig.contact_damage` is `None`.
+    pub contact_damage_cuts_rejected: u64,
+    /// T21 / ENG-28 increment 4: bodies the dormancy pass deactivated this
+    /// run. `0` when `ServeConfig.dormancy` is `None`.
+    pub dormancy_deactivations_total: u64,
+    /// T21 / ENG-28 increment 4: bodies the dormancy pass reactivated this
+    /// run (proximity or a hard-wake edit). `0` when `ServeConfig.dormancy` is
+    /// `None`.
+    pub dormancy_reactivations_total: u64,
 }
 
 /// Anything that stops a [`serve`] run.
@@ -926,6 +973,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let max_join_retries = config.max_join_retries;
     let dev_unvalidated_actions = config.dev_unvalidated_actions;
     let residency_limits = config.residency;
+    let contact_damage_cfg = config.contact_damage;
+    let dormancy_cfg = config.dormancy;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
@@ -982,6 +1031,16 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // instead of every connected client.
         let mut submitted_by: HashMap<RequestId, SessionId> = HashMap::new();
         let mut commit_latency = CommitLatency::default();
+
+        // T21 / ENG-28 increment 4 (3c): default-off passes. `None` -> every
+        // counter below stays `0` and neither pass is ever called, so an
+        // ordinary run is byte-identical to before this increment.
+        let mut contact_damage_policy = contact_damage_cfg.map(spall_sim::ContactDamagePolicy::new);
+        let mut dormancy_policy = dormancy_cfg.map(spall_sim::DormancyPolicy::new);
+        let mut contact_damage_cuts_submitted = 0u64;
+        let mut contact_damage_cuts_rejected = 0u64;
+        let mut dormancy_deactivations_total = 0u64;
+        let mut dormancy_reactivations_total = 0u64;
 
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
@@ -1155,6 +1214,23 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             };
             ticks_run += 1;
             let tick = sim.current_tick();
+
+            // T21 / ENG-28 increment 4 (3c): opt-in contact damage + region
+            // dormancy, run every tick right after the commit they react to.
+            // A contact-damage cut stages off-tick and commits on a later
+            // tick, like any client edit; a dormancy deactivation/reactivation
+            // applies to `sim.world()` immediately but never touches
+            // authoritative geometry, ownership, or `world_hash`.
+            if let Some(policy) = contact_damage_policy.as_mut() {
+                let cd = sim.apply_contact_damage(policy, &report);
+                contact_damage_cuts_submitted += cd.submitted as u64;
+                contact_damage_cuts_rejected += cd.rejected as u64;
+            }
+            if let Some(policy) = dormancy_policy.as_mut() {
+                let dp = sim.apply_dormancy(policy, &report);
+                dormancy_deactivations_total += dp.deactivate.len() as u64;
+                dormancy_reactivations_total += dp.reactivate.len() as u64;
+            }
 
             // ENG-61: fold this tick into the "bodies holding still" window.
             // Only when the scenario asked for it — an ordinary run does no
@@ -1496,6 +1572,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             actions_queued_unresolved: submitted_at.len() as u64,
             latency: commit_latency.report(),
             residency: residency.as_ref().map(|p| p.stats()),
+            contact_damage_cuts_submitted,
+            contact_damage_cuts_rejected,
+            dormancy_deactivations_total,
+            dormancy_reactivations_total,
         }
     });
 
@@ -1539,7 +1619,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     ))?;
 
     let summary = ServeSummary {
-        version: 4,
+        // v5: T21 / ENG-28 increment 4 adds contact_damage_cuts_submitted /
+        // contact_damage_cuts_rejected / dormancy_deactivations_total /
+        // dormancy_reactivations_total.
+        version: 5,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -1600,6 +1683,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             .residency
             .map(|r| r.budget_miss_ticks)
             .unwrap_or(0),
+        contact_damage_cuts_submitted: sim_result.contact_damage_cuts_submitted,
+        contact_damage_cuts_rejected: sim_result.contact_damage_cuts_rejected,
+        dormancy_deactivations_total: sim_result.dormancy_deactivations_total,
+        dormancy_reactivations_total: sim_result.dormancy_reactivations_total,
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -1652,6 +1739,10 @@ struct SimResult {
     actions_queued_unresolved: u64,
     latency: commit_latency::LatencyReport,
     residency: Option<crate::ResidencyStats>,
+    contact_damage_cuts_submitted: u64,
+    contact_damage_cuts_rejected: u64,
+    dormancy_deactivations_total: u64,
+    dormancy_reactivations_total: u64,
 }
 
 impl SimResult {
@@ -1691,6 +1782,10 @@ impl SimResult {
             actions_queued_unresolved: 0,
             latency: commit_latency::LatencyReport::default(),
             residency: None,
+            contact_damage_cuts_submitted: 0,
+            contact_damage_cuts_rejected: 0,
+            dormancy_deactivations_total: 0,
+            dormancy_reactivations_total: 0,
         }
     }
 }
