@@ -135,6 +135,16 @@ T21 outcome — region dormancy, increment 2 (`spall_physics` + `spall_sim::dorm
 
 T23 outcome — G3/G4 integrated acceptance, increment 1 (`spall_voxel` + `spall_sim` + `spall_server` + `spall_client`): the `separated-regions` scene (`Scene::SeparatedRegions`) is one volume bounded to 256 x 128 x 256 m — the G3 operating envelope — holding two independent collapsible bridge structures, a "west" region at the origin and an "east" region offset by `+72,+0,+72` cells. Only the two regions plus the ground between them are resident, so the terrain occupancy grid and collider rebuilds are bounded by the structures, not the world box. `Scene::player_spawns` replaces the previously unconditional `WALK_ARENA_SPAWNS`: each player scene now supplies its own per-slot spawn table, and `SEPARATED_REGION_SPAWNS` alternates connecting clients between the two regions so they start geographically separated. The `t23-g3` scenario drives a multi-region collapse (one column cut per region detaches that region's beam and no other) plus a `--late-join` replica that converges after six edits, headless and at `--loss-percent 3`, with committed-stream replay and body-at-rest checks. Increment 2 adds the harness `restart_check`: after the run the server is stopped and a fresh `sandbox-server --serve --save` is cold-started over the same `world.db` — recovery from the shutdown checkpoint plus the durable journal, no edit replay from world creation — and both the recovered server and a fresh `--late-join` client against it must reach the agreed topology hash. This is the first T23 slice; resident-cache eviction, traverse-away/back, the full persistence crash-injection matrix, the join-duration budget, and the whole G4 eight-client workload + soak are enumerated open in `docs/reports/G3.md`.
 
+T23 increment 12 tightens the live residency contract after integration review.
+Backing bricks are digest-validated before insertion, preserving atomic logical
+membership on reload failure. Client reload requests have a global per-step
+ceiling and completed-load/budget-miss accounting. The authoritative terrain
+hash remains cache-placement-independent, while a separate resident-terrain
+dirty hash invalidates the client's derived prediction collider whenever
+geometry is evicted or restored. The traversal harness now gates on real
+eviction, completed reload, an edit dependency gap while evicted, and measured
+outbound/return crossings; a fully resident fallback cannot pass that fixture.
+
 ## Collision and character physics
 
 T06 compares native voxel colliders with deterministic merged-cuboid compounds for static and dynamic volumes. Verify concave contacts, edit/rebuild cost, and mass handling on the pinned Rapier version. Avoid dynamic concave triangle-mesh colliders; the Rapier documentation cautions against them. Terrain contains tunnels/overhangs, so heightfields are insufficient. [Rapier collider guidance](https://rapier.rs/docs/user_guides/rust/colliders/).

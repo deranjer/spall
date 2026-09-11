@@ -604,7 +604,31 @@ refinements (`ResidencyController` unification, durable-store backing,
 incremental capture, logical-terrain predicted collider) are follow-up tickets;
 the join-duration budget and the G4 eight-client workload + soak stay open.
 
+T23 increment 12 qualifies that residency evidence after the post-merge review.
+`SimWorld::reload_brick` now validates revision/content before publishing a
+backing candidate; wrong-revision and wrong-content tests require unchanged
+hash, solid count, nonresidency and retained digest, followed by a successful
+correct retry. Client reload work is globally capped at four requests per mover
+step and reports completed loads plus budget misses. Prediction collision uses
+a resident-cache dirty hash, so eviction/reload rebuilds collision even though
+the logical topology hash correctly stays unchanged. `t23-g3-traversal` now
+configures `residency_assertions`: server/client eviction, completed reloads,
+an edit gap caused by evicted client geometry, `>=20 m` outbound travel, and a
+return to `<=12 m` from spawn are all required. The measured clean run reached
+23.38 m out and 10.03 m final, server 5/3 evict/reload, client 6/4/4
+evict/request/complete, grounded ratio 0.993; replay, restart and reconnect all
+matched `2a47eda7…`. This does not satisfy the still-open durable-backing,
+bounded-capture, live-exhaustion, prediction-safe `2%`-loss traversal,
+join-budget or full-envelope requirements.
+
 ### G4 — eight-client engine slice
+
+See the [ENG-30 post-merge review](reviews/2026-09-10-eng-30-post-merge.md) for
+current evidence qualifications: live retry-exhaustion remains untested by the
+after-shutdown join fixture; increment 12 now enforces residency/traversal
+activity, while impaired traversal is still open; and the in-memory
+backing/full-reload checkpoint path does not establish the frozen durable
+residency or total-memory requirements.
 
 Run for two measured minutes after 30 seconds warmup; also run a 30-minute reduced-telemetry soak. Eight players in both clustered and separated arrangements, 256 active nontrivial voxel bodies server-wide, at least 64 nearby to one observer, and an accumulated population of 4,096 sleeping persistent bodies. Drive 10 ordinary edits/s total and one 4 m diameter blast every 10 seconds. Include one 64-brick connected collapse. Geometry fixtures must specify occupied cells and collider complexity, not only body count.
 

@@ -218,6 +218,10 @@ struct Scenario {
     /// `client_residency_budget_bricks` is set. Defaults to the client's default.
     #[serde(default)]
     client_residency_radius_bricks: Option<i64>,
+    /// Enforced end-to-end proof that residency actually ran during this
+    /// scenario. A configured block makes zero/default counters a failure.
+    #[serde(default)]
+    residency_assertions: Option<ResidencyAssertions>,
     /// Minimum straight-line distance (metres) some replicated body must have
     /// travelled on every live client — proof the detached geometry actually
     /// moved, not merely that a (possibly stationary) snapshot arrived.
@@ -378,6 +382,26 @@ struct MovementAcceptance {
     expect_no_hover: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ResidencyAssertions {
+    #[serde(default)]
+    client: u64,
+    #[serde(default)]
+    min_server_evictions: u64,
+    #[serde(default)]
+    min_server_reloads: u64,
+    #[serde(default)]
+    min_client_evictions: u64,
+    #[serde(default)]
+    min_client_reloads_completed: u64,
+    #[serde(default)]
+    min_evicted_transaction_gaps: u64,
+    #[serde(default)]
+    min_outbound_distance_m: f64,
+    #[serde(default)]
+    max_return_distance_m: Option<f64>,
+}
+
 impl Default for MovementAcceptance {
     fn default() -> Self {
         Self {
@@ -444,6 +468,10 @@ struct ServerSummary {
     max_contact_penetration_m: f64,
     #[serde(default)]
     detached_body_min_origin_y_m: f64,
+    #[serde(default)]
+    residency_evictions_total: u64,
+    #[serde(default)]
+    residency_reloads_total: u64,
 }
 
 /// ENG-61: whether the server's end-of-run report shows every detached body at
@@ -482,6 +510,16 @@ struct ClientSummary {
     body_cut_committed: bool,
     #[serde(default)]
     movement: Option<MovementRow>,
+    #[serde(default)]
+    client_residency_evictions: u64,
+    #[serde(default)]
+    client_residency_reloads_requested: u64,
+    #[serde(default)]
+    client_residency_reloads_completed: u64,
+    #[serde(default)]
+    client_residency_budget_miss_steps: u64,
+    #[serde(default)]
+    client_residency_evicted_transaction_gaps: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -489,6 +527,8 @@ struct MovementRow {
     #[serde(default)]
     ticks: u64,
     distance_travelled_m: f64,
+    #[serde(default)]
+    max_distance_from_start_m: f64,
     max_correction_m: f64,
     ground_contact_ratio: f64,
     hovered_after_floor_removal: bool,
@@ -594,7 +634,40 @@ struct ClientRow {
     motion_snapshots_out_of_order: u64,
     max_body_displacement_m: f64,
     body_cut_committed: bool,
+    client_residency_evictions: u64,
+    client_residency_reloads_requested: u64,
+    client_residency_reloads_completed: u64,
+    client_residency_budget_miss_steps: u64,
+    client_residency_evicted_transaction_gaps: u64,
     hash_matches_server: bool,
+}
+
+fn residency_requirements_met(
+    scenario: &Scenario,
+    server: &ServerSummary,
+    clients: &[Option<ClientSummary>],
+) -> bool {
+    let Some(required) = &scenario.residency_assertions else {
+        return true;
+    };
+    let Some(client) = clients
+        .get(required.client as usize)
+        .and_then(Option::as_ref)
+    else {
+        return false;
+    };
+    let movement_ok = client.movement.as_ref().is_some_and(|movement| {
+        movement.max_distance_from_start_m >= required.min_outbound_distance_m
+            && required
+                .max_return_distance_m
+                .is_none_or(|max| movement.distance_travelled_m <= max)
+    });
+    server.residency_evictions_total >= required.min_server_evictions
+        && server.residency_reloads_total >= required.min_server_reloads
+        && client.client_residency_evictions >= required.min_client_evictions
+        && client.client_residency_reloads_completed >= required.min_client_reloads_completed
+        && client.client_residency_evicted_transaction_gaps >= required.min_evicted_transaction_gaps
+        && movement_ok
 }
 
 fn requirements_met(
@@ -665,7 +738,64 @@ mod requirement_tests {
             max_body_displacement_m: 5.0,
             body_cut_committed: true,
             movement: None,
+            client_residency_evictions: 0,
+            client_residency_reloads_requested: 0,
+            client_residency_reloads_completed: 0,
+            client_residency_budget_miss_steps: 0,
+            client_residency_evicted_transaction_gaps: 0,
         }
+    }
+
+    #[test]
+    fn residency_assertions_fail_when_a_pass_is_disabled_or_return_is_missing() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "residency_assertions": {
+                    "client": 0,
+                    "min_server_evictions": 1,
+                    "min_server_reloads": 1,
+                    "min_client_evictions": 1,
+                    "min_client_reloads_completed": 1,
+                    "min_evicted_transaction_gaps": 1,
+                    "min_outbound_distance_m": 10.0,
+                    "max_return_distance_m": 6.0
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut server = ServerSummary::default();
+        let mut mover = client(1);
+        assert!(!residency_requirements_met(
+            &scenario,
+            &server,
+            &[Some(mover.clone())]
+        ));
+
+        server.residency_evictions_total = 4;
+        server.residency_reloads_total = 2;
+        mover.client_residency_evictions = 4;
+        mover.client_residency_reloads_completed = 2;
+        mover.client_residency_evicted_transaction_gaps = 1;
+        mover.movement = Some(MovementRow {
+            ticks: 30,
+            distance_travelled_m: 12.0,
+            max_distance_from_start_m: 14.0,
+            max_correction_m: 0.0,
+            ground_contact_ratio: 1.0,
+            hovered_after_floor_removal: false,
+            held_button_release_ok: true,
+        });
+        assert!(
+            !residency_requirements_met(&scenario, &server, &[Some(mover.clone())]),
+            "outbound-only motion must not satisfy the return crossing"
+        );
+        mover.movement.as_mut().unwrap().distance_travelled_m = 4.0;
+        assert!(residency_requirements_met(
+            &scenario,
+            &server,
+            &[Some(mover)]
+        ));
     }
 
     #[test]
@@ -1127,7 +1257,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             return finish(
                 &output,
                 SessionSummary {
-                    version: 1,
+                    version: 2,
                     result: "failed",
                     scenario: scenario.name.clone(),
                     clients,
@@ -1223,6 +1353,12 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     motion_snapshots_out_of_order: c.motion_snapshots_out_of_order,
                     max_body_displacement_m: c.max_body_displacement_m,
                     body_cut_committed: c.body_cut_committed,
+                    client_residency_evictions: c.client_residency_evictions,
+                    client_residency_reloads_requested: c.client_residency_reloads_requested,
+                    client_residency_reloads_completed: c.client_residency_reloads_completed,
+                    client_residency_budget_miss_steps: c.client_residency_budget_miss_steps,
+                    client_residency_evicted_transaction_gaps: c
+                        .client_residency_evicted_transaction_gaps,
                     hash_matches_server: hash_ok,
                 });
             }
@@ -1238,6 +1374,11 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     motion_snapshots_out_of_order: 0,
                     max_body_displacement_m: 0.0,
                     body_cut_committed: false,
+                    client_residency_evictions: 0,
+                    client_residency_reloads_requested: 0,
+                    client_residency_reloads_completed: 0,
+                    client_residency_budget_miss_steps: 0,
+                    client_residency_evicted_transaction_gaps: 0,
                     hash_matches_server: false,
                 });
             }
@@ -1249,6 +1390,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         &client_summaries,
         run.loss_percent > 0,
     );
+    if !residency_requirements_met(&scenario, &server, &client_summaries) {
+        requirements_met = false;
+    }
     // Cross-brick ownership transfer: a detached body's cells must have been
     // taken out of terrain across a brick boundary (server-authoritative).
     if scenario.minimum_detached_body_brick_span > 0
@@ -1315,7 +1459,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     finish(
         &output,
         SessionSummary {
-            version: 1,
+            version: 2,
             result: if all_match { "passed" } else { "failed" },
             scenario: scenario.name,
             clients,

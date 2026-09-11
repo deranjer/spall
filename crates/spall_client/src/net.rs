@@ -36,7 +36,7 @@ use spall_physics::{CharacterParams, CharacterState};
 use spall_protocol::{
     ActionKind, ActionOutcome, ActionRequest, AlgorithmVersions, BaselineAck, BaselineWorld,
     ClaimedTarget, Handshake, Hash32, InputFrame, InputSeq, MotionSnapshot, NegotiatedLimits,
-    PROTOCOL_VERSION, RecentInput, RequestId, TransferId, session_player_entity,
+    PROTOCOL_VERSION, RecentInput, RepairKey, RequestId, TransferId, session_player_entity,
 };
 
 use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
@@ -288,6 +288,13 @@ pub struct ClientSummary {
     pub client_residency_evictions: u64,
     #[serde(default)]
     pub client_residency_reloads_requested: u64,
+    #[serde(default)]
+    pub client_residency_reloads_completed: u64,
+    #[serde(default)]
+    pub client_residency_budget_miss_steps: u64,
+    /// Transactions that first gapped on a brick this client had evicted.
+    #[serde(default)]
+    pub client_residency_evicted_transaction_gaps: u64,
 }
 
 /// Anything that stops a client run before it can report.
@@ -364,6 +371,9 @@ struct Counters {
     /// back as the player returned. Both `0` unless `client_residency` is set.
     residency_evictions: AtomicU64,
     residency_reloads_requested: AtomicU64,
+    residency_reloads_completed: AtomicU64,
+    residency_budget_miss_steps: AtomicU64,
+    residency_evicted_transaction_gaps: AtomicU64,
 }
 
 /// The `CharacterState` carried by a player [`MotionSnapshot`]. Orientation is
@@ -621,6 +631,18 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         {
                             let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
                             let primary = guard.apply_transaction(&tx);
+                            if let ApplyOutcome::NeedsRepair(reqs) = &primary
+                                && reqs.iter().any(|req| match req.key {
+                                    RepairKey::Brick { volume, coord } => {
+                                        guard.evicted(volume).contains(coord)
+                                    }
+                                    _ => false,
+                                })
+                            {
+                                counters
+                                    .residency_evicted_transaction_gaps
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             let publish = matches!(primary, ApplyOutcome::Published { .. });
                             outcomes.push(primary);
                             if publish {
@@ -799,7 +821,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 // Rebuild the collider if the terrain changed near us.
                 let terrain = {
                     let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.terrain_hash().zip(guard.terrain_volume().cloned())
+                    guard
+                        .terrain_resident_hash()
+                        .zip(guard.terrain_volume().cloned())
                 };
                 // All predictor-lock work happens in this non-async block, which
                 // returns the datagram to send (and the predicted feet position
@@ -869,6 +893,12 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     counters
                         .residency_reloads_requested
                         .store(pass.reloads_requested_total(), Ordering::Relaxed);
+                    counters
+                        .residency_reloads_completed
+                        .store(pass.reloads_completed_total(), Ordering::Relaxed);
+                    counters
+                        .residency_budget_miss_steps
+                        .store(pass.budget_miss_steps_total(), Ordering::Relaxed);
                     for req in reqs {
                         let _ = conn.send_record(WireRecord::RepairRequest(req)).await;
                     }
@@ -1037,7 +1067,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         }
     };
     let summary = ClientSummary {
-        version: 1,
+        version: 2,
         result: if progressed && movement_ok {
             "passed"
         } else {
@@ -1064,6 +1094,15 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         client_residency_evictions: counters.residency_evictions.load(Ordering::Relaxed),
         client_residency_reloads_requested: counters
             .residency_reloads_requested
+            .load(Ordering::Relaxed),
+        client_residency_reloads_completed: counters
+            .residency_reloads_completed
+            .load(Ordering::Relaxed),
+        client_residency_budget_miss_steps: counters
+            .residency_budget_miss_steps
+            .load(Ordering::Relaxed),
+        client_residency_evicted_transaction_gaps: counters
+            .residency_evicted_transaction_gaps
             .load(Ordering::Relaxed),
     };
     drop(guard);

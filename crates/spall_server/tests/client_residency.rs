@@ -4,7 +4,10 @@
 //! resident-*and*-evicted brick and the replica still converges with the
 //! server. See `docs/reports/G3-residency-hash.md` (reload lifecycle).
 
-use spall_client::{ApplyOutcome, ClientResidency, ReplicaConfig, ReplicaWorld};
+use spall_client::{
+    ApplyOutcome, ClientResidency, ClientResidencyPass, MAX_RELOAD_REQUESTS_PER_STEP,
+    ReplicaConfig, ReplicaWorld,
+};
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
 use spall_core::{BrickCoord, EntityId, SphereBrush};
 use spall_protocol::{Hash32, RepairKey, RepairRequest, RequestId};
@@ -219,4 +222,37 @@ fn wanted_reloads_targets_evicted_bricks_back_in_interest() {
             "wanted_reloads named a brick that is not evicted"
         );
     }
+}
+
+#[test]
+fn live_client_reload_work_is_globally_bounded_and_counts_completions() {
+    let sim = server();
+    let mut replica = replica_of(&sim);
+    let terrain = replica.terrain_volume_id();
+    let victims = east_bricks(&replica);
+    assert!(victims.len() > MAX_RELOAD_REQUESTS_PER_STEP);
+    for coord in &victims {
+        assert!(replica.evict_brick(terrain, *coord));
+    }
+
+    // A wide box makes every victim eligible at once. The pass must still emit
+    // no more than the global per-step ceiling.
+    let mut pass = ClientResidencyPass::new(128, 16);
+    let requests = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+    assert_eq!(requests.len(), MAX_RELOAD_REQUESTS_PER_STEP);
+    assert_eq!(pass.reloads_requested_total(), requests.len() as u64);
+
+    for req in &requests {
+        let patch = brick_repair_patch(&sim, req).expect("eligible brick is repairable");
+        replica
+            .apply_baseline_patch(&patch)
+            .expect("repair patch applies");
+    }
+    let next = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+    assert_eq!(pass.reloads_completed_total(), requests.len() as u64);
+    assert!(next.len() <= MAX_RELOAD_REQUESTS_PER_STEP);
+    assert!(
+        !next.is_empty(),
+        "the bounded queue must fairly advance to later eligible bricks"
+    );
 }

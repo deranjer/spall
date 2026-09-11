@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use spall_core::{BrickCoord, CELLS_PER_BRICK, LocalCell, Revision};
 
-use crate::brick::BrickHash;
+use crate::brick::{Brick, BrickHash};
 use crate::volume::{AccessError, Volume};
 
 /// The exact per-brick topology contribution retained when geometry leaves the
@@ -62,6 +62,25 @@ impl BrickDigest {
             solid_cells,
             modified_air: snap.is_modified_air(),
         })
+    }
+
+    /// Captures a digest from a candidate brick before it is published into a
+    /// volume. Reload paths use this to validate backing data without briefly
+    /// creating an invalid resident-and-evicted logical membership.
+    pub fn capture_brick(brick: &Brick) -> Self {
+        let mut solid_cells = 0u32;
+        for index in 0..CELLS_PER_BRICK as u16 {
+            let cell = LocalCell::from_linear_index(index).expect("index < CELLS_PER_BRICK");
+            if !brick.get(cell).is_air() {
+                solid_cells += 1;
+            }
+        }
+        Self {
+            revision: brick.revision(),
+            content_hash: brick.content_hash(),
+            solid_cells,
+            modified_air: brick.is_modified_air(),
+        }
     }
 }
 
@@ -196,6 +215,29 @@ impl EvictedBricks {
             .get(&coord)
             .ok_or(DigestError::NoRetained(coord))?;
         let reloaded = BrickDigest::capture(volume, coord)?;
+        if reloaded.revision == retained.revision && reloaded.content_hash == retained.content_hash
+        {
+            Ok(())
+        } else {
+            Err(DigestError::ReloadMismatch {
+                coord,
+                retained: retained.revision,
+                retained_hash: retained.content_hash,
+                reloaded: reloaded.revision,
+                reloaded_hash: reloaded.content_hash,
+            })
+        }
+    }
+
+    /// Validates a candidate backing brick before it becomes resident. This is
+    /// the atomic reload precondition: an error preserves both the absent live
+    /// slot and the retained digest.
+    pub fn verify_candidate(&self, coord: BrickCoord, brick: &Brick) -> Result<(), DigestError> {
+        let retained = self
+            .digests
+            .get(&coord)
+            .ok_or(DigestError::NoRetained(coord))?;
+        let reloaded = BrickDigest::capture_brick(brick);
         if reloaded.revision == retained.revision && reloaded.content_hash == retained.content_hash
         {
             Ok(())
