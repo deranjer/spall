@@ -19,7 +19,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use spall_net::{PacketFaultPlan, UdpProxy};
 
-use crate::{XtaskError, run_cargo, sandbox_binary};
+use crate::{XtaskError, run_cargo, sandbox_binary_profile};
 
 /// `cargo xtask session` — run an explicit scenario file.
 #[derive(Debug, Args)]
@@ -138,6 +138,9 @@ struct Scenario {
     /// `bridge-cut` (default) or `cross-bridge-cut`.
     #[serde(default = "default_scene")]
     scene: String,
+    /// Build and run optimized binaries for CPU-heavy performance gates.
+    #[serde(default)]
+    release_profile: bool,
     server_ticks: u64,
     /// Consecutive idle ticks before the server stops early. A gate fixture with
     /// widely-spaced scripted cuts under an impaired transport needs a larger
@@ -1265,9 +1268,19 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         source,
     })?;
 
-    // Build both binaries once.
-    run_cargo(&["build", "-p", "sandbox", "--bin", "sandbox-server"])?;
-    run_cargo(&[
+    // Build both binaries once. Performance fixtures may explicitly select the
+    // release profile; the scenario assertions remain identical.
+    let profile = if scenario.release_profile {
+        "release"
+    } else {
+        "debug"
+    };
+    let mut server_build = vec!["build", "-p", "sandbox", "--bin", "sandbox-server"];
+    if scenario.release_profile {
+        server_build.push("--release");
+    }
+    run_cargo(&server_build)?;
+    let mut client_build = vec![
         "build",
         "-p",
         "sandbox",
@@ -1275,7 +1288,11 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         "client",
         "--bin",
         "sandbox-client",
-    ])?;
+    ];
+    if scenario.release_profile {
+        client_build.push("--release");
+    }
+    run_cargo(&client_build)?;
 
     // Per-run credentials.
     let token_hex = random_hex_32(run.seed ^ 0xA5A5_A5A5_A5A5_A5A5);
@@ -1301,7 +1318,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     let min_clients = clients.saturating_sub(late_count).max(1);
 
     // Spawn the server.
-    let mut server_cmd = Command::new(sandbox_binary("sandbox-server"));
+    let mut server_cmd = Command::new(sandbox_binary_profile("sandbox-server", profile));
     server_cmd.args([
         "--serve",
         "--listen",
@@ -1427,7 +1444,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         let summary = output.join(format!("client{i}.summary.json"));
         let _ = fs::remove_file(&summary);
         client_summary_paths.push(summary.clone());
-        let mut c = Command::new(sandbox_binary("sandbox-client"));
+        let mut c = Command::new(sandbox_binary_profile("sandbox-client", profile));
         c.args([
             "--connect",
             &targets[i as usize].to_string(),
@@ -1687,7 +1704,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     // T11 exact replay: fold the committed topology-event stream from the tick-0
     // baseline and require the rebuilt canonical hash to equal the live hash.
     let replay = if scenario.replay_check {
-        let r = run_replay_check(&replay_db, &agreed, &output);
+        let r = run_replay_check(&replay_db, &agreed, &output, profile);
         if !(r.ran && r.matches) {
             requirements_met = false;
         }
@@ -1700,7 +1717,14 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     // from the shutdown checkpoint + journal), then a fresh `--late-join` client
     // against it. Both must reach the agreed hash.
     let restart = if scenario.restart_check {
-        let r = run_restart_check(&output, &scenario.scene, &token_file, &agreed, run.timeout);
+        let r = run_restart_check(
+            &output,
+            &scenario.scene,
+            &token_file,
+            &agreed,
+            run.timeout,
+            profile,
+        );
         if !(r.ran && r.recovered_matches && r.reconnect_matches) {
             requirements_met = false;
         }
@@ -1783,7 +1807,7 @@ struct ReplayCheck {
 
 /// Runs `sandbox-server --replay` over the journalled world DB and checks the
 /// rebuilt canonical hash against `expected`.
-fn run_replay_check(db: &Path, expected: &str, output: &Path) -> ReplayCheck {
+fn run_replay_check(db: &Path, expected: &str, output: &Path, profile: &str) -> ReplayCheck {
     if !db.exists() {
         return ReplayCheck {
             ran: false,
@@ -1793,7 +1817,7 @@ fn run_replay_check(db: &Path, expected: &str, output: &Path) -> ReplayCheck {
     }
     let summary_path = output.join("replay.summary.json");
     let _ = fs::remove_file(&summary_path);
-    let mut cmd = Command::new(sandbox_binary("sandbox-server"));
+    let mut cmd = Command::new(sandbox_binary_profile("sandbox-server", profile));
     cmd.args([
         // `--listen` / `--ticks` / `--log-json` are required by the arg parser
         // but ignored on the `--replay` path.
@@ -1849,6 +1873,7 @@ fn run_restart_check(
     token_file: &Path,
     expected: &str,
     deadline: Duration,
+    profile: &str,
 ) -> RestartCheck {
     let miss = RestartCheck {
         ran: false,
@@ -1869,7 +1894,7 @@ fn run_restart_check(
     }
 
     let mut guard = ChildGuard::default();
-    let mut srv = Command::new(sandbox_binary("sandbox-server"));
+    let mut srv = Command::new(sandbox_binary_profile("sandbox-server", profile));
     srv.args([
         "--serve",
         "--listen",
@@ -1915,7 +1940,7 @@ fn run_restart_check(
     };
 
     let client_timeout = deadline.saturating_sub(Duration::from_secs(3)).as_millis() as u64;
-    let mut cl = Command::new(sandbox_binary("sandbox-client"));
+    let mut cl = Command::new(sandbox_binary_profile("sandbox-client", profile));
     cl.args([
         "--connect",
         &bound,

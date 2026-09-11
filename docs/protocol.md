@@ -247,7 +247,10 @@ carry datagrams is rejected at setup.
 
 **Liveness.** QUIC keep-alive plus an application `Heartbeat` on the control
 stream every `heartbeat_interval`; a connection with no inbound control traffic
-for `idle_timeout` is closed. Defaults: 500 ms / 10 s (2 s QUIC keep-alive).
+for `idle_timeout` is closed. Defaults: 500 ms / 30 s (2 s QUIC keep-alive). The
+30 s bound gives a dependency-complete baseline capture (a bounded, CPU-heavy
+snapshot before its first bulk byte) headroom to finish under legitimate
+server-side load while still bounding a genuinely stalled peer.
 
 **Deduplication.** Per-stream sequence gates (`spall_protocol::SequenceGate`):
 the control stream is strict (any replay dropped); datagrams tolerate a bounded

@@ -1122,6 +1122,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
+            lj.publish_ready_captures(&clients_for_sim);
             let report = match sim.tick() {
                 Ok(r) => r,
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
@@ -1705,6 +1706,19 @@ struct LateJoin {
     /// late-join baseline / repair patch can fill a brick the server has
     /// evicted. `None` when residency is off.
     backing: Option<std::sync::Arc<spall_sim::MemoryBacking>>,
+    /// The most recent immutable topology baseline. A current join may reuse
+    /// it with a fresh transfer id; transactions after its cursor remain in the
+    /// ordinary per-client catch-up queue.
+    cached_baseline: Option<std::sync::Arc<BaselineTransfer>>,
+    /// Bounded worker results keyed by the joining session. The simulation owns
+    /// publication and only polls these at tick boundaries.
+    pending_captures: HashMap<
+        u64,
+        (
+            TransferId,
+            std::sync::mpsc::Receiver<Result<BaselineTransfer, baseline::BaselineError>>,
+        ),
+    >,
 }
 
 impl LateJoin {
@@ -1721,6 +1735,8 @@ impl LateJoin {
             expired_actions: 0,
             baseline_bytes: 0,
             backing: None,
+            cached_baseline: None,
+            pending_captures: HashMap::new(),
         }
     }
 
@@ -1748,6 +1764,7 @@ impl LateJoin {
         // Keep `latest_gen` so a straggler record from this session is still
         // rejected after the link is gone.
         self.links.remove(&session.raw());
+        self.pending_captures.remove(&session.raw());
     }
 
     /// Every connected client currently in normal (`Live`) replication. A client
@@ -1811,8 +1828,13 @@ impl LateJoin {
 
         if want_baseline {
             let id = self.next_id();
-            match self.capture_for(sim, id) {
+            match self
+                .cached_baseline
+                .as_ref()
+                .filter(|b| b.begin.journal_cursor == JournalSeq(sim.journal_cursor()))
+            {
                 Some(transfer) => {
+                    let transfer = transfer.reissue(id);
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&session.raw()) {
                         link.phase = Phase::Joining {
@@ -1824,9 +1846,23 @@ impl LateJoin {
                     send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
                 }
                 None => {
-                    self.failed += 1;
-                    self.links.remove(&session.raw());
-                    send_to(clients, session, Outbound::Shutdown);
+                    let snapshot = baseline::snapshot_world(sim);
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    std::thread::spawn(move || {
+                        let _ = tx.send(baseline::transfer_from_snapshot(
+                            snapshot,
+                            id,
+                            InterestEpoch(1),
+                        ));
+                    });
+                    if let Some(link) = self.links.get_mut(&session.raw()) {
+                        link.phase = Phase::Joining {
+                            transfer_id: id,
+                            queue: VecDeque::new(),
+                            retries: 0,
+                        };
+                        self.pending_captures.insert(session.raw(), (id, rx));
+                    }
                 }
             }
             return;
@@ -1875,6 +1911,9 @@ impl LateJoin {
         sim: &Simulation,
         clients: &ClientMap,
     ) {
+        // A topology transaction invalidates the snapshot/cursor pairing. Body
+        // motion alone does not: the promotion keyframe supplies current poses.
+        self.cached_baseline = None;
         if let Some(t) = &split_transfer {
             self.baseline_bytes += t.payload_bytes() as u64;
         }
@@ -1961,10 +2000,55 @@ impl LateJoin {
     /// Captures a baseline transfer at the current tick / journal cursor, over
     /// the logical brick set (evicted bricks filled from the residency
     /// backing when one is installed).
-    fn capture_for(&self, sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
+    fn capture_for(&mut self, sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
         let cursor = JournalSeq(sim.journal_cursor());
-        baseline::logical_capture_transfer(sim, self.backing_ref(), id, InterestEpoch(1), cursor)
-            .ok()
+        if let Some(cached) = &self.cached_baseline
+            && cached.begin.journal_cursor == cursor
+        {
+            return Some(cached.reissue(id));
+        }
+        let transfer = baseline::logical_capture_transfer(
+            sim,
+            self.backing_ref(),
+            id,
+            InterestEpoch(1),
+            cursor,
+        )
+        .ok()?;
+        self.cached_baseline = Some(std::sync::Arc::new(transfer.reissue(id)));
+        Some(transfer)
+    }
+
+    fn publish_ready_captures(&mut self, clients: &ClientMap) {
+        let ready: Vec<(u64, Result<BaselineTransfer, baseline::BaselineError>)> = self
+            .pending_captures
+            .iter()
+            .filter_map(|(&raw, (_, rx))| rx.try_recv().ok().map(|result| (raw, result)))
+            .collect();
+        for (raw, result) in ready {
+            let Some((id, _)) = self.pending_captures.remove(&raw) else {
+                continue;
+            };
+            match result {
+                Ok(transfer) => {
+                    self.baseline_bytes += transfer.payload_bytes() as u64;
+                    self.cached_baseline = Some(Arc::new(transfer.reissue(id)));
+                    if let Some(link) = self.links.get(&raw) {
+                        send_to(
+                            clients,
+                            link.session,
+                            Outbound::Baseline(Arc::new(transfer)),
+                        );
+                    }
+                }
+                _ => {
+                    self.failed += 1;
+                    if let Some(link) = self.links.remove(&raw) {
+                        send_to(clients, link.session, Outbound::Shutdown);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2511,7 +2595,7 @@ async fn send_baseline(conn: &Connection, transfer: &BaselineTransfer) -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
-    for part in &transfer.parts {
+    for part in transfer.parts.iter() {
         if bulk.send_part(part).await.is_err() {
             return false;
         }
@@ -3041,6 +3125,42 @@ mod tests {
         assert!(lj.session_expired(old));
         // A slot that never connected is not "expired".
         assert!(!lj.session_expired(sess(3, 1)));
+    }
+
+    #[test]
+    fn simultaneous_joiners_reuse_the_same_immutable_baseline_at_one_cursor() {
+        let sim = Scene::BridgeCut.simulation();
+        let mut lj = LateJoin::new(DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES);
+        let first = lj.capture_for(&sim, TransferId(1)).unwrap();
+        let second = lj.capture_for(&sim, TransferId(2)).unwrap();
+
+        assert_eq!(first.begin.journal_cursor, second.begin.journal_cursor);
+        assert_eq!(first.begin.transfer_id, TransferId(1));
+        assert_eq!(second.begin.transfer_id, TransferId(2));
+        assert!(std::sync::Arc::ptr_eq(&first.world, &second.world));
+        assert!(
+            second
+                .parts
+                .iter()
+                .all(|part| part.transfer_id == TransferId(2))
+        );
+
+        let tx = Arc::new(TopologyTransaction {
+            transaction_id: spall_core::TransactionId::new(1).unwrap(),
+            server_tick: spall_core::Tick(1),
+            control_seq: spall_protocol::ControlSeq(0),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![],
+            result_hashes: vec![],
+        });
+        lj.fan_out_transaction(tx, None, &sim, &empty_clients());
+        assert!(
+            lj.cached_baseline.is_none(),
+            "a topology commit invalidates the cache"
+        );
     }
 
     #[test]
