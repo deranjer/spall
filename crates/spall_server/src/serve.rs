@@ -1307,8 +1307,14 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
             // Quiesce only after the pipeline is drained *and* no client has
             // sent anything for `quiescence` ticks — a late scripted action from
-            // one client keeps the run alive for the others.
-            if sim.is_idle() && !saw_client_work && report.committed.is_empty() {
+            // one client keeps the run alive for the others. A client still
+            // mid-baseline (`lj.any_joining()`) also keeps the run alive: under
+            // an impaired transport its bulk transfer can legitimately take
+            // longer than `quiescence` ticks of otherwise-quiet simulation, and
+            // ending the run out from under it would strand the connection
+            // before the client ever gets to replicate.
+            if sim.is_idle() && !saw_client_work && report.committed.is_empty() && !lj.any_joining()
+            {
                 idle_streak += 1;
             } else {
                 idle_streak = 0;
@@ -1741,6 +1747,20 @@ impl LateJoin {
             .values()
             .filter(|link| matches!(link.phase, Phase::Live))
             .map(|link| link.session)
+    }
+
+    /// `true` while any connected client is still mid-baseline: it has sent its
+    /// `BaselineAck` sentinel (or been re-captured after a catch-up overflow)
+    /// but has not yet sent back the confirming ack that promotes it to `Live`.
+    /// A run must never be declared quiescent while this holds — an impaired
+    /// transport can stretch a bulk transfer well past `quiescence_ticks` of
+    /// otherwise-idle ticks, and ending the session early strands that client's
+    /// connection before its transfer completes (it never gets a chance to
+    /// replicate, let alone run its scripted movement/residency).
+    fn any_joining(&self) -> bool {
+        self.links
+            .values()
+            .any(|link| matches!(link.phase, Phase::Joining { .. }))
     }
 
     /// `true` if `session`'s generation has been superseded by a reconnect on

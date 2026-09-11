@@ -412,6 +412,14 @@ impl Simulation {
             })
             .collect();
         self.world.advance_players(TICK_DT_S, &boxes);
+        if std::env::var_os("SPALL_DEBUG_PLAYER").is_some() {
+            for p in self.world.players() {
+                eprintln!(
+                    "DBGPLAYER tick={} pos={:?} grounded={} vel={:?}",
+                    self.tick.0, p.state.position_m, p.state.grounded, p.state.velocity_m_s
+                );
+            }
+        }
     }
 
     /// Registers an authoritative player capsule at `feet_m` (metres). `entity`

@@ -323,6 +323,13 @@ pub struct ClientSummary {
     /// meaningless (`false`) when no baseline was pulled.
     #[serde(default)]
     pub late_join_ready_confirmed: bool,
+    /// A mid-session `BaselineBegin` (hash-repair patch or split-bulk
+    /// transfer) whose body failed to arrive intact — dropped rather than
+    /// treated as fatal (see the control reader). Non-zero under loss is
+    /// expected; what matters is that reloads still complete (see
+    /// `client_residency_reloads_completed`) despite it.
+    #[serde(default)]
+    pub baseline_transfer_failures: u64,
 }
 
 /// Anything that stops a client run before it can report.
@@ -417,6 +424,13 @@ struct Counters {
     /// `1` when the installed baseline carries at least one body volume, so
     /// "ready" waits for a motion keyframe before it is declared.
     late_join_has_bodies: AtomicU64,
+    /// A `BaselineBegin` (a mid-session hash-repair patch, or split-bulk
+    /// transfer) whose body failed to arrive intact — the bulk stream, the
+    /// decode, or the `BaselineEnd` hash check. Under loss this is expected
+    /// occasionally; the requester (residency pass or gapped-transaction
+    /// retry) already re-requests on its own schedule, so this is dropped and
+    /// counted rather than treated as fatal.
+    baseline_transfer_failures: AtomicU64,
 }
 
 /// The `CharacterState` carried by a player [`MotionSnapshot`]. Orientation is
@@ -441,6 +455,18 @@ struct Predictor {
     terrain_hash: Option<Hash32>,
     input_seq: u64,
     recent: std::collections::VecDeque<RecentInput>,
+    /// The server tick observed on the *first* authoritative snapshot for this
+    /// player (when `player` is first created). Movement-script windows are
+    /// authored relative to "ticks since this client's player went live", not
+    /// the server's absolute tick — under a fast/clean join the two coincide,
+    /// but an impaired transport can stretch the join handshake (baseline
+    /// transfer, its confirming ack, and the resulting keyframe snapshot — each
+    /// its own round trip) well past the tick the script expects to start at.
+    /// Anchoring on this snapshot rather than on when the baseline *transfer*
+    /// finished is what actually matters: the player has no authoritative state
+    /// (and the mover sends nothing) until it arrives, so it is the true
+    /// "tick zero" for the script.
+    script_origin_tick: Option<u64>,
 }
 
 impl Predictor {
@@ -453,6 +479,7 @@ impl Predictor {
             terrain_hash: None,
             input_seq: 0,
             recent: std::collections::VecDeque::new(),
+            script_origin_tick: None,
         }
     }
 }
@@ -733,6 +760,18 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         // retried (ENG-49).
                         let is_split =
                             begin.transfer_id.0 & spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT != 0;
+                        // A `None` here is *this one transfer* failing to
+                        // arrive intact (the bulk stream, the decode, or the
+                        // `BaselineEnd` hash check) — expected occasionally
+                        // under loss, and not fatal to the connection: the
+                        // requester (the residency pass's cooldown, or a
+                        // gapped transaction's own retry) re-requests on its
+                        // own schedule regardless. Tearing down the whole
+                        // control-record loop over one failed transfer used
+                        // to leave every *later* repair response unread too
+                        // — including ones for a request sent well after
+                        // this failure — turning one dropped patch into a
+                        // permanently stuck reload.
                         match receive_baseline_body(&conn).await {
                             Some(world) if is_split => {
                                 let retried = {
@@ -762,7 +801,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                     forward_outcome(&conn, &counters, outcome).await;
                                 }
                             }
-                            None => break,
+                            None => {
+                                counters
+                                    .baseline_transfer_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                     Ok(Some(WireRecord::ActionStatus(st))) => {
@@ -833,6 +876,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                 match &mut p.player {
                                     None => {
                                         p.player = Some(PredictedPlayer::new(p.params, st));
+                                        p.script_origin_tick.get_or_insert(snap.server_tick.get());
                                     }
                                     Some(pl) => pl.reconcile(&p.phys, st, snap.acked_input),
                                 }
@@ -914,6 +958,12 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             // `RepairRequest`s as the player returns.
             let mut residency = client_residency
                 .map(|l| ClientResidencyPass::new(l.budget_bricks, l.interest_radius_bricks));
+            // A residency gap deliberately holds prediction over unknown
+            // ground.  Script legs describe controlled movement, so advancing
+            // their clock during that hold would consume the outbound leg
+            // without ever sending an input frame.
+            let mut active_script_tick = 0_u64;
+            let mut last_active_server_tick = None;
             loop {
                 if *stop_rx.borrow() {
                     return;
@@ -930,7 +980,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 // All predictor-lock work happens in this non-async block, which
                 // returns the datagram to send (and the predicted feet position
                 // for the residency pass) once the guard is dropped.
-                let (frame, feet): (Option<InputFrame>, Option<[f64; 3]>) = {
+                let (frame, feet, script_tick): (
+                    Option<InputFrame>,
+                    Option<[f64; 3]>,
+                    Option<u64>,
+                ) = {
                     let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
                     let p: &mut Predictor = &mut guard;
                     if let Some((hash, volume)) = terrain
@@ -944,12 +998,45 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         }
                     }
 
-                    let frame = if p.player.is_some() && p.phys.has_terrain() {
-                        let input = scripted_input(&script, tick);
+                    // Beyond simply having *a* collider, prediction needs it to
+                    // actually cover where the player is standing
+                    // (`ClientPhysics::covers`): the collider body survives a
+                    // residency gap (`set_terrain` keeps it, empty, for a later
+                    // refill), so `has_terrain` alone stays true while a reload
+                    // a lossy repair round trip hasn't delivered yet leaves the
+                    // player over unknown ground. Predicting through that as if
+                    // it were confirmed air is exactly what turns one delayed
+                    // reload into an unbounded free-fall; holding here instead
+                    // means the predicted tick simply resumes once the brick
+                    // lands, the same way it already pauses before the player
+                    // exists.
+                    let ready = p
+                        .player
+                        .as_ref()
+                        .is_some_and(|pl| p.phys.covers(pl.predicted().position_m));
+
+                    // Start only once the player is live, then advance only
+                    // when an input is actually predicted and sent.  This
+                    // pauses an authored leg through a known residency hold.
+                    let script_tick = p.script_origin_tick.map(|_| active_script_tick);
+
+                    let frame = if ready && p.phys.has_terrain() {
+                        let input = scripted_input(&script, script_tick.unwrap_or(0));
                         p.input_seq += 1;
                         let seq = InputSeq(p.input_seq);
                         if let Some(pl) = &mut p.player {
                             pl.tick(&p.phys, input, seq, MOVEMENT_DT_S);
+                        }
+                        // Preserve the script's server-tick cadence.  The
+                        // mover itself samples more often than snapshots can
+                        // advance, so incrementing once per loop makes an
+                        // impaired client cover several scripted ticks per
+                        // authoritative tick.  Resetting this reference while
+                        // held intentionally discards the unknown-ground gap.
+                        let prior = last_active_server_tick.replace(tick);
+                        if let Some(prior) = prior {
+                            active_script_tick =
+                                active_script_tick.saturating_add(tick.saturating_sub(prior));
                         }
 
                         let recent: Vec<RecentInput> =
@@ -974,10 +1061,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             recent,
                         })
                     } else {
+                        last_active_server_tick = None;
                         None
                     };
                     let feet = p.player.as_ref().map(|pl| pl.predicted().position_m);
-                    (frame, feet)
+                    (frame, feet, script_tick)
                 };
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
@@ -1007,8 +1095,10 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 }
 
                 // Stop predicting a while after the script ends (the neutral
-                // tail proves the player settles).
-                if end_tick > 0 && tick > end_tick + 180 {
+                // tail proves the player settles). `script_tick` advances only
+                // while controlled input is sent, so an unknown-ground hold
+                // cannot silently consume this neutral tail.
+                if end_tick > 0 && script_tick.is_some_and(|t| t > end_tick + 360) {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(16)).await;
@@ -1131,11 +1221,18 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
 
     // T19 movement summary: a scripted player is at rest (grounded, low speed)
-    // once its script has ended and the held-input timeout has fired.
+    // once its script has ended and the held-input timeout has fired. Checked
+    // against the *authoritative* state, not the predicted one: prediction
+    // only advances while `ClientPhysics::covers` holds (see the mover loop),
+    // so it can still be legitimately frozen mid-settle if the run ends
+    // during a stall waiting on a lossy repair round trip near the very end
+    // of the script — the authoritative state keeps updating from every
+    // snapshot regardless, so it is the one that actually answers "has the
+    // real player come to rest".
     let movement = predictor.as_ref().and_then(|pred| {
         let p = pred.lock().unwrap_or_else(|e| e.into_inner());
         p.player.as_ref().map(|pl| {
-            let s = pl.predicted();
+            let s = pl.authoritative();
             let at_rest =
                 s.grounded && s.velocity_m_s[0].abs() < 0.5 && s.velocity_m_s[2].abs() < 0.5;
             pl.summary(at_rest)
@@ -1214,6 +1311,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             .load(Ordering::Relaxed),
         late_join_ready_ms: counters.late_join_ready_ms.load(Ordering::Relaxed),
         late_join_ready_confirmed: counters.late_join_ready_confirmed.load(Ordering::Relaxed) != 0,
+        baseline_transfer_failures: counters.baseline_transfer_failures.load(Ordering::Relaxed),
     };
     drop(guard);
 

@@ -13,27 +13,38 @@
 //! snaps to each snapshot and replays the still-unacknowledged inputs, and the
 //! residual is reported as a bounded correction.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use serde::Serialize;
-use spall_core::PlayerInput;
+use spall_core::{BrickCoord, GlobalCell, MaterialId, PlayerInput};
 use spall_physics::{
     BodyId, BodyKind, BodySpec, CharacterMove, CharacterParams, CharacterState, OccupancyGrid,
     PhysicsConfig, PhysicsWorld, Representation, step_character,
 };
 use spall_protocol::InputSeq;
-use spall_voxel::Volume;
+use spall_voxel::{Sample, Volume};
 
 /// Bounded predicted-input history depth.
 pub const PREDICTION_HISTORY: usize = 128;
 /// Terrain cell size, metres (the 0.25 m world grid).
 pub const CELL_M: f32 = 0.25;
+/// Cells per brick edge (`docs/architecture.md`'s fixed brick size).
+const BRICK_CELLS: i64 = 32;
 
 /// A physics world that mirrors only the replica's terrain collider, so the
 /// predictor sweeps the capsule against the geometry the server used.
 pub struct ClientPhysics {
     world: PhysicsWorld,
     terrain: Option<BodyId>,
+    /// Bricks the collider currently installed on `terrain` was actually built
+    /// from, as of the last [`set_terrain`](Self::set_terrain) — empty
+    /// whenever nothing is resident yet. Residency streams bricks
+    /// independently of each other, so this set is routinely non-contiguous
+    /// for a step or two while the player walks (one trailing brick evicted,
+    /// one leading brick still mid-reload); [`covers`](Self::covers) is what
+    /// tells a caller whether *the player's own* brick is actually one of
+    /// them, as opposed to merely "some geometry exists somewhere".
+    resident_bricks: BTreeSet<BrickCoord>,
 }
 
 impl Default for ClientPhysics {
@@ -47,15 +58,28 @@ impl ClientPhysics {
         Self {
             world: PhysicsWorld::new(PhysicsConfig::default()),
             terrain: None,
+            resident_bricks: BTreeSet::new(),
         }
     }
 
     /// (Re)builds the terrain collider from `volume`. The caller gates this on a
-    /// cheap dirty check (`ReplicaWorld::terrain_hash`). An empty terrain drops
-    /// the collider entirely so the capsule falls through a fully-removed floor.
+    /// cheap dirty check (`ReplicaWorld::terrain_hash`).
+    ///
+    /// Unlike [`OccupancyGrid::from_volume`], this tolerates a *non-contiguous*
+    /// resident set: it still takes the tight bounding box of every resident
+    /// solid cell, but a cell whose brick is not (yet) resident is treated as
+    /// empty — no collision — rather than failing the whole extraction. Under
+    /// eviction/reload churn the resident set routinely has a gap for a step
+    /// or two (one trailing brick evicted, one leading brick still mid-reload
+    /// after a lossy repair round trip); failing the entire collider over that
+    /// gap would blank out geometry that *is* loaded and correct, well away
+    /// from the gap. An empty resident set (no solid cell anywhere) still
+    /// drops the collider entirely so the capsule falls through a
+    /// fully-removed floor.
     pub fn set_terrain(&mut self, volume: &Volume) {
-        match OccupancyGrid::from_volume(volume) {
-            Ok(Some(grid)) => match self.terrain {
+        self.resident_bricks = volume.resident_brick_coords().into_iter().collect();
+        match lenient_occupancy(volume) {
+            Some(grid) => match self.terrain {
                 Some(id) => {
                     self.world
                         .rebuild_collider(id, &grid, Representation::MergedCuboids);
@@ -74,7 +98,7 @@ impl ClientPhysics {
                     self.terrain = Some(id);
                 }
             },
-            _ => {
+            None => {
                 if let Some(id) = self.terrain {
                     self.world.remove_collider(id);
                 }
@@ -99,6 +123,92 @@ impl ClientPhysics {
     pub fn has_terrain(&self) -> bool {
         self.terrain.is_some()
     }
+
+    /// Whether the brick under `feet_m` was actually resident (and so part of
+    /// the collider) as of the last [`set_terrain`]. `has_terrain` alone
+    /// cannot tell "the player's own footing is loaded" from "some other,
+    /// unrelated patch of the world is loaded" — the collider body persists
+    /// across a residency gap so a later refill can rebuild it, and stays
+    /// "present" throughout. A caller predicting movement should hold rather
+    /// than extrapolate through a point this returns `false` for: it means
+    /// the client does not yet know whether that ground is solid, not that it
+    /// has confirmed open air.
+    pub fn covers(&self, feet_m: [f64; 3]) -> bool {
+        let cell_m = f64::from(CELL_M);
+        let cell = GlobalCell::new(
+            (feet_m[0] / cell_m).floor() as i64,
+            (feet_m[1] / cell_m).floor() as i64,
+            (feet_m[2] / cell_m).floor() as i64,
+        );
+        self.resident_bricks.contains(&cell.split().0)
+    }
+}
+
+/// See [`ClientPhysics::set_terrain`]. `None` when no resident brick holds a
+/// solid cell at all (nothing to collide with yet, or a genuinely empty
+/// world); `Some` grid otherwise, built over the tight bounding box of every
+/// resident solid cell with non-resident cells inside that box left empty.
+fn lenient_occupancy(volume: &Volume) -> Option<OccupancyGrid> {
+    let coords = volume.resident_brick_coords();
+    let mut min = [i64::MAX; 3];
+    let mut max = [i64::MIN; 3];
+    for c in &coords {
+        let base = [c.x * BRICK_CELLS, c.y * BRICK_CELLS, c.z * BRICK_CELLS];
+        for lz in 0..BRICK_CELLS {
+            for ly in 0..BRICK_CELLS {
+                for lx in 0..BRICK_CELLS {
+                    let cell = GlobalCell::new(base[0] + lx, base[1] + ly, base[2] + lz);
+                    if let Ok(Sample::Filled(_)) = volume.sample(cell) {
+                        min[0] = min[0].min(cell.x);
+                        min[1] = min[1].min(cell.y);
+                        min[2] = min[2].min(cell.z);
+                        max[0] = max[0].max(cell.x);
+                        max[1] = max[1].max(cell.y);
+                        max[2] = max[2].max(cell.z);
+                    }
+                }
+            }
+        }
+    }
+    if min[0] > max[0] {
+        return None;
+    }
+    let dims = [
+        (max[0] - min[0] + 1) as u32,
+        (max[1] - min[1] + 1) as u32,
+        (max[2] - min[2] + 1) as u32,
+    ];
+    let cells = dims[0] as usize * dims[1] as usize * dims[2] as usize;
+    let mut solid = vec![false; cells];
+    let mut material = vec![MaterialId::AIR; cells];
+    for gz in 0..dims[2] {
+        for gy in 0..dims[1] {
+            for gx in 0..dims[0] {
+                let cell =
+                    GlobalCell::new(min[0] + gx as i64, min[1] + gy as i64, min[2] + gz as i64);
+                if let Ok(Sample::Filled(m)) = volume.sample(cell) {
+                    let idx = (gx + dims[0] * (gy + dims[1] * gz)) as usize;
+                    solid[idx] = true;
+                    material[idx] = m;
+                }
+                // `Sample::Empty` and `Sample::Unknown` both leave this cell
+                // as air: real air collides with nothing, and an unresident
+                // cell must not be treated as solid either — but nor may it
+                // fail the whole box the way `OccupancyGrid::from_region`
+                // rightly does for callers who need a *complete* region (a
+                // body's own geometry, a checkpoint capture). `covers` is
+                // this module's answer to "was this cell actually resident",
+                // kept separately from the grid itself.
+            }
+        }
+    }
+    OccupancyGrid::from_solid_mask(
+        GlobalCell::new(min[0], min[1], min[2]),
+        dims,
+        solid,
+        material,
+    )
+    .ok()
 }
 
 /// One predicted input, kept so it can be re-simulated after a correction.
