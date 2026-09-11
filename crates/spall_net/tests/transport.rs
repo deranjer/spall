@@ -499,6 +499,7 @@ async fn packet_loss_recovers_reliable_records_and_shutdown_never_deadlocks() {
             delay: Duration::from_millis(15),
             jitter: Duration::from_millis(10),
             reorder_period: 0,
+            rate_limit_bytes_per_sec: 0,
         }),
         run_bulk_transfer: true,
         config: TransportConfig::for_tests(),

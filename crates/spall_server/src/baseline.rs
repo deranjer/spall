@@ -137,14 +137,26 @@ pub fn transfer_from_world(
     interest_epoch: InterestEpoch,
     journal_cursor: JournalSeq,
 ) -> Result<BaselineTransfer, BaselineError> {
-    let payload = world.encode();
-
-    if payload.len() > limits::MAX_ASSEMBLED_TRANSFER {
+    // `docs/protocol.md` late-join step 2: "sending compressed, hashed
+    // baseline parts on bulk streams". The size cap applies to the
+    // *decompressed* canonical payload (the same ceiling
+    // `BaselineWorld::decode_compressed` enforces on the receiving end), so a
+    // bigger world still needs region splitting (T18) regardless of how well
+    // it compresses.
+    let raw = world.encode();
+    if raw.len() > limits::MAX_ASSEMBLED_TRANSFER {
         return Err(BaselineError::TooLarge {
-            bytes: payload.len(),
+            bytes: raw.len(),
             cap: limits::MAX_ASSEMBLED_TRANSFER,
         });
     }
+    let assembled_hash = Hash32::of(&raw);
+    // `BaselineWorld::encode_compressed` re-encodes internally rather than
+    // reusing `raw` — an acceptable one-time cost for a per-join capture, and
+    // it keeps the zstd dependency centralized in `spall_protocol` alongside
+    // `decode_compressed`.
+    let payload = world.encode_compressed();
+
     let parts = chunk_payload(&payload, transfer_id);
     if parts.len() > limits::MAX_BASELINE_PARTS {
         return Err(BaselineError::TooManyParts {
@@ -155,7 +167,6 @@ pub fn transfer_from_world(
     // At least one part always: an empty world is not a valid late-join target.
     debug_assert!(!parts.is_empty());
 
-    let assembled_hash = Hash32::of(&payload);
     let regions: Vec<BaselineRegion> = world.volumes.iter().filter_map(region_of).collect();
 
     let begin = BaselineBegin {
@@ -198,8 +209,8 @@ pub fn chunk_payload(payload: &[u8], transfer_id: TransferId) -> Vec<BaselinePar
     parts
 }
 
-/// Reassembles and decodes a received part list (client side helper; also used
-/// by the server-side round-trip test).
+/// Reassembles, decompresses, and decodes a received part list (client side
+/// helper; also used by the server-side round-trip test).
 pub fn assemble(
     parts: &[BaselinePart],
 ) -> Result<BaselineWorld, spall_protocol::BaselineDecodeError> {
@@ -207,7 +218,7 @@ pub fn assemble(
     for part in parts {
         bytes.extend_from_slice(&part.payload);
     }
-    BaselineWorld::decode(&bytes)
+    BaselineWorld::decode_compressed(&bytes)
 }
 
 /// A targeted baseline patch for one diverged brick — the authoritative answer
@@ -429,6 +440,33 @@ mod tests {
         assert_eq!(rebuilt, transfer.world);
         assert_eq!(rebuilt.volumes.len(), sim.world().body_count() + 1);
         assert_eq!(Hash32::of(&rebuilt.encode()), transfer.end.assembled_hash);
+    }
+
+    /// T23 / G3 row 11: the wire payload a late-join transfer actually ships
+    /// (`transfer.payload_bytes()`, what the join-budget measurement reports as
+    /// "compressed baseline size") must genuinely be smaller than the raw
+    /// postcard encoding, not merely carry the label — `docs/protocol.md`
+    /// requires "compressed, hashed baseline parts on bulk streams".
+    #[test]
+    fn a_capture_of_a_realistic_resident_world_is_meaningfully_compressed_over_the_wire() {
+        let sim = Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup()))
+            .expect("separated-regions scene is valid");
+        let world = world_baseline(&sim);
+        let raw = world.encode();
+
+        let transfer =
+            capture_transfer(&sim, TransferId(1), InterestEpoch(1), JournalSeq(0)).unwrap();
+        assert!(
+            transfer.payload_bytes() < raw.len(),
+            "compressed {} bytes should be smaller than raw {} bytes for a realistic \
+             resident-terrain baseline",
+            transfer.payload_bytes(),
+            raw.len()
+        );
+
+        // Reassembly (decompress + decode) still recovers the exact world.
+        let rebuilt = assemble(&transfer.parts).unwrap();
+        assert_eq!(rebuilt, world);
     }
 
     #[test]

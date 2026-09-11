@@ -295,6 +295,29 @@ pub struct ClientSummary {
     /// Transactions that first gapped on a brick this client had evicted.
     #[serde(default)]
     pub client_residency_evicted_transaction_gaps: u64,
+    /// T23 / G3 row 11 join budget: compressed bytes of the installed
+    /// late-join / full-baseline transfer (`BaselineBegin.total_bytes`, the
+    /// same bytes shipped on the wire). `0` unless a baseline was pulled.
+    #[serde(default)]
+    pub late_join_baseline_compressed_bytes: u64,
+    /// Wall-clock milliseconds from connect (start of the QUIC handshake) to
+    /// the baseline being received, decompressed, decoded, verified, and
+    /// installed. `0` unless a baseline was pulled.
+    #[serde(default)]
+    pub late_join_baseline_install_ms: u64,
+    /// Wall-clock milliseconds from connect to "ready": baseline installed
+    /// and, if it carried any bodies, the first post-baseline motion keyframe
+    /// observed (`docs/protocol.md` late-join step 4 — the catch-up queue has
+    /// drained and the client is promoted to live replication). `0` unless a
+    /// baseline was pulled.
+    #[serde(default)]
+    pub late_join_ready_ms: u64,
+    /// Whether `late_join_ready_ms` reflects an actually-observed motion
+    /// keyframe (`true`) rather than a bounded wait that timed out without
+    /// one (`false`). Always `true` when the baseline carried no bodies, and
+    /// meaningless (`false`) when no baseline was pulled.
+    #[serde(default)]
+    pub late_join_ready_confirmed: bool,
 }
 
 /// Anything that stops a client run before it can report.
@@ -374,6 +397,21 @@ struct Counters {
     residency_reloads_completed: AtomicU64,
     residency_budget_miss_steps: AtomicU64,
     residency_evicted_transaction_gaps: AtomicU64,
+    /// T23 / G3 row 11: compressed bytes of the installed late-join baseline
+    /// transfer (`BaselineBegin.total_bytes`, the same bytes shipped on the
+    /// wire) and wall-clock milliseconds from connect to baseline-installed /
+    /// to "ready". All `0` unless `late_join` is set.
+    late_join_baseline_compressed_bytes: AtomicU64,
+    late_join_baseline_install_ms: AtomicU64,
+    late_join_ready_ms: AtomicU64,
+    /// `1` once the installed baseline is confirmed caught up: either it
+    /// carried no bodies (nothing to wait for) or the first post-baseline
+    /// motion keyframe (`docs/protocol.md` late-join step 4) was actually
+    /// observed rather than the bounded wait timing out.
+    late_join_ready_confirmed: AtomicU64,
+    /// `1` when the installed baseline carries at least one body volume, so
+    /// "ready" waits for a motion keyframe before it is declared.
+    late_join_has_bodies: AtomicU64,
 }
 
 /// The `CharacterState` carried by a player [`MotionSnapshot`]. Orientation is
@@ -424,7 +462,7 @@ async fn receive_baseline_body(conn: &Connection) -> Option<BaselineWorld> {
     for part in &parts {
         bytes.extend_from_slice(&part.payload);
     }
-    let world = BaselineWorld::decode(&bytes).ok()?;
+    let world = BaselineWorld::decode_compressed(&bytes).ok()?;
     // Drain until BaselineEnd (nothing else is interleaved for this client
     // while a transfer is in flight — the server writes it as one unit).
     loop {
@@ -464,10 +502,13 @@ async fn forward_outcome(conn: &Connection, counters: &Counters, outcome: ApplyO
 }
 
 /// The initial late-join handshake: ask for a baseline, install it, confirm it.
+/// `connect_at` is the wall-clock reference point ("late-join connect") the
+/// T23 / G3 row 11 join-budget timings are measured from.
 async fn perform_late_join(
     conn: &Connection,
     replica: &Mutex<ReplicaWorld>,
     counters: &Counters,
+    connect_at: std::time::Instant,
 ) -> Result<(), ClientNetError> {
     conn.send_record(WireRecord::BaselineAck(BaselineAck {
         transfer_id: BASELINE_REQUEST_SENTINEL,
@@ -494,6 +535,18 @@ async fn perform_late_join(
             "transfer failed to assemble / verify".into(),
         ));
     };
+    // T23 / G3 row 11: the wire bytes actually shipped (compressed) and the
+    // wall-clock cost of getting the baseline received + decompressed +
+    // decoded + verified, before the (comparatively cheap) local install.
+    counters
+        .late_join_baseline_compressed_bytes
+        .store(begin.total_bytes, Ordering::Relaxed);
+    counters
+        .late_join_baseline_install_ms
+        .store(connect_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+    counters
+        .late_join_has_bodies
+        .store(u64::from(world.volumes.len() > 1), Ordering::Relaxed);
 
     {
         let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
@@ -519,6 +572,11 @@ async fn perform_late_join(
 }
 
 async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetError> {
+    // T23 / G3 row 11: the join-budget wall-clock reference point ("late-join
+    // connect"). Deliberately taken before the QUIC handshake — under the
+    // imposed network profile that handshake is itself part of the cost a
+    // late-joining player actually experiences.
+    let session_start = std::time::Instant::now();
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -571,7 +629,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     // replication stream, so the replica starts at the server's current
     // topology with no edit replay from world creation.
     if want_baseline {
-        if let Err(e) = perform_late_join(&conn, &replica, &counters).await {
+        if let Err(e) = perform_late_join(&conn, &replica, &counters, session_start).await {
             log.write(&ProcessRecord::new(
                 ProcessEvent::Failed,
                 ProcessRole::Client,
@@ -791,6 +849,40 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             }
         })
     };
+
+    // T23 / G3 row 11: for a late joiner, wait (bounded) for the "ready"
+    // signal `docs/protocol.md` late-join step 4 describes — the current
+    // motion keyframe the server sends once the catch-up queue has drained
+    // and the client is promoted to live replication. A baseline with no
+    // bodies has nothing to wait for and is ready immediately. This bounds
+    // the extra wait at a few RTTs even under the imposed loss/latency
+    // profile (a dropped keyframe is followed by the next 20 Hz batch).
+    if config.late_join {
+        let expects_motion = counters.late_join_has_bodies.load(Ordering::Relaxed) != 0;
+        let mut confirmed = !expects_motion;
+        if expects_motion {
+            const READY_POLL: Duration = Duration::from_millis(10);
+            const READY_TIMEOUT: Duration = Duration::from_secs(5);
+            let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+            loop {
+                if counters.motion.load(Ordering::Relaxed) > 0 {
+                    confirmed = true;
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline || *stop_rx.borrow() {
+                    break;
+                }
+                tokio::time::sleep(READY_POLL).await;
+            }
+        }
+        counters.late_join_ready_ms.store(
+            session_start.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        counters
+            .late_join_ready_confirmed
+            .store(u64::from(confirmed), Ordering::Relaxed);
+    }
 
     // T19 mover: every ~16 ms sample the scripted input for the observed tick,
     // predict the capsule locally, and send an `InputFrame` datagram with up to
@@ -1067,7 +1159,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         }
     };
     let summary = ClientSummary {
-        version: 2,
+        version: 3,
         result: if progressed && movement_ok {
             "passed"
         } else {
@@ -1104,6 +1196,14 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         client_residency_evicted_transaction_gaps: counters
             .residency_evicted_transaction_gaps
             .load(Ordering::Relaxed),
+        late_join_baseline_compressed_bytes: counters
+            .late_join_baseline_compressed_bytes
+            .load(Ordering::Relaxed),
+        late_join_baseline_install_ms: counters
+            .late_join_baseline_install_ms
+            .load(Ordering::Relaxed),
+        late_join_ready_ms: counters.late_join_ready_ms.load(Ordering::Relaxed),
+        late_join_ready_confirmed: counters.late_join_ready_confirmed.load(Ordering::Relaxed) != 0,
     };
     drop(guard);
 

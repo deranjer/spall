@@ -311,6 +311,10 @@ fn run_replication(args: Args) -> ExitCode {
                         "baseline_bricks": 0,
                         "max_body_displacement_m": 0.0,
                         "body_cut_committed": false,
+                        "late_join_baseline_compressed_bytes": 0,
+                        "late_join_baseline_install_ms": 0,
+                        "late_join_ready_ms": 0,
+                        "late_join_ready_confirmed": false,
                         "detail": error.to_string(),
                     });
                     let _ = std::fs::write(path, serde_json::to_vec_pretty(&body).unwrap());
