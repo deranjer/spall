@@ -175,6 +175,12 @@ pub enum BaselineScene {
     /// (T19 / T23 row 8b). A stationary client on this scene installs it as a
     /// fixed baseline; a mover pulls it over a transfer.
     Walk,
+    /// [`spall_voxel::fixtures::g1_full_envelope_scene`] — the full G1 gate
+    /// envelope (T11a / ENG-62). Terrain-only: the "moving hollow test
+    /// volume" body is added to the server's `SimWorld` after construction,
+    /// same as `g4-workload`'s debris — a live replica's baseline never
+    /// carries it.
+    G1FullEnvelope,
 }
 
 impl BaselineScene {
@@ -193,6 +199,7 @@ impl BaselineScene {
                 Some(Self::SeparatedRegionsFar)
             }
             "walk" | "walk-arena" | "player-movement" => Some(Self::Walk),
+            "g1-full-envelope" | "g1-full-workload" | "g1" => Some(Self::G1FullEnvelope),
             _ => None,
         }
     }
@@ -208,12 +215,13 @@ impl BaselineScene {
                 spall_voxel::fixtures::separated_regions_full_envelope_scene(id)
             }
             Self::Walk => spall_voxel::fixtures::walk_arena(id),
+            Self::G1FullEnvelope => spall_voxel::fixtures::g1_full_envelope_scene(id),
         }
     }
 }
 
 /// Inputs to [`run_replication_client`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientNetConfig {
     /// Server (or UDP proxy) address to send packets to.
     pub connect_addr: SocketAddr,
@@ -248,7 +256,21 @@ pub struct ClientNetConfig {
     /// capsule and pulls bricks back with `RepairRequest`s as the player
     /// returns. Needs a `movement_script` (no mover, no pass).
     pub client_residency: Option<ClientResidencyLimits>,
+    /// T11a / ENG-62 increment 3: called once, right after the replica's
+    /// initial baseline is installed (late-join) or the fixed scene is set
+    /// (a live client), with a shared handle to the live
+    /// [`crate::replica::ReplicaWorld`]. Lets a caller (e.g. a graphical
+    /// capture harness) poll the replica's real, network-replicated state on
+    /// its own schedule — independent of this client's own script/receive
+    /// loop — instead of driving an authoritative [`spall_sim::Simulation`]
+    /// directly. `None` (the default) changes nothing about the client's
+    /// behaviour.
+    pub on_replica_ready: Option<ReplicaReadyHook>,
 }
+
+/// A shared handle to the live replica, and a callback invoked with it — see
+/// [`ClientNetConfig::on_replica_ready`].
+pub type ReplicaReadyHook = Arc<dyn Fn(Arc<Mutex<ReplicaWorld>>) + Send + Sync>;
 
 /// Client terrain-residency limits (slice E2).
 #[derive(Debug, Clone, Copy)]
@@ -715,6 +737,13 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 counters.baseline_bricks.load(Ordering::Relaxed)
             )),
         ))?;
+    }
+
+    // T11a / ENG-62 increment 3: hand the caller the live replica now that its
+    // initial state is installed. The hook runs synchronously on this task but
+    // must not block — it is expected to spawn its own thread/task and return.
+    if let Some(hook) = &config.on_replica_ready {
+        hook(replica.clone());
     }
 
     // T19: a scripted-movement client predicts its own player capsule.

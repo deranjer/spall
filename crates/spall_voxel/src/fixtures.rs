@@ -480,6 +480,245 @@ pub fn giant_collapse_scene(id: VolumeId) -> Volume {
     v
 }
 
+/// Bricks per axis of [`g1_full_envelope_scene`]'s world: `8 x 4 x 8` at
+/// `CellSizeCode::Quarter` (`32` cells/brick, `0.25 m`/cell) is exactly the G1
+/// gate's `64 x 32 x 64 m` envelope (`docs/validation.md` "G1").
+pub const G1_ENVELOPE_BRICKS_X: i64 = 8;
+pub const G1_ENVELOPE_BRICKS_Y: i64 = 4;
+pub const G1_ENVELOPE_BRICKS_Z: i64 = 8;
+
+/// Flat base surface height (global cell `y`) for
+/// [`g1_full_envelope_scene`]'s terrain, outside [`g1_in_ramp`]'s footprint.
+/// A continuously-varying heightmap (the first attempt at this fixture) built
+/// a real terrain but made the greedy-box decomposition of its rolling
+/// surface exceed [`crate::collider::PRIMITIVE_BUDGET`] (measured: 7137
+/// boxes for a smooth two-axis sine blend, over the 4096 budget) — falling
+/// back to the exact native-voxel collider, whose feasibility gate then
+/// rejects the whole ~6 000 000-cell region outright
+/// (`ColliderInfeasible::TooLarge`). A flat plain with one deliberate ramp
+/// feature greedy-merges into a handful of large boxes instead, comfortably
+/// inside budget, while still giving the gate's "excavatable slope" as a real
+/// dig-into-the-hillside feature rather than a single bespoke single-brick
+/// staircase (contrast [`sloped_terrain`]).
+const G1_FLAT_HEIGHT: i64 = 46;
+
+/// The excavatable slope: a linear ramp from [`G1_FLAT_HEIGHT`] down to `34`
+/// cells over `32` cells (`8 m`) of `x`, `16` cells (`4 m`) wide on `z`.
+/// Kept `>= 34` (inside brick row `y = 1`, `32..=63`) so the ramp — like the
+/// flat plain around it — never needs brick row `y = 0` to be anything but
+/// uniformly solid.
+const G1_RAMP_X0: i64 = 180;
+const G1_RAMP_X1: i64 = 211;
+const G1_RAMP_Z0: i64 = 100;
+const G1_RAMP_Z1: i64 = 115;
+const G1_RAMP_BOTTOM_HEIGHT: i64 = 34;
+
+fn g1_in_ramp(x: i64, z: i64) -> bool {
+    (G1_RAMP_X0..=G1_RAMP_X1).contains(&x) && (G1_RAMP_Z0..=G1_RAMP_Z1).contains(&z)
+}
+
+/// Surface height (global cell `y`) for [`g1_full_envelope_scene`]'s terrain:
+/// [`G1_FLAT_HEIGHT`] everywhere except the linear ramp inside
+/// [`g1_in_ramp`]'s footprint.
+fn g1_surface_height(x: i64, z: i64) -> i64 {
+    if g1_in_ramp(x, z) {
+        let rx = x - G1_RAMP_X0;
+        let span = G1_RAMP_X1 - G1_RAMP_X0;
+        let drop = G1_FLAT_HEIGHT - G1_RAMP_BOTTOM_HEIGHT;
+        G1_FLAT_HEIGHT - (rx * drop) / span
+    } else {
+        G1_FLAT_HEIGHT
+    }
+}
+
+/// Carves a hollow rectangular shell between `a` and `b` inclusive: solid
+/// `material` walls `wall` cells thick, air interior. `a`/`b` are whatever
+/// coordinate frame the caller's edits already use (world-relative for
+/// terrain, body-local for a standalone body) — [`GlobalCell`] is generic
+/// over both, matching [`solid_block`] / [`dumbbell`] below.
+fn hollow_box(
+    v: &mut Volume,
+    id: VolumeId,
+    a: GlobalCell,
+    b: GlobalCell,
+    wall: i64,
+    material: MaterialId,
+) {
+    v.apply_edit(&EditPlan::filled_box(id, a, b, material))
+        .expect("hollow shell outer edit");
+    let inner_a = GlobalCell::new(a.x + wall, a.y + wall, a.z + wall);
+    let inner_b = GlobalCell::new(b.x - wall, b.y - wall, b.z - wall);
+    if inner_a.x <= inner_b.x && inner_a.y <= inner_b.y && inner_a.z <= inner_b.z {
+        v.apply_edit(&EditPlan::filled_box(id, inner_a, inner_b, MaterialId::AIR))
+            .expect("hollow shell interior edit");
+    }
+}
+
+/// Tower footprint: `x 24..=39`, `z 32..=47` — 16 cells (4 m) each side,
+/// straddling the brick boundaries at `x = 32` and `z = 32`, well clear of the
+/// ramp footprint, standing on the flat plain.
+const G1_TOWER_X0: i64 = 24;
+const G1_TOWER_X1: i64 = 39;
+const G1_TOWER_Z0: i64 = 32;
+const G1_TOWER_Z1: i64 = 47;
+/// The tower's base — the flat plain height, so it sits flush with no
+/// embedding or floating.
+const G1_TOWER_BASE_Y: i64 = G1_FLAT_HEIGHT;
+/// `48` cells = `12 m` (`docs/validation.md` "a 12 m hollow tower/bridge").
+const G1_TOWER_HEIGHT: i64 = 48;
+
+/// The T11a / ENG-62 G1 full-workload world: a `64 x 32 x 64 m` bounded
+/// envelope holding real, resident, walkable terrain across its whole
+/// footprint — not just isolated structures in an otherwise-absent volume
+/// (contrast [`separated_regions_scene`]) — plus a hollow tower/bridge that
+/// spans brick boundaries and can be cut down.
+///
+/// - **Ground**: [`g1_surface_height`]'s flat plain + one excavatable ramp,
+///   stone below the surface with a one-cell dirt cap. Built by direct brick
+///   construction ([`Brick::uniform`] for the 192 always-solid / always-air
+///   bricks, one shared [`Brick::restored`] flat-surface brick cloned across
+///   62 of the 64 `y = 1` columns, two bespoke `Brick::restored` bricks for
+///   the ramp) rather than a `~8 400 000`-cell `EditPlan` fill — same trick as
+///   [`giant_collapse_scene`]'s block.
+/// - **Tower**: a hollow `4 x 4 x 12 m` stone shaft ([`G1_TOWER_X0`] etc.),
+///   one cell of wall, straddling two brick boundaries, standing on the
+///   terrain.
+/// - **Bridge**: a hollow `~16 m` stone tunnel cantilevered east off the
+///   tower at mid-height, crossing a third brick boundary (`x = 64`) —
+///   supported only by its solid-cell connection to the tower (T07
+///   connectivity, not a physical beam analysis), so cutting the tower
+///   detaches it.
+///
+/// The G1 gate's "moving hollow test volume" is a **body**, not terrain — see
+/// `spall_sim::fixtures::spawn_g1_hollow_test_volume` in the sibling crate.
+pub fn g1_full_envelope_scene(id: VolumeId) -> Volume {
+    let bounds = BrickBounds::new(
+        BrickCoord::new(0, 0, 0),
+        BrickCoord::new(
+            G1_ENVELOPE_BRICKS_X - 1,
+            G1_ENVELOPE_BRICKS_Y - 1,
+            G1_ENVELOPE_BRICKS_Z - 1,
+        ),
+    )
+    .expect("valid G1 full-envelope bounds");
+    let mut v = Volume::bounded(id, CellSizeCode::Quarter, bounds);
+
+    // Brick row y = 0 (global y 0..=31): every column's surface height is
+    // >= 34 (see g1_surface_height), so this row is always fully below the
+    // surface — one uniform stone brick per column, no per-cell cost.
+    for bx in 0..G1_ENVELOPE_BRICKS_X {
+        for bz in 0..G1_ENVELOPE_BRICKS_Z {
+            v.insert_brick(
+                BrickCoord::new(bx, 0, bz),
+                Brick::uniform(STONE, Revision(1)),
+            )
+            .expect("g1 bedrock brick insert");
+        }
+    }
+    // Brick rows y = 2..=3 (global y 64..=127): every column's surface height
+    // is <= 58, so these rows are always fully above the surface — uniform
+    // resident air, so a ray or a collider query above the hills still finds
+    // real (not merely absent) empty space.
+    for by in 2..G1_ENVELOPE_BRICKS_Y {
+        for bx in 0..G1_ENVELOPE_BRICKS_X {
+            for bz in 0..G1_ENVELOPE_BRICKS_Z {
+                v.insert_brick(
+                    BrickCoord::new(bx, by, bz),
+                    Brick::uniform(MaterialId::AIR, Revision(1)),
+                )
+                .expect("g1 sky brick insert");
+            }
+        }
+    }
+    // Brick row y = 1 (global y 32..=63): the surface transition. Every
+    // column's height falls in this row. The flat plain gives every
+    // non-ramp column the identical layer, so it is built once and cloned;
+    // only the (at most) two bricks the ramp's footprint overlaps
+    // (`x 180..=211` crosses the `x = 192` brick boundary; `z 100..=115`
+    // stays inside one `z` brick) are built from their own computed layer.
+    let flat_layer = {
+        let mut cells = vec![MaterialId::AIR; spall_core::CELLS_PER_BRICK];
+        for local_z in 0..32i64 {
+            for local_x in 0..32i64 {
+                for local_y in 0..32i64 {
+                    let gy = 32 + local_y;
+                    let m = if gy < G1_FLAT_HEIGHT - 1 {
+                        STONE
+                    } else if gy == G1_FLAT_HEIGHT - 1 {
+                        DIRT
+                    } else {
+                        MaterialId::AIR
+                    };
+                    let idx = (local_x + 32 * (local_y + 32 * local_z)) as usize;
+                    cells[idx] = m;
+                }
+            }
+        }
+        Brick::restored(&cells, Revision(1), true)
+    };
+    let mut cells = vec![MaterialId::AIR; spall_core::CELLS_PER_BRICK];
+    for bx in 0..G1_ENVELOPE_BRICKS_X {
+        for bz in 0..G1_ENVELOPE_BRICKS_Z {
+            let brick_touches_ramp = (G1_RAMP_X0 / 32..=G1_RAMP_X1 / 32).contains(&bx)
+                && (G1_RAMP_Z0 / 32..=G1_RAMP_Z1 / 32).contains(&bz);
+            let brick = if brick_touches_ramp {
+                for local_z in 0..32i64 {
+                    let gz = bz * 32 + local_z;
+                    for local_x in 0..32i64 {
+                        let gx = bx * 32 + local_x;
+                        let h = g1_surface_height(gx, gz);
+                        for local_y in 0..32i64 {
+                            let gy = 32 + local_y;
+                            let m = if gy < h - 1 {
+                                STONE
+                            } else if gy == h - 1 {
+                                DIRT
+                            } else {
+                                MaterialId::AIR
+                            };
+                            let idx = (local_x + 32 * (local_y + 32 * local_z)) as usize;
+                            cells[idx] = m;
+                        }
+                    }
+                }
+                Brick::restored(&cells, Revision(1), true)
+            } else {
+                flat_layer.clone()
+            };
+            v.insert_brick(BrickCoord::new(bx, 1, bz), brick)
+                .expect("g1 surface brick insert");
+        }
+    }
+
+    // Hollow tower.
+    hollow_box(
+        &mut v,
+        id,
+        GlobalCell::new(G1_TOWER_X0, G1_TOWER_BASE_Y, G1_TOWER_Z0),
+        GlobalCell::new(
+            G1_TOWER_X1,
+            G1_TOWER_BASE_Y + G1_TOWER_HEIGHT - 1,
+            G1_TOWER_Z1,
+        ),
+        1,
+        STONE,
+    );
+
+    // Hollow bridge: cantilevered east off the tower at mid-height, 16 m
+    // long, crossing the x = 64 brick boundary.
+    let bridge_y0 = G1_TOWER_BASE_Y + 18;
+    hollow_box(
+        &mut v,
+        id,
+        GlobalCell::new(G1_TOWER_X1 + 1, bridge_y0, G1_TOWER_Z0 + 4),
+        GlobalCell::new(G1_TOWER_X1 + 1 + 63, bridge_y0 + 7, G1_TOWER_Z0 + 11),
+        1,
+        STONE,
+    );
+
+    v
+}
+
 /// BLAKE3 digest over a volume's resident bricks in canonical `(z, y, x)`
 /// order: cell size, then per brick `(coord, content hash, revision)`. Stable
 /// across runs and platforms for a given fixture; use it to pin fixtures in

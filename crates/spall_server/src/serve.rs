@@ -163,6 +163,13 @@ pub enum Scene {
     G4Workload,
     /// Full-envelope separated regions joined by a causeway (T23 / G3 row 2).
     SeparatedRegionsFar,
+    /// T11a / ENG-62: the full G1 gate envelope — `64 x 32 x 64 m` of real,
+    /// resident, walkable terrain (not just isolated structures), a hollow
+    /// tower/bridge spanning brick boundaries, an excavatable ramp, and a
+    /// moving hollow test-volume body. See
+    /// [`spall_sim::fixtures::g1_full_envelope_setup`] /
+    /// [`spall_sim::fixtures::spawn_g1_hollow_test_volume`].
+    G1FullEnvelope,
 }
 
 impl Scene {
@@ -182,6 +189,7 @@ impl Scene {
             "separated-regions-far" | "t23-g3-full-envelope" | "g3-far" => {
                 Some(Scene::SeparatedRegionsFar)
             }
+            "g1-full-envelope" | "g1-full-workload" | "g1" => Some(Scene::G1FullEnvelope),
             _ => None,
         }
     }
@@ -197,6 +205,7 @@ impl Scene {
             Scene::SeparatedRegions => "separated-regions",
             Scene::G4Workload => "g4-workload",
             Scene::SeparatedRegionsFar => "separated-regions-far",
+            Scene::G1FullEnvelope => "g1-full-envelope",
         }
     }
 
@@ -204,7 +213,11 @@ impl Scene {
     pub fn has_players(self) -> bool {
         matches!(
             self,
-            Scene::Walk | Scene::SeparatedRegions | Scene::G4Workload | Scene::SeparatedRegionsFar
+            Scene::Walk
+                | Scene::SeparatedRegions
+                | Scene::G4Workload
+                | Scene::SeparatedRegionsFar
+                | Scene::G1FullEnvelope
         )
     }
 
@@ -216,6 +229,7 @@ impl Scene {
             Scene::SeparatedRegions => &SEPARATED_REGION_SPAWNS,
             Scene::G4Workload => &G4_WORKLOAD_SPAWNS,
             Scene::SeparatedRegionsFar => &SEPARATED_REGION_FAR_SPAWNS,
+            Scene::G1FullEnvelope => &spall_sim::fixtures::G1_WORKLOAD_SPAWNS,
             _ => &[],
         }
     }
@@ -232,6 +246,7 @@ impl Scene {
             Scene::SeparatedRegionsFar => {
                 spall_sim::fixtures::separated_regions_full_envelope_setup()
             }
+            Scene::G1FullEnvelope => spall_sim::fixtures::g1_full_envelope_setup(),
         };
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
@@ -247,6 +262,12 @@ impl Scene {
             // 4096 sleeping debris bodies, built once at scene-construction
             // time (docs/reports/G3.md increment for this row).
             spall_sim::fixtures::spawn_g4_workload_bodies(sim.world_mut(), G4_WORKLOAD_SPAWNS[0]);
+        }
+        if matches!(self, Scene::G1FullEnvelope) {
+            // The gate's "moving hollow test volume" — built once at
+            // scene-construction time, same as G4Workload's debris.
+            spall_sim::fixtures::spawn_g1_hollow_test_volume(sim.world_mut())
+                .expect("hollow test volume spawns");
         }
         sim
     }

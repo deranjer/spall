@@ -199,6 +199,86 @@ pub const WALK_ARENA_SPAWNS: [[f64; 3]; 4] = [
     [1.0, 1.0, 3.0],
 ];
 
+/// The T11a / ENG-62 G1 full-workload world
+/// ([`spall_voxel::fixtures::g1_full_envelope_scene`]): the full
+/// `64 x 32 x 64 m` gate envelope with real, resident, walkable terrain
+/// (rolling-hill heightmap, dirt over stone) across its whole footprint, plus
+/// a hollow tower/bridge spanning brick boundaries. The collider region tops
+/// out at `y = 100` cells (`25 m`) — comfortably above the tallest structure
+/// (the tower's roof at `y = 92`) — rather than the full `128`-cell envelope
+/// height, since nothing above that has any geometry to collide with.
+pub fn g1_full_envelope_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: spall_voxel::fixtures::g1_full_envelope_scene(id),
+        terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(255, 100, 255)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
+/// Feet spawn positions (metres) for [`g1_full_envelope_setup`]: the four
+/// corners of the envelope, each on the local terrain surface
+/// ([`spall_voxel::fixtures::g1_surface_height`] at that column, times the
+/// `0.25 m` cell size), clear of the tower/bridge footprint
+/// (`x 24..=103`, `z 32..=47`).
+pub const G1_WORKLOAD_SPAWNS: [[f64; 3]; 4] = [
+    [2.0, 13.5, 2.0],
+    [55.0, 13.25, 55.0],
+    [2.0, 12.5, 55.0],
+    [55.0, 14.25, 2.0],
+];
+
+/// A hollow body-local cube shell: `size` cells outer, `wall` cells of solid
+/// stone, air core. The G1 gate's "moving hollow test volume" — used with
+/// [`crate::world::SimWorld::spawn_body`] to stand up a body that free-falls
+/// and settles, not terrain.
+pub fn hollow_block(size: i64, wall: i64) -> impl FnOnce(VolumeId) -> Volume {
+    move |id| {
+        let mut v = Volume::new(id, CellSizeCode::Quarter);
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(size - 1, size - 1, size - 1),
+            STONE,
+        ))
+        .expect("hollow test-volume outer shell edit");
+        let lo = wall;
+        let hi = size - 1 - wall;
+        if lo <= hi {
+            v.apply_edit(&box_plan(
+                id,
+                GlobalCell::new(lo, lo, lo),
+                GlobalCell::new(hi, hi, hi),
+                MaterialId::AIR,
+            ))
+            .expect("hollow test-volume interior edit");
+        }
+        v
+    }
+}
+
+/// Spawns the G1 gate's "moving hollow test volume": an `8`-cell (`2 m`)
+/// hollow stone cube, `1`-cell wall, a few metres above the tower's roof so it
+/// free-falls onto the tower and rolls off — real, visible motion for the
+/// destruction-capture evidence, distinct from the tower/bridge terrain.
+pub fn spawn_g1_hollow_test_volume(
+    world: &mut crate::world::SimWorld,
+) -> Result<spall_core::EntityId, crate::world::WorldError> {
+    // Drop point: above the tower roof (base 45 + height 48 = 93 cells =
+    // 23.25 m), offset so the falling cube does not spawn embedded in the
+    // tower's stone shell.
+    world.spawn_body(
+        hollow_block(8, 1),
+        BodyPose::new(DQuat::IDENTITY, [7.0, 27.0, 9.0]),
+        [0.0; 3],
+        [0.3, 0.0, 0.2],
+        2600.0,
+        0,
+    )
+}
+
 /// The T23 / G3 integrated-acceptance world
 /// ([`spall_voxel::fixtures::separated_regions_scene`]): two independent
 /// collapsible bridge structures in one bounded `256 x 128 x 256 m` world, a
