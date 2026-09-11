@@ -169,6 +169,8 @@ pub enum BaselineScene {
     /// live (non-late-join) replica's baseline is terrain-only — it never
     /// carries the pre-existing bodies. See `docs/reports/G3.md`.
     SeparatedRegions,
+    /// Full-envelope separated regions joined by a causeway (T23 / G3 row 2).
+    SeparatedRegionsFar,
     /// [`spall_voxel::fixtures::walk_arena`] — the flat 30 m movement lane
     /// (T19 / T23 row 8b). A stationary client on this scene installs it as a
     /// fixed baseline; a mover pulls it over a transfer.
@@ -187,6 +189,9 @@ impl BaselineScene {
             "bulk-split" | "giant-split" => Some(Self::BulkSplit),
             "separated-regions" | "t23-g3" | "g3" => Some(Self::SeparatedRegions),
             "g4-workload" | "t23-g4" | "g4" => Some(Self::SeparatedRegions),
+            "separated-regions-far" | "t23-g3-full-envelope" | "g3-far" => {
+                Some(Self::SeparatedRegionsFar)
+            }
             "walk" | "walk-arena" | "player-movement" => Some(Self::Walk),
             _ => None,
         }

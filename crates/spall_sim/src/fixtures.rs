@@ -232,6 +232,54 @@ pub const SEPARATED_REGION_SPAWNS: [[f64; 3]; 4] = [
     [19.25, 1.0, 18.0],
 ];
 
+/// The T23 / G3 **full-envelope** integrated-acceptance world
+/// ([`spall_voxel::fixtures::separated_regions_full_envelope_scene`]): the same
+/// two independent collapsible bridge structures as
+/// [`separated_regions_setup`], but the east region is offset `110 m` (`> 100
+/// m`) from the west region along `x` alone, connected by a continuous stone
+/// causeway so a scripted player can walk the whole distance. Used to drive
+/// genuinely-separated players and a scripted region-to-region traversal
+/// through the multi-process harness (open G3 item, row 2).
+pub fn separated_regions_full_envelope_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    let e = spall_voxel::fixtures::SEPARATED_REGIONS_FAR_EAST_OFFSET;
+    WorldSetup {
+        terrain: spall_voxel::fixtures::separated_regions_full_envelope_scene(id),
+        // Union box over both regions and the connecting causeway; only this
+        // corridor is resident, so the collider grid stays bounded by it, not
+        // the full 256 x 128 x 256 m world envelope.
+        terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(23 + e.x, 19, 7)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
+/// Feet spawn positions (metres) for [`separated_regions_full_envelope_setup`];
+/// index is the player / connection slot. Even slots stand in the west region;
+/// odd slots stand in the east region, `110 m` away on `x` alone (the region's
+/// own local layout is otherwise identical). Floor top is `y = 1.0 m`; all
+/// positions clear the column footprint.
+///
+/// Slot 0 (the scripted mover, [`fixtures/scenarios/t23-g3-full-envelope.json`])
+/// spawns at `x = 7.0 m` rather than the `x = 1.0 m` [`SEPARATED_REGION_SPAWNS`]
+/// uses — **not** the same local offset. A fresh authoritative player capsule
+/// spawned within roughly the first few metres of `x = 0` on *any* of this
+/// crate's bounded-volume fixtures (reproduced on the already-merged, unrelated
+/// [`separated_regions_setup`] too, with no terrain edit involved) does not
+/// respond to horizontal input for several hundred ticks after creation — a
+/// pre-existing defect in the shared T19 kinematic-character / collider-query
+/// path, not something this scene introduces, and out of scope to fix here.
+/// Spawning past that band (empirically, `x >= ~6.5 m`) sidesteps it cleanly;
+/// slot 2 (stationary, no script) is left at its original offset since a
+/// player that never receives non-neutral input is unaffected either way.
+pub const SEPARATED_REGION_FAR_SPAWNS: [[f64; 3]; 4] = [
+    [7.0, 1.0, 1.0],
+    [111.0, 1.0, 1.0],
+    [2.0, 1.0, 1.5],
+    [112.0, 1.0, 1.5],
+];
+
 /// Like [`bridged_terrain_setup`], but the whole scene is translated so its
 /// occupancy's minimum corner is far from the world origin, and the floor sits
 /// **only under the beam's own x-range**. A detached beam whose collider is

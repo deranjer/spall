@@ -38,7 +38,9 @@ use spall_protocol::{
     PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
     frame_input, recent_input, session_player_entity,
 };
-use spall_sim::fixtures::{G4_WORKLOAD_SPAWNS, SEPARATED_REGION_SPAWNS, WALK_ARENA_SPAWNS};
+use spall_sim::fixtures::{
+    G4_WORKLOAD_SPAWNS, SEPARATED_REGION_FAR_SPAWNS, SEPARATED_REGION_SPAWNS, WALK_ARENA_SPAWNS,
+};
 use spall_sim::{
     Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
     SimulationConfig, action_statuses, fixtures,
@@ -159,6 +161,8 @@ pub enum Scene {
     /// [`spall_sim::fixtures::g4_workload_setup`] /
     /// [`spall_sim::fixtures::spawn_g4_workload_bodies`].
     G4Workload,
+    /// Full-envelope separated regions joined by a causeway (T23 / G3 row 2).
+    SeparatedRegionsFar,
 }
 
 impl Scene {
@@ -175,6 +179,9 @@ impl Scene {
             "bulk-split" | "giant-split" => Some(Scene::BulkSplit),
             "separated-regions" | "t23-g3" | "g3" => Some(Scene::SeparatedRegions),
             "g4-workload" | "t23-g4" | "g4" => Some(Scene::G4Workload),
+            "separated-regions-far" | "t23-g3-full-envelope" | "g3-far" => {
+                Some(Scene::SeparatedRegionsFar)
+            }
             _ => None,
         }
     }
@@ -189,6 +196,7 @@ impl Scene {
             Scene::BulkSplit => "bulk-split",
             Scene::SeparatedRegions => "separated-regions",
             Scene::G4Workload => "g4-workload",
+            Scene::SeparatedRegionsFar => "separated-regions-far",
         }
     }
 
@@ -196,7 +204,7 @@ impl Scene {
     pub fn has_players(self) -> bool {
         matches!(
             self,
-            Scene::Walk | Scene::SeparatedRegions | Scene::G4Workload
+            Scene::Walk | Scene::SeparatedRegions | Scene::G4Workload | Scene::SeparatedRegionsFar
         )
     }
 
@@ -207,6 +215,7 @@ impl Scene {
             Scene::Walk => &WALK_ARENA_SPAWNS,
             Scene::SeparatedRegions => &SEPARATED_REGION_SPAWNS,
             Scene::G4Workload => &G4_WORKLOAD_SPAWNS,
+            Scene::SeparatedRegionsFar => &SEPARATED_REGION_FAR_SPAWNS,
             _ => &[],
         }
     }
@@ -220,6 +229,9 @@ impl Scene {
             Scene::BulkSplit => spall_sim::fixtures::bulk_split_setup(),
             Scene::SeparatedRegions => spall_sim::fixtures::separated_regions_setup(),
             Scene::G4Workload => spall_sim::fixtures::g4_workload_setup(),
+            Scene::SeparatedRegionsFar => {
+                spall_sim::fixtures::separated_regions_full_envelope_setup()
+            }
         };
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
