@@ -256,3 +256,23 @@ fn live_client_reload_work_is_globally_bounded_and_counts_completions() {
         "the bounded queue must fairly advance to later eligible bricks"
     );
 }
+
+#[test]
+fn live_client_does_not_duplicate_an_inflight_reload_before_its_retry_window() {
+    let sim = server();
+    let mut replica = replica_of(&sim);
+    let terrain = replica.terrain_volume_id();
+    let victim = east_bricks(&replica)[0];
+    assert!(replica.evict_brick(terrain, victim));
+
+    let mut pass = ClientResidencyPass::new(128, 16);
+    let first = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+    assert_eq!(first.len(), 1);
+    for _ in 0..119 {
+        assert!(pass.step(&mut replica, [0.5, 0.5, 0.5]).is_empty());
+    }
+    assert_eq!(pass.reloads_requested_total(), 1);
+    let retry = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+    assert_eq!(retry.len(), 1);
+    assert_eq!(pass.reloads_requested_total(), 2);
+}

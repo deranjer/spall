@@ -144,11 +144,11 @@ impl ClientResidency {
     }
 }
 
-/// Consecutive steps a retained-digest brick that is back in interest waits
-/// between outbound `RepairRequest`s, so one lost / in-flight patch is not
-/// re-requested every mover iteration. The patch itself clears the digest
-/// (`EvictedBricks::drop_resident`), which stops the requests for good.
-const RELOAD_COOLDOWN_STEPS: u32 = 24;
+/// Consecutive mover steps a repair transfer owns its brick before a retry is
+/// eligible.  This is deliberately longer than the loss profile's RTT: a QUIC
+/// bulk stream may still be retransmitting, and repeatedly asking for the same
+/// brick creates a queue of obsolete full-patch transfers behind it.
+const RELOAD_COOLDOWN_STEPS: u32 = 120;
 
 /// Global request ceiling for one mover iteration. Per-brick cooldown alone is
 /// insufficient: entering a wide interest box could otherwise enqueue every
