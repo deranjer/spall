@@ -39,6 +39,13 @@ struct Args {
     /// terrain. Repeatable.
     #[arg(long = "cut", value_parser = parse_cut)]
     cuts: Vec<Cut>,
+    /// T23 / G3 row 13: a JSON array of `{"tick", "cell": [x,y,z], "radius",
+    /// "target"}` (same fields as `--cut`, `target` optional/`"terrain"` by
+    /// default) — for a sustained script too long to fit as individual
+    /// `--cut` arguments on one process command line. Appended after any
+    /// `--cut` entries.
+    #[arg(long)]
+    cuts_file: Option<PathBuf>,
     /// T19 scripted movement leg: `FROM:TO:MX,MY,MZ:BUTTONS` — hold the
     /// (clamped `-1..=1`) movement axes and button bitset from server tick
     /// `FROM` up to `TO`. The player walks along `+X` (button 1 = jump).
@@ -119,6 +126,56 @@ fn parse_move(s: &str) -> Result<MoveLeg, String> {
         movement: [m[0], m[1], m[2]],
         buttons,
     })
+}
+
+/// One `--cuts-file` entry — the same fields `parse_cut` reads off a `--cut`
+/// string, as JSON instead (see `Cut`).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CutFileEntry {
+    tick: u64,
+    cell: [i64; 3],
+    radius: i64,
+    #[serde(default)]
+    target: CutFileTarget,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CutFileTarget {
+    #[default]
+    Terrain,
+    Body,
+}
+
+/// Reads a `--cuts-file`'s JSON array into `Cut`s, or an empty vec + a
+/// printed warning if it can't be read/parsed — a malformed sustained-script
+/// file should not silently vanish into "the client just never edited".
+fn read_cuts_file(path: &std::path::Path) -> Vec<Cut> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("sandbox-client: --cuts-file {path:?}: {e}");
+            return Vec::new();
+        }
+    };
+    match serde_json::from_str::<Vec<CutFileEntry>>(&body) {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|e| Cut {
+                tick: e.tick,
+                cell: e.cell,
+                radius: e.radius,
+                target: match e.target {
+                    CutFileTarget::Terrain => ScriptTarget::Terrain,
+                    CutFileTarget::Body => ScriptTarget::DetachedBody,
+                },
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("sandbox-client: --cuts-file {path:?}: {e}");
+            Vec::new()
+        }
+    }
 }
 
 fn parse_cut(s: &str) -> Result<Cut, String> {
@@ -226,8 +283,11 @@ fn run_replication(args: Args) -> ExitCode {
     }
 
     let id_base = (args.client_index << 40) | 1;
-    let script: Vec<ScriptedAction> = args
-        .cuts
+    let mut all_cuts = args.cuts.clone();
+    if let Some(path) = &args.cuts_file {
+        all_cuts.extend(read_cuts_file(path));
+    }
+    let script: Vec<ScriptedAction> = all_cuts
         .iter()
         .enumerate()
         .map(|(i, c)| ScriptedAction {

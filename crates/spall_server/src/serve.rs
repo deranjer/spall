@@ -504,6 +504,25 @@ pub struct ServeSummary {
     /// Ticks the resident-brick count exceeded `budget_bricks` (a player's
     /// interest set is larger than the declared budget).
     pub residency_budget_miss_ticks: u64,
+    /// T23 / G3 row 14: **per-connection** application/transport egress — the
+    /// aggregate `app_egress_bytes` / `transport_egress_bytes` above prove
+    /// total bandwidth is bounded, but not that `motion_interest` actually
+    /// separates load *between* clients. One row per connection that was ever
+    /// accepted this run (order not meaningful; sorted by slot).
+    pub per_client_egress: Vec<PerClientEgress>,
+}
+
+/// One connection's total egress this run, alongside where its interest
+/// anchor (player spawn) was, so a reviewer can read bandwidth separation
+/// directly off the numbers without any client-side cooperation.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PerClientEgress {
+    pub slot: u32,
+    /// `None` on a scene with no player spawns (a `motion_static_anchor`
+    /// scenario) or if the connection closed before `Joined` was processed.
+    pub spawn_m: Option<[f64; 3]>,
+    pub app_bytes: u64,
+    pub transport_bytes: u64,
 }
 
 /// Anything that stops a [`serve`] run.
@@ -800,7 +819,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     // and folds its final counts into `egress_closed` under the `conns` lock, so
     // teardown counts every connection exactly once.
     let conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let egress_closed: Arc<Mutex<(u64, u64)>> = Arc::new(Mutex::new((0, 0)));
+    // T20 / T23 G3 row 14: per-session (not just summed) egress, keyed by
+    // `session.raw()` — same close-once-counted discipline as the aggregate
+    // version above.
+    let egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -971,6 +993,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut client_repl: HashMap<u64, ClientReplication> = HashMap::new();
         let mut motion_batch_index = 0u64;
         let mut motion_egress = MotionEgress::default();
+        // T23 / G3 row 14: each slot's player spawn, so the final per-connection
+        // egress report can be read alongside where that connection's interest
+        // anchor was.
+        let mut client_spawns: HashMap<u32, [f64; 3]> = HashMap::new();
 
         // ENG-61: rolling "every detached body is holding still" window. Each
         // tick we compare every body's origin Y against the previous tick; a run
@@ -1013,6 +1039,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             let slot = session.slot().0 as usize;
                             let spawn = spawns[slot.min(spawns.len() - 1)];
                             sim.add_player(session_player_entity(session), spawn);
+                            // T23 / G3 row 14: remember which spawn this slot
+                            // got, so the final per-connection egress report
+                            // can be read alongside *where* that connection's
+                            // interest anchor was — self-describing bandwidth
+                            // separation evidence with no client cooperation.
+                            client_spawns.insert(session.slot().0, spawn);
                         }
                     }
                     Inbound::Input(session, frame) => {
@@ -1475,6 +1507,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             actions_queued_unresolved: submitted_at.len() as u64,
             latency: commit_latency.report(),
             residency: residency.as_ref().map(|p| p.stats()),
+            client_spawns,
         }
     });
 
@@ -1492,14 +1525,35 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     // late-closing `serve_conn` can neither remove-and-accumulate an entry
     // concurrently (it takes the same lock first) nor be missed — every
     // connection is counted once, here or in `egress_closed`.
-    let (app_egress_bytes, transport_egress_bytes) = {
+    let (app_egress_bytes, transport_egress_bytes, per_client_egress) = {
         let conns_guard = conns.lock().unwrap_or_else(|e| e.into_inner());
         let mut acc = egress_closed.lock().unwrap_or_else(|e| e.into_inner());
-        for conn in conns_guard.values() {
-            acc.0 = acc.0.saturating_add(conn.stats().app_bytes_sent);
-            acc.1 = acc.1.saturating_add(conn.transport_stats().udp_tx.bytes);
+        for (raw, conn) in conns_guard.iter() {
+            acc.insert(
+                *raw,
+                (
+                    conn.stats().app_bytes_sent,
+                    conn.transport_stats().udp_tx.bytes,
+                ),
+            );
         }
-        (acc.0, acc.1)
+        let mut app_total = 0u64;
+        let mut transport_total = 0u64;
+        let mut rows: Vec<PerClientEgress> = Vec::with_capacity(acc.len());
+        for (&raw, &(app_bytes, transport_bytes)) in acc.iter() {
+            app_total = app_total.saturating_add(app_bytes);
+            transport_total = transport_total.saturating_add(transport_bytes);
+            // `SessionId`'s high 32 bits are the slot (see spall_protocol::session).
+            let slot = (raw >> 32) as u32;
+            rows.push(PerClientEgress {
+                slot,
+                spawn_m: sim_result.client_spawns.get(&slot).copied(),
+                app_bytes,
+                transport_bytes,
+            });
+        }
+        rows.sort_by_key(|r| r.slot);
+        (app_total, transport_total, rows)
     };
 
     let clients_connected = *count_rx.borrow();
@@ -1579,6 +1633,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             .residency
             .map(|r| r.budget_miss_ticks)
             .unwrap_or(0),
+        per_client_egress,
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -1631,6 +1686,10 @@ struct SimResult {
     actions_queued_unresolved: u64,
     latency: commit_latency::LatencyReport,
     residency: Option<crate::ResidencyStats>,
+    /// T23 / G3 row 14: each slot's player spawn, keyed by slot so the outer
+    /// per-connection egress report (built after this blocking task returns)
+    /// can be read alongside where that connection's interest anchor was.
+    client_spawns: HashMap<u32, [f64; 3]>,
 }
 
 impl SimResult {
@@ -1670,6 +1729,7 @@ impl SimResult {
             actions_queued_unresolved: 0,
             latency: commit_latency::LatencyReport::default(),
             residency: None,
+            client_spawns: HashMap::new(),
         }
     }
 }
@@ -2645,7 +2705,7 @@ async fn serve_conn(
     handle: OutboundHandle,
     clients: ClientMap,
     conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
-    egress_closed: Arc<Mutex<(u64, u64)>>,
+    egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>>,
     stop: watch::Receiver<bool>,
 ) {
     debug_assert_eq!(conn.role(), Role::Server);
@@ -2779,8 +2839,13 @@ async fn serve_conn(
         let mut conns_guard = conns.lock().unwrap_or_else(|e| e.into_inner());
         if conns_guard.remove(&session.raw()).is_some() {
             let mut acc = egress_closed.lock().unwrap_or_else(|e| e.into_inner());
-            acc.0 = acc.0.saturating_add(conn.stats().app_bytes_sent);
-            acc.1 = acc.1.saturating_add(conn.transport_stats().udp_tx.bytes);
+            acc.insert(
+                session.raw(),
+                (
+                    conn.stats().app_bytes_sent,
+                    conn.transport_stats().udp_tx.bytes,
+                ),
+            );
         }
     }
     conn.close("connection complete");

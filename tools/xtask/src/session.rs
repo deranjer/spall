@@ -40,8 +40,12 @@ pub struct SessionArgs {
     /// Override the server tick budget from the scenario.
     #[arg(long)]
     server_ticks: Option<u64>,
-    /// Whole-run deadline in milliseconds.
-    #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(2_000..=600_000))]
+    /// Whole-run deadline in milliseconds. The upper bound covers the T23 /
+    /// G3 row 13 sustained-soak scenarios (`sustained_edits`), the longest of
+    /// which (`t23-g4-soak-30min`) needs a 30 s warmup + 30 measured minutes +
+    /// a settle buffer — comfortably under an hour but well past a "normal"
+    /// scenario's few minutes.
+    #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(2_000..=3_600_000))]
     timeout_ms: u64,
     /// Output directory. A unique `.local/runs` directory is created if omitted.
     #[arg(long)]
@@ -62,7 +66,9 @@ pub struct ScenarioArgs {
     seed: u64,
     #[arg(long)]
     server_ticks: Option<u64>,
-    #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(2_000..=600_000))]
+    /// Whole-run deadline in milliseconds — see `SessionArgs::timeout_ms` for
+    /// why the upper bound is an hour, not the usual few minutes.
+    #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(2_000..=3_600_000))]
     timeout_ms: u64,
     #[arg(long)]
     output: Option<PathBuf>,
@@ -225,6 +231,17 @@ struct Scenario {
     /// scenario. A configured block makes zero/default counters a failure.
     #[serde(default)]
     residency_assertions: Option<ResidencyAssertions>,
+    /// T23 / G3 row 14: run the server with `--motion-interest` — per-client
+    /// interest relevance + motion bandwidth budget (T20). `None` keeps the
+    /// pre-T20 unfiltered broadcast.
+    #[serde(default)]
+    motion_interest: Option<MotionInterestSpec>,
+    /// T23 / G3 row 13: a programmatically generated, sustained edit +
+    /// blast stream — too long to hand-author as individual `cuts` entries
+    /// (a 30-minute soak at the gate's rates is 18,000 small edits + 180
+    /// blasts). See `generate_sustained_cuts`.
+    #[serde(default)]
+    sustained_edits: Option<SustainedEdits>,
     /// Minimum straight-line distance (metres) some replicated body must have
     /// travelled on every live client — proof the detached geometry actually
     /// moved, not merely that a (possibly stationary) snapshot arrived.
@@ -440,6 +457,172 @@ struct MovementAcceptance {
     expect_no_hover: bool,
 }
 
+/// T23 / G3 row 14: mirrors `sandbox-server`'s `--motion-interest` flag group.
+#[derive(Debug, Clone, Deserialize)]
+struct MotionInterestSpec {
+    #[serde(default = "default_motion_near_m")]
+    near_m: f64,
+    #[serde(default = "default_motion_far_m")]
+    far_m: f64,
+    #[serde(default = "default_motion_far_interval")]
+    far_interval: u64,
+    #[serde(default)]
+    client_budget_bytes: usize,
+    /// `x,y,z` metres for a scene with no player spawns. Omitted → those
+    /// clients stay unfiltered (matches the CLI default).
+    #[serde(default)]
+    static_anchor: Option<[f64; 3]>,
+}
+
+fn default_motion_near_m() -> f64 {
+    48.0
+}
+fn default_motion_far_m() -> f64 {
+    96.0
+}
+fn default_motion_far_interval() -> u64 {
+    4
+}
+
+/// T23 / G3 row 13: `docs/validation.md`'s G4 sustained-load gate ("Run for
+/// two measured minutes after 30 seconds warmup; also run a 30-minute
+/// reduced-telemetry soak... Drive 10 ordinary edits/s total and one 4 m
+/// diameter blast every 10 seconds"). Generates that stream programmatically
+/// against the `g4-workload` scene's already-proven-safe target cells (the
+/// same rows/points `t23-g4-workload.json`'s hand-authored `cuts` already
+/// exercise), round-robined across every connected client, from `start_tick`
+/// through `server_ticks` (minus a trailing buffer so the last few edits have
+/// time to commit before quiescence). Cycling back through a short cell list
+/// once it's exhausted is intentional and cheap (see `generate_sustained_cuts`)
+/// — this is a throughput/latency soak, not a claim of ever-fresh geometry.
+#[derive(Debug, Clone, Deserialize)]
+struct SustainedEdits {
+    start_tick: u64,
+    #[serde(default = "default_small_rate")]
+    small_rate_per_sec: f64,
+    #[serde(default = "default_blast_interval")]
+    blast_interval_sec: f64,
+    #[serde(default = "default_trailing_buffer")]
+    trailing_buffer_ticks: u64,
+}
+
+fn default_small_rate() -> f64 {
+    10.0
+}
+fn default_blast_interval() -> f64 {
+    10.0
+}
+fn default_trailing_buffer() -> u64 {
+    120
+}
+
+/// One generated `--cuts-file` entry, in the JSON shape `sandbox-client`'s
+/// `--cuts-file` reads (`tick`/`cell`/`radius`/`target`, `target` optional).
+#[derive(Debug, Serialize)]
+struct GeneratedCut {
+    tick: u64,
+    cell: [i64; 3],
+    radius: i64,
+}
+
+/// West/east floor rows already proven safe by `t23-g4-workload.json`'s
+/// hand-authored small cuts (`y = 1`) and blasts (`y = 12`, `z = 12` /
+/// `z = 73`) — see `docs/reports/G3.md` increment 18 for why those exact
+/// coordinates stay inside the declared volume bounds. Reused verbatim here
+/// rather than re-derived, so this generator carries no new bounds-safety
+/// risk.
+const WEST_SMALL_Z: i64 = 6;
+const EAST_SMALL_Z: i64 = 78;
+const EAST_X_OFFSET: i64 = 72;
+const SMALL_Y: i64 = 1;
+const SMALL_X_MIN: i64 = 1;
+const SMALL_X_MAX: i64 = 22;
+const BLAST_WEST: [i64; 3] = [20, 12, 12];
+const BLAST_EAST: [i64; 3] = [20 + EAST_X_OFFSET, 12, 73];
+
+/// The tick window available for the generated stream, its small-edit step
+/// (ticks), and the resulting `(n_small, n_blasts)` counts — shared between
+/// `generate_sustained_cuts` (which builds the lists) and `requirements_met`
+/// (which needs the same expected total without re-deriving it, so the two
+/// can never silently disagree).
+fn sustained_counts(s: &SustainedEdits, server_ticks: u64) -> (u64, u64, f64) {
+    let end_tick = server_ticks.saturating_sub(s.trailing_buffer_ticks);
+    let start = s.start_tick.min(end_tick);
+    let available = end_tick.saturating_sub(start);
+    let small_step = (60.0 / s.small_rate_per_sec.max(0.01)).max(1.0);
+    let blast_step = (s.blast_interval_sec * 60.0).max(1.0);
+    let n_small = (available as f64 / small_step).floor() as u64;
+    let n_blasts = (available as f64 / blast_step).floor() as u64;
+    (n_small, n_blasts, small_step)
+}
+
+/// Builds the sustained small-edit + blast stream `SustainedEdits`
+/// describes, round-robined across `clients` and grouped by client index
+/// (same shape `by_client` already uses for hand-authored `cuts`).
+fn generate_sustained_cuts(
+    s: &SustainedEdits,
+    server_ticks: u64,
+    clients: u64,
+) -> BTreeMap<u64, Vec<GeneratedCut>> {
+    let mut by_client: BTreeMap<u64, Vec<GeneratedCut>> = BTreeMap::new();
+    if clients == 0 {
+        return by_client;
+    }
+    let end_tick = server_ticks.saturating_sub(s.trailing_buffer_ticks);
+    let start = s.start_tick.min(end_tick);
+    let (n_small, n_blasts, small_step) = sustained_counts(s, server_ticks);
+
+    // Small edits: one every `60 / small_rate_per_sec` ticks, alternating
+    // west/east, cycling x across a `SMALL_X_MIN..=SMALL_X_MAX` row at the
+    // proven-safe y/z for that region.
+    let small_span = (SMALL_X_MAX - SMALL_X_MIN + 1).max(1);
+    for i in 0..n_small {
+        let tick = start + (i as f64 * small_step) as u64;
+        let west = i % 2 == 0;
+        let x = SMALL_X_MIN + (i as i64 / 2) % small_span;
+        let cell = if west {
+            [x, SMALL_Y, WEST_SMALL_Z]
+        } else {
+            [x + EAST_X_OFFSET, SMALL_Y, EAST_SMALL_Z]
+        };
+        let client = i % clients;
+        by_client.entry(client).or_default().push(GeneratedCut {
+            tick,
+            cell,
+            radius: 1,
+        });
+    }
+
+    // Blasts: one every `blast_interval_sec`, alternating west/east at the
+    // fixed proven-safe blast points. West is always sent by client 0, east
+    // always by the start of the east cluster (`clients / 2`, matching the
+    // g4-workload west/east client split) — deterministic and easy to audit,
+    // not a throughput concern (there are far fewer blasts than small edits).
+    let blast_step = (s.blast_interval_sec * 60.0).max(1.0);
+    let west_client = 0u64;
+    let east_client = (clients / 2).min(clients - 1);
+    for i in 0..n_blasts {
+        // Offset half a small-edit step so a blast never lands on the exact
+        // same tick as a small edit from the same client.
+        let tick = start + (i as f64 * blast_step + small_step / 2.0) as u64;
+        let (cell, client) = if i % 2 == 0 {
+            (BLAST_WEST, west_client)
+        } else {
+            (BLAST_EAST, east_client)
+        };
+        by_client.entry(client).or_default().push(GeneratedCut {
+            tick,
+            cell,
+            radius: 8,
+        });
+    }
+
+    for cuts in by_client.values_mut() {
+        cuts.sort_by_key(|c| c.tick);
+    }
+    by_client
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ResidencyAssertions {
     #[serde(default)]
@@ -530,6 +713,23 @@ struct ServerSummary {
     residency_evictions_total: u64,
     #[serde(default)]
     residency_reloads_total: u64,
+    // T23 / G3 row 14.
+    #[serde(default)]
+    app_egress_bytes: u64,
+    #[serde(default)]
+    transport_egress_bytes: u64,
+    #[serde(default)]
+    per_client_egress: Vec<PerClientEgressRow>,
+}
+
+/// Mirrors `spall_server::PerClientEgress`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PerClientEgressRow {
+    slot: u32,
+    #[serde(default)]
+    spawn_m: Option<[f64; 3]>,
+    app_bytes: u64,
+    transport_bytes: u64,
 }
 
 /// ENG-61: whether the server's end-of-run report shows every detached body at
@@ -658,6 +858,14 @@ struct SessionSummary {
     /// scenario block is set.
     join_budget: JoinBudgetRow,
     per_client: Vec<ClientRow>,
+    /// T23 / G3 row 14: total application/transport egress this run, and the
+    /// per-connection breakdown (bytes alongside each connection's player
+    /// spawn) proving `motion_interest` separates bandwidth *between*
+    /// clients, not just that the total stays bounded. Empty when
+    /// `motion_interest` was not configured for this scenario.
+    app_egress_bytes: u64,
+    transport_egress_bytes: u64,
+    per_client_egress: Vec<PerClientEgressRow>,
     note: &'static str,
 }
 
@@ -838,6 +1046,7 @@ fn residency_requirements_met(
 
 fn requirements_met(
     scenario: &Scenario,
+    server_ticks: u64,
     transactions_committed: u64,
     clients: &[Option<ClientSummary>],
     proxy_active: bool,
@@ -845,8 +1054,21 @@ fn requirements_met(
     // The whole script must have run: a fixture that quiesces early (a gap
     // between scripted cuts longer than the server's idle window) commits fewer
     // transactions than it has cuts, and that is a failure no matter how the
-    // `minimum_transactions` floor is set.
-    let all_cuts_committed = transactions_committed >= scenario.cuts.len() as u64;
+    // `minimum_transactions` floor is set. `sustained_edits` (row 13) adds a
+    // programmatically generated count on top of any hand-authored `cuts` —
+    // computed with the exact same formula `generate_sustained_cuts` used to
+    // build the stream, so this can never silently drift from what was
+    // actually sent.
+    let expected_sustained: u64 = scenario
+        .sustained_edits
+        .as_ref()
+        .map(|s| {
+            let (n_small, n_blasts, _) = sustained_counts(s, server_ticks);
+            n_small + n_blasts
+        })
+        .unwrap_or(0);
+    let all_cuts_committed =
+        transactions_committed >= scenario.cuts.len() as u64 + expected_sustained;
 
     let work_ok = transactions_committed >= scenario.minimum_transactions && all_cuts_committed;
 
@@ -980,10 +1202,23 @@ mod requirement_tests {
             }"#,
         )
         .unwrap();
-        assert!(!requirements_met(&scenario, 1, &[Some(client(2))], false));
-        assert!(!requirements_met(&scenario, 2, &[Some(client(0))], false));
+        assert!(!requirements_met(
+            &scenario,
+            10,
+            1,
+            &[Some(client(2))],
+            false
+        ));
+        assert!(!requirements_met(
+            &scenario,
+            10,
+            2,
+            &[Some(client(0))],
+            false
+        ));
         assert!(requirements_met(
             &scenario,
+            10,
             2,
             &[Some(client(1)), Some(client(4))],
             false
@@ -1012,6 +1247,7 @@ mod requirement_tests {
         // four scripted cuts: the run quiesced early.
         assert!(!requirements_met(
             &scenario,
+            600,
             3,
             &[Some(client(4)), Some(client(4))],
             false
@@ -1020,6 +1256,7 @@ mod requirement_tests {
         // All four cuts committed and both clients saw real displacement.
         assert!(requirements_met(
             &scenario,
+            600,
             4,
             &[Some(client(4)), Some(client(4))],
             false
@@ -1030,6 +1267,7 @@ mod requirement_tests {
         still.max_body_displacement_m = 0.01;
         assert!(!requirements_met(
             &scenario,
+            600,
             4,
             &[Some(still), Some(client(4))],
             false
@@ -1040,6 +1278,7 @@ mod requirement_tests {
         no_body_cut.body_cut_committed = false;
         assert!(!requirements_met(
             &scenario,
+            600,
             4,
             &[Some(no_body_cut.clone()), Some(no_body_cut)],
             false
@@ -1121,14 +1360,21 @@ mod requirement_tests {
         // Clean loopback run (no proxy): reordering is not required.
         assert!(requirements_met(
             &scenario,
+            600,
             1,
             &[Some(ordered.clone())],
             false
         ));
         // Impaired run: a client that never saw a reordered datagram fails.
-        assert!(!requirements_met(&scenario, 1, &[Some(ordered)], true));
+        assert!(!requirements_met(&scenario, 600, 1, &[Some(ordered)], true));
         // Impaired run with real reordering observed: passes.
-        assert!(requirements_met(&scenario, 1, &[Some(client(4))], true));
+        assert!(requirements_met(
+            &scenario,
+            600,
+            1,
+            &[Some(client(4))],
+            true
+        ));
     }
 
     #[test]
@@ -1257,6 +1503,79 @@ mod requirement_tests {
         assert!(join_budget_requirements_met(&unconfigured, &[]));
         assert!(!join_budget_row(&unconfigured, &[]).configured);
     }
+
+    /// T23 / G3 row 13: `generate_sustained_cuts` produces exactly the count
+    /// `sustained_counts` (and therefore `requirements_met`) expects, every
+    /// generated cell stays within the proven-safe ranges (see
+    /// `docs/reports/G3.md` increment 18 for why `y = 1` / `y = 12, z = 12`
+    /// or `z = 73` stay inside the declared volume bounds), and every
+    /// connected client is actually used.
+    #[test]
+    fn sustained_cuts_match_expected_count_stay_in_safe_ranges_and_cover_every_client() {
+        let s = SustainedEdits {
+            start_tick: 1800,
+            small_rate_per_sec: 10.0,
+            blast_interval_sec: 10.0,
+            trailing_buffer_ticks: 120,
+        };
+        let server_ticks = 1800 + 7200 + 120; // 30 s warmup + 2 measured minutes + buffer
+        let (n_small, n_blasts, _) = sustained_counts(&s, server_ticks);
+        assert_eq!(n_small, 1200, "10 edits/s over 2 measured minutes");
+        assert_eq!(n_blasts, 12, "one blast/10s over 2 measured minutes");
+
+        let by_client = generate_sustained_cuts(&s, server_ticks, 8);
+        let total: usize = by_client.values().map(|v| v.len()).sum();
+        assert_eq!(total as u64, n_small + n_blasts);
+        assert_eq!(
+            by_client.len(),
+            8,
+            "round-robin across 8 clients must actually reach all 8"
+        );
+
+        for cuts in by_client.values() {
+            for c in cuts {
+                assert!(
+                    c.tick >= s.start_tick && c.tick < server_ticks,
+                    "generated tick {} outside [{}, {server_ticks})",
+                    c.tick,
+                    s.start_tick
+                );
+                let [x, y, z] = c.cell;
+                assert!(x >= 0, "cell x must not be negative: {c:?}");
+                if c.radius == 8 {
+                    // Blasts: the two proven-safe fixed points only.
+                    assert!(
+                        c.cell == BLAST_WEST || c.cell == BLAST_EAST,
+                        "blast at an unproven cell: {c:?}"
+                    );
+                } else {
+                    // Small edits: proven-safe y/z rows, x within the safe span.
+                    assert!(y == SMALL_Y, "small edit at unproven y: {c:?}");
+                    assert!(
+                        z == WEST_SMALL_Z || z == EAST_SMALL_Z,
+                        "small edit at unproven z: {c:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The 30-minute soak scales the same formula to 18,000 small edits + 180
+    /// blasts — this is the count `docs/validation.md`'s gate spec requires
+    /// ("10 ordinary edits/s" / "one 4 m blast every 10 seconds" for 30 min).
+    #[test]
+    fn sustained_cuts_scale_to_the_thirty_minute_soak_count() {
+        let s = SustainedEdits {
+            start_tick: 1800,
+            small_rate_per_sec: 10.0,
+            blast_interval_sec: 10.0,
+            trailing_buffer_ticks: 200,
+        };
+        let server_ticks = 1800 + 108_000 + 200; // 30 s warmup + 30 measured minutes + buffer
+        let (n_small, n_blasts, _) = sustained_counts(&s, server_ticks);
+        assert_eq!(n_small, 18_000);
+        assert_eq!(n_blasts, 180);
+    }
 }
 
 // --- the run -----------------------------------------------------------------
@@ -1372,6 +1691,25 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             server_cmd.args(["--residency-radius-bricks", &r.to_string()]);
         }
     }
+    if let Some(mi) = &scenario.motion_interest {
+        server_cmd.args([
+            "--motion-interest",
+            "--motion-near-m",
+            &mi.near_m.to_string(),
+            "--motion-far-m",
+            &mi.far_m.to_string(),
+            "--motion-far-interval",
+            &mi.far_interval.to_string(),
+            "--motion-client-budget-bytes",
+            &mi.client_budget_bytes.to_string(),
+        ]);
+        if let Some(a) = mi.static_anchor {
+            server_cmd.args([
+                "--motion-static-anchor",
+                &format!("{},{},{}", a[0], a[1], a[2]),
+            ]);
+        }
+    }
     // T11 exact-replay check (and the T23 cold-restart check) both journal every
     // committed transaction to a world DB. Replay rebuilds from the tick-0
     // baseline; restart recovers a fresh server from the shutdown checkpoint.
@@ -1446,6 +1784,14 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             .or_default()
             .push(cut.clone());
     }
+    // T23 / G3 row 13: the generated sustained stream, kept separate from
+    // `by_client` (a different element type) until the per-client dispatch
+    // below decides `--cut` args vs a `--cuts-file`.
+    let generated_by_client: BTreeMap<u64, Vec<GeneratedCut>> = scenario
+        .sustained_edits
+        .as_ref()
+        .map(|s| generate_sustained_cuts(s, server_ticks, clients))
+        .unwrap_or_default();
 
     // Spawn the clients.
     let client_timeout = run
@@ -1488,6 +1834,22 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 spec.push_str(":body");
             }
             c.args(["--cut", &spec]);
+        }
+        // T23 / G3 row 13: the generated sustained stream can run into the
+        // thousands of entries per client — well past what fits as individual
+        // `--cut` arguments on one process command line (Windows'
+        // `CreateProcess` caps the whole command line around 32K chars) — so
+        // it always goes through `--cuts-file`, never inline.
+        if let Some(cuts) = generated_by_client.get(&i)
+            && !cuts.is_empty()
+        {
+            let path = output.join(format!("client{i}.sustained-cuts.json"));
+            let body = serde_json::to_vec(cuts).expect("generated cuts are serializable");
+            fs::write(&path, body).map_err(|source| XtaskError::Output {
+                path: path.display().to_string(),
+                source,
+            })?;
+            c.args(["--cuts-file", &path.display().to_string()]);
         }
         let mut client_moves = false;
         for path in scenario.player_paths.iter().filter(|p| p.client == i) {
@@ -1573,6 +1935,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     admission: AdmissionRow::empty(),
                     join_budget: JoinBudgetRow::unconfigured(),
                     per_client: Vec::new(),
+                    app_egress_bytes: 0,
+                    transport_egress_bytes: 0,
+                    per_client_egress: Vec::new(),
                     note: "server produced no summary; inspect server.jsonl",
                 },
             );
@@ -1689,6 +2054,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     }
     let mut requirements_met = requirements_met(
         &scenario,
+        server_ticks,
         server.transactions_committed,
         &client_summaries,
         run.loss_percent > 0 || scenario.join_budget.is_some(),
@@ -1811,6 +2177,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             admission,
             join_budget,
             per_client: rows,
+            app_egress_bytes: server.app_egress_bytes,
+            transport_egress_bytes: server.transport_egress_bytes,
+            per_client_egress: server.per_client_egress.clone(),
             note: "real OS processes over QUIC; encrypted-packet loss via per-client UDP proxy; gate requirements are fixture-defined: every scripted cut commits, each live client sees real body displacement, any body-targeted cut lands, and (when enabled) the committed topology-event stream replays from baseline to the same hash",
         },
     )

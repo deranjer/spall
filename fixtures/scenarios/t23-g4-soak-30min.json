@@ -1,0 +1,36 @@
+{
+  "name": "t23-g4-soak-30min",
+  "description": "T23 / G4 sustained-load proof (rows 13-14), 30-minute reduced-telemetry soak lane -- see t23-g4-soak-2min.json for the full design rationale (same mechanism, same proven-safe target cells, same motion_interest config for row 14's bandwidth-separation evidence); this file only scales the measured window from 2 to 30 minutes (108,000 ticks) per docs/validation.md's G4 gate (\"also run a 30-minute reduced-telemetry soak\"). \"Reduced telemetry\": the harness's per-process JSONL logs are already lifecycle-only (started/ready/stopped), not per-tick or per-motion-snapshot, so there is no separate verbose mode to turn off here -- this run simply does not enable any of the optional SPALL_DEBUG_* env-gated diagnostics, keeping output at the same minimal size as every other scenario run regardless of the 30x longer duration. At the gate's 10 edits/s + one 4 m blast/10 s rates this is 18,000 small edits and 180 blasts (tools/xtask/src/session.rs generate_sustained_cuts, shipped to each sandbox-client over --cuts-file, never as individual process arguments). trailing_buffer_ticks/quiescence_ticks are scaled up (600/500 ticks = 10 s / 8.3 s) for the larger run's settle margin. This is a genuinely long real-wall-clock run (~31 minutes: 30 s warmup + 30 measured minutes + the trailing buffer) -- run with a correspondingly large --timeout-ms.",
+  "scene": "g4-workload",
+  "release_profile": true,
+  "server_ticks": 110400,
+  "quiescence_ticks": 500,
+  "clients": 8,
+  "late_join_clients": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "late_join_connect_delay_ms": 200,
+  "minimum_transactions": 18180,
+  "replay_check": true,
+  "restart_check": true,
+  "cuts": [],
+  "sustained_edits": {
+    "start_tick": 1800,
+    "small_rate_per_sec": 10.0,
+    "blast_interval_sec": 10.0,
+    "trailing_buffer_ticks": 600
+  },
+  "motion_interest": {
+    "near_m": 12.0,
+    "far_m": 24.0,
+    "far_interval": 4,
+    "client_budget_bytes": 0
+  }
+}

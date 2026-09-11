@@ -38,7 +38,9 @@ pub use residency::{
     PartitionCoord, ResidencyBacking, ResidencyController, ResidencyError, StructuralResolution,
 };
 pub use residency_pass::{PassTick, ResidencyLimits, ResidencyPass, ResidencyStats};
-pub use serve::{MotionInterest, Scene, ServeConfig, ServeError, ServeSummary, serve};
+pub use serve::{
+    MotionInterest, PerClientEgress, Scene, ServeConfig, ServeError, ServeSummary, serve,
+};
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};
 use std::{net::SocketAddr, path::PathBuf, thread, time::Duration};
