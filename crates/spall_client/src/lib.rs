@@ -1,11 +1,14 @@
 //! Native render-window host and the client-side replica. GPU voxel extraction
 //! and transport wiring are added by later tasks.
 
+pub mod interactive;
 pub mod net;
 pub mod predict;
 pub mod replica;
 pub mod residency;
+pub mod window;
 
+pub use interactive::{InteractiveSession, InteractiveView, LiveInput};
 pub use net::{
     BaselineScene, ClientNetConfig, ClientNetError, ClientResidencyLimits, ClientSummary,
     MovementStep, ReplicaReadyHook, ScriptTarget, ScriptedAction, cut_request,
@@ -14,6 +17,7 @@ pub use net::{
 pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
 pub use residency::{ClientResidency, ClientResidencyPass, MAX_RELOAD_REQUESTS_PER_STEP};
+pub use window::run_interactive_window;
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};
 use std::{path::PathBuf, sync::Arc};
@@ -45,6 +49,10 @@ pub enum ClientError {
     Gpu(String),
     #[error("rendering failed: {0}")]
     Render(String),
+    #[error("network session failed: {0}")]
+    Net(#[from] crate::net::ClientNetError),
+    #[error("network session thread panicked")]
+    NetThreadPanicked,
 }
 
 pub fn run_window(config: ClientConfig) -> Result<(), ClientError> {

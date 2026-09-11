@@ -2600,6 +2600,8 @@ dependencies = [
 name = "spall_client"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "glam 0.33.6",
  "pollster",
  "serde",
  "serde_json",

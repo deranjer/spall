@@ -39,6 +39,7 @@ use spall_protocol::{
     PROTOCOL_VERSION, RecentInput, RepairKey, RequestId, TransferId, session_player_entity,
 };
 
+use crate::interactive::{InteractiveSession, InteractiveView};
 use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
 use crate::residency::ClientResidencyPass;
@@ -266,6 +267,15 @@ pub struct ClientNetConfig {
     /// directly. `None` (the default) changes nothing about the client's
     /// behaviour.
     pub on_replica_ready: Option<ReplicaReadyHook>,
+    /// Interactive follow-up (T19): live keyboard/mouse-driven input instead
+    /// of `movement_script` — set by `spall_client::window::run_interactive_window`,
+    /// not normally constructed directly. Implies a baseline pull and a
+    /// predicted player exactly like a non-empty `movement_script`, but reads
+    /// `InteractiveSession::input` every mover tick instead of the scripted
+    /// table, publishes the predicted pose into `InteractiveSession::view`,
+    /// and never auto-stops on a script end tick. `None` (every existing
+    /// scripted/headless run) is byte-for-byte unchanged.
+    pub interactive: Option<Arc<InteractiveSession>>,
 }
 
 /// A shared handle to the live replica, and a callback invoked with it — see
@@ -700,8 +710,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     ))?;
 
     // A movement client pulls a baseline like a late joiner so it works with any
-    // scene the server runs (T19 uses the `walk` arena).
-    let want_baseline = config.late_join || !config.movement_script.is_empty();
+    // scene the server runs (T19 uses the `walk` arena). An interactive
+    // client always predicts a player too, exactly like a non-empty
+    // `movement_script`.
+    let want_baseline =
+        config.late_join || !config.movement_script.is_empty() || config.interactive.is_some();
 
     let replica = Arc::new(Mutex::new(if want_baseline {
         ReplicaWorld::empty(ReplicaConfig::default())
@@ -714,6 +727,13 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         )
     }));
     let counters = Arc::new(Counters::default());
+
+    // The window reads live terrain straight off the replica for its debug
+    // draw; publish the handle once, up front, rather than threading it
+    // through every later closure.
+    if let Some(session) = &config.interactive {
+        let _ = session.replica.set(replica.clone());
+    }
 
     // T17: pull a full baseline over a bulk transfer before touching the
     // replication stream, so the replica starts at the server's current
@@ -746,12 +766,14 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         hook(replica.clone());
     }
 
-    // T19: a scripted-movement client predicts its own player capsule.
-    let predictor = (!config.movement_script.is_empty()).then(|| {
-        Arc::new(Mutex::new(Predictor::new(session_player_entity(
-            conn.session(),
-        ))))
-    });
+    // T19: a scripted-movement (or interactively-played) client predicts its
+    // own player capsule.
+    let predictor =
+        (!config.movement_script.is_empty() || config.interactive.is_some()).then(|| {
+            Arc::new(Mutex::new(Predictor::new(session_player_entity(
+                conn.session(),
+            ))))
+        });
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
@@ -1025,6 +1047,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let session = conn.session();
         let stop_rx = stop_rx.clone();
         let client_residency = config.client_residency;
+        let interactive = config.interactive.clone();
         tokio::spawn(async move {
             let end_tick = script_end_tick(&script);
             // Slice E2: a scripted mover optionally evicts terrain outside a
@@ -1054,10 +1077,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 // All predictor-lock work happens in this non-async block, which
                 // returns the datagram to send (and the predicted feet position
                 // for the residency pass) once the guard is dropped.
-                let (frame, feet, script_tick): (
+                let (frame, feet, script_tick, predicted_state): (
                     Option<InputFrame>,
                     Option<[f64; 3]>,
                     Option<u64>,
+                    Option<CharacterState>,
                 ) = {
                     let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
                     let p: &mut Predictor = &mut guard;
@@ -1095,7 +1119,10 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     let script_tick = p.script_origin_tick.map(|_| active_script_tick);
 
                     let frame = if ready && p.phys.has_terrain() {
-                        let input = scripted_input(&script, script_tick.unwrap_or(0));
+                        let input = match &interactive {
+                            Some(session) => session.input.snapshot(),
+                            None => scripted_input(&script, script_tick.unwrap_or(0)),
+                        };
                         p.input_seq += 1;
                         let seq = InputSeq(p.input_seq);
                         if let Some(pl) = &mut p.player {
@@ -1138,11 +1165,19 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         last_active_server_tick = None;
                         None
                     };
-                    let feet = p.player.as_ref().map(|pl| pl.predicted().position_m);
-                    (frame, feet, script_tick)
+                    let predicted_state = p.player.as_ref().map(PredictedPlayer::predicted);
+                    let feet = predicted_state.map(|st| st.position_m);
+                    (frame, feet, script_tick, predicted_state)
                 };
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
+                }
+                if let (Some(session), Some(predicted)) = (&interactive, predicted_state) {
+                    *session.view.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(InteractiveView {
+                            predicted,
+                            server_tick: tick,
+                        });
                 }
 
                 // Slice E2: evict / request-reload terrain around the player.
@@ -1265,6 +1300,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let done = {
         let counters = counters.clone();
         let run_ticks = config.run_ticks;
+        let interactive = config.interactive.clone();
         async move {
             tokio::select! {
                 _ = async { let _ = control.await; let _ = motion.await; } => {}
@@ -1278,6 +1314,17 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }, if run_ticks > 0 => {}
+                // The window's close handler sets this so an interactive
+                // session disconnects promptly instead of riding out
+                // `overall_timeout`.
+                _ = async {
+                    loop {
+                        if interactive.as_ref().is_some_and(|s| s.stop.load(Ordering::Relaxed)) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }, if interactive.is_some() => {}
             }
         }
     };

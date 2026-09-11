@@ -108,6 +108,7 @@ fn column_cut_client(
         transport: TransportConfig::for_tests(),
         client_residency: None,
         on_replica_ready: None,
+        interactive: None,
     }
 }
 
