@@ -338,6 +338,18 @@ pub struct ClientSummary {
     /// `client_residency_reloads_completed`) despite it.
     #[serde(default)]
     pub baseline_transfer_failures: u64,
+    /// A sent `ActionRequest` the server declined to admit or stage
+    /// (`ActionOutcome::Rejected`) — the scripted-action retrier only retries
+    /// a `"throttled"` reason, so anything else is a lost scripted action.
+    /// `0` unless the server actually rejected one.
+    #[serde(default)]
+    pub action_requests_rejected: u64,
+    /// The distinct `ActionOutcome::Rejected` reasons observed, most recent
+    /// last (bounded — see `Counters::action_reject_reasons`). Diagnostic:
+    /// tells you *why* `action_requests_rejected` is non-zero without a
+    /// separate server-side log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub action_reject_reasons: Vec<String>,
 }
 
 /// Anything that stops a client run before it can report.
@@ -432,6 +444,13 @@ struct Counters {
     /// `1` when the installed baseline carries at least one body volume, so
     /// "ready" waits for a motion keyframe before it is declared.
     late_join_has_bodies: AtomicU64,
+    /// A sent `ActionRequest` that came back `ActionOutcome::Rejected` for any
+    /// reason (the retrier only resends a `"throttled"` one).
+    action_rejected: AtomicU64,
+    /// Bounded log of `action_rejected` reasons, most recent last (see
+    /// `MAX_RECORDED_ACTION_REJECT_REASONS`). Diagnostic only — never read to
+    /// drive behavior.
+    action_reject_reasons: std::sync::Mutex<Vec<String>>,
     /// A `BaselineBegin` (a mid-session hash-repair patch, or split-bulk
     /// transfer) whose body failed to arrive intact — the bulk stream, the
     /// decode, or the `BaselineEnd` hash check. Under loss this is expected
@@ -440,6 +459,10 @@ struct Counters {
     /// counted rather than treated as fatal.
     baseline_transfer_failures: AtomicU64,
 }
+
+/// Cap on `Counters::action_reject_reasons` — a diagnostic log, not something
+/// that should grow unbounded if a script somehow floods rejections.
+const MAX_RECORDED_ACTION_REJECT_REASONS: usize = 8;
 
 /// The `CharacterState` carried by a player [`MotionSnapshot`]. Orientation is
 /// discarded (players walk upright); `grounded` / `jump_held_last` are not on
@@ -817,10 +840,24 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         }
                     }
                     Ok(Some(WireRecord::ActionStatus(st))) => {
-                        if let ActionOutcome::Rejected { reason } = &st.outcome
-                            && reason.starts_with("throttled")
-                        {
-                            let _ = throttle_tx.send(st.request_id.0);
+                        if let ActionOutcome::Rejected { reason } = &st.outcome {
+                            if reason.starts_with("throttled") {
+                                let _ = throttle_tx.send(st.request_id.0);
+                            } else {
+                                // Anything other than "throttled" is not
+                                // retried (see the retrier below) — record it
+                                // so a lost scripted action is visible in the
+                                // summary instead of silently vanishing.
+                                counters.action_rejected.fetch_add(1, Ordering::Relaxed);
+                                let mut reasons = counters
+                                    .action_reject_reasons
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if reasons.len() >= MAX_RECORDED_ACTION_REJECT_REASONS {
+                                    reasons.remove(0);
+                                }
+                                reasons.push(reason.clone());
+                            }
                         }
                     }
                     Ok(Some(_)) => {}
@@ -1305,6 +1342,12 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         client_residency_reloads_completed: counters
             .residency_reloads_completed
             .load(Ordering::Relaxed),
+        action_requests_rejected: counters.action_rejected.load(Ordering::Relaxed),
+        action_reject_reasons: counters
+            .action_reject_reasons
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
         client_residency_budget_miss_steps: counters
             .residency_budget_miss_steps
             .load(Ordering::Relaxed),

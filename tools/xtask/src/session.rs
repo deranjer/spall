@@ -586,6 +586,14 @@ struct ClientSummary {
     late_join_ready_ms: u64,
     #[serde(default)]
     late_join_ready_confirmed: bool,
+    /// A sent `ActionRequest` the server declined to admit or stage, other
+    /// than a `"throttled"` one (which the client retries on its own).
+    #[serde(default)]
+    action_requests_rejected: u64,
+    /// The distinct rejection reasons observed (bounded, most recent last) —
+    /// diagnostic only.
+    #[serde(default)]
+    action_reject_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -715,6 +723,9 @@ struct ClientRow {
     late_join_baseline_install_ms: u64,
     late_join_ready_ms: u64,
     late_join_ready_confirmed: bool,
+    action_requests_rejected: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    action_reject_reasons: Vec<String>,
 }
 
 /// T23 / G3 row 11: measured join-budget evidence for the configured client,
@@ -902,6 +913,8 @@ mod requirement_tests {
             late_join_baseline_install_ms: 0,
             late_join_ready_ms: 0,
             late_join_ready_confirmed: false,
+            action_requests_rejected: 0,
+            action_reject_reasons: Vec::new(),
         }
     }
 
@@ -1642,6 +1655,8 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     late_join_baseline_install_ms: c.late_join_baseline_install_ms,
                     late_join_ready_ms: c.late_join_ready_ms,
                     late_join_ready_confirmed: c.late_join_ready_confirmed,
+                    action_requests_rejected: c.action_requests_rejected,
+                    action_reject_reasons: c.action_reject_reasons.clone(),
                 });
             }
             None => {
@@ -1666,6 +1681,8 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     late_join_baseline_install_ms: 0,
                     late_join_ready_ms: 0,
                     late_join_ready_confirmed: false,
+                    action_requests_rejected: 0,
+                    action_reject_reasons: Vec::new(),
                 });
             }
         }
