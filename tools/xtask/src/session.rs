@@ -285,6 +285,51 @@ struct Scenario {
     /// the edit history is not itself bandwidth-limited.
     #[serde(default)]
     join_budget: Option<JoinBudget>,
+    /// T23 / G3 row 10 follow-up: unlike `late_join_may_fail`'s existing
+    /// delayed-connect fixture (proves explicit-failure handling for a client
+    /// that never gets a baseline at all), this exercises **retry/catch-up
+    /// exhaustion while connected clients stay active** — the named
+    /// `late_join_clients` entry connects and starts joining normally, but a
+    /// severely shaped proxy plus a tiny server-side `catch_up_cap` /
+    /// `max_join_retries` make its catch-up queue overflow every recapture
+    /// until its retry budget is spent, ending in the same bounded
+    /// `join-failed` (exit 4) `late_join_may_fail` already accepts — while
+    /// `sustained_edits` keeps the other, live clients continuously
+    /// committing (the "connected clients keep running" half this exercises).
+    #[serde(default)]
+    retry_exhaustion: Option<RetryExhaustion>,
+}
+
+/// See `Scenario::retry_exhaustion`.
+#[derive(Debug, Clone, Deserialize)]
+struct RetryExhaustion {
+    /// Which `late_join_clients` entry gets the shaped proxy + is expected to
+    /// exhaust its retries.
+    #[serde(default)]
+    client: u64,
+    #[serde(default = "default_retry_exhaustion_catch_up_cap")]
+    catch_up_cap: usize,
+    #[serde(default = "default_retry_exhaustion_max_retries")]
+    max_join_retries: u32,
+    #[serde(default = "default_retry_exhaustion_bandwidth")]
+    bandwidth_bytes_per_sec: u64,
+    #[serde(default = "default_retry_exhaustion_rtt_ms")]
+    rtt_ms: u64,
+    #[serde(default = "default_join_budget_seed")]
+    seed: u64,
+}
+
+fn default_retry_exhaustion_catch_up_cap() -> usize {
+    1
+}
+fn default_retry_exhaustion_max_retries() -> u32 {
+    2
+}
+fn default_retry_exhaustion_bandwidth() -> u64 {
+    256
+}
+fn default_retry_exhaustion_rtt_ms() -> u64 {
+    50
 }
 
 /// T23 / G3 row 11 join-budget network profile + acceptance budget. Defaults
@@ -1710,6 +1755,14 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             ]);
         }
     }
+    if let Some(re) = &scenario.retry_exhaustion {
+        server_cmd.args([
+            "--catch-up-cap",
+            &re.catch_up_cap.to_string(),
+            "--max-join-retries",
+            &re.max_join_retries.to_string(),
+        ]);
+    }
     // T11 exact-replay check (and the T23 cold-restart check) both journal every
     // committed transaction to a world DB. Replay rebuilds from the tick-0
     // baseline; restart recovers a fresh server from the shutdown checkpoint.
@@ -1758,6 +1811,23 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             ..PacketFaultPlan::shaped(budget.seed, budget.bandwidth_bytes_per_sec)
         };
         if let Some(slot) = plans.get_mut(budget.client as usize) {
+            *slot = shaped;
+        }
+        Some(ProxyFarm::spawn_with_plans(bound, plans)?)
+    } else if let Some(re) = &scenario.retry_exhaustion {
+        // T23 / G3 row 10 follow-up: the same "shape only the named client"
+        // pattern as `join_budget` above, but tuned to make that one client's
+        // catch-up queue overflow (severely bandwidth-limited, so a re-capture
+        // can never land before `sustained_edits`'s next commit overflows the
+        // tiny `catch_up_cap` again) rather than to measure a join budget.
+        let mut plans: Vec<PacketFaultPlan> = (0..clients)
+            .map(|i| PacketFaultPlan::transparent(run.seed ^ (i + 1)))
+            .collect();
+        let shaped = PacketFaultPlan {
+            delay: Duration::from_millis(re.rtt_ms / 2),
+            ..PacketFaultPlan::shaped(re.seed, re.bandwidth_bytes_per_sec)
+        };
+        if let Some(slot) = plans.get_mut(re.client as usize) {
             *slot = shaped;
         }
         Some(ProxyFarm::spawn_with_plans(bound, plans)?)
