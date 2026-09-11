@@ -293,6 +293,73 @@ mod tests {
         CharacterState::at([8.0, top, 8.0])
     }
 
+    /// **Known upstream defect (T23 / G3 row 15, `docs/reports/G3.md`).** A
+    /// freshly created authoritative player capsule spawned close to a
+    /// bounded volume's `x = 0` origin, near a floor **and** a second,
+    /// elevated slab-like solid structure a few metres above it (this scene's
+    /// "beam"), does not respond to horizontal input — `move_shape`'s
+    /// returned translation is `[0, 0, 0]` every tick indefinitely, though
+    /// `grounded` stays `true` and the desired wish-velocity is computed
+    /// correctly every tick (verified: the bug is in the swept-collision
+    /// resolution, not upstream of it).
+    ///
+    /// Root-caused down to `rapier3d::control::KinematicCharacterController`
+    /// itself, not anything in this crate or `spall_sim`/`spall_voxel`:
+    /// reproduces with this crate's `PhysicsWorld` alone, no `spall_sim`
+    /// commit/structural pipeline involved. Ruled out by direct experiment
+    /// (see the PR that added this test for the full parameter sweep):
+    /// - **Not a broad-phase "warm-up"**: extra `world.step()`s before the
+    ///   character is added make no difference.
+    /// - **Not representation-specific**: reproduces identically with
+    ///   [`Representation::NativeVoxels`], not just `MergedCuboids` —
+    ///   `spall_physics::merge::greedy_boxes`'s box decomposition is not the
+    ///   cause.
+    /// - **Not about one combined collider**: still reproduces with the
+    ///   floor and the elevated structure as two separate physics bodies.
+    /// - **Position-dependent, not proximity-to-column**: a floor + a narrow
+    ///   *column* (no beam) does **not** reproduce it; a floor + the wide,
+    ///   thin *beam* alone does, at its original position. Moving the beam
+    ///   either much higher (`y`) or much further away (`x`) — while leaving
+    ///   the spawn where it was — also stops it reproducing, so the exact
+    ///   trigger is some position/geometry relationship this investigation
+    ///   did not fully isolate inside `rapier3d`.
+    ///
+    /// The shipped mitigation ([`fixtures::SEPARATED_REGION_FAR_SPAWNS`]'s
+    /// `x = 7 m` slot-0 spawn, `docs/reports/G3.md` row 2) is empirically
+    /// justified: `x >= ~6.5 m` on this exact scene does not reproduce it.
+    ///
+    /// This test pins the **current broken behaviour** so a `rapier3d`
+    /// upgrade (or a future fix) is caught: if it ever starts failing, the
+    /// defect is gone — delete this test, drop the `#[ignore]`, and reconsider
+    /// whether the spawn-distance mitigation is still needed.
+    #[test]
+    #[ignore = "documents a known upstream rapier3d defect, not a bug in this crate; see the doc comment"]
+    fn row15_elevated_beam_near_origin_freezes_horizontal_movement() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let v = vox::separated_regions_scene(VolumeId::new(1).unwrap());
+        add_fixed(&mut world, &v);
+        world.step();
+
+        let params = CharacterParams::DEFAULT;
+        let mut state = CharacterState::at([1.0, 1.0, 1.0]);
+        let input = PlayerInput {
+            movement: [0.0, 0.0, 1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+        for _ in 0..200 {
+            state = step_character(state, input, DT, |pos, desired| {
+                world.sweep_character(params, pos, desired, DT)
+            });
+        }
+        assert!(
+            state.position_m[0] - 1.0 > 1.0,
+            "expected this to fail today (row 15): capsule should have moved \
+             but stayed frozen at x={} after 200 ticks of forward input",
+            state.position_m[0]
+        );
+    }
+
     #[test]
     fn walks_forward_on_flat_floor() {
         let (mut world, top, _floor) = floor_world();

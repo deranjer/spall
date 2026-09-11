@@ -363,6 +363,19 @@ impl PredictedPlayer {
         (dx * dx + dz * dz).sqrt()
     }
 
+    /// Horizontal distance the *authoritative* feet have travelled from spawn,
+    /// metres — see the comment on [`Self::summary`]'s `distance_travelled_m`
+    /// for why the final reported figure uses this instead of the predicted
+    /// equivalent.
+    fn authoritative_distance_travelled_m(
+        authoritative: CharacterState,
+        start_pos_m: [f64; 3],
+    ) -> f64 {
+        let dx = authoritative.position_m[0] - start_pos_m[0];
+        let dz = authoritative.position_m[2] - start_pos_m[2];
+        (dx * dx + dz * dz).sqrt()
+    }
+
     /// Current gap between the predicted and authoritative feet, metres.
     pub fn prediction_error_m(&self) -> f64 {
         self.predicted.distance_m(&self.authoritative)
@@ -372,7 +385,24 @@ impl PredictedPlayer {
     pub fn summary(&self, held_button_release_ok: bool) -> PlayerMovementSummary {
         PlayerMovementSummary {
             ticks: self.total_ticks,
-            distance_travelled_m: self.distance_travelled_m(),
+            // T23 / G3 row 16: not `self.distance_travelled_m()` (which reads
+            // `self.predicted`). The mover only advances prediction while
+            // `ClientPhysics::covers` holds for the predicted position (T23 /
+            // G3 increment 16) — a residency reload round trip legitimately
+            // *holds* (does not advance) `self.predicted` for a while, exactly
+            // like the `at_rest` check a few lines below already accounts for.
+            // `self.authoritative` "keeps updating from every snapshot
+            // regardless" (same comment) and so is always at least as far
+            // along. If the run's final summary happens to be captured while
+            // predicted is held but authoritative has already progressed
+            // further, distance-from-predicted under-reports a run that
+            // otherwise converged correctly everywhere else — the reported
+            // symptom, "the predictor's own bookkeeping was the casualty, not
+            // the simulation". `self.authoritative` never has this gap.
+            distance_travelled_m: Self::authoritative_distance_travelled_m(
+                self.authoritative,
+                self.start_pos_m,
+            ),
             max_distance_from_start_m: self.max_distance_from_start_m,
             final_prediction_error_m: self.prediction_error_m(),
             corrections: self.corrections,
