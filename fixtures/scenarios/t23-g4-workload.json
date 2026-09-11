@@ -1,0 +1,224 @@
+{
+  "name": "t23-g4-workload",
+  "description": "T23 / G4 eight-client workload (row 12), proof run. Eight clients connect to the g4-workload scene: a west cluster (clients 0-3) and an east cluster (clients 4-7), each internally clustered (~1.4 m spread) and separated from the other cluster by the region offset (18 m) -- \"8 players clustered and separated\". The server populates 256 active debris bodies (64 of them within 12 m of client 0's spawn -- \"64 near one observer\") plus 4096 sleeping (dormant, persisted) debris bodies directly into SimWorld at scene construction, before any client connects. Because that population bypasses the ordinary commit/transaction pipeline, a live (tick-0, locally-installed-scene) client join never learns about it (spall_client::net's BaselineScene::SeparatedRegions doc comment) -- so every client here is deliberately configured `--late-join`: each pulls the real T17 live baseline (terrain + all 4352 bodies, spall_server::baseline::logical_world_baseline) over a bulk transfer instead, which is the only path that gives a client the pre-populated body state and lets its world_hash agree with the server's. Client 0 severs the west column (~tick 200) and client 4 severs the east column (~tick 260), a real multi-region structural collapse in the populated world. A ~10 committed-edits/s stream (one every 6 ticks) runs for 1.5 s, round-robined across all 8 clients. Two 4 m diameter blasts (radius 8 cells), 600 ticks (10 s) apart, one per region, demonstrate the blast cadence. This is a shorter proof run, not the full measured-duration G4 soak (row 13) -- it demonstrates the workload spins up at the specified counts/rates and converges/replays, not sustained throughput over the full 2-minute / 30-minute windows. require_body_settled is intentionally NOT set: the 256 active bodies are dropped with nothing underneath them by design (spall_sim::fixtures::spawn_g4_workload_bodies) and never come to rest, so an end-of-run settle gate does not apply to this scene. The one 64-brick connected collapse is proved separately, in isolation, by spall_sim's CPU-level giant_collapse_attempt test -- see docs/reports/G3.md row 12 for why it cannot be merged into this 8-client scene's world and for the measured outcome. Server and all eight clients must converge to one canonical topology hash and the committed topology-event stream must replay from baseline to that same hash. KNOWN LIMITATION (see docs/reports/G3.md row 12): as of this increment, running this exact scenario through the standard `cargo xtask scenario` harness currently times out -- the harness always builds sandbox-server / sandbox-client in the debug profile (tools/xtask/src/session.rs run_cargo, no --release), and in that profile capturing this scene's late-join baseline (4352 bodies) measured 22.5-23.0 s, well past spall_net's fixed 10 s QUIC idle timeout; the identical capture measured ~3.0 s in a release build and a manual release-mode 1-client late-join run against this exact scene converged correctly (see G3.md for the measured hashes and byte counts). This is a debug-build wall-clock gap, not a design or protocol defect.",
+  "scene": "g4-workload",
+  "server_ticks": 1500,
+  "quiescence_ticks": 220,
+  "clients": 8,
+  "late_join_clients": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "late_join_connect_delay_ms": 200,
+  "minimum_transactions": 20,
+  "replay_check": true,
+  "restart_check": true,
+  "cuts": [
+    {
+      "client": 0,
+      "at_tick": 200,
+      "cell": [
+        10,
+        6,
+        3
+      ],
+      "radius": 2
+    },
+    {
+      "client": 4,
+      "at_tick": 260,
+      "cell": [
+        82,
+        6,
+        75
+      ],
+      "radius": 2
+    },
+    {
+      "client": 0,
+      "at_tick": 320,
+      "cell": [
+        1,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 1,
+      "at_tick": 326,
+      "cell": [
+        2,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 2,
+      "at_tick": 332,
+      "cell": [
+        3,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 3,
+      "at_tick": 338,
+      "cell": [
+        4,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 4,
+      "at_tick": 344,
+      "cell": [
+        73,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 5,
+      "at_tick": 350,
+      "cell": [
+        74,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 6,
+      "at_tick": 356,
+      "cell": [
+        75,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 7,
+      "at_tick": 362,
+      "cell": [
+        76,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 0,
+      "at_tick": 368,
+      "cell": [
+        5,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 1,
+      "at_tick": 374,
+      "cell": [
+        6,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 2,
+      "at_tick": 380,
+      "cell": [
+        7,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 3,
+      "at_tick": 386,
+      "cell": [
+        8,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 4,
+      "at_tick": 392,
+      "cell": [
+        77,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 5,
+      "at_tick": 398,
+      "cell": [
+        78,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 6,
+      "at_tick": 404,
+      "cell": [
+        79,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 7,
+      "at_tick": 410,
+      "cell": [
+        80,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 0,
+      "at_tick": 500,
+      "cell": [
+        20,
+        1,
+        1
+      ],
+      "radius": 8
+    },
+    {
+      "client": 4,
+      "at_tick": 1100,
+      "cell": [
+        92,
+        1,
+        73
+      ],
+      "radius": 8
+    }
+  ]
+}

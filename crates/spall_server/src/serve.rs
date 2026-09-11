@@ -38,7 +38,7 @@ use spall_protocol::{
     PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
     frame_input, recent_input, session_player_entity,
 };
-use spall_sim::fixtures::{SEPARATED_REGION_SPAWNS, WALK_ARENA_SPAWNS};
+use spall_sim::fixtures::{G4_WORKLOAD_SPAWNS, SEPARATED_REGION_SPAWNS, WALK_ARENA_SPAWNS};
 use spall_sim::{
     Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
     SimulationConfig, action_statuses, fixtures,
@@ -153,6 +153,12 @@ pub enum Scene {
     /// harness drives geographically separated players and a multi-region
     /// collapse. See [`spall_sim::fixtures::separated_regions_setup`].
     SeparatedRegions,
+    /// T23 / G4 eight-client workload (row 12): the same bounded world as
+    /// [`Scene::SeparatedRegions`], eight player spawns in two 4-player
+    /// clusters, plus 256 active + 4096 sleeping debris bodies. See
+    /// [`spall_sim::fixtures::g4_workload_setup`] /
+    /// [`spall_sim::fixtures::spawn_g4_workload_bodies`].
+    G4Workload,
 }
 
 impl Scene {
@@ -168,6 +174,7 @@ impl Scene {
             "checkerboard-split" | "oversized-split" => Some(Scene::CheckerboardSplit),
             "bulk-split" | "giant-split" => Some(Scene::BulkSplit),
             "separated-regions" | "t23-g3" | "g3" => Some(Scene::SeparatedRegions),
+            "g4-workload" | "t23-g4" | "g4" => Some(Scene::G4Workload),
             _ => None,
         }
     }
@@ -181,12 +188,16 @@ impl Scene {
             Scene::CheckerboardSplit => "checkerboard-split",
             Scene::BulkSplit => "bulk-split",
             Scene::SeparatedRegions => "separated-regions",
+            Scene::G4Workload => "g4-workload",
         }
     }
 
     /// `true` if this scene gives every connecting client a player capsule.
     pub fn has_players(self) -> bool {
-        matches!(self, Scene::Walk | Scene::SeparatedRegions)
+        matches!(
+            self,
+            Scene::Walk | Scene::SeparatedRegions | Scene::G4Workload
+        )
     }
 
     /// Feet spawn positions (metres) for a player scene, indexed by connection
@@ -195,6 +206,7 @@ impl Scene {
         match self {
             Scene::Walk => &WALK_ARENA_SPAWNS,
             Scene::SeparatedRegions => &SEPARATED_REGION_SPAWNS,
+            Scene::G4Workload => &G4_WORKLOAD_SPAWNS,
             _ => &[],
         }
     }
@@ -207,6 +219,7 @@ impl Scene {
             Scene::CheckerboardSplit => spall_sim::fixtures::checkerboard_split_setup(),
             Scene::BulkSplit => spall_sim::fixtures::bulk_split_setup(),
             Scene::SeparatedRegions => spall_sim::fixtures::separated_regions_setup(),
+            Scene::G4Workload => spall_sim::fixtures::g4_workload_setup(),
         };
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
@@ -215,7 +228,15 @@ impl Scene {
         // is still settling (repro: `cargo xtask scenario --name
         // g1-networked-destruction`). Skip the CCD pass — a no-op here.
         setup.physics.disable_ccd = true;
-        Simulation::new(SimulationConfig::new(setup)).expect("built-in scene is valid")
+        let mut sim =
+            Simulation::new(SimulationConfig::new(setup)).expect("built-in scene is valid");
+        if matches!(self, Scene::G4Workload) {
+            // Row 12: 256 active (64 near the west cluster's first spawn) +
+            // 4096 sleeping debris bodies, built once at scene-construction
+            // time (docs/reports/G3.md increment for this row).
+            spall_sim::fixtures::spawn_g4_workload_bodies(sim.world_mut(), G4_WORKLOAD_SPAWNS[0]);
+        }
+        sim
     }
 }
 

@@ -374,6 +374,74 @@ pub fn separated_regions_scene(id: VolumeId) -> Volume {
     v
 }
 
+/// Bricks per axis of [`giant_collapse_scene`]'s detachable block —
+/// `4^3 = 64`, the literal G1/G4 "64-brick connected body" stress case
+/// (`docs/collision-decision.md`, `docs/validation.md` G1/G4: "Include ... a
+/// 64-brick connected body stress case").
+pub const GIANT_COLLAPSE_BRICKS: i64 = 4;
+
+/// An anchored floor + slender column holding up a **fully solid** block
+/// spanning exactly `4 x 4 x 4 = 64` connected bricks. Cutting the column
+/// detaches the whole block as one component whose bounding grid is the
+/// literal 64-brick stress case.
+///
+/// The block is built by directly [`Volume::insert_brick`]-ing 64
+/// `Brick::uniform` bricks rather than a `2 097 152`-cell `EditPlan` fill —
+/// same resident content, but the fixture costs 64 brick insertions instead of
+/// two million per-cell writes. The wire encoding of a uniform brick
+/// (`spall_protocol::baseline::BaselineCells::Uniform`) is independently tiny,
+/// regardless of this construction shortcut.
+///
+/// - floor:  `x 0..=7`, `z 0..=7`, `y 0..=1`   (anchored at `y = 0`)
+/// - column: `x 3..=4`, `z 3..=4`, `y 2..=31`  (fills brick row `y = 0` up to
+///   the block's brick-aligned base)
+/// - block:  `x 0..=127`, `z 0..=127`, `y 32..=159` — brick coordinates
+///   `(0..=3, 1..=4, 0..=3)`, exactly 64 bricks, every one solid `STONE`
+///
+/// The occupancy/collider extraction this fixture is built for requires every
+/// brick in its bounding box to be resident (`separated_regions_scene`'s doc
+/// comment carries the same rule) — the brick-row-`y = 0` layer around the
+/// floor/column is therefore filled resident air first, directly by brick
+/// (not a per-cell edit), before the floor and column are cut into it.
+pub fn giant_collapse_scene(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    for bx in 0..GIANT_COLLAPSE_BRICKS {
+        for bz in 0..GIANT_COLLAPSE_BRICKS {
+            v.insert_brick(
+                BrickCoord::new(bx, 0, bz),
+                Brick::uniform(MaterialId::AIR, Revision(1)),
+            )
+            .expect("giant-collapse air envelope insert");
+        }
+    }
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(7, 1, 7),
+        STONE,
+    ))
+    .expect("giant-collapse floor edit");
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(3, 2, 3),
+        GlobalCell::new(4, 31, 4),
+        STONE,
+    ))
+    .expect("giant-collapse column edit");
+    for bx in 0..GIANT_COLLAPSE_BRICKS {
+        for by in 0..GIANT_COLLAPSE_BRICKS {
+            for bz in 0..GIANT_COLLAPSE_BRICKS {
+                v.insert_brick(
+                    BrickCoord::new(bx, 1 + by, bz),
+                    Brick::uniform(STONE, Revision(1)),
+                )
+                .expect("giant-collapse block brick insert");
+            }
+        }
+    }
+    v
+}
+
 /// BLAKE3 digest over a volume's resident bricks in canonical `(z, y, x)`
 /// order: cell size, then per brick `(coord, content hash, revision)`. Stable
 /// across runs and platforms for a given fixture; use it to pin fixtures in
@@ -468,6 +536,41 @@ mod tests {
         let b = v.sample(GlobalCell::new(21, 20, 20)).unwrap();
         assert!(matches!(a, Sample::Filled(_)) && matches!(b, Sample::Filled(_)));
         assert_eq!(digest_hex(&v), BULK_SPLIT_DIGEST);
+    }
+
+    #[test]
+    fn giant_collapse_scene_block_spans_exactly_64_bricks() {
+        let v = giant_collapse_scene(vid(1));
+        assert_eq!(
+            v.sample(GlobalCell::new(0, 0, 0)).unwrap(),
+            Sample::Filled(STONE),
+            "anchored floor"
+        );
+        assert_eq!(
+            v.sample(GlobalCell::new(3, 4, 3)).unwrap(),
+            Sample::Filled(STONE),
+            "column"
+        );
+        assert_eq!(
+            v.sample(GlobalCell::new(0, 32, 0)).unwrap(),
+            Sample::Filled(STONE),
+            "block corner"
+        );
+        assert_eq!(
+            v.sample(GlobalCell::new(127, 159, 127)).unwrap(),
+            Sample::Filled(STONE),
+            "block far corner"
+        );
+        let block_bricks: std::collections::BTreeSet<BrickCoord> = v
+            .resident_brick_coords()
+            .into_iter()
+            .filter(|c| c.y >= 1 && c.y <= 4)
+            .collect();
+        assert_eq!(
+            block_bricks.len(),
+            64,
+            "the detachable block occupies exactly 64 bricks"
+        );
     }
 
     #[test]

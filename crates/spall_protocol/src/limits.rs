@@ -11,8 +11,24 @@ pub const MAX_CONTROL_RECORD: usize = 64 * 1024;
 /// Maximum bytes in one baseline bulk part payload.
 pub const MAX_BULK_PART: usize = 1024 * 1024;
 
-/// Maximum bytes in one fully assembled baseline transfer.
+/// Maximum **compressed** bytes in one fully assembled baseline transfer —
+/// the actual bytes that cross the wire (`spall_server::baseline::
+/// transfer_from_world` compresses the transfer; see docs/reports/G3.md's G4
+/// increment). Distinct from [`MAX_ASSEMBLED_TRANSFER_DECOMPRESSED`] for the
+/// same reason [`MAX_SPLIT_BASELINE_BLOB`] is distinct from
+/// [`MAX_SPLIT_BASELINE_DECOMPRESSED`]: a world with many small, highly
+/// redundant bodies (e.g. T23/G4's debris population) compresses far smaller
+/// than it decodes.
 pub const MAX_ASSEMBLED_TRANSFER: usize = 64 * 1024 * 1024;
+
+/// Maximum **decompressed** bytes accepted from one assembled baseline
+/// transfer — a DoS bound on `zstd` output, independent of the wire-size cap
+/// above. A world whose *compressed* transfer already fit
+/// [`MAX_ASSEMBLED_TRANSFER`] can still decompress to legitimately more than
+/// that (many small, mostly-air bodies each cost a full dense brick
+/// decompressed); this bound is sized for that case, not just headroom on the
+/// wire cap.
+pub const MAX_ASSEMBLED_TRANSFER_DECOMPRESSED: usize = 256 * 1024 * 1024;
 
 /// Maximum *decompressed* size of a material-only brick record.
 pub const MAX_BRICK_MATERIAL_DECOMPRESSED: usize = 256 * 1024;

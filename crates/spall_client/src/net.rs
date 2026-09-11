@@ -163,7 +163,11 @@ pub enum BaselineScene {
     /// overflows even the inline op-blob cap (T17 increment 2 / ENG-64).
     BulkSplit,
     /// [`spall_voxel::fixtures::separated_regions_scene`] — two independent
-    /// collapsible structures in one bounded world (T23 / G3).
+    /// collapsible structures in one bounded world (T23 / G3). Also the
+    /// terrain for the T23 / G4 `g4-workload` scene: the workload's debris
+    /// bodies are added to the server's `SimWorld` after construction, so a
+    /// live (non-late-join) replica's baseline is terrain-only — it never
+    /// carries the pre-existing bodies. See `docs/reports/G3.md`.
     SeparatedRegions,
     /// [`spall_voxel::fixtures::walk_arena`] — the flat 30 m movement lane
     /// (T19 / T23 row 8b). A stationary client on this scene installs it as a
@@ -182,6 +186,7 @@ impl BaselineScene {
             "checkerboard-split" | "oversized-split" => Some(Self::CheckerboardSplit),
             "bulk-split" | "giant-split" => Some(Self::BulkSplit),
             "separated-regions" | "t23-g3" | "g3" => Some(Self::SeparatedRegions),
+            "g4-workload" | "t23-g4" | "g4" => Some(Self::SeparatedRegions),
             "walk" | "walk-arena" | "player-movement" => Some(Self::Walk),
             _ => None,
         }
@@ -456,6 +461,11 @@ impl Predictor {
 /// accepts the bulk stream, reassembles + decodes the payload, then consumes
 /// records until `BaselineEnd`. Returns the decoded world, or `None` on any
 /// transport / decode failure.
+///
+/// T23 / G4: the reassembled bytes are the server's zstd-compressed payload
+/// (`spall_server::baseline::transfer_from_world`), so this decompresses
+/// before decoding — `end.assembled_hash` below is still checked against the
+/// canonical **uncompressed** re-encoding, independent of the compressor.
 async fn receive_baseline_body(conn: &Connection) -> Option<BaselineWorld> {
     let parts = conn.accept_bulk().await.ok()?.collect_parts().await.ok()?;
     let mut bytes = Vec::new();

@@ -143,21 +143,23 @@ impl BaselineWorld {
     }
 
     /// Decompress + decode + validate. Bounded by
-    /// [`crate::limits::MAX_ASSEMBLED_TRANSFER`] decompressed (the same ceiling
-    /// the bulk transfer path enforces).
+    /// [`crate::limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED`] — a DoS bound on
+    /// the decompressed size, independent of the *compressed* wire-transfer
+    /// cap ([`crate::limits::MAX_ASSEMBLED_TRANSFER`]) `transfer_from_world`
+    /// enforces on what actually crossed the wire.
     pub fn decode_compressed(bytes: &[u8]) -> Result<Self, BaselineDecodeError> {
         use std::io::Read;
         let decoder = zstd::stream::Decoder::new(bytes)
             .map_err(|e| BaselineDecodeError::Zstd(e.to_string()))?;
         let mut raw = Vec::new();
         decoder
-            .take(crate::limits::MAX_ASSEMBLED_TRANSFER as u64 + 1)
+            .take(crate::limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED as u64 + 1)
             .read_to_end(&mut raw)
             .map_err(|e| BaselineDecodeError::Zstd(e.to_string()))?;
-        if raw.len() > crate::limits::MAX_ASSEMBLED_TRANSFER {
+        if raw.len() > crate::limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED {
             return Err(BaselineDecodeError::BlobTooLarge {
                 bytes: raw.len(),
-                cap: crate::limits::MAX_ASSEMBLED_TRANSFER,
+                cap: crate::limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED,
             });
         }
         Self::decode(&raw)
