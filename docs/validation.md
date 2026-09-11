@@ -689,6 +689,20 @@ frozen); an edit targeting it, an approaching player, or a terrain cut within
 distant cut leaves it dormant; `world_hash` and conservation are identical to a
 run without the dormancy pass.
 
+Server-wiring networked proof (T21 increment 4 / 3c): `cargo xtask scenario
+--name sleep-wake` runs `sandbox-server --serve --dormancy` on the dedicated
+`Scene::SleepWake` against one real client over QUIC. The client cuts a column
+early, detaching a beam that falls and settles well outside the default wake
+margin; the server-reported `dormancy_deactivations_total` and
+`dormancy_reactivations_total` must both be `>= 1` (`dormancy_assertions` in
+the fixture). The client then walks down the lane into the wake margin — the
+dormant beam reactivates by proximity — and a final body-targeted cut proves it
+is still destructible (`body_cut_committed`). Passes clean, under `--loss-percent
+2`, and with `replay_check` (the committed topology-event stream replayed from
+the tick-0 baseline reproduces the same hash — dormancy is not journalled, only
+the two topology transactions are). See
+`docs/reports/ENG-28-increment-4-sleep-wake.md` for measured evidence.
+
 ### G5 — larger world
 
 Define actual radius, height, concurrent active regions, topology metadata size, and persistent debris envelope from G4 measurements. Demonstrate multiple physics origins with widely separated players and approach/merge tests. Measure generation, streaming/LOD seams, far graph traversal, and long-session storage growth. Do not publish an infinite-world claim or a maximum player count based on extrapolation alone.

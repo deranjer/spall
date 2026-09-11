@@ -97,6 +97,22 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     residency_radius_bricks: i64,
 
+    // --- T21 / ENG-28 increment 4 (3c): default-off contact damage + dormancy ---
+    /// Enable the contact-damage pass: a hard enough impact carves a cut into
+    /// terrain or the struck body (`spall_sim::ContactDamageConfig::DEFAULT`
+    /// tuning). Off by default — this changes the committed hash.
+    #[arg(long)]
+    contact_damage: bool,
+    /// Enable the region-dormancy pass: a settled body with nothing active
+    /// nearby is deactivated (dropped from the physics step), and a dormant
+    /// body a player or edit approaches is reactivated
+    /// (`spall_sim::DormancyConfig::DEFAULT` tuning). Off by default — a
+    /// deactivated body leaves the live physics world, which a gate scenario
+    /// reading physics state directly (e.g. `--await-body-settle`) must not
+    /// combine with this.
+    #[arg(long)]
+    dormancy: bool,
+
     // --- T20 interest + bandwidth scheduling ---
     /// Enable per-client interest relevance + motion bandwidth budget. Without
     /// it, one 20 Hz motion batch is broadcast unfiltered to every client
@@ -186,7 +202,7 @@ fn run_serve(args: Args) -> ExitCode {
         Some(s) => s,
         None => {
             eprintln!(
-                "sandbox-server: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, walk, checkerboard-split, bulk-split, separated-regions, g4-workload, separated-regions-far, or g1-full-envelope)",
+                "sandbox-server: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, walk, checkerboard-split, bulk-split, separated-regions, g4-workload, separated-regions-far, g1-full-envelope, or sleep-wake)",
                 args.scene
             );
             return ExitCode::from(2);
@@ -252,6 +268,10 @@ fn run_serve(args: Args) -> ExitCode {
             budget_bricks: args.residency_budget_bricks,
             interest_radius_bricks: args.residency_radius_bricks,
         }),
+        contact_damage: args
+            .contact_damage
+            .then_some(spall_sim::ContactDamageConfig::DEFAULT),
+        dormancy: args.dormancy.then_some(spall_sim::DormancyConfig::DEFAULT),
     };
     match spall_server::serve(config) {
         Ok(summary) => {

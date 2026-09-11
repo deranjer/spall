@@ -292,6 +292,23 @@ pub fn spawn_g1_hollow_test_volume(
     )
 }
 
+/// T21 / ENG-28 increment 4: [`walk_arena_setup`] with a small column-and-beam
+/// in the player lane ([`spall_voxel::fixtures::sleep_wake_arena`]) — cutting
+/// the column detaches the beam as a body a scripted client can walk away
+/// from and back to, exercising the networked dormancy deactivate/reactivate
+/// path end to end. Same collider region and spawns as [`walk_arena_setup`]:
+/// the added geometry sits entirely inside the existing bounds.
+pub fn sleep_wake_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: spall_voxel::fixtures::sleep_wake_arena(id),
+        terrain_collider_region: (GlobalCell::new(0, 0, 0), GlobalCell::new(119, 13, 15)),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: sim_physics_config(),
+    }
+}
+
 /// The T23 / G3 integrated-acceptance world
 /// ([`spall_voxel::fixtures::separated_regions_scene`]): two independent
 /// collapsible bridge structures in one bounded `256 x 128 x 256 m` world, a
