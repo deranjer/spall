@@ -39,10 +39,15 @@ use crate::predict::CELL_M;
 
 /// Debug-view visible radius (metres) around the player's feet. This
 /// renderer walks the raw volume every rebuild (no meshing/culling beyond a
-/// buried-cell filter), so a wide radius costs real per-rebuild time.
-const VIEW_RADIUS_M: f32 = 10.0;
-const VIEW_HEIGHT_UP_M: f32 = 4.0;
-const VIEW_HEIGHT_DOWN_M: f32 = 3.0;
+/// buried-cell filter), so a wide radius costs real per-rebuild time — but
+/// that cost lands on the background `RebuildWorker` thread (see its own
+/// doc), not the render/input thread, so a bigger radius only makes terrain
+/// pop in a little later after a big camera jump, never stalls a frame.
+/// `10.0` (the original value) left almost the whole scene invisible until
+/// the player was standing right in front of it — raised after user report.
+const VIEW_RADIUS_M: f32 = 48.0;
+const VIEW_HEIGHT_UP_M: f32 = 10.0;
+const VIEW_HEIGHT_DOWN_M: f32 = 8.0;
 /// Rebuild the instanced terrain draw once the player has moved this far
 /// (metres) from where it was last built, or the resident terrain changes.
 const REBUILD_DISTANCE_M: f64 = 1.0;
