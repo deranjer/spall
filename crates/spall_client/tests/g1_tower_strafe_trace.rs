@@ -343,6 +343,25 @@ fn g1_tower_strafe_trace_with_matched_representations() {
          (both NativeVoxels) {matched_notable} events > 0.01m, max {matched_max:.4}m"
     );
     report("matched (both NativeVoxels)", &matched);
+
+    // ENG-69 round 17: converts the round-16 elimination finding into a real
+    // regression assertion, not just a printed observation — a future
+    // change that reintroduces representation-mismatch corrections (or
+    // silently breaks `force_volume_representation_for_test`) fails this
+    // test, not just looks different in `--nocapture` output.
+    assert!(
+        baseline_notable > 0 && baseline_max > 0.01,
+        "the baseline (unmatched representations) should still reproduce the seam-divergence \
+         corrections this test exists to eliminate — got {baseline_notable} events > 0.01m, max \
+         {baseline_max:.4}m; if this genuinely changed, the comparison below is no longer \
+         meaningful and needs re-establishing, not just a loosened threshold"
+    );
+    assert!(
+        matched_max < 1.0e-4,
+        "matching the server's terrain representation to the client's (both NativeVoxels) \
+         should eliminate the divergence entirely — got a max error of {matched_max:.6}m across \
+         {matched_notable} events > 0.01m (round 16 measured exactly 0.0000m)"
+    );
 }
 
 /// Sanity check on the fixed start point, independent of the rest of the
