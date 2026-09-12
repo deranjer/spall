@@ -205,6 +205,47 @@ fn removing_the_floor_mid_run_does_not_leave_the_player_hovering() {
 }
 
 #[test]
+fn idle_correction_breakdown_stays_consistent_with_the_combined_counters() {
+    // ENG-69 round 7: the interactive HUD now splits `corrections` into an
+    // idle subset plus a vertical/horizontal decomposition, to tell a
+    // resting-contact disagreement (idle, vertical) apart from a
+    // collision-sweep one incurred while moving (horizontal). This harness
+    // shares the server's own volume directly (no wire/replica
+    // reconstruction), so it is not expected to reproduce the live-session
+    // divergence itself — this only guards the accounting: whatever fires,
+    // the idle subset and either component must never exceed the combined
+    // lifetime counters they were derived from.
+    let mut h = Harness::new(3);
+    for _ in 0..200 {
+        h.step(idle());
+    }
+    assert!(
+        h.predictor.idle_corrections <= h.predictor.corrections,
+        "idle corrections {} exceeded total corrections {}",
+        h.predictor.idle_corrections,
+        h.predictor.corrections
+    );
+    assert!(
+        h.predictor.max_idle_correction_m <= h.predictor.max_correction_m + 1e-9,
+        "idle max {:.6} exceeded overall max {:.6}",
+        h.predictor.max_idle_correction_m,
+        h.predictor.max_correction_m
+    );
+    assert!(
+        h.predictor.max_vertical_correction_m <= h.predictor.max_correction_m + 1e-9,
+        "vertical max {:.6} exceeded combined max {:.6}",
+        h.predictor.max_vertical_correction_m,
+        h.predictor.max_correction_m
+    );
+    assert!(
+        h.predictor.max_horizontal_correction_m <= h.predictor.max_correction_m + 1e-9,
+        "horizontal max {:.6} exceeded combined max {:.6}",
+        h.predictor.max_horizontal_correction_m,
+        h.predictor.max_correction_m
+    );
+}
+
+#[test]
 fn a_lost_button_release_leaves_both_sides_at_rest() {
     let mut h = Harness::new(8);
     // 20 ticks of held-forward input, then total silence (every later datagram,

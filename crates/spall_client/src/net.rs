@@ -547,6 +547,21 @@ impl Predictor {
     }
 }
 
+/// One mover tick's snapshot of `PredictedPlayer`'s correction counters,
+/// published into `InteractiveView` for the interactive HUD (see ENG-69's
+/// round-6/7 investigation into corrections firing even while standing
+/// still) — a named struct rather than growing `MoverTickOutcome`'s tuple
+/// past readability.
+#[derive(Debug, Clone, Copy, Default)]
+struct CorrectionStats {
+    corrections: u64,
+    max_correction_m: f64,
+    idle_corrections: u64,
+    max_idle_correction_m: f64,
+    max_vertical_correction_m: f64,
+    max_horizontal_correction_m: f64,
+}
+
 /// Receives one baseline transfer whose `BaselineBegin` has already been read:
 /// accepts the bulk stream, reassembles + decodes the payload, then consumes
 /// records until `BaselineEnd`. Returns the decoded world, or `None` on any
@@ -1082,7 +1097,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     Option<[f64; 3]>,
                     Option<u64>,
                     Option<CharacterState>,
-                    Option<(u64, f64)>,
+                    Option<CorrectionStats>,
                 );
                 let (frame, feet, script_tick, predicted_state, correction_stats): MoverTickOutcome = {
                     let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
@@ -1169,24 +1184,32 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     };
                     let predicted_state = p.player.as_ref().map(PredictedPlayer::predicted);
                     let feet = predicted_state.map(|st| st.position_m);
-                    let correction_stats = p
-                        .player
-                        .as_ref()
-                        .map(|pl| (pl.corrections, pl.max_correction_m));
+                    let correction_stats = p.player.as_ref().map(|pl| CorrectionStats {
+                        corrections: pl.corrections,
+                        max_correction_m: pl.max_correction_m,
+                        idle_corrections: pl.idle_corrections,
+                        max_idle_correction_m: pl.max_idle_correction_m,
+                        max_vertical_correction_m: pl.max_vertical_correction_m,
+                        max_horizontal_correction_m: pl.max_horizontal_correction_m,
+                    });
                     (frame, feet, script_tick, predicted_state, correction_stats)
                 };
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
                 }
                 if let (Some(session), Some(predicted)) = (&interactive, predicted_state) {
-                    let (corrections, max_correction_m) = correction_stats.unwrap_or_default();
+                    let stats = correction_stats.unwrap_or_default();
                     *session.view.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(InteractiveView {
                             predicted,
                             server_tick: tick,
                             published_at: std::time::Instant::now(),
-                            corrections,
-                            max_correction_m,
+                            corrections: stats.corrections,
+                            max_correction_m: stats.max_correction_m,
+                            idle_corrections: stats.idle_corrections,
+                            max_idle_correction_m: stats.max_idle_correction_m,
+                            max_vertical_correction_m: stats.max_vertical_correction_m,
+                            max_horizontal_correction_m: stats.max_horizontal_correction_m,
                         });
                 }
 

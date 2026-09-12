@@ -235,6 +235,24 @@ pub struct PredictedPlayer {
     pub corrections: u64,
     /// Largest such difference, metres.
     pub max_correction_m: f64,
+    /// Of `corrections`, how many happened on a record whose input was
+    /// perfectly neutral (no movement, no buttons) — isolates a resting-contact
+    /// disagreement (both sides idle, nothing to sweep) from a collision-sweep
+    /// difference incurred while actually walking, which the plain lifetime
+    /// counters above cannot tell apart (see ENG-69's round-6/7 investigation
+    /// into corrections that keep firing "even while standing still").
+    pub idle_corrections: u64,
+    /// Largest correction magnitude ever seen on an idle record.
+    pub max_idle_correction_m: f64,
+    /// Largest vertical (Y) component of `err` ever seen across all
+    /// corrections — large relative to `max_correction_m` points at the two
+    /// sides resting at different heights (a terrain/ground-snap disagreement);
+    /// small relative to it (with `max_horizontal_correction_m` large instead)
+    /// points at a swept-move/collision-response disagreement instead.
+    pub max_vertical_correction_m: f64,
+    /// Largest horizontal (XZ) component of `err` ever seen across all
+    /// corrections. See `max_vertical_correction_m`.
+    pub max_horizontal_correction_m: f64,
     pub total_ticks: u64,
     pub grounded_ticks: u64,
     /// Set only if the predictor ever reported "grounded" while authority was
@@ -255,6 +273,10 @@ impl PredictedPlayer {
             max_distance_from_start_m: 0.0,
             corrections: 0,
             max_correction_m: 0.0,
+            idle_corrections: 0,
+            max_idle_correction_m: 0.0,
+            max_vertical_correction_m: 0.0,
+            max_horizontal_correction_m: 0.0,
             total_ticks: 0,
             grounded_ticks: 0,
             hovered_after_floor_removal: false,
@@ -314,8 +336,23 @@ impl PredictedPlayer {
             let err = rec.predicted_after.distance_m(&authoritative);
             if err > 1.0e-4 {
                 self.corrections += 1;
+                // A record only ever holds the *sanitized* input actually fed to
+                // `step_character` (see `tick`), so this is exactly the input
+                // that produced `predicted_after` — comparing it to `NEUTRAL`
+                // tells whether the two sides had anything to sweep at all.
+                if rec.input.movement == [0.0, 0.0, 0.0] && rec.input.buttons == 0 {
+                    self.idle_corrections += 1;
+                    self.max_idle_correction_m = self.max_idle_correction_m.max(err);
+                }
             }
             self.max_correction_m = self.max_correction_m.max(err);
+            let dy = (rec.predicted_after.position_m[1] - authoritative.position_m[1]).abs();
+            let dx = rec.predicted_after.position_m[0] - authoritative.position_m[0];
+            let dz = rec.predicted_after.position_m[2] - authoritative.position_m[2];
+            self.max_vertical_correction_m = self.max_vertical_correction_m.max(dy);
+            self.max_horizontal_correction_m = self
+                .max_horizontal_correction_m
+                .max((dx * dx + dz * dz).sqrt());
         }
         if !authoritative.grounded
             && authoritative.velocity_m_s[1] < -1.0

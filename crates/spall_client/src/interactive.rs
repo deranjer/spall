@@ -92,6 +92,15 @@ pub struct InteractiveView {
     /// character controller's own collision response).
     pub corrections: u64,
     pub max_correction_m: f64,
+    /// `PredictedPlayer::idle_corrections` / `max_idle_correction_m` and the
+    /// vertical/horizontal decomposition of `max_correction_m` — see those
+    /// fields' docs. Split out so the HUD can tell a resting-contact
+    /// disagreement (idle, vertical) from a collision-sweep one (moving,
+    /// horizontal) without re-deriving it from raw logs.
+    pub idle_corrections: u64,
+    pub max_idle_correction_m: f64,
+    pub max_vertical_correction_m: f64,
+    pub max_horizontal_correction_m: f64,
 }
 
 /// Shared handle between the network thread and the render window for one
