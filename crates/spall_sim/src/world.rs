@@ -15,8 +15,9 @@ use spall_core::{
 };
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
-    BodyKind as PhysBodyKind, BodySpec, CharacterParams, OccupancyGrid, PhysicsConfig,
-    PhysicsWorld, Representation, analytic_mass_properties, step_character,
+    BodyId as PhysBodyId, BodyKind as PhysBodyKind, BodySpec, CharacterParams, CharacterQueryCache,
+    OccupancyGrid, PhysicsConfig, PhysicsWorld, Representation, analytic_mass_properties,
+    step_character,
 };
 use spall_protocol::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
@@ -123,6 +124,13 @@ pub struct SimWorld {
     /// (T19). Not bodies: no volume, never split, never in the dynamic set.
     players: BTreeMap<u64, Player>,
     physics: PhysicsWorld,
+    /// ENG-69 round 18: each live player's own bounded terrain-query window
+    /// (`spall_physics::query_cache`'s own doc has the full design) — keyed
+    /// the same as `players`, kept in sync with it by `advance_players`
+    /// (which also owns tearing a stale entry's physics-world collider down
+    /// when its player has left, since that needs `&mut physics` alongside
+    /// everything else it already touches that tick).
+    query_caches: BTreeMap<u64, CharacterQueryCache>,
     /// T23 / G3 row 7, slice B: per-volume digests of bricks that have been
     /// evicted from the live cache. Empty unless the residency pass (slice D)
     /// populates it, so every logical path is byte-identical to today by
@@ -195,6 +203,7 @@ impl SimWorld {
             volume_owner: BTreeMap::new(),
             players: BTreeMap::new(),
             physics,
+            query_caches: BTreeMap::new(),
             evicted: BTreeMap::new(),
             backing: None,
         })
@@ -520,28 +529,121 @@ impl SimWorld {
     /// capsule is never left inside new solid or hovering over removed floor and
     /// the client knows to rebuild prediction from the next snapshot.
     pub fn advance_players(&mut self, dt_s: f32, invalidation_boxes: &[([f64; 3], [f64; 3])]) {
-        let physics = &self.physics;
-        for player in self.players.values_mut() {
-            if invalidation_boxes
-                .iter()
-                .any(|(lo, hi)| player.near_world_box(*lo, *hi))
-            {
-                player.movement_epoch = player.movement_epoch.wrapping_add(1);
-                let mv =
-                    physics.sweep_character(player.params, player.state.position_m, [0.0; 3], dt_s);
-                player.state.position_m = [
-                    player.state.position_m[0] + f64::from(mv.translation_m[0]),
-                    player.state.position_m[1] + f64::from(mv.translation_m[1]),
-                    player.state.position_m[2] + f64::from(mv.translation_m[2]),
-                ];
-                player.state.grounded = mv.grounded;
-                player.state.velocity_m_s = [0.0; 3];
+        // Depenetration pass (unchanged from before ENG-69 round 18): still
+        // sweeps against the real, always-current whole-terrain collider
+        // directly, not through any player's own window. This is a rare,
+        // correctness-critical one-shot resolve right after a committed
+        // edit invalidated the player — not the steady-state movement path
+        // the window cache targets — and the real terrain is the simplest,
+        // safest thing to resolve fresh solid-vs-player penetration against.
+        {
+            let physics = &self.physics;
+            for player in self.players.values_mut() {
+                if invalidation_boxes
+                    .iter()
+                    .any(|(lo, hi)| player.near_world_box(*lo, *hi))
+                {
+                    player.movement_epoch = player.movement_epoch.wrapping_add(1);
+                    let mv = physics.sweep_character(
+                        player.params,
+                        player.state.position_m,
+                        [0.0; 3],
+                        dt_s,
+                    );
+                    player.state.position_m = [
+                        player.state.position_m[0] + f64::from(mv.translation_m[0]),
+                        player.state.position_m[1] + f64::from(mv.translation_m[1]),
+                        player.state.position_m[2] + f64::from(mv.translation_m[2]),
+                    ];
+                    player.state.grounded = mv.grounded;
+                    player.state.velocity_m_s = [0.0; 3];
+                }
             }
+        }
+
+        // Drop any query-cache entries for players that are no longer live
+        // (`remove_player` only drops the `Player`; the window's own
+        // physics-world teardown happens here, batched with everything else
+        // that needs `&mut self.physics` this tick, rather than needing
+        // `remove_player` to reach into physics on its own).
+        let stale: Vec<u64> = self
+            .query_caches
+            .keys()
+            .copied()
+            .filter(|k| !self.players.contains_key(k))
+            .collect();
+        for key in stale {
+            if let Some(mut cache) = self.query_caches.remove(&key) {
+                cache.clear(&mut self.physics);
+            }
+        }
+
+        // Pass 1: ensure every live player's own window covers their
+        // *current* position before any of them move this tick — pass 2's
+        // exclude lists (every *other* player's window) need every window
+        // to already be current, not stale from whenever that player last
+        // moved, or built from wherever iteration order happens to reach
+        // them first.
+        //
+        // A window build can fail (`ExtractError`) when the player is close
+        // enough to the edge of a small/bounded terrain that the window's
+        // margin reaches cells the volume never authored at all — not a
+        // rare case: most non-g1-scale fixtures in this codebase are far
+        // smaller than `WINDOW_RADIUS_M`'s own margin. That player falls
+        // back to sweeping against the real whole-terrain collider this
+        // tick, unfiltered — exactly what every player did before this
+        // round — rather than the sim thread panicking near any small
+        // world's edge.
+        let terrain_revision = self.terrain.collider_revision;
+        let cell_m = self.terrain.volume.cell_size().metres() as f32;
+        let mut windows: Vec<(u64, Option<PhysBodyId>)> = Vec::with_capacity(self.players.len());
+        let mut window_unavailable: std::collections::BTreeSet<u64> =
+            std::collections::BTreeSet::new();
+        for (&key, player) in &self.players {
+            let cache = self.query_caches.entry(key).or_default();
+            match cache.ensure_covers(
+                &mut self.physics,
+                &self.terrain.volume,
+                cell_m,
+                player.state.position_m,
+                terrain_revision,
+            ) {
+                Ok((window_id, _cost)) => windows.push((key, window_id)),
+                Err(_) => {
+                    window_unavailable.insert(key);
+                }
+            }
+        }
+
+        // Pass 2: the actual movement step. Each player whose window built
+        // successfully excludes the real whole-terrain collider (their own
+        // window replaces it exactly — ENG-69 rounds 15-17) and every
+        // *other* player's window (each is sized and centred for its own
+        // owner alone, meaningless — and potentially misleading, being
+        // `MergedCuboids`-seam-free geometry built around a different
+        // position — to anyone else's sweep). A player whose window is
+        // unavailable this tick excludes nothing, sweeping against the real
+        // terrain instead. Ordinary dynamic bodies (debris, detached
+        // structures) are *never* excluded either way: they stay fully
+        // visible, exactly as before this round.
+        let terrain_id = self.terrain.phys;
+        for (key, player) in &mut self.players {
+            let mut exclude: Vec<PhysBodyId> = Vec::with_capacity(windows.len());
+            if !window_unavailable.contains(key) {
+                exclude.push(terrain_id);
+            }
+            exclude.extend(
+                windows
+                    .iter()
+                    .filter(|(other, _)| other != key)
+                    .filter_map(|(_, id)| *id),
+            );
 
             let input = player.effective_input();
             let params = player.params;
+            let physics = &self.physics;
             player.state = step_character(player.state, input, dt_s, |pos, desired| {
-                physics.sweep_character(params, pos, desired, dt_s)
+                physics.sweep_character_excluding(params, pos, desired, dt_s, &exclude)
             });
 
             // Bounded-fixture safety net: a capsule that leaves the world (bad

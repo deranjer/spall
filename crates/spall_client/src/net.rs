@@ -40,7 +40,7 @@ use spall_protocol::{
 };
 
 use crate::interactive::{InteractiveSession, InteractiveView};
-use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
+use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer, WindowStats};
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
 use crate::residency::ClientResidencyPass;
 
@@ -981,6 +981,14 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         // T19: a snapshot for our own player entity reconciles
                         // the predictor rather than entering the body replica.
                         if let Some(pred) = &predictor {
+                            // Locked (and dropped) before `pred`'s own lock below,
+                            // matching the mover loop's lock ordering
+                            // (`replica` then `pred`) to avoid a cross-task
+                            // deadlock risk.
+                            let terrain_volume = {
+                                let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                                guard.terrain_volume().cloned()
+                            };
                             let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
                             let p: &mut Predictor = &mut guard;
                             if snap.body == p.entity {
@@ -996,9 +1004,19 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                     // `CorrectionLog` (ENG-69 round 10/11 — see its own doc)
                                     // when this is an interactive session, for post-hoc
                                     // analysis of a real hands-on run.
+                                    //
+                                    // `terrain_volume` is `None` only before the replica
+                                    // has any terrain object at all — skipping
+                                    // reconciliation this one time is the same as any
+                                    // other not-ready tick, not a hard failure.
                                     Some(pl) => {
-                                        if let Some(event) =
-                                            pl.reconcile(&p.phys, st, snap.acked_input)
+                                        if let Some(volume) = &terrain_volume
+                                            && let Some(event) = pl.reconcile(
+                                                &mut p.phys,
+                                                volume,
+                                                st,
+                                                snap.acked_input,
+                                            )
                                             && let Some(session) = &interactive
                                             && let Some(log) = &session.corrections
                                         {
@@ -1097,12 +1115,18 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 }
                 let tick = counters.last_tick.load(Ordering::Relaxed);
 
-                // Rebuild the collider if the terrain changed near us.
-                let terrain = {
+                // Rebuild the collider if the terrain changed near us. Kept as
+                // two separate bindings, not one `Option<(Hash32, Volume)>`
+                // (as before ENG-69 round 18): `terrain_volume` needs to stay
+                // borrowable both for the dirty-check block below *and* for
+                // every `pl.tick` call afterward, which now also needs a
+                // fresh `&Volume` each tick for its own window cache.
+                let (terrain_hash, terrain_volume) = {
                     let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
-                    guard
-                        .terrain_resident_hash()
-                        .zip(guard.terrain_volume().cloned())
+                    (
+                        guard.terrain_resident_hash(),
+                        guard.terrain_volume().cloned(),
+                    )
                 };
                 // All predictor-lock work happens in this non-async block, which
                 // returns the datagram to send (and the predicted feet position
@@ -1113,14 +1137,15 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     Option<u64>,
                     Option<CharacterState>,
                     Option<CorrectionStats>,
+                    WindowStats,
                 );
-                let (frame, feet, script_tick, predicted_state, correction_stats): MoverTickOutcome = {
+                let (frame, feet, script_tick, predicted_state, correction_stats, window_stats): MoverTickOutcome = {
                     let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
                     let p: &mut Predictor = &mut guard;
-                    if let Some((hash, volume)) = terrain
+                    if let (Some(hash), Some(volume)) = (terrain_hash, &terrain_volume)
                         && p.terrain_hash != Some(hash)
                     {
-                        p.phys.set_terrain(&volume);
+                        p.phys.set_terrain(volume);
                         let first = p.terrain_hash.is_none();
                         p.terrain_hash = Some(hash);
                         if !first && let Some(pl) = &mut p.player {
@@ -1157,8 +1182,10 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         };
                         p.input_seq += 1;
                         let seq = InputSeq(p.input_seq);
-                        if let Some(pl) = &mut p.player {
-                            pl.tick(&p.phys, input, seq, MOVEMENT_DT_S);
+                        if let Some(pl) = &mut p.player
+                            && let Some(volume) = &terrain_volume
+                        {
+                            pl.tick(&mut p.phys, volume, input, seq, MOVEMENT_DT_S);
                         }
                         // Preserve the script's server-tick cadence.  The
                         // mover itself samples more often than snapshots can
@@ -1207,7 +1234,15 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         max_vertical_correction_m: pl.max_vertical_correction_m,
                         max_horizontal_correction_m: pl.max_horizontal_correction_m,
                     });
-                    (frame, feet, script_tick, predicted_state, correction_stats)
+                    let window_stats = p.phys.window_stats();
+                    (
+                        frame,
+                        feet,
+                        script_tick,
+                        predicted_state,
+                        correction_stats,
+                        window_stats,
+                    )
                 };
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
@@ -1225,6 +1260,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             max_idle_correction_m: stats.max_idle_correction_m,
                             max_vertical_correction_m: stats.max_vertical_correction_m,
                             max_horizontal_correction_m: stats.max_horizontal_correction_m,
+                            window_stats,
                         });
                 }
 

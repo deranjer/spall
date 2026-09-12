@@ -158,11 +158,16 @@ impl Harness {
             self.sim.player_acked_input(self.player).unwrap(),
         ));
         self.phase_log.push(phase);
-        self.predictor.tick(&self.phys, input, seq, TICK_DT_S);
+        let volume = self.sim.world().terrain().volume.clone();
+        self.predictor
+            .tick(&mut self.phys, &volume, input, seq, TICK_DT_S);
         if self.server_log.len() > self.ack_delay {
             let record_index = self.server_log.len() - 1 - self.ack_delay;
             let (auth, acked) = self.server_log[record_index];
-            if let Some(event) = self.predictor.reconcile(&self.phys, auth, acked) {
+            if let Some(event) = self
+                .predictor
+                .reconcile(&mut self.phys, &volume, auth, acked)
+            {
                 samples.push(Sample {
                     tick: record_index,
                     phase: self.phase_log[record_index],

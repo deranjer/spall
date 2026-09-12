@@ -83,11 +83,14 @@ impl Harness {
             self.sim.player_acked_input(self.player).unwrap(),
         ));
 
-        self.predictor.tick(&self.phys, input, seq, TICK_DT_S);
+        let volume = self.sim.world().terrain().volume.clone();
+        self.predictor
+            .tick(&mut self.phys, &volume, input, seq, TICK_DT_S);
 
         if self.server_log.len() > self.ack_delay {
             let (auth, acked) = self.server_log[self.server_log.len() - 1 - self.ack_delay];
-            self.predictor.reconcile(&self.phys, auth, acked);
+            self.predictor
+                .reconcile(&mut self.phys, &volume, auth, acked);
         }
     }
 
@@ -261,10 +264,11 @@ fn a_lost_button_release_leaves_both_sides_at_rest() {
             h.sim.player_state(h.player).unwrap(),
             h.sim.player_acked_input(h.player).unwrap(),
         ));
+        let volume = h.sim.world().terrain().volume.clone();
         h.predictor
-            .tick(&h.phys, idle(), InputSeq(h.seq), TICK_DT_S);
+            .tick(&mut h.phys, &volume, idle(), InputSeq(h.seq), TICK_DT_S);
         let (auth, acked) = h.server_log[h.server_log.len() - 1 - h.ack_delay];
-        h.predictor.reconcile(&h.phys, auth, acked);
+        h.predictor.reconcile(&mut h.phys, &volume, auth, acked);
     }
 
     let server_end = h.server_state();

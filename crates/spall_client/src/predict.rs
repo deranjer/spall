@@ -18,8 +18,8 @@ use std::collections::{BTreeSet, VecDeque};
 use serde::Serialize;
 use spall_core::{BrickCoord, GlobalCell, MaterialId, PlayerInput};
 use spall_physics::{
-    BodyId, BodyKind, BodySpec, CharacterMove, CharacterParams, CharacterState, OccupancyGrid,
-    PhysicsConfig, PhysicsWorld, Representation, step_character,
+    BodyId, BodyKind, BodySpec, CharacterMove, CharacterParams, CharacterQueryCache,
+    CharacterState, OccupancyGrid, PhysicsConfig, PhysicsWorld, Representation, step_character,
 };
 use spall_protocol::InputSeq;
 use spall_voxel::{Sample, Volume};
@@ -45,6 +45,42 @@ pub struct ClientPhysics {
     /// tells a caller whether *the player's own* brick is actually one of
     /// them, as opposed to merely "some geometry exists somewhere".
     resident_bricks: BTreeSet<BrickCoord>,
+    /// ENG-69 round 18: [`Self::sweep`]'s own small window, tried before
+    /// falling back to `terrain` (`spall_physics::query_cache`'s own doc has
+    /// the full design/rationale — this is the client half of the same fix
+    /// `spall_sim::world::SimWorld::advance_players` applies server-side).
+    /// Kept *alongside* `terrain`, not instead of it: a window build fails
+    /// outright (rather than silently approximating) whenever its margin
+    /// would reach a cell the replica hasn't streamed in yet — common near
+    /// the edge of the client's own residency radius, an everyday case here
+    /// in a way it mostly isn't for the server's complete-knowledge terrain
+    /// — so `terrain`'s existing, already-validated full-resident-set
+    /// collider stays as the fallback for exactly that case.
+    query_cache: CharacterQueryCache,
+    /// Bumped every [`Self::set_terrain`] call — the `revision` token
+    /// [`Self::query_cache`] uses to know its window is stale even when the
+    /// player hasn't moved far enough to cross it on position alone (an
+    /// edit landing inside an otherwise-unmoved window).
+    revision: u64,
+    /// Live counters proving [`Self::query_cache`] is actually in the
+    /// sweep path, not just present and unused — ENG-69 round 18 asked for
+    /// this explicitly after the round-17 prototype never got wired to
+    /// anything live. Surfaced through [`Self::window_stats`] to the
+    /// interactive HUD (`window.rs`'s `Hud::report`).
+    window_stats: WindowStats,
+}
+
+/// See [`ClientPhysics::window_stats`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WindowStats {
+    /// Sweeps that used the window (with or without rebuilding it first).
+    pub window_sweeps: u64,
+    /// Of those, how many also rebuilt the window this call.
+    pub window_rebuilds: u64,
+    /// Sweeps that fell back to the whole-resident-set `terrain` collider —
+    /// the window couldn't be built (residency-edge `ExtractError`) or was
+    /// legitimately empty this call.
+    pub terrain_fallbacks: u64,
 }
 
 impl Default for ClientPhysics {
@@ -59,7 +95,16 @@ impl ClientPhysics {
             world: PhysicsWorld::new(PhysicsConfig::default()),
             terrain: None,
             resident_bricks: BTreeSet::new(),
+            query_cache: CharacterQueryCache::new(),
+            revision: 0,
+            window_stats: WindowStats::default(),
         }
+    }
+
+    /// Live proof [`Self::query_cache`] is actually serving sweeps, not
+    /// just present — see [`WindowStats`]'s own fields.
+    pub fn window_stats(&self) -> WindowStats {
+        self.window_stats
     }
 
     /// (Re)builds the terrain collider from `volume`. The caller gates this on a
@@ -146,16 +191,52 @@ impl ClientPhysics {
         // Refresh the broad-phase BVH so the next character sweep sees the new
         // collider (the sweep runs no physics step of its own).
         self.world.step();
+        self.revision = self.revision.wrapping_add(1);
     }
 
-    /// Sweeps the capsule one tick against the terrain collider.
+    /// Sweeps the capsule one tick, preferring [`Self::query_cache`]'s own
+    /// small `NativeVoxels` window (real terrain excluded, since the window
+    /// replaces it exactly) over `terrain`'s whole-resident-set collider —
+    /// falling back to the latter, unfiltered, whenever the window can't be
+    /// built this call (see [`Self::query_cache`]'s own doc for why that
+    /// happens routinely here, unlike server-side). `volume` is the
+    /// replica's current terrain — the caller already holds/clones it each
+    /// tick for the existing dirty check, so this asks for nothing new.
     pub fn sweep(
-        &self,
+        &mut self,
+        volume: &Volume,
         params: CharacterParams,
         feet_m: [f64; 3],
         desired_m: [f32; 3],
         dt_s: f32,
     ) -> CharacterMove {
+        if let Some(terrain_id) = self.terrain
+            && let Ok((Some(_window_id), cost)) = self.query_cache.ensure_covers(
+                &mut self.world,
+                volume,
+                CELL_M,
+                feet_m,
+                self.revision,
+            )
+        {
+            self.window_stats.window_sweeps += 1;
+            if cost.is_some() {
+                self.window_stats.window_rebuilds += 1;
+            }
+            return self.world.sweep_character_excluding(
+                params,
+                feet_m,
+                desired_m,
+                dt_s,
+                &[terrain_id],
+            );
+        }
+        // No window this call — either the cache couldn't build one (too
+        // close to the residency edge) or it legitimately found no solid
+        // cell nearby (open air within the window, but `terrain` may still
+        // hold real geometry elsewhere the player is about to reach) — the
+        // original whole-resident-set sweep covers both correctly.
+        self.window_stats.terrain_fallbacks += 1;
         self.world.sweep_character(params, feet_m, desired_m, dt_s)
     }
 
@@ -347,16 +428,20 @@ impl PredictedPlayer {
     }
 
     /// Advances the prediction one tick and records the input for replay.
+    /// `volume` is the replica's current terrain, passed through to
+    /// [`ClientPhysics::sweep`]'s own window cache — the caller already
+    /// holds/clones it each tick for the existing terrain-hash dirty check.
     pub fn tick(
         &mut self,
-        phys: &ClientPhysics,
+        phys: &mut ClientPhysics,
+        volume: &Volume,
         input: PlayerInput,
         seq: InputSeq,
         dt_s: f32,
     ) -> CharacterState {
         let params = self.params;
         self.predicted = step_character(self.predicted, input, dt_s, |p, d| {
-            phys.sweep(params, p, d, dt_s)
+            phys.sweep(volume, params, p, d, dt_s)
         });
         self.history.push_back(Record {
             seq,
@@ -391,7 +476,8 @@ impl PredictedPlayer {
     /// uses, so callers computing percentiles see the true near-zero tail too.
     pub fn reconcile(
         &mut self,
-        phys: &ClientPhysics,
+        phys: &mut ClientPhysics,
+        volume: &Volume,
         authoritative: CharacterState,
         acked: InputSeq,
     ) -> Option<CorrectionEvent> {
@@ -441,7 +527,9 @@ impl PredictedPlayer {
         let mut state = authoritative;
         for rec in self.history.iter_mut() {
             let dt = rec.dt;
-            state = step_character(state, rec.input, dt, |p, d| phys.sweep(params, p, d, dt));
+            state = step_character(state, rec.input, dt, |p, d| {
+                phys.sweep(volume, params, p, d, dt)
+            });
             rec.predicted_after = state;
         }
         self.predicted = state;

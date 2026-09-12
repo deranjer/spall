@@ -275,6 +275,12 @@ struct Hud {
     /// Same idea for `InteractiveView::idle_corrections` — see
     /// `PredictedPlayer::idle_corrections`.
     last_idle_corrections_total: u64,
+    /// `InteractiveView::window_stats` as of the last report — same
+    /// lifetime-counter-to-delta idea as `last_corrections_total`. ENG-69
+    /// round 18: live proof the character-query-window cache is actually
+    /// serving sweeps during a hands-on session, not just present in the
+    /// code and never exercised.
+    last_window_stats: crate::predict::WindowStats,
 }
 
 impl Hud {
@@ -339,6 +345,7 @@ impl Hud {
         max_idle_correction_m: f64,
         max_vertical_correction_m: f64,
         max_horizontal_correction_m: f64,
+        window_stats_total: crate::predict::WindowStats,
     ) -> String {
         let elapsed = self
             .last_report_at
@@ -354,10 +361,28 @@ impl Hud {
         let max_buffer_upload_ms = self.max_buffer_upload_ms;
         self.max_frame_ms = 0.0;
         self.max_buffer_upload_ms = 0.0;
+        // ENG-69 round 18: `window_sweeps` vs `terrain_fallbacks` shows
+        // whether the character-query-window cache is actually the thing
+        // resolving movement this session, or silently falling back to the
+        // whole-resident-set collider the whole time (e.g. because the
+        // player has never strayed far enough from the world's streaming
+        // edge for a window to build) — either is a real, different fact
+        // about *this* session, not visible any other way.
+        let new_window_sweeps = window_stats_total
+            .window_sweeps
+            .saturating_sub(self.last_window_stats.window_sweeps);
+        let new_window_rebuilds = window_stats_total
+            .window_rebuilds
+            .saturating_sub(self.last_window_stats.window_rebuilds);
+        let new_terrain_fallbacks = window_stats_total
+            .terrain_fallbacks
+            .saturating_sub(self.last_window_stats.terrain_fallbacks);
+        self.last_window_stats = window_stats_total;
         format!(
             "{fps:.0} fps | frame {:.1} ms (avg) / {max_frame_ms:.1} ms (max) | buffer upload {max_buffer_upload_ms:.1} ms (max) | \
              rebuild {:.1} ms ({} instances) | server tick {server_tick} | \
-             +{new_corrections} corrections ({new_idle} idle) (lifetime max {max_correction_m:.3} m idle {max_idle_correction_m:.3} m vert {max_vertical_correction_m:.3} m horiz {max_horizontal_correction_m:.3} m)",
+             +{new_corrections} corrections ({new_idle} idle) (lifetime max {max_correction_m:.3} m idle {max_idle_correction_m:.3} m vert {max_vertical_correction_m:.3} m horiz {max_horizontal_correction_m:.3} m) | \
+             window cache: {new_window_sweeps} sweeps ({new_window_rebuilds} rebuilt), {new_terrain_fallbacks} terrain fallbacks",
             self.frame_ms_ema, self.last_rebuild_ms, self.last_rebuild_instances,
         )
     }
@@ -584,6 +609,7 @@ impl ApplicationHandler for InteractiveApp {
                         view.map_or(0.0, |v| v.max_vertical_correction_m);
                     let max_horizontal_correction_m =
                         view.map_or(0.0, |v| v.max_horizontal_correction_m);
+                    let window_stats = view.map_or_else(Default::default, |v| v.window_stats);
                     let line = self.hud.report(
                         now,
                         server_tick,
@@ -593,6 +619,7 @@ impl ApplicationHandler for InteractiveApp {
                         max_idle_correction_m,
                         max_vertical_correction_m,
                         max_horizontal_correction_m,
+                        window_stats,
                     );
                     if let Some(window) = &self.window {
                         window.set_title(&format!("Spall sandbox — interactive | {line}"));

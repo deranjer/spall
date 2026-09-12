@@ -102,6 +102,12 @@ pub struct InteractiveView {
     pub max_idle_correction_m: f64,
     pub max_vertical_correction_m: f64,
     pub max_horizontal_correction_m: f64,
+    /// `ClientPhysics::window_stats()` as of this tick (ENG-69 round 18) —
+    /// live proof the character-query-window cache is actually serving
+    /// sweeps, not just present and unused. Cumulative counters, like
+    /// `corrections`; the HUD reports the delta since its last report the
+    /// same way it already does for those.
+    pub window_stats: crate::predict::WindowStats,
 }
 
 /// Best-effort append-only JSONL log of every `CorrectionEvent`

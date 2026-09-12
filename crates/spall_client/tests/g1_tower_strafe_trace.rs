@@ -21,12 +21,18 @@
 //! shares the *same* `Simulation`-owned `Volume` object between "client" and
 //! "server" physics — it does not stand up QUIC transport or exercise
 //! `ReplicaWorld` reconstruction from wire baseline/patch traffic. The
-//! *representations* are real production ones though: the client always
-//! builds `NativeVoxels` (`ClientPhysics::set_terrain`, round 8), the server
-//! builds whatever `spall_sim::collider::plan_collider` picks for
-//! `g1_full_envelope_scene` (`MergedCuboids`, confirmed by
-//! `spall_sim::collider::tests::g1_full_envelope_scene_representation_choice`
-//! — 39 greedy boxes, comfortably under budget).
+//! *movement path* is the real production one though — and, as of round 18,
+//! that path no longer sweeps player movement against the real terrain
+//! collider's own representation at all on either side: `SimWorld::
+//! advance_players` and `ClientPhysics::sweep` both use their own small
+//! `CharacterQueryCache` window (always `NativeVoxels`, real terrain
+//! excluded) by default. `g1_tower_strafe_trace_is_corrections_free_by_
+//! default` asserts the consequence of that directly. What the real
+//! whole-terrain collider itself builds (`MergedCuboids` for
+//! `g1_full_envelope_scene`, confirmed by `spall_sim::collider::tests::
+//! g1_full_envelope_scene_representation_choice`) no longer matters to
+//! player movement either way — it's still what *other* physics (dynamic
+//! bodies, non-character queries) uses, untouched by this round.
 //!
 //! Run with `cargo test -p spall_client --test g1_tower_strafe_trace --
 //! --nocapture` to see the reports.
@@ -166,11 +172,16 @@ impl Harness {
             self.sim.player_acked_input(self.player).unwrap(),
         ));
         self.phase_log.push(phase);
-        self.predictor.tick(&self.phys, input, seq, TICK_DT_S);
+        let volume = self.sim.world().terrain().volume.clone();
+        self.predictor
+            .tick(&mut self.phys, &volume, input, seq, TICK_DT_S);
         if self.server_log.len() > self.ack_delay {
             let record_index = self.server_log.len() - 1 - self.ack_delay;
             let (auth, acked) = self.server_log[record_index];
-            if let Some(event) = self.predictor.reconcile(&self.phys, auth, acked) {
+            if let Some(event) = self
+                .predictor
+                .reconcile(&mut self.phys, &volume, auth, acked)
+            {
                 samples.push(Sample {
                     tick: record_index,
                     phase: self.phase_log[record_index],
@@ -307,60 +318,72 @@ fn g1_tower_strafe_trace_100ms_rtt() {
     report("100ms RTT (ack_delay=6)", &samples);
 }
 
-/// ENG-69 round 16: does matching the server's terrain representation to
-/// the client's (both `NativeVoxels`) eliminate the divergence, through the
-/// *real* reconciliation path — not just the lower-level CPU trajectory
-/// diff (`spall_physics::character::tests::
-/// strafing_the_g1_tower_wall_diverges_between_representations`), which
-/// trivially shows zero gap for matched representations by construction and
-/// so isn't itself new evidence about the *reconciliation* path. This is a
-/// proxy for the bounded, character-query-scoped `NativeVoxels` collider
-/// design (`SimWorld::force_volume_representation_for_test`'s doc): it
-/// tests the *representation-matching* property that design would provide,
-/// without yet building the bounded/windowed production version (cost,
-/// revision-invalidation, and dynamic-body-preservation still need their
-/// own work — see this file's module doc / the ENG-69 memory for the full
-/// list).
+/// ENG-69 round 16 found that forcing the server's terrain representation to
+/// match the client's (both `NativeVoxels`, via `SimWorld::
+/// force_volume_representation_for_test`) eliminates the seam divergence
+/// through the real reconciliation path. Round 18 then *integrated* the
+/// underlying fix for real — `spall_sim::world::SimWorld::advance_players`
+/// and `spall_client::predict::ClientPhysics::sweep` both now sweep each
+/// character against its own small `NativeVoxels` window
+/// (`spall_physics::query_cache::CharacterQueryCache`) instead of the real
+/// terrain collider by default, unconditionally — so `force_server_native_
+/// voxels` no longer has anything left to change: player movement never
+/// touches the real terrain collider's representation at all any more,
+/// only each character's own window. This test now asserts that directly:
+/// `run_trace(0)` (the exact default path `g1_tower_strafe_trace_loopback`
+/// above already exercises, unasserted) should show zero — not merely
+/// small — corrections, because the representation mismatch this whole
+/// file was built to chase no longer exists in the default configuration.
+/// The `force_server_native_voxels` comparison is kept as a secondary
+/// check that the flag is now inert (not silently broken), not the primary
+/// claim.
 #[test]
-fn g1_tower_strafe_trace_with_matched_representations() {
-    let baseline = run_trace(0);
-    let matched = run_trace_with(0, true);
+fn g1_tower_strafe_trace_is_corrections_free_by_default() {
+    let default_path = run_trace(0);
+    let forced_flag = run_trace_with(0, true);
 
-    let baseline_notable = baseline.iter().filter(|s| s.event.error_m > 0.01).count();
-    let matched_notable = matched.iter().filter(|s| s.event.error_m > 0.01).count();
-    let baseline_max = baseline
+    let default_notable = default_path
+        .iter()
+        .filter(|s| s.event.error_m > 0.01)
+        .count();
+    let default_max = default_path
         .iter()
         .map(|s| s.event.error_m)
         .fold(0.0_f64, f64::max);
-    let matched_max = matched
+    let forced_notable = forced_flag
+        .iter()
+        .filter(|s| s.event.error_m > 0.01)
+        .count();
+    let forced_max = forced_flag
         .iter()
         .map(|s| s.event.error_m)
         .fold(0.0_f64, f64::max);
 
     eprintln!(
-        "representation-matched comparison: baseline (client NativeVoxels / server \
-         MergedCuboids) {baseline_notable} events > 0.01m, max {baseline_max:.4}m | matched \
-         (both NativeVoxels) {matched_notable} events > 0.01m, max {matched_max:.4}m"
+        "default path (both sides use their own window cache): {default_notable} events > \
+         0.01m, max {default_max:.6}m | force_server_native_voxels=true (now inert): \
+         {forced_notable} events > 0.01m, max {forced_max:.6}m"
     );
-    report("matched (both NativeVoxels)", &matched);
+    report("default (window-cache) path", &default_path);
 
-    // ENG-69 round 17: converts the round-16 elimination finding into a real
-    // regression assertion, not just a printed observation — a future
-    // change that reintroduces representation-mismatch corrections (or
-    // silently breaks `force_volume_representation_for_test`) fails this
-    // test, not just looks different in `--nocapture` output.
+    // The primary claim: the real, default, no-flags-needed path is
+    // corrections-free — round 18's actual integration goal, not just the
+    // round-16 diagnostic proxy for it.
     assert!(
-        baseline_notable > 0 && baseline_max > 0.01,
-        "the baseline (unmatched representations) should still reproduce the seam-divergence \
-         corrections this test exists to eliminate — got {baseline_notable} events > 0.01m, max \
-         {baseline_max:.4}m; if this genuinely changed, the comparison below is no longer \
-         meaningful and needs re-establishing, not just a loosened threshold"
+        default_max < 1.0e-4,
+        "the default path (both sides' own window cache, no manual force) should be \
+         corrections-free — got a max error of {default_max:.6}m across {default_notable} \
+         events > 0.01m; the window-cache integration in SimWorld::advance_players / \
+         ClientPhysics::sweep may have regressed"
     );
+    // The secondary claim: forcing the (now-bypassed) whole-terrain
+    // representation changes nothing, confirming the flag didn't silently
+    // start doing something unexpected instead of nothing.
     assert!(
-        matched_max < 1.0e-4,
-        "matching the server's terrain representation to the client's (both NativeVoxels) \
-         should eliminate the divergence entirely — got a max error of {matched_max:.6}m across \
-         {matched_notable} events > 0.01m (round 16 measured exactly 0.0000m)"
+        (forced_max - default_max).abs() < 1.0e-4,
+        "force_server_native_voxels=true produced a different result ({forced_max:.6}m) than \
+         the default path ({default_max:.6}m) — it should be fully inert now that player \
+         movement never touches the real terrain collider's own representation"
     );
 }
 

@@ -1,13 +1,15 @@
 //! A small, revision-aware `NativeVoxels` collider scoped to just a
-//! character's own movement-query region (ENG-69 round 17).
+//! character's own movement-query region (ENG-69 rounds 17-18).
 //!
 //! **Why this exists:** ENG-69 rounds 15-16 confirmed, through the real
 //! `PredictedPlayer` reconciliation path, that a `MergedCuboids`-vs-
 //! `NativeVoxels` representation mismatch between client and server produces
 //! a small (~0.075 m), real, felt jitter whenever a character's sweep grazes
 //! a `MergedCuboids` box seam — and that forcing *both* sides to
-//! `NativeVoxels` eliminates it completely (`g1_tower_strafe_trace_with_
-//! matched_representations`: 0.0000 m across 1250 reconciled events). But a
+//! `NativeVoxels` eliminates it completely
+//! (`g1_tower_strafe_trace_is_corrections_free_by_default`: 0.000000 m
+//! across 1250 reconciled events, through the real integration this module
+//! provides — see that test's own doc for how it got there). But a
 //! full-terrain `NativeVoxels` collider is infeasible for the *server*: it's
 //! one whole-volume body with no regional split, and `NativeVoxels`' own
 //! `MAX_ACTIVE_COLLIDER_CELLS` feasibility gate (bounding per-tick rebuild
@@ -27,23 +29,31 @@
 //! this cache is additive, for character queries specifically, not a
 //! replacement for the terrain collider every other query still uses.
 //!
-//! **Status: validated prototype, not yet integrated.** This module proves
-//! the cache tracks a full-`NativeVoxels` reference exactly across window
-//! rebuilds, edits, and prediction-replay-style position jumps
-//! (`tests` below), and measures its cost. It does **not** yet:
-//! - hook into `ClientPhysics`/`SimWorld`'s real edit-notification path (the
-//!   `revision` parameter here is caller-supplied, not wired to a real
-//!   commit/replication event yet);
-//! - exclude the whole-terrain collider from a character's query when both
-//!   coexist in the same [`crate::PhysicsWorld`] (needed to avoid a double
-//!   hit once this actually runs alongside the server's normal terrain body
-//!   — the validation tests below deliberately use a `PhysicsWorld` with
-//!   only the window collider present, sidestepping this rather than
-//!   solving it);
-//! - preserve dynamic-body collisions through that same coexistence problem
-//!   (today's tests don't exercise dynamic bodies at all).
+//! **Status: integrated (ENG-69 round 18) into both
+//! `spall_sim::world::SimWorld::advance_players` (server) and
+//! `spall_client::predict::ClientPhysics::sweep` (client).** Round 17's
+//! prototype validated correctness (a window tracks a full-`NativeVoxels`
+//! reference exactly across rebuilds, edits, and replay-style position
+//! jumps) but called `world.step()` for its own broad-phase refresh and
+//! had no exclusion mechanism — fine for a self-contained test world, unsafe
+//! next to a real, actively-simulated one. Round 18 closed both:
+//! - [`Self::rebuild`] now calls [`PhysicsWorld::sync_queries`] — a
+//!   broad-phase-only refresh, never [`PhysicsWorld::step`] — so this cache
+//!   can share a `PhysicsWorld` with a simulation it does not own the tick
+//!   loop for without corrupting anything else in it;
+//! - every window collider is marked [`PhysicsWorld::set_query_only`] (zero
+//!   `solver_groups`, so it can never produce a real rigid-body collision
+//!   response — a dynamic body passes through it with zero physical effect)
+//!   while staying fully visible to `sweep_character_excluding`'s
+//!   query-based filtering, and [`Self::sweep`] takes an `exclude: &[BodyId]`
+//!   list a caller uses to hide the whole-terrain collider and every *other*
+//!   character's own window from this one sweep.
 //!
-//! Those three are exactly the remaining "integrating it" work.
+//! `revision` is still an opaque, caller-supplied token, not automatically
+//! wired to a commit/replication event — both integration sites currently
+//! pass the terrain body's own `collider_revision` counter (already bumped
+//! on every real terrain rebuild), which is the correct signal without
+//! needing new plumbing.
 
 use std::time::Duration;
 
@@ -75,13 +85,34 @@ pub const WINDOW_RADIUS_M: f32 = 4.0;
 pub const REBUILD_MARGIN_M: f32 = 1.5;
 
 /// A small, revision-aware `NativeVoxels` collider tracking one character's
-/// movement queries — see the module doc for the design and its current
-/// (prototype, not-yet-integrated) status.
+/// movement queries — see the module doc for the design and integration
+/// status.
 pub struct CharacterQueryCache {
     body: Option<BodyId>,
     centre_m: [f64; 3],
     revision: u64,
     cell_m: f32,
+}
+
+/// One window rebuild's full cost, broken out by stage — ENG-69 round 18:
+/// the round-17 numbers only covered [`Self::collider`] (what
+/// [`crate::PhysicsWorld::rebuild_collider`] itself measures); this also
+/// covers [`Self::extraction`] (walking the volume into an
+/// [`crate::OccupancyGrid`], `OccupancyGrid::from_region`) and
+/// [`Self::query_sync`] ([`crate::PhysicsWorld::sync_queries`]'s broad-phase
+/// refresh) — everything a caller actually pays for one rebuild, not just
+/// the single most expensive stage of it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RebuildCost {
+    pub extraction: Duration,
+    pub collider: Duration,
+    pub query_sync: Duration,
+}
+
+impl RebuildCost {
+    pub fn total(&self) -> Duration {
+        self.extraction + self.collider + self.query_sync
+    }
 }
 
 impl Default for CharacterQueryCache {
@@ -106,6 +137,28 @@ impl CharacterQueryCache {
         self.body.map(|_| self.centre_m)
     }
 
+    /// This cache's window `BodyId`, if it currently has a live collider —
+    /// what a caller needs to exclude this character's own window from
+    /// *another* character's sweep (see [`PhysicsWorld::sweep_character_excluding`]).
+    pub fn window_body_id(&self) -> Option<BodyId> {
+        self.body
+    }
+
+    /// Tears down this cache's window collider (if any) and resets it to
+    /// freshly-`new()` state. For a player/character leaving the world: the
+    /// window is a real collider in `world` and otherwise lingers forever,
+    /// a small permanent leak (wasted broad-phase space, and a stale
+    /// exclude-list entry other callers would need to keep filtering out).
+    pub fn clear(&mut self, world: &mut PhysicsWorld) {
+        if let Some(id) = self.body.take() {
+            world.remove_collider(id);
+            world.sync_queries();
+        }
+        self.centre_m = [f64::NAN; 3];
+        self.revision = u64::MAX;
+        self.cell_m = 0.0;
+    }
+
     /// Ensures the cached window covers `position_m` with margin and matches
     /// `revision`, rebuilding from `volume` first if not. `cell_m` is
     /// `volume`'s cell size in metres. Returns the window's [`BodyId`]
@@ -124,7 +177,7 @@ impl CharacterQueryCache {
         cell_m: f32,
         position_m: [f64; 3],
         revision: u64,
-    ) -> Result<(Option<BodyId>, Option<Duration>), ExtractError> {
+    ) -> Result<(Option<BodyId>, Option<RebuildCost>), ExtractError> {
         let needs_rebuild = self.body.is_none()
             || revision != self.revision
             || cell_m != self.cell_m
@@ -137,10 +190,14 @@ impl CharacterQueryCache {
     }
 
     /// [`Self::ensure_covers`] followed by a sweep through the resulting
-    /// window — the whole point of this cache from a caller's perspective:
-    /// a drop-in replacement for [`PhysicsWorld::sweep_character`] scoped to
-    /// a small window instead of the whole terrain. Returns the sweep result
-    /// and, when this call rebuilt the window, that rebuild's cost.
+    /// window, **excluding** `exclude` from the sweep's own query
+    /// ([`PhysicsWorld::sweep_character_excluding`]) — the whole-terrain
+    /// collider and every other character's own window belong here; this
+    /// cache has no way to know that on its own, so the caller must supply
+    /// it (see `spall_sim::world::advance_players` / `spall_client::predict::
+    /// ClientPhysics::sweep` for how each side assembles it). Returns the
+    /// sweep result and, when this call rebuilt the window, that rebuild's
+    /// full cost breakdown.
     #[allow(clippy::too_many_arguments)]
     pub fn sweep(
         &mut self,
@@ -152,9 +209,16 @@ impl CharacterQueryCache {
         desired_translation_m: [f32; 3],
         dt_s: f32,
         revision: u64,
-    ) -> Result<(CharacterMove, Option<Duration>), ExtractError> {
+        exclude: &[BodyId],
+    ) -> Result<(CharacterMove, Option<RebuildCost>), ExtractError> {
         let (_, rebuild_cost) = self.ensure_covers(world, volume, cell_m, position_m, revision)?;
-        let moved = world.sweep_character(params, position_m, desired_translation_m, dt_s);
+        let moved = world.sweep_character_excluding(
+            params,
+            position_m,
+            desired_translation_m,
+            dt_s,
+            exclude,
+        );
         Ok((moved, rebuild_cost))
     }
 
@@ -170,7 +234,7 @@ impl CharacterQueryCache {
         cell_m: f32,
         position_m: [f64; 3],
         revision: u64,
-    ) -> Result<Duration, ExtractError> {
+    ) -> Result<RebuildCost, ExtractError> {
         let radius_cells = (f64::from(WINDOW_RADIUS_M) / f64::from(cell_m)).ceil() as i64;
         let centre_cell = [
             (position_m[0] / f64::from(cell_m)).floor() as i64,
@@ -187,7 +251,9 @@ impl CharacterQueryCache {
             centre_cell[1] + radius_cells,
             centre_cell[2] + radius_cells,
         );
+        let extraction_start = std::time::Instant::now();
         let grid = OccupancyGrid::from_region(volume, min, max)?;
+        let extraction = extraction_start.elapsed();
 
         self.centre_m = position_m;
         self.revision = revision;
@@ -200,11 +266,16 @@ impl CharacterQueryCache {
             if let Some(id) = self.body.take() {
                 world.remove_collider(id);
             }
-            world.step();
-            return Ok(Duration::ZERO);
+            let sync_start = std::time::Instant::now();
+            world.sync_queries();
+            return Ok(RebuildCost {
+                extraction,
+                collider: Duration::ZERO,
+                query_sync: sync_start.elapsed(),
+            });
         }
 
-        let cost = if let Some(id) = self.body {
+        let collider = if let Some(id) = self.body {
             world.rebuild_collider(id, &grid, Representation::NativeVoxels)
         } else {
             let start = std::time::Instant::now();
@@ -218,11 +289,30 @@ impl CharacterQueryCache {
                 translation_m: [0.0; 3],
                 linvel_m_s: [0.0; 3],
             });
+            // A window must never act as a real obstacle for a dynamic
+            // body's own physics (debris, another player's own dynamics)
+            // passing through the same space — it exists purely for this
+            // one character's own query. Sticky: every later rebuild of
+            // this same body reapplies it automatically (`set_query_only`'s
+            // doc). Only needed once, here, not on the `rebuild_collider`
+            // branch above.
+            world.set_query_only(id);
             self.body = Some(id);
             start.elapsed()
         };
-        world.step();
-        Ok(cost)
+        // `sync_queries`, not `step`: this cache must never advance a
+        // simulation another caller owns the tick loop for (ENG-69 round 18
+        // — round 17's prototype called `world.step()` here, which was safe
+        // only because its test worlds held nothing but fixed/kinematic
+        // bodies; a real server's PhysicsWorld also holds actively-simulated
+        // dynamic bodies that a stray extra `step()` would corrupt).
+        let sync_start = std::time::Instant::now();
+        world.sync_queries();
+        Ok(RebuildCost {
+            extraction,
+            collider,
+            query_sync: sync_start.elapsed(),
+        })
     }
 }
 
@@ -312,6 +402,7 @@ mod tests {
                         desired,
                         DT,
                         0,
+                        &[],
                     )
                     .expect("window build over flat, fully-resident terrain");
                 if cost.is_some() {
@@ -367,7 +458,15 @@ mod tests {
             *cand_state = step_character(*cand_state, input, DT, |pos, desired| {
                 cache
                     .sweep(
-                        cand_world, volume, CELL_M, params, pos, desired, DT, revision,
+                        cand_world,
+                        volume,
+                        CELL_M,
+                        params,
+                        pos,
+                        desired,
+                        DT,
+                        revision,
+                        &[],
                     )
                     .expect("window build")
                     .0
@@ -450,6 +549,97 @@ mod tests {
     }
 
     #[test]
+    fn falling_from_height_onto_the_tower_roof_tracks_the_reference() {
+        // Every other test here walks horizontally — the window is a cube,
+        // so its vertical margin needs the same validation, and simple
+        // ground-level walking never exercises it: normal gravity/ground-snap
+        // keeps a walking capsule's own vertical excursion under a few tens
+        // of centimetres per tick, nowhere near `REBUILD_MARGIN_M`. A real
+        // fall does: dropped from above the G1 tower's roof, landing *on*
+        // it (the roof reads as solid from directly above — the shaft's
+        // hollow interior is not open at the top the way this test first
+        // assumed) after a real multi-metre drop under active gravity, the
+        // fastest-changing case a window has to track vertically.
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+        let (ref_world, _ref_id) = reference_world(&volume);
+        let mut cand_world = PhysicsWorld::new(PhysicsConfig::default());
+        let mut cache = CharacterQueryCache::new();
+        let params = CharacterParams::DEFAULT;
+
+        // Inside the tower's hollow interior footprint (x 6.25-9.5 m, z
+        // 8.25-11.5 m after the 1-cell/0.25 m wall) well above the roof
+        // (23.5 m) but low enough that the window's own 4 m margin still
+        // stays inside the world's resident vertical extent (`g1_full_
+        // envelope_scene`'s bricks span y cells 0..128 = 0..32 m — 27.0 m
+        // + 4 m leaves exactly 1 m of headroom).
+        let start = CharacterState::at([7.5, 27.0, 9.5]);
+        let idle = PlayerInput::NEUTRAL;
+        let mut ref_state = start;
+        let mut cand_state = start;
+        let mut rebuilds = 0usize;
+        let mut max_gap = 0.0_f64;
+
+        // 400 ticks (~6.7 s) — comfortably enough for the ~3.5 m drop onto
+        // the roof (settles in well under a second under 9.81 m/s^2) plus
+        // time to land and rest.
+        for _ in 0..400 {
+            ref_state = step_character(ref_state, idle, DT, |pos, desired| {
+                ref_world.sweep_character(params, pos, desired, DT)
+            });
+            cand_state = step_character(cand_state, idle, DT, |pos, desired| {
+                let (mv, cost) = cache
+                    .sweep(
+                        &mut cand_world,
+                        &volume,
+                        CELL_M,
+                        params,
+                        pos,
+                        desired,
+                        DT,
+                        0,
+                        &[],
+                    )
+                    .expect("window build during a fall through open shaft air");
+                if cost.is_some() {
+                    rebuilds += 1;
+                }
+                mv
+            });
+            let dx = ref_state.position_m[0] - cand_state.position_m[0];
+            let dy = ref_state.position_m[1] - cand_state.position_m[1];
+            let dz = ref_state.position_m[2] - cand_state.position_m[2];
+            max_gap = max_gap.max((dx * dx + dy * dy + dz * dz).sqrt());
+        }
+
+        eprintln!(
+            "fall onto tower roof: {rebuilds} window rebuilds over the drop, ref landed \
+             y={:.3} grounded={}, cache-driven landed y={:.3} grounded={}, max gap {max_gap:.6} m",
+            ref_state.position_m[1],
+            ref_state.grounded,
+            cand_state.position_m[1],
+            cand_state.grounded
+        );
+        assert!(
+            rebuilds >= 2,
+            "expected multiple vertical window rebuilds during the fall, got {rebuilds} — the \
+             test isn't exercising vertical boundary crossings as intended"
+        );
+        assert!(
+            ref_state.grounded && cand_state.grounded,
+            "both runs should have landed on the tower's roof by the end of the fall — ref \
+             grounded={}, cache-driven grounded={}",
+            ref_state.grounded,
+            cand_state.grounded
+        );
+        assert!(
+            max_gap < 1.0e-4,
+            "windowed cache diverged from the full-NativeVoxels reference by {max_gap:.6} m \
+             during a vertical fall — the window's vertical margin/rebuild-trigger sizing has a \
+             bug"
+        );
+    }
+
+    #[test]
     fn replay_style_rewind_past_a_window_boundary_stays_correct() {
         // `PredictedPlayer::reconcile` rebases to an older authoritative
         // state and replays recorded inputs forward from there — a real
@@ -478,6 +668,7 @@ mod tests {
                         desired,
                         DT,
                         0,
+                        &[],
                     )
                     .expect("window build")
                     .0
@@ -504,6 +695,7 @@ mod tests {
                         desired,
                         DT,
                         0,
+                        &[],
                     )
                     .expect("window build after rewind");
                 if let Some(c) = cost {
@@ -521,10 +713,15 @@ mod tests {
         let dy = replay_state.position_m[1] - history[200].position_m[1];
         let dz = replay_state.position_m[2] - history[200].position_m[2];
         let gap = (dx * dx + dy * dy + dz * dz).sqrt();
-        let total_replay_cost: Duration = replay_costs.iter().sum();
+        let total_replay_cost: Duration = replay_costs.iter().map(RebuildCost::total).sum();
+        let total_extraction: Duration = replay_costs.iter().map(|c| c.extraction).sum();
+        let total_collider: Duration = replay_costs.iter().map(|c| c.collider).sum();
+        let total_query_sync: Duration = replay_costs.iter().map(|c| c.query_sync).sum();
         eprintln!(
             "replay rewind: {} rebuilds during the {}-tick replay, total {total_replay_cost:?} \
-             ({:?}/rebuild avg), trajectory gap vs the original forward walk {gap:.6} m",
+             (extraction {total_extraction:?} + collider {total_collider:?} + query-sync \
+             {total_query_sync:?}) ({:?}/rebuild avg), trajectory gap vs the original forward \
+             walk {gap:.6} m",
             replay_costs.len(),
             200 - rewind_to,
             total_replay_cost
@@ -566,19 +763,25 @@ mod tests {
             .expect("window build");
         let cost = cost.expect("first call always rebuilds");
         eprintln!(
-            "single window rebuild: {cost:?} (cross-reference: collision-decision.md's own \
-             32768-cell / 32^3 native-voxel measurement is ~1.3 ms on the reference host in \
-             release — this window is the same order of magnitude, ~{}^3 cells; run this test \
-             with `--release` for a comparable number, a debug build is 10-30x slower)",
+            "single window rebuild: {:?} total (extraction {:?} + collider {:?} + query-sync \
+             {:?}) (cross-reference: collision-decision.md's own 32768-cell / 32^3 native-voxel \
+             measurement is ~1.3 ms on the reference host in release — this window is the same \
+             order of magnitude, ~{}^3 cells; run this test with `--release` for a comparable \
+             number, a debug build is 10-30x slower)",
+            cost.total(),
+            cost.extraction,
+            cost.collider,
+            cost.query_sync,
             (2.0 * f64::from(WINDOW_RADIUS_M) / f64::from(CELL_M)).round() as i64
         );
         // Debug-build-safe (see the replay test's comment above) — catches
         // a true regression (an accidental full-terrain rebuild, an
         // infinite loop) without being tripped by debug/release variance.
         assert!(
-            cost < Duration::from_millis(500),
-            "a single window rebuild took {cost:?} — investigate before relying on this for a \
-             per-tick budget"
+            cost.total() < Duration::from_millis(500),
+            "a single window rebuild took {:?} — investigate before relying on this for a \
+             per-tick budget",
+            cost.total()
         );
     }
 
@@ -610,7 +813,7 @@ mod tests {
             let (_, cost) = cache
                 .ensure_covers(&mut world, &volume, CELL_M, position_m, 0)
                 .expect("window build");
-            total += cost.expect("first call always rebuilds");
+            total += cost.expect("first call always rebuilds").total();
         }
 
         eprintln!(
