@@ -16,6 +16,7 @@
 //! left to a follow-up increment.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
@@ -45,6 +46,16 @@ const VIEW_HEIGHT_DOWN_M: f32 = 3.0;
 /// Rebuild the instanced terrain draw once the player has moved this far
 /// (metres) from where it was last built, or the resident terrain changes.
 const REBUILD_DISTANCE_M: f64 = 1.0;
+/// How often, at most, a *stationary* player pays for `terrain_resident_hash`
+/// — measured (see `perf_probe` below) at 5-100+ ms depending on scene size,
+/// because it walks and hashes the whole resident volume rather than being
+/// the cheap dirty-check its own doc comment describes. A moving player
+/// already gets a fresh rebuild every `REBUILD_DISTANCE_M` and skips this
+/// check entirely; a stationary one only needs it to notice a terrain edit
+/// landing nearby, and noticing up to this long after it lands — instead of
+/// paying the full hash on every single rendered frame regardless of
+/// movement — is an imperceptible trade for a debug renderer.
+const TERRAIN_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 const MAX_PITCH: f32 = 1.5;
@@ -132,7 +143,68 @@ struct InteractiveApp {
     cursor_locked: bool,
     last_rebuild_pos: Option<[f64; 3]>,
     last_rebuild_hash: Option<Hash32>,
+    last_hash_check: Option<Instant>,
+    hud: Hud,
     result: Result<(), ClientError>,
+}
+
+/// On-screen-debug support (per the ENG-69 lag investigation): there is no
+/// text-rendering pipeline in this debug renderer, so "on screen" means the
+/// window title bar — plus a mirrored line on stdout so it is visible in
+/// whatever terminal launched the client (`cargo xtask play` included).
+#[derive(Default)]
+struct Hud {
+    last_frame_at: Option<Instant>,
+    /// Exponential moving average, so a single slow frame doesn't make the
+    /// readout unreadable jitter.
+    frame_ms_ema: f32,
+    frames_since_report: u32,
+    last_report_at: Option<Instant>,
+    last_rebuild_ms: f32,
+    last_rebuild_instances: usize,
+}
+
+impl Hud {
+    const REPORT_INTERVAL: Duration = Duration::from_millis(500);
+
+    /// Call once per `RedrawRequested`, before doing any frame work — updates
+    /// the frame-time average and returns `true` on the (throttled) tick
+    /// where a report is due.
+    fn tick(&mut self, now: Instant) -> bool {
+        if let Some(prev) = self.last_frame_at {
+            let ms = (now - prev).as_secs_f32() * 1000.0;
+            self.frame_ms_ema = if self.frame_ms_ema == 0.0 {
+                ms
+            } else {
+                self.frame_ms_ema * 0.9 + ms * 0.1
+            };
+        }
+        self.last_frame_at = Some(now);
+        self.frames_since_report += 1;
+        self.last_report_at
+            .is_none_or(|t| now - t >= Self::REPORT_INTERVAL)
+    }
+
+    fn record_rebuild(&mut self, elapsed: Duration, instance_count: usize) {
+        self.last_rebuild_ms = elapsed.as_secs_f32() * 1000.0;
+        self.last_rebuild_instances = instance_count;
+    }
+
+    /// The due report's text, and resets the report window. `None` fps until
+    /// the first `REPORT_INTERVAL` has actually elapsed (avoids a bogus huge
+    /// number from a near-zero-duration first window).
+    fn report(&mut self, now: Instant, server_tick: u64) -> String {
+        let elapsed = self
+            .last_report_at
+            .map_or(Self::REPORT_INTERVAL, |t| now - t);
+        let fps = self.frames_since_report as f32 / elapsed.as_secs_f32();
+        self.last_report_at = Some(now);
+        self.frames_since_report = 0;
+        format!(
+            "{fps:.0} fps | frame {:.1} ms (avg) | rebuild {:.1} ms ({} instances) | server tick {server_tick}",
+            self.frame_ms_ema, self.last_rebuild_ms, self.last_rebuild_instances
+        )
+    }
 }
 
 impl InteractiveApp {
@@ -148,6 +220,8 @@ impl InteractiveApp {
             cursor_locked: false,
             last_rebuild_pos: None,
             last_rebuild_hash: None,
+            last_hash_check: None,
+            hud: Hud::default(),
             result: Ok(()),
         }
     }
@@ -252,6 +326,9 @@ impl ApplicationHandler for InteractiveApp {
                 self.publish_movement();
             }
             WindowEvent::RedrawRequested => {
+                let now = Instant::now();
+                let due_for_report = self.hud.tick(now);
+
                 let view = *self.session.view.lock().unwrap_or_else(|e| e.into_inner());
                 let look_dir = Vec3::from_array(self.view_dir());
                 let session = self.session.clone();
@@ -260,16 +337,28 @@ impl ApplicationHandler for InteractiveApp {
                         &session,
                         &mut self.last_rebuild_pos,
                         &mut self.last_rebuild_hash,
+                        &mut self.last_hash_check,
                         v,
                     );
                     (eye, look_dir, instances)
                 });
+                if let Some((_, _, Some(instances))) = &frame {
+                    self.hud.record_rebuild(now.elapsed(), instances.len());
+                }
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
                 if let Err(error) = renderer.render(frame.as_ref()) {
                     self.fail(event_loop, error);
                     return;
+                }
+                if due_for_report {
+                    let server_tick = view.map_or(0, |v| v.server_tick);
+                    let line = self.hud.report(now, server_tick);
+                    if let Some(window) = &self.window {
+                        window.set_title(&format!("Spall sandbox — interactive | {line}"));
+                    }
+                    eprintln!("spall-interactive: {line}");
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -320,6 +409,7 @@ fn build_scene(
     session: &InteractiveSession,
     last_pos: &mut Option<[f64; 3]>,
     last_hash: &mut Option<Hash32>,
+    last_hash_check: &mut Option<Instant>,
     view: InteractiveView,
 ) -> (Vec3, Option<Vec<Instance>>) {
     let feet = view.predicted.position_m;
@@ -334,17 +424,30 @@ fn build_scene(
         let d = [feet[0] - p[0], feet[1] - p[1], feet[2] - p[2]];
         (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() >= REBUILD_DISTANCE_M
     });
-    let terrain_hash = session.replica.get().and_then(|replica| {
-        replica
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .terrain_resident_hash()
-    });
-    let hash_changed = terrain_hash != *last_hash;
+
+    // `terrain_resident_hash` walks and hashes the whole resident volume —
+    // 5-100+ ms depending on scene size, not the cheap check its own doc
+    // comment describes (see `perf_probe` below). A moving player already
+    // gets a fresh rebuild every `REBUILD_DISTANCE_M` regardless, so only a
+    // *stationary* one needs this at all (to notice an edit landing nearby),
+    // and only at `TERRAIN_CHECK_INTERVAL`'s rate rather than every frame.
+    let hash_changed = !moved_far_enough
+        && last_hash_check.is_none_or(|t| t.elapsed() >= TERRAIN_CHECK_INTERVAL)
+        && {
+            *last_hash_check = Some(Instant::now());
+            let terrain_hash = session.replica.get().and_then(|replica| {
+                replica
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .terrain_resident_hash()
+            });
+            let changed = terrain_hash != *last_hash;
+            *last_hash = terrain_hash;
+            changed
+        };
 
     let instances = if moved_far_enough || hash_changed {
         *last_pos = Some(feet);
-        *last_hash = terrain_hash;
         session.replica.get().and_then(|replica| {
             let volume = replica
                 .lock()
@@ -891,4 +994,79 @@ fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Te
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+#[cfg(test)]
+mod perf_probe {
+    //! Informational only (no assertions — debug-vs-release and per-machine
+    //! variance make a hard threshold meaningless here): times the one thing
+    //! `RedrawRequested` does synchronously on the window's own thread that
+    //! scales with view radius. Run with `cargo test -p spall_client
+    //! build_instances_timing -- --nocapture --test-threads=1` to see it.
+    use super::*;
+    use crate::replica::{ReplicaConfig, ReplicaWorld};
+    use spall_core::VolumeId;
+
+    #[test]
+    fn build_instances_timing_walk_arena() {
+        let volume = spall_voxel::fixtures::walk_arena(VolumeId::new(1).unwrap());
+        // On the floor (top surface y = 1.0 m) near the spawn end.
+        let start = std::time::Instant::now();
+        let instances = build_instances(&volume, [0.5, 1.0, 2.0]);
+        eprintln!(
+            "build_instances(walk_arena): {:?}, {} instances",
+            start.elapsed(),
+            instances.len()
+        );
+    }
+
+    #[test]
+    fn build_instances_timing_g1_full_envelope() {
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+        // A real G1_WORKLOAD_SPAWNS point (spall_sim::fixtures), on the
+        // ground rather than in mid-air.
+        let start = std::time::Instant::now();
+        let instances = build_instances(&volume, [2.0, 13.5, 2.0]);
+        eprintln!(
+            "build_instances(g1_full_envelope): {:?}, {} instances",
+            start.elapsed(),
+            instances.len()
+        );
+    }
+
+    /// `build_scene` calls this *every `RedrawRequested`*, not just on a
+    /// rebuild — unlike `build_instances` (throttled to once per metre moved
+    /// / terrain change), this is the per-frame floor cost of the debug
+    /// window regardless of camera movement.
+    #[test]
+    fn terrain_resident_hash_timing_g1_full_envelope() {
+        let replica = ReplicaWorld::from_baseline(
+            spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap()),
+            ReplicaConfig::default(),
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            std::hint::black_box(replica.terrain_resident_hash());
+        }
+        eprintln!(
+            "terrain_resident_hash(g1_full_envelope): {:?}/call over 10 calls",
+            start.elapsed() / 10
+        );
+    }
+
+    #[test]
+    fn terrain_resident_hash_timing_walk_arena() {
+        let replica = ReplicaWorld::from_baseline(
+            spall_voxel::fixtures::walk_arena(VolumeId::new(1).unwrap()),
+            ReplicaConfig::default(),
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            std::hint::black_box(replica.terrain_resident_hash());
+        }
+        eprintln!(
+            "terrain_resident_hash(walk_arena): {:?}/call over 10 calls",
+            start.elapsed() / 10
+        );
+    }
 }
