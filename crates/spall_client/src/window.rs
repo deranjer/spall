@@ -514,13 +514,31 @@ impl ApplicationHandler for InteractiveApp {
 /// standing eye height. Cheap — no lock, no volume access — so it stays
 /// directly on the render/input thread; only the terrain draw list
 /// ([`RebuildWorker`]) is expensive enough to need moving off of it.
+/// A render frame lands on its own (vsync-paced) clock, independent of the
+/// mover's own ~60 Hz tick clock — see [`InteractiveView::published_at`] — so
+/// extrapolate the feet forward by the time elapsed since that tick was
+/// published, using the velocity it reported, rather than redrawing the
+/// exact same discrete pose on every frame between ticks (the jitter that
+/// produces is a beat pattern between the two unsynchronized clocks, not
+/// anything wrong with the underlying motion). Clamped short in case the
+/// mover has stalled (a lost connection, a debugger break) — extrapolating
+/// indefinitely would fling the camera off in whatever direction it was last
+/// moving.
+const MAX_EXTRAPOLATION_S: f32 = 0.1;
+
 fn eye_position(view: InteractiveView) -> Vec3 {
+    let dt = view
+        .published_at
+        .elapsed()
+        .as_secs_f32()
+        .min(MAX_EXTRAPOLATION_S);
     let feet = view.predicted.position_m;
+    let v = view.predicted.velocity_m_s;
     let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
     Vec3::new(
-        feet[0] as f32,
-        (feet[1] + eye_height_m) as f32,
-        feet[2] as f32,
+        (feet[0] + f64::from(v[0] * dt)) as f32,
+        (feet[1] + f64::from(v[1] * dt) + eye_height_m) as f32,
+        (feet[2] + f64::from(v[2] * dt)) as f32,
     )
 }
 

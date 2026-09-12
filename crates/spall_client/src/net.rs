@@ -1177,6 +1177,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         Some(InteractiveView {
                             predicted,
                             server_tick: tick,
+                            published_at: std::time::Instant::now(),
                         });
                 }
 

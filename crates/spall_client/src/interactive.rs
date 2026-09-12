@@ -71,6 +71,18 @@ pub struct InteractiveView {
     pub predicted: CharacterState,
     /// Last server tick observed when this pose was published.
     pub server_tick: u64,
+    /// Wall-clock moment this pose was published. The mover ticks on its own
+    /// ~60 Hz clock, independent of the render thread's own (also ~60 Hz,
+    /// vsync-paced) redraw clock — two unsynchronized clocks at close to the
+    /// same rate drift in and out of phase continuously, so a render frame
+    /// landing right before a fresh mover tick repeats the previous pose,
+    /// then "catches up" with a double-size jump on the frame that lands
+    /// right after one. That beat pattern is visible as jitter even though
+    /// the underlying motion is smooth. The window uses this timestamp to
+    /// extrapolate the drawn position forward by `velocity * elapsed` instead
+    /// of redrawing the exact same discrete pose on every frame between
+    /// ticks.
+    pub published_at: std::time::Instant,
 }
 
 /// Shared handle between the network thread and the render window for one
