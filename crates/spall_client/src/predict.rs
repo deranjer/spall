@@ -250,6 +250,22 @@ fn lenient_occupancy(volume: &Volume) -> Option<OccupancyGrid> {
     .ok()
 }
 
+/// One individual predicted-vs-authoritative comparison, as returned by
+/// [`PredictedPlayer::reconcile`]. See that method's doc.
+#[derive(Debug, Clone, Copy)]
+pub struct CorrectionEvent {
+    /// Full 3-D distance between what was predicted for `acked` and what the
+    /// server actually reported, metres.
+    pub error_m: f64,
+    /// `|Y|` component of the same gap.
+    pub vertical_m: f64,
+    /// `XZ`-plane magnitude of the same gap.
+    pub horizontal_m: f64,
+    /// Whether the record's input was exactly [`PlayerInput::NEUTRAL`] (no
+    /// movement, no buttons) — see [`PredictedPlayer::idle_corrections`].
+    pub idle: bool,
+}
+
 /// One predicted input, kept so it can be re-simulated after a correction.
 #[derive(Debug, Clone, Copy)]
 struct Record {
@@ -364,22 +380,31 @@ impl PredictedPlayer {
     /// Reconciles against an authoritative snapshot. `acked` is the last input
     /// sequence the server consumed for this player: everything up to and
     /// including it is dropped, and the rest is replayed from the authoritative
-    /// state to produce the new predicted "now".
+    /// state to produce the new predicted "now". Returns the individual
+    /// correction event this call measured against `acked`'s recorded
+    /// prediction — `None` when no record for that sequence remains (e.g. it
+    /// aged out of `PREDICTION_HISTORY`, or a mid-flight `invalidate` cleared
+    /// it) — so a caller doing per-event analysis (ENG-69 round 10's G1 ramp
+    /// trace, `crates/spall_client/tests/g1_ramp_trace.rs`) can record every
+    /// one rather than only the running maxima the fields above track. This
+    /// event is reported *regardless* of the `1.0e-4` threshold `corrections`
+    /// uses, so callers computing percentiles see the true near-zero tail too.
     pub fn reconcile(
         &mut self,
         phys: &ClientPhysics,
         authoritative: CharacterState,
         acked: InputSeq,
-    ) {
-        if let Some(rec) = self.history.iter().find(|r| r.seq == acked) {
+    ) -> Option<CorrectionEvent> {
+        let event = if let Some(rec) = self.history.iter().find(|r| r.seq == acked) {
             let err = rec.predicted_after.distance_m(&authoritative);
+            // A record only ever holds the *sanitized* input actually fed to
+            // `step_character` (see `tick`), so this is exactly the input
+            // that produced `predicted_after` — comparing it to `NEUTRAL`
+            // tells whether the two sides had anything to sweep at all.
+            let idle = rec.input.movement == [0.0, 0.0, 0.0] && rec.input.buttons == 0;
             if err > 1.0e-4 {
                 self.corrections += 1;
-                // A record only ever holds the *sanitized* input actually fed to
-                // `step_character` (see `tick`), so this is exactly the input
-                // that produced `predicted_after` — comparing it to `NEUTRAL`
-                // tells whether the two sides had anything to sweep at all.
-                if rec.input.movement == [0.0, 0.0, 0.0] && rec.input.buttons == 0 {
+                if idle {
                     self.idle_corrections += 1;
                     self.max_idle_correction_m = self.max_idle_correction_m.max(err);
                 }
@@ -388,11 +413,18 @@ impl PredictedPlayer {
             let dy = (rec.predicted_after.position_m[1] - authoritative.position_m[1]).abs();
             let dx = rec.predicted_after.position_m[0] - authoritative.position_m[0];
             let dz = rec.predicted_after.position_m[2] - authoritative.position_m[2];
+            let horizontal_m = (dx * dx + dz * dz).sqrt();
             self.max_vertical_correction_m = self.max_vertical_correction_m.max(dy);
-            self.max_horizontal_correction_m = self
-                .max_horizontal_correction_m
-                .max((dx * dx + dz * dz).sqrt());
-        }
+            self.max_horizontal_correction_m = self.max_horizontal_correction_m.max(horizontal_m);
+            Some(CorrectionEvent {
+                error_m: err,
+                vertical_m: dy,
+                horizontal_m,
+                idle,
+            })
+        } else {
+            None
+        };
         if !authoritative.grounded
             && authoritative.velocity_m_s[1] < -1.0
             && self.predicted.grounded
@@ -413,6 +445,7 @@ impl PredictedPlayer {
             rec.predicted_after = state;
         }
         self.predicted = state;
+        event
     }
 
     /// A committed edit invalidated the geometry the predicted history walked

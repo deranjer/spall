@@ -989,7 +989,13 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                         p.player = Some(PredictedPlayer::new(p.params, st));
                                         p.script_origin_tick.get_or_insert(snap.server_tick.get());
                                     }
-                                    Some(pl) => pl.reconcile(&p.phys, st, snap.acked_input),
+                                    // The returned per-event `CorrectionEvent` is for callers
+                                    // doing detailed analysis (ENG-69's G1 ramp trace test);
+                                    // the live HUD path only needs `PredictedPlayer`'s own
+                                    // running counters, read separately below.
+                                    Some(pl) => {
+                                        pl.reconcile(&p.phys, st, snap.acked_input);
+                                    }
                                 }
                                 counters.motion.fetch_add(1, Ordering::Relaxed);
                                 continue;
