@@ -1,4 +1,5 @@
 mod netcheck;
+mod play;
 mod process;
 mod session;
 
@@ -37,6 +38,12 @@ enum CommandKind {
     /// T10 replication harness against a named built-in scenario
     /// (`fixtures/scenarios/<name>.json`).
     Scenario(session::ScenarioArgs),
+    /// ENG-69: launch one `sandbox-server` and open one interactive
+    /// `sandbox-client --interactive` window against it — a real hands-on
+    /// local play session (generates the join token, waits for the server to
+    /// bind, then opens the window), not the scripted `session`/`scenario`
+    /// harness.
+    Play(play::PlayArgs),
     /// Render acceptance shapes or a named lighting fixture offscreen.
     /// Exit 3 means no GPU/capture capability.
     Capture(CaptureArgs),
@@ -166,6 +173,7 @@ fn run(cli: Cli) -> Result<(), XtaskError> {
         CommandKind::NetCheck(args) => netcheck::run(args, unique_output),
         CommandKind::Session(args) => session::run_session(args, || unique_run_dir("session")),
         CommandKind::Scenario(args) => session::run_scenario(args, || unique_run_dir("scenario")),
+        CommandKind::Play(args) => play::run(args, || unique_run_dir("play")),
         CommandKind::Capture(args) => capture(args),
         CommandKind::Bench(_) => unavailable("bench", "G1/G2 measurement work"),
         CommandKind::CrashTest(args) => crash_test(args),
