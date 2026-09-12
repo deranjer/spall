@@ -16,7 +16,7 @@ use spall_core::{
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
     BodyKind as PhysBodyKind, BodySpec, CharacterParams, OccupancyGrid, PhysicsConfig,
-    PhysicsWorld, analytic_mass_properties, step_character,
+    PhysicsWorld, Representation, analytic_mass_properties, step_character,
 };
 use spall_protocol::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
@@ -1344,6 +1344,38 @@ impl SimWorld {
         if let Some(body) = self.volume_body_mut(volume) {
             body.collider_revision += 1;
             body.coarsen_k = plan.coarsen_k;
+        }
+        Ok(())
+    }
+
+    /// **Diagnostic/test only — never call this from real server code.**
+    /// Rebuilds `volume`'s collider as `representation`, bypassing
+    /// [`crate::collider::plan_collider`]'s budget entirely (including
+    /// [`crate::collider::MAX_ACTIVE_COLLIDER_CELLS`], which exists
+    /// specifically to keep a per-tick-editable rebuild inside one tick's
+    /// budget — forcing `NativeVoxels` on a terrain-scale volume through
+    /// this method can take far longer than a tick, exactly what that gate
+    /// prevents in production). Added ENG-69 round 16 to test, through the
+    /// *real* `Simulation`/`PredictedPlayer` reconciliation path, whether
+    /// matching the server's representation to the client's (both
+    /// `NativeVoxels`) eliminates the `MergedCuboids`-seam divergence —
+    /// without yet building the bounded, character-query-scoped collider
+    /// that would give the same property in production at a bounded cost.
+    pub fn force_volume_representation_for_test(
+        &mut self,
+        volume: VolumeId,
+        representation: Representation,
+    ) -> Result<(), WorldError> {
+        let Some(body) = self.volume_body(volume) else {
+            return Err(WorldError::UnknownVolume(volume));
+        };
+        let phys = body.phys;
+        let Some(grid) = OccupancyGrid::from_volume(&body.volume)? else {
+            return Ok(());
+        };
+        self.physics.rebuild_collider(phys, &grid, representation);
+        if let Some(body) = self.volume_body_mut(volume) {
+            body.collider_revision += 1;
         }
         Ok(())
     }

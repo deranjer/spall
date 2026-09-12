@@ -720,6 +720,159 @@ mod tests {
     }
 
     #[test]
+    fn tick_131_isolates_the_slope_handling_divergence() {
+        // ENG-69 round 16: the wall-strafe test above found the whole
+        // 0.0805 m gap opens in exactly one tick (131) with a real contact
+        // on both sides — but review correctly pushed back that "ground
+        // snap" (the operation nearest the end of `move_shape`) cannot by
+        // itself explain a *horizontal* displacement, so which controller
+        // operation actually produces it needs to be established, not
+        // inferred from proximity to a floor-ish contact normal. Isolates
+        // that one tick: reproduces the state immediately before it (from
+        // the `MergedCuboids` trajectory only — the two runs are ~3 mm apart
+        // by then, see the previous test's per-tick trace), then re-runs
+        // *that exact same* starting state and input against a fresh
+        // instance of each representation for exactly one more tick, so any
+        // difference in the result can only come from this one tick's own
+        // contact resolution, never an accumulated prior difference.
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+        let params = CharacterParams::DEFAULT;
+
+        let start = CharacterState::at([5.0, 46.0 * f64::from(CELL_M), 10.0]);
+        let approach = PlayerInput {
+            movement: [0.0, 0.0, 1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+        let hug = PlayerInput {
+            movement: [1.0, 0.0, 1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+
+        // The state immediately before tick 131: 30 approach ticks + 130
+        // hug ticks, against the `MergedCuboids` representation only.
+        let mut reference_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut reference_world, &volume, Representation::MergedCuboids);
+        reference_world.step();
+        let pre_approach = run(&mut reference_world, start, approach, 30);
+        let pre_state = run(&mut reference_world, pre_approach, hug, 130);
+
+        // The isolated experiment: from that identical state, one tick
+        // against each representation, in fresh worlds (so neither carries
+        // any broad-phase state from `reference_world`'s own run).
+        let mut cuboid_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut cuboid_world, &volume, Representation::MergedCuboids);
+        cuboid_world.step();
+        let mut voxel_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut voxel_world, &volume, Representation::NativeVoxels);
+        voxel_world.step();
+
+        let mut cuboid_hits = Vec::new();
+        let mut cuboid_desired = [0.0f32; 3];
+        let cuboid_end = step_character(pre_state, hug, DT, |pos, desired| {
+            cuboid_desired = desired;
+            cuboid_world.sweep_character_with(params, pos, desired, DT, |c| {
+                cuboid_hits.push(*c);
+            })
+        });
+        let mut voxel_hits = Vec::new();
+        let mut voxel_desired = [0.0f32; 3];
+        let voxel_end = step_character(pre_state, hug, DT, |pos, desired| {
+            voxel_desired = desired;
+            voxel_world.sweep_character_with(params, pos, desired, DT, |c| {
+                voxel_hits.push(*c);
+            })
+        });
+
+        let cuboid_actual = [
+            (cuboid_end.position_m[0] - pre_state.position_m[0]) as f32,
+            (cuboid_end.position_m[1] - pre_state.position_m[1]) as f32,
+            (cuboid_end.position_m[2] - pre_state.position_m[2]) as f32,
+        ];
+        let voxel_actual = [
+            (voxel_end.position_m[0] - pre_state.position_m[0]) as f32,
+            (voxel_end.position_m[1] - pre_state.position_m[1]) as f32,
+            (voxel_end.position_m[2] - pre_state.position_m[2]) as f32,
+        ];
+        let dx = cuboid_end.position_m[0] - voxel_end.position_m[0];
+        let dz = cuboid_end.position_m[2] - voxel_end.position_m[2];
+        let horiz_gap_this_tick = (dx * dx + dz * dz).sqrt();
+
+        eprintln!(
+            "tick 131 isolated: pre_state pos={:?} grounded={}",
+            pre_state.position_m, pre_state.grounded
+        );
+        eprintln!(
+            "  requested translation (desired, both identical): cuboid={cuboid_desired:?} \
+             voxel={voxel_desired:?}"
+        );
+        eprintln!(
+            "  cuboid: {} hit(s), actual translation={cuboid_actual:?}, end grounded={}",
+            cuboid_hits.len(),
+            cuboid_end.grounded
+        );
+        for hit in &cuboid_hits {
+            eprintln!(
+                "    hit: normal1={:?} toi={:.5} remaining={:?}",
+                hit.hit.normal1, hit.hit.time_of_impact, hit.translation_remaining
+            );
+        }
+        eprintln!(
+            "  voxel : {} hit(s), actual translation={voxel_actual:?}, end grounded={}",
+            voxel_hits.len(),
+            voxel_end.grounded
+        );
+        for hit in &voxel_hits {
+            eprintln!(
+                "    hit: normal1={:?} toi={:.5} remaining={:?}",
+                hit.hit.normal1, hit.hit.time_of_impact, hit.translation_remaining
+            );
+        }
+        eprintln!(
+            "  -> from the *identical* pre-state and input, one tick alone produces a \
+             {horiz_gap_this_tick:.4} m horizontal gap"
+        );
+
+        // The mechanism, not just the symptom: `KinematicCharacterController
+        // ::decompose_hit` (Rapier's own slope-handling step, called from
+        // `handle_slopes` — not `handle_stairs`/autostep, which only runs
+        // for a wall-steep contact, and not `snap_to_ground`, which runs
+        // after and only adjusts the up-axis) derives a
+        // "horizontal tangent direction" as `hit.normal1.cross(up)`, then
+        // resolves the remaining wish vector against it. For a *perfectly*
+        // vertical normal — which only `MergedCuboids`' exactly-axis-aligned
+        // box-top faces can produce — that cross product is the zero vector
+        // (mathematically degenerate: a perfectly flat, perfectly
+        // horizontal surface has no privileged "along the surface"
+        // direction), and Rapier's own fallback (`try_normalize().
+        // unwrap_or_default()`) dumps the entire tangential remainder into
+        // the *vertical* tangent component instead of splitting it
+        // horizontally. `NativeVoxels`' contact normals are essentially
+        // never exactly vertical (this run's tilt: ~3-6 degrees off), so the
+        // cross product is well-defined there, and the wish vector's
+        // horizontal component is retained and applied along a real
+        // direction. Same code path, same branch (`is_wall`/`is_nonslip_
+        // slope` should classify identically for two contacts this close to
+        // vertical — verified by the two runs each reporting exactly one
+        // hit, not two), genuinely different result: this is why "ground
+        // snap alone" doesn't explain it, and why "the contact normal
+        // happened to be near-vertical" isn't itself the culprit — it's
+        // specifically the *exactness* of a `MergedCuboids` box-top normal
+        // that hits this degenerate case.
+        for (label, hits) in [("cuboid", &cuboid_hits), ("voxel", &voxel_hits)] {
+            for hit in hits {
+                let up = Vector::new(0.0, 1.0, 0.0);
+                let cross_len = hit.hit.normal1.cross(up).length();
+                eprintln!(
+                    "  {label} hit: |normal x up| = {cross_len:.6} (near 0 = degenerate \
+                     horizontal-tangent-direction case)"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn removing_the_floor_leaves_no_hover() {
         let (mut world, top, floor) = floor_world();
         // Settle on the floor.
