@@ -10,7 +10,7 @@
 
 use spall_client::predict::{ClientPhysics, PredictedPlayer};
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
-use spall_core::{EntityId, PlayerInput, SphereBrush, player_entity_for};
+use spall_core::{EntityId, PlayerInput, SphereBrush, Tick, player_entity_for};
 use spall_physics::{CharacterParams, CharacterState};
 use spall_protocol::{InputSeq, RequestId};
 use spall_sim::fixtures::{WALK_ARENA_SPAWNS, walk_arena_setup};
@@ -42,10 +42,24 @@ struct Harness {
     player: EntityId,
     phys: ClientPhysics,
     predictor: PredictedPlayer,
-    /// `(authoritative state, acked input seq)` per elapsed tick.
-    server_log: Vec<(CharacterState, InputSeq)>,
+    /// `(authoritative state, acked input seq, server tick)` per elapsed tick.
+    server_log: Vec<(CharacterState, InputSeq, Tick)>,
     seq: u64,
     ack_delay: usize,
+    /// `server_log.len()` as of the last [`Self::resync_terrain_and_invalidate`]
+    /// call, `0` if none yet. `step`'s `ack_delay` lookback must never read a
+    /// `server_log` entry from *before* this point: `resync_terrain_and_invalidate`
+    /// clears `predictor`'s history but `server_log` itself (this harness's
+    /// own bookkeeping, not anything `PredictedPlayer` owns) keeps every
+    /// entry ever pushed, pre-edit included. A real snapshot's `server_tick`
+    /// is always genuinely current, so production never faces this; this
+    /// harness's fixed-offset-into-an-ever-growing-log stand-in for network
+    /// delay can otherwise land squarely in the stale pre-edit tail right
+    /// after an edit + `run_until_idle` timeskip, repeatedly reconciling the
+    /// freshly-invalidated predictor against a *pre-edit*, standing-on-solid-
+    /// ground `authoritative` for the first `ack_delay` ticks post-resync —
+    /// fighting the real post-edit fall it should be tracking instead.
+    resync_len: usize,
 }
 
 impl Harness {
@@ -58,7 +72,11 @@ impl Harness {
 
         let mut phys = ClientPhysics::new();
         phys.set_terrain(&sim.world().terrain().volume);
-        let predictor = PredictedPlayer::new(CharacterParams::DEFAULT, CharacterState::at(spawn));
+        let predictor = PredictedPlayer::new(
+            CharacterParams::DEFAULT,
+            CharacterState::at(spawn),
+            sim.current_tick(),
+        );
 
         Self {
             sim,
@@ -68,6 +86,7 @@ impl Harness {
             server_log: Vec::new(),
             seq: 0,
             ack_delay,
+            resync_len: 0,
         }
     }
 
@@ -81,16 +100,20 @@ impl Harness {
         self.server_log.push((
             self.sim.player_state(self.player).unwrap(),
             self.sim.player_acked_input(self.player).unwrap(),
+            self.sim.current_tick(),
         ));
 
         let volume = self.sim.world().terrain().volume.clone();
         self.predictor
-            .tick(&mut self.phys, &volume, input, seq, TICK_DT_S);
+            .tick(&mut self.phys, &volume, input, TICK_DT_S);
 
         if self.server_log.len() > self.ack_delay {
-            let (auth, acked) = self.server_log[self.server_log.len() - 1 - self.ack_delay];
+            let wanted = self.server_log.len() - 1 - self.ack_delay;
+            // Never look back past the last resync — see `resync_len`'s doc.
+            let record_index = wanted.max(self.resync_len);
+            let (auth, acked, server_tick) = self.server_log[record_index];
             self.predictor
-                .reconcile(&mut self.phys, &volume, auth, acked);
+                .reconcile(&mut self.phys, &volume, auth, acked, server_tick);
         }
     }
 
@@ -100,6 +123,7 @@ impl Harness {
     fn resync_terrain_and_invalidate(&mut self) {
         self.phys.set_terrain(&self.sim.world().terrain().volume);
         self.predictor.invalidate();
+        self.resync_len = self.server_log.len();
     }
 
     fn server_state(&self) -> CharacterState {
@@ -263,12 +287,13 @@ fn a_lost_button_release_leaves_both_sides_at_rest() {
         h.server_log.push((
             h.sim.player_state(h.player).unwrap(),
             h.sim.player_acked_input(h.player).unwrap(),
+            h.sim.current_tick(),
         ));
         let volume = h.sim.world().terrain().volume.clone();
+        h.predictor.tick(&mut h.phys, &volume, idle(), TICK_DT_S);
+        let (auth, acked, server_tick) = h.server_log[h.server_log.len() - 1 - h.ack_delay];
         h.predictor
-            .tick(&mut h.phys, &volume, idle(), InputSeq(h.seq), TICK_DT_S);
-        let (auth, acked) = h.server_log[h.server_log.len() - 1 - h.ack_delay];
-        h.predictor.reconcile(&mut h.phys, &volume, auth, acked);
+            .reconcile(&mut h.phys, &volume, auth, acked, server_tick);
     }
 
     let server_end = h.server_state();

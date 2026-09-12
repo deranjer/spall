@@ -995,7 +995,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                 let st = state_from_snapshot(&snap);
                                 match &mut p.player {
                                     None => {
-                                        p.player = Some(PredictedPlayer::new(p.params, st));
+                                        p.player = Some(PredictedPlayer::new(
+                                            p.params,
+                                            st,
+                                            snap.server_tick,
+                                        ));
                                         p.script_origin_tick.get_or_insert(snap.server_tick.get());
                                     }
                                     // The live HUD path only needs `PredictedPlayer`'s own
@@ -1016,6 +1020,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                                 volume,
                                                 st,
                                                 snap.acked_input,
+                                                snap.server_tick,
                                             )
                                             && let Some(session) = &interactive
                                             && let Some(log) = &session.corrections
@@ -1185,7 +1190,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         if let Some(pl) = &mut p.player
                             && let Some(volume) = &terrain_volume
                         {
-                            pl.tick(&mut p.phys, volume, input, seq, MOVEMENT_DT_S);
+                            pl.tick(&mut p.phys, volume, input, MOVEMENT_DT_S);
                         }
                         // Preserve the script's server-tick cadence.  The
                         // mover itself samples more often than snapshots can

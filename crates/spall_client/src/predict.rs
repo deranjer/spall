@@ -16,12 +16,12 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use serde::Serialize;
-use spall_core::{BrickCoord, GlobalCell, MaterialId, PlayerInput};
+use spall_core::{BrickCoord, GlobalCell, MaterialId, PlayerInput, Tick};
+pub use spall_physics::WindowStats;
 use spall_physics::{
     BodyId, BodyKind, BodySpec, CharacterMove, CharacterParams, CharacterQueryCache,
     CharacterState, OccupancyGrid, PhysicsConfig, PhysicsWorld, Representation, step_character,
 };
-pub use spall_physics::WindowStats;
 use spall_protocol::InputSeq;
 use spall_voxel::{Sample, Volume};
 
@@ -354,9 +354,12 @@ pub struct CorrectionEvent {
 }
 
 /// One predicted input, kept so it can be re-simulated after a correction.
+/// No longer tags itself with an `InputSeq` (ENG-69 round 19): `reconcile`
+/// now decides what's still outstanding by counting elapsed server ticks,
+/// not by comparing sequence numbers, and nothing else in this crate reads
+/// a record's original seq.
 #[derive(Debug, Clone, Copy)]
 struct Record {
-    seq: InputSeq,
     input: PlayerInput,
     dt: f32,
     predicted_after: CharacterState,
@@ -368,6 +371,13 @@ pub struct PredictedPlayer {
     predicted: CharacterState,
     authoritative: CharacterState,
     acked: InputSeq,
+    /// The server tick of the last [`Self::reconcile`] call — `spawn_tick`
+    /// ([`Self::new`]) before the first one, so there is always a valid
+    /// anchor, first call included. ENG-69 round 19: this is what
+    /// `reconcile` now diffs against to decide how many `history` records
+    /// the server has already simulated — see that method's own doc for why
+    /// `acked`'s `InputSeq` cannot answer that question on its own.
+    last_server_tick: Tick,
     history: VecDeque<Record>,
     start_pos_m: [f64; 3],
     max_distance_from_start_m: f64,
@@ -404,12 +414,26 @@ pub struct PredictedPlayer {
 }
 
 impl PredictedPlayer {
-    pub fn new(params: CharacterParams, spawn: CharacterState) -> Self {
+    /// `spawn_tick` is the server tick `spawn` itself is authoritative as of
+    /// — always available at construction time in practice, since a
+    /// `PredictedPlayer` is only ever created from a `CharacterState` that
+    /// just arrived *with* a tick attached (`net.rs`'s first `MotionSnapshot`
+    /// for this player; a test harness's `Simulation::current_tick()` before
+    /// its first `tick()` call, i.e. `Tick(0)`). This is what lets
+    /// [`Self::reconcile`] treat every call uniformly, the very first one
+    /// included, instead of needing a "no anchor yet" special case — ENG-69
+    /// round 19's own first-draft fix special-cased the first call as "drop
+    /// nothing," which left one stale record stuck at the front of
+    /// `history` forever, silently shifting every later comparison one tick
+    /// off (invisible except right when input changes between the
+    /// mis-selected record and the current tick).
+    pub fn new(params: CharacterParams, spawn: CharacterState, spawn_tick: Tick) -> Self {
         Self {
             params,
             predicted: spawn,
             authoritative: spawn,
             acked: InputSeq(0),
+            last_server_tick: spawn_tick,
             history: VecDeque::new(),
             start_pos_m: spawn.position_m,
             max_distance_from_start_m: 0.0,
@@ -442,7 +466,6 @@ impl PredictedPlayer {
         phys: &mut ClientPhysics,
         volume: &Volume,
         input: PlayerInput,
-        seq: InputSeq,
         dt_s: f32,
     ) -> CharacterState {
         let params = self.params;
@@ -450,7 +473,6 @@ impl PredictedPlayer {
             phys.sweep(volume, params, p, d, dt_s)
         });
         self.history.push_back(Record {
-            seq,
             input,
             dt: dt_s,
             predicted_after: self.predicted,
@@ -468,26 +490,83 @@ impl PredictedPlayer {
         self.predicted
     }
 
-    /// Reconciles against an authoritative snapshot. `acked` is the last input
-    /// sequence the server consumed for this player: everything up to and
-    /// including it is dropped, and the rest is replayed from the authoritative
-    /// state to produce the new predicted "now". Returns the individual
-    /// correction event this call measured against `acked`'s recorded
-    /// prediction — `None` when no record for that sequence remains (e.g. it
-    /// aged out of `PREDICTION_HISTORY`, or a mid-flight `invalidate` cleared
-    /// it) — so a caller doing per-event analysis (ENG-69 round 10's G1 ramp
-    /// trace, `crates/spall_client/tests/g1_ramp_trace.rs`) can record every
-    /// one rather than only the running maxima the fields above track. This
+    /// Reconciles against an authoritative snapshot at `server_tick`. Drops
+    /// exactly the `history` records the server has actually simulated as of
+    /// that tick, and replays the rest — the still-genuinely-outstanding
+    /// ones — from the authoritative state to produce the new predicted
+    /// "now". Returns the individual correction event this call measured
+    /// against the record predicted for the same tick `authoritative`
+    /// represents — `None` when there isn't one to compare (nothing in
+    /// `history` yet, it aged out of `PREDICTION_HISTORY`, a mid-flight
+    /// `invalidate` cleared it, or a residency hold meant fewer local ticks
+    /// were predicted than the server actually advanced — see the
+    /// `keep_from`/`ticks_elapsed` comment below) — so a caller doing
+    /// per-event analysis (ENG-69 round 10's G1 ramp trace,
+    /// `crates/spall_client/tests/g1_ramp_trace.rs`) can record every one
+    /// rather than only the running maxima the fields above track. This
     /// event is reported *regardless* of the `1.0e-4` threshold `corrections`
     /// uses, so callers computing percentiles see the true near-zero tail too.
+    ///
+    /// `acked` (the last input sequence the server *accepted* — i.e. treated
+    /// as fresh, `Simulation::player_acked_input`/`MotionSnapshot::
+    /// acked_input`) is still recorded (`Self::acked`... no external reader
+    /// today, kept for parity with the wire concept it names) but is
+    /// deliberately **not** used to decide what counts as "already
+    /// simulated by the server" — that was ENG-69 round 19's bug.
+    /// `spall_sim::player::Player::last_input_seq` (what `acked` reports)
+    /// only advances on a *fresh* accepted frame, but the server steps the
+    /// player forward every tick regardless, reusing the last input via
+    /// `effective_input()` whenever a fresh frame hasn't arrived
+    /// (`HELD_INPUT_TIMEOUT_TICKS`). So while `acked` stays pinned during a
+    /// delivery gap, the server's real position keeps advancing — and the
+    /// old `history.retain(|r| r.seq.0 > acked.0)` kept replaying ticks the
+    /// server had already simulated via reuse, on top of an `authoritative`
+    /// state that already included them, compounding a larger and larger
+    /// double-counted overshoot until the next fresh ack forced a full
+    /// re-anchor and the whole accumulated error snapped back at once (up to
+    /// 0.75 m measured in `g1_realistic_input_timing_trace.rs`, for a
+    /// ~10-tick held stretch). `server_tick` (`MotionSnapshot::server_tick`)
+    /// has no such gap — it is the server's own tick counter, advanced every
+    /// tick unconditionally — so diffing against *it* instead is immune.
     pub fn reconcile(
         &mut self,
         phys: &mut ClientPhysics,
         volume: &Volume,
         authoritative: CharacterState,
         acked: InputSeq,
+        server_tick: Tick,
     ) -> Option<CorrectionEvent> {
-        let event = if let Some(rec) = self.history.iter().find(|r| r.seq == acked) {
+        // How many ticks the server has actually simulated since the last
+        // reconcile — well-defined from the very first call, since `Self::
+        // new`'s `spawn_tick` already anchors `last_server_tick` before any
+        // record exists. (An earlier draft special-cased "no anchor yet" as
+        // "drop nothing" on the first call, which left one stale record
+        // permanently stuck at the front of `history`: every later call's
+        // `keep_from` then came out one short forever — invisible while
+        // consecutive predictions stay numerically close (steady input),
+        // but a real, visible one-tick error the instant input changes
+        // between the mis-selected record and the current tick, i.e.
+        // exactly at every phase transition — caught by
+        // `g1_tower_strafe_trace_is_corrections_free_by_default` regressing
+        // from <1e-4m to 0.075m. Anchoring at construction instead removes
+        // the special case entirely.)
+        let ticks_elapsed = server_tick.0.saturating_sub(self.last_server_tick.0);
+        self.last_server_tick = server_tick;
+        // Ordinarily every local tick pushes exactly one `history` record
+        // (`Self::tick` is called once per predicted tick, unconditionally),
+        // so `ticks_elapsed` local records are exactly the ones the server
+        // has now covered. A residency hold (`net.rs`'s `ready` gate) can
+        // predict fewer local ticks than the server actually advances —
+        // clamping here just means "the server's ahead of everything we
+        // have," the correct, safe reading of that case too.
+        let keep_from = (ticks_elapsed as usize).min(self.history.len());
+        // Only trust the boundary record as "predicted for this exact tick"
+        // when the count wasn't clamped above — otherwise a residency hold
+        // (or the very first call) broke the 1-local-tick-per-server-tick
+        // correspondence this alignment relies on, and there's no record
+        // that legitimately corresponds to `server_tick`.
+        let event = if keep_from > 0 && ticks_elapsed as usize == keep_from {
+            let rec = self.history[keep_from - 1];
             let err = rec.predicted_after.distance_m(&authoritative);
             // A record only ever holds the *sanitized* input actually fed to
             // `step_character` (see `tick`), so this is exactly the input
@@ -527,7 +606,9 @@ impl PredictedPlayer {
 
         self.authoritative = authoritative;
         self.acked = acked;
-        self.history.retain(|r| r.seq.0 > acked.0);
+        for _ in 0..keep_from {
+            self.history.pop_front();
+        }
 
         let params = self.params;
         let mut state = authoritative;

@@ -38,7 +38,7 @@
 //! --nocapture` to see the reports.
 
 use spall_client::predict::{CELL_M, ClientPhysics, CorrectionEvent, PredictedPlayer};
-use spall_core::{EntityId, PlayerInput, player_entity_for};
+use spall_core::{EntityId, PlayerInput, Tick, player_entity_for};
 use spall_physics::{CharacterParams, CharacterState};
 use spall_protocol::InputSeq;
 use spall_sim::fixtures::g1_full_envelope_setup;
@@ -113,7 +113,7 @@ struct Harness {
     player: EntityId,
     phys: ClientPhysics,
     predictor: PredictedPlayer,
-    server_log: Vec<(CharacterState, InputSeq)>,
+    server_log: Vec<(CharacterState, InputSeq, Tick)>,
     phase_log: Vec<&'static str>,
     seq: u64,
     ack_delay: usize,
@@ -148,6 +148,7 @@ impl Harness {
         let predictor = PredictedPlayer::new(
             CharacterParams::DEFAULT,
             CharacterState::at(TOWER_APPROACH_M),
+            sim.current_tick(),
         );
 
         Self {
@@ -170,17 +171,18 @@ impl Harness {
         self.server_log.push((
             self.sim.player_state(self.player).unwrap(),
             self.sim.player_acked_input(self.player).unwrap(),
+            self.sim.current_tick(),
         ));
         self.phase_log.push(phase);
         let volume = self.sim.world().terrain().volume.clone();
         self.predictor
-            .tick(&mut self.phys, &volume, input, seq, TICK_DT_S);
+            .tick(&mut self.phys, &volume, input, TICK_DT_S);
         if self.server_log.len() > self.ack_delay {
             let record_index = self.server_log.len() - 1 - self.ack_delay;
-            let (auth, acked) = self.server_log[record_index];
-            if let Some(event) = self
-                .predictor
-                .reconcile(&mut self.phys, &volume, auth, acked)
+            let (auth, acked, server_tick) = self.server_log[record_index];
+            if let Some(event) =
+                self.predictor
+                    .reconcile(&mut self.phys, &volume, auth, acked, server_tick)
             {
                 samples.push(Sample {
                     tick: record_index,

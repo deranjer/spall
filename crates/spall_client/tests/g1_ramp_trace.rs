@@ -40,9 +40,24 @@
 //! to see the reports; deliberately not asserting numeric bounds (see this
 //! file's own findings for why a hard threshold would be premature) — this
 //! is a diagnostic instrument, not an acceptance gate.
+//!
+//! **Update, ENG-69 round 19:** the original run of this file (round 10)
+//! reported a genuine ~0.0750 m moving-max residual, attributed to the
+//! `MergedCuboids` seam mechanism this file's own doc above describes.
+//! Two things have since changed what that number means: round 18
+//! integrated `CharacterQueryCache`, so player movement no longer touches
+//! the real terrain collider's representation at all (the seam mechanism
+//! is gone from this path); and round 19 fixed a *reconciliation* bug
+//! (`PredictedPlayer::reconcile` — see `predict.rs`'s own doc) that,
+//! independently, was producing a same-order-of-magnitude ~0.075 m
+//! artifact of its own at every phase transition in *this exact harness's*
+//! `ack_delay = 0` case (a one-tick-stale comparison, not a seam catch).
+//! With both fixed, this file now reports 0 events and a 0.000000 m max —
+//! the ~0.0750 m this doc originally described no longer reproduces
+//! through either mechanism.
 
 use spall_client::predict::{ClientPhysics, CorrectionEvent, PredictedPlayer};
-use spall_core::{EntityId, PlayerInput, player_entity_for};
+use spall_core::{EntityId, PlayerInput, Tick, player_entity_for};
 use spall_physics::{CharacterParams, CharacterState};
 use spall_protocol::InputSeq;
 use spall_sim::fixtures::g1_full_envelope_setup;
@@ -100,7 +115,7 @@ struct Harness {
     player: EntityId,
     phys: ClientPhysics,
     predictor: PredictedPlayer,
-    server_log: Vec<(CharacterState, InputSeq)>,
+    server_log: Vec<(CharacterState, InputSeq, Tick)>,
     /// The phase label active on each tick, index-parallel to `server_log` —
     /// needed because a reconciled event at `ack_delay > 0` belongs to an
     /// *older* tick than the one triggering the `reconcile()` call. Tagging
@@ -133,6 +148,7 @@ impl Harness {
         let predictor = PredictedPlayer::new(
             CharacterParams::DEFAULT,
             CharacterState::at(RAMP_APPROACH_M),
+            sim.current_tick(),
         );
 
         Self {
@@ -156,17 +172,18 @@ impl Harness {
         self.server_log.push((
             self.sim.player_state(self.player).unwrap(),
             self.sim.player_acked_input(self.player).unwrap(),
+            self.sim.current_tick(),
         ));
         self.phase_log.push(phase);
         let volume = self.sim.world().terrain().volume.clone();
         self.predictor
-            .tick(&mut self.phys, &volume, input, seq, TICK_DT_S);
+            .tick(&mut self.phys, &volume, input, TICK_DT_S);
         if self.server_log.len() > self.ack_delay {
             let record_index = self.server_log.len() - 1 - self.ack_delay;
-            let (auth, acked) = self.server_log[record_index];
-            if let Some(event) = self
-                .predictor
-                .reconcile(&mut self.phys, &volume, auth, acked)
+            let (auth, acked, server_tick) = self.server_log[record_index];
+            if let Some(event) =
+                self.predictor
+                    .reconcile(&mut self.phys, &volume, auth, acked, server_tick)
             {
                 samples.push(Sample {
                     tick: record_index,

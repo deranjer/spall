@@ -3,6 +3,29 @@
 //! representation, confirmed stable and corrections-free by round 18 — is
 //! modelled realistically?
 //!
+//! **Answer, found by this file: not because of a collider/window issue
+//! (both sides report zero terrain fallbacks throughout), but because of a
+//! separate, genuine reconciliation bug this file's own held-input-reuse
+//! modelling was the first harness to actually exercise.**
+//! `PredictedPlayer::reconcile` (`predict.rs`) used to decide what to
+//! replay by comparing `InputSeq`s (`history.retain(|r| r.seq.0 >
+//! acked.0)`) — correct only when the server accepts exactly one fresh
+//! input per tick. Once `spall_sim::player::Player::effective_input` starts
+//! reusing a held input (any ordinary delivery gap, not just a long
+//! stall), `Player::last_input_seq` stops advancing while the server keeps
+//! stepping the player forward regardless — so the old logic kept
+//! replaying ticks the server had *already* simulated via reuse, on top of
+//! an `authoritative` state that already included them, until the next
+//! fresh ack forced the whole compounded overshoot to snap back at once
+//! (up to 0.75 m measured here, well past the live 0.150 m signature).
+//! Fixed the same round: `reconcile` now diffs against
+//! `MotionSnapshot::server_tick` (the server's own tick counter, advanced
+//! unconditionally every tick, immune to the gap) instead. With the fix,
+//! `g1_realistic_input_timing_is_corrections_free_once_reconcile_tracks_server_ticks`
+//! asserts what this file originally only reported: realistic input timing
+//! alone is corrections-free, the same as round 18 already showed for
+//! evenly-ticked input.
+//!
 //! Every earlier reconciliation harness in this ticket (`g1_ramp_trace.rs`,
 //! `g1_tower_strafe_trace.rs`, `prediction.rs`) shares the same
 //! simplification: one fresh input, with a strictly-incrementing sequence
@@ -189,6 +212,7 @@ impl Harness {
         let predictor = PredictedPlayer::new(
             CharacterParams::DEFAULT,
             CharacterState::at(TOWER_APPROACH_M),
+            sim.current_tick(),
         );
 
         Self {
@@ -248,7 +272,7 @@ impl Harness {
         // tick. This is the fix for this file's own first-draft bug: it
         // must never reuse a seq across multiple `predictor.tick` calls.
         self.predictor
-            .tick(&mut self.phys, &volume, input, client_seq, TICK_DT_S);
+            .tick(&mut self.phys, &volume, input, TICK_DT_S);
 
         if !self.tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS) {
             return;
@@ -260,7 +284,13 @@ impl Harness {
         let client_before = self.last_client_window;
         let server_before = self.last_server_window;
         let predicted_before = self.predictor.predicted();
-        let event = self.predictor.reconcile(&mut self.phys, &volume, auth, acked);
+        let event = self.predictor.reconcile(
+            &mut self.phys,
+            &volume,
+            auth,
+            acked,
+            self.sim.current_tick(),
+        );
         let predicted_after = self.predictor.predicted();
         let client_after = self.phys.window_stats();
         // Aggregate (all players — this harness only ever has one) server
@@ -340,20 +370,30 @@ fn run_trace() -> Vec<ReconcileRecord> {
     let mut h = Harness::new();
     let mut records = Vec::new();
 
-    let run_phase = |h: &mut Harness, schedule: Vec<(PlayerInput, bool)>, records: &mut Vec<ReconcileRecord>| {
+    let run_phase = |h: &mut Harness,
+                     schedule: Vec<(PlayerInput, bool)>,
+                     records: &mut Vec<ReconcileRecord>| {
         for (input, deliver) in schedule {
             h.step(input, deliver, records);
         }
     };
 
-    run_phase(&mut h, delivery_schedule(approach(), APPROACH_TICKS), &mut records);
+    run_phase(
+        &mut h,
+        delivery_schedule(approach(), APPROACH_TICKS),
+        &mut records,
+    );
     for _ in 0..ROUND_TRIPS {
         run_phase(&mut h, delivery_schedule(hug_positive(), 150), &mut records);
         run_phase(&mut h, delivery_schedule(idle(), 20), &mut records);
         run_phase(&mut h, delivery_schedule(hug_negative(), 150), &mut records);
         run_phase(&mut h, delivery_schedule(idle(), 20), &mut records);
     }
-    run_phase(&mut h, delivery_schedule(idle(), FINAL_IDLE_TICKS), &mut records);
+    run_phase(
+        &mut h,
+        delivery_schedule(idle(), FINAL_IDLE_TICKS),
+        &mut records,
+    );
 
     // Sanity check on the harness itself: the held-input path must have
     // actually engaged, or this trace isn't testing what it claims to.
@@ -364,7 +404,7 @@ fn run_trace() -> Vec<ReconcileRecord> {
         .max()
         .unwrap_or(0);
     assert!(
-        max_held >= 8 && max_held < HELD_INPUT_TIMEOUT_TICKS,
+        (8..HELD_INPUT_TIMEOUT_TICKS).contains(&max_held),
         "expected the scripted held stretch to reuse one input for close to (but under) the \
          {HELD_INPUT_TIMEOUT_TICKS}-tick timeout, got a max of {max_held} ticks — the delivery \
          schedule isn't exercising held-input reuse as intended"
@@ -374,7 +414,8 @@ fn run_trace() -> Vec<ReconcileRecord> {
 }
 
 fn report(records: &[ReconcileRecord]) {
-    let notable: Vec<&ReconcileRecord> = records.iter().filter(|r| r.event.error_m > 0.01).collect();
+    let notable: Vec<&ReconcileRecord> =
+        records.iter().filter(|r| r.event.error_m > 0.01).collect();
     eprintln!(
         "--- realistic input timing: {} reconcile events (one per {SNAPSHOT_INTERVAL_TICKS}-tick \
          snapshot, not every tick), {} exceed 0.01 m ---",
@@ -417,15 +458,14 @@ fn report(records: &[ReconcileRecord]) {
 }
 
 #[test]
-fn g1_realistic_input_timing_reproduces_or_clears_the_150mm_signature() {
+fn g1_realistic_input_timing_is_corrections_free_once_reconcile_tracks_server_ticks() {
     let records = run_trace();
     report(&records);
 
-    // This is the actual open question, not a pre-decided pass/fail: does
-    // realistic input timing alone (round 18's collider fix left
-    // unchanged, confirmed stable) reproduce something close to the live
-    // session's repeated ~0.150 m signature? Report either outcome
-    // plainly rather than asserting a bound that presupposes the answer.
+    // Informational only, kept for the same cross-check this file's own
+    // doc originally asked for: how many events land near the live
+    // session's ~0.150 m horizontal signature. Not asserted on directly —
+    // `max_err` below is the actual regression gate.
     let near_150mm = records
         .iter()
         .filter(|r| (r.event.horizontal_m - 0.150).abs() < 0.02)
@@ -434,5 +474,27 @@ fn g1_realistic_input_timing_reproduces_or_clears_the_150mm_signature() {
         "{near_150mm} of {} events land within 2 cm of the live session's ~0.150 m horizontal \
          signature",
         records.len()
+    );
+
+    // ENG-69 round 19's actual finding: realistic input timing (held-input
+    // reuse across scripted delivery gaps, reconciling only at the real
+    // 20 Hz snapshot cadence) reproduced up to 0.75 m corrections — far
+    // larger than the live 0.150 m signature — via a genuine reconciliation
+    // bug (`PredictedPlayer::reconcile` keying its retain/replay off
+    // `InputSeq` comparison instead of `MotionSnapshot::server_tick`; see
+    // that method's own doc). Fixed the same round. This is now a
+    // regression gate, not an open question: with the fix, realistic input
+    // timing alone should be corrections-free, the same way round 18 showed
+    // evenly-ticked input already was.
+    let max_err = records
+        .iter()
+        .map(|r| r.event.error_m)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_err < 1e-4,
+        "realistic input timing (held-input reuse, scripted delivery gaps, 20 Hz reconcile \
+         cadence) produced a {max_err:.6} m correction — the reconciliation fix (diffing \
+         `history` against `MotionSnapshot::server_tick` instead of `InputSeq`) may have \
+         regressed"
     );
 }
