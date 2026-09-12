@@ -997,7 +997,21 @@ impl WorldRenderer {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: capabilities.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // ENG-69 round 12: `.local/runs/interactive-frames.jsonl` from a
+            // live hands-on run showed a perfectly regular 4-frame cycle —
+            // two near-free frames, one ~16ms frame, one ~50ms frame,
+            // repeating — with every millisecond of it inside `acquire_ms`
+            // (the wait in `get_current_texture`), never in `buffer_upload`/
+            // `submit`/`present`. With `ControlFlow::Poll` never yielding
+            // between iterations, a latency of `2` let the render loop burst
+            // through two queued-ahead frames almost instantly and then stall
+            // to let the display drain the backlog, instead of pacing evenly
+            // at one vsync interval per frame — the felt "corners jitter"
+            // when strafing past an object. `1` forces the CPU to wait for
+            // the previous frame to actually present before acquiring the
+            // next one, trading a little frame-queuing slack for even
+            // pacing.
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &surface_config);
         let depth_view = create_depth_view(&device, surface_config.width, surface_config.height);
