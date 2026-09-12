@@ -259,6 +259,14 @@ struct Hud {
     last_report_at: Option<Instant>,
     last_rebuild_ms: f32,
     last_rebuild_instances: usize,
+    /// Worst single-frame total render time seen since the last report —
+    /// see `record_frame`. Reset to `0.0` each time `report` runs.
+    max_frame_ms: f32,
+    /// Worst single-frame terrain-instance-buffer upload time seen since the
+    /// last report (frames without a fresh upload don't count — see
+    /// `FrameTiming::buffer_upload_ms`). Reset to `0.0` each time `report`
+    /// runs.
+    max_buffer_upload_ms: f32,
     /// `InteractiveView::corrections` as of the last report — a *lifetime*
     /// counter, so the report shows how many are new since then rather than
     /// a running total that only ever grows and stops being useful for
@@ -293,6 +301,18 @@ impl Hud {
     fn record_rebuild(&mut self, elapsed: Duration, instance_count: usize) {
         self.last_rebuild_ms = elapsed.as_secs_f32() * 1000.0;
         self.last_rebuild_instances = instance_count;
+    }
+
+    /// Folds one render frame's timing into the worst-case-since-last-report
+    /// trackers (see `max_frame_ms`/`max_buffer_upload_ms`) — the averaged
+    /// `frame_ms_ema` above hides exactly the short, occasional stall these
+    /// exist to surface (ENG-69 round 12: a video review of a hands-on run
+    /// showed a "hold, then jump" pattern the average alone didn't explain).
+    fn record_frame(&mut self, timing: &FrameTiming) {
+        self.max_frame_ms = self.max_frame_ms.max(timing.total_ms);
+        if let Some(ms) = timing.buffer_upload_ms {
+            self.max_buffer_upload_ms = self.max_buffer_upload_ms.max(ms);
+        }
     }
 
     /// The due report's text, and resets the report window. `None` fps until
@@ -330,8 +350,13 @@ impl Hud {
         self.last_corrections_total = corrections_total;
         let new_idle = idle_corrections_total.saturating_sub(self.last_idle_corrections_total);
         self.last_idle_corrections_total = idle_corrections_total;
+        let max_frame_ms = self.max_frame_ms;
+        let max_buffer_upload_ms = self.max_buffer_upload_ms;
+        self.max_frame_ms = 0.0;
+        self.max_buffer_upload_ms = 0.0;
         format!(
-            "{fps:.0} fps | frame {:.1} ms (avg) | rebuild {:.1} ms ({} instances) | server tick {server_tick} | \
+            "{fps:.0} fps | frame {:.1} ms (avg) / {max_frame_ms:.1} ms (max) | buffer upload {max_buffer_upload_ms:.1} ms (max) | \
+             rebuild {:.1} ms ({} instances) | server tick {server_tick} | \
              +{new_corrections} corrections ({new_idle} idle) (lifetime max {max_correction_m:.3} m idle {max_idle_correction_m:.3} m vert {max_vertical_correction_m:.3} m horiz {max_horizontal_correction_m:.3} m)",
             self.frame_ms_ema, self.last_rebuild_ms, self.last_rebuild_instances,
         )
@@ -531,9 +556,23 @@ impl ApplicationHandler for InteractiveApp {
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
-                if let Err(error) = renderer.render(frame.as_ref()) {
-                    self.fail(event_loop, error);
-                    return;
+                let timing = match renderer.render(frame.as_ref()) {
+                    Ok(timing) => timing,
+                    Err(error) => {
+                        self.fail(event_loop, error);
+                        return;
+                    }
+                };
+                self.hud.record_frame(&timing);
+                if let Some(frames) = &self.session.frames {
+                    frames.record(
+                        timing.total_ms,
+                        timing.buffer_upload_ms,
+                        timing.instance_count,
+                        timing.acquire_ms,
+                        timing.submit_ms,
+                        timing.present_ms,
+                    );
                 }
                 if due_for_report {
                     let server_tick = view.map_or(0, |v| v.server_tick);
@@ -866,6 +905,57 @@ struct WorldRenderer {
     aspect: f32,
 }
 
+/// One render frame's timing breakdown — see [`WorldRenderer::render`] and
+/// `Hud::record_frame`. Added ENG-69 round 12: the averaged `frame_ms_ema`
+/// the HUD already tracked hides short, occasional stalls; a video review of
+/// an actual hands-on run showed a "hold, then jump" pattern (~60% of
+/// consecutive frames nearly identical, interspersed with larger jumps) that
+/// an average can't diagnose. This breaks a frame into the stages that can
+/// plausibly eat a vsync interval's worth of time on their own.
+struct FrameTiming {
+    /// Wall time for the whole `render` call.
+    total_ms: f32,
+    /// `Some` only on the (occasional) frame a background `RebuildWorker`
+    /// result landed and `render` uploaded a fresh instance buffer — see
+    /// `create_buffer_init` below. This reallocates and copies the *entire*
+    /// buffer every time rather than reusing one, and `VIEW_RADIUS_M` going
+    /// 10m -> 48m this same session made that copy ~23x bigger (proportional
+    /// to view area) — the leading suspect for the stall this instrumentation
+    /// exists to confirm or rule out.
+    buffer_upload_ms: Option<f32>,
+    /// Instance count uploaded, when `buffer_upload_ms` is `Some`.
+    instance_count: Option<u32>,
+    /// Time blocked in `surface.get_current_texture()`.
+    acquire_ms: f32,
+    /// Time in `queue.submit()` (usually just enqueues; doesn't normally
+    /// wait on the GPU).
+    submit_ms: f32,
+    /// Time in `surface_texture.present()` — on some backends this, not
+    /// `acquire`, is where `PresentMode::Fifo` actually blocks for vsync.
+    present_ms: f32,
+}
+
+impl FrameTiming {
+    /// A frame that bailed out of `render` early (an `Outdated`/`Lost`/
+    /// `Timeout` swapchain acquire) — whatever ran before the early return
+    /// still counts, the rest is `0.0`.
+    fn early_return(
+        total_ms: f32,
+        buffer_upload_ms: Option<f32>,
+        instance_count: Option<u32>,
+        acquire_ms: f32,
+    ) -> Self {
+        Self {
+            total_ms,
+            buffer_upload_ms,
+            instance_count,
+            acquire_ms,
+            submit_ms: 0.0,
+            present_ms: 0.0,
+        }
+    }
+}
+
 impl WorldRenderer {
     fn new(window: Arc<Window>) -> Result<Self, ClientError> {
         use wgpu::util::DeviceExt;
@@ -1064,10 +1154,14 @@ impl WorldRenderer {
     fn render(
         &mut self,
         frame: Option<&(Vec3, Vec3, Option<Vec<Instance>>)>,
-    ) -> Result<(), ClientError> {
+    ) -> Result<FrameTiming, ClientError> {
         use wgpu::util::DeviceExt as _;
 
+        let frame_start = Instant::now();
+        let mut buffer_upload_ms = None;
+        let mut instance_count = None;
         if let Some((_, _, Some(instances))) = frame {
+            let upload_start = Instant::now();
             let buffer = self
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1075,6 +1169,8 @@ impl WorldRenderer {
                     contents: bytemuck::cast_slice(instances),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
+            buffer_upload_ms = Some(upload_start.elapsed().as_secs_f32() * 1000.0);
+            instance_count = Some(instances.len() as u32);
             self.instance_buffer = Some((buffer, instances.len() as u32));
         }
 
@@ -1084,15 +1180,29 @@ impl WorldRenderer {
             b: 0.85,
             a: 1.0,
         };
+        let acquire_start = Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.surface_config);
-                return Ok(());
+                return Ok(FrameTiming::early_return(
+                    frame_start.elapsed().as_secs_f32() * 1000.0,
+                    buffer_upload_ms,
+                    instance_count,
+                    acquire_start.elapsed().as_secs_f32() * 1000.0,
+                ));
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::Timeout) => {
+                return Ok(FrameTiming::early_return(
+                    frame_start.elapsed().as_secs_f32() * 1000.0,
+                    buffer_upload_ms,
+                    instance_count,
+                    acquire_start.elapsed().as_secs_f32() * 1000.0,
+                ));
+            }
             Err(error) => return Err(ClientError::Render(error.to_string())),
         };
+        let acquire_ms = acquire_start.elapsed().as_secs_f32() * 1000.0;
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1155,9 +1265,20 @@ impl WorldRenderer {
                 pass.draw_indexed(0..self.index_count, 0, 0..*count);
             }
         }
+        let submit_start = Instant::now();
         self.queue.submit([encoder.finish()]);
+        let submit_ms = submit_start.elapsed().as_secs_f32() * 1000.0;
+        let present_start = Instant::now();
         surface_texture.present();
-        Ok(())
+        let present_ms = present_start.elapsed().as_secs_f32() * 1000.0;
+        Ok(FrameTiming {
+            total_ms: frame_start.elapsed().as_secs_f32() * 1000.0,
+            buffer_upload_ms,
+            instance_count,
+            acquire_ms,
+            submit_ms,
+            present_ms,
+        })
     }
 }
 

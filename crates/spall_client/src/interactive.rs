@@ -154,6 +154,72 @@ impl CorrectionLog {
     }
 }
 
+/// Best-effort append-only JSONL log of every render-thread frame's timing
+/// breakdown during an interactive session — for post-hoc analysis of a
+/// *live, human-driven* run. Added ENG-69 round 12: a video review of an
+/// actual hands-on run showed ~60% of consecutive frames nearly identical
+/// (a "hold") interspersed with larger jumps, matching the shape you'd get
+/// if the terrain instance buffer's full `create_buffer_init`
+/// reallocation+upload (only on the frame a background rebuild result
+/// lands — see `RebuildWorker`) occasionally stalls the render thread past
+/// a vsync interval. `Hud`'s averaged frame time hides exactly this kind of
+/// short, occasional stall, so this captures each frame's actual
+/// breakdown — buffer upload, swapchain acquire, submit, present — instead
+/// of inferring it from an average.
+pub struct FrameLog {
+    file: Mutex<std::io::BufWriter<std::fs::File>>,
+    started_at: std::time::Instant,
+}
+
+impl FrameLog {
+    /// Creates (truncating any previous run's log) the file at `path`,
+    /// including its parent directory.
+    fn create(path: &std::path::Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(path)?;
+        Ok(Self {
+            file: Mutex::new(std::io::BufWriter::new(file)),
+            started_at: std::time::Instant::now(),
+        })
+    }
+
+    /// Appends one frame's timing as a JSON line. `buffer_upload_ms`/
+    /// `instance_count` are `None` on frames that didn't upload a fresh
+    /// instance buffer (most of them — see `RebuildWorker`). Failures are
+    /// swallowed — this log is a diagnostic aid, never a reason to disrupt
+    /// the session itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &self,
+        total_ms: f32,
+        buffer_upload_ms: Option<f32>,
+        instance_count: Option<u32>,
+        acquire_ms: f32,
+        submit_ms: f32,
+        present_ms: f32,
+    ) {
+        use std::io::Write;
+        let buffer_upload_ms = buffer_upload_ms
+            .map(|ms| format!("{ms:.3}"))
+            .unwrap_or_else(|| "null".to_string());
+        let instance_count = instance_count
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let line = format!(
+            "{{\"wall_ms\":{},\"total_ms\":{total_ms:.3},\"buffer_upload_ms\":{buffer_upload_ms},\
+             \"instance_count\":{instance_count},\"acquire_ms\":{acquire_ms:.3},\
+             \"submit_ms\":{submit_ms:.3},\"present_ms\":{present_ms:.3}}}\n",
+            self.started_at.elapsed().as_millis(),
+        );
+        if let Ok(mut f) = self.file.lock() {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.flush();
+        }
+    }
+}
+
 /// Shared handle between the network thread and the render window for one
 /// interactively-played client session.
 pub struct InteractiveSession {
@@ -171,6 +237,8 @@ pub struct InteractiveSession {
     /// `None` only if the log file could not be created (diagnostic, not
     /// required for the session to run) — see [`CorrectionLog`].
     pub corrections: Option<CorrectionLog>,
+    /// `None` only if the log file could not be created — see [`FrameLog`].
+    pub frames: Option<FrameLog>,
 }
 
 impl std::fmt::Debug for InteractiveSession {
@@ -186,6 +254,8 @@ impl std::fmt::Debug for InteractiveSession {
 /// rather than plumbed through as a CLI flag, since this is diagnostic
 /// infrastructure for one active investigation, not a permanent feature.
 const CORRECTION_LOG_PATH: &str = ".local/runs/interactive-corrections.jsonl";
+/// Where `FrameLog` writes — same rationale as `CORRECTION_LOG_PATH`.
+const FRAME_LOG_PATH: &str = ".local/runs/interactive-frames.jsonl";
 
 impl InteractiveSession {
     pub fn new() -> Arc<Self> {
@@ -199,12 +269,23 @@ impl InteractiveSession {
                 None
             }
         };
+        let frames = match FrameLog::create(std::path::Path::new(FRAME_LOG_PATH)) {
+            Ok(log) => Some(log),
+            Err(e) => {
+                eprintln!(
+                    "spall-interactive: could not create {FRAME_LOG_PATH} ({e}); \
+                     per-frame timing logging is disabled for this session"
+                );
+                None
+            }
+        };
         Arc::new(Self {
             input: LiveInput::new(),
             view: Mutex::new(None),
             replica: OnceLock::new(),
             stop: AtomicBool::new(false),
             corrections,
+            frames,
         })
     }
 
