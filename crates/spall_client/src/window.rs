@@ -147,6 +147,10 @@ struct InteractiveApp {
     /// the centre of the most recent request, which may still be in flight.
     last_built_pos: Option<[f64; 3]>,
     last_dispatch_at: Option<Instant>,
+    /// The camera's own displayed feet position — deliberately a separate,
+    /// smoothed value rather than reading `InteractiveView::predicted`
+    /// directly every frame. See [`smoothed_eye`].
+    display_feet: Option<([f64; 3], Instant)>,
     hud: Hud,
     result: Result<(), ClientError>,
 }
@@ -327,6 +331,7 @@ impl InteractiveApp {
             rebuild,
             last_built_pos: None,
             last_dispatch_at: None,
+            display_feet: None,
             hud: Hud::default(),
             result: Ok(()),
         })
@@ -344,6 +349,35 @@ impl InteractiveApp {
 
     fn publish_movement(&self) {
         self.session.input.set_movement(self.held.movement());
+    }
+
+    /// The eye position to render this frame: [`extrapolated_feet`], smoothed
+    /// ([`CORRECTION_SMOOTHING_TAU_S`]) against `self.display_feet` — the
+    /// camera's own previous displayed position — rather than the target
+    /// position used outright. See that constant's doc for why: this exists
+    /// to turn a reconciliation correction into a glide instead of a snap,
+    /// without adding meaningfully more lag to intentional movement.
+    fn smoothed_eye(&mut self, view: InteractiveView, now: Instant) -> Vec3 {
+        let target = extrapolated_feet(view);
+        let feet = match self.display_feet {
+            Some((prev, prev_at)) => {
+                let dt = (now - prev_at).as_secs_f32().max(0.0);
+                let factor = 1.0 - (-dt / CORRECTION_SMOOTHING_TAU_S).exp();
+                [
+                    prev[0] + (target[0] - prev[0]) * f64::from(factor),
+                    prev[1] + (target[1] - prev[1]) * f64::from(factor),
+                    prev[2] + (target[2] - prev[2]) * f64::from(factor),
+                ]
+            }
+            None => target,
+        };
+        self.display_feet = Some((feet, now));
+        let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
+        Vec3::new(
+            feet[0] as f32,
+            (feet[1] + eye_height_m) as f32,
+            feet[2] as f32,
+        )
     }
 
     fn set_cursor_locked(&mut self, locked: bool) {
@@ -471,7 +505,7 @@ impl ApplicationHandler for InteractiveApp {
                     }
                 }
 
-                let frame = view.map(|v| (eye_position(v), look_dir, new_instances));
+                let frame = view.map(|v| (self.smoothed_eye(v, now), look_dir, new_instances));
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
@@ -547,7 +581,22 @@ impl ApplicationHandler for InteractiveApp {
 /// moving.
 const MAX_EXTRAPOLATION_S: f32 = 0.1;
 
-fn eye_position(view: InteractiveView) -> Vec3 {
+/// How quickly the *displayed* camera position catches up to the raw
+/// (extrapolated) predicted one — see [`InteractiveApp::smoothed_eye`].
+/// Short enough to add well under a frame's worth of lag to genuinely
+/// continuous movement (WASD keeps moving the target every frame, so
+/// smoothing barely touches it), long enough to turn a `PredictedPlayer`
+/// reconciliation correction — measured live at a small, consistent ~0.15 m,
+/// happening even while standing still (resting-contact micro-jitter
+/// between the client's and server's independently-computed physics, not a
+/// bug introduced by this window) — into a brief, barely-visible glide
+/// instead of a snap.
+const CORRECTION_SMOOTHING_TAU_S: f32 = 0.05;
+
+/// The raw predicted feet position, extrapolated forward by the time elapsed
+/// since the mover published it — not yet smoothed for a correction (see
+/// [`InteractiveApp::smoothed_eye`], which is what callers actually want).
+fn extrapolated_feet(view: InteractiveView) -> [f64; 3] {
     let dt = view
         .published_at
         .elapsed()
@@ -555,12 +604,11 @@ fn eye_position(view: InteractiveView) -> Vec3 {
         .min(MAX_EXTRAPOLATION_S);
     let feet = view.predicted.position_m;
     let v = view.predicted.velocity_m_s;
-    let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
-    Vec3::new(
-        (feet[0] + f64::from(v[0] * dt)) as f32,
-        (feet[1] + f64::from(v[1] * dt) + eye_height_m) as f32,
-        (feet[2] + f64::from(v[2] * dt)) as f32,
-    )
+    [
+        feet[0] + f64::from(v[0] * dt),
+        feet[1] + f64::from(v[1] * dt),
+        feet[2] + f64::from(v[2] * dt),
+    ]
 }
 
 fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
