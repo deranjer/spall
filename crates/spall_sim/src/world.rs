@@ -131,6 +131,13 @@ pub struct SimWorld {
     /// when its player has left, since that needs `&mut physics` alongside
     /// everything else it already touches that tick).
     query_caches: BTreeMap<u64, CharacterQueryCache>,
+    /// Aggregate (all players combined) live counters for `query_caches`'
+    /// actual usage this world — ENG-69 round 19: the client side already
+    /// had this (`ClientPhysics::window_stats`, round 18); the server side
+    /// didn't, leaving no way to see whether a live session's server-side
+    /// sweeps were actually using each player's window versus silently
+    /// falling back the whole time. See [`Self::window_stats`].
+    window_stats: spall_physics::WindowStats,
     /// T23 / G3 row 7, slice B: per-volume digests of bricks that have been
     /// evicted from the live cache. Empty unless the residency pass (slice D)
     /// populates it, so every logical path is byte-identical to today by
@@ -204,6 +211,7 @@ impl SimWorld {
             players: BTreeMap::new(),
             physics,
             query_caches: BTreeMap::new(),
+            window_stats: spall_physics::WindowStats::default(),
             evicted: BTreeMap::new(),
             backing: None,
         })
@@ -504,6 +512,14 @@ impl SimWorld {
         self.players.len()
     }
 
+    /// Live, aggregate (every player combined) proof that
+    /// `advance_players`'s per-player [`CharacterQueryCache`] windows are
+    /// actually serving sweeps, not just present — see the field's own
+    /// doc.
+    pub fn window_stats(&self) -> spall_physics::WindowStats {
+        self.window_stats
+    }
+
     /// Accepts one validated input frame for a player. Returns `false` for an
     /// unknown player or a stale / duplicate / non-finite frame.
     pub fn set_player_input(
@@ -594,49 +610,88 @@ impl SimWorld {
         // tick, unfiltered — exactly what every player did before this
         // round — rather than the sim thread panicking near any small
         // world's edge.
+        //
+        // `fresh` (did *this tick's* `ensure_covers` call return a live,
+        // just-verified window) is tracked separately from `window_id`
+        // (whatever `CharacterQueryCache::window_body_id` currently holds,
+        // fresh or not): a failed `ensure_covers` returns early — see
+        // `CharacterQueryCache::rebuild` — *before* touching the cache's own
+        // stored body, so a *previous* tick's successfully-built collider
+        // can still be sitting in `self.physics`, unrefreshed, exactly where
+        // the player used to be. ENG-69 round 19: that stale collider was
+        // never being excluded from anyone's sweep — not even its own
+        // owner's fallback one — so it could silently act as a phantom
+        // obstacle at a stale position. Every window this pass finds, fresh
+        // or stale, always gets excluded from every *other* player; a
+        // player whose own window isn't fresh this tick excludes its own
+        // (possibly stale) window too, alongside falling back to the real
+        // terrain — never both a stale window *and* real terrain
+        // overlapping in the same sweep.
         let terrain_revision = self.terrain.collider_revision;
         let cell_m = self.terrain.volume.cell_size().metres() as f32;
-        let mut windows: Vec<(u64, Option<PhysBodyId>)> = Vec::with_capacity(self.players.len());
-        let mut window_unavailable: std::collections::BTreeSet<u64> =
-            std::collections::BTreeSet::new();
+        struct PlayerWindow {
+            key: u64,
+            window_id: Option<PhysBodyId>,
+            fresh: bool,
+            rebuilt: bool,
+        }
+        let mut windows: Vec<PlayerWindow> = Vec::with_capacity(self.players.len());
         for (&key, player) in &self.players {
             let cache = self.query_caches.entry(key).or_default();
-            match cache.ensure_covers(
+            let result = cache.ensure_covers(
                 &mut self.physics,
                 &self.terrain.volume,
                 cell_m,
                 player.state.position_m,
                 terrain_revision,
-            ) {
-                Ok((window_id, _cost)) => windows.push((key, window_id)),
-                Err(_) => {
-                    window_unavailable.insert(key);
-                }
-            }
+            );
+            let fresh = matches!(result, Ok((Some(_), _)));
+            let rebuilt = matches!(result, Ok((_, Some(_))));
+            windows.push(PlayerWindow {
+                key,
+                window_id: cache.window_body_id(),
+                fresh,
+                rebuilt,
+            });
         }
 
-        // Pass 2: the actual movement step. Each player whose window built
-        // successfully excludes the real whole-terrain collider (their own
-        // window replaces it exactly — ENG-69 rounds 15-17) and every
-        // *other* player's window (each is sized and centred for its own
-        // owner alone, meaningless — and potentially misleading, being
-        // `MergedCuboids`-seam-free geometry built around a different
-        // position — to anyone else's sweep). A player whose window is
-        // unavailable this tick excludes nothing, sweeping against the real
-        // terrain instead. Ordinary dynamic bodies (debris, detached
+        // Pass 2: the actual movement step. Each player whose window is
+        // fresh this tick excludes the real whole-terrain collider (their
+        // own window replaces it exactly — ENG-69 rounds 15-17); one whose
+        // window isn't (build failed, or legitimately found no solid cell
+        // nearby) sweeps the real terrain instead, excluding its own
+        // (possibly stale) window so the two can never both participate.
+        // Every *other* player's window — fresh or stale — is always
+        // excluded too: it is sized and centred for its own owner alone,
+        // meaningless (and, being `MergedCuboids`-seam-free geometry built
+        // around a different position, potentially misleading) to anyone
+        // else's sweep. Ordinary dynamic bodies (debris, detached
         // structures) are *never* excluded either way: they stay fully
         // visible, exactly as before this round.
         let terrain_id = self.terrain.phys;
         for (key, player) in &mut self.players {
+            let my = windows.iter().find(|w| w.key == *key);
+            let my_fresh = my.is_some_and(|w| w.fresh);
+            let my_window_id = my.and_then(|w| w.window_id);
+            if my_fresh {
+                self.window_stats.window_sweeps += 1;
+                if my.is_some_and(|w| w.rebuilt) {
+                    self.window_stats.window_rebuilds += 1;
+                }
+            } else {
+                self.window_stats.terrain_fallbacks += 1;
+            }
             let mut exclude: Vec<PhysBodyId> = Vec::with_capacity(windows.len());
-            if !window_unavailable.contains(key) {
+            if my_fresh {
                 exclude.push(terrain_id);
+            } else if let Some(id) = my_window_id {
+                exclude.push(id);
             }
             exclude.extend(
                 windows
                     .iter()
-                    .filter(|(other, _)| other != key)
-                    .filter_map(|(_, id)| *id),
+                    .filter(|w| w.key != *key)
+                    .filter_map(|w| w.window_id),
             );
 
             let input = player.effective_input();

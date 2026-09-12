@@ -115,6 +115,25 @@ impl RebuildCost {
     }
 }
 
+/// Live counters proving a [`CharacterQueryCache`] is actually serving
+/// sweeps, not just present and unused — ENG-69 round 18 asked for this
+/// after round 17's own prototype never got wired to anything live. Shared
+/// between server (`spall_sim::world::SimWorld::window_stats`) and client
+/// (`spall_client::predict::ClientPhysics::window_stats`) so both track
+/// the same shape and a diagnostic that reads one can read the other the
+/// same way.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WindowStats {
+    /// Sweeps that used the window (with or without rebuilding it first).
+    pub window_sweeps: u64,
+    /// Of those, how many also rebuilt the window this call.
+    pub window_rebuilds: u64,
+    /// Sweeps that fell back to the whole-resident-set `terrain` collider —
+    /// the window couldn't be built (an `ExtractError` — e.g. the residency/
+    /// world-bounds edge) or was legitimately empty this call.
+    pub terrain_fallbacks: u64,
+}
+
 impl Default for CharacterQueryCache {
     fn default() -> Self {
         Self::new()

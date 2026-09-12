@@ -21,6 +21,7 @@ use spall_physics::{
     BodyId, BodyKind, BodySpec, CharacterMove, CharacterParams, CharacterQueryCache,
     CharacterState, OccupancyGrid, PhysicsConfig, PhysicsWorld, Representation, step_character,
 };
+pub use spall_physics::WindowStats;
 use spall_protocol::InputSeq;
 use spall_voxel::{Sample, Volume};
 
@@ -66,21 +67,11 @@ pub struct ClientPhysics {
     /// sweep path, not just present and unused — ENG-69 round 18 asked for
     /// this explicitly after the round-17 prototype never got wired to
     /// anything live. Surfaced through [`Self::window_stats`] to the
-    /// interactive HUD (`window.rs`'s `Hud::report`).
+    /// interactive HUD (`window.rs`'s `Hud::report`). The type itself lives
+    /// in `spall_physics::query_cache` (re-exported here) so
+    /// `spall_sim::world::SimWorld` can track the same shape server-side —
+    /// see its own `window_stats` field.
     window_stats: WindowStats,
-}
-
-/// See [`ClientPhysics::window_stats`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct WindowStats {
-    /// Sweeps that used the window (with or without rebuilding it first).
-    pub window_sweeps: u64,
-    /// Of those, how many also rebuilt the window this call.
-    pub window_rebuilds: u64,
-    /// Sweeps that fell back to the whole-resident-set `terrain` collider —
-    /// the window couldn't be built (residency-edge `ExtractError`) or was
-    /// legitimately empty this call.
-    pub terrain_fallbacks: u64,
 }
 
 impl Default for ClientPhysics {
@@ -231,12 +222,27 @@ impl ClientPhysics {
                 &[terrain_id],
             );
         }
-        // No window this call — either the cache couldn't build one (too
+        // No window *this call* — either the cache couldn't build one (too
         // close to the residency edge) or it legitimately found no solid
-        // cell nearby (open air within the window, but `terrain` may still
-        // hold real geometry elsewhere the player is about to reach) — the
-        // original whole-resident-set sweep covers both correctly.
+        // cell nearby. Falls back to the whole-resident-set sweep, but must
+        // also exclude `query_cache`'s own body if one still exists: a
+        // failed `ensure_covers` returns early (`CharacterQueryCache::
+        // rebuild`) *before* touching the cache's stored body, so a
+        // previous call's successfully-built window can still be sitting in
+        // `self.world`, unrefreshed, at a stale position — ENG-69 round 19
+        // found this was never excluded from the fallback sweep, letting a
+        // stale window silently double up with real terrain in the same
+        // query.
         self.window_stats.terrain_fallbacks += 1;
+        if let Some(stale_window_id) = self.query_cache.window_body_id() {
+            return self.world.sweep_character_excluding(
+                params,
+                feet_m,
+                desired_m,
+                dt_s,
+                &[stale_window_id],
+            );
+        }
         self.world.sweep_character(params, feet_m, desired_m, dt_s)
     }
 
