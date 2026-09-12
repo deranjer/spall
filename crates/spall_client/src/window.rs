@@ -16,6 +16,7 @@
 //! left to a follow-up increment.
 
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
@@ -23,7 +24,6 @@ use glam::Vec3;
 use glam::camera::rh;
 use spall_core::{BUTTON_JUMP, GlobalCell, MaterialId};
 use spall_physics::CharacterParams;
-use spall_protocol::Hash32;
 use spall_voxel::{Sample, Volume};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -46,16 +46,12 @@ const VIEW_HEIGHT_DOWN_M: f32 = 3.0;
 /// Rebuild the instanced terrain draw once the player has moved this far
 /// (metres) from where it was last built, or the resident terrain changes.
 const REBUILD_DISTANCE_M: f64 = 1.0;
-/// How often, at most, a *stationary* player pays for `terrain_resident_hash`
-/// — measured (see `perf_probe` below) at 5-100+ ms depending on scene size,
-/// because it walks and hashes the whole resident volume rather than being
-/// the cheap dirty-check its own doc comment describes. A moving player
-/// already gets a fresh rebuild every `REBUILD_DISTANCE_M` and skips this
-/// check entirely; a stationary one only needs it to notice a terrain edit
-/// landing nearby, and noticing up to this long after it lands — instead of
-/// paying the full hash on every single rendered frame regardless of
-/// movement — is an imperceptible trade for a debug renderer.
-const TERRAIN_CHECK_INTERVAL: Duration = Duration::from_millis(200);
+/// How often, at most, a *stationary* player re-requests a rebuild just to
+/// notice a terrain edit landing nearby (a moving player already re-requests
+/// every `REBUILD_DISTANCE_M`). This governs background-worker traffic, not
+/// frame time — see [`RebuildWorker`] — so it only needs to be "responsive
+/// enough for a person to notice", not "cheap".
+const TERRAIN_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 const MAX_PITCH: f32 = 1.5;
@@ -76,6 +72,12 @@ pub fn run_interactive_window(mut net_config: ClientNetConfig) -> Result<(), Cli
     // scene forever until someone notices and closes it by hand.
     let event_loop = EventLoop::<()>::with_user_event().build()?;
     let net_done = event_loop.create_proxy();
+
+    // Built before the network thread spawns: if this fails there is nothing
+    // yet to clean up, whereas failing after would leak a running,
+    // never-stopped network thread.
+    let mut app = InteractiveApp::new(session.clone())?;
+
     let net_thread = std::thread::Builder::new()
         .name("spall-client-net".into())
         .spawn(move || {
@@ -86,7 +88,6 @@ pub fn run_interactive_window(mut net_config: ClientNetConfig) -> Result<(), Cli
         .map_err(|e| ClientError::Gpu(format!("spawning network thread: {e}")))?;
 
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = InteractiveApp::new(session.clone());
     let run_result = event_loop.run_app(&mut app);
 
     // The window is gone either way; make sure the network thread notices
@@ -141,11 +142,98 @@ struct InteractiveApp {
     yaw: f32,
     pitch: f32,
     cursor_locked: bool,
-    last_rebuild_pos: Option<[f64; 3]>,
-    last_rebuild_hash: Option<Hash32>,
-    last_hash_check: Option<Instant>,
+    rebuild: RebuildWorker,
+    /// Centre the *last completed* background rebuild was built around — not
+    /// the centre of the most recent request, which may still be in flight.
+    last_built_pos: Option<[f64; 3]>,
+    last_dispatch_at: Option<Instant>,
     hud: Hud,
     result: Result<(), ClientError>,
+}
+
+/// Runs [`build_instances`] on a dedicated background thread instead of the
+/// window's render/input thread. Every dispatched request gets a freshly
+/// walked instance list unconditionally — this no longer consults
+/// `ReplicaWorld::terrain_resident_hash()` to decide whether anything
+/// actually changed first, because that hash walk costs as much as (or more
+/// than) `build_instances` itself (see `perf_probe` below); it's cheaper
+/// overall to occasionally rebuild an unchanged scene in the background than
+/// to also pay for the "did it change" check.
+///
+/// This exists because of a measured feedback loop, not just to shave frame
+/// time: on a big scene a rebuild can cost 100s of ms (`perf_probe`), and
+/// when that ran synchronously in `RedrawRequested`, a slow rebuild delayed
+/// the *next* frame, during which the player (still receiving predicted
+/// motion from the net thread, which this never blocked) covered more
+/// ground before the window got to check again — pushing it straight back
+/// past `REBUILD_DISTANCE_M` and into another rebuild. Once a rebuild's cost
+/// exceeds roughly `REBUILD_DISTANCE_M` / walking speed, that loop never
+/// breaks on its own: FPS collapses further with every step, while the GPU
+/// stays idle throughout (this is pure CPU volume-walking, no draw-call
+/// cost) and the one thread paying for it doesn't move an aggregate
+/// multi-core CPU reading much — which is exactly the "incredible lag, flat
+/// CPU/GPU graphs" symptom this was chasing.
+///
+/// At most one request is in flight at a time (`InteractiveApp` only sends a
+/// new one once the last result has been drained); a request superseded by
+/// player movement before the worker gets to it is simply answered a little
+/// stale; the renderer always has *something* to draw meanwhile, because it
+/// keeps presenting the last completed result rather than blocking on a new
+/// one.
+struct RebuildWorker {
+    request_tx: mpsc::Sender<[f64; 3]>,
+    result_rx: mpsc::Receiver<RebuildOutcome>,
+    in_flight: bool,
+}
+
+struct RebuildOutcome {
+    center_m: [f64; 3],
+    instances: Vec<Instance>,
+    elapsed: Duration,
+}
+
+impl RebuildWorker {
+    /// Spawns the worker thread. It exits on its own once `request_tx`'s
+    /// last sender (owned by the `InteractiveApp` this returns into) drops —
+    /// no explicit shutdown signal or join needed.
+    fn spawn(session: Arc<InteractiveSession>) -> Result<Self, ClientError> {
+        let (request_tx, request_rx) = mpsc::channel::<[f64; 3]>();
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("spall-client-rebuild".into())
+            .spawn(move || {
+                for center_m in request_rx {
+                    let Some(replica) = session.replica.get() else {
+                        continue;
+                    };
+                    let volume = replica
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .terrain_volume()
+                        .cloned();
+                    let Some(volume) = volume else { continue };
+                    let start = Instant::now();
+                    let instances = build_instances(&volume, center_m);
+                    let elapsed = start.elapsed();
+                    if result_tx
+                        .send(RebuildOutcome {
+                            center_m,
+                            instances,
+                            elapsed,
+                        })
+                        .is_err()
+                    {
+                        return; // the window is gone
+                    }
+                }
+            })
+            .map_err(|e| ClientError::Gpu(format!("spawning the terrain-rebuild thread: {e}")))?;
+        Ok(Self {
+            request_tx,
+            result_rx,
+            in_flight: false,
+        })
+    }
 }
 
 /// On-screen-debug support (per the ENG-69 lag investigation): there is no
@@ -208,8 +296,9 @@ impl Hud {
 }
 
 impl InteractiveApp {
-    fn new(session: Arc<InteractiveSession>) -> Self {
-        Self {
+    fn new(session: Arc<InteractiveSession>) -> Result<Self, ClientError> {
+        let rebuild = RebuildWorker::spawn(session.clone())?;
+        Ok(Self {
             session,
             window: None,
             renderer: None,
@@ -218,12 +307,12 @@ impl InteractiveApp {
             yaw: 0.0,
             pitch: 0.0,
             cursor_locked: false,
-            last_rebuild_pos: None,
-            last_rebuild_hash: None,
-            last_hash_check: None,
+            rebuild,
+            last_built_pos: None,
+            last_dispatch_at: None,
             hud: Hud::default(),
             result: Ok(()),
-        }
+        })
     }
 
     fn view_dir(&self) -> [f32; 3] {
@@ -329,22 +418,43 @@ impl ApplicationHandler for InteractiveApp {
                 let now = Instant::now();
                 let due_for_report = self.hud.tick(now);
 
+                // Drain the background worker's result, if a fresh one has
+                // landed since the last frame (never blocks — `try_recv`).
+                // Only the newest matters if somehow more than one queued up.
+                let mut new_instances = None;
+                while let Ok(outcome) = self.rebuild.result_rx.try_recv() {
+                    self.hud
+                        .record_rebuild(outcome.elapsed, outcome.instances.len());
+                    self.last_built_pos = Some(outcome.center_m);
+                    new_instances = Some(outcome.instances);
+                    self.rebuild.in_flight = false;
+                }
+
                 let view = *self.session.view.lock().unwrap_or_else(|e| e.into_inner());
                 let look_dir = Vec3::from_array(self.view_dir());
-                let session = self.session.clone();
-                let frame = view.map(|v| {
-                    let (eye, instances) = build_scene(
-                        &session,
-                        &mut self.last_rebuild_pos,
-                        &mut self.last_rebuild_hash,
-                        &mut self.last_hash_check,
-                        v,
-                    );
-                    (eye, look_dir, instances)
-                });
-                if let Some((_, _, Some(instances))) = &frame {
-                    self.hud.record_rebuild(now.elapsed(), instances.len());
+
+                if let Some(v) = view {
+                    let feet = v.predicted.position_m;
+                    let moved_far_enough = self.last_built_pos.is_none_or(|p| {
+                        let d = [feet[0] - p[0], feet[1] - p[1], feet[2] - p[2]];
+                        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() >= REBUILD_DISTANCE_M
+                    });
+                    let due_for_recheck = self
+                        .last_dispatch_at
+                        .is_none_or(|t| now - t >= TERRAIN_RECHECK_INTERVAL);
+                    // At most one request in flight — a faster player than the
+                    // worker can keep up with just rides on a slightly stale
+                    // draw rather than queuing requests it'll never need.
+                    if !self.rebuild.in_flight
+                        && (moved_far_enough || due_for_recheck)
+                        && self.rebuild.request_tx.send(feet).is_ok()
+                    {
+                        self.rebuild.in_flight = true;
+                        self.last_dispatch_at = Some(now);
+                    }
                 }
+
+                let frame = view.map(|v| (eye_position(v), look_dir, new_instances));
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
@@ -400,67 +510,18 @@ impl ApplicationHandler for InteractiveApp {
     }
 }
 
-/// The eye position for the current predicted pose, and — only when the
-/// player has moved far enough (or the resident terrain changed) since the
-/// last rebuild to be worth the cost — a freshly walked instance list for
-/// [`WorldRenderer::render`]. `None` instances tells the renderer to keep
-/// drawing whatever it last uploaded.
-fn build_scene(
-    session: &InteractiveSession,
-    last_pos: &mut Option<[f64; 3]>,
-    last_hash: &mut Option<Hash32>,
-    last_hash_check: &mut Option<Instant>,
-    view: InteractiveView,
-) -> (Vec3, Option<Vec<Instance>>) {
+/// The eye position for the current predicted pose: feet, raised to (90% of)
+/// standing eye height. Cheap — no lock, no volume access — so it stays
+/// directly on the render/input thread; only the terrain draw list
+/// ([`RebuildWorker`]) is expensive enough to need moving off of it.
+fn eye_position(view: InteractiveView) -> Vec3 {
     let feet = view.predicted.position_m;
     let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
-    let eye = Vec3::new(
+    Vec3::new(
         feet[0] as f32,
         (feet[1] + eye_height_m) as f32,
         feet[2] as f32,
-    );
-
-    let moved_far_enough = last_pos.is_none_or(|p| {
-        let d = [feet[0] - p[0], feet[1] - p[1], feet[2] - p[2]];
-        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() >= REBUILD_DISTANCE_M
-    });
-
-    // `terrain_resident_hash` walks and hashes the whole resident volume —
-    // 5-100+ ms depending on scene size, not the cheap check its own doc
-    // comment describes (see `perf_probe` below). A moving player already
-    // gets a fresh rebuild every `REBUILD_DISTANCE_M` regardless, so only a
-    // *stationary* one needs this at all (to notice an edit landing nearby),
-    // and only at `TERRAIN_CHECK_INTERVAL`'s rate rather than every frame.
-    let hash_changed = !moved_far_enough
-        && last_hash_check.is_none_or(|t| t.elapsed() >= TERRAIN_CHECK_INTERVAL)
-        && {
-            *last_hash_check = Some(Instant::now());
-            let terrain_hash = session.replica.get().and_then(|replica| {
-                replica
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .terrain_resident_hash()
-            });
-            let changed = terrain_hash != *last_hash;
-            *last_hash = terrain_hash;
-            changed
-        };
-
-    let instances = if moved_far_enough || hash_changed {
-        *last_pos = Some(feet);
-        session.replica.get().and_then(|replica| {
-            let volume = replica
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .terrain_volume()
-                .cloned();
-            volume.map(|v| build_instances(&v, feet))
-        })
-    } else {
-        None
-    };
-
-    (eye, instances)
+    )
 }
 
 fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
