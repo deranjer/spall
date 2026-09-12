@@ -509,6 +509,72 @@ mod tests {
     }
 
     #[test]
+    fn walking_the_g1_ramp_diverges_between_representations() {
+        // ENG-69 round 9: the flat-floor test above proved Voxels and Cuboid
+        // shapes agree on identical geometry *without* internal seams. Does a
+        // real feature with genuine internal MergedCuboids seams — not an
+        // artificial partial-view crop — actually produce a resolvable
+        // disagreement? Use the exact fixture behind the live
+        // `cargo xtask play --scene g1` session the correction was measured
+        // on: `g1_full_envelope_scene` merges to only ~39 total boxes for its
+        // ~3M solid cells (comfortably inside the budget, confirmed by
+        // `spall_sim::collider`'s own `g1_full_envelope_scene_representation_choice`
+        // test — this is why the server picks `MergedCuboids` for it), but
+        // its one deliberate ramp feature (`g1_full_envelope_scene`'s own
+        // doc: 12 cells of height dropped over 32 cells of x, cell y in
+        // `[180, 211]`, cell z in `[100, 115]`) is a staircase of several
+        // tread boxes meeting at right-angle seams — exactly the kind of
+        // internal seam the flat floor above has none of.
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+
+        let mut cuboid_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut cuboid_world, &volume, Representation::MergedCuboids);
+        cuboid_world.step();
+
+        let mut voxel_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut voxel_world, &volume, Representation::NativeVoxels);
+        voxel_world.step();
+
+        // Just before the ramp, on the flat plain (cell height 46), walking
+        // +X across the whole ramp and stopping just short of its bottom
+        // (cell x = 211) so the run never reaches whatever geometry lies
+        // beyond it.
+        let start = CharacterState::at([
+            179.0 * f64::from(CELL_M),
+            46.0 * f64::from(CELL_M),
+            106.0 * f64::from(CELL_M),
+        ]);
+        let input = PlayerInput {
+            movement: [0.0, 0.0, 1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+        let cuboid_end = run(&mut cuboid_world, start, input, 100);
+        let voxel_end = run(&mut voxel_world, start, input, 100);
+
+        let dx = cuboid_end.position_m[0] - voxel_end.position_m[0];
+        let dz = cuboid_end.position_m[2] - voxel_end.position_m[2];
+        let dy = cuboid_end.position_m[1] - voxel_end.position_m[1];
+        let horiz_gap = (dx * dx + dz * dz).sqrt();
+        eprintln!(
+            "g1 ramp walk: cuboid {:?} (grounded {}) vs voxels {:?} (grounded {}) \
+             -> horiz gap {horiz_gap:.4} m, vert gap {:.4} m",
+            cuboid_end.position_m,
+            cuboid_end.grounded,
+            voxel_end.position_m,
+            voxel_end.grounded,
+            dy
+        );
+        // Deliberately not asserting a bound here (unlike the flat-floor
+        // test): this test's purpose is the eprintln! above (run with
+        // `-- --nocapture`) — measuring whether real ramp/staircase seams
+        // move XZ at all, to settle whether ENG-69's round-9 theory (the
+        // server's own MergedCuboids seams, not any client-side issue, are
+        // the residual's source) holds up against the actual scene, not just
+        // an idealized flat floor.
+    }
+
+    #[test]
     fn removing_the_floor_leaves_no_hover() {
         let (mut world, top, floor) = floor_world();
         // Settle on the floor.

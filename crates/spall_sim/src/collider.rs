@@ -370,4 +370,33 @@ mod tests {
         )
         .unwrap()
     }
+
+    #[test]
+    fn g1_full_envelope_scene_representation_choice() {
+        // ENG-69 round 9: which representation does the server actually pick
+        // for the live `cargo xtask play --scene g1` terrain? This is the
+        // fact the round-9 theory (a stable ~0.15 m horizontal correction
+        // even after the client went seamless is most likely the *server's
+        // own* MergedCuboids seams on non-flat terrain) rests on — check it
+        // rather than assume it. `MergedCuboids` here would support that
+        // theory; `NativeVoxels` would rule it out (the server would already
+        // be seamless too, and the residual would need a different
+        // explanation).
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(vid(1));
+        let grid = OccupancyGrid::from_volume(&volume)
+            .expect("extract")
+            .expect("non-empty");
+        let greedy = greedy_boxes(&grid).len();
+        let plan = plan_collider(&grid).expect("g1 terrain collider plan");
+        eprintln!(
+            "g1_full_envelope_scene: {} solid cells, {greedy} greedy boxes \
+             (budget {PRIMITIVE_BUDGET}) -> {}",
+            grid.solid_count(),
+            plan.representation.label()
+        );
+        // Not asserting a specific representation: this test's value is the
+        // eprintln! above (run with `-- --nocapture`) documenting which side
+        // of the budget the real scene actually falls on, for the next round
+        // of this investigation to build on rather than re-derive.
+    }
 }
