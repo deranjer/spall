@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant};
 
+use rapier3d::control::CharacterCollision;
 use rapier3d::prelude::*;
 
 use crate::collider::{Representation, build_collider};
@@ -602,6 +603,27 @@ impl PhysicsWorld {
         desired_translation_m: [f32; 3],
         dt_s: f32,
     ) -> crate::character::CharacterMove {
+        self.sweep_character_with(params, position_m, desired_translation_m, dt_s, |_| {})
+    }
+
+    /// Same as [`Self::sweep_character`], but `on_collision` is called for
+    /// every [`CharacterCollision`] Rapier's controller reports along the way
+    /// — normally discarded (`sweep_character` passes an empty closure).
+    /// ENG-69 round 15: added to directly confirm (not just infer from
+    /// endpoint position diffs) that a representation-divergence event is a
+    /// real contact against real geometry, not a coincidental integration
+    /// difference — see `spall_physics::character::tests::
+    /// strafing_the_g1_tower_wall_diverges_between_representations`'s
+    /// per-tick trace, which found the divergence lands entirely within one
+    /// tick.
+    pub fn sweep_character_with(
+        &self,
+        params: crate::character::CharacterParams,
+        position_m: [f64; 3],
+        desired_translation_m: [f32; 3],
+        dt_s: f32,
+        mut on_collision: impl FnMut(&CharacterCollision),
+    ) -> crate::character::CharacterMove {
         let controller = crate::character::controller();
         let shape = crate::character::capsule(params);
         let centre = params.centre_offset_m();
@@ -622,7 +644,9 @@ impl PhysicsWorld {
             desired_translation_m[1],
             desired_translation_m[2],
         );
-        let moved = controller.move_shape(dt_s, &queries, &shape, &pos, desired, |_| {});
+        let moved = controller.move_shape(dt_s, &queries, &shape, &pos, desired, |c| {
+            on_collision(&c);
+        });
         crate::character::CharacterMove {
             translation_m: [
                 moved.translation.x,
