@@ -1077,12 +1077,14 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 // All predictor-lock work happens in this non-async block, which
                 // returns the datagram to send (and the predicted feet position
                 // for the residency pass) once the guard is dropped.
-                let (frame, feet, script_tick, predicted_state): (
+                type MoverTickOutcome = (
                     Option<InputFrame>,
                     Option<[f64; 3]>,
                     Option<u64>,
                     Option<CharacterState>,
-                ) = {
+                    Option<(u64, f64)>,
+                );
+                let (frame, feet, script_tick, predicted_state, correction_stats): MoverTickOutcome = {
                     let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
                     let p: &mut Predictor = &mut guard;
                     if let Some((hash, volume)) = terrain
@@ -1167,17 +1169,24 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     };
                     let predicted_state = p.player.as_ref().map(PredictedPlayer::predicted);
                     let feet = predicted_state.map(|st| st.position_m);
-                    (frame, feet, script_tick, predicted_state)
+                    let correction_stats = p
+                        .player
+                        .as_ref()
+                        .map(|pl| (pl.corrections, pl.max_correction_m));
+                    (frame, feet, script_tick, predicted_state, correction_stats)
                 };
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
                 }
                 if let (Some(session), Some(predicted)) = (&interactive, predicted_state) {
+                    let (corrections, max_correction_m) = correction_stats.unwrap_or_default();
                     *session.view.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(InteractiveView {
                             predicted,
                             server_tick: tick,
                             published_at: std::time::Instant::now(),
+                            corrections,
+                            max_correction_m,
                         });
                 }
 

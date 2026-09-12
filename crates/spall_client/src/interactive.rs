@@ -83,6 +83,15 @@ pub struct InteractiveView {
     /// of redrawing the exact same discrete pose on every frame between
     /// ticks.
     pub published_at: std::time::Instant,
+    /// `PredictedPlayer::corrections` / `max_correction_m` as of this tick:
+    /// how many times, and by how much (metres), a server snapshot has ever
+    /// disagreed with what was predicted at the same input — see
+    /// `PredictedPlayer::reconcile`. Surfaced so the window's HUD can show
+    /// whether a moment of felt jerkiness lines up with a real reconciliation
+    /// correction rather than something else (rendering, input, or just the
+    /// character controller's own collision response).
+    pub corrections: u64,
+    pub max_correction_m: f64,
 }
 
 /// Shared handle between the network thread and the render window for one

@@ -250,6 +250,11 @@ struct Hud {
     last_report_at: Option<Instant>,
     last_rebuild_ms: f32,
     last_rebuild_instances: usize,
+    /// `InteractiveView::corrections` as of the last report — a *lifetime*
+    /// counter, so the report shows how many are new since then rather than
+    /// a running total that only ever grows and stops being useful for
+    /// spotting "did one just happen".
+    last_corrections_total: u64,
 }
 
 impl Hud {
@@ -280,16 +285,28 @@ impl Hud {
 
     /// The due report's text, and resets the report window. `None` fps until
     /// the first `REPORT_INTERVAL` has actually elapsed (avoids a bogus huge
-    /// number from a near-zero-duration first window).
-    fn report(&mut self, now: Instant, server_tick: u64) -> String {
+    /// number from a near-zero-duration first window). `corrections` /
+    /// `max_correction_m` are `PredictedPlayer`'s own reconciliation-error
+    /// counters (see `InteractiveView`) — a felt "snap back" that lines up
+    /// with these climbing is a real prediction/authoritative disagreement,
+    /// not a rendering artifact.
+    fn report(
+        &mut self,
+        now: Instant,
+        server_tick: u64,
+        corrections_total: u64,
+        max_correction_m: f64,
+    ) -> String {
         let elapsed = self
             .last_report_at
             .map_or(Self::REPORT_INTERVAL, |t| now - t);
         let fps = self.frames_since_report as f32 / elapsed.as_secs_f32();
         self.last_report_at = Some(now);
         self.frames_since_report = 0;
+        let new_corrections = corrections_total.saturating_sub(self.last_corrections_total);
+        self.last_corrections_total = corrections_total;
         format!(
-            "{fps:.0} fps | frame {:.1} ms (avg) | rebuild {:.1} ms ({} instances) | server tick {server_tick}",
+            "{fps:.0} fps | frame {:.1} ms (avg) | rebuild {:.1} ms ({} instances) | server tick {server_tick} | +{new_corrections} corrections (lifetime max {max_correction_m:.3} m)",
             self.frame_ms_ema, self.last_rebuild_ms, self.last_rebuild_instances
         )
     }
@@ -464,7 +481,11 @@ impl ApplicationHandler for InteractiveApp {
                 }
                 if due_for_report {
                     let server_tick = view.map_or(0, |v| v.server_tick);
-                    let line = self.hud.report(now, server_tick);
+                    let corrections = view.map_or(0, |v| v.corrections);
+                    let max_correction_m = view.map_or(0.0, |v| v.max_correction_m);
+                    let line = self
+                        .hud
+                        .report(now, server_tick, corrections, max_correction_m);
                     if let Some(window) = &self.window {
                         window.set_title(&format!("Spall sandbox — interactive | {line}"));
                     }
