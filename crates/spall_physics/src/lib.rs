@@ -30,7 +30,10 @@ pub mod report;
 pub mod world;
 
 pub use character::{CharacterMove, CharacterParams, CharacterState, PlayerInput, step_character};
-pub use collider::{ColliderBuild, Representation, build_collider};
+pub use collider::{
+    ColliderBuild, MERGED_CUBOID_PRIMITIVE_BUDGET, Representation, build_collider,
+    choose_representation,
+};
 pub use mass::{BodyMassProperties, MassProperties, analytic_mass_properties};
 pub use merge::{BoxSpan, greedy_boxes};
 pub use metrics::{DurationSamples, PercentileSummary};

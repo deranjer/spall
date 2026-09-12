@@ -19,7 +19,7 @@ use serde::Serialize;
 use spall_core::{BrickCoord, GlobalCell, MaterialId, PlayerInput};
 use spall_physics::{
     BodyId, BodyKind, BodySpec, CharacterMove, CharacterParams, CharacterState, OccupancyGrid,
-    PhysicsConfig, PhysicsWorld, Representation, step_character,
+    PhysicsConfig, PhysicsWorld, choose_representation, step_character,
 };
 use spall_protocol::InputSeq;
 use spall_voxel::{Sample, Volume};
@@ -76,28 +76,44 @@ impl ClientPhysics {
     /// from the gap. An empty resident set (no solid cell anywhere) still
     /// drops the collider entirely so the capsule falls through a
     /// fully-removed floor.
+    ///
+    /// The representation is chosen by [`spall_physics::choose_representation`]
+    /// — the same budget `spall_sim::collider::plan_collider` uses for the
+    /// server's own terrain body — rather than a hardcoded
+    /// `Representation::MergedCuboids`. ENG-69 round 7 found this hardcoding
+    /// was a real bug, not a style choice: once the server's terrain grew
+    /// fragmented enough to cross the budget and fall back to
+    /// `NativeVoxels`, the client kept building `MergedCuboids` regardless —
+    /// two structurally different colliders over the same logical geometry.
+    /// `MergedCuboids`' internal box seams can deflect a sliding kinematic
+    /// character sideways where `NativeVoxels` (parry suppresses
+    /// internal-edge contacts between adjacent voxels) would not, which
+    /// showed up as a small, purely-horizontal correction that fired even
+    /// while the player stood perfectly still.
     pub fn set_terrain(&mut self, volume: &Volume) {
         self.resident_bricks = volume.resident_brick_coords().into_iter().collect();
         match lenient_occupancy(volume) {
-            Some(grid) => match self.terrain {
-                Some(id) => {
-                    self.world
-                        .rebuild_collider(id, &grid, Representation::MergedCuboids);
+            Some(grid) => {
+                let representation = choose_representation(&grid);
+                match self.terrain {
+                    Some(id) => {
+                        self.world.rebuild_collider(id, &grid, representation);
+                    }
+                    None => {
+                        let id = self.world.add_body(BodySpec {
+                            kind: BodyKind::Fixed,
+                            representation,
+                            grid,
+                            cell_m: CELL_M,
+                            density_kg_m3: 1.0,
+                            mass_properties: None,
+                            translation_m: [0.0; 3],
+                            linvel_m_s: [0.0; 3],
+                        });
+                        self.terrain = Some(id);
+                    }
                 }
-                None => {
-                    let id = self.world.add_body(BodySpec {
-                        kind: BodyKind::Fixed,
-                        representation: Representation::MergedCuboids,
-                        grid,
-                        cell_m: CELL_M,
-                        density_kg_m3: 1.0,
-                        mass_properties: None,
-                        translation_m: [0.0; 3],
-                        linvel_m_s: [0.0; 3],
-                    });
-                    self.terrain = Some(id);
-                }
-            },
+            }
             None => {
                 if let Some(id) = self.terrain {
                     self.world.remove_collider(id);

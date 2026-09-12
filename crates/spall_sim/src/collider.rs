@@ -32,7 +32,11 @@ use spall_physics::{OccupancyGrid, Representation, greedy_boxes};
 
 /// Merged-cuboid budget per body: above this the exact native voxel shape is
 /// used instead of the compound (provisional, from `docs/collision-decision.md`).
-pub const PRIMITIVE_BUDGET: usize = 4096;
+/// Re-exported from [`spall_physics::MERGED_CUBOID_PRIMITIVE_BUDGET`] rather
+/// than redefined here — every side building a collider for the *same*
+/// logical geometry must agree on this number (see that constant's doc for
+/// why a mismatch is a real, if subtle, bug).
+pub const PRIMITIVE_BUDGET: usize = spall_physics::MERGED_CUBOID_PRIMITIVE_BUDGET;
 
 /// Largest fine-grid cell count for which the **native-voxel** exact fallback is
 /// declared feasible: `1 << 17` = 131 072 cells (~50³).
