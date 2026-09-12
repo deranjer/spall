@@ -117,6 +117,13 @@ struct Harness {
     phase_log: Vec<&'static str>,
     seq: u64,
     ack_delay: usize,
+    /// `reconcile` calls whose `ReconcileOutcome::comparison` was `None` —
+    /// see that field's own doc. This harness ticks client and server
+    /// together every loop iteration in one process, so a matched
+    /// comparison is expected on *every* call; a nonzero count here would
+    /// mean that assumption broke, not that nothing happened (ENG-69
+    /// round 21).
+    unmatched: u64,
 }
 
 impl Harness {
@@ -160,6 +167,7 @@ impl Harness {
             phase_log: Vec::new(),
             seq: 0,
             ack_delay,
+            unmatched: 0,
         }
     }
 
@@ -176,19 +184,21 @@ impl Harness {
         self.phase_log.push(phase);
         let volume = self.sim.world().terrain().volume.clone();
         self.predictor
-            .tick(&mut self.phys, &volume, input, TICK_DT_S);
+            .tick(&mut self.phys, &volume, input, seq, TICK_DT_S);
         if self.server_log.len() > self.ack_delay {
             let record_index = self.server_log.len() - 1 - self.ack_delay;
             let (auth, acked, server_tick) = self.server_log[record_index];
-            if let Some(event) =
+            let outcome =
                 self.predictor
-                    .reconcile(&mut self.phys, &volume, auth, acked, server_tick)
-            {
+                    .reconcile(&mut self.phys, &volume, auth, acked, server_tick);
+            if let Some(event) = outcome.comparison {
                 samples.push(Sample {
                     tick: record_index,
                     phase: self.phase_log[record_index],
                     event,
                 });
+            } else {
+                self.unmatched += 1;
             }
         }
     }
@@ -206,11 +216,16 @@ fn percentile(values: &[f64], p: f64) -> f64 {
     sorted[idx]
 }
 
-fn run_trace(ack_delay: usize) -> Vec<Sample> {
+fn run_trace(ack_delay: usize) -> (Vec<Sample>, u64) {
     run_trace_with(ack_delay, false)
 }
 
-fn run_trace_with(ack_delay: usize, force_server_native_voxels: bool) -> Vec<Sample> {
+/// Returns the reconciled samples plus how many `reconcile` calls had no
+/// `comparison` at all (ENG-69 round 21 — see `Harness::unmatched`'s own
+/// doc: this harness's lockstep single-process design means that count
+/// should always be `0`, and every caller checks it rather than silently
+/// discarding it).
+fn run_trace_with(ack_delay: usize, force_server_native_voxels: bool) -> (Vec<Sample>, u64) {
     let mut h = Harness::new_with(ack_delay, force_server_native_voxels);
     let mut samples = Vec::new();
 
@@ -239,7 +254,7 @@ fn run_trace_with(ack_delay: usize, force_server_native_voxels: bool) -> Vec<Sam
     }
     leg(&mut h, idle(), "final-idle", FINAL_IDLE_TICKS, &mut samples);
 
-    samples
+    (samples, h.unmatched)
 }
 
 fn report(label: &str, samples: &[Sample]) {
@@ -310,14 +325,24 @@ fn report(label: &str, samples: &[Sample]) {
 
 #[test]
 fn g1_tower_strafe_trace_loopback() {
-    let samples = run_trace(0);
+    let (samples, unmatched) = run_trace(0);
     report("loopback (ack_delay=0)", &samples);
+    assert_eq!(
+        unmatched, 0,
+        "lockstep single-process harness had {unmatched} reconcile calls with no comparison — \
+         the local-tick/server-tick correspondence this harness relies on broke"
+    );
 }
 
 #[test]
 fn g1_tower_strafe_trace_100ms_rtt() {
-    let samples = run_trace(RTT_100MS_ACK_DELAY);
+    let (samples, unmatched) = run_trace(RTT_100MS_ACK_DELAY);
     report("100ms RTT (ack_delay=6)", &samples);
+    assert_eq!(
+        unmatched, 0,
+        "lockstep single-process harness had {unmatched} reconcile calls with no comparison — \
+         the local-tick/server-tick correspondence this harness relies on broke"
+    );
 }
 
 /// ENG-69 round 16 found that forcing the server's terrain representation to
@@ -341,8 +366,16 @@ fn g1_tower_strafe_trace_100ms_rtt() {
 /// claim.
 #[test]
 fn g1_tower_strafe_trace_is_corrections_free_by_default() {
-    let default_path = run_trace(0);
-    let forced_flag = run_trace_with(0, true);
+    let (default_path, default_unmatched) = run_trace(0);
+    let (forced_flag, forced_unmatched) = run_trace_with(0, true);
+    assert_eq!(
+        default_unmatched, 0,
+        "default path had unmatched reconciles"
+    );
+    assert_eq!(
+        forced_unmatched, 0,
+        "forced-flag path had unmatched reconciles"
+    );
 
     let default_notable = default_path
         .iter()

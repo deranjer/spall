@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use spall_core::PlayerInput;
 use spall_physics::CharacterState;
 
-use crate::predict::CorrectionEvent;
+use crate::predict::ReconcileOutcome;
 use crate::replica::ReplicaWorld;
 
 /// Thread-safe latest input state: written by the window's key/mouse event
@@ -102,6 +102,13 @@ pub struct InteractiveView {
     pub max_idle_correction_m: f64,
     pub max_vertical_correction_m: f64,
     pub max_horizontal_correction_m: f64,
+    /// `PredictedPlayer::unmatched_reconciles` / `max_unmatched_displacement_m`
+    /// (ENG-69 round 21) — reconcile calls that found no comparison record
+    /// at all, and the largest actual position jump one of them produced.
+    /// A silent, fully-uncounted resync shows up *only* here, never in
+    /// `corrections` — see `ReconcileOutcome::comparison`'s own doc.
+    pub unmatched_reconciles: u64,
+    pub max_unmatched_displacement_m: f64,
     /// `ClientPhysics::window_stats()` as of this tick (ENG-69 round 18) —
     /// live proof the character-query-window cache is actually serving
     /// sweeps, not just present and unused. Cumulative counters, like
@@ -110,18 +117,29 @@ pub struct InteractiveView {
     pub window_stats: crate::predict::WindowStats,
 }
 
-/// Best-effort append-only JSONL log of every `CorrectionEvent`
-/// `PredictedPlayer::reconcile` returns during an interactive session — for
-/// post-hoc analysis of a *live, human-driven* run. Added ENG-69 round 10/11:
-/// a CPU-only scripted trace (`crates/spall_client/tests/g1_ramp_trace.rs`)
-/// could reproduce the seam mechanism but not the frequency/magnitude an
-/// actual hands-on session showed (near-continuous corrections, a
-/// substantial vertical component, a lifetime max that kept climbing past
-/// what the ramp alone explained) — rather than write another synthetic
-/// script and guess whether it covers the real gap (jumping? resting on a
-/// slope? something the script never exercises?), this captures every real
-/// event the real session produces, so the actual distribution can be
-/// computed after the fact instead of inferred from a lifetime maximum.
+/// Best-effort append-only JSONL log of every `PredictedPlayer::reconcile`
+/// call during an interactive session — for post-hoc analysis of a *live,
+/// human-driven* run. Added ENG-69 round 10/11: a CPU-only scripted trace
+/// (`crates/spall_client/tests/g1_ramp_trace.rs`) could reproduce the seam
+/// mechanism but not the frequency/magnitude an actual hands-on session
+/// showed (near-continuous corrections, a substantial vertical component, a
+/// lifetime max that kept climbing past what the ramp alone explained) —
+/// rather than write another synthetic script and guess whether it covers
+/// the real gap, this captures every real event the real session produces,
+/// so the actual distribution can be computed after the fact instead of
+/// inferred from a lifetime maximum.
+///
+/// ENG-69 round 21: logs the full [`ReconcileOutcome`] of *every* call, not
+/// only ones with a `comparison` — a synthetic, single-process, lockstep
+/// test harness always has one (client and server tick together every loop
+/// iteration by construction), so logging conditionally on it never showed
+/// the gap; a real, independently-scheduled client routinely does not
+/// (clock drift, a stall, a delayed first snapshot), and a reconcile that
+/// silently drops every outstanding record and hard-snaps `predicted`
+/// straight onto `authoritative` is exactly the kind of large, felt jump
+/// that reading only "corrections" (which requires a comparison to even
+/// exist) would miss entirely — the live regression this round's report
+/// was chasing.
 pub struct CorrectionLog {
     file: Mutex<std::io::BufWriter<std::fs::File>>,
     started_at: std::time::Instant,
@@ -141,17 +159,31 @@ impl CorrectionLog {
         })
     }
 
-    /// Appends one event as a JSON line. Failures are swallowed — this log
-    /// is a diagnostic aid, never a reason to disrupt the session itself.
-    pub fn record(&self, server_tick: u64, event: CorrectionEvent) {
+    /// Appends one `reconcile` call's full outcome as a JSON line, matched
+    /// or not. Failures are swallowed — this log is a diagnostic aid, never
+    /// a reason to disrupt the session itself.
+    pub fn record(&self, outcome: &ReconcileOutcome) {
         use std::io::Write;
+        let displacement_m = outcome
+            .predicted_before
+            .distance_m(&outcome.predicted_after);
+        let comparison = match outcome.comparison {
+            Some(event) => format!(
+                "{{\"seq\":{},\"error_m\":{:.6},\"vertical_m\":{:.6},\"horizontal_m\":{:.6},\"idle\":{}}}",
+                event.seq.0, event.error_m, event.vertical_m, event.horizontal_m, event.idle,
+            ),
+            None => "null".to_string(),
+        };
         let line = format!(
-            "{{\"tick\":{server_tick},\"wall_ms\":{},\"error_m\":{:.6},\"vertical_m\":{:.6},\"horizontal_m\":{:.6},\"idle\":{}}}\n",
+            "{{\"tick\":{},\"wall_ms\":{},\"server_tick_delta\":{},\"history_len_before\":{},\
+             \"records_removed\":{},\"records_replayed\":{},\"displacement_m\":{displacement_m:.6},\
+             \"comparison\":{comparison}}}\n",
+            outcome.server_tick.get(),
             self.started_at.elapsed().as_millis(),
-            event.error_m,
-            event.vertical_m,
-            event.horizontal_m,
-            event.idle,
+            outcome.server_tick_delta,
+            outcome.history_len_before,
+            outcome.records_removed,
+            outcome.records_replayed,
         );
         if let Ok(mut f) = self.file.lock() {
             let _ = f.write_all(line.as_bytes());

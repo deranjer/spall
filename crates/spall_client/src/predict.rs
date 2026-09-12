@@ -337,12 +337,19 @@ fn lenient_occupancy(volume: &Volume) -> Option<OccupancyGrid> {
     .ok()
 }
 
-/// One individual predicted-vs-authoritative comparison, as returned by
-/// [`PredictedPlayer::reconcile`]. See that method's doc.
+/// One individual predicted-vs-authoritative comparison — [`ReconcileOutcome::
+/// comparison`], `Some` only when a `history` record was tagged for the
+/// exact tick `authoritative` represents. See that field's own doc for what
+/// it means when there isn't one.
 #[derive(Debug, Clone, Copy)]
 pub struct CorrectionEvent {
-    /// Full 3-D distance between what was predicted for `acked` and what the
-    /// server actually reported, metres.
+    /// The matched record's own input sequence — which locally-sent
+    /// `InputFrame` this comparison actually used, for cross-referencing
+    /// against a client-side send log (e.g. the `sent_log` pattern
+    /// `crates/spall_client/tests/g1_realistic_input_timing_trace.rs` keeps).
+    pub seq: InputSeq,
+    /// Full 3-D distance between what was predicted for that tick and what
+    /// the server actually reported, metres.
     pub error_m: f64,
     /// `|Y|` component of the same gap.
     pub vertical_m: f64,
@@ -353,13 +360,87 @@ pub struct CorrectionEvent {
     pub idle: bool,
 }
 
+/// Everything one [`PredictedPlayer::reconcile`] call actually did —
+/// returned unconditionally, not only when a [`Self::comparison`] was
+/// possible. ENG-69 round 21: an earlier version returned
+/// `Option<CorrectionEvent>`, `None` whenever no `history` record could be
+/// matched to `server_tick` — including the case where *every* record got
+/// silently dropped and `predicted` hard-snapped straight onto
+/// `authoritative`. A caller that only acts on `Some` cannot tell "a clean
+/// small correction" from "a large silent resync just happened and there's
+/// no comparison for it" — precisely the blind spot that let a synthetic,
+/// single-process, lockstep test report "zero corrections" while a real,
+/// independently-scheduled client's felt jitter visibly got worse: the test
+/// never diverged from its own count-based assumption (client and server
+/// ticked in the same loop iteration, always exactly once each), so it
+/// never exercised the branch a real client's clock drift, stalls, or a
+/// delayed first snapshot actually hit.
+#[derive(Debug, Clone, Copy)]
+pub struct ReconcileOutcome {
+    pub server_tick: Tick,
+    /// `server_tick` minus the previous call's `server_tick` (or minus
+    /// `spawn_tick` on the first call), signed and *not* saturated —
+    /// reported as-is so a real ordering bug (a snapshot arriving out of
+    /// order) would show up as a negative delta instead of being clamped
+    /// away and looking identical to "nothing happened yet".
+    pub server_tick_delta: i64,
+    /// `history.len()` before this call touched it.
+    pub history_len_before: usize,
+    /// Records dropped as "the server has already covered this tick" — not
+    /// replayed.
+    pub records_removed: usize,
+    /// Records kept and re-simulated from `authoritative` — this call's
+    /// actual replay depth. `history.len()` after is exactly this.
+    pub records_replayed: usize,
+    pub predicted_before: CharacterState,
+    pub predicted_after: CharacterState,
+    /// `Some` only when a `history` record was tagged for exactly
+    /// `server_tick` (see `Record::tick`'s doc for the tagging/re-anchoring
+    /// scheme). A hand-authored fixed-offset or single-process lockstep
+    /// test harness hits this every time by construction; a real client
+    /// does not — clock drift between two independently-scheduled ~60 Hz
+    /// loops, a stall, a delayed first snapshot, or `PREDICTION_HISTORY`
+    /// eviction can all legitimately leave no record at that exact tick.
+    /// `None` here does **not** mean nothing happened: `records_removed`
+    /// and `predicted_before` vs. `predicted_after` (or
+    /// [`PredictedPlayer::unmatched_reconciles`]/
+    /// `max_unmatched_displacement_m`) are what actually happened this
+    /// call regardless.
+    pub comparison: Option<CorrectionEvent>,
+}
+
 /// One predicted input, kept so it can be re-simulated after a correction.
-/// No longer tags itself with an `InputSeq` (ENG-69 round 19): `reconcile`
-/// now decides what's still outstanding by counting elapsed server ticks,
-/// not by comparing sequence numbers, and nothing else in this crate reads
-/// a record's original seq.
 #[derive(Debug, Clone, Copy)]
 struct Record {
+    /// The local clock's best estimate of which server tick this record
+    /// represents. Assigned from [`PredictedPlayer`]'s own free-running
+    /// `next_tick` counter (incremented once per [`PredictedPlayer::tick`]
+    /// call, starting from [`PredictedPlayer::new`]'s `spawn_tick`) and
+    /// re-anchored *exactly* onto the true `server_tick` at the end of
+    /// every [`PredictedPlayer::reconcile`] call — so whatever drift
+    /// accumulated between two reconciles (an independently-scheduled
+    /// client clock running at a slightly different rate than the server,
+    /// or a stall that skipped some local ticks) can never compound past
+    /// one reconcile interval.
+    ///
+    /// ENG-69 round 21: this field replaces round 19/20's positional/count-
+    /// based `history` draining (`keep_from = min(server_tick_delta,
+    /// history.len())`, dropping *however many records that count implies*
+    /// rather than the *specific* ones the server actually covered).
+    /// Counting only gives the right answer when local-tick-count equals
+    /// elapsed-server-tick-count between two reconciles — true in a
+    /// single-process test that ticks client and server together every
+    /// loop iteration, not guaranteed for a real client on its own
+    /// wall-clock timer. Retaining by explicit per-record `tick` comparison
+    /// (`tick.0 > server_tick.0`) instead of by count is correct regardless
+    /// of whether that correspondence held this interval.
+    tick: Tick,
+    /// The input sequence this record was predicted for — kept for
+    /// identity (a `ReconcileOutcome`/log line can name exactly which input
+    /// a comparison used), not load-bearing for retain/replay itself (see
+    /// `tick` above, which round 19 found `seq` cannot correctly stand in
+    /// for once held-input reuse is in play).
+    seq: InputSeq,
     input: PlayerInput,
     dt: f32,
     predicted_after: CharacterState,
@@ -371,12 +452,13 @@ pub struct PredictedPlayer {
     predicted: CharacterState,
     authoritative: CharacterState,
     acked: InputSeq,
-    /// The server tick of the last [`Self::reconcile`] call — `spawn_tick`
-    /// ([`Self::new`]) before the first one, so there is always a valid
-    /// anchor, first call included. ENG-69 round 19: this is what
-    /// `reconcile` now diffs against to decide how many `history` records
-    /// the server has already simulated — see that method's own doc for why
-    /// `acked`'s `InputSeq` cannot answer that question on its own.
+    /// The tick the *next* pushed [`Record`] will be tagged with — see that
+    /// field's own doc for the full self-healing tagging scheme.
+    next_tick: Tick,
+    /// `server_tick` of the last [`Self::reconcile`] call — `spawn_tick`
+    /// (`Self::new`) before the first one. Purely diagnostic
+    /// (`ReconcileOutcome::server_tick_delta`); retain/replay itself no
+    /// longer uses a delta at all, see `Record::tick`.
     last_server_tick: Tick,
     history: VecDeque<Record>,
     start_pos_m: [f64; 3],
@@ -411,6 +493,15 @@ pub struct PredictedPlayer {
     /// clearly falling — the bug "removing a floor during replay leaves the
     /// player hovering". Correct code never sets it.
     pub hovered_after_floor_removal: bool,
+    /// `reconcile` calls whose `ReconcileOutcome::comparison` was `None` —
+    /// see that field's own doc. ENG-69 round 21: tracked separately from
+    /// `corrections` precisely so "zero corrections" can never silently
+    /// mean "we stopped being able to tell" instead of "nothing happened".
+    pub unmatched_reconciles: u64,
+    /// Largest `predicted_before`-to-`predicted_after` displacement ever
+    /// seen on an unmatched reconcile — the actually-felt jump size for the
+    /// cases `corrections`/`max_correction_m` cannot see at all.
+    pub max_unmatched_displacement_m: f64,
 }
 
 impl PredictedPlayer {
@@ -433,6 +524,7 @@ impl PredictedPlayer {
             predicted: spawn,
             authoritative: spawn,
             acked: InputSeq(0),
+            next_tick: Tick(spawn_tick.0 + 1),
             last_server_tick: spawn_tick,
             history: VecDeque::new(),
             start_pos_m: spawn.position_m,
@@ -446,6 +538,8 @@ impl PredictedPlayer {
             total_ticks: 0,
             grounded_ticks: 0,
             hovered_after_floor_removal: false,
+            unmatched_reconciles: 0,
+            max_unmatched_displacement_m: 0.0,
         }
     }
 
@@ -461,11 +555,15 @@ impl PredictedPlayer {
     /// `volume` is the replica's current terrain, passed through to
     /// [`ClientPhysics::sweep`]'s own window cache — the caller already
     /// holds/clones it each tick for the existing terrain-hash dirty check.
+    /// `seq` is the input's own sequence number — kept on the pushed
+    /// [`Record`] for identity, not for retain/replay (see that field's own
+    /// doc).
     pub fn tick(
         &mut self,
         phys: &mut ClientPhysics,
         volume: &Volume,
         input: PlayerInput,
+        seq: InputSeq,
         dt_s: f32,
     ) -> CharacterState {
         let params = self.params;
@@ -473,10 +571,13 @@ impl PredictedPlayer {
             phys.sweep(volume, params, p, d, dt_s)
         });
         self.history.push_back(Record {
+            tick: self.next_tick,
+            seq,
             input,
             dt: dt_s,
             predicted_after: self.predicted,
         });
+        self.next_tick = Tick(self.next_tick.0 + 1);
         while self.history.len() > PREDICTION_HISTORY {
             self.history.pop_front();
         }
@@ -492,20 +593,14 @@ impl PredictedPlayer {
 
     /// Reconciles against an authoritative snapshot at `server_tick`. Drops
     /// exactly the `history` records the server has actually simulated as of
-    /// that tick, and replays the rest — the still-genuinely-outstanding
+    /// that tick (identified by each record's own [`Record::tick`], not a
+    /// count), and replays the rest — the still-genuinely-outstanding
     /// ones — from the authoritative state to produce the new predicted
-    /// "now". Returns the individual correction event this call measured
-    /// against the record predicted for the same tick `authoritative`
-    /// represents — `None` when there isn't one to compare (nothing in
-    /// `history` yet, it aged out of `PREDICTION_HISTORY`, a mid-flight
-    /// `invalidate` cleared it, or a residency hold meant fewer local ticks
-    /// were predicted than the server actually advanced — see the
-    /// `keep_from`/`ticks_elapsed` comment below) — so a caller doing
-    /// per-event analysis (ENG-69 round 10's G1 ramp trace,
-    /// `crates/spall_client/tests/g1_ramp_trace.rs`) can record every one
-    /// rather than only the running maxima the fields above track. This
-    /// event is reported *regardless* of the `1.0e-4` threshold `corrections`
-    /// uses, so callers computing percentiles see the true near-zero tail too.
+    /// "now". Returns a [`ReconcileOutcome`] describing exactly what this
+    /// call did, unconditionally — see that type's own doc for why it is
+    /// not `Option<CorrectionEvent>` any more (ENG-69 round 21: a caller
+    /// that only reacted to `Some` could not tell a clean small correction
+    /// apart from a large, completely uncounted resync).
     ///
     /// `acked` (the last input sequence the server *accepted* — i.e. treated
     /// as fresh, `Simulation::player_acked_input`/`MotionSnapshot::
@@ -517,17 +612,9 @@ impl PredictedPlayer {
     /// only advances on a *fresh* accepted frame, but the server steps the
     /// player forward every tick regardless, reusing the last input via
     /// `effective_input()` whenever a fresh frame hasn't arrived
-    /// (`HELD_INPUT_TIMEOUT_TICKS`). So while `acked` stays pinned during a
-    /// delivery gap, the server's real position keeps advancing — and the
-    /// old `history.retain(|r| r.seq.0 > acked.0)` kept replaying ticks the
-    /// server had already simulated via reuse, on top of an `authoritative`
-    /// state that already included them, compounding a larger and larger
-    /// double-counted overshoot until the next fresh ack forced a full
-    /// re-anchor and the whole accumulated error snapped back at once (up to
-    /// 0.75 m measured in `g1_realistic_input_timing_trace.rs`, for a
-    /// ~10-tick held stretch). `server_tick` (`MotionSnapshot::server_tick`)
-    /// has no such gap — it is the server's own tick counter, advanced every
-    /// tick unconditionally — so diffing against *it* instead is immune.
+    /// (`HELD_INPUT_TIMEOUT_TICKS`). `server_tick`
+    /// (`MotionSnapshot::server_tick`) has no such gap — it is the server's
+    /// own tick counter, advanced every tick unconditionally.
     pub fn reconcile(
         &mut self,
         phys: &mut ClientPhysics,
@@ -535,38 +622,20 @@ impl PredictedPlayer {
         authoritative: CharacterState,
         acked: InputSeq,
         server_tick: Tick,
-    ) -> Option<CorrectionEvent> {
-        // How many ticks the server has actually simulated since the last
-        // reconcile — well-defined from the very first call, since `Self::
-        // new`'s `spawn_tick` already anchors `last_server_tick` before any
-        // record exists. (An earlier draft special-cased "no anchor yet" as
-        // "drop nothing" on the first call, which left one stale record
-        // permanently stuck at the front of `history`: every later call's
-        // `keep_from` then came out one short forever — invisible while
-        // consecutive predictions stay numerically close (steady input),
-        // but a real, visible one-tick error the instant input changes
-        // between the mis-selected record and the current tick, i.e.
-        // exactly at every phase transition — caught by
-        // `g1_tower_strafe_trace_is_corrections_free_by_default` regressing
-        // from <1e-4m to 0.075m. Anchoring at construction instead removes
-        // the special case entirely.)
-        let ticks_elapsed = server_tick.0.saturating_sub(self.last_server_tick.0);
+    ) -> ReconcileOutcome {
+        let server_tick_delta = server_tick.0 as i64 - self.last_server_tick.0 as i64;
         self.last_server_tick = server_tick;
-        // Ordinarily every local tick pushes exactly one `history` record
-        // (`Self::tick` is called once per predicted tick, unconditionally),
-        // so `ticks_elapsed` local records are exactly the ones the server
-        // has now covered. A residency hold (`net.rs`'s `ready` gate) can
-        // predict fewer local ticks than the server actually advances —
-        // clamping here just means "the server's ahead of everything we
-        // have," the correct, safe reading of that case too.
-        let keep_from = (ticks_elapsed as usize).min(self.history.len());
-        // Only trust the boundary record as "predicted for this exact tick"
-        // when the count wasn't clamped above — otherwise a residency hold
-        // (or the very first call) broke the 1-local-tick-per-server-tick
-        // correspondence this alignment relies on, and there's no record
-        // that legitimately corresponds to `server_tick`.
-        let event = if keep_from > 0 && ticks_elapsed as usize == keep_from {
-            let rec = self.history[keep_from - 1];
+
+        let history_len_before = self.history.len();
+        let predicted_before = self.predicted;
+
+        // Identity-based lookup, *before* any mutation: the record (if any)
+        // whose own tag is exactly `server_tick` — not an index derived from
+        // a count. `Record` is `Copy`, so this ends the borrow on
+        // `self.history` immediately and the running-counter updates below
+        // can freely borrow `self` mutably.
+        let matched = self.history.iter().find(|r| r.tick == server_tick).copied();
+        let comparison = matched.map(|rec| {
             let err = rec.predicted_after.distance_m(&authoritative);
             // A record only ever holds the *sanitized* input actually fed to
             // `step_character` (see `tick`), so this is exactly the input
@@ -587,15 +656,15 @@ impl PredictedPlayer {
             let horizontal_m = (dx * dx + dz * dz).sqrt();
             self.max_vertical_correction_m = self.max_vertical_correction_m.max(dy);
             self.max_horizontal_correction_m = self.max_horizontal_correction_m.max(horizontal_m);
-            Some(CorrectionEvent {
+            CorrectionEvent {
+                seq: rec.seq,
                 error_m: err,
                 vertical_m: dy,
                 horizontal_m,
                 idle,
-            })
-        } else {
-            None
-        };
+            }
+        });
+
         if !authoritative.grounded
             && authoritative.velocity_m_s[1] < -1.0
             && self.predicted.grounded
@@ -606,9 +675,26 @@ impl PredictedPlayer {
 
         self.authoritative = authoritative;
         self.acked = acked;
-        for _ in 0..keep_from {
-            self.history.pop_front();
+        // Drop exactly the records the server has covered — identified by
+        // each one's own tag, not a count (see `Record::tick`'s doc for why
+        // that distinction matters).
+        self.history.retain(|r| r.tick.0 > server_tick.0);
+        let records_replayed = self.history.len();
+        let records_removed = history_len_before - records_replayed;
+
+        // Re-anchor every surviving record's tag exactly onto `server_tick`
+        // — closes whatever drift accumulated *this* interval in one step
+        // (an independently-scheduled client clock running fractionally
+        // faster or slower than the server, or a stall that skipped some
+        // local ticks, both show up as drift here). The retain decision
+        // above used each record's tag as carried into this call, however
+        // drifted; everything from here on is exact again, `next_tick`
+        // included, so drift can never compound past one reconcile
+        // interval.
+        for (i, rec) in self.history.iter_mut().enumerate() {
+            rec.tick = Tick(server_tick.0 + 1 + i as u64);
         }
+        self.next_tick = Tick(server_tick.0 + 1 + self.history.len() as u64);
 
         let params = self.params;
         let mut state = authoritative;
@@ -620,7 +706,23 @@ impl PredictedPlayer {
             rec.predicted_after = state;
         }
         self.predicted = state;
-        event
+
+        if comparison.is_none() {
+            self.unmatched_reconciles += 1;
+            let displacement = predicted_before.distance_m(&self.predicted);
+            self.max_unmatched_displacement_m = self.max_unmatched_displacement_m.max(displacement);
+        }
+
+        ReconcileOutcome {
+            server_tick,
+            server_tick_delta,
+            history_len_before,
+            records_removed,
+            records_replayed,
+            predicted_before,
+            predicted_after: self.predicted,
+            comparison,
+        }
     }
 
     /// A committed edit invalidated the geometry the predicted history walked

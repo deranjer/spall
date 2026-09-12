@@ -560,6 +560,14 @@ struct CorrectionStats {
     max_idle_correction_m: f64,
     max_vertical_correction_m: f64,
     max_horizontal_correction_m: f64,
+    /// `PredictedPlayer::unmatched_reconciles` / `max_unmatched_displacement_m`
+    /// (ENG-69 round 21) — reconcile calls with no comparison at all, and
+    /// the largest actual position jump one of them produced. Surfaced
+    /// separately from `corrections` precisely so the HUD's "+N corrections"
+    /// line can never read as "nothing happened" when a large, uncounted
+    /// resync did.
+    unmatched_reconciles: u64,
+    max_unmatched_displacement_m: f64,
 }
 
 /// Receives one baseline transfer whose `BaselineBegin` has already been read:
@@ -1014,18 +1022,27 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                     // reconciliation this one time is the same as any
                                     // other not-ready tick, not a hard failure.
                                     Some(pl) => {
-                                        if let Some(volume) = &terrain_volume
-                                            && let Some(event) = pl.reconcile(
+                                        if let Some(volume) = &terrain_volume {
+                                            let outcome = pl.reconcile(
                                                 &mut p.phys,
                                                 volume,
                                                 st,
                                                 snap.acked_input,
                                                 snap.server_tick,
-                                            )
-                                            && let Some(session) = &interactive
-                                            && let Some(log) = &session.corrections
-                                        {
-                                            log.record(snap.server_tick.get(), event);
+                                            );
+                                            // Logged unconditionally, not only
+                                            // when `outcome.comparison` is
+                                            // `Some` (ENG-69 round 21): a
+                                            // silent full resync — every
+                                            // record dropped, no comparison
+                                            // possible — is exactly the case
+                                            // that must never read as "zero
+                                            // corrections".
+                                            if let Some(session) = &interactive
+                                                && let Some(log) = &session.corrections
+                                            {
+                                                log.record(&outcome);
+                                            }
                                         }
                                     }
                                 }
@@ -1190,7 +1207,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         if let Some(pl) = &mut p.player
                             && let Some(volume) = &terrain_volume
                         {
-                            pl.tick(&mut p.phys, volume, input, MOVEMENT_DT_S);
+                            pl.tick(&mut p.phys, volume, input, seq, MOVEMENT_DT_S);
                         }
                         // Preserve the script's server-tick cadence.  The
                         // mover itself samples more often than snapshots can
@@ -1238,6 +1255,8 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         max_idle_correction_m: pl.max_idle_correction_m,
                         max_vertical_correction_m: pl.max_vertical_correction_m,
                         max_horizontal_correction_m: pl.max_horizontal_correction_m,
+                        unmatched_reconciles: pl.unmatched_reconciles,
+                        max_unmatched_displacement_m: pl.max_unmatched_displacement_m,
                     });
                     let window_stats = p.phys.window_stats();
                     (
@@ -1265,6 +1284,8 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             max_idle_correction_m: stats.max_idle_correction_m,
                             max_vertical_correction_m: stats.max_vertical_correction_m,
                             max_horizontal_correction_m: stats.max_horizontal_correction_m,
+                            unmatched_reconciles: stats.unmatched_reconciles,
+                            max_unmatched_displacement_m: stats.max_unmatched_displacement_m,
                             window_stats,
                         });
                 }

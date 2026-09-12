@@ -105,7 +105,7 @@ impl Harness {
 
         let volume = self.sim.world().terrain().volume.clone();
         self.predictor
-            .tick(&mut self.phys, &volume, input, TICK_DT_S);
+            .tick(&mut self.phys, &volume, input, seq, TICK_DT_S);
 
         if self.server_log.len() > self.ack_delay {
             let wanted = self.server_log.len() - 1 - self.ack_delay;
@@ -290,7 +290,8 @@ fn a_lost_button_release_leaves_both_sides_at_rest() {
             h.sim.current_tick(),
         ));
         let volume = h.sim.world().terrain().volume.clone();
-        h.predictor.tick(&mut h.phys, &volume, idle(), TICK_DT_S);
+        h.predictor
+            .tick(&mut h.phys, &volume, idle(), InputSeq(h.seq), TICK_DT_S);
         let (auth, acked, server_tick) = h.server_log[h.server_log.len() - 1 - h.ack_delay];
         h.predictor
             .reconcile(&mut h.phys, &volume, auth, acked, server_tick);

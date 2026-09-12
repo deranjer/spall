@@ -127,6 +127,11 @@ struct Harness {
     phase_log: Vec<&'static str>,
     seq: u64,
     ack_delay: usize,
+    /// `reconcile` calls whose `ReconcileOutcome::comparison` was `None` —
+    /// see `g1_tower_strafe_trace.rs`'s identical field for why this
+    /// harness (client and server ticked together every loop iteration, in
+    /// one process) expects it to always be `0`.
+    unmatched: u64,
     /// Count of `ClientPhysics::set_terrain` / `PredictedPlayer::invalidate`
     /// calls — the "terrain rebuild/invalidation events" the review asked to
     /// see tracked. `1` after `new` (the initial build); this trace submits
@@ -160,6 +165,7 @@ impl Harness {
             phase_log: Vec::new(),
             seq: 0,
             ack_delay,
+            unmatched: 0,
             terrain_events: 1,
         }
     }
@@ -177,19 +183,21 @@ impl Harness {
         self.phase_log.push(phase);
         let volume = self.sim.world().terrain().volume.clone();
         self.predictor
-            .tick(&mut self.phys, &volume, input, TICK_DT_S);
+            .tick(&mut self.phys, &volume, input, seq, TICK_DT_S);
         if self.server_log.len() > self.ack_delay {
             let record_index = self.server_log.len() - 1 - self.ack_delay;
             let (auth, acked, server_tick) = self.server_log[record_index];
-            if let Some(event) =
+            let outcome =
                 self.predictor
-                    .reconcile(&mut self.phys, &volume, auth, acked, server_tick)
-            {
+                    .reconcile(&mut self.phys, &volume, auth, acked, server_tick);
+            if let Some(event) = outcome.comparison {
                 samples.push(Sample {
                     tick: record_index,
                     phase: self.phase_log[record_index],
                     event,
                 });
+            } else {
+                self.unmatched += 1;
             }
         }
     }
@@ -208,7 +216,9 @@ fn percentile(values: &[f64], p: f64) -> f64 {
     sorted[idx]
 }
 
-fn run_trace(ack_delay: usize) -> Vec<Sample> {
+/// Returns the reconciled samples plus how many `reconcile` calls had no
+/// `comparison` at all — see `Harness::unmatched`'s own doc.
+fn run_trace(ack_delay: usize) -> (Vec<Sample>, u64) {
     let mut h = Harness::new(ack_delay);
     let mut samples = Vec::new();
 
@@ -244,7 +254,7 @@ fn run_trace(ack_delay: usize) -> Vec<Sample> {
          none further are expected)",
         h.terrain_events
     );
-    samples
+    (samples, h.unmatched)
 }
 
 fn report(label: &str, samples: &[Sample]) {
@@ -299,12 +309,14 @@ fn report(label: &str, samples: &[Sample]) {
 
 #[test]
 fn g1_ramp_trace_loopback() {
-    let samples = run_trace(0);
+    let (samples, unmatched) = run_trace(0);
     report("loopback (ack_delay=0)", &samples);
+    assert_eq!(unmatched, 0, "lockstep harness had unmatched reconciles");
 }
 
 #[test]
 fn g1_ramp_trace_100ms_rtt() {
-    let samples = run_trace(RTT_100MS_ACK_DELAY);
+    let (samples, unmatched) = run_trace(RTT_100MS_ACK_DELAY);
     report("100ms RTT (ack_delay=6)", &samples);
+    assert_eq!(unmatched, 0, "lockstep harness had unmatched reconciles");
 }

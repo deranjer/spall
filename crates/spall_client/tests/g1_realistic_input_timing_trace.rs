@@ -140,8 +140,17 @@ struct SentInput {
     held_for_ticks: u32,
 }
 
-/// One reconcile event, with the timing context the review asked to see
-/// alongside the correction itself.
+/// One reconcile *call*, logged unconditionally — including a missing-
+/// history/unmatched one — with the timing context the review asked to see
+/// alongside the correction itself. ENG-69 round 21: an earlier version of
+/// this struct only ever got pushed when `PredictedPlayer::reconcile`
+/// returned `Some(CorrectionEvent)`, so a call with no comparison (nothing
+/// in `history` matched `server_tick`) simply never appeared here — the
+/// exact "an empty comparison log reads as zero corrections" blind spot a
+/// review flagged. Every call is now recorded, `comparison` and
+/// `displacement_m` (renamed from what used to be a hand-derived value —
+/// now read straight off `ReconcileOutcome`, which tracks it regardless of
+/// whether a comparison exists) included.
 struct ReconcileRecord {
     snapshot_tick: u64,
     acked_seq: InputSeq,
@@ -149,11 +158,19 @@ struct ReconcileRecord {
     /// if the snapshot acknowledges a seq older than this harness kept
     /// around (shouldn't happen at this trace's length, checked below).
     acked_frame: Option<SentInput>,
-    event: CorrectionEvent,
-    /// Server-vs-predicted displacement this reconcile actually produced:
-    /// the *authoritative* position minus what was predicted for the same
-    /// acked input before reconciling — i.e. `event.error_m`'s signed,
-    /// axis-broken-out source, kept alongside it rather than re-derived.
+    /// `Some` only when `PredictedPlayer::reconcile` found a `history`
+    /// record tagged for the exact tick this snapshot represents — see
+    /// `ReconcileOutcome::comparison`'s own doc for when it doesn't.
+    comparison: Option<CorrectionEvent>,
+    /// This call's actual effect regardless of `comparison` — server tick
+    /// delta, history accounting, and predicted position before/after.
+    outcome_history_len_before: usize,
+    outcome_records_removed: usize,
+    outcome_records_replayed: usize,
+    /// `predicted_after` minus `predicted_before` — the actually-*felt*
+    /// displacement this reconcile produced (what a camera would be
+    /// rendering), distinct from `comparison`'s own fields (the
+    /// *retrospective* gap at the matched tick, when one exists).
     displacement_m: [f64; 3],
     server_window_sweeps: u64,
     server_window_rebuilds: u64,
@@ -272,7 +289,7 @@ impl Harness {
         // tick. This is the fix for this file's own first-draft bug: it
         // must never reuse a seq across multiple `predictor.tick` calls.
         self.predictor
-            .tick(&mut self.phys, &volume, input, TICK_DT_S);
+            .tick(&mut self.phys, &volume, input, client_seq, TICK_DT_S);
 
         if !self.tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS) {
             return;
@@ -283,15 +300,13 @@ impl Harness {
 
         let client_before = self.last_client_window;
         let server_before = self.last_server_window;
-        let predicted_before = self.predictor.predicted();
-        let event = self.predictor.reconcile(
+        let outcome = self.predictor.reconcile(
             &mut self.phys,
             &volume,
             auth,
             acked,
             self.sim.current_tick(),
         );
-        let predicted_after = self.predictor.predicted();
         let client_after = self.phys.window_stats();
         // Aggregate (all players — this harness only ever has one) server
         // window usage across every server tick since the last snapshot,
@@ -299,44 +314,42 @@ impl Harness {
         // over that same 3-tick interval.
         let server_after = self.sim.world().window_stats();
 
-        if let Some(event) = event {
-            // The actually-*felt* displacement this reconcile produced: how
-            // far the live "now" prediction (what a camera would be
-            // rendering) moved as a direct result of this call — distinct
-            // from `event`'s own fields, which measure the *retrospective*
-            // gap at the specific acked tick, not the visible jump in the
-            // current position.
-            let displacement_m = [
-                predicted_after.position_m[0] - predicted_before.position_m[0],
-                predicted_after.position_m[1] - predicted_before.position_m[1],
-                predicted_after.position_m[2] - predicted_before.position_m[2],
-            ];
-            records.push(ReconcileRecord {
-                snapshot_tick: self.tick,
-                acked_seq: acked,
-                acked_frame,
-                event,
-                displacement_m,
-                server_window_sweeps: server_after
-                    .window_sweeps
-                    .saturating_sub(server_before.window_sweeps),
-                server_window_rebuilds: server_after
-                    .window_rebuilds
-                    .saturating_sub(server_before.window_rebuilds),
-                server_terrain_fallbacks: server_after
-                    .terrain_fallbacks
-                    .saturating_sub(server_before.terrain_fallbacks),
-                client_window_sweeps: client_after
-                    .window_sweeps
-                    .saturating_sub(client_before.window_sweeps),
-                client_window_rebuilds: client_after
-                    .window_rebuilds
-                    .saturating_sub(client_before.window_rebuilds),
-                client_terrain_fallbacks: client_after
-                    .terrain_fallbacks
-                    .saturating_sub(client_before.terrain_fallbacks),
-            });
-        }
+        // Logged unconditionally — see `ReconcileRecord`'s own doc for why
+        // an unmatched call (`outcome.comparison == None`) must never be
+        // silently dropped instead of recorded.
+        let displacement_m = [
+            outcome.predicted_after.position_m[0] - outcome.predicted_before.position_m[0],
+            outcome.predicted_after.position_m[1] - outcome.predicted_before.position_m[1],
+            outcome.predicted_after.position_m[2] - outcome.predicted_before.position_m[2],
+        ];
+        records.push(ReconcileRecord {
+            snapshot_tick: self.tick,
+            acked_seq: acked,
+            acked_frame,
+            comparison: outcome.comparison,
+            outcome_history_len_before: outcome.history_len_before,
+            outcome_records_removed: outcome.records_removed,
+            outcome_records_replayed: outcome.records_replayed,
+            displacement_m,
+            server_window_sweeps: server_after
+                .window_sweeps
+                .saturating_sub(server_before.window_sweeps),
+            server_window_rebuilds: server_after
+                .window_rebuilds
+                .saturating_sub(server_before.window_rebuilds),
+            server_terrain_fallbacks: server_after
+                .terrain_fallbacks
+                .saturating_sub(server_before.terrain_fallbacks),
+            client_window_sweeps: client_after
+                .window_sweeps
+                .saturating_sub(client_before.window_sweeps),
+            client_window_rebuilds: client_after
+                .window_rebuilds
+                .saturating_sub(client_before.window_rebuilds),
+            client_terrain_fallbacks: client_after
+                .terrain_fallbacks
+                .saturating_sub(client_before.terrain_fallbacks),
+        });
         self.last_client_window = client_after;
         self.last_server_window = server_after;
     }
@@ -414,15 +427,37 @@ fn run_trace() -> Vec<ReconcileRecord> {
 }
 
 fn report(records: &[ReconcileRecord]) {
-    let notable: Vec<&ReconcileRecord> =
-        records.iter().filter(|r| r.event.error_m > 0.01).collect();
+    let unmatched: Vec<&ReconcileRecord> =
+        records.iter().filter(|r| r.comparison.is_none()).collect();
+    let notable: Vec<&ReconcileRecord> = records
+        .iter()
+        .filter(|r| r.comparison.is_some_and(|c| c.error_m > 0.01))
+        .collect();
     eprintln!(
         "--- realistic input timing: {} reconcile events (one per {SNAPSHOT_INTERVAL_TICKS}-tick \
-         snapshot, not every tick), {} exceed 0.01 m ---",
+         snapshot, not every tick), {} unmatched (no comparison), {} exceed 0.01 m ---",
         records.len(),
+        unmatched.len(),
         notable.len()
     );
+    // Unmatched calls first — these are exactly the ones a comparison-only
+    // report would have silently dropped (ENG-69 round 21).
+    for r in &unmatched {
+        eprintln!(
+            "  UNMATCHED snapshot_tick={:5} acked_seq={:<5} history_len_before={} \
+             records_removed={} records_replayed={} displacement=[{:.4},{:.4},{:.4}]",
+            r.snapshot_tick,
+            r.acked_seq.0,
+            r.outcome_history_len_before,
+            r.outcome_records_removed,
+            r.outcome_records_replayed,
+            r.displacement_m[0],
+            r.displacement_m[1],
+            r.displacement_m[2],
+        );
+    }
     for r in &notable {
+        let event = r.comparison.expect("filtered on comparison.is_some above");
         let held = r.acked_frame.map(|f| f.held_for_ticks).unwrap_or(0);
         let sent_at = r.acked_frame.map(|f| f.sent_at_tick).unwrap_or(0);
         let acked_movement = r.acked_frame.map(|f| f.input.movement).unwrap_or([0.0; 3]);
@@ -435,10 +470,10 @@ fn report(records: &[ReconcileRecord]) {
             r.snapshot_tick,
             r.acked_seq.0,
             sent_at,
-            r.event.error_m,
-            r.event.vertical_m,
-            r.event.horizontal_m,
-            r.event.idle,
+            event.error_m,
+            event.vertical_m,
+            event.horizontal_m,
+            event.idle,
             r.displacement_m[0],
             r.displacement_m[1],
             r.displacement_m[2],
@@ -452,9 +487,19 @@ fn report(records: &[ReconcileRecord]) {
     }
     let max_err = records
         .iter()
-        .map(|r| r.event.error_m)
+        .filter_map(|r| r.comparison.map(|c| c.error_m))
         .fold(0.0_f64, f64::max);
-    eprintln!("max error across the trace: {max_err:.6} m");
+    let max_displacement_m = records
+        .iter()
+        .map(|r| {
+            let [dx, dy, dz] = r.displacement_m;
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        })
+        .fold(0.0_f64, f64::max);
+    eprintln!(
+        "max comparison error across the trace: {max_err:.6} m | max reconcile displacement \
+         (matched or not): {max_displacement_m:.6} m"
+    );
 }
 
 #[test]
@@ -468,7 +513,10 @@ fn g1_realistic_input_timing_is_corrections_free_once_reconcile_tracks_server_ti
     // `max_err` below is the actual regression gate.
     let near_150mm = records
         .iter()
-        .filter(|r| (r.event.horizontal_m - 0.150).abs() < 0.02)
+        .filter(|r| {
+            r.comparison
+                .is_some_and(|c| (c.horizontal_m - 0.150).abs() < 0.02)
+        })
         .count();
     eprintln!(
         "{near_150mm} of {} events land within 2 cm of the live session's ~0.150 m horizontal \
@@ -488,7 +536,7 @@ fn g1_realistic_input_timing_is_corrections_free_once_reconcile_tracks_server_ti
     // evenly-ticked input already was.
     let max_err = records
         .iter()
-        .map(|r| r.event.error_m)
+        .filter_map(|r| r.comparison.map(|c| c.error_m))
         .fold(0.0_f64, f64::max);
     assert!(
         max_err < 1e-4,
@@ -496,5 +544,23 @@ fn g1_realistic_input_timing_is_corrections_free_once_reconcile_tracks_server_ti
          cadence) produced a {max_err:.6} m correction — the reconciliation fix (diffing \
          `history` against `MotionSnapshot::server_tick` instead of `InputSeq`) may have \
          regressed"
+    );
+
+    // ENG-69 round 21's own finding: a comparison-only check like the one
+    // above cannot tell a clean trace apart from one where every reconcile
+    // silently missed its comparison and did a large, uncounted resync
+    // instead — this harness still ticks client and server together every
+    // loop iteration (lockstep, single process), so every call is expected
+    // to find a match; a real client is not guaranteed this (see
+    // `reconcile_clock_mapping.rs` for scenarios that genuinely break it).
+    // Asserting both here is what "both problems need to stay fixed" means
+    // for this specific harness.
+    let unmatched = records.iter().filter(|r| r.comparison.is_none()).count();
+    assert_eq!(
+        unmatched,
+        0,
+        "{unmatched} of {} reconcile calls had no comparison in this lockstep harness — the \
+         local-tick/server-tick correspondence it relies on broke",
+        records.len()
     );
 }
