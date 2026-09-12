@@ -247,12 +247,16 @@ mod tests {
     const CELL_M: f32 = fixtures::CELL_M;
 
     fn add_fixed(world: &mut PhysicsWorld, volume: &Volume) -> BodyId {
+        add_fixed_rep(world, volume, Representation::MergedCuboids)
+    }
+
+    fn add_fixed_rep(world: &mut PhysicsWorld, volume: &Volume, rep: Representation) -> BodyId {
         let grid = OccupancyGrid::from_volume(volume)
             .expect("extract")
             .expect("non-empty");
         world.add_body(BodySpec {
             kind: BodyKind::Fixed,
-            representation: Representation::MergedCuboids,
+            representation: rep,
             grid,
             cell_m: CELL_M,
             density_kg_m3: 1.0,
@@ -450,6 +454,57 @@ mod tests {
             end.velocity_m_s[1].abs() < 0.5,
             "resting vertical velocity should be ~0, got {}",
             end.velocity_m_s[1]
+        );
+    }
+
+    #[test]
+    fn resting_xz_agrees_between_merged_cuboids_and_native_voxels() {
+        // ENG-69 round 8: after eliminating the client's own MergedCuboids
+        // seam artifact (client always builds NativeVoxels now), a live
+        // session against a server terrain body built as MergedCuboids still
+        // showed a small (~0.15 m), stable, purely-horizontal, idle-reproducible
+        // prediction/authoritative disagreement. This isolates that specific
+        // remaining variable in a pure CPU test, no networking involved: the
+        // *same* flat floor, built once as each representation, with an
+        // identical idle capsule run against each. If Rapier's contact
+        // resolution for a Voxels shape and a Cuboid shape disagree even on
+        // perfectly flat, gap-free, identical geometry, resting XZ drifts
+        // between the two runs — confirming the representation *type* itself
+        // (not terrain fragmentation/seams) is the remaining source, which
+        // would mean client and server must use the *same* representation
+        // for genuinely matching prediction, not just each build a
+        // individually-reasonable one.
+        let floor = fixtures::floor_slab(VolumeId::new(1).unwrap(), 2, 2, 4);
+        let top = 4.0 * f64::from(CELL_M);
+        let start = CharacterState::at([8.0, top + 2.0, 8.0]);
+
+        let mut cuboid_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut cuboid_world, &floor, Representation::MergedCuboids);
+        cuboid_world.step();
+        let cuboid_end = run(&mut cuboid_world, start, PlayerInput::NEUTRAL, 300);
+
+        let mut voxel_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut voxel_world, &floor, Representation::NativeVoxels);
+        voxel_world.step();
+        let voxel_end = run(&mut voxel_world, start, PlayerInput::NEUTRAL, 300);
+
+        assert!(
+            cuboid_end.grounded && voxel_end.grounded,
+            "both should land"
+        );
+        let dx = cuboid_end.position_m[0] - voxel_end.position_m[0];
+        let dz = cuboid_end.position_m[2] - voxel_end.position_m[2];
+        let horiz_gap = (dx * dx + dz * dz).sqrt();
+        assert!(
+            horiz_gap < 0.01,
+            "resting XZ disagrees between representations on identical flat \
+             geometry: cuboid {:?} vs voxels {:?} (horizontal gap {horiz_gap:.4} m) \
+             — the same shape drifts sideways differently depending on which \
+             Rapier collider type resolves its rest contact, so client and \
+             server predicting from different representations of the same \
+             terrain can never fully agree even with zero seams on either side",
+            cuboid_end.position_m,
+            voxel_end.position_m
         );
     }
 
