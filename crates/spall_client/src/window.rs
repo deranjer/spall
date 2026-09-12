@@ -385,9 +385,7 @@ impl InteractiveApp {
     }
 
     fn view_dir(&self) -> [f32; 3] {
-        let (sin_y, cos_y) = self.yaw.sin_cos();
-        let (sin_p, cos_p) = self.pitch.sin_cos();
-        [sin_y * cos_p, sin_p, -cos_y * cos_p]
+        view_dir_from(self.yaw, self.pitch)
     }
 
     fn publish_look(&self) {
@@ -396,35 +394,6 @@ impl InteractiveApp {
 
     fn publish_movement(&self) {
         self.session.input.set_movement(self.held.movement());
-    }
-
-    /// The eye position to render this frame: [`extrapolated_feet`], smoothed
-    /// ([`CORRECTION_SMOOTHING_TAU_S`]) against `self.display_feet` — the
-    /// camera's own previous displayed position — rather than the target
-    /// position used outright. See that constant's doc for why: this exists
-    /// to turn a reconciliation correction into a glide instead of a snap,
-    /// without adding meaningfully more lag to intentional movement.
-    fn smoothed_eye(&mut self, view: InteractiveView, now: Instant) -> Vec3 {
-        let target = extrapolated_feet(view);
-        let feet = match self.display_feet {
-            Some((prev, prev_at)) => {
-                let dt = (now - prev_at).as_secs_f32().max(0.0);
-                let factor = 1.0 - (-dt / CORRECTION_SMOOTHING_TAU_S).exp();
-                [
-                    prev[0] + (target[0] - prev[0]) * f64::from(factor),
-                    prev[1] + (target[1] - prev[1]) * f64::from(factor),
-                    prev[2] + (target[2] - prev[2]) * f64::from(factor),
-                ]
-            }
-            None => target,
-        };
-        self.display_feet = Some((feet, now));
-        let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
-        Vec3::new(
-            feet[0] as f32,
-            (feet[1] + eye_height_m) as f32,
-            feet[2] as f32,
-        )
     }
 
     fn set_cursor_locked(&mut self, locked: bool) {
@@ -529,7 +498,6 @@ impl ApplicationHandler for InteractiveApp {
                 }
 
                 let view = *self.session.view.lock().unwrap_or_else(|e| e.into_inner());
-                let look_dir = Vec3::from_array(self.view_dir());
 
                 if let Some(v) = view {
                     let feet = v.predicted.position_m;
@@ -552,15 +520,47 @@ impl ApplicationHandler for InteractiveApp {
                     }
                 }
 
-                let frame = view.map(|v| (self.smoothed_eye(v, now), look_dir, new_instances));
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
-                let timing = match renderer.render(frame.as_ref()) {
-                    Ok(timing) => timing,
+                let outcome = match renderer.begin_frame(new_instances.as_ref()) {
+                    Ok(outcome) => outcome,
                     Err(error) => {
                         self.fail(event_loop, error);
                         return;
+                    }
+                };
+                let timing = match outcome {
+                    AcquireOutcome::Skipped(timing) => timing,
+                    AcquireOutcome::Ready(acquired) => {
+                        // Read the freshest pose and compute the camera with
+                        // a timestamp taken right now — after the swapchain
+                        // acquire's variable-length wait above, not before
+                        // it. ENG-69 round 13: `interactive-frames.jsonl`
+                        // showed that wait ranging ~1-33ms frame to frame
+                        // (see `desired_maximum_frame_latency`'s doc); doing
+                        // this before `begin_frame`, as this used to, meant
+                        // some frames' camera was measurably staler than
+                        // others by the time they were actually drawn —
+                        // uneven sideways motion during a strafe, most
+                        // visible along a nearby object's silhouette.
+                        let fresh_view =
+                            *self.session.view.lock().unwrap_or_else(|e| e.into_inner());
+                        let look_dir = Vec3::from_array(view_dir_from(self.yaw, self.pitch));
+                        let render_now = Instant::now();
+                        let cam = fresh_view.map(|v| {
+                            (
+                                compute_smoothed_eye(&mut self.display_feet, v, render_now),
+                                look_dir,
+                            )
+                        });
+                        match renderer.finish_frame(acquired, cam.as_ref()) {
+                            Ok(timing) => timing,
+                            Err(error) => {
+                                self.fail(event_loop, error);
+                                return;
+                            }
+                        }
                     }
                 };
                 self.hud.record_frame(&timing);
@@ -656,7 +656,7 @@ impl ApplicationHandler for InteractiveApp {
 const MAX_EXTRAPOLATION_S: f32 = 0.1;
 
 /// How quickly the *displayed* camera position catches up to the raw
-/// (extrapolated) predicted one — see [`InteractiveApp::smoothed_eye`].
+/// (extrapolated) predicted one — see [`compute_smoothed_eye`].
 /// Short enough to add well under a frame's worth of lag to genuinely
 /// continuous movement (WASD keeps moving the target every frame, so
 /// smoothing barely touches it), long enough to turn a `PredictedPlayer`
@@ -669,7 +669,7 @@ const CORRECTION_SMOOTHING_TAU_S: f32 = 0.05;
 
 /// The raw predicted feet position, extrapolated forward by the time elapsed
 /// since the mover published it — not yet smoothed for a correction (see
-/// [`InteractiveApp::smoothed_eye`], which is what callers actually want).
+/// [`compute_smoothed_eye`], which is what callers actually want).
 fn extrapolated_feet(view: InteractiveView) -> [f64; 3] {
     let dt = view
         .published_at
@@ -683,6 +683,56 @@ fn extrapolated_feet(view: InteractiveView) -> [f64; 3] {
         feet[1] + f64::from(v[1] * dt),
         feet[2] + f64::from(v[2] * dt),
     ]
+}
+
+/// Local wish-independent world-space look direction from yaw/pitch — a free
+/// function (not an `InteractiveApp` method) so it can be called from the
+/// `RedrawRequested` handler's camera step without borrowing all of `self`
+/// while `self.renderer` is already mutably borrowed there — see ENG-69
+/// round 13.
+fn view_dir_from(yaw: f32, pitch: f32) -> [f32; 3] {
+    let (sin_y, cos_y) = yaw.sin_cos();
+    let (sin_p, cos_p) = pitch.sin_cos();
+    [sin_y * cos_p, sin_p, -cos_y * cos_p]
+}
+
+/// The eye position to render this frame: [`extrapolated_feet`], smoothed
+/// ([`CORRECTION_SMOOTHING_TAU_S`]) against `*display_feet` — the camera's
+/// own previous displayed position — rather than the target position used
+/// outright. See that constant's doc for why: this exists to turn a
+/// reconciliation correction into a glide instead of a snap, without adding
+/// meaningfully more lag to intentional movement.
+///
+/// A free function taking `display_feet` directly (not an `InteractiveApp`
+/// method) for the same borrow-checker reason as [`view_dir_from`]: the
+/// `RedrawRequested` handler calls this after `WorldRenderer::begin_frame`,
+/// while `self.renderer` is still mutably borrowed for the matching
+/// `finish_frame` call — see ENG-69 round 13's doc on `begin_frame`.
+fn compute_smoothed_eye(
+    display_feet: &mut Option<([f64; 3], Instant)>,
+    view: InteractiveView,
+    now: Instant,
+) -> Vec3 {
+    let target = extrapolated_feet(view);
+    let feet = match *display_feet {
+        Some((prev, prev_at)) => {
+            let dt = (now - prev_at).as_secs_f32().max(0.0);
+            let factor = 1.0 - (-dt / CORRECTION_SMOOTHING_TAU_S).exp();
+            [
+                prev[0] + (target[0] - prev[0]) * f64::from(factor),
+                prev[1] + (target[1] - prev[1]) * f64::from(factor),
+                prev[2] + (target[2] - prev[2]) * f64::from(factor),
+            ]
+        }
+        None => target,
+    };
+    *display_feet = Some((feet, now));
+    let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
+    Vec3::new(
+        feet[0] as f32,
+        (feet[1] + eye_height_m) as f32,
+        feet[2] as f32,
+    )
 }
 
 fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
@@ -905,8 +955,9 @@ struct WorldRenderer {
     aspect: f32,
 }
 
-/// One render frame's timing breakdown — see [`WorldRenderer::render`] and
-/// `Hud::record_frame`. Added ENG-69 round 12: the averaged `frame_ms_ema`
+/// One render frame's timing breakdown — see [`WorldRenderer::begin_frame`]/
+/// [`WorldRenderer::finish_frame`] and `Hud::record_frame`. Added ENG-69
+/// round 12: the averaged `frame_ms_ema`
 /// the HUD already tracked hides short, occasional stalls; a video review of
 /// an actual hands-on run showed a "hold, then jump" pattern (~60% of
 /// consecutive frames nearly identical, interspersed with larger jumps) that
@@ -916,16 +967,20 @@ struct FrameTiming {
     /// Wall time for the whole `render` call.
     total_ms: f32,
     /// `Some` only on the (occasional) frame a background `RebuildWorker`
-    /// result landed and `render` uploaded a fresh instance buffer — see
-    /// `create_buffer_init` below. This reallocates and copies the *entire*
-    /// buffer every time rather than reusing one, and `VIEW_RADIUS_M` going
-    /// 10m -> 48m this same session made that copy ~23x bigger (proportional
-    /// to view area) — the leading suspect for the stall this instrumentation
-    /// exists to confirm or rule out.
+    /// result landed and `begin_frame` uploaded a fresh instance buffer —
+    /// see `create_buffer_init` there. This reallocates and copies the
+    /// *entire* buffer every time rather than reusing one; round 12
+    /// suspected this (a bigger buffer since `VIEW_RADIUS_M` went 10m ->
+    /// 48m) as the stall's cause, but round 13's data disproved it — this
+    /// stayed under 0.2ms on every measured frame, stalled or not. Kept
+    /// for visibility, not because it's still a live suspect.
     buffer_upload_ms: Option<f32>,
     /// Instance count uploaded, when `buffer_upload_ms` is `Some`.
     instance_count: Option<u32>,
-    /// Time blocked in `surface.get_current_texture()`.
+    /// Time blocked in `surface.get_current_texture()` — round 13 found
+    /// this is where virtually all frame-to-frame timing variance actually
+    /// lives (a regular burst pattern from `desired_maximum_frame_latency`
+    /// letting the CPU queue ahead of the display; see that field's doc).
     acquire_ms: f32,
     /// Time in `queue.submit()` (usually just enqueues; doesn't normally
     /// wait on the GPU).
@@ -954,6 +1009,27 @@ impl FrameTiming {
             present_ms: 0.0,
         }
     }
+}
+
+/// A frame that has acquired its swapchain image, awaiting only the
+/// camera-dependent draw ([`WorldRenderer::finish_frame`]) — see
+/// [`WorldRenderer::begin_frame`].
+struct AcquiredFrame {
+    frame_start: Instant,
+    surface_texture: wgpu::SurfaceTexture,
+    view: wgpu::TextureView,
+    buffer_upload_ms: Option<f32>,
+    instance_count: Option<u32>,
+    acquire_ms: f32,
+}
+
+/// [`WorldRenderer::begin_frame`]'s result: either an acquired frame ready
+/// for [`WorldRenderer::finish_frame`], or a frame that bailed out early
+/// (an `Outdated`/`Lost`/`Timeout` swapchain acquire) and already has its
+/// complete (if mostly-zero) timing.
+enum AcquireOutcome {
+    Ready(AcquiredFrame),
+    Skipped(FrameTiming),
 }
 
 impl WorldRenderer {
@@ -1165,16 +1241,22 @@ impl WorldRenderer {
     /// `eye`/`look_dir` come from the window's own camera state; `scene` is
     /// `None` before the local player has an authoritative pose yet (still
     /// connecting), in which case this just clears the screen.
-    fn render(
+    /// Uploads any fresh terrain instances and acquires the next swapchain
+    /// image — everything in a render frame whose cost doesn't depend on the
+    /// camera. Split out from the old single `render` method (ENG-69 round
+    /// 13): the caller now computes the camera *after* this returns, with a
+    /// fresh timestamp, instead of before — see [`finish_frame`] and
+    /// `InteractiveApp`'s `RedrawRequested` handler for why.
+    fn begin_frame(
         &mut self,
-        frame: Option<&(Vec3, Vec3, Option<Vec<Instance>>)>,
-    ) -> Result<FrameTiming, ClientError> {
+        instances: Option<&Vec<Instance>>,
+    ) -> Result<AcquireOutcome, ClientError> {
         use wgpu::util::DeviceExt as _;
 
         let frame_start = Instant::now();
         let mut buffer_upload_ms = None;
         let mut instance_count = None;
-        if let Some((_, _, Some(instances))) = frame {
+        if let Some(instances) = instances {
             let upload_start = Instant::now();
             let buffer = self
                 .device
@@ -1188,31 +1270,25 @@ impl WorldRenderer {
             self.instance_buffer = Some((buffer, instances.len() as u32));
         }
 
-        let clear_color = wgpu::Color {
-            r: 0.45,
-            g: 0.65,
-            b: 0.85,
-            a: 1.0,
-        };
         let acquire_start = Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.surface_config);
-                return Ok(FrameTiming::early_return(
+                return Ok(AcquireOutcome::Skipped(FrameTiming::early_return(
                     frame_start.elapsed().as_secs_f32() * 1000.0,
                     buffer_upload_ms,
                     instance_count,
                     acquire_start.elapsed().as_secs_f32() * 1000.0,
-                ));
+                )));
             }
             Err(wgpu::SurfaceError::Timeout) => {
-                return Ok(FrameTiming::early_return(
+                return Ok(AcquireOutcome::Skipped(FrameTiming::early_return(
                     frame_start.elapsed().as_secs_f32() * 1000.0,
                     buffer_upload_ms,
                     instance_count,
                     acquire_start.elapsed().as_secs_f32() * 1000.0,
-                ));
+                )));
             }
             Err(error) => return Err(ClientError::Render(error.to_string())),
         };
@@ -1221,7 +1297,41 @@ impl WorldRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        if let Some((eye, look_dir, _)) = frame {
+        Ok(AcquireOutcome::Ready(AcquiredFrame {
+            frame_start,
+            surface_texture,
+            view,
+            buffer_upload_ms,
+            instance_count,
+            acquire_ms,
+        }))
+    }
+
+    /// Draws and presents an already-acquired frame. `cam` is `None` before
+    /// the local player has an authoritative pose yet (still connecting), in
+    /// which case this just clears the screen.
+    fn finish_frame(
+        &mut self,
+        acquired: AcquiredFrame,
+        cam: Option<&(Vec3, Vec3)>,
+    ) -> Result<FrameTiming, ClientError> {
+        let AcquiredFrame {
+            frame_start,
+            surface_texture,
+            view,
+            buffer_upload_ms,
+            instance_count,
+            acquire_ms,
+        } = acquired;
+
+        let clear_color = wgpu::Color {
+            r: 0.45,
+            g: 0.65,
+            b: 0.85,
+            a: 1.0,
+        };
+
+        if let Some((eye, look_dir)) = cam {
             // Targets the wgpu/DirectX NDC (`z in [0, 1]`, Y-up) — matches
             // `spall_render::camera::Camera`'s convention.
             let view_matrix = rh::view::look_to_mat4(*eye, *look_dir, Vec3::Y);
@@ -1267,7 +1377,7 @@ impl WorldRenderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            if frame.is_some()
+            if cam.is_some()
                 && let Some((instance_buffer, count)) = &self.instance_buffer
                 && *count > 0
             {
