@@ -19,7 +19,7 @@ use serde::Serialize;
 use spall_core::{BrickCoord, GlobalCell, MaterialId, PlayerInput};
 use spall_physics::{
     BodyId, BodyKind, BodySpec, CharacterMove, CharacterParams, CharacterState, OccupancyGrid,
-    PhysicsConfig, PhysicsWorld, choose_representation, step_character,
+    PhysicsConfig, PhysicsWorld, Representation, step_character,
 };
 use spall_protocol::InputSeq;
 use spall_voxel::{Sample, Volume};
@@ -77,43 +77,66 @@ impl ClientPhysics {
     /// drops the collider entirely so the capsule falls through a
     /// fully-removed floor.
     ///
-    /// The representation is chosen by [`spall_physics::choose_representation`]
-    /// — the same budget `spall_sim::collider::plan_collider` uses for the
-    /// server's own terrain body — rather than a hardcoded
-    /// `Representation::MergedCuboids`. ENG-69 round 7 found this hardcoding
-    /// was a real bug, not a style choice: once the server's terrain grew
-    /// fragmented enough to cross the budget and fall back to
-    /// `NativeVoxels`, the client kept building `MergedCuboids` regardless —
-    /// two structurally different colliders over the same logical geometry.
-    /// `MergedCuboids`' internal box seams can deflect a sliding kinematic
-    /// character sideways where `NativeVoxels` (parry suppresses
-    /// internal-edge contacts between adjacent voxels) would not, which
-    /// showed up as a small, purely-horizontal correction that fired even
-    /// while the player stood perfectly still.
+    /// Always builds [`Representation::NativeVoxels`], **not**
+    /// [`spall_physics::choose_representation`]'s budget-based pick, even
+    /// though that budget is exactly what `spall_sim::collider::plan_collider`
+    /// uses for the server's own terrain body. ENG-69 round 7 tried matching
+    /// the server's policy (commit `196d9ff`, since reverted in spirit here)
+    /// on the theory that a representation *mismatch* was the bug; a live
+    /// retest with the same terrain came back with an unchanged ~0.15-0.2 m
+    /// horizontal-only correction, disproving it — the terrain's greedy box
+    /// count apparently never crossed the budget on either side, so both
+    /// sides were already building `MergedCuboids`.
+    ///
+    /// The real issue is more fundamental than *which* representation: this
+    /// grid's extent is the tight bounding box of whatever bricks happen to
+    /// be resident *right now* (see the non-contiguous-resident-set note
+    /// above), while the server's grid for the same logical terrain spans the
+    /// complete, fixed volume. `greedy_boxes`' box-growth loop only stops
+    /// early where the *next cell* isn't solid — and at this grid's edge,
+    /// "not solid" and "not yet loaded" are indistinguishable from inside the
+    /// array. For any solid region larger than the client's own streaming
+    /// radius (an ordinary large flat floor easily qualifies), a box that
+    /// would run further on the server's complete grid gets cut short here,
+    /// planting a seam the server's collider does not have — anywhere within
+    /// the resident set, not only at its visible boundary, because greedy
+    /// merging is a global, order-dependent process (an earlier box's extent
+    /// changes what is left `consumed` for a later one). `MergedCuboids`
+    /// resolves that seam as a real geometric discontinuity a sliding
+    /// kinematic character can catch on. `NativeVoxels` has no internal
+    /// seams at all — parry's `Voxels` shape suppresses contact response
+    /// between connected adjacent voxels — so while its own resident-boundary
+    /// edge is still an (unavoidable, partial-knowledge) approximation, nothing
+    /// *interior* to what the client has already loaded can produce a false
+    /// seam the player might be standing on or walking across. This is
+    /// heavier to rebuild than a small `MergedCuboids` compound would be
+    /// (cost scales with the resident cell count, not the box count — see
+    /// `spall_sim::collider`'s own doc on the same trade-off), but rebuilds
+    /// are already bounded by [`crate::residency`]'s / the replica's own
+    /// resident-cell ceiling, and correctness here matters more than shaving
+    /// that cost.
     pub fn set_terrain(&mut self, volume: &Volume) {
         self.resident_bricks = volume.resident_brick_coords().into_iter().collect();
         match lenient_occupancy(volume) {
-            Some(grid) => {
-                let representation = choose_representation(&grid);
-                match self.terrain {
-                    Some(id) => {
-                        self.world.rebuild_collider(id, &grid, representation);
-                    }
-                    None => {
-                        let id = self.world.add_body(BodySpec {
-                            kind: BodyKind::Fixed,
-                            representation,
-                            grid,
-                            cell_m: CELL_M,
-                            density_kg_m3: 1.0,
-                            mass_properties: None,
-                            translation_m: [0.0; 3],
-                            linvel_m_s: [0.0; 3],
-                        });
-                        self.terrain = Some(id);
-                    }
+            Some(grid) => match self.terrain {
+                Some(id) => {
+                    self.world
+                        .rebuild_collider(id, &grid, Representation::NativeVoxels);
                 }
-            }
+                None => {
+                    let id = self.world.add_body(BodySpec {
+                        kind: BodyKind::Fixed,
+                        representation: Representation::NativeVoxels,
+                        grid,
+                        cell_m: CELL_M,
+                        density_kg_m3: 1.0,
+                        mass_properties: None,
+                        translation_m: [0.0; 3],
+                        linvel_m_s: [0.0; 3],
+                    });
+                    self.terrain = Some(id);
+                }
+            },
             None => {
                 if let Some(id) = self.terrain {
                     self.world.remove_collider(id);
