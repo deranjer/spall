@@ -970,6 +970,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let replica = replica.clone();
         let counters = counters.clone();
         let predictor = predictor.clone();
+        let interactive = config.interactive.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_datagram().await {
@@ -989,12 +990,20 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                         p.player = Some(PredictedPlayer::new(p.params, st));
                                         p.script_origin_tick.get_or_insert(snap.server_tick.get());
                                     }
-                                    // The returned per-event `CorrectionEvent` is for callers
-                                    // doing detailed analysis (ENG-69's G1 ramp trace test);
-                                    // the live HUD path only needs `PredictedPlayer`'s own
-                                    // running counters, read separately below.
+                                    // The live HUD path only needs `PredictedPlayer`'s own
+                                    // running counters, read separately below; the returned
+                                    // per-event `CorrectionEvent` instead goes to
+                                    // `CorrectionLog` (ENG-69 round 10/11 — see its own doc)
+                                    // when this is an interactive session, for post-hoc
+                                    // analysis of a real hands-on run.
                                     Some(pl) => {
-                                        pl.reconcile(&p.phys, st, snap.acked_input);
+                                        if let Some(event) =
+                                            pl.reconcile(&p.phys, st, snap.acked_input)
+                                            && let Some(session) = &interactive
+                                            && let Some(log) = &session.corrections
+                                        {
+                                            log.record(snap.server_tick.get(), event);
+                                        }
                                     }
                                 }
                                 counters.motion.fetch_add(1, Ordering::Relaxed);

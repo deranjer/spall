@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use spall_core::PlayerInput;
 use spall_physics::CharacterState;
 
+use crate::predict::CorrectionEvent;
 use crate::replica::ReplicaWorld;
 
 /// Thread-safe latest input state: written by the window's key/mouse event
@@ -103,6 +104,56 @@ pub struct InteractiveView {
     pub max_horizontal_correction_m: f64,
 }
 
+/// Best-effort append-only JSONL log of every `CorrectionEvent`
+/// `PredictedPlayer::reconcile` returns during an interactive session — for
+/// post-hoc analysis of a *live, human-driven* run. Added ENG-69 round 10/11:
+/// a CPU-only scripted trace (`crates/spall_client/tests/g1_ramp_trace.rs`)
+/// could reproduce the seam mechanism but not the frequency/magnitude an
+/// actual hands-on session showed (near-continuous corrections, a
+/// substantial vertical component, a lifetime max that kept climbing past
+/// what the ramp alone explained) — rather than write another synthetic
+/// script and guess whether it covers the real gap (jumping? resting on a
+/// slope? something the script never exercises?), this captures every real
+/// event the real session produces, so the actual distribution can be
+/// computed after the fact instead of inferred from a lifetime maximum.
+pub struct CorrectionLog {
+    file: Mutex<std::io::BufWriter<std::fs::File>>,
+    started_at: std::time::Instant,
+}
+
+impl CorrectionLog {
+    /// Creates (truncating any previous run's log) the file at `path`,
+    /// including its parent directory.
+    fn create(path: &std::path::Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(path)?;
+        Ok(Self {
+            file: Mutex::new(std::io::BufWriter::new(file)),
+            started_at: std::time::Instant::now(),
+        })
+    }
+
+    /// Appends one event as a JSON line. Failures are swallowed — this log
+    /// is a diagnostic aid, never a reason to disrupt the session itself.
+    pub fn record(&self, server_tick: u64, event: CorrectionEvent) {
+        use std::io::Write;
+        let line = format!(
+            "{{\"tick\":{server_tick},\"wall_ms\":{},\"error_m\":{:.6},\"vertical_m\":{:.6},\"horizontal_m\":{:.6},\"idle\":{}}}\n",
+            self.started_at.elapsed().as_millis(),
+            event.error_m,
+            event.vertical_m,
+            event.horizontal_m,
+            event.idle,
+        );
+        if let Ok(mut f) = self.file.lock() {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.flush();
+        }
+    }
+}
+
 /// Shared handle between the network thread and the render window for one
 /// interactively-played client session.
 pub struct InteractiveSession {
@@ -117,6 +168,9 @@ pub struct InteractiveSession {
     /// select loop polls it so it disconnects promptly instead of relying on
     /// `overall_timeout`.
     pub stop: AtomicBool,
+    /// `None` only if the log file could not be created (diagnostic, not
+    /// required for the session to run) — see [`CorrectionLog`].
+    pub corrections: Option<CorrectionLog>,
 }
 
 impl std::fmt::Debug for InteractiveSession {
@@ -128,20 +182,30 @@ impl std::fmt::Debug for InteractiveSession {
     }
 }
 
-impl Default for InteractiveSession {
-    fn default() -> Self {
-        Self {
+/// Where `CorrectionLog` writes for a `cargo xtask play` session — fixed,
+/// rather than plumbed through as a CLI flag, since this is diagnostic
+/// infrastructure for one active investigation, not a permanent feature.
+const CORRECTION_LOG_PATH: &str = ".local/runs/interactive-corrections.jsonl";
+
+impl InteractiveSession {
+    pub fn new() -> Arc<Self> {
+        let corrections = match CorrectionLog::create(std::path::Path::new(CORRECTION_LOG_PATH)) {
+            Ok(log) => Some(log),
+            Err(e) => {
+                eprintln!(
+                    "spall-interactive: could not create {CORRECTION_LOG_PATH} ({e}); \
+                     per-event correction logging is disabled for this session"
+                );
+                None
+            }
+        };
+        Arc::new(Self {
             input: LiveInput::new(),
             view: Mutex::new(None),
             replica: OnceLock::new(),
             stop: AtomicBool::new(false),
-        }
-    }
-}
-
-impl InteractiveSession {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+            corrections,
+        })
     }
 
     pub fn request_stop(&self) {
