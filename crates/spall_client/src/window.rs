@@ -58,12 +58,22 @@ pub fn run_interactive_window(mut net_config: ClientNetConfig) -> Result<(), Cli
     let session = InteractiveSession::new();
     net_config.interactive = Some(session.clone());
 
+    // A user event (rather than a plain `()` event loop) so the network
+    // thread ending — a failed connect, or the server closing the session —
+    // wakes and closes the window right away. Without this the window has no
+    // way to learn the session is over: it just keeps presenting an empty
+    // scene forever until someone notices and closes it by hand.
+    let event_loop = EventLoop::<()>::with_user_event().build()?;
+    let net_done = event_loop.create_proxy();
     let net_thread = std::thread::Builder::new()
         .name("spall-client-net".into())
-        .spawn(move || run_replication_client(net_config))
+        .spawn(move || {
+            let result = run_replication_client(net_config);
+            let _ = net_done.send_event(());
+            result
+        })
         .map_err(|e| ClientError::Gpu(format!("spawning network thread: {e}")))?;
 
-    let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = InteractiveApp::new(session.clone());
     let run_result = event_loop.run_app(&mut app);
@@ -267,6 +277,15 @@ impl ApplicationHandler for InteractiveApp {
             }
             _ => {}
         }
+    }
+
+    /// The network thread's wake-up (see `run_interactive_window`): the
+    /// session ended, either the server closing it or a failed connect.
+    /// `net_result` (checked after `run_app` returns) carries the actual
+    /// error, if any — this just makes sure the window doesn't sit there
+    /// showing an empty scene once there is no session left to drive it.
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
+        event_loop.exit();
     }
 
     fn device_event(
