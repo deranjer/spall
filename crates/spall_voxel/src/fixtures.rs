@@ -403,16 +403,36 @@ pub fn separated_regions_scene(id: VolumeId) -> Volume {
 /// East-region offset for the full-envelope T23 scene: 110 m on the x axis.
 pub const SEPARATED_REGIONS_FAR_EAST_OFFSET: GlobalCell = GlobalCell::new(440, 0, 0);
 
+/// T23 / G3 row 2 follow-up (increment 23): extra solid ground, in cells,
+/// appended past the east region's own floor (which otherwise ends a bare
+/// `5.75 m` past the causeway, only `~4.8 m` past `t23-g3-full-envelope.json`'s
+/// scripted leg's own deterministic stopping point). The pure-`spall_sim`
+/// version of this walk (`scripted_walk_from_slot_0_spawn_covers_over_100_m`)
+/// lands well short of that edge every time; the real multi-process harness
+/// occasionally does not, because the client's scripted-movement clock
+/// (`active_script_tick` in `spall_client::net`) advances from the *observed*
+/// server tick, not wall-clock time — a real OS-scheduling stall in receiving
+/// a `MotionSnapshot` delays the script's own release-to-neutral relative to
+/// true server time, and the player keeps walking for however much extra real
+/// time that stall cost. A `~4.8 m` margin was not enough headroom to absorb
+/// that (observed: the player walked off the far edge and fell, `y ≈ -60..-80`,
+/// in `4/6` real sessions). `120` cells (`30 m`) of extra apron makes that
+/// realistically un-reachable while `causeway_connects_the_two_far_regions_
+/// with_continuous_solid_ground`'s `resident_brick_count() <= 20` budget still
+/// holds (`19` bricks with this margin, `15` without it).
+pub const SEPARATED_REGIONS_FAR_EAST_LANDING_MARGIN_CELLS: i64 = 120;
+
 /// Two separated regions joined by a continuous, narrow stone causeway.
 pub fn separated_regions_full_envelope_scene(id: VolumeId) -> Volume {
     let bounds = BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(31, 15, 31))
         .expect("valid G3 world bounds");
     let mut v = Volume::bounded(id, CellSizeCode::Quarter, bounds);
     let e = SEPARATED_REGIONS_FAR_EAST_OFFSET;
+    let margin = SEPARATED_REGIONS_FAR_EAST_LANDING_MARGIN_CELLS;
     v.apply_edit(&EditPlan::filled_box(
         id,
         GlobalCell::new(0, 0, 0),
-        GlobalCell::new(23 + e.x, 19, 7),
+        GlobalCell::new(23 + e.x + margin, 19, 7),
         MaterialId::AIR,
     ))
     .expect("far-scene air envelope");
@@ -423,6 +443,17 @@ pub fn separated_regions_full_envelope_scene(id: VolumeId) -> Volume {
         STONE,
     ))
     .expect("far-scene causeway");
+    // Landing apron: continues the causeway's own floor slab past the east
+    // region's far edge, so a client-timing overshoot on the scripted walk
+    // lands on solid ground instead of falling into the void (see
+    // `SEPARATED_REGIONS_FAR_EAST_LANDING_MARGIN_CELLS`'s doc comment).
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(24 + e.x, 0, 0),
+        GlobalCell::new(23 + e.x + margin, 3, 7),
+        STONE,
+    ))
+    .expect("far-scene landing apron");
     let region = [
         (GlobalCell::new(0, 0, 0), GlobalCell::new(23, 3, 7), STONE),
         (GlobalCell::new(10, 4, 3), GlobalCell::new(11, 9, 4), STONE),
