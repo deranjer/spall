@@ -65,3 +65,25 @@ debug = 1
 
 [profile.release]
 debug = 1
+
+# ENG-30 / T23 row 11: quinn-proto 0.11.17 (the latest crates.io release as of
+# 2026-09-13) has a real, reproducible bug in `Datagrams::send(drop = true)`'s
+# outgoing-buffer eviction loop -- it subtracts an evicted datagram's size
+# from `payload_bytes` twice (once inside `DatagramBuffer::pop_front`, once
+# again at the call site), so under sustained eviction (a peer not draining
+# its outgoing datagrams fast enough, e.g. a bandwidth-shaped connection under
+# real per-tick MotionSnapshot traffic) the counter underflows: release builds
+# wrap it to a huge value, drain the whole queue, and then panic on
+# `.expect("datagrams.outgoing.payload_bytes desynchronized")` while the
+# connection's mutex is held -- poisoning it for every other task on that
+# connection, and (since quinn's endpoint-level state is shared across every
+# connection on one socket) cascading into every other client's connection on
+# the same server process. Reproduced running `t23-g4-join-budget` (a shaped
+# 1 MiB/s / 100 ms RTT / 2% loss connection carrying G4-scale per-tick
+# datagram traffic) -- see docs/reports/G3.md row 11. Fixed upstream, merged
+# to the `0.11.x` branch (quinn-rs/quinn#2806, closing quinn-rs/quinn#2805),
+# not yet in a released crates.io version. Pinned to that merge commit; drop
+# this patch once a quinn-proto release containing the fix ships and `cargo
+# update -p quinn-proto` picks it up.
+[patch.crates-io]
+quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "f650e0f213b01ea7bebd60023e5df7df65e5c2bd" }

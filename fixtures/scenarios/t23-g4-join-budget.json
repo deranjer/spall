@@ -1,0 +1,233 @@
+{
+  "name": "t23-g4-join-budget",
+  "description": "T23 / G4 row 11 join budget, worst-case-sized evidence -- currently an accurate FAILING repro, not a passing gate; see docs/reports/G3.md row 11 for the full writeup. Same eight-client g4-workload scene/population/cuts as t23-g4-workload (256 active + 4096 sleeping bodies = 4352 bodies, two multi-region column cuts, a round-robined edit stream, two blasts) -- t23-g4-workload's own increment-19 run already measured this population's late-join baseline at 48,122 compressed bytes per client with no network shaping (ready in 22.7-25.8 s purely from 8-way CPU capture contention on the tick thread). This fixture adds the missing piece: client 7's connection is shaped to the exact docs/validation.md G3 join-budget network profile (1 MiB/s bandwidth, 100 ms RTT, 20 ms jitter, 2% packet loss) via the `join_budget` block, while clients 0-6 stay on transparent proxies so the population/edit workload itself is not bandwidth-limited. Client 7's own background baseline-capture thread has to contend with the other seven's simultaneous capture threads for real CPU time; that contention alone (proven by t23-g4-workload, no shaping involved) already costs 20-25 s, and client 7's connection hits the transport's 30 s QUIC idle timeout while still waiting on its own capture, before the server ever sends it a BaselineBegin -- `result: \"join-failed\"`, not a measured budget. This is a real, reproducible gap (see docs/reports/G3.md row 11), not a fixture bug: it shows the current implementation cannot serve a worst-case-sized dependency-complete baseline to a network-constrained client while seven other simultaneous joiners are also capturing. `restart_check` is intentionally omitted (t23-g4-workload already covers cold-restart recovery for this scene; this fixture's only new work is the join-budget measurement, and dropping it keeps this run's already-long release-profile duration bounded).",
+  "scene": "g4-workload",
+  "release_profile": true,
+  "server_ticks": 3000,
+  "quiescence_ticks": 2000,
+  "clients": 8,
+  "late_join_clients": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "late_join_connect_delay_ms": 200,
+  "minimum_transactions": 20,
+  "replay_check": true,
+  "join_budget": {
+    "client": 7,
+    "bandwidth_bytes_per_sec": 1048576,
+    "rtt_ms": 100,
+    "jitter_ms": 20,
+    "loss_percent": 2,
+    "max_baseline_compressed_bytes": 16777216,
+    "max_ready_ms": 30000
+  },
+  "cuts": [
+    {
+      "client": 0,
+      "at_tick": 200,
+      "cell": [
+        10,
+        6,
+        3
+      ],
+      "radius": 2
+    },
+    {
+      "client": 4,
+      "at_tick": 260,
+      "cell": [
+        82,
+        6,
+        75
+      ],
+      "radius": 2
+    },
+    {
+      "client": 0,
+      "at_tick": 320,
+      "cell": [
+        1,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 1,
+      "at_tick": 326,
+      "cell": [
+        2,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 2,
+      "at_tick": 332,
+      "cell": [
+        3,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 3,
+      "at_tick": 338,
+      "cell": [
+        4,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 4,
+      "at_tick": 344,
+      "cell": [
+        73,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 5,
+      "at_tick": 350,
+      "cell": [
+        74,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 6,
+      "at_tick": 356,
+      "cell": [
+        75,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 7,
+      "at_tick": 362,
+      "cell": [
+        76,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 0,
+      "at_tick": 368,
+      "cell": [
+        5,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 1,
+      "at_tick": 374,
+      "cell": [
+        6,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 2,
+      "at_tick": 380,
+      "cell": [
+        7,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 3,
+      "at_tick": 386,
+      "cell": [
+        8,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 4,
+      "at_tick": 392,
+      "cell": [
+        77,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 5,
+      "at_tick": 398,
+      "cell": [
+        78,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 6,
+      "at_tick": 404,
+      "cell": [
+        79,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 7,
+      "at_tick": 410,
+      "cell": [
+        80,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 0,
+      "at_tick": 500,
+      "cell": [
+        20,
+        12,
+        12
+      ],
+      "radius": 8
+    },
+    {
+      "client": 4,
+      "at_tick": 1100,
+      "cell": [
+        92,
+        12,
+        73
+      ],
+      "radius": 8
+    }
+  ]
+}
