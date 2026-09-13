@@ -391,33 +391,46 @@ fn scripted_walk_from_slot_0_spawn_covers_over_100_m() {
     );
 }
 
-/// T23 / G3 row 15 follow-up: a scripted walk from `SEPARATED_REGION_SPAWNS[0]`
-/// (`x = 1 m`, the *non*-far-envelope spawn table) does not merely fail to
-/// travel — with scripted movement input, the player falls straight through
-/// the west floor instead of walking it (`grounded` stays `false` and `y`
-/// falls without bound while `x` keeps advancing). This does **not**
-/// reproduce with [`fixtures::separated_regions_full_envelope_setup`] at the
-/// same `x`, only with the plain [`fixtures::separated_regions_setup`] — the
-/// two scenes' terrain differs only in their east-region offset and the
-/// resulting `terrain_collider_region` union box shape (see each function's
-/// doc comment), so the divergence is somewhere in occupancy extraction for
-/// that wider/shorter union box, not the row-15 defect
-/// (`spall_physics::character::row15_elevated_beam_near_origin_freezes_horizontal_movement`)
-/// pinned at the `spall_physics` level, which reproduces identically on
-/// *both* scenes. Newly discovered while investigating row 15, not
-/// previously exercised (no prior scenario scripted movement on
-/// `separated_regions_setup` specifically — `t23-g3`/`t23-g3-traversal` use
-/// stationary spawns or the unrelated `walk_arena` scene). Not fixed here;
-/// filed as its own follow-up in `docs/reports/G3.md`.
+/// T23 / G3 row 15 follow-up, **resolved as not an engine defect**: an earlier
+/// version of this test spawned at `x = 7 m` on the plain
+/// [`fixtures::separated_regions_setup`] scene (picked to sit past row 15's
+/// freeze band, mirroring [`fixtures::separated_regions_full_envelope_setup`]'s
+/// `x = 7 m` slot-0 spawn) and found the player fell through instead of
+/// walking, theorizing a divergence in occupancy extraction between the two
+/// scenes' differently-shaped `terrain_collider_region` union boxes.
+///
+/// Instrumenting per-tick position showed `grounded` is already `false` at
+/// tick 1, before any meaningful travel — the player free-falls from the
+/// very first tick, not partway through a walk. The real explanation is
+/// simpler: the west region's actual solid floor only spans `x` cells
+/// `0..=23` (`0..6 m`; see [`fixtures::separated_regions_scene`]'s doc
+/// comment), so `x = 7 m` is already past its edge, in real air, at spawn.
+/// `terrain_collider_region` is merely the bounding envelope the collider
+/// system extracts occupancy over (mostly air outside the two regions and
+/// their connecting causeway, if any) — not a claim that the whole box is
+/// solid ground. `separated_regions_full_envelope_setup` does not reproduce
+/// at the same `x` only because it fills a causeway from cell `24` (`x = 6
+/// m`) onward specifically to carry a scripted walker past this gap
+/// ([`fixtures::separated_regions_full_envelope_scene`]); the plain scene has
+/// no such causeway, by design — the whole point of `separated_regions_setup`
+/// is two small, isolated collapsible structures with genuine empty world
+/// between them. `PlayerInput::movement`'s forward axis is relative to
+/// `view_dir`; with `view_dir = [1, 0, 0]` (the convention used throughout
+/// `spall_physics::character`'s own tests), "forward" drives `x`, which is
+/// why `x` advances while `z` stays fixed here — also not a bug.
+///
+/// Kept as a sanity check that a spawn genuinely off any floor free-falls
+/// cleanly (no panic, no false-grounded) rather than as a regression pin —
+/// there is no defect here to pin.
 #[test]
-fn plain_scene_spawn_falls_through_the_floor_instead_of_walking_it() {
+fn spawn_past_the_narrow_floors_edge_free_falls_through_the_gap() {
     let mut sim =
         Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
     let entity = player_entity_for(0);
-    // Not `SEPARATED_REGION_SPAWNS[0]` (`x = 1 m`) -- that spawn hits row 15's
-    // freeze instead (the same defect either scene reproduces). This is a
-    // *different* x, past row 15's band, where the plain scene specifically
-    // falls through instead of walking.
+    // Past the west floor's own `x` extent (`0..6 m`) on the plain scene,
+    // which has no causeway past it (unlike the full-envelope scene) -- this
+    // is genuine void, not row 15's freeze band or an occupancy-extraction
+    // divergence. See the doc comment above.
     let spawn = [7.0, 1.0, 1.0];
     sim.add_player(entity, spawn);
     let forward = PlayerInput {
@@ -432,8 +445,7 @@ fn plain_scene_spawn_falls_through_the_floor_instead_of_walking_it() {
     let p = sim.world().players().next().unwrap();
     assert!(
         !p.state.grounded && p.state.position_m[1] < spawn[1] - 1.0,
-        "expected this to fail today (undiagnosed defect): player should \
-         have fallen through the floor, but is at y={} grounded={}",
+        "expected a spawn off the floor's edge to free-fall, but is at y={} grounded={}",
         p.state.position_m[1],
         p.state.grounded
     );
