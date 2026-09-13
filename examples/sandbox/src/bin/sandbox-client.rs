@@ -28,6 +28,12 @@ struct Args {
     /// Connect to this server (or UDP proxy) address and replicate.
     #[arg(long)]
     connect: Option<SocketAddr>,
+    /// T19 follow-up: open a real render window driven by live keyboard
+    /// (WASD, Space to jump, Escape to release the mouse) and mouse-look
+    /// input instead of a scripted `--move` path. Needs `--connect`; ignores
+    /// `--move` if both are given.
+    #[arg(long)]
+    interactive: bool,
     /// File holding the server certificate fingerprint (hex).
     #[arg(long)]
     server_fingerprint: Option<PathBuf>,
@@ -152,6 +158,9 @@ fn main() -> ExitCode {
     sandbox::init_tracing();
     let args = Args::parse();
 
+    if args.connect.is_some() && args.interactive {
+        return run_interactive(args);
+    }
     if args.connect.is_some() {
         return run_replication(args);
     }
@@ -270,6 +279,7 @@ fn run_replication(args: Args) -> ExitCode {
             },
         ),
         on_replica_ready: None,
+        interactive: None,
     };
     match run_replication_client(config) {
         Ok(summary) => {
@@ -322,6 +332,91 @@ fn run_replication(args: Args) -> ExitCode {
                 }
                 return ExitCode::from(4);
             }
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// T19 follow-up: `--connect --interactive` opens a real render window
+/// driven by live keyboard/mouse input instead of a scripted `--move` path.
+/// Blocks until the window closes or the session ends on its own.
+fn run_interactive(args: Args) -> ExitCode {
+    let connect_addr = args.connect.expect("checked by caller");
+    let (Some(fp_file), Some(token_file)) = (args.server_fingerprint, args.join_token_file) else {
+        eprintln!("sandbox-client: --connect requires --server-fingerprint and --join-token-file");
+        return ExitCode::from(2);
+    };
+    let fingerprint = match std::fs::read_to_string(&fp_file)
+        .ok()
+        .and_then(|s| Fingerprint::from_hex(s.trim()))
+    {
+        Some(f) => f,
+        None => {
+            eprintln!("sandbox-client: could not read a fingerprint from {fp_file:?}");
+            return ExitCode::from(2);
+        }
+    };
+    let token = match std::fs::read_to_string(&token_file)
+        .ok()
+        .and_then(|s| JoinToken::from_hex(s.trim()))
+    {
+        Some(t) => t,
+        None => {
+            eprintln!("sandbox-client: could not read a join token from {token_file:?}");
+            return ExitCode::from(2);
+        }
+    };
+    // An interactive client always predicts a player, exactly like a mover
+    // (`--move`): an unknown/omitted `--scene` falls back to the default
+    // rather than being rejected.
+    let baseline_scene = BaselineScene::from_name(&args.scene).unwrap_or_default();
+
+    if !args.moves.is_empty() {
+        eprintln!(
+            "sandbox-client: --interactive drives the player from live input; ignoring --move"
+        );
+    }
+
+    let id_base = (args.client_index << 40) | 1;
+    let script: Vec<ScriptedAction> = args
+        .cuts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| ScriptedAction {
+            at_tick: c.tick,
+            request: cut_request(id_base + i as u64, i as u64, c.cell, c.radius),
+            target: c.target,
+        })
+        .collect();
+
+    let config = ClientNetConfig {
+        connect_addr,
+        server_fingerprint: fingerprint,
+        join_token: token,
+        script,
+        movement_script: Vec::new(),
+        late_join: args.late_join,
+        baseline_scene,
+        run_ticks: 0,
+        idle_grace: Duration::from_millis(500),
+        // An interactive session has no natural end; a person closes the
+        // window when they're done rather than the client hitting a deadline.
+        overall_timeout: Duration::from_secs(4 * 60 * 60),
+        log_json: args.log_json,
+        summary_json: None,
+        transport: TransportConfig::default(),
+        client_residency: None,
+        on_replica_ready: None,
+        interactive: None, // set by `run_interactive_window` itself
+    };
+    match spall_client::run_interactive_window(config) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error @ spall_client::ClientError::Gpu(_)) => {
+            eprintln!("sandbox-client: {error}");
+            ExitCode::from(3)
+        }
+        Err(error) => {
+            eprintln!("sandbox-client: {error}");
             ExitCode::from(1)
         }
     }

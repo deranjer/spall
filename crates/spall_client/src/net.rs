@@ -39,9 +39,11 @@ use spall_protocol::{
     PROTOCOL_VERSION, RecentInput, RepairKey, RequestId, TransferId, session_player_entity,
 };
 
-use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
+use crate::interactive::{InteractiveSession, InteractiveView};
+use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer, WindowStats};
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
 use crate::residency::ClientResidencyPass;
+use crate::tick_accumulator::TickAccumulator;
 
 /// One leg of a scripted movement path: hold `input` from tick `from` up to (not
 /// including) tick `to`.
@@ -266,6 +268,15 @@ pub struct ClientNetConfig {
     /// directly. `None` (the default) changes nothing about the client's
     /// behaviour.
     pub on_replica_ready: Option<ReplicaReadyHook>,
+    /// Interactive follow-up (T19): live keyboard/mouse-driven input instead
+    /// of `movement_script` — set by `spall_client::window::run_interactive_window`,
+    /// not normally constructed directly. Implies a baseline pull and a
+    /// predicted player exactly like a non-empty `movement_script`, but reads
+    /// `InteractiveSession::input` every mover tick instead of the scripted
+    /// table, publishes the predicted pose into `InteractiveSession::view`,
+    /// and never auto-stops on a script end tick. `None` (every existing
+    /// scripted/headless run) is byte-for-byte unchanged.
+    pub interactive: Option<Arc<InteractiveSession>>,
 }
 
 /// A shared handle to the live replica, and a callback invoked with it — see
@@ -537,6 +548,29 @@ impl Predictor {
     }
 }
 
+/// One mover tick's snapshot of `PredictedPlayer`'s correction counters,
+/// published into `InteractiveView` for the interactive HUD (see ENG-69's
+/// round-6/7 investigation into corrections firing even while standing
+/// still) — a named struct rather than growing `MoverTickOutcome`'s tuple
+/// past readability.
+#[derive(Debug, Clone, Copy, Default)]
+struct CorrectionStats {
+    corrections: u64,
+    max_correction_m: f64,
+    idle_corrections: u64,
+    max_idle_correction_m: f64,
+    max_vertical_correction_m: f64,
+    max_horizontal_correction_m: f64,
+    /// `PredictedPlayer::unmatched_reconciles` / `max_unmatched_displacement_m`
+    /// (ENG-69 round 21) — reconcile calls with no comparison at all, and
+    /// the largest actual position jump one of them produced. Surfaced
+    /// separately from `corrections` precisely so the HUD's "+N corrections"
+    /// line can never read as "nothing happened" when a large, uncounted
+    /// resync did.
+    unmatched_reconciles: u64,
+    max_unmatched_displacement_m: f64,
+}
+
 /// Receives one baseline transfer whose `BaselineBegin` has already been read:
 /// accepts the bulk stream, reassembles + decodes the payload, then consumes
 /// records until `BaselineEnd`. Returns the decoded world, or `None` on any
@@ -700,8 +734,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     ))?;
 
     // A movement client pulls a baseline like a late joiner so it works with any
-    // scene the server runs (T19 uses the `walk` arena).
-    let want_baseline = config.late_join || !config.movement_script.is_empty();
+    // scene the server runs (T19 uses the `walk` arena). An interactive
+    // client always predicts a player too, exactly like a non-empty
+    // `movement_script`.
+    let want_baseline =
+        config.late_join || !config.movement_script.is_empty() || config.interactive.is_some();
 
     let replica = Arc::new(Mutex::new(if want_baseline {
         ReplicaWorld::empty(ReplicaConfig::default())
@@ -714,6 +751,13 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         )
     }));
     let counters = Arc::new(Counters::default());
+
+    // The window reads live terrain straight off the replica for its debug
+    // draw; publish the handle once, up front, rather than threading it
+    // through every later closure.
+    if let Some(session) = &config.interactive {
+        let _ = session.replica.set(replica.clone());
+    }
 
     // T17: pull a full baseline over a bulk transfer before touching the
     // replication stream, so the replica starts at the server's current
@@ -746,12 +790,14 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         hook(replica.clone());
     }
 
-    // T19: a scripted-movement client predicts its own player capsule.
-    let predictor = (!config.movement_script.is_empty()).then(|| {
-        Arc::new(Mutex::new(Predictor::new(session_player_entity(
-            conn.session(),
-        ))))
-    });
+    // T19: a scripted-movement (or interactively-played) client predicts its
+    // own player capsule.
+    let predictor =
+        (!config.movement_script.is_empty() || config.interactive.is_some()).then(|| {
+            Arc::new(Mutex::new(Predictor::new(session_player_entity(
+                conn.session(),
+            ))))
+        });
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
@@ -933,6 +979,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let replica = replica.clone();
         let counters = counters.clone();
         let predictor = predictor.clone();
+        let interactive = config.interactive.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_datagram().await {
@@ -943,16 +990,62 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         // T19: a snapshot for our own player entity reconciles
                         // the predictor rather than entering the body replica.
                         if let Some(pred) = &predictor {
+                            // Locked (and dropped) before `pred`'s own lock below,
+                            // matching the mover loop's lock ordering
+                            // (`replica` then `pred`) to avoid a cross-task
+                            // deadlock risk.
+                            let terrain_volume = {
+                                let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                                guard.terrain_volume().cloned()
+                            };
                             let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
                             let p: &mut Predictor = &mut guard;
                             if snap.body == p.entity {
                                 let st = state_from_snapshot(&snap);
                                 match &mut p.player {
                                     None => {
-                                        p.player = Some(PredictedPlayer::new(p.params, st));
+                                        p.player = Some(PredictedPlayer::new(
+                                            p.params,
+                                            st,
+                                            snap.server_tick,
+                                        ));
                                         p.script_origin_tick.get_or_insert(snap.server_tick.get());
                                     }
-                                    Some(pl) => pl.reconcile(&p.phys, st, snap.acked_input),
+                                    // The live HUD path only needs `PredictedPlayer`'s own
+                                    // running counters, read separately below; the returned
+                                    // per-event `CorrectionEvent` instead goes to
+                                    // `CorrectionLog` (ENG-69 round 10/11 — see its own doc)
+                                    // when this is an interactive session, for post-hoc
+                                    // analysis of a real hands-on run.
+                                    //
+                                    // `terrain_volume` is `None` only before the replica
+                                    // has any terrain object at all — skipping
+                                    // reconciliation this one time is the same as any
+                                    // other not-ready tick, not a hard failure.
+                                    Some(pl) => {
+                                        if let Some(volume) = &terrain_volume {
+                                            let outcome = pl.reconcile(
+                                                &mut p.phys,
+                                                volume,
+                                                st,
+                                                snap.acked_input,
+                                                snap.server_tick,
+                                            );
+                                            // Logged unconditionally, not only
+                                            // when `outcome.comparison` is
+                                            // `Some` (ENG-69 round 21): a
+                                            // silent full resync — every
+                                            // record dropped, no comparison
+                                            // possible — is exactly the case
+                                            // that must never read as "zero
+                                            // corrections".
+                                            if let Some(session) = &interactive
+                                                && let Some(log) = &session.corrections
+                                            {
+                                                log.record(&outcome);
+                                            }
+                                        }
+                                    }
                                 }
                                 counters.motion.fetch_add(1, Ordering::Relaxed);
                                 continue;
@@ -1025,6 +1118,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let session = conn.session();
         let stop_rx = stop_rx.clone();
         let client_residency = config.client_residency;
+        let interactive = config.interactive.clone();
         tokio::spawn(async move {
             let end_tick = script_end_tick(&script);
             // Slice E2: a scripted mover optionally evicts terrain outside a
@@ -1038,33 +1132,62 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             // without ever sending an input frame.
             let mut active_script_tick = 0_u64;
             let mut last_active_server_tick = None;
+            // ENG-69, PR #109 review: this loop's own per-iteration cost
+            // (the terrain-hash/clone work below, plus the unconditional
+            // 16ms sleep at its end) is not a fixed 16ms — it varies with
+            // scene size — so real time between iterations can cover more
+            // than one `MOVEMENT_DT_S`-wide tick. Calling `PredictedPlayer::
+            // tick` exactly once per iteration regardless silently starved
+            // `Record::tick`'s tagging scheme (`predict.rs`) of the "local
+            // tick count tracks real elapsed ticks" correspondence it needs
+            // — confirmed against a real interactive session's own
+            // correction log (844 of 844 reconciles unmatched,
+            // `records_replayed` pinned at 0 the entire session). See
+            // `crate::tick_accumulator` for the fix.
+            let mut tick_accumulator =
+                TickAccumulator::new(Duration::from_secs_f32(MOVEMENT_DT_S));
+            let mut last_tick_accumulator_at = std::time::Instant::now();
             loop {
                 if *stop_rx.borrow() {
                     return;
                 }
+                let now = std::time::Instant::now();
+                let ticks_to_run =
+                    tick_accumulator.advance(now.duration_since(last_tick_accumulator_at));
+                last_tick_accumulator_at = now;
                 let tick = counters.last_tick.load(Ordering::Relaxed);
 
-                // Rebuild the collider if the terrain changed near us.
-                let terrain = {
+                // Rebuild the collider if the terrain changed near us. Kept as
+                // two separate bindings, not one `Option<(Hash32, Volume)>`
+                // (as before ENG-69 round 18): `terrain_volume` needs to stay
+                // borrowable both for the dirty-check block below *and* for
+                // every `pl.tick` call afterward, which now also needs a
+                // fresh `&Volume` each tick for its own window cache.
+                let (terrain_hash, terrain_volume) = {
                     let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
-                    guard
-                        .terrain_resident_hash()
-                        .zip(guard.terrain_volume().cloned())
+                    (
+                        guard.terrain_resident_hash(),
+                        guard.terrain_volume().cloned(),
+                    )
                 };
                 // All predictor-lock work happens in this non-async block, which
                 // returns the datagram to send (and the predicted feet position
                 // for the residency pass) once the guard is dropped.
-                let (frame, feet, script_tick): (
+                type MoverTickOutcome = (
                     Option<InputFrame>,
                     Option<[f64; 3]>,
                     Option<u64>,
-                ) = {
+                    Option<CharacterState>,
+                    Option<CorrectionStats>,
+                    WindowStats,
+                );
+                let (frame, feet, script_tick, predicted_state, correction_stats, window_stats): MoverTickOutcome = {
                     let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
                     let p: &mut Predictor = &mut guard;
-                    if let Some((hash, volume)) = terrain
+                    if let (Some(hash), Some(volume)) = (terrain_hash, &terrain_volume)
                         && p.terrain_hash != Some(hash)
                     {
-                        p.phys.set_terrain(&volume);
+                        p.phys.set_terrain(volume);
                         let first = p.terrain_hash.is_none();
                         p.terrain_hash = Some(hash);
                         if !first && let Some(pl) = &mut p.player {
@@ -1095,11 +1218,25 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     let script_tick = p.script_origin_tick.map(|_| active_script_tick);
 
                     let frame = if ready && p.phys.has_terrain() {
-                        let input = scripted_input(&script, script_tick.unwrap_or(0));
+                        let input = match &interactive {
+                            Some(session) => session.input.snapshot(),
+                            None => scripted_input(&script, script_tick.unwrap_or(0)),
+                        };
                         p.input_seq += 1;
                         let seq = InputSeq(p.input_seq);
-                        if let Some(pl) = &mut p.player {
-                            pl.tick(&p.phys, input, seq, MOVEMENT_DT_S);
+                        if let Some(pl) = &mut p.player
+                            && let Some(volume) = &terrain_volume
+                        {
+                            // Catch local prediction up to however many real
+                            // ticks elapsed since the last iteration (see
+                            // `tick_accumulator` above) — usually 1, more
+                            // when this loop's own per-iteration cost ran
+                            // long. The same sampled `input`/`seq` covers
+                            // every tick in the burst, exactly like ordinary
+                            // held-input reuse already does.
+                            for _ in 0..ticks_to_run {
+                                pl.tick(&mut p.phys, volume, input, seq, MOVEMENT_DT_S);
+                            }
                         }
                         // Preserve the script's server-tick cadence.  The
                         // mover itself samples more often than snapshots can
@@ -1138,11 +1275,48 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         last_active_server_tick = None;
                         None
                     };
-                    let feet = p.player.as_ref().map(|pl| pl.predicted().position_m);
-                    (frame, feet, script_tick)
+                    let predicted_state = p.player.as_ref().map(PredictedPlayer::predicted);
+                    let feet = predicted_state.map(|st| st.position_m);
+                    let correction_stats = p.player.as_ref().map(|pl| CorrectionStats {
+                        corrections: pl.corrections,
+                        max_correction_m: pl.max_correction_m,
+                        idle_corrections: pl.idle_corrections,
+                        max_idle_correction_m: pl.max_idle_correction_m,
+                        max_vertical_correction_m: pl.max_vertical_correction_m,
+                        max_horizontal_correction_m: pl.max_horizontal_correction_m,
+                        unmatched_reconciles: pl.unmatched_reconciles,
+                        max_unmatched_displacement_m: pl.max_unmatched_displacement_m,
+                    });
+                    let window_stats = p.phys.window_stats();
+                    (
+                        frame,
+                        feet,
+                        script_tick,
+                        predicted_state,
+                        correction_stats,
+                        window_stats,
+                    )
                 };
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
+                }
+                if let (Some(session), Some(predicted)) = (&interactive, predicted_state) {
+                    let stats = correction_stats.unwrap_or_default();
+                    *session.view.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(InteractiveView {
+                            predicted,
+                            server_tick: tick,
+                            published_at: std::time::Instant::now(),
+                            corrections: stats.corrections,
+                            max_correction_m: stats.max_correction_m,
+                            idle_corrections: stats.idle_corrections,
+                            max_idle_correction_m: stats.max_idle_correction_m,
+                            max_vertical_correction_m: stats.max_vertical_correction_m,
+                            max_horizontal_correction_m: stats.max_horizontal_correction_m,
+                            unmatched_reconciles: stats.unmatched_reconciles,
+                            max_unmatched_displacement_m: stats.max_unmatched_displacement_m,
+                            window_stats,
+                        });
                 }
 
                 // Slice E2: evict / request-reload terrain around the player.
@@ -1265,6 +1439,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let done = {
         let counters = counters.clone();
         let run_ticks = config.run_ticks;
+        let interactive = config.interactive.clone();
         async move {
             tokio::select! {
                 _ = async { let _ = control.await; let _ = motion.await; } => {}
@@ -1278,6 +1453,17 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }, if run_ticks > 0 => {}
+                // The window's close handler sets this so an interactive
+                // session disconnects promptly instead of riding out
+                // `overall_timeout`.
+                _ = async {
+                    loop {
+                        if interactive.as_ref().is_some_and(|s| s.stop.load(Ordering::Relaxed)) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }, if interactive.is_some() => {}
             }
         }
     };

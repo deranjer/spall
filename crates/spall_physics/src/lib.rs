@@ -26,15 +26,20 @@ pub mod mass;
 pub mod merge;
 pub mod metrics;
 pub mod occupancy;
+pub mod query_cache;
 pub mod report;
 pub mod world;
 
 pub use character::{CharacterMove, CharacterParams, CharacterState, PlayerInput, step_character};
-pub use collider::{ColliderBuild, Representation, build_collider};
+pub use collider::{
+    ColliderBuild, MERGED_CUBOID_PRIMITIVE_BUDGET, Representation, build_collider,
+    choose_representation,
+};
 pub use mass::{BodyMassProperties, MassProperties, analytic_mass_properties};
 pub use merge::{BoxSpan, greedy_boxes};
 pub use metrics::{DurationSamples, PercentileSummary};
 pub use occupancy::{ExtractError, OccupancyGrid};
+pub use query_cache::{CharacterQueryCache, REBUILD_MARGIN_M, WINDOW_RADIUS_M, WindowStats};
 pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_feasibility};
 pub use world::{
     BodyId, BodyKind, BodySpec, BodyState, ContactImpulse, PhysicsConfig, PhysicsWorld, StepTiming,

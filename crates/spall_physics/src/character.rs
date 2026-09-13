@@ -247,12 +247,16 @@ mod tests {
     const CELL_M: f32 = fixtures::CELL_M;
 
     fn add_fixed(world: &mut PhysicsWorld, volume: &Volume) -> BodyId {
+        add_fixed_rep(world, volume, Representation::MergedCuboids)
+    }
+
+    fn add_fixed_rep(world: &mut PhysicsWorld, volume: &Volume, rep: Representation) -> BodyId {
         let grid = OccupancyGrid::from_volume(volume)
             .expect("extract")
             .expect("non-empty");
         world.add_body(BodySpec {
             kind: BodyKind::Fixed,
-            representation: Representation::MergedCuboids,
+            representation: rep,
             grid,
             cell_m: CELL_M,
             density_kg_m3: 1.0,
@@ -451,6 +455,421 @@ mod tests {
             "resting vertical velocity should be ~0, got {}",
             end.velocity_m_s[1]
         );
+    }
+
+    #[test]
+    fn resting_xz_agrees_between_merged_cuboids_and_native_voxels() {
+        // ENG-69 round 8: after eliminating the client's own MergedCuboids
+        // seam artifact (client always builds NativeVoxels now), a live
+        // session against a server terrain body built as MergedCuboids still
+        // showed a small (~0.15 m), stable, purely-horizontal, idle-reproducible
+        // prediction/authoritative disagreement. This isolates that specific
+        // remaining variable in a pure CPU test, no networking involved: the
+        // *same* flat floor, built once as each representation, with an
+        // identical idle capsule run against each. If Rapier's contact
+        // resolution for a Voxels shape and a Cuboid shape disagree even on
+        // perfectly flat, gap-free, identical geometry, resting XZ drifts
+        // between the two runs — confirming the representation *type* itself
+        // (not terrain fragmentation/seams) is the remaining source, which
+        // would mean client and server must use the *same* representation
+        // for genuinely matching prediction, not just each build a
+        // individually-reasonable one.
+        let floor = fixtures::floor_slab(VolumeId::new(1).unwrap(), 2, 2, 4);
+        let top = 4.0 * f64::from(CELL_M);
+        let start = CharacterState::at([8.0, top + 2.0, 8.0]);
+
+        let mut cuboid_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut cuboid_world, &floor, Representation::MergedCuboids);
+        cuboid_world.step();
+        let cuboid_end = run(&mut cuboid_world, start, PlayerInput::NEUTRAL, 300);
+
+        let mut voxel_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut voxel_world, &floor, Representation::NativeVoxels);
+        voxel_world.step();
+        let voxel_end = run(&mut voxel_world, start, PlayerInput::NEUTRAL, 300);
+
+        assert!(
+            cuboid_end.grounded && voxel_end.grounded,
+            "both should land"
+        );
+        let dx = cuboid_end.position_m[0] - voxel_end.position_m[0];
+        let dz = cuboid_end.position_m[2] - voxel_end.position_m[2];
+        let horiz_gap = (dx * dx + dz * dz).sqrt();
+        assert!(
+            horiz_gap < 0.01,
+            "resting XZ disagrees between representations on identical flat \
+             geometry: cuboid {:?} vs voxels {:?} (horizontal gap {horiz_gap:.4} m) \
+             — the same shape drifts sideways differently depending on which \
+             Rapier collider type resolves its rest contact, so client and \
+             server predicting from different representations of the same \
+             terrain can never fully agree even with zero seams on either side",
+            cuboid_end.position_m,
+            voxel_end.position_m
+        );
+    }
+
+    #[test]
+    fn walking_the_g1_ramp_diverges_between_representations() {
+        // ENG-69 round 9: the flat-floor test above proved Voxels and Cuboid
+        // shapes agree on identical geometry *without* internal seams. Does a
+        // real feature with genuine internal MergedCuboids seams — not an
+        // artificial partial-view crop — actually produce a resolvable
+        // disagreement? Use the exact fixture behind the live
+        // `cargo xtask play --scene g1` session the correction was measured
+        // on: `g1_full_envelope_scene` merges to only ~39 total boxes for its
+        // ~3M solid cells (comfortably inside the budget, confirmed by
+        // `spall_sim::collider`'s own `g1_full_envelope_scene_representation_choice`
+        // test — this is why the server picks `MergedCuboids` for it), but
+        // its one deliberate ramp feature (`g1_full_envelope_scene`'s own
+        // doc: 12 cells of height dropped over 32 cells of x, cell y in
+        // `[180, 211]`, cell z in `[100, 115]`) is a staircase of several
+        // tread boxes meeting at right-angle seams — exactly the kind of
+        // internal seam the flat floor above has none of.
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+
+        let mut cuboid_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut cuboid_world, &volume, Representation::MergedCuboids);
+        cuboid_world.step();
+
+        let mut voxel_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut voxel_world, &volume, Representation::NativeVoxels);
+        voxel_world.step();
+
+        // Just before the ramp, on the flat plain (cell height 46), walking
+        // +X across the whole ramp and stopping just short of its bottom
+        // (cell x = 211) so the run never reaches whatever geometry lies
+        // beyond it.
+        let start = CharacterState::at([
+            179.0 * f64::from(CELL_M),
+            46.0 * f64::from(CELL_M),
+            106.0 * f64::from(CELL_M),
+        ]);
+        let input = PlayerInput {
+            movement: [0.0, 0.0, 1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+        let cuboid_end = run(&mut cuboid_world, start, input, 100);
+        let voxel_end = run(&mut voxel_world, start, input, 100);
+
+        let dx = cuboid_end.position_m[0] - voxel_end.position_m[0];
+        let dz = cuboid_end.position_m[2] - voxel_end.position_m[2];
+        let dy = cuboid_end.position_m[1] - voxel_end.position_m[1];
+        let horiz_gap = (dx * dx + dz * dz).sqrt();
+        eprintln!(
+            "g1 ramp walk: cuboid {:?} (grounded {}) vs voxels {:?} (grounded {}) \
+             -> horiz gap {horiz_gap:.4} m, vert gap {:.4} m",
+            cuboid_end.position_m,
+            cuboid_end.grounded,
+            voxel_end.position_m,
+            voxel_end.grounded,
+            dy
+        );
+        // Deliberately not asserting a bound here (unlike the flat-floor
+        // test): this test's purpose is the eprintln! above (run with
+        // `-- --nocapture`) — measuring whether real ramp/staircase seams
+        // move XZ at all, to settle whether ENG-69's round-9 theory (the
+        // server's own MergedCuboids seams, not any client-side issue, are
+        // the residual's source) holds up against the actual scene, not just
+        // an idealized flat floor.
+    }
+
+    #[test]
+    fn strafing_the_g1_tower_wall_diverges_between_representations() {
+        // ENG-69 round 15: the ramp test above confirms the seam mechanism
+        // is real on a staircase feature crossed head-on; it does not by
+        // itself establish that a hands-on session's felt jitter — reported
+        // while strafing *around the G1 tower's base* specifically, not
+        // crossing the ramp — has the same cause. A reviewer correctly
+        // flagged this gap (`g1_ramp_trace.rs`'s own doc already disclaims
+        // covering "every possible source"), and separately noted the
+        // measured ~0.150 m horizontal correction equals exactly two
+        // movement ticks (`WALK_SPEED_M_S * 2 / 60`) — worth keeping open as
+        // an alternative, input-acknowledgement-timing explanation rather
+        // than assuming this test alone settles it. Same methodology as the
+        // ramp test, applied to a *lateral wall-slide* instead of a
+        // head-on ramp crossing: approach flush against the tower's west
+        // face (`G1_TOWER_X0` = cell 24 = 6.0 m) then strafe along it while
+        // still pressing in — hugging a corner, exactly what rounding an
+        // obstacle while strafing does — and diff the resulting trajectory
+        // between representations built from the identical complete
+        // geometry (no partial-occupancy confound — see this file's own
+        // flat-floor test above for why that variable has to be held
+        // fixed to isolate representation type).
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+
+        let mut cuboid_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut cuboid_world, &volume, Representation::MergedCuboids);
+        cuboid_world.step();
+
+        let mut voxel_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut voxel_world, &volume, Representation::NativeVoxels);
+        voxel_world.step();
+
+        // 1 m west of the tower's west wall (cell x=24 -> 6.0 m), mid-span
+        // on z (tower z 32..=47 -> 8.0..12.0 m; z=10.0 m sits 2 m clear of
+        // either corner at the start, so a ~2.5 s strafe reaches and rounds
+        // one of them regardless of which way "strafe right" resolves),
+        // standing on the flat plain (cell height 46 -> 11.5 m).
+        let start = CharacterState::at([5.0, 46.0 * f64::from(CELL_M), 10.0]);
+        let approach = PlayerInput {
+            movement: [0.0, 0.0, 1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+        // Forward (into the wall, keeping contact pressure) plus strafe
+        // (the lateral component that actually slides along the face and
+        // around the corner) — `diagonal_input_is_not_faster` above already
+        // confirms this doesn't move any faster than pure-forward, just at
+        // an angle.
+        let hug = PlayerInput {
+            movement: [1.0, 0.0, 1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+        let cuboid_mid = run(&mut cuboid_world, start, approach, 30);
+        let voxel_mid = run(&mut voxel_world, start, approach, 30);
+
+        // Per-tick trace of the "hug" phase specifically: does the gap
+        // between representations open in discrete jumps concentrated at
+        // specific ticks (consistent with crossing individual MergedCuboids
+        // box seams, one per contact with a new box), or drift smoothly and
+        // continuously throughout (which would instead point at ordinary
+        // per-tick contact-resolution differences between the two shape
+        // types, unrelated to any specific seam)? Distinguishes the seam
+        // theory from an alternative the review raised: an input-
+        // acknowledgement/replay-timing bug, which would not correlate with
+        // geometric contact events at all.
+        let params = CharacterParams::DEFAULT;
+        let mut cuboid_state = cuboid_mid;
+        let mut voxel_state = voxel_mid;
+        let mut prev_gap = 0.0_f64;
+        for tick in 0..150 {
+            // `sweep_character_with` instead of `sweep_character`: surfaces
+            // the `CharacterCollision`s Rapier's controller reports (each
+            // hit's collider, contact normal, time of impact) instead of
+            // discarding them — directly confirms a divergence-producing
+            // tick is a real contact against real geometry, not a
+            // coincidental integration difference with no contact at all.
+            let mut cuboid_hits = Vec::new();
+            cuboid_state = step_character(cuboid_state, hug, DT, |pos, desired| {
+                cuboid_world.sweep_character_with(params, pos, desired, DT, |c| {
+                    cuboid_hits.push(*c);
+                })
+            });
+            let mut voxel_hits = Vec::new();
+            voxel_state = step_character(voxel_state, hug, DT, |pos, desired| {
+                voxel_world.sweep_character_with(params, pos, desired, DT, |c| {
+                    voxel_hits.push(*c);
+                })
+            });
+            let dx = cuboid_state.position_m[0] - voxel_state.position_m[0];
+            let dz = cuboid_state.position_m[2] - voxel_state.position_m[2];
+            let gap = (dx * dx + dz * dz).sqrt();
+            let step = gap - prev_gap;
+            if step.abs() > 0.002 {
+                eprintln!(
+                    "  tick {tick:3}: horiz gap {gap:.4} m (+{step:.4} this tick) | \
+                     cuboid x={:.3} z={:.3} grounded={} hits={} | voxels x={:.3} z={:.3} \
+                     grounded={} hits={}",
+                    cuboid_state.position_m[0],
+                    cuboid_state.position_m[2],
+                    cuboid_state.grounded,
+                    cuboid_hits.len(),
+                    voxel_state.position_m[0],
+                    voxel_state.position_m[2],
+                    voxel_state.grounded,
+                    voxel_hits.len(),
+                );
+                for hit in &cuboid_hits {
+                    eprintln!(
+                        "    cuboid hit: normal1={:?} toi={:.4} remaining={:?}",
+                        hit.hit.normal1, hit.hit.time_of_impact, hit.translation_remaining
+                    );
+                }
+                for hit in &voxel_hits {
+                    eprintln!(
+                        "    voxel  hit: normal1={:?} toi={:.4} remaining={:?}",
+                        hit.hit.normal1, hit.hit.time_of_impact, hit.translation_remaining
+                    );
+                }
+            }
+            prev_gap = gap;
+        }
+
+        let dx = cuboid_state.position_m[0] - voxel_state.position_m[0];
+        let dz = cuboid_state.position_m[2] - voxel_state.position_m[2];
+        let dy = cuboid_state.position_m[1] - voxel_state.position_m[1];
+        let horiz_gap = (dx * dx + dz * dz).sqrt();
+        eprintln!(
+            "g1 tower-wall strafe: cuboid mid={:?} end={:?} (grounded {}) vs \
+             voxels mid={:?} end={:?} (grounded {}) -> horiz gap {horiz_gap:.4} m, \
+             vert gap {:.4} m",
+            cuboid_mid.position_m,
+            cuboid_state.position_m,
+            cuboid_state.grounded,
+            voxel_mid.position_m,
+            voxel_state.position_m,
+            voxel_state.grounded,
+            dy
+        );
+        // Deliberately not asserting a bound here, same rationale as the
+        // ramp test: this is a measurement to settle whether the seam
+        // mechanism extends to lateral wall-hugging, not an acceptance
+        // gate.
+    }
+
+    #[test]
+    fn tick_131_isolates_the_slope_handling_divergence() {
+        // ENG-69 round 16: the wall-strafe test above found the whole
+        // 0.0805 m gap opens in exactly one tick (131) with a real contact
+        // on both sides — but review correctly pushed back that "ground
+        // snap" (the operation nearest the end of `move_shape`) cannot by
+        // itself explain a *horizontal* displacement, so which controller
+        // operation actually produces it needs to be established, not
+        // inferred from proximity to a floor-ish contact normal. Isolates
+        // that one tick: reproduces the state immediately before it (from
+        // the `MergedCuboids` trajectory only — the two runs are ~3 mm apart
+        // by then, see the previous test's per-tick trace), then re-runs
+        // *that exact same* starting state and input against a fresh
+        // instance of each representation for exactly one more tick, so any
+        // difference in the result can only come from this one tick's own
+        // contact resolution, never an accumulated prior difference.
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+        let params = CharacterParams::DEFAULT;
+
+        let start = CharacterState::at([5.0, 46.0 * f64::from(CELL_M), 10.0]);
+        let approach = PlayerInput {
+            movement: [0.0, 0.0, 1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+        let hug = PlayerInput {
+            movement: [1.0, 0.0, 1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+
+        // The state immediately before tick 131: 30 approach ticks + 130
+        // hug ticks, against the `MergedCuboids` representation only.
+        let mut reference_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut reference_world, &volume, Representation::MergedCuboids);
+        reference_world.step();
+        let pre_approach = run(&mut reference_world, start, approach, 30);
+        let pre_state = run(&mut reference_world, pre_approach, hug, 130);
+
+        // The isolated experiment: from that identical state, one tick
+        // against each representation, in fresh worlds (so neither carries
+        // any broad-phase state from `reference_world`'s own run).
+        let mut cuboid_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut cuboid_world, &volume, Representation::MergedCuboids);
+        cuboid_world.step();
+        let mut voxel_world = PhysicsWorld::new(PhysicsConfig::default());
+        add_fixed_rep(&mut voxel_world, &volume, Representation::NativeVoxels);
+        voxel_world.step();
+
+        let mut cuboid_hits = Vec::new();
+        let mut cuboid_desired = [0.0f32; 3];
+        let cuboid_end = step_character(pre_state, hug, DT, |pos, desired| {
+            cuboid_desired = desired;
+            cuboid_world.sweep_character_with(params, pos, desired, DT, |c| {
+                cuboid_hits.push(*c);
+            })
+        });
+        let mut voxel_hits = Vec::new();
+        let mut voxel_desired = [0.0f32; 3];
+        let voxel_end = step_character(pre_state, hug, DT, |pos, desired| {
+            voxel_desired = desired;
+            voxel_world.sweep_character_with(params, pos, desired, DT, |c| {
+                voxel_hits.push(*c);
+            })
+        });
+
+        let cuboid_actual = [
+            (cuboid_end.position_m[0] - pre_state.position_m[0]) as f32,
+            (cuboid_end.position_m[1] - pre_state.position_m[1]) as f32,
+            (cuboid_end.position_m[2] - pre_state.position_m[2]) as f32,
+        ];
+        let voxel_actual = [
+            (voxel_end.position_m[0] - pre_state.position_m[0]) as f32,
+            (voxel_end.position_m[1] - pre_state.position_m[1]) as f32,
+            (voxel_end.position_m[2] - pre_state.position_m[2]) as f32,
+        ];
+        let dx = cuboid_end.position_m[0] - voxel_end.position_m[0];
+        let dz = cuboid_end.position_m[2] - voxel_end.position_m[2];
+        let horiz_gap_this_tick = (dx * dx + dz * dz).sqrt();
+
+        eprintln!(
+            "tick 131 isolated: pre_state pos={:?} grounded={}",
+            pre_state.position_m, pre_state.grounded
+        );
+        eprintln!(
+            "  requested translation (desired, both identical): cuboid={cuboid_desired:?} \
+             voxel={voxel_desired:?}"
+        );
+        eprintln!(
+            "  cuboid: {} hit(s), actual translation={cuboid_actual:?}, end grounded={}",
+            cuboid_hits.len(),
+            cuboid_end.grounded
+        );
+        for hit in &cuboid_hits {
+            eprintln!(
+                "    hit: normal1={:?} toi={:.5} remaining={:?}",
+                hit.hit.normal1, hit.hit.time_of_impact, hit.translation_remaining
+            );
+        }
+        eprintln!(
+            "  voxel : {} hit(s), actual translation={voxel_actual:?}, end grounded={}",
+            voxel_hits.len(),
+            voxel_end.grounded
+        );
+        for hit in &voxel_hits {
+            eprintln!(
+                "    hit: normal1={:?} toi={:.5} remaining={:?}",
+                hit.hit.normal1, hit.hit.time_of_impact, hit.translation_remaining
+            );
+        }
+        eprintln!(
+            "  -> from the *identical* pre-state and input, one tick alone produces a \
+             {horiz_gap_this_tick:.4} m horizontal gap"
+        );
+
+        // The mechanism, not just the symptom: `KinematicCharacterController
+        // ::decompose_hit` (Rapier's own slope-handling step, called from
+        // `handle_slopes` — not `handle_stairs`/autostep, which only runs
+        // for a wall-steep contact, and not `snap_to_ground`, which runs
+        // after and only adjusts the up-axis) derives a
+        // "horizontal tangent direction" as `hit.normal1.cross(up)`, then
+        // resolves the remaining wish vector against it. For a *perfectly*
+        // vertical normal — which only `MergedCuboids`' exactly-axis-aligned
+        // box-top faces can produce — that cross product is the zero vector
+        // (mathematically degenerate: a perfectly flat, perfectly
+        // horizontal surface has no privileged "along the surface"
+        // direction), and Rapier's own fallback (`try_normalize().
+        // unwrap_or_default()`) dumps the entire tangential remainder into
+        // the *vertical* tangent component instead of splitting it
+        // horizontally. `NativeVoxels`' contact normals are essentially
+        // never exactly vertical (this run's tilt: ~3-6 degrees off), so the
+        // cross product is well-defined there, and the wish vector's
+        // horizontal component is retained and applied along a real
+        // direction. Same code path, same branch (`is_wall`/`is_nonslip_
+        // slope` should classify identically for two contacts this close to
+        // vertical — verified by the two runs each reporting exactly one
+        // hit, not two), genuinely different result: this is why "ground
+        // snap alone" doesn't explain it, and why "the contact normal
+        // happened to be near-vertical" isn't itself the culprit — it's
+        // specifically the *exactness* of a `MergedCuboids` box-top normal
+        // that hits this degenerate case.
+        for (label, hits) in [("cuboid", &cuboid_hits), ("voxel", &voxel_hits)] {
+            for hit in hits {
+                let up = Vector::new(0.0, 1.0, 0.0);
+                let cross_len = hit.hit.normal1.cross(up).length();
+                eprintln!(
+                    "  {label} hit: |normal x up| = {cross_len:.6} (near 0 = degenerate \
+                     horizontal-tangent-direction case)"
+                );
+            }
+        }
     }
 
     #[test]

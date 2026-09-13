@@ -135,6 +135,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         transport: TransportConfig::for_tests(),
         client_residency: None,
         on_replica_ready: None,
+        interactive: None,
     };
     let early_thread = std::thread::spawn(move || run_replication_client(early_cfg));
 
@@ -163,6 +164,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         transport: TransportConfig::for_tests(),
         client_residency: None,
         on_replica_ready: None,
+        interactive: None,
     };
     let late = run_replication_client(late_cfg).expect("late-join client run");
     let early = early_thread

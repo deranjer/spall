@@ -892,6 +892,8 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         await_body_settle: false,
         motion_interest: None,
         residency: None,
+        contact_damage: None,
+        dormancy: None,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 
@@ -947,6 +949,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         transport: TransportConfig::for_tests(),
         client_residency: None,
         on_replica_ready: None,
+        interactive: None,
     };
     let cutter_thread = std::thread::spawn(move || run_replication_client(cutter_cfg));
 
@@ -975,6 +978,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         on_replica_ready: Some(Arc::new(move |r| {
             *replica_slot_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         })),
+        interactive: None,
     };
     let observer_thread = std::thread::spawn(move || run_replication_client(observer_cfg));
 

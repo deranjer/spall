@@ -2106,18 +2106,18 @@ fn finish(output: &Path, summary: SessionSummary) -> Result<(), XtaskError> {
 // --- child supervision -------------------------------------------------------
 
 #[derive(Default)]
-struct ChildGuard {
+pub(crate) struct ChildGuard {
     children: Vec<(String, Child)>,
 }
 
 impl ChildGuard {
-    fn push(&mut self, label: String, child: Child) {
+    pub(crate) fn push(&mut self, label: String, child: Child) {
         self.children.push((label, child));
     }
 
     /// Polls every child until all have exited or `deadline` passes; kills any
     /// survivors. Returns `label -> exit code` (`None` if killed / no code).
-    fn wait_all(&mut self, deadline: Duration) -> BTreeMap<String, Option<i32>> {
+    pub(crate) fn wait_all(&mut self, deadline: Duration) -> BTreeMap<String, Option<i32>> {
         let end = Instant::now() + deadline;
         let mut codes: BTreeMap<String, Option<i32>> = BTreeMap::new();
         loop {
@@ -2161,7 +2161,7 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_for_addr(
+pub(crate) fn wait_for_addr(
     path: &Path,
     guard: &mut ChildGuard,
     deadline: Duration,
@@ -2202,7 +2202,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Option<T> 
     serde_json::from_str(&buf).ok()
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -2214,7 +2214,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
 
 /// 64 lowercase hex chars from a seeded SplitMix64-ish stream (no crypto needed:
 /// this is a per-run development token in an ignored directory).
-fn random_hex_32(seed: u64) -> String {
+pub(crate) fn random_hex_32(seed: u64) -> String {
     let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
     let mut out = String::with_capacity(64);
     for _ in 0..4 {

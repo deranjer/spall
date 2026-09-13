@@ -1923,6 +1923,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "poc-local"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam 0.33.6",
+ "pollster",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2600,6 +2611,8 @@ dependencies = [
 name = "spall_client"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "glam 0.33.6",
  "pollster",
  "serde",
  "serde_json",
