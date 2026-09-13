@@ -599,7 +599,10 @@ enum Outbound {
     /// or one brick for a hash repair — the client decides replace vs. merge
     /// from whether it has installed a baseline yet.
     Baseline(Arc<BaselineTransfer>),
-    Shutdown,
+    /// Ends the connection with the given `Bye` reason (T23 / G3 row 10: a
+    /// catch-up-exhaustion give-up carries a reason distinct from an ordinary
+    /// end of session, so the client can tell the two apart on the wire).
+    Shutdown(&'static str),
 }
 
 type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
@@ -640,8 +643,8 @@ impl OutboundQueue {
                 Ok(())
             }
             // The shutdown marker always goes through — it ends the stream.
-            Outbound::Shutdown => {
-                self.reliable.push_back(Outbound::Shutdown);
+            Outbound::Shutdown(reason) => {
+                self.reliable.push_back(Outbound::Shutdown(reason));
                 Ok(())
             }
             reliable => {
@@ -688,7 +691,7 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
         }
         Outbound::Status(_) => 96,
         Outbound::Baseline(t) => 64 + t.payload_bytes(),
-        Outbound::Motion(_) | Outbound::Shutdown => 0,
+        Outbound::Motion(_) | Outbound::Shutdown(_) => 0,
     }
 }
 
@@ -1401,7 +1404,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             }
         }
 
-        broadcast(&clients_for_sim, Outbound::Shutdown);
+        broadcast(
+            &clients_for_sim,
+            Outbound::Shutdown(Connection::BYE_REASON_COMPLETE),
+        );
 
         // Clean-shutdown durability: queue the final journal tail + checkpoint
         // + retain, then block until the off-thread writer has drained and
@@ -2029,7 +2035,11 @@ impl LateJoin {
             if retries > self.max_retries {
                 self.failed += 1;
                 self.links.remove(&raw);
-                send_to(clients, session, Outbound::Shutdown);
+                send_to(
+                    clients,
+                    session,
+                    Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                );
                 continue;
             }
             self.retries += 1;
@@ -2049,7 +2059,11 @@ impl LateJoin {
                 None => {
                     self.failed += 1;
                     self.links.remove(&raw);
-                    send_to(clients, session, Outbound::Shutdown);
+                    send_to(
+                        clients,
+                        session,
+                        Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                    );
                 }
             }
         }
@@ -2122,7 +2136,11 @@ impl LateJoin {
                 _ => {
                     self.failed += 1;
                     if let Some(link) = self.links.remove(&raw) {
-                        send_to(clients, link.session, Outbound::Shutdown);
+                        send_to(
+                            clients,
+                            link.session,
+                            Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                        );
                     }
                 }
             }
@@ -2796,8 +2814,8 @@ async fn serve_conn(
                     Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
                     // Motion is never queued as reliable; ignore defensively.
                     Outbound::Motion(_) => true,
-                    Outbound::Shutdown => {
-                        let _ = conn.say_bye("server complete").await;
+                    Outbound::Shutdown(reason) => {
+                        let _ = conn.say_bye(reason).await;
                         false
                     }
                 };
@@ -3299,6 +3317,69 @@ mod tests {
         assert!(
             !lj.links.contains_key(&joiner.raw()),
             "the joiner was dropped after exhausting its retry budget; other clients are untouched"
+        );
+    }
+
+    /// T23 / G3 row 10: the joiner dropped after its retry budget is exhausted
+    /// must be told with a `Bye` reason distinct from an ordinary end of
+    /// session, so a client that sees its control loop end can tell the two
+    /// apart. Regression for the gap `docs/reports/G3.md` recorded: this used
+    /// to be the same bare `Outbound::Shutdown` sent at run end.
+    #[test]
+    fn catch_up_exhaustion_gives_the_dropped_joiner_a_distinguishable_bye_reason() {
+        let sim = Scene::BridgeCut.simulation();
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        let joiner = sess(0, 1);
+        let handle = OutboundHandle::new();
+        clients.lock().unwrap().insert(joiner.raw(), handle.clone());
+
+        let mut lj = LateJoin::new(2, 1);
+        lj.on_joined(joiner);
+        lj.on_baseline_ack(
+            joiner,
+            BaselineAck {
+                transfer_id: BASELINE_REQUEST_SENTINEL,
+                verified_manifest_hash: Hash32::ZERO,
+                installed_cursor: spall_core::JournalSeq(0),
+            },
+            &sim,
+            &clients,
+            &mut MotionPublisher::new(60, 20),
+        );
+
+        let tx = || {
+            Arc::new(TopologyTransaction {
+                transaction_id: spall_core::TransactionId::new(1).unwrap(),
+                server_tick: spall_core::Tick(1),
+                control_seq: spall_protocol::ControlSeq(0),
+                algorithm_version: 1,
+                dependencies: vec![],
+                before: vec![],
+                after: vec![],
+                ops: vec![],
+                result_hashes: vec![],
+            })
+        };
+        // First overflow (re-capture, retry 1), then a second past the budget
+        // (dropped).
+        for _ in 0..6 {
+            lj.fan_out_transaction(tx(), None, &sim, &clients);
+        }
+        assert_eq!(lj.failed, 1);
+
+        let shutdowns: Vec<&'static str> = handle
+            .take()
+            .reliable
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Outbound::Shutdown(reason) => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shutdowns,
+            vec![Connection::BYE_REASON_CATCH_UP_EXHAUSTED],
+            "the dropped joiner must see the catch-up-exhaustion reason, not the ordinary end-of-session one"
         );
     }
 

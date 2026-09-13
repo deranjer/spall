@@ -103,6 +103,13 @@ pub struct Connection {
     bulk_open: Arc<AtomicU32>,
 
     stats: Arc<ConnStats>,
+
+    /// The `reason` of the last `Bye` received on the control stream, if any.
+    /// `recv_record` returns `Ok(None)` for both a received `Bye` and a plain
+    /// stream close, so a caller that needs to tell those apart (e.g. a bounded
+    /// server-initiated disconnect vs. a peer that just vanished) reads this
+    /// after seeing `Ok(None)`.
+    bye_reason: std::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -151,6 +158,7 @@ impl Connection {
             last_control_seen: Mutex::new(Instant::now()),
             bulk_open: Arc::new(AtomicU32::new(0)),
             stats: Arc::new(ConnStats::default()),
+            bye_reason: std::sync::Mutex::new(None),
         })
     }
 
@@ -186,6 +194,17 @@ impl Connection {
     /// Shared counter handle, for a spawned pump that wants to record bytes.
     pub fn stats_handle(&self) -> Arc<ConnStats> {
         self.stats.clone()
+    }
+
+    /// The `reason` string of the last `Bye` this end received on the control
+    /// stream, if any has arrived yet. Set the moment `recv_record` decodes a
+    /// `Bye` (before it returns `Ok(None)`), so it is available to a caller
+    /// that just saw its control-record loop end.
+    pub fn bye_reason(&self) -> Option<String> {
+        self.bye_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     // --- control stream ----------------------------------------------------
@@ -240,7 +259,10 @@ impl Connection {
                 NetMessage::Heartbeat { seq } => {
                     recv.peer_heartbeat_seq = seq;
                 }
-                NetMessage::Bye { .. } => return Ok(None),
+                NetMessage::Bye { reason } => {
+                    *self.bye_reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+                    return Ok(None);
+                }
                 NetMessage::Record { seq, record } => {
                     match self.ctrl_dedup.lock().await.admit(seq) {
                         DedupVerdict::Accept { .. } => {
@@ -256,7 +278,25 @@ impl Connection {
         }
     }
 
-    /// Sends a `Bye` then finishes the control send stream.
+    /// `say_bye` reason for an ordinary end of session (the server closing
+    /// every connection at run end, or a client leaving on its own).
+    pub const BYE_REASON_COMPLETE: &'static str = "server complete";
+    /// `say_bye` reason for a server-initiated disconnect of a joining client
+    /// whose catch-up queue kept overflowing past `max_join_retries` (T23 / G3
+    /// row 10): a *bounded, explicit* give-up, distinct on the wire from an
+    /// ordinary shutdown so the disconnected client can report a bounded
+    /// failure instead of silently keeping its stale pre-catch-up state.
+    pub const BYE_REASON_CATCH_UP_EXHAUSTED: &'static str = "catch-up exhausted";
+
+    /// Sends a `Bye` then finishes the control send stream. Waits briefly
+    /// (bounded) for the peer to acknowledge receipt before returning.
+    ///
+    /// `finish()` alone only stops *sending* -- it does not wait for
+    /// delivery, so a caller that immediately tears down the whole QUIC
+    /// connection afterward (every current caller does exactly this) can
+    /// race the `Bye` away before the peer's `recv_record` ever sees it,
+    /// turning a deliberate, reasoned goodbye into an indistinguishable
+    /// "connection lost" on the other end (T23 / G3 row 10).
     pub async fn say_bye(&self, reason: &str) -> Result<()> {
         let bytes = NetMessage::Bye {
             reason: reason.to_string(),
@@ -265,7 +305,9 @@ impl Connection {
         .map_err(|e| TransportError::Frame(crate::framing::FrameError::Stream(e.to_string())))?;
         let mut send = self.ctrl_send.lock().await;
         write_framed(&mut send, &bytes, self.cfg.limits.max_control_record).await?;
+        let stopped = send.stopped();
         let _ = send.finish();
+        let _ = tokio::time::timeout(Duration::from_secs(2), stopped).await;
         Ok(())
     }
 
