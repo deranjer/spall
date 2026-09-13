@@ -122,3 +122,47 @@ fn world_baseline_is_unchanged_when_nothing_is_evicted() {
     let replica = ReplicaWorld::from_baseline_world(&a, ReplicaConfig::default()).unwrap();
     assert_eq!(replica.world_hash(), sim.world().world_hash());
 }
+
+/// T23 / G3 row 7 follow-up: regression for a real panic
+/// (`background snapshots require resident geometry`) found while landing
+/// bounded checkpoint capture. `snapshot_world` is the background/worker-thread
+/// baseline-capture path (increment 17) used for a client's *first* join when
+/// no cached baseline is ready; unlike `logical_world_baseline` it never took a
+/// backing and assumed every logical brick was resident, which held only by
+/// accident while `ResidencyPass::reload_all` still ran before every periodic
+/// checkpoint. Proves the fixed `snapshot_world` reaches the same world as the
+/// synchronous `logical_world_baseline` path over the same evicted terrain.
+#[test]
+fn snapshot_world_over_evicted_terrain_matches_the_synchronous_logical_baseline() {
+    let (mut sim, backing) = sim_with_backing();
+    let terrain = sim.world().terrain_volume_id();
+    let full_hash = sim.world().world_hash();
+
+    for c in evictable_bricks(&sim) {
+        assert!(sim.world_mut().evict_brick(terrain, c).unwrap());
+    }
+    assert!(sim.world().has_evicted());
+
+    let snapshot = spall_server::baseline::snapshot_world(&sim, Some(&backing));
+    let transfer = spall_server::baseline::transfer_from_snapshot(
+        snapshot,
+        spall_protocol::TransferId(1),
+        spall_protocol::InterestEpoch(1),
+    )
+    .expect("a background snapshot over evicted terrain with a backing must encode");
+
+    let reference = logical_world_baseline(&sim, Some(&backing));
+    assert_eq!(
+        transfer.world.encode(),
+        reference.encode(),
+        "the background-capture path must reach the same baseline as the synchronous one"
+    );
+
+    let replica = ReplicaWorld::from_baseline_world(&transfer.world, ReplicaConfig::default())
+        .expect("the baseline installs");
+    assert_eq!(
+        replica.world_hash(),
+        full_hash,
+        "a joiner served by the background capture path did not reconstruct the full world"
+    );
+}

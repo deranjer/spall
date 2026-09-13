@@ -558,6 +558,12 @@ pub struct ServeSummary {
     /// Ticks the resident-brick count exceeded `budget_bricks` (a player's
     /// interest set is larger than the declared budget).
     pub residency_budget_miss_ticks: u64,
+    /// T23 / G3 row 14: **per-connection** application/transport egress — the
+    /// aggregate `app_egress_bytes` / `transport_egress_bytes` above prove
+    /// total bandwidth is bounded, but not that `motion_interest` actually
+    /// separates load *between* clients. One row per connection that was ever
+    /// accepted this run (order not meaningful; sorted by slot).
+    pub per_client_egress: Vec<PerClientEgress>,
     /// T21 / ENG-28 increment 4: contact-damage cuts admitted into the edit
     /// pipeline this run. `0` when `ServeConfig.contact_damage` is `None`.
     pub contact_damage_cuts_submitted: u64,
@@ -572,6 +578,19 @@ pub struct ServeSummary {
     /// run (proximity or a hard-wake edit). `0` when `ServeConfig.dormancy` is
     /// `None`.
     pub dormancy_reactivations_total: u64,
+}
+
+/// One connection's total egress this run, alongside where its interest
+/// anchor (player spawn) was, so a reviewer can read bandwidth separation
+/// directly off the numbers without any client-side cooperation.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PerClientEgress {
+    pub slot: u32,
+    /// `None` on a scene with no player spawns (a `motion_static_anchor`
+    /// scenario) or if the connection closed before `Joined` was processed.
+    pub spawn_m: Option<[f64; 3]>,
+    pub app_bytes: u64,
+    pub transport_bytes: u64,
 }
 
 /// Anything that stops a [`serve`] run.
@@ -648,7 +667,10 @@ enum Outbound {
     /// or one brick for a hash repair — the client decides replace vs. merge
     /// from whether it has installed a baseline yet.
     Baseline(Arc<BaselineTransfer>),
-    Shutdown,
+    /// Ends the connection with the given `Bye` reason (T23 / G3 row 10: a
+    /// catch-up-exhaustion give-up carries a reason distinct from an ordinary
+    /// end of session, so the client can tell the two apart on the wire).
+    Shutdown(&'static str),
 }
 
 type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
@@ -689,8 +711,8 @@ impl OutboundQueue {
                 Ok(())
             }
             // The shutdown marker always goes through — it ends the stream.
-            Outbound::Shutdown => {
-                self.reliable.push_back(Outbound::Shutdown);
+            Outbound::Shutdown(reason) => {
+                self.reliable.push_back(Outbound::Shutdown(reason));
                 Ok(())
             }
             reliable => {
@@ -737,7 +759,7 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
         }
         Outbound::Status(_) => 96,
         Outbound::Baseline(t) => 64 + t.payload_bytes(),
-        Outbound::Motion(_) | Outbound::Shutdown => 0,
+        Outbound::Motion(_) | Outbound::Shutdown(_) => 0,
     }
 }
 
@@ -868,7 +890,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     // and folds its final counts into `egress_closed` under the `conns` lock, so
     // teardown counts every connection exactly once.
     let conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let egress_closed: Arc<Mutex<(u64, u64)>> = Arc::new(Mutex::new((0, 0)));
+    // T20 / T23 G3 row 14: per-session (not just summed) egress, keyed by
+    // `session.raw()` — same close-once-counted discipline as the aggregate
+    // version above.
+    let egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -1051,6 +1076,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut client_repl: HashMap<u64, ClientReplication> = HashMap::new();
         let mut motion_batch_index = 0u64;
         let mut motion_egress = MotionEgress::default();
+        // T23 / G3 row 14: each slot's player spawn, so the final per-connection
+        // egress report can be read alongside where that connection's interest
+        // anchor was.
+        let mut client_spawns: HashMap<u32, [f64; 3]> = HashMap::new();
 
         // ENG-61: rolling "every detached body is holding still" window. Each
         // tick we compare every body's origin Y against the previous tick; a run
@@ -1093,6 +1122,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             let slot = session.slot().0 as usize;
                             let spawn = spawns[slot.min(spawns.len() - 1)];
                             sim.add_player(session_player_entity(session), spawn);
+                            // T23 / G3 row 14: remember which spawn this slot
+                            // got, so the final per-connection egress report
+                            // can be read alongside *where* that connection's
+                            // interest anchor was — self-describing bandwidth
+                            // separation evidence with no client cooperation.
+                            client_spawns.insert(session.slot().0, spawn);
                         }
                     }
                     Inbound::Input(session, frame) => {
@@ -1392,12 +1427,19 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 // journal prefix behind it. Retain right after, so disk use
                 // stays bounded during the run — not only at shutdown.
                 if checkpoint_interval > 0 && tick.get().is_multiple_of(checkpoint_interval) {
-                    // Slice D: a checkpoint is a full-world snapshot — reload any
-                    // evicted terrain first so `persist::capture` sees it all.
-                    if let Some(pass) = &mut residency {
-                        pass.reload_all(sim.world_mut());
-                    }
-                    match persist::capture(&sim, &persist_cfg, journalled_through) {
+                    // T23 / G3 row 7 follow-up: a checkpoint is a full-world
+                    // snapshot, but it no longer reloads evicted terrain into
+                    // the live world to get there — `capture_checkpoint` folds
+                    // the durable backing's evicted-brick records straight
+                    // into the checkpoint, so residency's bounded memory
+                    // holds even at checkpoint time.
+                    let captured = match &residency {
+                        Some(pass) => {
+                            pass.capture_checkpoint(&sim, &persist_cfg, journalled_through)
+                        }
+                        None => persist::capture(&sim, &persist_cfg, journalled_through),
+                    };
+                    match captured {
                         Ok(cp) => {
                             if let Err(e) = pipe
                                 .submit_checkpoint(cp)
@@ -1466,7 +1508,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             }
         }
 
-        broadcast(&clients_for_sim, Outbound::Shutdown);
+        broadcast(
+            &clients_for_sim,
+            Outbound::Shutdown(Connection::BYE_REASON_COMPLETE),
+        );
 
         // Clean-shutdown durability: queue the final journal tail + checkpoint
         // + retain, then block until the off-thread writer has drained and
@@ -1478,18 +1523,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut persist_bytes_per_write = 0.0;
         let mut persist_commit_bytes_per_sec = 0.0;
         let mut shutdown_error: Option<String> = None;
-        // Slice D: reload every evicted brick before the shutdown snapshot so
-        // the final checkpoint and the reported world hash are the complete
-        // world.
-        if let Some(pass) = &mut residency {
-            pass.reload_all(sim.world_mut());
-        }
         if let Some(pipe) = pipeline.take() {
             let final_tick = sim.current_tick().get();
             let tail = tick_journal_batch(&mut sim, &mut journalled_through, None, final_tick)
                 .unwrap_or_default();
             let _ = pipe.submit_journal(tail);
-            if let Ok(cp) = persist::capture(&sim, &persist_cfg, journalled_through) {
+            // T23 / G3 row 7 follow-up: the shutdown snapshot folds evicted
+            // terrain in from the durable backing the same way the periodic
+            // checkpoints above do now, instead of reloading it into the live
+            // world first.
+            let captured = match &residency {
+                Some(pass) => pass.capture_checkpoint(&sim, &persist_cfg, journalled_through),
+                None => persist::capture(&sim, &persist_cfg, journalled_through),
+            };
+            if let Ok(cp) = captured {
                 let _ = pipe
                     .submit_checkpoint(cp)
                     .and_then(|()| pipe.submit_retain(RETAIN_CHECKPOINTS));
@@ -1572,6 +1619,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             actions_queued_unresolved: submitted_at.len() as u64,
             latency: commit_latency.report(),
             residency: residency.as_ref().map(|p| p.stats()),
+            client_spawns,
             contact_damage_cuts_submitted,
             contact_damage_cuts_rejected,
             dormancy_deactivations_total,
@@ -1593,14 +1641,35 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     // late-closing `serve_conn` can neither remove-and-accumulate an entry
     // concurrently (it takes the same lock first) nor be missed — every
     // connection is counted once, here or in `egress_closed`.
-    let (app_egress_bytes, transport_egress_bytes) = {
+    let (app_egress_bytes, transport_egress_bytes, per_client_egress) = {
         let conns_guard = conns.lock().unwrap_or_else(|e| e.into_inner());
         let mut acc = egress_closed.lock().unwrap_or_else(|e| e.into_inner());
-        for conn in conns_guard.values() {
-            acc.0 = acc.0.saturating_add(conn.stats().app_bytes_sent);
-            acc.1 = acc.1.saturating_add(conn.transport_stats().udp_tx.bytes);
+        for (raw, conn) in conns_guard.iter() {
+            acc.insert(
+                *raw,
+                (
+                    conn.stats().app_bytes_sent,
+                    conn.transport_stats().udp_tx.bytes,
+                ),
+            );
         }
-        (acc.0, acc.1)
+        let mut app_total = 0u64;
+        let mut transport_total = 0u64;
+        let mut rows: Vec<PerClientEgress> = Vec::with_capacity(acc.len());
+        for (&raw, &(app_bytes, transport_bytes)) in acc.iter() {
+            app_total = app_total.saturating_add(app_bytes);
+            transport_total = transport_total.saturating_add(transport_bytes);
+            // `SessionId`'s high 32 bits are the slot (see spall_protocol::session).
+            let slot = (raw >> 32) as u32;
+            rows.push(PerClientEgress {
+                slot,
+                spawn_m: sim_result.client_spawns.get(&slot).copied(),
+                app_bytes,
+                transport_bytes,
+            });
+        }
+        rows.sort_by_key(|r| r.slot);
+        (app_total, transport_total, rows)
     };
 
     let clients_connected = *count_rx.borrow();
@@ -1621,7 +1690,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let summary = ServeSummary {
         // v5: T21 / ENG-28 increment 4 adds contact_damage_cuts_submitted /
         // contact_damage_cuts_rejected / dormancy_deactivations_total /
-        // dormancy_reactivations_total.
+        // dormancy_reactivations_total; T23 / G3 row 14 adds per_client_egress.
         version: 5,
         result: result.to_string(),
         scene: format!("{scene:?}"),
@@ -1683,6 +1752,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             .residency
             .map(|r| r.budget_miss_ticks)
             .unwrap_or(0),
+        per_client_egress,
         contact_damage_cuts_submitted: sim_result.contact_damage_cuts_submitted,
         contact_damage_cuts_rejected: sim_result.contact_damage_cuts_rejected,
         dormancy_deactivations_total: sim_result.dormancy_deactivations_total,
@@ -1739,6 +1809,10 @@ struct SimResult {
     actions_queued_unresolved: u64,
     latency: commit_latency::LatencyReport,
     residency: Option<crate::ResidencyStats>,
+    /// T23 / G3 row 14: each slot's player spawn, keyed by slot so the outer
+    /// per-connection egress report (built after this blocking task returns)
+    /// can be read alongside where that connection's interest anchor was.
+    client_spawns: HashMap<u32, [f64; 3]>,
     contact_damage_cuts_submitted: u64,
     contact_damage_cuts_rejected: u64,
     dormancy_deactivations_total: u64,
@@ -1782,6 +1856,7 @@ impl SimResult {
             actions_queued_unresolved: 0,
             latency: commit_latency::LatencyReport::default(),
             residency: None,
+            client_spawns: HashMap::new(),
             contact_damage_cuts_submitted: 0,
             contact_damage_cuts_rejected: 0,
             dormancy_deactivations_total: 0,
@@ -1980,7 +2055,7 @@ impl LateJoin {
                     send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
                 }
                 None => {
-                    let snapshot = baseline::snapshot_world(sim);
+                    let snapshot = baseline::snapshot_world(sim, self.backing_ref());
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
                     std::thread::spawn(move || {
                         let _ = tx.send(baseline::transfer_from_snapshot(
@@ -2085,7 +2160,11 @@ impl LateJoin {
             if retries > self.max_retries {
                 self.failed += 1;
                 self.links.remove(&raw);
-                send_to(clients, session, Outbound::Shutdown);
+                send_to(
+                    clients,
+                    session,
+                    Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                );
                 continue;
             }
             self.retries += 1;
@@ -2105,7 +2184,11 @@ impl LateJoin {
                 None => {
                     self.failed += 1;
                     self.links.remove(&raw);
-                    send_to(clients, session, Outbound::Shutdown);
+                    send_to(
+                        clients,
+                        session,
+                        Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                    );
                 }
             }
         }
@@ -2178,7 +2261,11 @@ impl LateJoin {
                 _ => {
                     self.failed += 1;
                     if let Some(link) = self.links.remove(&raw) {
-                        send_to(clients, link.session, Outbound::Shutdown);
+                        send_to(
+                            clients,
+                            link.session,
+                            Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                        );
                     }
                 }
             }
@@ -2761,7 +2848,7 @@ async fn serve_conn(
     handle: OutboundHandle,
     clients: ClientMap,
     conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
-    egress_closed: Arc<Mutex<(u64, u64)>>,
+    egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>>,
     stop: watch::Receiver<bool>,
 ) {
     debug_assert_eq!(conn.role(), Role::Server);
@@ -2852,8 +2939,8 @@ async fn serve_conn(
                     Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
                     // Motion is never queued as reliable; ignore defensively.
                     Outbound::Motion(_) => true,
-                    Outbound::Shutdown => {
-                        let _ = conn.say_bye("server complete").await;
+                    Outbound::Shutdown(reason) => {
+                        let _ = conn.say_bye(reason).await;
                         false
                     }
                 };
@@ -2895,8 +2982,13 @@ async fn serve_conn(
         let mut conns_guard = conns.lock().unwrap_or_else(|e| e.into_inner());
         if conns_guard.remove(&session.raw()).is_some() {
             let mut acc = egress_closed.lock().unwrap_or_else(|e| e.into_inner());
-            acc.0 = acc.0.saturating_add(conn.stats().app_bytes_sent);
-            acc.1 = acc.1.saturating_add(conn.transport_stats().udp_tx.bytes);
+            acc.insert(
+                session.raw(),
+                (
+                    conn.stats().app_bytes_sent,
+                    conn.transport_stats().udp_tx.bytes,
+                ),
+            );
         }
     }
     conn.close("connection complete");
@@ -3350,6 +3442,69 @@ mod tests {
         assert!(
             !lj.links.contains_key(&joiner.raw()),
             "the joiner was dropped after exhausting its retry budget; other clients are untouched"
+        );
+    }
+
+    /// T23 / G3 row 10: the joiner dropped after its retry budget is exhausted
+    /// must be told with a `Bye` reason distinct from an ordinary end of
+    /// session, so a client that sees its control loop end can tell the two
+    /// apart. Regression for the gap `docs/reports/G3.md` recorded: this used
+    /// to be the same bare `Outbound::Shutdown` sent at run end.
+    #[test]
+    fn catch_up_exhaustion_gives_the_dropped_joiner_a_distinguishable_bye_reason() {
+        let sim = Scene::BridgeCut.simulation();
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        let joiner = sess(0, 1);
+        let handle = OutboundHandle::new();
+        clients.lock().unwrap().insert(joiner.raw(), handle.clone());
+
+        let mut lj = LateJoin::new(2, 1);
+        lj.on_joined(joiner);
+        lj.on_baseline_ack(
+            joiner,
+            BaselineAck {
+                transfer_id: BASELINE_REQUEST_SENTINEL,
+                verified_manifest_hash: Hash32::ZERO,
+                installed_cursor: spall_core::JournalSeq(0),
+            },
+            &sim,
+            &clients,
+            &mut MotionPublisher::new(60, 20),
+        );
+
+        let tx = || {
+            Arc::new(TopologyTransaction {
+                transaction_id: spall_core::TransactionId::new(1).unwrap(),
+                server_tick: spall_core::Tick(1),
+                control_seq: spall_protocol::ControlSeq(0),
+                algorithm_version: 1,
+                dependencies: vec![],
+                before: vec![],
+                after: vec![],
+                ops: vec![],
+                result_hashes: vec![],
+            })
+        };
+        // First overflow (re-capture, retry 1), then a second past the budget
+        // (dropped).
+        for _ in 0..6 {
+            lj.fan_out_transaction(tx(), None, &sim, &clients);
+        }
+        assert_eq!(lj.failed, 1);
+
+        let shutdowns: Vec<&'static str> = handle
+            .take()
+            .reliable
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Outbound::Shutdown(reason) => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shutdowns,
+            vec![Connection::BYE_REASON_CATCH_UP_EXHAUSTED],
+            "the dropped joiner must see the catch-up-exhaustion reason, not the ordinary end-of-session one"
         );
     }
 

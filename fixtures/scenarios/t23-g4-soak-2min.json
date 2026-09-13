@@ -1,0 +1,36 @@
+{
+  "name": "t23-g4-soak-2min",
+  "description": "T23 / G4 sustained-load proof (rows 13-14), 2-minute lane. docs/validation.md's G4 gate: \"Run for two measured minutes after 30 seconds warmup... Drive 10 ordinary edits/s total and one 4 m diameter blast every 10 seconds\" (row 13), plus \"Per-connection interest + bandwidth separation under the eight-client load (T20 budgets)\" measured under that same real load, not a toy single-client case (row 14). Same g4-workload scene/population as the row-12 proof run (8 late-join clients, west/east 18 m clusters, 256 active + 4096 sleeping debris bodies) but with an empty static `cuts` list: `sustained_edits` generates the edit + blast stream programmatically instead (tools/xtask/src/session.rs generate_sustained_cuts) -- a 30-minute soak at these rates is 18,000 small edits + 180 blasts, far past what fits as hand-authored JSON or individual `--cut` process arguments (a new `--cuts-file` on sandbox-client carries the generated script instead). `start_tick: 1800` (30 s) is the warmup: real late-join baseline installs measured 22.7-25.8 s per client (docs/reports/G3.md increment 17), so every client is confirmed Live well inside the 30 s window before the first generated edit fires -- `docs/validation.md`'s own \"record warmup duration and exclude warmup from timing percentiles\" is satisfied for free here, since nothing else commits during warmup, so the server's whole-run single_brick_commit_p95_ms / structure_split_p95_ms already reflect only the measured window. `trailing_buffer_ticks: 300` (5 s) gives the tail edits real wall-clock room to commit and the server to detect quiescence and stop (quiescence_ticks: 250) rather than idling out to the server_ticks cap. Small edits reuse the exact proven-safe y=1 rows (west z=6 x in 1..=22, east z=78 x in 73..=94 / EAST_X_OFFSET+1..=94) t23-g4-workload.json's hand-authored cuts already exercise; blasts reuse the exact two proven-safe points from that same fixture (y=12, z=12 west / z=73 east) -- see docs/reports/G3.md increment 18 for why those specific coordinates stay inside the declared volume bounds. Cycling back through a short cell list once exhausted is intentional (this is a throughput/latency soak, not a claim of ever-fresh geometry each edit -- see generate_sustained_cuts). `motion_interest` (near 12 m / far 24 m / far_interval 4, no per-client byte cap) is configured so row 14's per-connection egress evidence (spall_server::PerClientEgress, summary.json's per_client_egress) is measured under this same real sustained 8-client load with a real 18 m cluster separation and 4,352 real bodies, not a toy localhost single-client case (the existing crates/spall_server/tests/interest_bandwidth.rs). The one 64-brick connected collapse row 13 also lists stays proven separately by spall_sim's CPU-level giant_collapse_attempt test, same as row 12 -- it cannot be merged into this 8-client scene's world (see docs/reports/G3.md row 12).",
+  "scene": "g4-workload",
+  "release_profile": true,
+  "server_ticks": 9300,
+  "quiescence_ticks": 250,
+  "clients": 8,
+  "late_join_clients": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "late_join_connect_delay_ms": 200,
+  "minimum_transactions": 1212,
+  "replay_check": true,
+  "restart_check": true,
+  "cuts": [],
+  "sustained_edits": {
+    "start_tick": 1800,
+    "small_rate_per_sec": 10.0,
+    "blast_interval_sec": 10.0,
+    "trailing_buffer_ticks": 300
+  },
+  "motion_interest": {
+    "near_m": 12.0,
+    "far_m": 24.0,
+    "far_interval": 4,
+    "client_budget_bytes": 0
+  }
+}

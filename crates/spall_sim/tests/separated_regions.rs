@@ -390,3 +390,51 @@ fn scripted_walk_from_slot_0_spawn_covers_over_100_m() {
         "the player should still be on solid ground"
     );
 }
+
+/// T23 / G3 row 15 follow-up: a scripted walk from `SEPARATED_REGION_SPAWNS[0]`
+/// (`x = 1 m`, the *non*-far-envelope spawn table) does not merely fail to
+/// travel — with scripted movement input, the player falls straight through
+/// the west floor instead of walking it (`grounded` stays `false` and `y`
+/// falls without bound while `x` keeps advancing). This does **not**
+/// reproduce with [`fixtures::separated_regions_full_envelope_setup`] at the
+/// same `x`, only with the plain [`fixtures::separated_regions_setup`] — the
+/// two scenes' terrain differs only in their east-region offset and the
+/// resulting `terrain_collider_region` union box shape (see each function's
+/// doc comment), so the divergence is somewhere in occupancy extraction for
+/// that wider/shorter union box, not the row-15 defect
+/// (`spall_physics::character::row15_elevated_beam_near_origin_freezes_horizontal_movement`)
+/// pinned at the `spall_physics` level, which reproduces identically on
+/// *both* scenes. Newly discovered while investigating row 15, not
+/// previously exercised (no prior scenario scripted movement on
+/// `separated_regions_setup` specifically — `t23-g3`/`t23-g3-traversal` use
+/// stationary spawns or the unrelated `walk_arena` scene). Not fixed here;
+/// filed as its own follow-up in `docs/reports/G3.md`.
+#[test]
+fn plain_scene_spawn_falls_through_the_floor_instead_of_walking_it() {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    let entity = player_entity_for(0);
+    // Not `SEPARATED_REGION_SPAWNS[0]` (`x = 1 m`) -- that spawn hits row 15's
+    // freeze instead (the same defect either scene reproduces). This is a
+    // *different* x, past row 15's band, where the plain scene specifically
+    // falls through instead of walking.
+    let spawn = [7.0, 1.0, 1.0];
+    sim.add_player(entity, spawn);
+    let forward = PlayerInput {
+        movement: [0.0, 0.0, 1.0],
+        view_dir: [1.0, 0.0, 0.0],
+        buttons: 0,
+    };
+    for seq in 1..=200u64 {
+        sim.set_player_input(entity, forward, InputSeq(seq));
+        sim.tick().unwrap();
+    }
+    let p = sim.world().players().next().unwrap();
+    assert!(
+        !p.state.grounded && p.state.position_m[1] < spawn[1] - 1.0,
+        "expected this to fail today (undiagnosed defect): player should \
+         have fallen through the floor, but is at y={} grounded={}",
+        p.state.position_m[1],
+        p.state.grounded
+    );
+}
