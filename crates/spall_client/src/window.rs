@@ -1433,6 +1433,17 @@ impl WorldRenderer {
         }
         let submit_start = Instant::now();
         self.queue.submit([encoder.finish()]);
+        // A minimal isolated reproduction (`examples/poc_local`, ENG-69)
+        // found that on this app's Vulkan backend, `desired_maximum_frame_latency: 1`
+        // above did not actually stop the CPU from racing ~2 frames ahead of
+        // the display — a measured, sustained 0.2ms/16ms/33ms three-frame
+        // burst cycle even at complete idle, which reads as edge
+        // ghosting/jitter under any camera motion regardless of what drives
+        // it (confirmed independent of physics/input/networking). Blocking
+        // here until the GPU has actually finished this frame's work caps
+        // one submission in flight at a time and restored a rock-steady
+        // ~16.6ms cadence in that reproduction.
+        let _ = self.device.poll(wgpu::Maintain::Wait);
         let submit_ms = submit_start.elapsed().as_secs_f32() * 1000.0;
         let present_start = Instant::now();
         surface_texture.present();
