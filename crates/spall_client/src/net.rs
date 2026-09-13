@@ -458,6 +458,14 @@ struct Counters {
     /// retry) already re-requests on its own schedule, so this is dropped and
     /// counted rather than treated as fatal.
     baseline_transfer_failures: AtomicU64,
+    /// T23 / G3 row 10: the `Bye` reason the control reader saw when its
+    /// record loop ended, if the peer said goodbye rather than the stream
+    /// just closing. Set at most once (the control reader breaks right
+    /// after). `Some(Connection::BYE_REASON_CATCH_UP_EXHAUSTED)` is a
+    /// server-initiated bounded give-up on this join, not an ordinary end of
+    /// session -- the summary must not report "passed" on the strength of a
+    /// baseline installed before that happened.
+    disconnect_reason: std::sync::Mutex<Option<String>>,
 }
 
 /// Cap on `Counters::action_reject_reasons` — a diagnostic log, not something
@@ -861,7 +869,20 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         }
                     }
                     Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => break,
+                    Ok(None) => {
+                        // T23 / G3 row 10: distinguish a peer `Bye` (which
+                        // carries a reason) from the stream simply closing --
+                        // a server-initiated catch-up-exhaustion give-up must
+                        // not be read as an ordinary end of session.
+                        if let Some(reason) = conn.bye_reason() {
+                            *counters
+                                .disconnect_reason
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(reason);
+                        }
+                        break;
+                    }
+                    Err(_) => break,
                 }
             }
         })
@@ -1298,6 +1319,19 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let progressed = movement.is_some() && movement_ok
         || applied > 0
         || (config.late_join && baseline_bricks > 0);
+    // T23 / G3 row 10: a late joiner the server gave up on mid-catch-up (its
+    // queue kept overflowing past `max_join_retries`) is a bounded, explicit
+    // join failure -- even though it installed a first baseline and so would
+    // otherwise satisfy `progressed` above with a now-stale, non-converged
+    // hash. Only `late_join` clients get this override: a live client that
+    // was never joining has nothing to be exhausted.
+    let catch_up_exhausted = config.late_join
+        && counters
+            .disconnect_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+            == Some(Connection::BYE_REASON_CATCH_UP_EXHAUSTED);
     let max_body_displacement_m = guard.max_body_displacement_m();
     let body_cut_committed = match counters.body_cut_entity_plus1.load(Ordering::Relaxed) {
         0 => false,
@@ -1312,7 +1346,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     };
     let summary = ClientSummary {
         version: 3,
-        result: if progressed && movement_ok {
+        result: if catch_up_exhausted {
+            "join-failed"
+        } else if progressed && movement_ok {
             "passed"
         } else {
             "failed"

@@ -344,6 +344,13 @@ fn run_replication(args: Args) -> ExitCode {
             );
             if summary.result == "passed" {
                 ExitCode::SUCCESS
+            } else if summary.result == "join-failed" {
+                // T23 / G3 row 10: a live late-join client the server gave up
+                // on mid-catch-up reports this from inside `run_replication_client`
+                // (unlike the pre-baseline handshake failure below, which
+                // returns `Err` instead) -- same bounded-failure contract, same
+                // distinct exit code.
+                ExitCode::from(4)
             } else {
                 ExitCode::from(1)
             }
