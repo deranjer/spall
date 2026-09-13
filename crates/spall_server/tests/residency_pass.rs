@@ -5,7 +5,7 @@
 //! terrain bricks.
 
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
-use spall_core::{BrickCoord, EntityId, SphereBrush};
+use spall_core::{BrickCoord, EntityId, GlobalCell, SphereBrush};
 use spall_protocol::{Hash32, RequestId};
 use spall_server::{ResidencyLimits, ResidencyPass};
 use spall_sim::{EditIntent, EditTarget, Simulation, SimulationConfig, fixtures};
@@ -367,5 +367,82 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
             if volume == terrain.get() && coord == [evicted_coord.x, evicted_coord.y, evicted_coord.z]
         ),
         "expected EvictedBrickUnavailable naming the exact brick, got {err:?}"
+    );
+}
+
+/// T23 / G3 row 7 — ack-before-evict. Closes the gap the post-merge review
+/// (P2/P3) and increment 22's own "still open" note flagged against T18's
+/// `ResidencyController::enforce_budget` contract ("persist dirty candidates
+/// synchronously ... a backing error leaves geometry resident"): before this
+/// fix, `ResidencyPass::run` evicted a brick from the live cache on interest/
+/// hysteresis alone, trusting that some earlier `on_commit` capture had
+/// already reached the backing — never checking at the moment it mattered.
+/// This proves the pass now gates each eviction on a fresh, successful
+/// capture taken immediately beforehand, and that a failed one leaves the
+/// brick resident (not silently evicted with stale or absent durable
+/// geometry) until a later tick's capture succeeds.
+#[test]
+fn a_failed_capture_leaves_the_brick_resident_instead_of_evicting_it() {
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let mut pass = ResidencyPass::install(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 4,
+            interest_radius_bricks: 1,
+        },
+    );
+    // Stationary west player; the east region (script cut cell [82, 6, 75],
+    // same as the other tests here) is out of interest from tick 1.
+    let player_feet = [[1.0_f64, 1.0, 1.0]];
+    let east_coord = GlobalCell::new(82, 6, 75).split().0;
+    assert!(
+        sim.world()
+            .terrain()
+            .volume
+            .resident_brick_coords()
+            .contains(&east_coord),
+        "the east region brick must start resident, or this test proves nothing"
+    );
+
+    // Poison the one capture that would gate this brick's eviction. No cuts
+    // are submitted -- residency alone drives this test.
+    pass.backing().fail_next_capture(terrain, east_coord);
+
+    // `EVICT_SETTLE_TICKS` (4, private to `residency_pass`) consecutive
+    // out-of-interest ticks before an eviction is even attempted; the brick
+    // is out of interest from tick 1, so the first attempt lands on tick 4.
+    for _ in 1..=4u64 {
+        sim.tick().unwrap();
+        pass.run(sim.world_mut(), &player_feet);
+    }
+    assert!(
+        !sim.world().evicted(terrain).contains(east_coord),
+        "the poisoned capture must have blocked eviction"
+    );
+    assert!(
+        sim.world()
+            .terrain()
+            .volume
+            .resident_brick_coords()
+            .contains(&east_coord),
+        "a failed backing write must leave the brick resident, not evict it"
+    );
+
+    // The poison was one-shot: the very next tick's capture succeeds, and the
+    // brick evicts normally.
+    sim.tick().unwrap();
+    pass.run(sim.world_mut(), &player_feet);
+    assert!(
+        sim.world().evicted(terrain).contains(east_coord),
+        "once the backing write succeeds, the brick must evict on the next attempt"
+    );
+    assert!(
+        !sim.world()
+            .terrain()
+            .volume
+            .resident_brick_coords()
+            .contains(&east_coord),
+        "an evicted brick must not still be resident"
     );
 }

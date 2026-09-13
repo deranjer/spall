@@ -49,6 +49,11 @@ struct MemoryBackingInner {
     bricks: BTreeMap<Key, Brick>,
     known_empty: BTreeMap<Key, (Revision, bool)>,
     unavailable: BTreeSet<Key>,
+    /// T23 / G3 row 7 (ack-before-evict coverage): keys whose *next* `capture`
+    /// call must fail, as if the brick had unexpectedly stopped being
+    /// resident. One-shot -- consumed by the failing call. Test-only fault
+    /// injection; empty in every non-test run.
+    poisoned_captures: BTreeSet<Key>,
 }
 
 /// In-memory brick source for fixtures, tests, and the default-off serve
@@ -72,10 +77,21 @@ impl MemoryBacking {
     }
 
     /// Records `volume`'s current geometry at `coord` (must be resident). Called
-    /// after every committed edit so a later reload gets the current revision.
-    pub fn capture(&self, volume: &Volume, coord: BrickCoord) {
+    /// after every committed edit so a later reload gets the current revision,
+    /// and (T23 / G3 row 7) again, gated, immediately before the residency
+    /// pass evicts the brick -- ack-before-evict. `true` if the record now
+    /// reflects the live brick; `false` (nothing written) if the brick was not
+    /// resident to snapshot, or a test poisoned this call via
+    /// [`Self::fail_next_capture`].
+    pub fn capture(&self, volume: &Volume, coord: BrickCoord) -> bool {
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if g.poisoned_captures.remove(&key(volume.id(), coord)) {
+                return false;
+            }
+        }
         let Ok(Some(snap)) = volume.snapshot_brick(coord) else {
-            return;
+            return false;
         };
         let cells: Vec<MaterialId> = (0..CELLS_PER_BRICK as u16)
             .map(|i| snap.get(LocalCell::from_linear_index(i).expect("i < 32768")))
@@ -85,6 +101,22 @@ impl MemoryBacking {
             coord,
             Brick::restored(&cells, snap.revision(), snap.is_edited()),
         );
+        true
+    }
+
+    /// T23 / G3 row 7 test-only fault injection: makes the *next* [`Self::capture`]
+    /// call for `(volume, coord)` fail, as if the brick had unexpectedly
+    /// stopped being resident, without touching any currently-held record.
+    /// One-shot; a later `capture` for the same key succeeds normally. `pub`
+    /// (not `#[cfg(test)]`) so an integration test in another crate can drive
+    /// it, matching this workspace's `spall_store::inject` convention.
+    #[doc(hidden)]
+    pub fn fail_next_capture(&self, volume: VolumeId, coord: BrickCoord) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .poisoned_captures
+            .insert(key(volume, coord));
     }
 
     pub fn insert(&self, volume: VolumeId, coord: BrickCoord, brick: Brick) {
