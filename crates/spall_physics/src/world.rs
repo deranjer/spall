@@ -627,30 +627,53 @@ impl PhysicsWorld {
         }
     }
 
-    /// Refreshes the broad-phase for every collider added, rebuilt, or
-    /// removed since the last call to this or [`Self::step`] — **without**
+    /// Refreshes the broad-phase spatial index for every collider added or
+    /// rebuilt since the last call to this or [`Self::step`], for
+    /// **queries only** (`sweep_character`/`cast_shape`/...) — without
     /// stepping the dynamics pipeline: no gravity or velocity integration, no
-    /// contact resolution, for *any* body in this world, including ones
-    /// wholly unrelated to what changed. [`Self::step`] already refreshes the
-    /// broad-phase as part of its own full pipeline step, so a caller that
-    /// steps this world's simulation every tick regardless (the normal case)
-    /// never needs this. It exists for a caller that adds/rebuilds/removes
-    /// colliders on a world it does **not** own the tick loop for —
-    /// [`CharacterQueryCache`](crate::query_cache::CharacterQueryCache),
+    /// contact resolution, for *any* body in this world. [`Self::step`]
+    /// already refreshes the broad-phase as part of its own full pipeline
+    /// step, so a caller that steps this world's simulation every tick
+    /// regardless (the normal case) never needs this. It exists for a caller
+    /// that adds/rebuilds colliders on a world it does **not** own the tick
+    /// loop for — [`CharacterQueryCache`](crate::query_cache::CharacterQueryCache),
     /// which must never advance a simulation another caller is driving.
+    ///
+    /// Uses [`BroadPhaseBvh::set_aabb`] per modified collider, **not**
+    /// [`BroadPhaseBvh::update`]: `update` is the same call [`Self::step`]
+    /// uses to detect newly-overlapping pairs and emit `AddPair` — and
+    /// Rapier permanently remembers, per pair, that it already announced one
+    /// ("no need to re-send an `AddPair` event... if no `RemovePair`
+    /// happened since", `BroadPhaseBvh::update`'s own doc). Calling `update`
+    /// from here — as this used to — consumes that one-time announcement
+    /// for any dynamic body's pair that happens to be pending, with no
+    /// narrow-phase registration ever created for it: `step`'s *own* later
+    /// `update` call sees the pair as already-announced and never re-emits
+    /// it, so that pair's contacts are never generated again for the rest of
+    /// the simulation, however many times `step` runs afterwards. Confirmed
+    /// with an isolated repro (`.local/analysis/pr109-probe`): a dynamic
+    /// cube resting on a fixed one falls straight through it if a single
+    /// `sync_queries` call happens before the first `step`. `set_aabb`
+    /// refits the tree immediately (so queries see the new shape/position
+    /// right away) but explicitly defers pair evaluation "to the next
+    /// broad-phase update" (its own doc) — i.e. to `step`'s real one, which
+    /// still runs the full detect-and-announce logic exactly once, correctly.
+    /// A collider in `pending_removed` needs no action here: `remove_collider`/
+    /// `retire_body` already removed it from `self.colliders` before pushing
+    /// it there, so a query pipeline built from `self.colliders` naturally
+    /// filters it out via the lookup miss regardless of the tree's own leaf
+    /// cleanup timing, and `step`'s removal handling runs on Rapier's native
+    /// dirty flags next time regardless of what this does.
     pub fn sync_queries(&mut self) {
         if self.pending_modified.is_empty() && self.pending_removed.is_empty() {
             return;
         }
-        let mut events = Vec::new();
-        self.broad_phase.update(
-            &self.params,
-            &self.colliders,
-            &self.bodies,
-            &self.pending_modified,
-            &self.pending_removed,
-            &mut events,
-        );
+        for &handle in &self.pending_modified {
+            if let Some(collider) = self.colliders.get(handle) {
+                let aabb = collider.compute_aabb();
+                self.broad_phase.set_aabb(&self.params, handle, aabb);
+            }
+        }
         self.pending_modified.clear();
         self.pending_removed.clear();
     }
@@ -1253,6 +1276,131 @@ mod tests {
             world.max_penetration_m() < 0.1,
             "resting body did not sink into the floor ({} m)",
             world.max_penetration_m()
+        );
+    }
+
+    /// PR #109 review finding: [`PhysicsWorld::sync_queries`] used to call
+    /// [`rapier3d::geometry::BroadPhaseBvh::update`] directly, which Rapier
+    /// permanently remembers as "this pair was announced" — so a single
+    /// `sync_queries` call before a pair's very first real [`PhysicsWorld::step`]
+    /// silently and permanently starved that pair of contacts, for the rest
+    /// of the simulation, however many times `step` ran afterwards. This is
+    /// exactly [`CharacterQueryCache`](crate::query_cache::CharacterQueryCache)'s
+    /// real call pattern: it shares this `PhysicsWorld` with a simulation it
+    /// does not own the tick loop for, and calls `sync_queries` (never
+    /// `step`) after every window rebuild.
+    #[test]
+    fn sync_queries_before_the_first_step_does_not_starve_a_dynamic_body_of_contacts() {
+        fn unit_cube_body(world: &mut PhysicsWorld, kind: BodyKind, y: f32) -> BodyId {
+            world.add_body(BodySpec {
+                kind,
+                representation: Representation::MergedCuboids,
+                grid: OccupancyGrid::from_solid_mask(
+                    GlobalCell::new(0, 0, 0),
+                    [1, 1, 1],
+                    vec![true],
+                    vec![MaterialId(1)],
+                )
+                .unwrap(),
+                cell_m: 1.0,
+                density_kg_m3: 1.0,
+                mass_properties: None,
+                translation_m: [0.0, y, 0.0],
+                linvel_m_s: [0.0; 3],
+            })
+        }
+
+        let mut without_sync = PhysicsWorld::new(PhysicsConfig::default());
+        unit_cube_body(&mut without_sync, BodyKind::Fixed, 0.0);
+        let dynamic_no_sync =
+            unit_cube_body(&mut without_sync, BodyKind::Dynamic { ccd: false }, 1.0);
+        for _ in 0..60 {
+            without_sync.step();
+        }
+        let baseline = without_sync.body_state(dynamic_no_sync);
+        assert!(
+            baseline.translation_m[1] > 0.9,
+            "baseline (no sync_queries) should rest on the floor, got y = {}",
+            baseline.translation_m[1]
+        );
+
+        let mut with_sync = PhysicsWorld::new(PhysicsConfig::default());
+        unit_cube_body(&mut with_sync, BodyKind::Fixed, 0.0);
+        let dynamic = unit_cube_body(&mut with_sync, BodyKind::Dynamic { ccd: false }, 1.0);
+        with_sync.sync_queries();
+        for _ in 0..60 {
+            with_sync.step();
+        }
+        let st = with_sync.body_state(dynamic);
+        assert!(
+            st.translation_m[1] > 0.9,
+            "a sync_queries call before the first step must not stop the pair from ever \
+             contacting — expected the body to rest at y > 0.9 like the no-sync baseline \
+             ({}), got y = {}",
+            baseline.translation_m[1],
+            st.translation_m[1]
+        );
+        assert!(
+            with_sync.contact_pair_count() >= 1,
+            "expected at least one live contact pair after settling, found none"
+        );
+    }
+
+    /// Same regression, but exercising [`CharacterQueryCache`]'s actual usage
+    /// pattern: a collider *replacement* ([`PhysicsWorld::rebuild_collider`])
+    /// followed by `sync_queries`, on a `PhysicsWorld` a real dynamic body is
+    /// also resting in — not just a freshly-added collider.
+    #[test]
+    fn sync_queries_after_collider_replacement_does_not_starve_a_dynamic_body_of_contacts() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [1, 1, 1],
+            vec![true],
+            vec![MaterialId(1)],
+        )
+        .unwrap();
+        let floor = world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: grid.clone(),
+            cell_m: 1.0,
+            density_kg_m3: 1.0,
+            mass_properties: None,
+            translation_m: [0.0, 0.0, 0.0],
+            linvel_m_s: [0.0; 3],
+        });
+        let dynamic = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::MergedCuboids,
+            grid: grid.clone(),
+            cell_m: 1.0,
+            density_kg_m3: 1.0,
+            mass_properties: None,
+            translation_m: [0.0, 1.0, 0.0],
+            linvel_m_s: [0.0; 3],
+        });
+
+        // Rebuild the floor's collider (a no-op geometry change) and sync
+        // queries against it, exactly like `CharacterQueryCache::rebuild`
+        // does for its window collider — before the dynamic body's own pair
+        // has ever gone through a real `step`.
+        world.rebuild_collider(floor, &grid, Representation::MergedCuboids);
+        world.sync_queries();
+
+        for _ in 0..60 {
+            world.step();
+        }
+        let st = world.body_state(dynamic);
+        assert!(
+            st.translation_m[1] > 0.9,
+            "a collider-replacement + sync_queries call must not stop the dynamic body's \
+             pair from ever contacting — got y = {}",
+            st.translation_m[1]
+        );
+        assert!(
+            world.contact_pair_count() >= 1,
+            "expected at least one live contact pair after settling, found none"
         );
     }
 
