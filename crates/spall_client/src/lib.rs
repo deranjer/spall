@@ -6,6 +6,7 @@ pub mod net;
 pub mod predict;
 pub mod replica;
 pub mod residency;
+pub mod tick_accumulator;
 pub mod window;
 
 pub use interactive::{InteractiveSession, InteractiveView, LiveInput};

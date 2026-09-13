@@ -43,6 +43,7 @@ use crate::interactive::{InteractiveSession, InteractiveView};
 use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer, WindowStats};
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
 use crate::residency::ClientResidencyPass;
+use crate::tick_accumulator::TickAccumulator;
 
 /// One leg of a scripted movement path: hold `input` from tick `from` up to (not
 /// including) tick `to`.
@@ -1131,10 +1132,29 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             // without ever sending an input frame.
             let mut active_script_tick = 0_u64;
             let mut last_active_server_tick = None;
+            // ENG-69, PR #109 review: this loop's own per-iteration cost
+            // (the terrain-hash/clone work below, plus the unconditional
+            // 16ms sleep at its end) is not a fixed 16ms — it varies with
+            // scene size — so real time between iterations can cover more
+            // than one `MOVEMENT_DT_S`-wide tick. Calling `PredictedPlayer::
+            // tick` exactly once per iteration regardless silently starved
+            // `Record::tick`'s tagging scheme (`predict.rs`) of the "local
+            // tick count tracks real elapsed ticks" correspondence it needs
+            // — confirmed against a real interactive session's own
+            // correction log (844 of 844 reconciles unmatched,
+            // `records_replayed` pinned at 0 the entire session). See
+            // `crate::tick_accumulator` for the fix.
+            let mut tick_accumulator =
+                TickAccumulator::new(Duration::from_secs_f32(MOVEMENT_DT_S));
+            let mut last_tick_accumulator_at = std::time::Instant::now();
             loop {
                 if *stop_rx.borrow() {
                     return;
                 }
+                let now = std::time::Instant::now();
+                let ticks_to_run =
+                    tick_accumulator.advance(now.duration_since(last_tick_accumulator_at));
+                last_tick_accumulator_at = now;
                 let tick = counters.last_tick.load(Ordering::Relaxed);
 
                 // Rebuild the collider if the terrain changed near us. Kept as
@@ -1207,7 +1227,16 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         if let Some(pl) = &mut p.player
                             && let Some(volume) = &terrain_volume
                         {
-                            pl.tick(&mut p.phys, volume, input, seq, MOVEMENT_DT_S);
+                            // Catch local prediction up to however many real
+                            // ticks elapsed since the last iteration (see
+                            // `tick_accumulator` above) — usually 1, more
+                            // when this loop's own per-iteration cost ran
+                            // long. The same sampled `input`/`seq` covers
+                            // every tick in the burst, exactly like ordinary
+                            // held-input reuse already does.
+                            for _ in 0..ticks_to_run {
+                                pl.tick(&mut p.phys, volume, input, seq, MOVEMENT_DT_S);
+                            }
                         }
                         // Preserve the script's server-tick cadence.  The
                         // mover itself samples more often than snapshots can
