@@ -115,7 +115,21 @@ pub fn world_baseline(sim: &Simulation) -> BaselineWorld {
 /// Captures a stable, cheap copy-on-write view at a tick boundary. Expanding
 /// snapshots into protocol cell vectors and compressing them is intentionally
 /// deferred to [`transfer_from_snapshot`], which may run on a worker.
-pub fn snapshot_world(sim: &Simulation) -> BaselineSnapshot {
+///
+/// T23 / G3 row 7 follow-up: over the **logical** brick set, exactly like
+/// [`logical_world_baseline`] — a resident brick is snapshotted directly, an
+/// evicted one is read from `backing` and wrapped as an equivalent
+/// [`BrickSnapshot`]. Before this, a currently-evicted terrain brick made this
+/// panic (`background snapshots require resident geometry`): the periodic
+/// checkpoint path used to paper over it by reloading every evicted brick
+/// back into the live world before every checkpoint, which incidentally also
+/// made most background baseline captures land on a fully-resident tick; once
+/// that reload was replaced with bounded capture (this same follow-up),
+/// evictions persist for the whole run and this path panicked for real.
+/// Panics if a volume has evicted bricks and `backing` is `None` or cannot
+/// supply one — a partial baseline is never emitted, same contract as
+/// `baseline_volume`.
+pub fn snapshot_world(sim: &Simulation, backing: Option<&dyn BrickBacking>) -> BaselineSnapshot {
     let world = sim.world();
     let mut volumes = Vec::with_capacity(world.body_count() + 1);
     let mut push = |body: &Body, owner| {
@@ -125,11 +139,25 @@ pub fn snapshot_world(sim: &Simulation) -> BaselineSnapshot {
             .into_iter()
             .map(|logical| {
                 let coord = logical.coord;
-                let snapshot = volume
-                    .snapshot_brick(coord)
-                    .expect("baseline snapshot bounds")
-                    .expect("background snapshots require resident geometry");
-                (coord, snapshot)
+                if let Ok(Some(snap)) = volume.snapshot_brick(coord) {
+                    return (coord, snap);
+                }
+                // Evicted: its cells come from the durable backing (same
+                // fallback `baseline_volume` uses for the synchronous path).
+                let backing =
+                    backing.expect("a background baseline snapshot over evicted geometry needs a durable backing");
+                let brick = match backing.load(volume.id(), coord) {
+                    spall_sim::BackingBrick::Loaded(brick) => brick,
+                    spall_sim::BackingBrick::KnownEmpty { revision, edited } => {
+                        let air = vec![spall_core::MaterialId::AIR; CELLS_PER_BRICK];
+                        spall_voxel::Brick::restored(&air, revision, edited)
+                    }
+                    spall_sim::BackingBrick::Unavailable => panic!(
+                        "background baseline snapshot: durable brick {coord:?} of volume {} is unavailable",
+                        volume.id()
+                    ),
+                };
+                (coord, brick.snapshot())
             })
             .collect::<Vec<_>>();
         bricks.sort_by_key(|(coord, _)| (coord.z, coord.y, coord.x));
@@ -573,7 +601,8 @@ mod tests {
         .unwrap();
         let live = capture_transfer(&sim, TransferId(11), InterestEpoch(1), JournalSeq(0)).unwrap();
         let detached =
-            transfer_from_snapshot(snapshot_world(&sim), TransferId(12), InterestEpoch(1)).unwrap();
+            transfer_from_snapshot(snapshot_world(&sim, None), TransferId(12), InterestEpoch(1))
+                .unwrap();
         assert_eq!(*live.world, *detached.world);
         assert_eq!(live.begin.journal_cursor, detached.begin.journal_cursor);
     }

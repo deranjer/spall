@@ -1330,12 +1330,19 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 // journal prefix behind it. Retain right after, so disk use
                 // stays bounded during the run — not only at shutdown.
                 if checkpoint_interval > 0 && tick.get().is_multiple_of(checkpoint_interval) {
-                    // Slice D: a checkpoint is a full-world snapshot — reload any
-                    // evicted terrain first so `persist::capture` sees it all.
-                    if let Some(pass) = &mut residency {
-                        pass.reload_all(sim.world_mut());
-                    }
-                    match persist::capture(&sim, &persist_cfg, journalled_through) {
+                    // T23 / G3 row 7 follow-up: a checkpoint is a full-world
+                    // snapshot, but it no longer reloads evicted terrain into
+                    // the live world to get there — `capture_checkpoint` folds
+                    // the durable backing's evicted-brick records straight
+                    // into the checkpoint, so residency's bounded memory
+                    // holds even at checkpoint time.
+                    let captured = match &residency {
+                        Some(pass) => {
+                            pass.capture_checkpoint(&sim, &persist_cfg, journalled_through)
+                        }
+                        None => persist::capture(&sim, &persist_cfg, journalled_through),
+                    };
+                    match captured {
                         Ok(cp) => {
                             if let Err(e) = pipe
                                 .submit_checkpoint(cp)
@@ -1419,18 +1426,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut persist_bytes_per_write = 0.0;
         let mut persist_commit_bytes_per_sec = 0.0;
         let mut shutdown_error: Option<String> = None;
-        // Slice D: reload every evicted brick before the shutdown snapshot so
-        // the final checkpoint and the reported world hash are the complete
-        // world.
-        if let Some(pass) = &mut residency {
-            pass.reload_all(sim.world_mut());
-        }
         if let Some(pipe) = pipeline.take() {
             let final_tick = sim.current_tick().get();
             let tail = tick_journal_batch(&mut sim, &mut journalled_through, None, final_tick)
                 .unwrap_or_default();
             let _ = pipe.submit_journal(tail);
-            if let Ok(cp) = persist::capture(&sim, &persist_cfg, journalled_through) {
+            // T23 / G3 row 7 follow-up: the shutdown snapshot folds evicted
+            // terrain in from the durable backing the same way the periodic
+            // checkpoints above do now, instead of reloading it into the live
+            // world first.
+            let captured = match &residency {
+                Some(pass) => pass.capture_checkpoint(&sim, &persist_cfg, journalled_through),
+                None => persist::capture(&sim, &persist_cfg, journalled_through),
+            };
+            if let Ok(cp) = captured {
                 let _ = pipe
                     .submit_checkpoint(cp)
                     .and_then(|()| pipe.submit_retain(RETAIN_CHECKPOINTS));
@@ -1930,7 +1939,7 @@ impl LateJoin {
                     send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
                 }
                 None => {
-                    let snapshot = baseline::snapshot_world(sim);
+                    let snapshot = baseline::snapshot_world(sim, self.backing_ref());
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
                     std::thread::spawn(move || {
                         let _ = tx.send(baseline::transfer_from_snapshot(
