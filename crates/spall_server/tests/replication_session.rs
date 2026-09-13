@@ -80,6 +80,8 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         await_body_settle: false,
         motion_interest: None,
         residency: None,
+        contact_damage: None,
+        dormancy: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -109,6 +111,8 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         summary_json: Some(dir.join("client.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        on_replica_ready: None,
+        interactive: None,
     };
 
     let client = run_replication_client(client_cfg).expect("client run");
@@ -186,6 +190,8 @@ fn server_persists_and_recovers_across_a_restart() {
         await_body_settle: false,
         motion_interest: None,
         residency: None,
+        contact_damage: None,
+        dormancy: None,
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {
@@ -212,6 +218,8 @@ fn server_persists_and_recovers_across_a_restart() {
             summary_json: None,
             transport: TransportConfig::for_tests(),
             client_residency: None,
+            on_replica_ready: None,
+            interactive: None,
         };
         let _ = run_replication_client(client_cfg).expect("client run");
         server_thread
@@ -301,6 +309,8 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         await_body_settle: false,
         motion_interest: None,
         residency: None,
+        contact_damage: None,
+        dormancy: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(cfg));
@@ -326,6 +336,8 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         summary_json: None,
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        on_replica_ready: None,
+        interactive: None,
     };
     let _ = run_replication_client(client_cfg).expect("client run");
 

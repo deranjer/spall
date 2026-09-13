@@ -1,4 +1,4 @@
-//! T21 — contact-to-damage intent conversion (increment 1: terrain targets).
+//! T21 — contact-to-damage intent conversion (increments 1 & 3).
 //!
 //! `docs/architecture.md`: *"Convert qualifying contacts/damage into intents for
 //! a later tick; no mutation inside physics callbacks."* A resting body pushes a
@@ -8,6 +8,15 @@
 //! solver's per-step contact impulses ([`spall_physics::ContactImpulse`],
 //! resolved by the integrator into [`ContactEvent`]s) and the bounded
 //! [`EditIntent`] stream:
+//!
+//! Increment 1 damaged **terrain** only; increment 3 adds **body-on-body**
+//! fracture. A hard enough impact between two dynamic bodies carves a bounded
+//! cut into the struck body, through the same threshold / cooldown / per-tick-cap
+//! machinery. The policy works purely in the **target volume's local cell
+//! frame**: [`ContactEvent::point_cell`] is already resolved to global cells for
+//! terrain or body-local cells for a body, so the same cooldown key and brush
+//! construction serve both — and a moving body's cooldown is keyed on a spot
+//! that does not drift every tick.
 //!
 //! * **Threshold** — a contact qualifies only when its normal impulse is several
 //!   times the striking body's own resting weight *and* clears an absolute
@@ -62,6 +71,13 @@ pub struct ContactDamageConfig {
     pub explosion_ratio: f32,
     /// Fraction of the contact impulse handed to that detachment impulse.
     pub explosion_scale: f64,
+    /// Body-on-body only (increment 3): when two dynamic bodies collide, the
+    /// slower one is treated as the body being struck and takes the damage. If
+    /// their speeds are within this margin (m/s) the tie is broken toward the
+    /// lower-mass body. Read by [`crate::sim::Simulation::apply_contact_damage`]
+    /// when it builds the `(dynamic, dynamic)` event; the pure policy never sees
+    /// it. Matches `DormancyConfig::still_speed_m_s`.
+    pub still_speed_m_s: f64,
 }
 
 impl ContactDamageConfig {
@@ -76,6 +92,7 @@ impl ContactDamageConfig {
         brush_radius_cells: 2,
         explosion_ratio: 20.0,
         explosion_scale: 0.2,
+        still_speed_m_s: 0.05,
     };
 }
 
@@ -86,15 +103,23 @@ impl Default for ContactDamageConfig {
 }
 
 /// One solver contact the integrator has resolved to "a dynamic body struck
-/// terrain": which terrain volume, where, how hard, and how that compares to the
-/// striking body's own weight.
+/// something destructible": which volume, where in *that volume's* cell frame,
+/// how hard, and how that compares to the striking body's own weight.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContactEvent {
-    /// The terrain volume taking the damage.
+    /// What the cut edits: [`EditTarget::Terrain`] or [`EditTarget::Body`].
+    pub target: EditTarget,
+    /// The volume taking the damage — the terrain grid, or a detached body's
+    /// volume. Together with the brick of [`Self::point_cell`] it is the
+    /// per-region cooldown key.
     pub target_volume: VolumeId,
-    /// World contact point, metres.
-    pub point_m: [f64; 3],
-    /// World contact normal (unit), pointing terrain → striking body. Used as
+    /// Contact point in the **target volume's local cell frame** (fractional
+    /// cells): global cells for terrain (`world_m / cell_m`), body-local cells
+    /// for a body (`RigidXform::world_to_local_cell`). The caller resolves the
+    /// frame so the pure policy only ever works in cell coordinates — and a
+    /// moving body's cooldown spot does not drift with its world pose.
+    pub point_cell: [f64; 3],
+    /// World contact normal (unit), pointing target → striking body. Used as
     /// the detachment-impulse direction for a hard enough hit.
     pub normal: [f64; 3],
     /// Accumulated normal impulse over the pair this step, newton-seconds.
@@ -108,13 +133,16 @@ pub struct ContactEvent {
     pub striker_born_this_tick: bool,
 }
 
-/// A terrain-damage cut the policy decided to emit. The integrator wraps it in
-/// an [`crate::intent::EditIntent`] with a server-authored request id.
+/// A damage cut the policy decided to emit. The integrator wraps it in an
+/// [`crate::intent::EditIntent`] with a server-authored request id.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlannedDamage {
-    /// Always [`EditTarget::Terrain`] in increment 1.
+    /// Which volume the cut edits — copied through from the source
+    /// [`ContactEvent::target`] ([`EditTarget::Terrain`] or
+    /// [`EditTarget::Body`]).
     pub target: EditTarget,
-    /// Cut brush at the contact cell, in the terrain volume's cell space.
+    /// Cut brush centred on the contact cell, in the target volume's local
+    /// cell space (global cells for terrain, body-local for a body).
     pub brush: SphereBrush,
     /// One-shot detachment impulse for a hard hit, else `None`.
     pub explosion: Option<ExplosionImpulse>,
@@ -175,13 +203,14 @@ impl ContactDamagePolicy {
 
     /// Plans the damage cuts for one tick from the resolved contact events.
     ///
-    /// Deterministic in `(tick, cell_m, events)` and independent of the order
-    /// `events` arrives in: candidates are sorted by region then descending
-    /// impulse, so the hardest hit in a region claims its single slot and the
-    /// per-tick cap keeps the same cuts under reordering. Calling twice for the
-    /// same `tick` is a no-op returning an empty plan — contact damage is a
-    /// once-per-tick pass.
-    pub fn plan(&mut self, tick: u64, cell_m: f64, events: &[ContactEvent]) -> ContactDamagePlan {
+    /// Deterministic in `(tick, events)` and independent of the order `events`
+    /// arrives in: candidates are sorted by region then descending impulse, so
+    /// the hardest hit in a region claims its single slot and the per-tick cap
+    /// keeps the same cuts under reordering. Calling twice for the same `tick`
+    /// is a no-op returning an empty plan — contact damage is a once-per-tick
+    /// pass. Every [`ContactEvent::point_cell`] is already in its target
+    /// volume's cell frame, so the policy is unit-agnostic: no `cell_m`.
+    pub fn plan(&mut self, tick: u64, events: &[ContactEvent]) -> ContactDamagePlan {
         let mut plan = ContactDamagePlan::default();
         if self.last_tick == Some(tick) {
             return plan;
@@ -194,7 +223,7 @@ impl ContactDamagePolicy {
         let mut candidates: Vec<(BrickCoord, usize, &ContactEvent)> = events
             .iter()
             .enumerate()
-            .map(|(i, e)| (brick_of(e.point_m, cell_m), i, e))
+            .map(|(i, e)| (brick_of(e.point_cell), i, e))
             .collect();
         candidates.sort_by(|a, b| {
             a.0.sort_key()
@@ -230,8 +259,7 @@ impl ContactDamagePolicy {
                 plan.dropped_over_cap += 1;
                 continue;
             }
-            let Some(brush) = brush_at(event.point_m, cell_m, self.config.brush_radius_cells)
-            else {
+            let Some(brush) = brush_at(event.point_cell, self.config.brush_radius_cells) else {
                 plan.malformed += 1;
                 continue;
             };
@@ -245,7 +273,7 @@ impl ContactDamagePolicy {
                 None
             };
             plan.damage.push(PlannedDamage {
-                target: EditTarget::Terrain,
+                target: event.target,
                 brush,
                 explosion,
             });
@@ -257,37 +285,37 @@ impl ContactDamagePolicy {
     }
 }
 
-/// The whole-cell index nearest a world-metre coordinate.
-fn cell_index(v: f64, cell_m: f64) -> Option<i64> {
-    if !v.is_finite() || cell_m <= 0.0 {
+/// The whole-cell index nearest a fractional cell coordinate.
+fn cell_index(cells: f64) -> Option<i64> {
+    if !cells.is_finite() {
         return None;
     }
-    let c = (v / cell_m).round();
+    let c = cells.round();
     if c.abs() >= i64::MAX as f64 {
         return None;
     }
     Some(c as i64)
 }
 
-/// The brick a world-space contact point falls in, for cooldown keying. A
-/// non-finite point collapses to the origin brick; such events are dropped as
-/// `malformed` at brush-build time anyway.
-fn brick_of(point_m: [f64; 3], cell_m: f64) -> BrickCoord {
+/// The brick a contact point falls in (in the target volume's cell frame), for
+/// cooldown keying. A non-finite point collapses to the origin brick; such
+/// events are dropped as `malformed` at brush-build time anyway.
+fn brick_of(point_cell: [f64; 3]) -> BrickCoord {
     let cell = GlobalCell::new(
-        cell_index(point_m[0], cell_m).unwrap_or(0),
-        cell_index(point_m[1], cell_m).unwrap_or(0),
-        cell_index(point_m[2], cell_m).unwrap_or(0),
+        cell_index(point_cell[0]).unwrap_or(0),
+        cell_index(point_cell[1]).unwrap_or(0),
+        cell_index(point_cell[2]).unwrap_or(0),
     );
     cell.split().0
 }
 
-/// A cut brush of `radius_cells` (clamped `>= 1`) centred on the terrain cell
-/// nearest `point_m`. `None` if the point is non-finite or so far out that the
-/// fixed-point centre would overflow.
-fn brush_at(point_m: [f64; 3], cell_m: f64, radius_cells: i64) -> Option<SphereBrush> {
-    let cx = cell_index(point_m[0], cell_m)?;
-    let cy = cell_index(point_m[1], cell_m)?;
-    let cz = cell_index(point_m[2], cell_m)?;
+/// A cut brush of `radius_cells` (clamped `>= 1`) centred on the target-volume
+/// cell nearest `point_cell`. `None` if the point is non-finite or so far out
+/// that the fixed-point centre would overflow.
+fn brush_at(point_cell: [f64; 3], radius_cells: i64) -> Option<SphereBrush> {
+    let cx = cell_index(point_cell[0])?;
+    let cy = cell_index(point_cell[1])?;
+    let cz = cell_index(point_cell[2])?;
     let half = BRUSH_UNIT / 2;
     let centre = BrushPoint::from_units(
         cx.checked_mul(BRUSH_UNIT)?.checked_add(half)?,
@@ -300,19 +328,20 @@ fn brush_at(point_m: [f64; 3], cell_m: f64, radius_cells: i64) -> Option<SphereB
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const CELL_M: f64 = 0.25;
+    use spall_core::EntityId;
 
     fn vol() -> VolumeId {
         VolumeId::new(1).unwrap()
     }
 
-    /// A contact `ratio`× the resting load of a `mass_kg` body at `point_m`.
-    fn event(point_m: [f64; 3], mass_kg: f32, ratio: f32) -> ContactEvent {
+    /// A terrain contact `ratio`× the resting load of a `mass_kg` body, with the
+    /// contact point given directly in cells.
+    fn event(point_cell: [f64; 3], mass_kg: f32, ratio: f32) -> ContactEvent {
         let resting = mass_kg * 9.81 * (1.0 / 60.0);
         ContactEvent {
+            target: EditTarget::Terrain,
             target_volume: vol(),
-            point_m,
+            point_cell,
             normal: [0.0, 1.0, 0.0],
             impulse_n_s: resting * ratio,
             resting_impulse_n_s: resting,
@@ -327,7 +356,7 @@ mod tests {
     #[test]
     fn a_hard_impact_becomes_one_damage_cut() {
         let mut p = policy();
-        let plan = p.plan(1, CELL_M, &[event([4.0, 1.0, 4.0], 200.0, 12.0)]);
+        let plan = p.plan(1, &[event([16.0, 4.0, 16.0], 200.0, 12.0)]);
         assert_eq!(plan.admitted(), 1);
         assert_eq!(plan.suppressed_below_threshold, 0);
         assert!(
@@ -341,7 +370,7 @@ mod tests {
     fn a_resting_contact_is_below_threshold() {
         let mut p = policy();
         // A body sitting on the floor: impulse ~= its weight support, ratio ~1.
-        let plan = p.plan(1, CELL_M, &[event([4.0, 1.0, 4.0], 200.0, 1.2)]);
+        let plan = p.plan(1, &[event([16.0, 4.0, 16.0], 200.0, 1.2)]);
         assert_eq!(plan.admitted(), 0);
         assert_eq!(plan.suppressed_below_threshold, 1);
     }
@@ -351,7 +380,7 @@ mod tests {
         let mut p = policy();
         // Ratio 10x clears impact_ratio, but a 0.2 kg body's 10x impulse is
         // ~0.33 N·s — far below min_impulse_n_s.
-        let plan = p.plan(1, CELL_M, &[event([4.0, 1.0, 4.0], 0.2, 10.0)]);
+        let plan = p.plan(1, &[event([16.0, 4.0, 16.0], 0.2, 10.0)]);
         assert_eq!(plan.admitted(), 0);
         assert_eq!(plan.suppressed_below_threshold, 1);
     }
@@ -359,7 +388,7 @@ mod tests {
     #[test]
     fn a_very_hard_hit_also_detaches_material() {
         let mut p = policy();
-        let plan = p.plan(1, CELL_M, &[event([4.0, 1.0, 4.0], 200.0, 30.0)]);
+        let plan = p.plan(1, &[event([16.0, 4.0, 16.0], 200.0, 30.0)]);
         assert_eq!(plan.admitted(), 1);
         let x = plan.damage[0]
             .explosion
@@ -371,25 +400,25 @@ mod tests {
     #[test]
     fn a_region_on_cooldown_takes_no_further_damage_until_it_expires() {
         let mut p = policy();
-        let hit = event([4.0, 1.0, 4.0], 200.0, 12.0);
-        assert_eq!(p.plan(1, CELL_M, &[hit]).admitted(), 1);
+        let hit = event([16.0, 4.0, 16.0], 200.0, 12.0);
+        assert_eq!(p.plan(1, &[hit]).admitted(), 1);
 
         // Same region, still inside cooldown_ticks (20): suppressed.
         for tick in 2..=20 {
-            let plan = p.plan(tick, CELL_M, &[hit]);
+            let plan = p.plan(tick, &[hit]);
             assert_eq!(plan.admitted(), 0, "tick {tick} inside cooldown");
             assert_eq!(plan.suppressed_cooldown, 1);
         }
         // Cooldown expires: eligible again.
-        assert_eq!(p.plan(21, CELL_M, &[hit]).admitted(), 1);
+        assert_eq!(p.plan(21, &[hit]).admitted(), 1);
     }
 
     #[test]
     fn two_contacts_in_one_region_in_one_tick_emit_once() {
         let mut p = policy();
-        let a = event([4.0, 1.0, 4.0], 200.0, 12.0);
-        let b = event([4.1, 1.0, 4.05], 200.0, 30.0); // same 0.25 m cell/brick
-        let plan = p.plan(1, CELL_M, &[a, b]);
+        let a = event([16.0, 4.0, 16.0], 200.0, 12.0);
+        let b = event([16.4, 4.0, 16.2], 200.0, 30.0); // same cell/brick
+        let plan = p.plan(1, &[a, b]);
         assert_eq!(plan.admitted(), 1);
         assert_eq!(plan.suppressed_cooldown, 1);
         // The harder hit (b, 30x) won the slot, so the cut carries an explosion.
@@ -399,11 +428,12 @@ mod tests {
     #[test]
     fn the_per_tick_cap_drops_excess_qualifying_contacts() {
         let mut p = policy(); // max_intents_per_tick = 4
-        // Six qualifying hits in six well-separated bricks (32 cells = 8 m).
+        // Six qualifying hits in six well-separated bricks (one 32-cell brick
+        // apart on x).
         let events: Vec<ContactEvent> = (0..6)
-            .map(|i| event([i as f64 * 8.0 + 1.0, 1.0, 1.0], 200.0, 12.0))
+            .map(|i| event([i as f64 * 32.0 + 4.0, 4.0, 4.0], 200.0, 12.0))
             .collect();
-        let plan = p.plan(1, CELL_M, &events);
+        let plan = p.plan(1, &events);
         assert_eq!(plan.admitted(), 4);
         assert_eq!(plan.dropped_over_cap, 2);
     }
@@ -411,9 +441,9 @@ mod tests {
     #[test]
     fn a_body_born_this_tick_cannot_trigger_damage() {
         let mut p = policy();
-        let mut e = event([4.0, 1.0, 4.0], 200.0, 30.0);
+        let mut e = event([16.0, 4.0, 16.0], 200.0, 30.0);
         e.striker_born_this_tick = true;
-        let plan = p.plan(1, CELL_M, &[e]);
+        let plan = p.plan(1, &[e]);
         assert_eq!(plan.admitted(), 0);
         assert_eq!(plan.suppressed_recursion, 1);
     }
@@ -421,16 +451,16 @@ mod tests {
     #[test]
     fn planning_is_independent_of_event_order() {
         let events: Vec<ContactEvent> = vec![
-            event([1.0, 1.0, 1.0], 200.0, 12.0),
-            event([20.0, 1.0, 1.0], 200.0, 30.0),
-            event([1.0, 1.0, 20.0], 200.0, 8.0),
+            event([4.0, 4.0, 4.0], 200.0, 12.0),
+            event([80.0, 4.0, 4.0], 200.0, 30.0),
+            event([4.0, 4.0, 80.0], 200.0, 8.0),
         ];
         let mut forward = policy();
-        let a = forward.plan(1, CELL_M, &events);
+        let a = forward.plan(1, &events);
         let mut reversed = policy();
         let mut rev = events.clone();
         rev.reverse();
-        let b = reversed.plan(1, CELL_M, &rev);
+        let b = reversed.plan(1, &rev);
         assert_eq!(a.damage, b.damage);
         assert_eq!(a.admitted(), 3);
     }
@@ -438,19 +468,88 @@ mod tests {
     #[test]
     fn replanning_the_same_tick_is_a_no_op() {
         let mut p = policy();
-        let hit = event([4.0, 1.0, 4.0], 200.0, 12.0);
-        assert_eq!(p.plan(7, CELL_M, &[hit]).admitted(), 1);
-        let again = p.plan(7, CELL_M, &[hit]);
+        let hit = event([16.0, 4.0, 16.0], 200.0, 12.0);
+        assert_eq!(p.plan(7, &[hit]).admitted(), 1);
+        let again = p.plan(7, &[hit]);
         assert_eq!(again, ContactDamagePlan::default());
     }
 
     #[test]
     fn a_non_finite_contact_point_is_counted_malformed_not_panicked() {
         let mut p = policy();
-        let mut e = event([f64::NAN, 1.0, 4.0], 200.0, 30.0);
-        e.point_m = [f64::INFINITY, 1.0, 4.0];
-        let plan = p.plan(1, CELL_M, &[e]);
+        let mut e = event([f64::NAN, 4.0, 16.0], 200.0, 30.0);
+        e.point_cell = [f64::INFINITY, 4.0, 16.0];
+        let plan = p.plan(1, &[e]);
         assert_eq!(plan.admitted(), 0);
         assert_eq!(plan.malformed, 1);
+    }
+
+    // ---- increment 3: body-on-body targets ----
+
+    fn body_vol() -> VolumeId {
+        VolumeId::new(7).unwrap()
+    }
+
+    fn body_ent() -> EntityId {
+        EntityId::new(42).unwrap()
+    }
+
+    /// A hard contact against a *body*, its point already resolved into that
+    /// body's local cell frame.
+    fn body_event(point_cell: [f64; 3], ratio: f32) -> ContactEvent {
+        let resting = 300.0_f32 * 9.81 * (1.0 / 60.0);
+        ContactEvent {
+            target: EditTarget::Body(body_ent()),
+            target_volume: body_vol(),
+            point_cell,
+            normal: [0.0, -1.0, 0.0],
+            impulse_n_s: resting * ratio,
+            resting_impulse_n_s: resting,
+            striker_born_this_tick: false,
+        }
+    }
+
+    #[test]
+    fn a_body_target_brush_lands_in_the_body_local_frame() {
+        let mut p = policy();
+        // Contact point at body-local cell (3, 3, 3) — nothing to do with world
+        // metres; the caller already mapped it through the body pose.
+        let plan = p.plan(1, &[body_event([3.0, 3.2, 2.8], 12.0)]);
+        assert_eq!(plan.admitted(), 1);
+        assert_eq!(plan.damage[0].target, EditTarget::Body(body_ent()));
+        // Brush centre is the cell centre of body-local (3, 3, 3).
+        let half = BRUSH_UNIT / 2;
+        let c = plan.damage[0].brush.centre;
+        assert_eq!(c.x, 3 * BRUSH_UNIT + half);
+        assert_eq!(c.y, 3 * BRUSH_UNIT + half);
+        assert_eq!(c.z, 3 * BRUSH_UNIT + half);
+    }
+
+    #[test]
+    fn a_body_local_cooldown_key_bites_for_a_moving_body() {
+        // The body translates through the world every tick, but the contact
+        // keeps landing on the *same body-local* spot. Because the policy keys
+        // the cooldown on `(target_volume, brick-of-point_cell)`, the repeat is
+        // suppressed — a world-frame key would miss every tick.
+        let mut p = policy();
+        let hit = body_event([3.0, 3.0, 3.0], 15.0);
+        assert_eq!(p.plan(1, &[hit]).admitted(), 1);
+        for tick in 2..=20 {
+            let plan = p.plan(tick, &[hit]);
+            assert_eq!(plan.admitted(), 0, "tick {tick} inside body-local cooldown");
+            assert_eq!(plan.suppressed_cooldown, 1);
+        }
+        assert_eq!(p.plan(21, &[hit]).admitted(), 1);
+    }
+
+    #[test]
+    fn terrain_and_body_contacts_in_the_same_brick_do_not_share_a_cooldown() {
+        // Same brick coordinate, different target volume: independent regions.
+        let mut p = policy();
+        let t = event([3.0, 3.0, 3.0], 300.0, 15.0);
+        let b = body_event([3.0, 3.0, 3.0], 15.0);
+        let plan = p.plan(1, &[t, b]);
+        assert_eq!(plan.admitted(), 2, "terrain and body cuts both admitted");
+        assert_eq!(plan.suppressed_cooldown, 0);
     }
 }

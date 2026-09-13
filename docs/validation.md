@@ -330,8 +330,8 @@ At a gate, retain raw metrics alongside a concise report in `docs/reports/Gx.md`
 | crash-transfer | Crash before/after source-removal/child-create commit cannot recover partial ownership |
 | malformed-input | Invalid lengths, huge coordinates, compressed bombs, invalid IDs/NaNs, excessive rates reject within bounds |
 | cantilever-strength | Material capacity changes failure outcome; damage/bonds survive restart and replication |
-| contact-damage | A falling body craters the terrain it strikes; a body at rest never re-fractures the floor under it; per-tick damage-intent count and pipeline depth stay bounded; conversion is deterministic |
-| sleep-wake | Settled persistent rubble wakes before nearby interaction and remains destructible |
+| contact-damage | A falling body craters the terrain it strikes; a heavier body dropped on a lighter one fractures the body being struck, not the dropper; a body at rest never re-fractures the surface under it; a settling debris stack produces only a bounded cut stream and stops once asleep; per-tick damage-intent count and pipeline depth stay bounded; conversion is deterministic and conserves matter |
+| sleep-wake | Settled persistent rubble wakes before nearby interaction — an edit targeting it, an approaching player, or a terrain cut under it — and remains destructible; a distant edit leaves it dormant |
 | scene-switch | Old asynchronous results never enter a new world/session at reused coordinates |
 | player-movement | A scripted capsule walks and stays grounded; a 100 ms link keeps corrections bounded; removing a floor cannot leave the player hovering; a lost button release stops it within 250 ms |
 
@@ -377,12 +377,22 @@ and end-of-run contact penetration `<= body_settle_max_penetration_m` (it settle
 *on* the floor, not through it). CPU-side proof:
 `spall_sim` `body_rest_on_structure` integration test.
 
-Neither fixture yet covers the full 64 x 32 x 64 m / 60-second /
-10-requests-per-second workload or the 64-brick collapse stress case; those
-remain explicit follow-up evidence until procedural world generation and the
-oversized-split path are available. `cargo xtask capture --scene destruction`
-(below) renders the authoritative cut sequence offscreen through the T12
-pipeline with real GPU pass timings. Measured results: `docs/reports/G1.md`.
+Neither fixture yet covers the full 60-second / 10-requests-per-second
+sustained two-client workload or the 64-brick collapse stress case; those
+remain explicit follow-up evidence pending a sustained-request-rate driver
+(the oversized-split path itself is available — T17 / ENG-64). The full
+`64 x 32 x 64 m` envelope itself is built (ENG-62 / T11a increment 3):
+`spall_sim::fixtures::g1_full_envelope_setup` (`--scene g1-full-envelope`) is
+real, resident, walkable terrain across the whole footprint — not just
+isolated structures — plus a hollow tower/bridge spanning brick boundaries, an
+excavatable ramp, and a moving hollow test-volume body, standing up and
+stepping well inside the 60 Hz tick budget. `cargo xtask scenario --name
+g1-full-envelope` runs it networked (two real `--late-join` clients); `cargo
+xtask capture --scene destruction` (below) renders the authoritative cut
+sequence offscreen through the T12 pipeline with real GPU pass timings, and
+`--scene destruction-networked` renders the same sequence from a real
+network-replicated client instead of the authoritative sim. Measured results:
+`docs/reports/G1.md`.
 
 For overload tests, requests beyond admission capacity may return busy. The report must distinguish requested, rejected, queued, and committed counts. Rejecting every expensive action does not satisfy the gate: all named mandatory edits must complete.
 
@@ -651,11 +661,17 @@ A second burst test exceeds ordinary load to verify explicit admission/backpress
 
 Material strength, contact damage, local player prediction, reliable repairs, full save/recovery, and destructible terrain/body parity are functional requirements of this gate. GPU and server gates may run on separate machines; localhost eight-client runs are correctness evidence, not a substitute for realistic network/performance measurement.
 
-Contact damage CPU-side proof (T21 increment 1): `spall_physics` unit test
+Contact damage CPU-side proof (T21 increments 1 & 3): `spall_physics` unit test
 `contact_impulses_spike_on_impact_then_decay_to_the_resting_load` and the
 `spall_sim` `contact_damage` integration test
 (`falling_body_damages_terrain`, `a_settled_body_stops_damaging_the_floor`,
-`contact_damage_is_bounded_and_deterministic`).
+`contact_damage_is_bounded_and_deterministic`,
+`a_heavy_body_dropped_on_a_lighter_one_fractures_the_lighter_one`,
+`settling_debris_stack_does_not_cascade`) plus the `contact_damage` pure-module
+unit tests for the body-local brush frame and body-local cooldown key. Increment
+3 targets the struck body (slower of the pair, tie-broken to lower mass) with the
+contact point resolved into its local cell frame; the fracture is a normal
+committed transaction, so conservation holds and the body count stays bounded.
 
 Region dormancy CPU-side proof (T21 increment 2, the `sleep-wake` fixture):
 `spall_physics` unit test
@@ -664,11 +680,28 @@ Region dormancy CPU-side proof (T21 increment 2, the `sleep-wake` fixture):
 (`settled_debris_deactivates_without_changing_the_world`,
 `an_edit_wakes_dormant_rubble_and_it_stays_destructible`,
 `a_player_approaching_wakes_dormant_rubble`,
+`a_terrain_cut_under_dormant_rubble_wakes_it`,
+`a_terrain_cut_far_from_dormant_rubble_leaves_it_dormant`,
 `dormancy_is_invisible_to_the_authoritative_state`). A settled body with a quiet
 interaction region is deactivated (dropped from the physics step, record
-frozen); an edit or an approaching player reactivates it before it is touched;
-`world_hash` and conservation are identical to a run without the dormancy pass.
-Body-on-body contact fracture is the next T21 increment.
+frozen); an edit targeting it, an approaching player, or a terrain cut within
+`wake_margin_m` (increment 3) reactivates it before it is touched, while a
+distant cut leaves it dormant; `world_hash` and conservation are identical to a
+run without the dormancy pass.
+
+Server-wiring networked proof (T21 increment 4 / 3c): `cargo xtask scenario
+--name sleep-wake` runs `sandbox-server --serve --dormancy` on the dedicated
+`Scene::SleepWake` against one real client over QUIC. The client cuts a column
+early, detaching a beam that falls and settles well outside the default wake
+margin; the server-reported `dormancy_deactivations_total` and
+`dormancy_reactivations_total` must both be `>= 1` (`dormancy_assertions` in
+the fixture). The client then walks down the lane into the wake margin — the
+dormant beam reactivates by proximity — and a final body-targeted cut proves it
+is still destructible (`body_cut_committed`). Passes clean, under `--loss-percent
+2`, and with `replay_check` (the committed topology-event stream replayed from
+the tick-0 baseline reproduces the same hash — dormancy is not journalled, only
+the two topology transactions are). See
+`docs/reports/ENG-28-increment-4-sleep-wake.md` for measured evidence.
 
 ### G5 — larger world
 

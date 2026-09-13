@@ -69,8 +69,8 @@ fn drop_and_settle(
         .unwrap();
     let mut dormant_at = None;
     for tick in 1..=max_ticks {
-        sim.tick().unwrap();
-        sim.apply_dormancy(policy);
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(policy, &report);
         if dormant_at.is_none() && sim.world().body_is_dormant(entity) {
             dormant_at = Some(tick);
         }
@@ -89,6 +89,20 @@ fn cut_body(entity: EntityId, req: u64, x: i64, y: i64, z: i64, r: i64) -> EditI
         spall_sim::RequestId(req),
         EntityId::new(1).unwrap(),
         EditTarget::Body(entity),
+        SphereBrush::new(
+            BrushPoint::from_units(x * BRUSH_UNIT + h, y * BRUSH_UNIT + h, z * BRUSH_UNIT + h),
+            r * BRUSH_UNIT,
+        )
+        .unwrap(),
+    )
+}
+
+fn cut_terrain(req: u64, x: i64, y: i64, z: i64, r: i64) -> EditIntent {
+    let h = BRUSH_UNIT / 2;
+    EditIntent::cut(
+        spall_sim::RequestId(req),
+        EntityId::new(1).unwrap(),
+        EditTarget::Terrain,
         SphereBrush::new(
             BrushPoint::from_units(x * BRUSH_UNIT + h, y * BRUSH_UNIT + h, z * BRUSH_UNIT + h),
             r * BRUSH_UNIT,
@@ -169,8 +183,8 @@ fn a_player_approaching_wakes_dormant_rubble() {
 
     let mut woke_at = None;
     for tick in 0..40 {
-        sim.tick().unwrap();
-        sim.apply_dormancy(&mut policy);
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
         if woke_at.is_none() && !sim.world().body_is_dormant(entity) {
             woke_at = Some(tick);
         }
@@ -181,6 +195,64 @@ fn a_player_approaching_wakes_dormant_rubble() {
     );
     assert_eq!(sim.world().dormant_body_count(), 0);
     assert_eq!(sim.world().physics().active_body_count(), 2);
+}
+
+#[test]
+fn a_terrain_cut_under_dormant_rubble_wakes_it() {
+    let mut sim = Simulation::new(SimulationConfig::new(thick_slab_setup())).unwrap();
+    let mut policy = DormancyPolicy::new(test_config());
+    let (entity, dormant_at) = drop_and_settle(&mut sim, &mut policy, 500);
+    assert!(dormant_at.is_some(), "the cube went dormant");
+    assert!(sim.world().body_is_dormant(entity));
+
+    // Cut the slab directly under the dormant cube (it rests around cell 17).
+    sim.submit(cut_terrain(1, 17, 5, 17, 3))
+        .expect("terrain cut admitted");
+
+    let mut woke_at = None;
+    for tick in 0..60 {
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+        if woke_at.is_none() && !sim.world().body_is_dormant(entity) {
+            woke_at = Some(tick);
+        }
+    }
+    assert!(
+        sim.committed(spall_sim::RequestId(1)).is_some(),
+        "the terrain cut committed"
+    );
+    assert!(
+        woke_at.is_some(),
+        "the support change under the dormant cube reactivated it"
+    );
+    // It may re-settle and go dormant again later — that is correct once nothing
+    // is interacting with it; the point is the cut woke it in the first place.
+}
+
+#[test]
+fn a_terrain_cut_far_from_dormant_rubble_leaves_it_dormant() {
+    let mut sim = Simulation::new(SimulationConfig::new(thick_slab_setup())).unwrap();
+    let mut policy = DormancyPolicy::new(test_config());
+    let (entity, dormant_at) = drop_and_settle(&mut sim, &mut policy, 500);
+    assert!(dormant_at.is_some());
+    assert!(sim.world().body_is_dormant(entity));
+
+    // A cut at the far corner of the slab — well outside wake_margin_m (3 m).
+    sim.submit(cut_terrain(1, 1, 5, 1, 2))
+        .expect("terrain cut admitted");
+
+    for _ in 0..60 {
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+    }
+    assert!(
+        sim.committed(spall_sim::RequestId(1)).is_some(),
+        "the far terrain cut committed"
+    );
+    assert!(
+        sim.world().body_is_dormant(entity),
+        "a distant terrain cut left the settled cube dormant"
+    );
 }
 
 #[test]
@@ -201,9 +273,9 @@ fn dormancy_is_invisible_to_the_authoritative_state() {
             )
             .unwrap();
         for _ in 0..500 {
-            sim.tick().unwrap();
+            let report = sim.tick().unwrap();
             if with_dormancy {
-                sim.apply_dormancy(&mut policy);
+                sim.apply_dormancy(&mut policy, &report);
             }
         }
         (

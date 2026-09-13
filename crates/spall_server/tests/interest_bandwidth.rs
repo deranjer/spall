@@ -77,6 +77,8 @@ fn base_config(
         await_body_settle: false,
         motion_interest: Some(motion_interest),
         residency: None,
+        contact_damage: None,
+        dormancy: None,
     }
 }
 
@@ -105,6 +107,8 @@ fn column_cut_client(
         summary_json: Some(dir.join("client.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        on_replica_ready: None,
+        interactive: None,
     }
 }
 

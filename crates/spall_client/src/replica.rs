@@ -595,6 +595,17 @@ impl ReplicaWorld {
         self.terrain_id
     }
 
+    /// The newest server tick this replica has observed, from either a
+    /// committed transaction or a motion snapshot — whichever arrived last.
+    /// `0` before anything has been applied. Unlike
+    /// [`Self::latest_motion_tick`] (per body), this is replica-wide: a
+    /// caller polling for "has the replica caught up to tick N yet" (e.g. a
+    /// graphical capture harness deciding when to render) does not need to
+    /// pick one body to watch.
+    pub fn now_tick(&self) -> u64 {
+        self.now_tick
+    }
+
     /// The live terrain volume, for building a client-side collision world (T19
     /// prediction). `None` before a baseline is installed.
     pub fn terrain_volume(&self) -> Option<&Volume> {

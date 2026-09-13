@@ -1,4 +1,5 @@
 mod netcheck;
+mod play;
 mod process;
 mod session;
 
@@ -37,6 +38,12 @@ enum CommandKind {
     /// T10 replication harness against a named built-in scenario
     /// (`fixtures/scenarios/<name>.json`).
     Scenario(session::ScenarioArgs),
+    /// ENG-69: launch one `sandbox-server` and open one interactive
+    /// `sandbox-client --interactive` window against it — a real hands-on
+    /// local play session (generates the join token, waits for the server to
+    /// bind, then opens the window), not the scripted `session`/`scenario`
+    /// harness.
+    Play(play::PlayArgs),
     /// Render acceptance shapes or a named lighting fixture offscreen.
     /// Exit 3 means no GPU/capture capability.
     Capture(CaptureArgs),
@@ -76,7 +83,10 @@ struct CaptureArgs {
     /// Fixture scene: `colored-room` (T13), `lighting-sequence` (T14),
     /// `destruction` (T11a — offscreen frames of the authoritative
     /// `g1-networked-destruction` cut sequence with GPU pass timings),
-    /// `g2-frames` (T15 — cold per-pass GPU frame-cost percentiles over the
+    /// `destruction-networked` (T11a / ENG-62 increment 3 — the same cut
+    /// sequence over real QUIC: a real server + two real clients, rendered
+    /// from a network-replicated `ReplicaWorld` instead of the authoritative
+    /// sim), `g2-frames` (T15 — cold per-pass GPU frame-cost percentiles over the
     /// still lighting fixtures at a fixed 1920x1080), `g2-loop` (T15 —
     /// persistent-resource settled-frame GPU + CPU percentiles), `g2-motion`
     /// (T15 — 120-frame moving sequences + ghosting / flicker / noise flags),
@@ -163,6 +173,7 @@ fn run(cli: Cli) -> Result<(), XtaskError> {
         CommandKind::NetCheck(args) => netcheck::run(args, unique_output),
         CommandKind::Session(args) => session::run_session(args, || unique_run_dir("session")),
         CommandKind::Scenario(args) => session::run_scenario(args, || unique_run_dir("scenario")),
+        CommandKind::Play(args) => play::run(args, || unique_run_dir("play")),
         CommandKind::Capture(args) => capture(args),
         CommandKind::Bench(_) => unavailable("bench", "G1/G2 measurement work"),
         CommandKind::CrashTest(args) => crash_test(args),

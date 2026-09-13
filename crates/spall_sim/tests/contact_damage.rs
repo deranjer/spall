@@ -13,7 +13,7 @@
 //!   deterministic (`contact_damage_is_bounded_and_deterministic`).
 
 use glam::DQuat;
-use spall_core::GlobalCell;
+use spall_core::{EntityId, GlobalCell};
 use spall_sim::{
     BodyPose, ContactDamageConfig, ContactDamagePolicy, Simulation, SimulationConfig, fixtures,
     solid_cells,
@@ -43,6 +43,14 @@ fn thick_slab_setup() -> spall_sim::WorldSetup {
 fn terrain_solids(sim: &Simulation) -> u64 {
     let vid = sim.world().terrain_volume_id();
     solid_cells(sim.world().volume_ref(vid).unwrap())
+}
+
+/// Solid cells of one body's volume, `0` if the body no longer exists.
+fn body_solids(sim: &Simulation, entity: EntityId) -> u64 {
+    sim.world()
+        .body(entity)
+        .map(|b| solid_cells(sim.world().volume_ref(b.volume_id).unwrap()))
+        .unwrap_or(0)
 }
 
 fn sample(sim: &Simulation, cell: GlobalCell) -> Sample {
@@ -203,5 +211,164 @@ fn contact_damage_is_bounded_and_deterministic() {
         a.0 <= 3,
         "no body explosion: at most the three cubes ({})",
         a.0
+    );
+}
+
+/// Increment 3 — a heavier body dropped onto a lighter one fractures the body
+/// being struck, not (or much less than) the dropper; matter is only ever
+/// destroyed, never created; the body count stays bounded.
+#[test]
+fn a_heavy_body_dropped_on_a_lighter_one_fractures_the_lighter_one() {
+    let mut sim = Simulation::new(SimulationConfig::new(thick_slab_setup())).unwrap();
+    let mut policy = ContactDamagePolicy::new(ContactDamageConfig::DEFAULT);
+
+    // Lighter cube, settled on the slab (top of the 6-cell slab is y = 1.5 m).
+    let struck = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(4),
+            BodyPose::new(DQuat::IDENTITY, [4.0, 1.75, 4.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    for _ in 0..150 {
+        let report = sim.tick().unwrap();
+        sim.apply_contact_damage(&mut policy, &report);
+    }
+    sim.run_until_idle(30).unwrap();
+    let struck_before = body_solids(&sim, struck);
+    let total_before = sim.world().total_solid_cells();
+    assert!(struck_before > 0, "the lighter cube settled intact");
+
+    // Heavier cube dropped ~1.5 m straight down onto it — a firm hit, not an
+    // explosive one, so the light cube (backed by terrain) never briefly
+    // outruns the decelerating dropper.
+    let dropper = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(4),
+            BodyPose::new(DQuat::IDENTITY, [4.0, 4.25, 4.0]),
+            [0.0; 3],
+            [0.0; 3],
+            3600.0,
+            0,
+        )
+        .unwrap();
+    let dropper_before = body_solids(&sim, dropper);
+
+    let mut admitted = 0usize;
+    let mut cuts_on_struck = 0usize;
+    let mut cuts_on_dropper = 0usize;
+    for _ in 0..300 {
+        let report = sim.tick().unwrap();
+        let dmg = sim.apply_contact_damage(&mut policy, &report);
+        admitted += dmg.plan.admitted();
+        for cut in &dmg.plan.damage {
+            match cut.target {
+                spall_sim::EditTarget::Body(e) if e == struck => cuts_on_struck += 1,
+                spall_sim::EditTarget::Body(e) if e == dropper => cuts_on_dropper += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(dmg.rejected, 0, "the pipeline never backpressured");
+    }
+    sim.run_until_idle(120).unwrap();
+
+    assert!(admitted >= 1, "the impact produced a damage cut");
+    assert!(
+        cuts_on_struck >= 1 && cuts_on_struck >= cuts_on_dropper,
+        "the struck body took the damage (struck {cuts_on_struck}, dropper {cuts_on_dropper})"
+    );
+
+    let struck_after = body_solids(&sim, struck);
+    let dropper_after = body_solids(&sim, dropper);
+    assert!(
+        struck_after < struck_before,
+        "the struck (lighter) body lost cells ({struck_before} -> {struck_after})"
+    );
+    assert!(
+        dropper_before - dropper_after <= struck_before - struck_after,
+        "the dropper lost no more cells than the body it struck \
+         (dropper {dropper_before} -> {dropper_after}, struck {struck_before} -> {struck_after})"
+    );
+
+    // Conservation: the only change to total solid matter is destruction.
+    let total_after = sim.world().total_solid_cells();
+    assert!(
+        total_after < total_before,
+        "a cut destroyed matter ({total_before} -> {total_after})"
+    );
+    let destroyed = total_before - total_after;
+    assert_eq!(
+        total_after + destroyed,
+        total_before,
+        "terrain + bodies + destroyed balances"
+    );
+    assert!(total_after > 0, "matter remains");
+
+    // No fragmentation blow-up: the two cubes plus a handful of chips.
+    assert!(
+        sim.world().body_count() <= 8,
+        "body count stayed bounded ({})",
+        sim.world().body_count()
+    );
+}
+
+/// Increment 3 — a loose stack of equal-mass debris settling onto a slab
+/// produces only a bounded number of body-damage cuts, and none once it sleeps
+/// (the body-on-body mirror of `a_settled_body_stops_damaging_the_floor`).
+#[test]
+fn settling_debris_stack_does_not_cascade() {
+    let mut sim = Simulation::new(SimulationConfig::new(thick_slab_setup())).unwrap();
+    let mut policy = ContactDamagePolicy::new(ContactDamageConfig::DEFAULT);
+
+    // Four 1 m cubes with ~0.4 m gaps, so each lands on the one below.
+    for i in 0..4 {
+        sim.world_mut()
+            .spawn_body(
+                fixtures::solid_block(4),
+                BodyPose::new(DQuat::IDENTITY, [4.0, 1.75 + i as f64 * 1.4, 4.0]),
+                [0.0; 3],
+                [0.0; 3],
+                2600.0,
+                0,
+            )
+            .unwrap();
+    }
+    let bodies0 = sim.world().body_count();
+    assert_eq!(bodies0, 4);
+
+    let mut admitted = 0usize;
+    for _ in 0..600 {
+        let report = sim.tick().unwrap();
+        admitted += sim
+            .apply_contact_damage(&mut policy, &report)
+            .plan
+            .admitted();
+    }
+    sim.run_until_idle(120).unwrap();
+
+    assert!(
+        admitted <= 4 * bodies0,
+        "the settling stack produced a bounded cut stream (got {admitted})"
+    );
+
+    // Everything is asleep now: another 180 quiet ticks admit nothing.
+    let mut late = 0usize;
+    for _ in 0..180 {
+        let report = sim.tick().unwrap();
+        late += sim
+            .apply_contact_damage(&mut policy, &report)
+            .plan
+            .admitted();
+    }
+    assert_eq!(late, 0, "a settled stack stops producing cuts");
+    assert!(
+        sim.world().body_count() <= 4 * bodies0,
+        "no body-count explosion ({})",
+        sim.world().body_count()
     );
 }

@@ -14,6 +14,7 @@ members = [
     "crates/spall_server",
     "crates/spall_client",
     "examples/sandbox",
+    "examples/poc_local",
     "tools/xtask",
 ]
 resolver = "3"

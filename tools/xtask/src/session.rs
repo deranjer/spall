@@ -277,6 +277,18 @@ struct Scenario {
     /// exercise (0 samples) is not asserted.
     #[serde(default)]
     latency_targets: Option<LatencyTargets>,
+    /// T21 / ENG-28 increment 4 (3c): run the server with `--dormancy` — a
+    /// settled body with nothing active nearby deactivates, and a dormant body
+    /// a player or edit approaches reactivates. Never combine with
+    /// `require_body_settled`: a deactivated body leaves the live physics
+    /// world that reads from.
+    #[serde(default)]
+    dormancy: bool,
+    /// T21 / ENG-28 increment 4: require the server's end-of-run report to
+    /// show at least this many dormancy deactivations / reactivations —
+    /// real end-to-end proof the pass ran, not just that `dormancy` was set.
+    #[serde(default)]
+    dormancy_assertions: Option<DormancyAssertions>,
     /// T23 / G3 row 11: when set, the named `late_join_clients` entry connects
     /// through a shaped proxy (bandwidth + RTT + loss) instead of the plain
     /// per-`loss_percent` one, and its measured compressed baseline size /
@@ -688,6 +700,16 @@ struct ResidencyAssertions {
     max_return_distance_m: Option<f64>,
 }
 
+/// T21 / ENG-28 increment 4 (3c): minimum dormancy pass activity the server's
+/// end-of-run report must show.
+#[derive(Debug, Clone, Deserialize)]
+struct DormancyAssertions {
+    #[serde(default = "one")]
+    min_deactivations: u64,
+    #[serde(default = "one")]
+    min_reactivations: u64,
+}
+
 impl Default for MovementAcceptance {
     fn default() -> Self {
         Self {
@@ -765,6 +787,10 @@ struct ServerSummary {
     transport_egress_bytes: u64,
     #[serde(default)]
     per_client_egress: Vec<PerClientEgressRow>,
+    #[serde(default)]
+    dormancy_deactivations_total: u64,
+    #[serde(default)]
+    dormancy_reactivations_total: u64,
 }
 
 /// Mirrors `spall_server::PerClientEgress`.
@@ -1089,6 +1115,17 @@ fn residency_requirements_met(
         && movement_ok
 }
 
+/// T21 / ENG-28 increment 4 (3c): when the scenario configured
+/// `dormancy_assertions`, require the server's reported deactivation /
+/// reactivation counts to clear the floor. `true` when unconfigured.
+fn dormancy_requirements_met(scenario: &Scenario, server: &ServerSummary) -> bool {
+    let Some(required) = &scenario.dormancy_assertions else {
+        return true;
+    };
+    server.dormancy_deactivations_total >= required.min_deactivations
+        && server.dormancy_reactivations_total >= required.min_reactivations
+}
+
 fn requirements_met(
     scenario: &Scenario,
     server_ticks: u64,
@@ -1183,6 +1220,40 @@ mod requirement_tests {
             action_requests_rejected: 0,
             action_reject_reasons: Vec::new(),
         }
+    }
+
+    #[test]
+    fn dormancy_assertions_require_both_a_deactivation_and_a_reactivation() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "dormancy_assertions": {
+                    "min_deactivations": 1,
+                    "min_reactivations": 1
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut server = ServerSummary::default();
+        assert!(!dormancy_requirements_met(&scenario, &server));
+
+        server.dormancy_deactivations_total = 1;
+        assert!(
+            !dormancy_requirements_met(&scenario, &server),
+            "a deactivation with no matching reactivation is not enough"
+        );
+
+        server.dormancy_reactivations_total = 1;
+        assert!(dormancy_requirements_met(&scenario, &server));
+    }
+
+    #[test]
+    fn dormancy_assertions_are_met_trivially_when_unconfigured() {
+        let scenario: Scenario = serde_json::from_str(r#"{ "server_ticks": 10 }"#).unwrap();
+        assert!(dormancy_requirements_met(
+            &scenario,
+            &ServerSummary::default()
+        ));
     }
 
     #[test]
@@ -1763,6 +1834,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             &re.max_join_retries.to_string(),
         ]);
     }
+    if scenario.dormancy {
+        server_cmd.arg("--dormancy");
+    }
     // T11 exact-replay check (and the T23 cold-restart check) both journal every
     // committed transaction to a world DB. Replay rebuilds from the tick-0
     // baseline; restart recovers a fresh server from the shutdown checkpoint.
@@ -2132,6 +2206,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     if !residency_requirements_met(&scenario, &server, &client_summaries) {
         requirements_met = false;
     }
+    if !dormancy_requirements_met(&scenario, &server) {
+        requirements_met = false;
+    }
     // T23 / G3 row 11: the configured client's measured compressed baseline
     // size and time-to-ready must both stay within budget, and it must have
     // actually converged — small/fast is not a pass if the join itself failed.
@@ -2468,18 +2545,18 @@ fn finish(output: &Path, summary: SessionSummary) -> Result<(), XtaskError> {
 // --- child supervision -------------------------------------------------------
 
 #[derive(Default)]
-struct ChildGuard {
+pub(crate) struct ChildGuard {
     children: Vec<(String, Child)>,
 }
 
 impl ChildGuard {
-    fn push(&mut self, label: String, child: Child) {
+    pub(crate) fn push(&mut self, label: String, child: Child) {
         self.children.push((label, child));
     }
 
     /// Polls every child until all have exited or `deadline` passes; kills any
     /// survivors. Returns `label -> exit code` (`None` if killed / no code).
-    fn wait_all(&mut self, deadline: Duration) -> BTreeMap<String, Option<i32>> {
+    pub(crate) fn wait_all(&mut self, deadline: Duration) -> BTreeMap<String, Option<i32>> {
         let end = Instant::now() + deadline;
         let mut codes: BTreeMap<String, Option<i32>> = BTreeMap::new();
         loop {
@@ -2523,7 +2600,7 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_for_addr(
+pub(crate) fn wait_for_addr(
     path: &Path,
     guard: &mut ChildGuard,
     deadline: Duration,
@@ -2564,7 +2641,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Option<T> 
     serde_json::from_str(&buf).ok()
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -2576,7 +2653,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
 
 /// 64 lowercase hex chars from a seeded SplitMix64-ish stream (no crypto needed:
 /// this is a per-run development token in an ignored directory).
-fn random_hex_32(seed: u64) -> String {
+pub(crate) fn random_hex_32(seed: u64) -> String {
     let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
     let mut out = String::with_capacity(64);
     for _ in 0..4 {

@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant};
 
+use rapier3d::control::CharacterCollision;
 use rapier3d::prelude::*;
 
 use crate::collider::{Representation, build_collider};
@@ -182,6 +183,23 @@ struct Entry {
     /// reversible. [`PhysicsWorld::reactivate_body`] rebuilds it in this same
     /// slot from the caller's grid and stored pose before any contact or edit.
     dormant: bool,
+    /// Set by [`PhysicsWorld::set_query_only`]: every subsequent
+    /// [`PhysicsWorld::rebuild_collider`] call reapplies zeroed
+    /// `solver_groups` to the fresh collider it builds, so the setting
+    /// survives a rebuild rather than needing the caller to reapply it every
+    /// time. See that method's doc for what this actually does.
+    query_only: bool,
+}
+
+/// `solver_groups` for [`PhysicsWorld::set_query_only`]: membership *and*
+/// filter both zeroed, so Rapier's interaction test — `(a.memberships &
+/// b.filter) != 0` (`And` mode additionally requires the symmetric term too)
+/// — is false against literally any other collider's groups, regardless of
+/// their own configuration or the test mode in effect. `collision_groups`
+/// (a separate field, left at its default) is untouched, so ordinary
+/// queries still see this collider normally.
+fn query_only_solver_groups() -> InteractionGroups {
+    InteractionGroups::new(Group::NONE, Group::NONE, InteractionTestMode::And)
 }
 
 /// The body-local offset that places a tight occupancy grid's cell `(0, 0, 0)`
@@ -243,6 +261,11 @@ pub struct PhysicsWorld {
     ccd_solver: CCDSolver,
     entries: Vec<Entry>,
     step_count: u64,
+    /// Collider handles added/rebuilt/removed since the last [`Self::step`]
+    /// or [`Self::sync_queries`] — see [`Self::sync_queries`]'s doc for why
+    /// this exists alongside `step`, not instead of it.
+    pending_modified: Vec<ColliderHandle>,
+    pending_removed: Vec<ColliderHandle>,
 }
 
 impl PhysicsWorld {
@@ -274,6 +297,8 @@ impl PhysicsWorld {
             ccd_solver: CCDSolver::new(),
             entries: Vec::new(),
             step_count: 0,
+            pending_modified: Vec::new(),
+            pending_removed: Vec::new(),
         }
     }
 
@@ -324,6 +349,7 @@ impl PhysicsWorld {
             rb.set_additional_mass_properties(rapier_mass_properties(props, offset), false);
             rb.recompute_mass_properties_from_colliders(&self.colliders);
         }
+        self.pending_modified.push(collider);
         (body, collider, offset)
     }
 
@@ -342,6 +368,7 @@ impl PhysicsWorld {
             mass_properties: spec.mass_properties,
             retired: false,
             dormant: false,
+            query_only: false,
         });
         id
     }
@@ -362,12 +389,13 @@ impl PhysicsWorld {
         if entry.retired {
             return Duration::ZERO;
         }
-        let (cell_m, density, body, old_collider, mass_properties) = (
+        let (cell_m, density, body, old_collider, mass_properties, query_only) = (
             entry.cell_m,
             entry.density,
             entry.body,
             entry.collider,
             entry.mass_properties,
+            entry.query_only,
         );
 
         let start = Instant::now();
@@ -384,10 +412,13 @@ impl PhysicsWorld {
         } else {
             density
         };
-        let collider = ColliderBuilder::new(built.collider.shared_shape().clone())
+        let mut collider = ColliderBuilder::new(built.collider.shared_shape().clone())
             .density(collider_density)
             .translation(Vector::new(offset[0], offset[1], offset[2]))
             .build();
+        if query_only {
+            collider.set_solver_groups(query_only_solver_groups());
+        }
         let handle = self
             .colliders
             .insert_with_parent(collider, body, &mut self.bodies);
@@ -399,6 +430,8 @@ impl PhysicsWorld {
         self.entries[id.0 as usize].collider = handle;
         self.entries[id.0 as usize].representation = rep;
         self.entries[id.0 as usize].collider_offset_m = offset;
+        self.pending_removed.push(old_collider);
+        self.pending_modified.push(handle);
         total
     }
 
@@ -554,15 +587,108 @@ impl PhysicsWorld {
         if entry.retired {
             return;
         }
+        let collider = entry.collider;
         self.colliders
-            .remove(entry.collider, &mut self.islands, &mut self.bodies, true);
+            .remove(collider, &mut self.islands, &mut self.bodies, true);
         // See `retire_body`: drop the CCD fixed-target cache so it cannot keep a
         // dangling handle to the collider just removed.
         self.ccd_solver = CCDSolver::new();
+        self.pending_removed.push(collider);
+    }
+
+    /// Excludes `id`'s collider from ever producing a rigid-body **solver**
+    /// response — no dynamic body colliding with it is pushed, slowed, or
+    /// stopped by it, ever, regardless of either side's own collision groups
+    /// (`solver_groups` zeroed on both membership and filter, so Rapier's
+    /// interaction test — `And` or `Or` — always fails). It stays fully
+    /// visible to ordinary **queries** (`sweep_character`/`cast_shape`/...),
+    /// which only ever consult `collision_groups`, a separate field this
+    /// leaves untouched.
+    ///
+    /// For [`CharacterQueryCache`](crate::query_cache::CharacterQueryCache)'s
+    /// windows: a window collider must block/redirect the *character's own*
+    /// query-based sweep exactly like real terrain would, while never once
+    /// acting as a real physical obstacle for any dynamic body (debris, other
+    /// players' own dynamics) that happens to pass through the same space —
+    /// it is a query-time convenience, not a real object in the world.
+    ///
+    /// The setting is sticky: every later [`Self::rebuild_collider`] call on
+    /// `id` reapplies it to the fresh collider automatically. A no-op on a
+    /// retired body.
+    pub fn set_query_only(&mut self, id: BodyId) {
+        let entry = &mut self.entries[id.0 as usize];
+        if entry.retired {
+            return;
+        }
+        entry.query_only = true;
+        let collider = entry.collider;
+        if let Some(c) = self.colliders.get_mut(collider) {
+            c.set_solver_groups(query_only_solver_groups());
+        }
+    }
+
+    /// Refreshes the broad-phase spatial index for every collider added or
+    /// rebuilt since the last call to this or [`Self::step`], for
+    /// **queries only** (`sweep_character`/`cast_shape`/...) — without
+    /// stepping the dynamics pipeline: no gravity or velocity integration, no
+    /// contact resolution, for *any* body in this world. [`Self::step`]
+    /// already refreshes the broad-phase as part of its own full pipeline
+    /// step, so a caller that steps this world's simulation every tick
+    /// regardless (the normal case) never needs this. It exists for a caller
+    /// that adds/rebuilds colliders on a world it does **not** own the tick
+    /// loop for — [`CharacterQueryCache`](crate::query_cache::CharacterQueryCache),
+    /// which must never advance a simulation another caller is driving.
+    ///
+    /// Uses [`BroadPhaseBvh::set_aabb`] per modified collider, **not**
+    /// [`BroadPhaseBvh::update`]: `update` is the same call [`Self::step`]
+    /// uses to detect newly-overlapping pairs and emit `AddPair` — and
+    /// Rapier permanently remembers, per pair, that it already announced one
+    /// ("no need to re-send an `AddPair` event... if no `RemovePair`
+    /// happened since", `BroadPhaseBvh::update`'s own doc). Calling `update`
+    /// from here — as this used to — consumes that one-time announcement
+    /// for any dynamic body's pair that happens to be pending, with no
+    /// narrow-phase registration ever created for it: `step`'s *own* later
+    /// `update` call sees the pair as already-announced and never re-emits
+    /// it, so that pair's contacts are never generated again for the rest of
+    /// the simulation, however many times `step` runs afterwards. Confirmed
+    /// with an isolated repro (`.local/analysis/pr109-probe`): a dynamic
+    /// cube resting on a fixed one falls straight through it if a single
+    /// `sync_queries` call happens before the first `step`. `set_aabb`
+    /// refits the tree immediately (so queries see the new shape/position
+    /// right away) but explicitly defers pair evaluation "to the next
+    /// broad-phase update" (its own doc) — i.e. to `step`'s real one, which
+    /// still runs the full detect-and-announce logic exactly once, correctly.
+    /// A collider in `pending_removed` needs no action here: `remove_collider`/
+    /// `retire_body` already removed it from `self.colliders` before pushing
+    /// it there, so a query pipeline built from `self.colliders` naturally
+    /// filters it out via the lookup miss regardless of the tree's own leaf
+    /// cleanup timing, and `step`'s removal handling runs on Rapier's native
+    /// dirty flags next time regardless of what this does.
+    pub fn sync_queries(&mut self) {
+        if self.pending_modified.is_empty() && self.pending_removed.is_empty() {
+            return;
+        }
+        for &handle in &self.pending_modified {
+            if let Some(collider) = self.colliders.get(handle) {
+                let aabb = collider.compute_aabb();
+                self.broad_phase.set_aabb(&self.params, handle, aabb);
+            }
+        }
+        self.pending_modified.clear();
+        self.pending_removed.clear();
     }
 
     /// Advances the world by one fixed step.
     pub fn step(&mut self) -> StepTiming {
+        // The pipeline's own broad-phase pass reads Rapier's native
+        // per-collider dirty flags directly (`ColliderChanges`), not this
+        // list — so whatever's pending is already covered by the step below,
+        // and needs clearing here or it grows without bound for a caller
+        // that always steps (never calling `sync_queries`) and never
+        // otherwise touches these — the normal case, and the only reason
+        // `sync_queries` exists at all is the caller that doesn't.
+        self.pending_modified.clear();
+        self.pending_removed.clear();
         let start = Instant::now();
         self.pipeline.step(
             self.gravity,
@@ -602,6 +728,82 @@ impl PhysicsWorld {
         desired_translation_m: [f32; 3],
         dt_s: f32,
     ) -> crate::character::CharacterMove {
+        self.sweep_character_with(params, position_m, desired_translation_m, dt_s, |_| {})
+    }
+
+    /// Same as [`Self::sweep_character`], but `on_collision` is called for
+    /// every [`CharacterCollision`] Rapier's controller reports along the way
+    /// — normally discarded (`sweep_character` passes an empty closure).
+    /// ENG-69 round 15: added to directly confirm (not just infer from
+    /// endpoint position diffs) that a representation-divergence event is a
+    /// real contact against real geometry, not a coincidental integration
+    /// difference — see `spall_physics::character::tests::
+    /// strafing_the_g1_tower_wall_diverges_between_representations`'s
+    /// per-tick trace, which found the divergence lands entirely within one
+    /// tick.
+    pub fn sweep_character_with(
+        &self,
+        params: crate::character::CharacterParams,
+        position_m: [f64; 3],
+        desired_translation_m: [f32; 3],
+        dt_s: f32,
+        on_collision: impl FnMut(&CharacterCollision),
+    ) -> crate::character::CharacterMove {
+        self.sweep_character_impl(
+            params,
+            position_m,
+            desired_translation_m,
+            dt_s,
+            &[],
+            on_collision,
+        )
+    }
+
+    /// Same as [`Self::sweep_character`], but every collider in `exclude`
+    /// (by [`BodyId`] — a retired id is silently skipped) is invisible to
+    /// this one sweep's query, as if it were not in the world at all. ENG-69
+    /// round 18: a character's own [`CharacterQueryCache`](crate::query_cache::CharacterQueryCache)
+    /// window must be the *only* terrain-like collider it sees for its own
+    /// movement — not the real whole-terrain collider (the window replaces
+    /// it, exactly), and not another character's own window (each
+    /// character's window is sized and centred for *that* character alone;
+    /// nothing about it is meaningful to anyone else's sweep). Both need
+    /// excluding explicitly, by identity, not by a collision-group category —
+    /// see [`Self::set_query_only`]'s doc for why a coarse per-category
+    /// exclusion isn't the right tool here (it would also have to reject the
+    /// caller's *own* window, which a predicate lets back in individually).
+    pub fn sweep_character_excluding(
+        &self,
+        params: crate::character::CharacterParams,
+        position_m: [f64; 3],
+        desired_translation_m: [f32; 3],
+        dt_s: f32,
+        exclude: &[BodyId],
+    ) -> crate::character::CharacterMove {
+        let handles: Vec<ColliderHandle> = exclude
+            .iter()
+            .filter(|id| !self.entries[id.0 as usize].retired)
+            .map(|id| self.entries[id.0 as usize].collider)
+            .collect();
+        self.sweep_character_impl(
+            params,
+            position_m,
+            desired_translation_m,
+            dt_s,
+            &handles,
+            |_| {},
+        )
+    }
+
+    fn sweep_character_impl(
+        &self,
+        params: crate::character::CharacterParams,
+        position_m: [f64; 3],
+        desired_translation_m: [f32; 3],
+        dt_s: f32,
+        exclude: &[ColliderHandle],
+        mut on_collision: impl FnMut(&CharacterCollision),
+    ) -> crate::character::CharacterMove {
         let controller = crate::character::controller();
         let shape = crate::character::capsule(params);
         let centre = params.centre_offset_m();
@@ -611,18 +813,27 @@ impl PhysicsWorld {
             position_m[2] as f32,
         );
         let pos = Pose::from_translation(feet + Vector::new(0.0, centre, 0.0));
+        let excluded_predicate =
+            move |handle: ColliderHandle, _collider: &Collider| !exclude.contains(&handle);
+        let filter = if exclude.is_empty() {
+            QueryFilter::default()
+        } else {
+            QueryFilter::default().predicate(&excluded_predicate)
+        };
         let queries = self.broad_phase.as_query_pipeline(
             self.narrow_phase.query_dispatcher(),
             &self.bodies,
             &self.colliders,
-            QueryFilter::default(),
+            filter,
         );
         let desired = Vector::new(
             desired_translation_m[0],
             desired_translation_m[1],
             desired_translation_m[2],
         );
-        let moved = controller.move_shape(dt_s, &queries, &shape, &pos, desired, |_| {});
+        let moved = controller.move_shape(dt_s, &queries, &shape, &pos, desired, |c| {
+            on_collision(&c);
+        });
         crate::character::CharacterMove {
             translation_m: [
                 moved.translation.x,
@@ -1065,6 +1276,131 @@ mod tests {
             world.max_penetration_m() < 0.1,
             "resting body did not sink into the floor ({} m)",
             world.max_penetration_m()
+        );
+    }
+
+    /// PR #109 review finding: [`PhysicsWorld::sync_queries`] used to call
+    /// [`rapier3d::geometry::BroadPhaseBvh::update`] directly, which Rapier
+    /// permanently remembers as "this pair was announced" — so a single
+    /// `sync_queries` call before a pair's very first real [`PhysicsWorld::step`]
+    /// silently and permanently starved that pair of contacts, for the rest
+    /// of the simulation, however many times `step` ran afterwards. This is
+    /// exactly [`CharacterQueryCache`](crate::query_cache::CharacterQueryCache)'s
+    /// real call pattern: it shares this `PhysicsWorld` with a simulation it
+    /// does not own the tick loop for, and calls `sync_queries` (never
+    /// `step`) after every window rebuild.
+    #[test]
+    fn sync_queries_before_the_first_step_does_not_starve_a_dynamic_body_of_contacts() {
+        fn unit_cube_body(world: &mut PhysicsWorld, kind: BodyKind, y: f32) -> BodyId {
+            world.add_body(BodySpec {
+                kind,
+                representation: Representation::MergedCuboids,
+                grid: OccupancyGrid::from_solid_mask(
+                    GlobalCell::new(0, 0, 0),
+                    [1, 1, 1],
+                    vec![true],
+                    vec![MaterialId(1)],
+                )
+                .unwrap(),
+                cell_m: 1.0,
+                density_kg_m3: 1.0,
+                mass_properties: None,
+                translation_m: [0.0, y, 0.0],
+                linvel_m_s: [0.0; 3],
+            })
+        }
+
+        let mut without_sync = PhysicsWorld::new(PhysicsConfig::default());
+        unit_cube_body(&mut without_sync, BodyKind::Fixed, 0.0);
+        let dynamic_no_sync =
+            unit_cube_body(&mut without_sync, BodyKind::Dynamic { ccd: false }, 1.0);
+        for _ in 0..60 {
+            without_sync.step();
+        }
+        let baseline = without_sync.body_state(dynamic_no_sync);
+        assert!(
+            baseline.translation_m[1] > 0.9,
+            "baseline (no sync_queries) should rest on the floor, got y = {}",
+            baseline.translation_m[1]
+        );
+
+        let mut with_sync = PhysicsWorld::new(PhysicsConfig::default());
+        unit_cube_body(&mut with_sync, BodyKind::Fixed, 0.0);
+        let dynamic = unit_cube_body(&mut with_sync, BodyKind::Dynamic { ccd: false }, 1.0);
+        with_sync.sync_queries();
+        for _ in 0..60 {
+            with_sync.step();
+        }
+        let st = with_sync.body_state(dynamic);
+        assert!(
+            st.translation_m[1] > 0.9,
+            "a sync_queries call before the first step must not stop the pair from ever \
+             contacting — expected the body to rest at y > 0.9 like the no-sync baseline \
+             ({}), got y = {}",
+            baseline.translation_m[1],
+            st.translation_m[1]
+        );
+        assert!(
+            with_sync.contact_pair_count() >= 1,
+            "expected at least one live contact pair after settling, found none"
+        );
+    }
+
+    /// Same regression, but exercising [`CharacterQueryCache`]'s actual usage
+    /// pattern: a collider *replacement* ([`PhysicsWorld::rebuild_collider`])
+    /// followed by `sync_queries`, on a `PhysicsWorld` a real dynamic body is
+    /// also resting in — not just a freshly-added collider.
+    #[test]
+    fn sync_queries_after_collider_replacement_does_not_starve_a_dynamic_body_of_contacts() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [1, 1, 1],
+            vec![true],
+            vec![MaterialId(1)],
+        )
+        .unwrap();
+        let floor = world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: grid.clone(),
+            cell_m: 1.0,
+            density_kg_m3: 1.0,
+            mass_properties: None,
+            translation_m: [0.0, 0.0, 0.0],
+            linvel_m_s: [0.0; 3],
+        });
+        let dynamic = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::MergedCuboids,
+            grid: grid.clone(),
+            cell_m: 1.0,
+            density_kg_m3: 1.0,
+            mass_properties: None,
+            translation_m: [0.0, 1.0, 0.0],
+            linvel_m_s: [0.0; 3],
+        });
+
+        // Rebuild the floor's collider (a no-op geometry change) and sync
+        // queries against it, exactly like `CharacterQueryCache::rebuild`
+        // does for its window collider — before the dynamic body's own pair
+        // has ever gone through a real `step`.
+        world.rebuild_collider(floor, &grid, Representation::MergedCuboids);
+        world.sync_queries();
+
+        for _ in 0..60 {
+            world.step();
+        }
+        let st = world.body_state(dynamic);
+        assert!(
+            st.translation_m[1] > 0.9,
+            "a collider-replacement + sync_queries call must not stop the dynamic body's \
+             pair from ever contacting — got y = {}",
+            st.translation_m[1]
+        );
+        assert!(
+            world.contact_pair_count() >= 1,
+            "expected at least one live contact pair after settling, found none"
         );
     }
 
