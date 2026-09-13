@@ -183,3 +183,189 @@ fn residency_default_off_is_a_no_op() {
     assert!(!sim.world().has_evicted());
     assert_eq!(sim.world().world_hash(), off_hash);
 }
+
+/// T23 / G3 row 7 follow-up (post-merge review P2/P3): `ResidencyPass::capture_checkpoint`
+/// must produce a checkpoint that recovers the complete world even while
+/// terrain sits evicted at capture time, *and* it must do so without
+/// reinstalling that evicted geometry into the live world first — the old
+/// `reload_all`-before-`persist::capture` path this replaced defeated
+/// residency's whole point by spiking memory back to the full world on every
+/// checkpoint.
+#[test]
+fn capture_checkpoint_round_trips_through_real_persistence_while_bricks_stay_evicted() {
+    use spall_physics::PhysicsConfig;
+    use spall_server::persist::{self, PersistConfig};
+    use spall_store::Writer;
+    use spall_structure::AnchorPlane;
+
+    let cfg = PersistConfig {
+        world_id: 0x5A11_0000_0000_C0DE,
+        seed: 11,
+        generator_version: 1,
+    };
+
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let mut pass = ResidencyPass::install(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 4,
+            interest_radius_bricks: 1,
+        },
+    );
+    let player_feet = [[1.0_f64, 1.0, 1.0]];
+
+    let mut next = 0usize;
+    for tick in 1..=180u64 {
+        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
+            let (_, cell, r) = SCRIPT[next];
+            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
+            next += 1;
+        }
+        let report = sim.tick().unwrap();
+        for (_, done) in &report.committed {
+            let touched: Vec<BrickCoord> = done
+                .topology
+                .after
+                .iter()
+                .filter(|br| br.volume == terrain)
+                .map(|br| br.coord)
+                .collect();
+            pass.on_commit(sim.world(), touched);
+        }
+        pass.run(sim.world_mut(), &player_feet);
+    }
+
+    assert!(
+        sim.world().has_evicted(),
+        "the run must still have evicted terrain at capture time -- otherwise this test proves nothing"
+    );
+    let resident_before = sim.world().terrain().volume.resident_brick_count();
+    let expected_hash = sim.world().world_hash();
+    let expected_solid = sim.world().total_solid_cells();
+
+    let checkpoint = pass
+        .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect("bounded capture succeeds from the durable backing");
+
+    // Capturing a checkpoint must not touch the live world's residency.
+    assert_eq!(
+        sim.world().terrain().volume.resident_brick_count(),
+        resident_before,
+        "capture_checkpoint must not reinstall evicted geometry into the live world"
+    );
+    assert!(
+        sim.world().has_evicted(),
+        "eviction must still hold after capture"
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "spall_residency_capture_checkpoint_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("world.db");
+    {
+        let mut w = Writer::open(&db).unwrap();
+        w.publish_checkpoint(&checkpoint).unwrap();
+    }
+    let recovery = spall_store::recover(&db).unwrap();
+    let (recovered, _) = persist::restore(
+        &recovery,
+        &cfg,
+        persist::RecoveryChoice::RequireClean,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .expect("a checkpoint captured with live evictions recovers cleanly");
+
+    assert_eq!(
+        recovered.world().world_hash(),
+        expected_hash,
+        "recovered world_hash must match the live logical hash despite evictions at capture time"
+    );
+    assert_eq!(
+        recovered.world().total_solid_cells(),
+        expected_solid,
+        "recovered conservation must match"
+    );
+    // Recovery has no backing, so its brick set is exactly the checkpoint's,
+    // which must be the *complete* world -- the evicted bricks really did
+    // come back from the durable backing, not get silently dropped.
+    assert!(
+        !recovered.world().has_evicted(),
+        "a freshly-recovered world starts fully resident"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A durable record lost or never captured must fail the whole checkpoint
+/// capture closed, not publish one whose `world_hash` (logical, so it already
+/// counts every evicted brick) claims geometry its `bricks` do not actually
+/// carry.
+#[test]
+fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
+    use spall_server::persist::{self, PersistConfig};
+
+    let cfg = PersistConfig {
+        world_id: 0x5A11_0000_0000_C0DE,
+        seed: 11,
+        generator_version: 1,
+    };
+
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let mut pass = ResidencyPass::install(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 4,
+            interest_radius_bricks: 1,
+        },
+    );
+    let player_feet = [[1.0_f64, 1.0, 1.0]];
+
+    let mut next = 0usize;
+    for tick in 1..=180u64 {
+        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
+            let (_, cell, r) = SCRIPT[next];
+            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
+            next += 1;
+        }
+        let report = sim.tick().unwrap();
+        for (_, done) in &report.committed {
+            let touched: Vec<BrickCoord> = done
+                .topology
+                .after
+                .iter()
+                .filter(|br| br.volume == terrain)
+                .map(|br| br.coord)
+                .collect();
+            pass.on_commit(sim.world(), touched);
+        }
+        pass.run(sim.world_mut(), &player_feet);
+    }
+
+    let evicted_coord = sim
+        .world()
+        .evicted(terrain)
+        .iter()
+        .next()
+        .map(|(c, _)| c)
+        .expect("the run must still have evicted terrain, or this test proves nothing");
+    pass.backing().mark_unavailable(terrain, evicted_coord);
+
+    let err = pass
+        .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect_err("a missing durable record for an evicted brick must fail capture");
+    assert!(
+        matches!(
+            err,
+            persist::PersistError::EvictedBrickUnavailable { volume, coord }
+            if volume == terrain.get() && coord == [evicted_coord.x, evicted_coord.y, evicted_coord.z]
+        ),
+        "expected EvictedBrickUnavailable naming the exact brick, got {err:?}"
+    );
+}

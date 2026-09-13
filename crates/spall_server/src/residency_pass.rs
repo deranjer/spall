@@ -15,8 +15,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use spall_core::{BrickCoord, GlobalCell, VolumeId};
-use spall_sim::{MemoryBacking, SimWorld};
+use spall_core::{BrickCoord, CELLS_PER_BRICK, GlobalCell, MaterialId, VolumeId};
+use spall_sim::{BackingBrick, BrickBacking, MemoryBacking, SimWorld, Simulation};
+use spall_store::Checkpoint;
+use spall_voxel::Brick;
+
+use crate::persist::{PersistConfig, PersistError, stored_brick_from_backing};
 
 /// Consecutive ticks a terrain brick must be resident *and* outside every
 /// player's interest before the pass evicts it. The hysteresis stops the pass
@@ -174,20 +178,52 @@ impl ResidencyPass {
         tick
     }
 
-    /// Reload every currently-evicted terrain brick, so a full-world snapshot
-    /// (checkpoint capture) sees the complete geometry. Slice D takes the
-    /// simple path here; incremental capture (live snapshot + backing records)
-    /// is a later refinement.
-    pub fn reload_all(&mut self, world: &mut SimWorld) {
-        let coords: Vec<BrickCoord> = world.evicted(self.terrain).iter().map(|(c, _)| c).collect();
-        for coord in coords {
-            if let Ok(true) = world.reload_brick(self.terrain, coord) {
-                self.reloads_total += 1;
-            }
+    /// T23 / G3 row 7 follow-up (post-merge review P2/P3): captures a
+    /// checkpoint that includes evicted terrain read straight from the
+    /// durable backing, instead of `reload_all`-ing every evicted brick back
+    /// into the live world first just to satisfy `persist::capture`'s
+    /// resident-only brick walk. That old path defeated the point of
+    /// residency during every periodic checkpoint: memory would spike back up
+    /// to the full world right before capture, then evict back down again —
+    /// this keeps the live world's resident set (and its memory) untouched
+    /// throughout. `world_hash` is unaffected either way — it has been the
+    /// logical (resident ∪ evicted-digest) hash since increment 6, so this
+    /// only changes what `capture` does to produce a checkpoint whose
+    /// `bricks` actually reproduce that hash on recovery.
+    ///
+    /// An evicted brick absent from the backing fails the whole capture
+    /// (`PersistError::EvictedBrickUnavailable`) rather than silently
+    /// publishing a checkpoint whose `world_hash` claims geometry its
+    /// `bricks` do not carry — recovery's rebuilt-hash check would catch that
+    /// anyway, but failing here is the earlier, clearer signal. In practice
+    /// this should not happen: every terrain brick is captured into the
+    /// backing on install and again on every commit that touches it.
+    pub fn capture_checkpoint(
+        &self,
+        sim: &Simulation,
+        cfg: &PersistConfig,
+        journal_cursor: u64,
+    ) -> Result<Checkpoint, PersistError> {
+        let mut checkpoint = crate::persist::capture(sim, cfg, journal_cursor)?;
+        for (coord, _digest) in sim.world().evicted(self.terrain).iter() {
+            let brick = match self.backing.load(self.terrain, coord) {
+                BackingBrick::Loaded(brick) => brick,
+                BackingBrick::KnownEmpty { revision, edited } => {
+                    let air = vec![MaterialId::AIR; CELLS_PER_BRICK];
+                    Brick::restored(&air, revision, edited)
+                }
+                BackingBrick::Unavailable => {
+                    return Err(PersistError::EvictedBrickUnavailable {
+                        volume: self.terrain.get(),
+                        coord: [coord.x, coord.y, coord.z],
+                    });
+                }
+            };
+            checkpoint
+                .bricks
+                .push(stored_brick_from_backing(self.terrain, coord, &brick)?);
         }
-        self.evicted_by_pass.clear();
-        self.out_of_interest.clear();
-        self.resident_final = world.terrain().volume.resident_brick_count();
+        Ok(checkpoint)
     }
 
     pub fn stats(&self) -> ResidencyStats {

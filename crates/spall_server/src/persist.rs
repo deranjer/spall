@@ -129,6 +129,12 @@ pub enum PersistError {
          a suffix that would stamp new events before older durable ones)"
     )]
     JournalTickRegression { seq: u64, tick: u64, durable: u64 },
+    #[error(
+        "evicted brick {coord:?} of volume {volume} has no durable backing record -- refusing to \
+         publish a checkpoint that would claim (via the already-logical world_hash) geometry it \
+         does not actually carry in its bricks"
+    )]
+    EvictedBrickUnavailable { volume: u64, coord: [i64; 3] },
 }
 
 // --- capture --------------------------------------------------------------
@@ -246,6 +252,30 @@ fn stored_bricks(v: &Volume) -> Result<Vec<StoredBrick>, PersistError> {
         });
     }
     Ok(out)
+}
+
+/// Encodes one durably-backed [`Brick`] into a [`StoredBrick`] record. T23 /
+/// G3 row 7 follow-up: `residency_pass`'s bounded checkpoint capture uses this
+/// to fold a currently-evicted terrain brick's durable record straight into a
+/// checkpoint, without reinstalling it into the live `Volume` first the way
+/// `ResidencyPass::reload_all` used to.
+pub(crate) fn stored_brick_from_backing(
+    volume_id: VolumeId,
+    coord: BrickCoord,
+    brick: &Brick,
+) -> Result<StoredBrick, PersistError> {
+    let mut cells = vec![0u16; CELLS_PER_BRICK];
+    for (i, slot) in cells.iter_mut().enumerate() {
+        let local = LocalCell::from_linear_index(i as u16).expect("i < CELLS_PER_BRICK");
+        *slot = brick.get(local).raw();
+    }
+    Ok(StoredBrick {
+        volume_id: volume_id.get(),
+        coord: [coord.x, coord.y, coord.z],
+        revision: brick.revision().get(),
+        edited: brick.is_edited(),
+        payload: encode_cells(&cells)?,
+    })
 }
 
 // --- journal records ----------------------------------------------------
