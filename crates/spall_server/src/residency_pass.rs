@@ -154,7 +154,15 @@ impl ResidencyPass {
             }
             let waited = self.out_of_interest.entry(coord).or_insert(0);
             *waited += 1;
+            // T23 / G3 row 7: ack-before-evict. A fresh, gated capture right
+            // here guarantees the backing holds this exact revision before the
+            // brick leaves the live cache -- the same contract T18's
+            // `ResidencyController::enforce_budget` enforces ("persist dirty
+            // candidates synchronously ... a backing error leaves geometry
+            // resident"). A failed capture skips eviction this tick; `waited`
+            // stays elevated so the very next tick retries.
             if *waited >= EVICT_SETTLE_TICKS
+                && self.backing.capture(&world.terrain().volume, coord)
                 && matches!(world.evict_brick(self.terrain, coord), Ok(true))
             {
                 tick.evicted += 1;
