@@ -2026,6 +2026,33 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 "--connect-delay-ms",
                 &scenario.late_join_connect_delay_ms.to_string(),
             ]);
+        } else {
+            // T23 / G3 row 2 follow-up (increment 23): every client process
+            // below is `spawn()`ed back-to-back with no synchronization, but
+            // `spall_net::NetServer::authenticate` assigns each connection's
+            // `SessionId`/slot strictly by arrival order
+            // (`SessionLease::acquire`) — there is no way for a client to
+            // request a specific slot. A scenario's `player_paths`/`cuts`
+            // ownership and `Scene::player_spawns()` slot assignment are keyed
+            // to *this loop's own launch index* `i`, which is only guaranteed
+            // to match the slot the server hands out if connections complete
+            // in launch order. Under real OS process-scheduling contention
+            // (this harness runs the server and every client as separate
+            // processes) that is not guaranteed — confirmed live: a scripted
+            // mover's own predictor occasionally latched onto a *different*
+            // client's entity/spawn entirely (`t23-g3-full-envelope`, west
+            // walker landing at the east spawn, `111 m` instead of `7 m`),
+            // producing an apparently-random final position with no relation
+            // to the intended script. Staggering each client's own connect
+            // attempt by its launch index (independent of, and much smaller
+            // than, `late_join_connect_delay_ms` above) makes connection
+            // arrival order match launch order deterministically — the QUIC
+            // handshake + auth round trip this races against is at most a few
+            // milliseconds on loopback, so 50 ms per client is a comfortable
+            // margin without meaningfully slowing a large-client-count
+            // scenario's startup.
+            const CONNECT_STAGGER_MS: u64 = 50;
+            c.args(["--connect-delay-ms", &(i * CONNECT_STAGGER_MS).to_string()]);
         }
         hide_console(&mut c);
         let child = c.spawn().map_err(|source| XtaskError::Output {
