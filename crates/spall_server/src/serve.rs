@@ -599,7 +599,10 @@ enum Outbound {
     /// or one brick for a hash repair — the client decides replace vs. merge
     /// from whether it has installed a baseline yet.
     Baseline(Arc<BaselineTransfer>),
-    Shutdown,
+    /// Ends the connection with the given `Bye` reason (T23 / G3 row 10: a
+    /// catch-up-exhaustion give-up carries a reason distinct from an ordinary
+    /// end of session, so the client can tell the two apart on the wire).
+    Shutdown(&'static str),
 }
 
 type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
@@ -640,8 +643,8 @@ impl OutboundQueue {
                 Ok(())
             }
             // The shutdown marker always goes through — it ends the stream.
-            Outbound::Shutdown => {
-                self.reliable.push_back(Outbound::Shutdown);
+            Outbound::Shutdown(reason) => {
+                self.reliable.push_back(Outbound::Shutdown(reason));
                 Ok(())
             }
             reliable => {
@@ -688,7 +691,7 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
         }
         Outbound::Status(_) => 96,
         Outbound::Baseline(t) => 64 + t.payload_bytes(),
-        Outbound::Motion(_) | Outbound::Shutdown => 0,
+        Outbound::Motion(_) | Outbound::Shutdown(_) => 0,
     }
 }
 
@@ -1327,12 +1330,19 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 // journal prefix behind it. Retain right after, so disk use
                 // stays bounded during the run — not only at shutdown.
                 if checkpoint_interval > 0 && tick.get().is_multiple_of(checkpoint_interval) {
-                    // Slice D: a checkpoint is a full-world snapshot — reload any
-                    // evicted terrain first so `persist::capture` sees it all.
-                    if let Some(pass) = &mut residency {
-                        pass.reload_all(sim.world_mut());
-                    }
-                    match persist::capture(&sim, &persist_cfg, journalled_through) {
+                    // T23 / G3 row 7 follow-up: a checkpoint is a full-world
+                    // snapshot, but it no longer reloads evicted terrain into
+                    // the live world to get there — `capture_checkpoint` folds
+                    // the durable backing's evicted-brick records straight
+                    // into the checkpoint, so residency's bounded memory
+                    // holds even at checkpoint time.
+                    let captured = match &residency {
+                        Some(pass) => {
+                            pass.capture_checkpoint(&sim, &persist_cfg, journalled_through)
+                        }
+                        None => persist::capture(&sim, &persist_cfg, journalled_through),
+                    };
+                    match captured {
                         Ok(cp) => {
                             if let Err(e) = pipe
                                 .submit_checkpoint(cp)
@@ -1401,7 +1411,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             }
         }
 
-        broadcast(&clients_for_sim, Outbound::Shutdown);
+        broadcast(
+            &clients_for_sim,
+            Outbound::Shutdown(Connection::BYE_REASON_COMPLETE),
+        );
 
         // Clean-shutdown durability: queue the final journal tail + checkpoint
         // + retain, then block until the off-thread writer has drained and
@@ -1413,18 +1426,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut persist_bytes_per_write = 0.0;
         let mut persist_commit_bytes_per_sec = 0.0;
         let mut shutdown_error: Option<String> = None;
-        // Slice D: reload every evicted brick before the shutdown snapshot so
-        // the final checkpoint and the reported world hash are the complete
-        // world.
-        if let Some(pass) = &mut residency {
-            pass.reload_all(sim.world_mut());
-        }
         if let Some(pipe) = pipeline.take() {
             let final_tick = sim.current_tick().get();
             let tail = tick_journal_batch(&mut sim, &mut journalled_through, None, final_tick)
                 .unwrap_or_default();
             let _ = pipe.submit_journal(tail);
-            if let Ok(cp) = persist::capture(&sim, &persist_cfg, journalled_through) {
+            // T23 / G3 row 7 follow-up: the shutdown snapshot folds evicted
+            // terrain in from the durable backing the same way the periodic
+            // checkpoints above do now, instead of reloading it into the live
+            // world first.
+            let captured = match &residency {
+                Some(pass) => pass.capture_checkpoint(&sim, &persist_cfg, journalled_through),
+                None => persist::capture(&sim, &persist_cfg, journalled_through),
+            };
+            if let Ok(cp) = captured {
                 let _ = pipe
                     .submit_checkpoint(cp)
                     .and_then(|()| pipe.submit_retain(RETAIN_CHECKPOINTS));
@@ -1924,7 +1939,7 @@ impl LateJoin {
                     send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
                 }
                 None => {
-                    let snapshot = baseline::snapshot_world(sim);
+                    let snapshot = baseline::snapshot_world(sim, self.backing_ref());
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
                     std::thread::spawn(move || {
                         let _ = tx.send(baseline::transfer_from_snapshot(
@@ -2029,7 +2044,11 @@ impl LateJoin {
             if retries > self.max_retries {
                 self.failed += 1;
                 self.links.remove(&raw);
-                send_to(clients, session, Outbound::Shutdown);
+                send_to(
+                    clients,
+                    session,
+                    Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                );
                 continue;
             }
             self.retries += 1;
@@ -2049,7 +2068,11 @@ impl LateJoin {
                 None => {
                     self.failed += 1;
                     self.links.remove(&raw);
-                    send_to(clients, session, Outbound::Shutdown);
+                    send_to(
+                        clients,
+                        session,
+                        Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                    );
                 }
             }
         }
@@ -2122,7 +2145,11 @@ impl LateJoin {
                 _ => {
                     self.failed += 1;
                     if let Some(link) = self.links.remove(&raw) {
-                        send_to(clients, link.session, Outbound::Shutdown);
+                        send_to(
+                            clients,
+                            link.session,
+                            Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                        );
                     }
                 }
             }
@@ -2796,8 +2823,8 @@ async fn serve_conn(
                     Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
                     // Motion is never queued as reliable; ignore defensively.
                     Outbound::Motion(_) => true,
-                    Outbound::Shutdown => {
-                        let _ = conn.say_bye("server complete").await;
+                    Outbound::Shutdown(reason) => {
+                        let _ = conn.say_bye(reason).await;
                         false
                     }
                 };
@@ -3299,6 +3326,69 @@ mod tests {
         assert!(
             !lj.links.contains_key(&joiner.raw()),
             "the joiner was dropped after exhausting its retry budget; other clients are untouched"
+        );
+    }
+
+    /// T23 / G3 row 10: the joiner dropped after its retry budget is exhausted
+    /// must be told with a `Bye` reason distinct from an ordinary end of
+    /// session, so a client that sees its control loop end can tell the two
+    /// apart. Regression for the gap `docs/reports/G3.md` recorded: this used
+    /// to be the same bare `Outbound::Shutdown` sent at run end.
+    #[test]
+    fn catch_up_exhaustion_gives_the_dropped_joiner_a_distinguishable_bye_reason() {
+        let sim = Scene::BridgeCut.simulation();
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        let joiner = sess(0, 1);
+        let handle = OutboundHandle::new();
+        clients.lock().unwrap().insert(joiner.raw(), handle.clone());
+
+        let mut lj = LateJoin::new(2, 1);
+        lj.on_joined(joiner);
+        lj.on_baseline_ack(
+            joiner,
+            BaselineAck {
+                transfer_id: BASELINE_REQUEST_SENTINEL,
+                verified_manifest_hash: Hash32::ZERO,
+                installed_cursor: spall_core::JournalSeq(0),
+            },
+            &sim,
+            &clients,
+            &mut MotionPublisher::new(60, 20),
+        );
+
+        let tx = || {
+            Arc::new(TopologyTransaction {
+                transaction_id: spall_core::TransactionId::new(1).unwrap(),
+                server_tick: spall_core::Tick(1),
+                control_seq: spall_protocol::ControlSeq(0),
+                algorithm_version: 1,
+                dependencies: vec![],
+                before: vec![],
+                after: vec![],
+                ops: vec![],
+                result_hashes: vec![],
+            })
+        };
+        // First overflow (re-capture, retry 1), then a second past the budget
+        // (dropped).
+        for _ in 0..6 {
+            lj.fan_out_transaction(tx(), None, &sim, &clients);
+        }
+        assert_eq!(lj.failed, 1);
+
+        let shutdowns: Vec<&'static str> = handle
+            .take()
+            .reliable
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Outbound::Shutdown(reason) => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shutdowns,
+            vec![Connection::BYE_REASON_CATCH_UP_EXHAUSTED],
+            "the dropped joiner must see the catch-up-exhaustion reason, not the ordinary end-of-session one"
         );
     }
 
