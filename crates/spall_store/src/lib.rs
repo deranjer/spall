@@ -21,6 +21,9 @@
 //!   previous checkpoint as a fallback.
 //! * [`fault`] — controlled [`CrashPoint`]s and disk-error injection for the
 //!   persistence crash tests.
+//! * [`residency_store`] — a separate, non-authoritative on-disk brick cache
+//!   for the T23/G3 residency subsystem (row 7 item 2). Deliberately outside
+//!   the versioned save schema above; see its module docs for why.
 
 pub mod brick;
 pub mod db;
@@ -29,6 +32,7 @@ pub mod fault;
 pub mod inject;
 pub mod metrics;
 pub mod recover;
+pub mod residency_store;
 mod schema;
 
 pub use brick::{BrickCodecError, DENSE_CELL_BYTES, decode_cells, encode_cells};
@@ -43,6 +47,7 @@ pub use recover::{
     CorruptionReport, RecoverBase, Recovery, recover, recover_conn, recover_conn_from,
     recover_from_base,
 };
+pub use residency_store::{ResidencyRecord, ResidencyStore};
 
 /// Anything that can go wrong opening, writing, or recovering a world database.
 #[derive(Debug, thiserror::Error)]

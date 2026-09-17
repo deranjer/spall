@@ -8,6 +8,7 @@
 
 pub mod baseline;
 pub mod commit_latency;
+pub mod disk_backing;
 pub mod persist;
 pub mod persist_pipeline;
 pub mod replication;
@@ -20,6 +21,7 @@ pub use baseline::{
     logical_brick_repair_patch, logical_capture_transfer, logical_world_baseline,
     transfer_from_world, world_baseline,
 };
+pub use disk_backing::{DiskBackingError, DiskBrickBacking};
 pub use persist::{
     CrashSuiteReport, PersistConfig, PersistError, RecoveryChoice, ScenarioResult, capture,
     journal_records, pose_batch_record, replay_from_base, replay_from_base_builtin, restore,
@@ -37,7 +39,9 @@ pub use residency::{
     BackingLoad, BodySpatialIndex, GraphBrickMeta, MemoryBackingError, MemoryBrickBacking,
     PartitionCoord, ResidencyBacking, ResidencyController, ResidencyError, StructuralResolution,
 };
-pub use residency_pass::{PassTick, ResidencyLimits, ResidencyPass, ResidencyStats};
+pub use residency_pass::{
+    PassTick, ResidencyLimits, ResidencyPass, ResidencyStats, total_resident_dense_bytes,
+};
 pub use serve::{
     MotionInterest, PerClientEgress, Scene, ServeConfig, ServeError, ServeSummary, serve,
 };

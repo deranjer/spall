@@ -81,6 +81,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         await_body_settle: false,
         motion_interest: None,
         residency: None,
+        residency_disk_path: None,
         contact_damage: None,
         dormancy: None,
     };

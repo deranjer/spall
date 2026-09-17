@@ -4,11 +4,13 @@
 //! per-transaction `result_hashes` — while actually evicting and reloading
 //! terrain bricks.
 
+use std::sync::Arc;
+
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
 use spall_core::{BrickCoord, EntityId, GlobalCell, SphereBrush};
 use spall_protocol::{Hash32, RequestId};
 use spall_server::{ResidencyLimits, ResidencyPass};
-use spall_sim::{EditIntent, EditTarget, Simulation, SimulationConfig, fixtures};
+use spall_sim::{EditIntent, EditTarget, MemoryBacking, Simulation, SimulationConfig, fixtures};
 
 /// (tick, cell, radius) — a west collapse, an east collapse, two floor cuts.
 const SCRIPT: &[(u64, [i64; 3], i64)] = &[
@@ -318,12 +320,14 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
 
     let mut sim = sim();
     let terrain = sim.world().terrain_volume_id();
-    let mut pass = ResidencyPass::install(
+    let backing = Arc::new(MemoryBacking::default());
+    let mut pass = ResidencyPass::install_with_backing(
         sim.world_mut(),
         ResidencyLimits {
             budget_bricks: 4,
             interest_radius_bricks: 1,
         },
+        backing.clone(),
     );
     let player_feet = [[1.0_f64, 1.0, 1.0]];
 
@@ -355,7 +359,7 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
         .next()
         .map(|(c, _)| c)
         .expect("the run must still have evicted terrain, or this test proves nothing");
-    pass.backing().mark_unavailable(terrain, evicted_coord);
+    backing.mark_unavailable(terrain, evicted_coord);
 
     let err = pass
         .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
@@ -385,12 +389,14 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
 fn a_failed_capture_leaves_the_brick_resident_instead_of_evicting_it() {
     let mut sim = sim();
     let terrain = sim.world().terrain_volume_id();
-    let mut pass = ResidencyPass::install(
+    let backing = Arc::new(MemoryBacking::default());
+    let mut pass = ResidencyPass::install_with_backing(
         sim.world_mut(),
         ResidencyLimits {
             budget_bricks: 4,
             interest_radius_bricks: 1,
         },
+        backing.clone(),
     );
     // Stationary west player; the east region (script cut cell [82, 6, 75],
     // same as the other tests here) is out of interest from tick 1.
@@ -407,7 +413,7 @@ fn a_failed_capture_leaves_the_brick_resident_instead_of_evicting_it() {
 
     // Poison the one capture that would gate this brick's eviction. No cuts
     // are submitted -- residency alone drives this test.
-    pass.backing().fail_next_capture(terrain, east_coord);
+    backing.fail_next_capture(terrain, east_coord);
 
     // `EVICT_SETTLE_TICKS` (4, private to `residency_pass`) consecutive
     // out-of-interest ticks before an eviction is even attempted; the brick
@@ -445,4 +451,167 @@ fn a_failed_capture_leaves_the_brick_resident_instead_of_evicting_it() {
             .contains(&east_coord),
         "an evicted brick must not still be resident"
     );
+}
+
+/// T23 / G3 row 7, item 1 (unification): `ResidencyPass` is written once
+/// against `spall_sim::BrickBackingWriter`, so a real disk-backed
+/// `DiskBrickBacking` (item 2) must reach exactly the same committed world as
+/// the default in-process `MemoryBacking` -- this is the same assertion as
+/// `residency_on_reaches_the_same_committed_world_as_residency_off`, just with
+/// `ResidencyPass::install_with_backing` and a real SQLite file standing in
+/// for `install`'s `MemoryBacking`.
+#[test]
+fn residency_on_a_disk_backing_reaches_the_same_committed_world_as_residency_off() {
+    use spall_server::DiskBrickBacking;
+
+    let (off_hash, off_solid, off_trace) = run_without_residency();
+
+    let dir = std::env::temp_dir().join(format!(
+        "spall_residency_pass_disk_backing_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let backing = Arc::new(DiskBrickBacking::open(dir.join("residency.db")).unwrap());
+
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let mut pass = ResidencyPass::install_with_backing(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 4,
+            interest_radius_bricks: 1,
+        },
+        backing,
+    );
+    let player_feet = [[1.0_f64, 1.0, 1.0]];
+    let initial_resident = sim.world().terrain().volume.resident_brick_count();
+
+    let mut next = 0usize;
+    for tick in 1..=180u64 {
+        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
+            let (_, cell, r) = SCRIPT[next];
+            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
+            next += 1;
+        }
+        let report = sim.tick().unwrap();
+        for (_, done) in &report.committed {
+            let touched: Vec<BrickCoord> = done
+                .topology
+                .after
+                .iter()
+                .filter(|br| br.volume == terrain)
+                .map(|br| br.coord)
+                .collect();
+            pass.on_commit(sim.world(), touched);
+        }
+        pass.run(sim.world_mut(), &player_feet);
+    }
+
+    for r in 1..=SCRIPT.len() as u64 {
+        assert!(
+            sim.committed(RequestId(r)).is_some(),
+            "cut {r} did not commit under disk-backed residency"
+        );
+    }
+    assert_eq!(sim.world().world_hash(), off_hash, "world_hash diverged");
+    assert_eq!(
+        sim.world().total_solid_cells(),
+        off_solid,
+        "conservation diverged"
+    );
+    assert_eq!(
+        result_hash_trace(&sim),
+        off_trace,
+        "per-transaction result_hashes diverged"
+    );
+
+    let stats = pass.stats();
+    assert!(
+        stats.evictions_total > 0,
+        "the disk-backed pass never evicted anything"
+    );
+    assert!(stats.resident_terrain_bricks_min < initial_resident);
+    assert!(
+        pass.backing_disk_bytes().unwrap() > 0,
+        "a real disk backing must report a nonzero on-disk footprint once it has captured bricks"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T23 / G3 row 7, item 2's exact ask: "a brick captured to disk survives a
+/// process restart and reloads correctly". This drives the capture through
+/// the real `ResidencyPass` eviction path (not a hand-built volume, as in
+/// `spall_server::disk_backing`'s own unit tests), then simulates a process
+/// restart by dropping every in-process handle to the backing and reopening a
+/// fresh `DiskBrickBacking` at the same path -- the only thing surviving is
+/// what actually reached disk.
+#[test]
+fn a_brick_captured_to_disk_survives_a_process_restart_and_reloads_correctly() {
+    use spall_server::DiskBrickBacking;
+    use spall_sim::{BackingBrick, BrickBacking};
+
+    let dir = std::env::temp_dir().join(format!(
+        "spall_residency_pass_disk_restart_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("residency.db");
+
+    let east_coord = GlobalCell::new(82, 6, 75).split().0;
+    let terrain_id;
+    let expected;
+    {
+        let backing = Arc::new(DiskBrickBacking::open(&db).unwrap());
+        let mut sim = sim();
+        let terrain = sim.world().terrain_volume_id();
+        terrain_id = terrain;
+        let mut pass = ResidencyPass::install_with_backing(
+            sim.world_mut(),
+            ResidencyLimits {
+                budget_bricks: 4,
+                interest_radius_bricks: 1,
+            },
+            backing,
+        );
+        let player_feet = [[1.0_f64, 1.0, 1.0]];
+        // No cuts submitted -- run just long enough for the stationary-west
+        // player's out-of-interest east region to clear `EVICT_SETTLE_TICKS`
+        // and evict, exactly as in `a_failed_capture_leaves_...` above.
+        for _ in 1..=6u64 {
+            sim.tick().unwrap();
+            pass.run(sim.world_mut(), &player_feet);
+        }
+        assert!(
+            sim.world().evicted(terrain).contains(east_coord),
+            "the east brick must be evicted through the disk backing, or this test proves nothing"
+        );
+        expected = match pass.backing().load(terrain, east_coord) {
+            BackingBrick::Loaded(brick) => brick,
+            other => panic!("expected a loaded backing brick before the restart, got {other:?}"),
+        };
+        // `sim`, `pass`, and every `Arc<DiskBrickBacking>` clone are dropped
+        // here at the end of this block -- the SQLite connection closes.
+    }
+
+    // "Process restart": a brand new `DiskBrickBacking` at the same path,
+    // nothing carried over in memory.
+    let reopened = DiskBrickBacking::open(&db).unwrap();
+    let BackingBrick::Loaded(reloaded) = reopened.load(terrain_id, east_coord) else {
+        panic!("the evicted brick's durable record must survive reopening the store");
+    };
+    assert_eq!(reloaded.revision(), expected.revision());
+    assert_eq!(reloaded.is_edited(), expected.is_edited());
+    for i in 0..spall_core::CELLS_PER_BRICK as u16 {
+        let local = spall_core::LocalCell::from_linear_index(i).unwrap();
+        assert_eq!(
+            reloaded.get(local),
+            expected.get(local),
+            "cell {i} did not survive the restart"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

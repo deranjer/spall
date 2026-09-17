@@ -96,6 +96,12 @@ struct Args {
     /// Chebyshev radius (bricks) of the kept-resident box around each player.
     #[arg(long, default_value_t = 2)]
     residency_radius_bricks: i64,
+    /// T23 / G3 row 7 item 2: back the residency pass with a real on-disk
+    /// SQLite store at `<world>/residency.db` instead of the in-process
+    /// `MemoryBacking` default. Only meaningful with
+    /// `--residency-budget-bricks > 0`; ignored otherwise.
+    #[arg(long)]
+    residency_disk_backing: bool,
 
     // --- T21 / ENG-28 increment 4 (3c): default-off contact damage + dormancy ---
     /// Enable the contact-damage pass: a hard enough impact carves a cut into
@@ -215,6 +221,13 @@ fn run_serve(args: Args) -> ExitCode {
     {
         let _ = std::fs::create_dir_all(parent);
     }
+    let residency_disk_path = (args.residency_budget_bricks > 0 && args.residency_disk_backing)
+        .then(|| args.world.join("residency.db"));
+    if let Some(db) = &residency_disk_path
+        && let Some(parent) = db.parent()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
 
     let motion_interest = if args.motion_interest {
         let static_anchor_m = match args.motion_static_anchor.as_deref() {
@@ -268,6 +281,7 @@ fn run_serve(args: Args) -> ExitCode {
             budget_bricks: args.residency_budget_bricks,
             interest_radius_bricks: args.residency_radius_bricks,
         }),
+        residency_disk_path,
         contact_damage: args
             .contact_damage
             .then_some(spall_sim::ContactDamageConfig::DEFAULT),
