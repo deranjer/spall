@@ -38,6 +38,35 @@ pub trait BrickBacking: Send + Sync {
     fn load(&self, volume: VolumeId, coord: BrickCoord) -> BackingBrick;
 }
 
+/// A [`BrickBacking`] that can also be written to -- the "ack-before-evict"
+/// half of the T23/G3 row-7 contract (`docs/reports/G3.md` increment 27):
+/// `ResidencyPass` captures a brick's exact current geometry through this
+/// trait immediately before evicting it, and again on every committed edit
+/// that touches it, so a later `load` always returns the right revision.
+///
+/// This is also this repo's one concrete step of row 7's residency-mechanism
+/// unification (still open otherwise -- see `docs/reports/G3.md`): both
+/// `MemoryBacking` (in-process, the historical default) and a real
+/// disk-backed store (`spall_server::disk_backing::DiskBrickBacking`) satisfy
+/// the same trait, so `ResidencyPass`/`SimWorld` are written once against it
+/// and do not care which is installed. `ResidencyPass::install` keeps using
+/// `MemoryBacking`; `ResidencyPass::install_with_backing` accepts any
+/// `Arc<dyn BrickBackingWriter>`.
+pub trait BrickBackingWriter: BrickBacking {
+    /// Captures `volume`'s current geometry at `coord` (must be resident) as
+    /// a reload record. `true` if the backing now reflects the live brick;
+    /// `false` if it was not resident to snapshot, or a fault was injected.
+    fn capture(&self, volume: &Volume, coord: BrickCoord) -> bool;
+
+    /// The backing's on-disk footprint in bytes, for a backing that is
+    /// actually disk-resident (T23/G3 row 7 item 3's durable-side memory
+    /// evidence). `None` by default -- `MemoryBacking` has nothing on disk;
+    /// `spall_server::disk_backing::DiskBrickBacking` overrides this.
+    fn disk_bytes(&self) -> Option<u64> {
+        None
+    }
+}
+
 type Key = (u64, i64, i64, i64);
 
 fn key(volume: VolumeId, coord: BrickCoord) -> Key {
@@ -146,6 +175,17 @@ impl MemoryBacking {
             .unwrap_or_else(|e| e.into_inner())
             .unavailable
             .insert(key(volume, coord));
+    }
+}
+
+impl BrickBackingWriter for MemoryBacking {
+    /// Delegates to the inherent [`MemoryBacking::capture`] (inherent methods
+    /// take priority over a trait method of the same name/signature, so this
+    /// is not recursive) -- kept so every existing call site that already
+    /// holds a concrete `MemoryBacking`/`Arc<MemoryBacking>` and calls
+    /// `.capture(...)` directly compiles unchanged.
+    fn capture(&self, volume: &Volume, coord: BrickCoord) -> bool {
+        MemoryBacking::capture(self, volume, coord)
     }
 }
 

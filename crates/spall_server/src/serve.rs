@@ -353,6 +353,12 @@ pub struct ServeConfig {
     /// (`crate::residency_pass`). The committed world is unchanged — see
     /// `docs/reports/G3-residency-hash.md`.
     pub residency: Option<crate::ResidencyLimits>,
+    /// T23 / G3 row 7, item 2: when residency is on, install a real
+    /// disk-backed `crate::disk_backing::DiskBrickBacking` at this path
+    /// instead of the in-process `MemoryBacking` default. `None` (the
+    /// default) keeps the prior in-memory behaviour byte-identical;
+    /// ignored when [`Self::residency`] is `None`.
+    pub residency_disk_path: Option<PathBuf>,
     /// T21 / ENG-28 increment 4 (3c): default-off contact-to-terrain/body
     /// damage pass. `None` keeps every prior run byte-identical (the pass is
     /// never invoked, exactly like every scene before this increment).
@@ -437,6 +443,7 @@ impl ServeConfig {
             await_body_settle: false,
             motion_interest: None,
             residency: None,
+            residency_disk_path: None,
             contact_damage: None,
             dormancy: None,
         }
@@ -558,6 +565,21 @@ pub struct ServeSummary {
     /// Ticks the resident-brick count exceeded `budget_bricks` (a player's
     /// interest set is larger than the declared budget).
     pub residency_budget_miss_ticks: u64,
+    /// T23 / G3 row 7 item 3: fewest / most / final total resident
+    /// dense-material bytes across the whole world (terrain + every body
+    /// volume), sampled every tick the residency pass runs
+    /// ([`spall_server::residency_pass::total_resident_dense_bytes`]). All `0`
+    /// when `ServeConfig.residency` is `None`, matching every other residency
+    /// counter's convention.
+    pub resident_dense_bytes_min: u64,
+    pub resident_dense_bytes_max: u64,
+    pub resident_dense_bytes_final: u64,
+    /// T23 / G3 row 7 item 3: the residency backing's on-disk footprint in
+    /// bytes -- the durable-side counterpart to `resident_dense_bytes_*`.
+    /// `Some(_)` only when `ServeConfig.residency_disk_path` installed a real
+    /// disk-backed store; `None` for the in-process `MemoryBacking` default
+    /// and when residency is off.
+    pub residency_backing_disk_bytes: Option<u64>,
     /// T23 / G3 row 14: **per-connection** application/transport egress — the
     /// aggregate `app_egress_bytes` / `transport_egress_bytes` above prove
     /// total bandwidth is bounded, but not that `motion_interest` actually
@@ -998,6 +1020,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let max_join_retries = config.max_join_retries;
     let dev_unvalidated_actions = config.dev_unvalidated_actions;
     let residency_limits = config.residency;
+    let residency_disk_path = config.residency_disk_path.clone();
     let contact_damage_cfg = config.contact_damage;
     let dormancy_cfg = config.dormancy;
     let persist_cfg = PersistConfig {
@@ -1030,8 +1053,30 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // T23 / G3 row 7, slice D: default-off residency pass. `None` -> the
         // world stays fully resident and every counter below is `0`.
         let terrain_vid = sim.world().terrain_volume_id();
-        let mut residency =
-            residency_limits.map(|limits| crate::ResidencyPass::install(sim.world_mut(), limits));
+        // T23 / G3 row 7, item 2: `--residency-disk-backing` swaps the
+        // in-process `MemoryBacking` default for a real disk-backed
+        // `DiskBrickBacking` (`crate::disk_backing`) at
+        // `<world>/residency.db`. Unset (the default), behaviour is
+        // byte-identical to every prior run.
+        let mut residency = match residency_limits {
+            None => None,
+            Some(limits) => match &residency_disk_path {
+                None => Some(crate::ResidencyPass::install(sim.world_mut(), limits)),
+                Some(path) => match crate::disk_backing::DiskBrickBacking::open(path) {
+                    Ok(backing) => Some(crate::ResidencyPass::install_with_backing(
+                        sim.world_mut(),
+                        limits,
+                        std::sync::Arc::new(backing),
+                    )),
+                    Err(e) => {
+                        return SimResult::error(
+                            format!("residency disk backing open failed: {e}"),
+                            0,
+                        );
+                    }
+                },
+            },
+        };
 
         let mut motion = MotionPublisher::new(60, 20);
         let mut committed_total = 0u64;
@@ -1619,6 +1664,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             actions_queued_unresolved: submitted_at.len() as u64,
             latency: commit_latency.report(),
             residency: residency.as_ref().map(|p| p.stats()),
+            residency_backing_disk_bytes: residency.as_ref().and_then(|p| p.backing_disk_bytes()),
             client_spawns,
             contact_damage_cuts_submitted,
             contact_damage_cuts_rejected,
@@ -1691,7 +1737,9 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // v5: T21 / ENG-28 increment 4 adds contact_damage_cuts_submitted /
         // contact_damage_cuts_rejected / dormancy_deactivations_total /
         // dormancy_reactivations_total; T23 / G3 row 14 adds per_client_egress.
-        version: 5,
+        // v6: T23 / G3 row 7 item 3 adds resident_dense_bytes_min/max/final and
+        // residency_backing_disk_bytes.
+        version: 6,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -1752,6 +1800,19 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             .residency
             .map(|r| r.budget_miss_ticks)
             .unwrap_or(0),
+        resident_dense_bytes_min: sim_result
+            .residency
+            .map(|r| r.resident_dense_bytes_min)
+            .unwrap_or(0),
+        resident_dense_bytes_max: sim_result
+            .residency
+            .map(|r| r.resident_dense_bytes_max)
+            .unwrap_or(0),
+        resident_dense_bytes_final: sim_result
+            .residency
+            .map(|r| r.resident_dense_bytes_final)
+            .unwrap_or(0),
+        residency_backing_disk_bytes: sim_result.residency_backing_disk_bytes,
         per_client_egress,
         contact_damage_cuts_submitted: sim_result.contact_damage_cuts_submitted,
         contact_damage_cuts_rejected: sim_result.contact_damage_cuts_rejected,
@@ -1809,6 +1870,11 @@ struct SimResult {
     actions_queued_unresolved: u64,
     latency: commit_latency::LatencyReport,
     residency: Option<crate::ResidencyStats>,
+    /// T23 / G3 row 7 item 3: the residency backing's on-disk footprint, when
+    /// it is a real disk-backed store (`crate::disk_backing::DiskBrickBacking`).
+    /// `None` for the in-process `MemoryBacking` default and when residency
+    /// is off.
+    residency_backing_disk_bytes: Option<u64>,
     /// T23 / G3 row 14: each slot's player spawn, keyed by slot so the outer
     /// per-connection egress report (built after this blocking task returns)
     /// can be read alongside where that connection's interest anchor was.
@@ -1856,6 +1922,7 @@ impl SimResult {
             actions_queued_unresolved: 0,
             latency: commit_latency::LatencyReport::default(),
             residency: None,
+            residency_backing_disk_bytes: None,
             client_spawns: HashMap::new(),
             contact_damage_cuts_submitted: 0,
             contact_damage_cuts_rejected: 0,
@@ -1914,7 +1981,7 @@ struct LateJoin {
     /// T23 / G3 row 7, slice D: the residency pass's durable backing, so a
     /// late-join baseline / repair patch can fill a brick the server has
     /// evicted. `None` when residency is off.
-    backing: Option<std::sync::Arc<spall_sim::MemoryBacking>>,
+    backing: Option<std::sync::Arc<dyn spall_sim::BrickBacking>>,
     /// The most recent immutable topology baseline. A current join may reuse
     /// it with a fresh transfer id; transactions after its cursor remain in the
     /// ordinary per-client catch-up queue.
@@ -1950,9 +2017,7 @@ impl LateJoin {
     }
 
     fn backing_ref(&self) -> Option<&dyn spall_sim::BrickBacking> {
-        self.backing
-            .as_deref()
-            .map(|b| b as &dyn spall_sim::BrickBacking)
+        self.backing.as_deref()
     }
 
     fn on_joined(&mut self, session: SessionId) {

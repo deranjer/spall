@@ -892,6 +892,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         await_body_settle: false,
         motion_interest: None,
         residency: None,
+        residency_disk_path: None,
         contact_damage: None,
         dormancy: None,
     };

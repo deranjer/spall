@@ -8,15 +8,19 @@
 //! `result_hashes` are unchanged (slices A–C). An edit that later needs an
 //! evicted brick's cells reloads it through the same backing (slice C).
 //!
-//! Body volumes are never evicted. This pass owns the `Arc<MemoryBacking>` and
-//! hands the same handle to [`SimWorld::set_backing`], so its `on_commit`
-//! updates and the pipeline's reloads see one store.
+//! Body volumes are never evicted. This pass owns the backing (default
+//! in-process `MemoryBacking`, or a real disk-backed store -- see
+//! [`spall_sim::BrickBackingWriter`] and `crate::disk_backing`) and hands the
+//! same handle to [`SimWorld::set_backing`], so its `on_commit` updates and
+//! the pipeline's reloads see one store.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use spall_core::{BrickCoord, CELLS_PER_BRICK, GlobalCell, MaterialId, VolumeId};
-use spall_sim::{BackingBrick, BrickBacking, MemoryBacking, SimWorld, Simulation};
+use spall_sim::{
+    BackingBrick, BrickBacking, BrickBackingWriter, MemoryBacking, SimWorld, Simulation,
+};
 use spall_store::Checkpoint;
 use spall_voxel::Brick;
 
@@ -57,13 +61,32 @@ pub struct ResidencyStats {
     pub resident_terrain_bricks_max: usize,
     pub resident_terrain_bricks_final: usize,
     pub budget_miss_ticks: u64,
+    /// T23 / G3 row 7 item 3: total resident dense-material bytes across the
+    /// whole `SimWorld` (terrain + every body volume), sampled every tick
+    /// this pass runs. This is the live, in-process working set the
+    /// residency budget exists to bound -- see [`total_resident_dense_bytes`].
+    pub resident_dense_bytes_min: u64,
+    pub resident_dense_bytes_max: u64,
+    pub resident_dense_bytes_final: u64,
+}
+
+/// Total resident dense-material bytes across `world`'s terrain and every
+/// body volume, via [`spall_voxel::Volume::memory_report`]. Independent of
+/// whether residency is on: with it off, this is simply the whole world's
+/// resident footprint (a useful baseline to compare a budgeted run against).
+pub fn total_resident_dense_bytes(world: &SimWorld) -> u64 {
+    let mut total = world.terrain().volume.memory_report().total_dense_bytes() as u64;
+    for body in world.bodies() {
+        total += body.volume.memory_report().total_dense_bytes() as u64;
+    }
+    total
 }
 
 pub struct ResidencyPass {
     limits: ResidencyLimits,
     terrain: VolumeId,
     cell_m: f64,
-    backing: Arc<MemoryBacking>,
+    backing: Arc<dyn BrickBackingWriter>,
     /// Bricks the pass itself evicted (so a reload by the edit pipeline is
     /// distinguishable and resets the settle counter).
     evicted_by_pass: BTreeSet<BrickCoord>,
@@ -75,17 +98,42 @@ pub struct ResidencyPass {
     resident_max: usize,
     resident_final: usize,
     budget_miss_ticks: u64,
+    dense_bytes_min: u64,
+    dense_bytes_max: u64,
+    dense_bytes_final: u64,
 }
 
 impl ResidencyPass {
-    /// Builds the pass, seeds the backing from the current terrain, and installs
-    /// that backing on `world`.
+    /// Builds the pass, seeds an in-process [`MemoryBacking`] from the current
+    /// terrain, and installs it on `world`. This is the historical default
+    /// and every prior caller's exact behaviour; see
+    /// [`Self::install_with_backing`] for a real disk-backed store.
     pub fn install(world: &mut SimWorld, limits: ResidencyLimits) -> Self {
+        Self::install_with_backing(world, limits, Arc::new(MemoryBacking::default()))
+    }
+
+    /// Builds the pass against any [`BrickBackingWriter`] -- the T23/G3 row 7
+    /// unification point (item 1): `MemoryBacking` (in-process) and
+    /// `spall_server::disk_backing::DiskBrickBacking` (real disk, item 2)
+    /// both satisfy this trait, so this constructor and everything else in
+    /// this module is written once, against the trait, and does not care
+    /// which is installed. Seeds `backing` from every currently-resident
+    /// terrain brick (idempotent -- a fresh backing is fully populated, a
+    /// restart-recovered one is simply re-captured at its current, already
+    /// correct values) and installs it on `world`.
+    pub fn install_with_backing(
+        world: &mut SimWorld,
+        limits: ResidencyLimits,
+        backing: Arc<dyn BrickBackingWriter>,
+    ) -> Self {
         let terrain = world.terrain_volume_id();
         let cell_m = world.terrain().volume.cell_size().metres();
-        let backing = Arc::new(MemoryBacking::from_volume(&world.terrain().volume));
+        for coord in world.terrain().volume.resident_brick_coords() {
+            backing.capture(&world.terrain().volume, coord);
+        }
         world.set_backing(backing.clone());
         let resident = world.terrain().volume.resident_brick_count();
+        let dense_bytes = total_resident_dense_bytes(world);
         Self {
             limits,
             terrain,
@@ -99,12 +147,17 @@ impl ResidencyPass {
             resident_max: resident,
             resident_final: resident,
             budget_miss_ticks: 0,
+            dense_bytes_min: dense_bytes,
+            dense_bytes_max: dense_bytes,
+            dense_bytes_final: dense_bytes,
         }
     }
 
     /// The durable backing this pass owns — hand it to the late-join / repair
-    /// capture path so a baseline can fill an evicted brick.
-    pub fn backing(&self) -> Arc<MemoryBacking> {
+    /// capture path so a baseline can fill an evicted brick. Read-only
+    /// (`BrickBacking`, not `BrickBackingWriter`): baseline/repair capture
+    /// only ever loads.
+    pub fn backing(&self) -> Arc<dyn BrickBacking> {
         self.backing.clone()
     }
 
@@ -183,6 +236,14 @@ impl ResidencyPass {
         if tick.over_budget {
             self.budget_miss_ticks += 1;
         }
+
+        // T23 / G3 row 7 item 3: sample the live resident dense-byte total
+        // every tick, the same way the brick-count ceiling above is tracked.
+        let dense_bytes = total_resident_dense_bytes(world);
+        self.dense_bytes_min = self.dense_bytes_min.min(dense_bytes);
+        self.dense_bytes_max = self.dense_bytes_max.max(dense_bytes);
+        self.dense_bytes_final = dense_bytes;
+
         tick
     }
 
@@ -242,7 +303,18 @@ impl ResidencyPass {
             resident_terrain_bricks_max: self.resident_max,
             resident_terrain_bricks_final: self.resident_final,
             budget_miss_ticks: self.budget_miss_ticks,
+            resident_dense_bytes_min: self.dense_bytes_min,
+            resident_dense_bytes_max: self.dense_bytes_max,
+            resident_dense_bytes_final: self.dense_bytes_final,
         }
+    }
+
+    /// The durable backing's on-disk footprint, when it is a real disk-backed
+    /// store (`None` for the in-process `MemoryBacking` default, which has
+    /// none). T23 / G3 row 7 item 3's durable-side counterpart to
+    /// `resident_dense_bytes_*`.
+    pub fn backing_disk_bytes(&self) -> Option<u64> {
+        self.backing.disk_bytes()
     }
 
     fn interest_bricks(&self, player_feet_m: &[[f64; 3]]) -> BTreeSet<BrickCoord> {

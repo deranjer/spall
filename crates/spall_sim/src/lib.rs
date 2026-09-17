@@ -56,7 +56,7 @@ pub mod world;
 /// Re-exported so game/example code names one `RequestId` type, not a copy.
 pub use spall_protocol::RequestId;
 
-pub use backing::{BackingBrick, BrickBacking, MemoryBacking};
+pub use backing::{BackingBrick, BrickBacking, BrickBackingWriter, MemoryBacking};
 pub use body::{Body, BodyKind, BodyPose};
 pub use collider::{
     ColliderInfeasible, ColliderPlan, MAX_ACTIVE_COLLIDER_CELLS, PRIMITIVE_BUDGET, plan_collider,

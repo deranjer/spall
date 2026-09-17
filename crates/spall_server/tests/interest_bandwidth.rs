@@ -77,6 +77,7 @@ fn base_config(
         await_body_settle: false,
         motion_interest: Some(motion_interest),
         residency: None,
+        residency_disk_path: None,
         contact_damage: None,
         dormancy: None,
     }
