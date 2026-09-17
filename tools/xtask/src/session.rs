@@ -216,6 +216,18 @@ struct Scenario {
     /// when `residency_budget_bricks` is set. Defaults to the server's default.
     #[serde(default)]
     residency_radius_bricks: Option<i64>,
+    /// T23 / G3 row 7 item 2 (increment 31): back the server's residency pass
+    /// with a real on-disk `DiskBrickBacking` (`--residency-disk-backing`)
+    /// instead of the in-process `MemoryBacking` default. Only meaningful
+    /// when `residency_budget_bricks` is set; ignored otherwise. `false`
+    /// (absent, the default) preserves every existing scenario's exact prior
+    /// behavior. When set alongside `restart_check`, the cold-restarted
+    /// server is also launched with matching residency + disk-backing flags
+    /// (pointed at the same `<world>/residency.db`), proving a restart reads
+    /// the durable backing back correctly -- other scenarios' restart runs
+    /// are unaffected since this only activates when the flag is set.
+    #[serde(default)]
+    residency_disk_backing: bool,
     /// T23 / G3 row 7, slice E2: run each **movement-scripted** client with
     /// `--residency-budget-bricks` — the replica evicts terrain outside a brick
     /// box around its predicted player and pulls it back with repair requests
@@ -780,6 +792,11 @@ struct ServerSummary {
     residency_evictions_total: u64,
     #[serde(default)]
     residency_reloads_total: u64,
+    // T23 / G3 row 7 item 2 (increment 31): `ServeSummary` v6's durable-backing
+    // byte count -- `Some(n)` once a disk-backed run has captured at least one
+    // brick, `None` for in-process `MemoryBacking` or when residency is off.
+    #[serde(default)]
+    residency_backing_disk_bytes: Option<u64>,
     // T23 / G3 row 14.
     #[serde(default)]
     app_egress_bytes: u64,
@@ -913,6 +930,13 @@ struct SessionSummary {
     restart_recovered_hash_matches: bool,
     restart_reconnect_hash_matches: bool,
     restart_recovered_world_hash: String,
+    /// T23 / G3 row 7 item 2 (increment 31): the server's reported durable
+    /// residency-backing byte count for this run -- `Some(n)` once a
+    /// `residency_disk_backing` run has captured at least one brick to disk,
+    /// `None` for an in-process-backed or residency-off run. Always surfaced
+    /// (not only on pass) so a scenario's `summary.json` shows the measured
+    /// value directly.
+    residency_backing_disk_bytes: Option<u64>,
     /// T23 / G3 row 10: `late_join_may_fail` was set and an impaired late joiner
     /// ended in an accepted bounded explicit failure (`join-failed`, real exit)
     /// while the live clients + server still converged.
@@ -1124,6 +1148,19 @@ fn dormancy_requirements_met(scenario: &Scenario, server: &ServerSummary) -> boo
     };
     server.dormancy_deactivations_total >= required.min_deactivations
         && server.dormancy_reactivations_total >= required.min_reactivations
+}
+
+/// T23 / G3 row 7 item 2 (increment 31): when the scenario turned on
+/// `residency_disk_backing`, require the server to have actually reported a
+/// nonzero durable-backing byte count (`ServeSummary.residency_backing_disk_bytes
+/// == Some(n > 0)`) -- proving the disk-backed path was exercised end to end,
+/// not just accepted as a CLI flag. `true` when the scenario did not request
+/// disk backing.
+fn residency_disk_backing_requirements_met(scenario: &Scenario, server: &ServerSummary) -> bool {
+    if !scenario.residency_disk_backing {
+        return true;
+    }
+    server.residency_backing_disk_bytes.is_some_and(|n| n > 0)
 }
 
 fn requirements_met(
@@ -1806,6 +1843,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         if let Some(r) = scenario.residency_radius_bricks {
             server_cmd.args(["--residency-radius-bricks", &r.to_string()]);
         }
+        if scenario.residency_disk_backing {
+            server_cmd.arg("--residency-disk-backing");
+        }
     }
     if let Some(mi) = &scenario.motion_interest {
         server_cmd.args([
@@ -2099,6 +2139,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     restart_recovered_hash_matches: false,
                     restart_reconnect_hash_matches: false,
                     restart_recovered_world_hash: String::new(),
+                    residency_backing_disk_bytes: None,
                     impaired_late_join_bounded_failure: false,
                     agreed_world_hash: String::new(),
                     all_hashes_match: false,
@@ -2236,6 +2277,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     if !dormancy_requirements_met(&scenario, &server) {
         requirements_met = false;
     }
+    if !residency_disk_backing_requirements_met(&scenario, &server) {
+        requirements_met = false;
+    }
     // T23 / G3 row 11: the configured client's measured compressed baseline
     // size and time-to-ready must both stay within budget, and it must have
     // actually converged — small/fast is not a pass if the join itself failed.
@@ -2274,6 +2318,17 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     // from the shutdown checkpoint + journal), then a fresh `--late-join` client
     // against it. Both must reach the agreed hash.
     let restart = if scenario.restart_check {
+        // T23 / G3 row 7 item 2 (increment 31): when the live run was
+        // disk-backed, the cold-restarted server also gets matching residency
+        // + disk-backing flags, pointed at the same `<world>/residency.db` --
+        // proving a restart reads the durable backing back correctly, not
+        // just that the world DB's own journal recovers (which residency,
+        // by design, does not affect). Every other scenario's restart run
+        // passes `None`/`false` here, exactly as before this increment.
+        let restart_residency = scenario.residency_disk_backing.then_some(RestartResidency {
+            budget_bricks: scenario.residency_budget_bricks.unwrap_or(0),
+            radius_bricks: scenario.residency_radius_bricks,
+        });
         let r = run_restart_check(
             &output,
             &scenario.scene,
@@ -2281,6 +2336,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             &agreed,
             run.timeout,
             profile,
+            restart_residency,
         );
         if !(r.ran && r.recovered_matches && r.reconnect_matches) {
             requirements_met = false;
@@ -2344,6 +2400,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 .as_ref()
                 .map(|r| r.recovered_hash.clone())
                 .unwrap_or_default(),
+            residency_backing_disk_bytes: server.residency_backing_disk_bytes,
             impaired_late_join_bounded_failure: bounded_join_failure_seen,
             agreed_world_hash: agreed,
             all_hashes_match: all_match,
@@ -2421,6 +2478,14 @@ struct RestartCheck {
     reconnect_matches: bool,
 }
 
+/// T23 / G3 row 7 item 2 (increment 31): matching residency + disk-backing
+/// config for the cold-restarted server in [`run_restart_check`], so it
+/// re-opens the exact same `<world>/residency.db` the live run wrote.
+struct RestartResidency {
+    budget_bricks: usize,
+    radius_bricks: Option<i64>,
+}
+
 /// T23 / G3 cold restart. Launches a **fresh** `sandbox-server --serve --save`
 /// over the world DB the run just journalled — a cold recovery from the
 /// shutdown checkpoint plus the durable journal, no client edit replay — and
@@ -2434,6 +2499,7 @@ fn run_restart_check(
     expected: &str,
     deadline: Duration,
     profile: &str,
+    residency: Option<RestartResidency>,
 ) -> RestartCheck {
     let miss = RestartCheck {
         ran: false,
@@ -2489,6 +2555,17 @@ fn run_restart_check(
         "0",
         "--dev-unvalidated-actions",
     ]);
+    // T23 / G3 row 7 item 2 (increment 31): re-open the same
+    // `<world>/residency.db` a disk-backed live run wrote, proving a cold
+    // restart's fresh `DiskBrickBacking` reads it back correctly. Absent for
+    // every scenario that didn't request disk backing (unchanged behavior).
+    if let Some(r) = &residency {
+        srv.args(["--residency-budget-bricks", &r.budget_bricks.to_string()]);
+        if let Some(radius) = r.radius_bricks {
+            srv.args(["--residency-radius-bricks", &radius.to_string()]);
+        }
+        srv.arg("--residency-disk-backing");
+    }
     hide_console(&mut srv);
     let Ok(child) = srv.spawn() else {
         return miss;
