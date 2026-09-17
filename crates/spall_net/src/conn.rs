@@ -543,8 +543,19 @@ impl Connection {
                         let mut s = self.ctrl_send.lock().await;
                         write_framed(&mut s, &bytes, self.cfg.limits.max_control_record).await
                     };
+                    // T23 / G3 row 11: bound the write by `idle_timeout`, not
+                    // `heartbeat_interval`. A heartbeat shares its connection's
+                    // congestion/flow-control budget with real application
+                    // traffic (a baseline transfer in particular); on a
+                    // bandwidth-capped link that traffic can legitimately keep
+                    // this write pending well past one `heartbeat_interval`
+                    // without the peer being unresponsive. `idle_timeout` is
+                    // already this connection's considered answer to "how long
+                    // is silence tolerated" -- reusing it here means a slow-but-
+                    // progressing write is never treated as a dead peer sooner
+                    // than genuine silence would be.
                     let sent = tokio::select! {
-                        result = tokio::time::timeout(self.cfg.heartbeat_interval, write) => result,
+                        result = tokio::time::timeout(self.cfg.idle_timeout, write) => result,
                         _ = stop.changed() => {
                             self.quic.close(0u32.into(), b"liveness stopped during write");
                             break;
