@@ -43,7 +43,8 @@ pub use residency_pass::{
     PassTick, ResidencyLimits, ResidencyPass, ResidencyStats, total_resident_dense_bytes,
 };
 pub use serve::{
-    MotionInterest, PerClientEgress, Scene, ServeConfig, ServeError, ServeSummary, serve,
+    MotionInterest, PerClientEgress, Scene, ServeConfig, ServeError, ServeSummary,
+    default_capture_workers, serve,
 };
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};

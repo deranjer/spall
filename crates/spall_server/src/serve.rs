@@ -69,6 +69,59 @@ pub const DEFAULT_CATCH_UP_CAP: usize = 512;
 /// Default bounded retry count for late-join transfer restarts.
 pub const DEFAULT_MAX_JOIN_RETRIES: u32 = 3;
 
+/// Default size of the background baseline-capture worker pool
+/// ([`LateJoin`]'s `capture_pool`), when [`ServeConfig::capture_workers`] is
+/// left unset by a caller.
+///
+/// ENG-30 / T23 row 11, increment 30: increment 29 traced a deterministic
+/// `t23-g4-join-budget` failure (a real ~30s+ span of *genuine* silence on
+/// every connection, not a false idle read) to real CPU/scheduling
+/// contention from eight concurrent, unbounded `std::thread::spawn` calls in
+/// `LateJoin::on_baseline_ack` -- one per simultaneous late join -- plus
+/// nine-plus OS processes (one server, eight clients) on one machine, and
+/// flagged sizing a bounded pool without first measuring this environment's
+/// real schedulable CPU budget as exactly the kind of unprincipled,
+/// environment-fitted guess this project's convention asks not to ship.
+///
+/// This increment measured that budget with a standalone, dependency-free
+/// CPU-bound thread sweep (`docs/reports/G3.md` increment 30 has the full
+/// methodology and raw numbers) independent of the join-budget scenario
+/// itself. Headline results on this environment (`available_parallelism()`
+/// reports 16): per-worker completion time grows only ~12-21% over solo
+/// execution through a quarter of that count, ~29% at half, and ~48% at the
+/// full count, with throughput saturating almost exactly at
+/// `available_parallelism()` workers and then flatlining (pure queueing, not
+/// a lower real core count) -- i.e. the reported 16 logical cores are real
+/// and genuinely schedulable in isolation. The isolated single-process probe
+/// does not, however, exercise this workspace's actual multi-process shape:
+/// the server and every client each build their own
+/// `tokio::runtime::Builder::new_multi_thread()` at its own default worker
+/// count (`available_parallelism()`, uncustomized anywhere in this
+/// workspace), so a real `t23-g4-join-budget` run puts up to nine such
+/// runtimes (~9 x 16 = up to 144 OS threads) on the same physical cores
+/// before a single capture thread is even spawned -- confirmed by inspecting
+/// every `Builder::new_multi_thread()` call site in this workspace
+/// (`spall_server::serve`, `spall_client::net`, and `xtask`'s own harness
+/// connections): none calls `.worker_threads(..)`, so all default to
+/// `available_parallelism()`. Because background capture must share this
+/// machine with that additional, unmeasured multi-process load -- not just
+/// with itself -- this picks the
+/// conservative quarter-of-parallelism point from the measured curve rather
+/// than the fuller "still efficient" range the isolated probe alone would
+/// suggest.
+///
+/// This is a general server-hygiene default (an unbounded thread-per-request
+/// spawn is a known scalability antipattern regardless of any one sandbox's
+/// contention), not a constant fitted to this one scenario -- see
+/// `docs/reports/G3.md` increment 30 for whether it actually closes row 11.
+pub fn default_capture_workers() -> usize {
+    (std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        / 4)
+    .max(1)
+}
+
 // --- ENG-48: minimum safe replication-host queue bounds ----------------------
 //
 // The full per-connection bandwidth / interest budget is T20. These caps only
@@ -323,6 +376,13 @@ pub struct ServeConfig {
     /// T17: bounded late-join transfer restarts before the client is dropped
     /// with an explicit failure (connected clients keep running).
     pub max_join_retries: u32,
+    /// ENG-30 / T23 row 11, increment 30: number of long-lived worker threads
+    /// in the background baseline-capture pool (`LateJoin::on_baseline_ack`).
+    /// Bounds how many captures run *concurrently* -- a request past this is
+    /// queued, never rejected. Clamped to at least `1`. See
+    /// [`default_capture_workers`] for how the default is derived and
+    /// `docs/reports/G3.md` increment 30 for the measurement behind it.
+    pub capture_workers: usize,
     /// **Development only.** Skip the server-side action-claim validation
     /// (`resolve_intent`) and take each `ActionRequest`'s `claimed_target` /
     /// `claimed_brush` verbatim. This is the "explicitly scoped authenticated
@@ -438,6 +498,7 @@ impl ServeConfig {
             seed: 0,
             catch_up_cap: DEFAULT_CATCH_UP_CAP,
             max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
+            capture_workers: default_capture_workers(),
             dev_unvalidated_actions: false,
             save_faults: None,
             await_body_settle: false,
@@ -1018,6 +1079,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let checkpoint_interval = config.checkpoint_interval_ticks;
     let catch_up_cap = config.catch_up_cap.max(1);
     let max_join_retries = config.max_join_retries;
+    let capture_workers = config.capture_workers.max(1);
     let dev_unvalidated_actions = config.dev_unvalidated_actions;
     let residency_limits = config.residency;
     let residency_disk_path = config.residency_disk_path.clone();
@@ -1134,7 +1196,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut body_stable_ticks = 0u64;
 
         // T17 late-join / reconnect state.
-        let mut lj = LateJoin::new(catch_up_cap, max_join_retries);
+        let mut lj = LateJoin::new(catch_up_cap, max_join_retries, capture_workers);
         // T23 / G3 row 7, slice D: a late-join baseline or repair patch over a
         // brick the residency pass has evicted is filled from its durable
         // backing.
@@ -1964,6 +2026,68 @@ struct ClientLink {
 /// All the per-run late-join / reconnect bookkeeping the sim loop needs, kept
 /// out of the loop body. Also the unit-test surface for the catch-up bound and
 /// the session-generation guard.
+/// A small fixed-size worker pool bounding how many background baseline
+/// captures (`LateJoin::on_baseline_ack`) run concurrently. ENG-30 / T23 row
+/// 11, increment 30: replaces one raw `std::thread::spawn` per join request
+/// with a bounded set of long-lived workers pulling from a shared job queue
+/// -- see [`default_capture_workers`] and `docs/reports/G3.md` increment 30
+/// for the measurement this pool's default size is derived from. A job past
+/// the worker count is queued, never rejected or dropped: this bounds
+/// *concurrency*, not the number of simultaneously in-flight joins (that is
+/// [`ServeConfig::catch_up_cap`] / [`ServeConfig::max_join_retries`]'s job).
+///
+/// Rayon (mentioned only as a design inspiration in this workspace's README,
+/// not an actual `[workspace.dependencies]` entry -- confirmed via `cargo
+/// tree -i rayon`, which finds no such package) was considered first per
+/// this ticket's instructions, but adding it as a new real dependency of
+/// `spall_server` for one bounded-queue primitive would cut against this
+/// project's stated preference for minimal dependencies; a channel plus a
+/// fixed set of threads is a handful of lines and needs no new crate.
+struct CapturePool {
+    job_tx: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
+}
+
+impl CapturePool {
+    /// Spawns `workers` (clamped to at least `1`) long-lived OS threads
+    /// sharing one job queue.
+    fn new(workers: usize) -> Self {
+        let workers = workers.max(1);
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        for _ in 0..workers {
+            let job_rx = Arc::clone(&job_rx);
+            std::thread::spawn(move || {
+                loop {
+                    // Hold the lock only long enough to pull the next job --
+                    // the actual capture work below runs unlocked, so workers
+                    // never serialize on anything but the handoff itself.
+                    let job = {
+                        let rx = job_rx.lock().unwrap_or_else(|poison| poison.into_inner());
+                        rx.recv()
+                    };
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => break, // every `CapturePool` (sender) is gone
+                    }
+                }
+            });
+        }
+        Self { job_tx }
+    }
+
+    /// Enqueues `job` for the next free worker. Never blocks the caller (the
+    /// simulation tick loop) -- the queue itself is unbounded, only
+    /// concurrent *execution* is bounded by the worker count.
+    fn spawn(&self, job: impl FnOnce() + Send + 'static) {
+        // The only failure mode is every worker thread having panicked and
+        // dropped its receiver handle -- the job closure here never panics on
+        // any known input. If it ever did happen, the caller's
+        // `pending_captures` entry simply never resolves rather than
+        // panicking the tick loop.
+        let _ = self.job_tx.send(Box::new(job));
+    }
+}
+
 struct LateJoin {
     /// `session.raw()` → link.
     links: HashMap<u64, ClientLink>,
@@ -1995,10 +2119,13 @@ struct LateJoin {
             std::sync::mpsc::Receiver<Result<BaselineTransfer, baseline::BaselineError>>,
         ),
     >,
+    /// ENG-30 / T23 row 11, increment 30: bounds concurrent background
+    /// baseline captures. See [`CapturePool`].
+    capture_pool: CapturePool,
 }
 
 impl LateJoin {
-    fn new(catch_up_cap: usize, max_retries: u32) -> Self {
+    fn new(catch_up_cap: usize, max_retries: u32, capture_workers: usize) -> Self {
         Self {
             links: HashMap::new(),
             latest_gen: HashMap::new(),
@@ -2013,6 +2140,7 @@ impl LateJoin {
             backing: None,
             cached_baseline: None,
             pending_captures: HashMap::new(),
+            capture_pool: CapturePool::new(capture_workers),
         }
     }
 
@@ -2122,7 +2250,7 @@ impl LateJoin {
                 None => {
                     let snapshot = baseline::snapshot_world(sim, self.backing_ref());
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                    std::thread::spawn(move || {
+                    self.capture_pool.spawn(move || {
                         let _ = tx.send(baseline::transfer_from_snapshot(
                             snapshot,
                             id,
@@ -3403,7 +3531,11 @@ mod tests {
 
     #[test]
     fn a_reconnect_supersedes_the_old_session_generation() {
-        let mut lj = LateJoin::new(DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES);
+        let mut lj = LateJoin::new(
+            DEFAULT_CATCH_UP_CAP,
+            DEFAULT_MAX_JOIN_RETRIES,
+            default_capture_workers(),
+        );
         let old = sess(0, 1);
         let new = sess(0, 2);
         lj.on_joined(old);
@@ -3421,7 +3553,11 @@ mod tests {
     #[test]
     fn simultaneous_joiners_reuse_the_same_immutable_baseline_at_one_cursor() {
         let sim = Scene::BridgeCut.simulation();
-        let mut lj = LateJoin::new(DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES);
+        let mut lj = LateJoin::new(
+            DEFAULT_CATCH_UP_CAP,
+            DEFAULT_MAX_JOIN_RETRIES,
+            default_capture_workers(),
+        );
         let first = lj.capture_for(&sim, TransferId(1)).unwrap();
         let second = lj.capture_for(&sim, TransferId(2)).unwrap();
 
@@ -3454,12 +3590,87 @@ mod tests {
         );
     }
 
+    /// ENG-30 / T23 row 11, increment 30: a 1-worker [`CapturePool`] must run
+    /// submitted jobs strictly one after another, never overlapping -- the
+    /// whole point of bounding `LateJoin::on_baseline_ack`'s background
+    /// captures instead of one raw `std::thread::spawn` per join request.
+    #[test]
+    fn capture_pool_bounds_concurrent_execution_to_its_worker_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = CapturePool::new(1);
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        for _ in 0..4 {
+            let concurrent = Arc::clone(&concurrent);
+            let max_concurrent = Arc::clone(&max_concurrent);
+            let done_tx = done_tx.clone();
+            pool.spawn(move || {
+                let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                max_concurrent.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                concurrent.fetch_sub(1, Ordering::SeqCst);
+                let _ = done_tx.send(());
+            });
+        }
+        drop(done_tx);
+        for _ in 0..4 {
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("every queued job eventually runs");
+        }
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "a 1-worker pool must never run two jobs at once"
+        );
+    }
+
+    /// The complement of the test above: a pool sized for real concurrency
+    /// must actually provide it, not accidentally serialize everything
+    /// (which would defeat the point of a *pool* rather than a single
+    /// background thread).
+    #[test]
+    fn capture_pool_allows_real_concurrency_up_to_its_worker_count() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = CapturePool::new(2);
+        let barrier = Arc::new(Barrier::new(2));
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let concurrent = Arc::clone(&concurrent);
+            let max_concurrent = Arc::clone(&max_concurrent);
+            let done_tx = done_tx.clone();
+            pool.spawn(move || {
+                let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                max_concurrent.fetch_max(now, Ordering::SeqCst);
+                // Both jobs must reach this point "at once" -- a serialized
+                // pool would deadlock here and fail the test via timeout.
+                barrier.wait();
+                concurrent.fetch_sub(1, Ordering::SeqCst);
+                let _ = done_tx.send(());
+            });
+        }
+        drop(done_tx);
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("both jobs run concurrently, not serialized");
+        }
+        assert_eq!(max_concurrent.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn catch_up_overflow_recaptures_then_drops_after_the_retry_budget() {
         let sim = Scene::BridgeCut.simulation();
         let clients = empty_clients();
         // cap 2, one retry allowed.
-        let mut lj = LateJoin::new(2, 1);
+        let mut lj = LateJoin::new(2, 1, 2);
         let joiner = sess(0, 1);
         lj.on_joined(joiner);
         lj.on_baseline_ack(
@@ -3523,7 +3734,7 @@ mod tests {
         let handle = OutboundHandle::new();
         clients.lock().unwrap().insert(joiner.raw(), handle.clone());
 
-        let mut lj = LateJoin::new(2, 1);
+        let mut lj = LateJoin::new(2, 1, 2);
         lj.on_joined(joiner);
         lj.on_baseline_ack(
             joiner,
@@ -3577,7 +3788,7 @@ mod tests {
     fn a_live_client_is_never_queued() {
         let sim = Scene::BridgeCut.simulation();
         let clients = empty_clients();
-        let mut lj = LateJoin::new(1, 1);
+        let mut lj = LateJoin::new(1, 1, 1);
         let live = sess(1, 1);
         lj.on_joined(live);
         for _ in 0..50 {
