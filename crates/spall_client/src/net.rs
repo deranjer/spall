@@ -655,10 +655,15 @@ async fn perform_late_join(
         match conn.recv_record().await {
             Ok(Some(WireRecord::BaselineBegin(b))) => break b,
             Ok(Some(_)) => continue,
-            Ok(None) | Err(_) => {
+            Ok(None) => {
                 return Err(ClientNetError::Baseline(
                     "connection closed before the baseline arrived".into(),
                 ));
+            }
+            Err(e) => {
+                return Err(ClientNetError::Baseline(format!(
+                    "connection closed before the baseline arrived: {e}"
+                )));
             }
         }
     };
@@ -741,6 +746,19 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         Some(format!("session={}", conn.session())),
     ))?;
 
+    // T23 / G3 row 11: start the heartbeat/idle-watchdog task now, before any
+    // late-join wait -- not after one. `perform_late_join` below can
+    // legitimately block for tens of seconds (a dependency-complete baseline
+    // capture under real server-side CPU contention); until this task exists,
+    // nothing on this connection ever sends the peer an application
+    // `Heartbeat`, so the *server's* `since_last_control_seen` watchdog sees a
+    // silent connection and — correctly, given what it can observe — closes it
+    // as idle once a slow capture crosses `idle_timeout`. Spawning `run_liveness`
+    // immediately after the connection is authenticated keeps heartbeats
+    // flowing through the whole session, late-join wait included.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let liveness = tokio::spawn(conn.clone().run_liveness(stop_rx.clone()));
+
     // A movement client pulls a baseline like a late joiner so it works with any
     // scene the server runs (T19 uses the `walk` arena). An interactive
     // client always predicts a player too, exactly like a non-empty
@@ -777,6 +795,8 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 ProcessRole::Client,
                 Some(format!("late join failed: {e}")),
             ))?;
+            let _ = stop_tx.send(true);
+            liveness.abort();
             let _ = conn.say_bye("late join failed").await;
             conn.close("late join failed");
             return Err(e);
@@ -806,10 +826,6 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 conn.session(),
             ))))
         });
-
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-
-    let liveness = tokio::spawn(conn.clone().run_liveness(stop_rx.clone()));
 
     // Bounded resend of `ActionRequest`s the server throttled (its per-tick
     // admission quota was exceeded — an explicitly retryable rejection). The
