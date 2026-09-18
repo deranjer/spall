@@ -289,24 +289,40 @@ Accept: long weak cantilevers fail, comparable strong supports hold within decla
 
 ### T23 — G3/G4 integrated engine acceptance
 
+Current disposition: **not accepted**, per the
+[2026-09-18 acceptance audit](reports/T23-acceptance-audit-2026-09-18.md).
+Of the audit's five findings, increment 37 (`docs/reports/G3.md`) fixes
+finding 1 (a real checkpoint-integrity regression — evicted-brick backing
+reads on the incremental-capture cache-miss path had lost their digest
+verification across a merge) and confirms finding 2 (baseline/repair
+integrity) was already closed by a same-day commit the audit's own stated
+verification numbers predate. Findings 3-5 — partial G4 soak evidence, a
+workload narrower than the required integrated gate, and incomplete
+network/visual evidence — are measurement and workload-coverage gaps, not
+correctness defects, and remain open. Full G4 measurement / workload
+coverage still requires follow-up. Historical increment completion does not
+unblock T24.
+
 Post-merge follow-ups and evidence limits are recorded in the
 [ENG-30 review](reviews/2026-09-10-eng-30-post-merge.md). T23 stays open.
 Those initial atomic-reload and traversal-assertion fixes have landed, as have
 bounded checkpoint capture and disk-backed residency with restart evidence.
-The current [G3 report](reports/G3.md) records increments through 36: the
+The current [G3 report](reports/G3.md) records increments through 37: the
 passing row 11 impaired join-budget run, row 7's pin-lifetime and
 capacity-admission enforcement pass, row 7's incremental (non-full-reload)
-checkpoint capture, row 7's client-side dense-byte admission, and a
-durable-ack audit that found the evict-time boundary already correct but
-fixed a real gap in checkpoint capture's verification of evicted-brick
-backing records. The only item row 7's increment-13 deferred list named that
-remains unaddressed is the dormant `ResidencyController`/`ClientResidency`
-policy-engine merge, which an earlier coordinator review explicitly rejected
-as the objective — not something left to schedule. Whether row 7's addressed
-gaps constitute full T23 gate acceptance is still a judgment call for an
-integrator reviewing the whole report, not a claim made here. Earlier
-increment notes below are historical evidence, not the current
-remaining-work queue.
+checkpoint capture, row 7's client-side dense-byte admission, a durable-ack
+audit that found the evict-time boundary already correct but fixed a real gap
+in checkpoint capture's verification of evicted-brick backing records, and
+(increment 37) the fix for the regression the 2026-09-18 acceptance audit
+found in that same checkpoint-capture verification after a later merge
+reintroduced the gap on a path the original fix predated. The only item row
+7's increment-13 deferred list named that remains unaddressed is the dormant
+`ResidencyController`/`ClientResidency` policy-engine merge, which an earlier
+coordinator review explicitly rejected as the objective — not something left
+to schedule. Whether row 7's addressed gaps constitute full T23 gate
+acceptance is still a judgment call for an integrator reviewing the whole
+report, not a claim made here. Earlier increment notes below are historical
+evidence, not the current remaining-work queue.
 
 Dependencies: T15, T17, T18, T20, T21, T22. Own: complete gate report and targeted fixes.
 

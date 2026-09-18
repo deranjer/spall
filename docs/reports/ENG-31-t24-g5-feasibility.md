@@ -1,5 +1,11 @@
 # ENG-31 / T24 — G5 larger-world feasibility scoping
 
+Dependency update, 2026-09-18: the [current T23 acceptance audit](T23-acceptance-audit-2026-09-18.md)
+supersedes the dated blocker list below. Disk backing, impaired join-budget
+fixes, and soak increments have landed; full T23 acceptance has not. T24
+implementation remains blocked. This historical scoping report is not a
+measured larger-world envelope.
+
 Status: **feasibility scoping only. Not an implementation. No acceptance
 bullet of T24 is claimed met.** T24's own dependency (T23, ENG-30) is not
 done — `docs/tasks.md` lines 292-296 records T23 as still open ("T23 stays
