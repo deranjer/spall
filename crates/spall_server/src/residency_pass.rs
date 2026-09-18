@@ -492,6 +492,26 @@ impl ResidencyPass {
     /// anyway, but failing here is the earlier, clearer signal. In practice
     /// this should not happen: every terrain brick is captured into the
     /// backing on install and again on every commit that touches it.
+    ///
+    /// T23 / G3 row 7 increment 16 (durable exact-revision backing
+    /// acknowledgement, audit + fix): a record the backing *does* offer is
+    /// also verified against the retained digest before it is trusted for the
+    /// checkpoint — the same exact-revision check
+    /// [`spall_voxel::EvictedBricks::verify_candidate`] already applies
+    /// before `SimWorld::reload_brick` publishes a reload into the *live*
+    /// world, now applied symmetrically on this read path too. Without it, a
+    /// backing record that silently drifted from the digest it was captured
+    /// against (a disk backing's `synchronous=NORMAL` write rolled back by an
+    /// OS/power crash before the next checkpoint reads it back, or any other
+    /// divergence between "capture returned true" and "the durable record
+    /// actually holds") would enter the checkpoint's `bricks` unnoticed,
+    /// while `checkpoint.world_hash` — computed from the live logical view,
+    /// i.e. the *retained digest*, not from `bricks` — kept reporting the
+    /// correct value: a durable checkpoint whose recorded hash and stored
+    /// bytes permanently disagree, caught only later (if at all) by
+    /// recovery's `CheckpointHashMismatch` check on a *different*,
+    /// possibly much later, restart. Failing here, at capture time, is the
+    /// earlier and more precise signal, naming the exact brick and revision.
     pub fn capture_checkpoint(
         &self,
         sim: &Simulation,
@@ -499,7 +519,7 @@ impl ResidencyPass {
         journal_cursor: u64,
     ) -> Result<Checkpoint, PersistError> {
         let mut checkpoint = crate::persist::capture(sim, cfg, journal_cursor)?;
-        for (coord, _digest) in sim.world().evicted(self.terrain).iter() {
+        for (coord, digest) in sim.world().evicted(self.terrain).iter() {
             let brick = match self.backing.load(self.terrain, coord) {
                 BackingBrick::Loaded(brick) => brick,
                 BackingBrick::KnownEmpty { revision, edited } => {
@@ -513,6 +533,17 @@ impl ResidencyPass {
                     });
                 }
             };
+            let offered = spall_voxel::BrickDigest::capture_brick(&brick);
+            if offered.revision != digest.revision || offered.content_hash != digest.content_hash {
+                return Err(PersistError::EvictedBrickDigestMismatch {
+                    volume: self.terrain.get(),
+                    coord: [coord.x, coord.y, coord.z],
+                    retained_revision: digest.revision.get(),
+                    retained_hash: digest.content_hash.to_string(),
+                    backing_revision: offered.revision.get(),
+                    backing_hash: offered.content_hash.to_string(),
+                });
+            }
             checkpoint
                 .bricks
                 .push(stored_brick_from_backing(self.terrain, coord, &brick)?);
