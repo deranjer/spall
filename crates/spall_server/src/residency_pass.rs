@@ -50,18 +50,38 @@
 //!   before; [`PassTick::required_over_budget`] reports, without evicting
 //!   anything required to force a fit, when even that is not enough because
 //!   the required (interest ∪ pinned) set alone exceeds `budget_bricks`.
+//!
+//! ## ENG-30 row 7 increment 15 — incremental checkpoint capture
+//!
+//! Increment 22 stopped `capture_checkpoint` from `reload_all`-ing every
+//! evicted brick back into the live world before every periodic/shutdown
+//! checkpoint, but the capture itself still re-snapshotted, re-loaded, and
+//! re-encoded **every** logical (resident ∪ evicted) terrain brick on every
+//! call — a full logical-world walk, just one that no longer touched live
+//! residency placement to do it. [`ResidencyPass::capture_checkpoint`] now
+//! keeps a per-brick cache of the last checkpoint that actually captured each
+//! coordinate ([`ResidencyPass::checkpoint_cache`]); a brick whose revision
+//! has not changed since reuses that prior record untouched, so only bricks
+//! dirtied (edited, or evicted/reloaded at a new revision) since the last
+//! successful checkpoint do real work. Every checkpoint's `bricks` list is
+//! still the *complete* logical set — checkpoints are pruned
+//! (`RETAIN_CHECKPOINTS` in `serve.rs`) and each one must stand alone for a
+//! cold recovery — only how that list is *assembled* changed.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
-use spall_core::{BrickCoord, CELLS_PER_BRICK, GlobalCell, MaterialId, VolumeId};
+use spall_core::{BrickCoord, CELLS_PER_BRICK, GlobalCell, MaterialId, Revision, VolumeId};
 use spall_sim::{
     BackingBrick, BrickBacking, BrickBackingWriter, MemoryBacking, SimWorld, Simulation,
 };
-use spall_store::Checkpoint;
+use spall_store::{Checkpoint, StoredBrick};
 use spall_voxel::{Brick, MemoryReport};
 
-use crate::persist::{PersistConfig, PersistError, stored_brick_from_backing};
+use crate::persist::{
+    PersistConfig, PersistError, capture_with_terrain_bricks, stored_brick_from_backing,
+    stored_brick_from_snapshot,
+};
 
 /// Consecutive ticks a terrain brick must be resident *and* outside every
 /// player's interest before the pass evicts it. The hysteresis stops the pass
@@ -151,6 +171,23 @@ pub struct ResidencyStats {
     /// (`spall_sim::BrickBackingWriter::resident_bytes`) — `None` when the
     /// installed backing does not keep a resident cache (a pure disk store).
     pub backing_bytes_final: Option<u64>,
+    /// T23 / G3 row 7 increment 15: cumulative, across every periodic +
+    /// shutdown [`ResidencyPass::capture_checkpoint`] call this run, of
+    /// terrain bricks actually re-snapshotted/reloaded and re-encoded (a
+    /// revision the pass's checkpoint cache did not already hold, or holds a
+    /// stale copy of). A brick whose revision has not changed since the last
+    /// checkpoint that captured it reuses that prior record untouched and is
+    /// **not** counted here — see [`Self::checkpoint_bricks_logical_total`]
+    /// for the size of the full logical set each of those calls produced.
+    pub checkpoint_bricks_captured_total: u64,
+    /// T23 / G3 row 7 increment 15: cumulative count of terrain bricks each
+    /// `capture_checkpoint` call's *complete* logical (resident ∪ evicted)
+    /// set contained, summed the same way as
+    /// [`Self::checkpoint_bricks_captured_total`]. `captured_total <
+    /// logical_total` (once more than one checkpoint has actually changed
+    /// state) is the direct evidence that capture is incremental, not a
+    /// full-walk no-op wearing a cache.
+    pub checkpoint_bricks_logical_total: u64,
 }
 
 /// Total resident dense-material bytes across `world`'s terrain and every
@@ -207,6 +244,16 @@ pub struct ResidencyPass {
     pinned_max: usize,
     admission_deferred_total: u64,
     required_over_budget_ticks: u64,
+    /// T23 / G3 row 7 increment 15: the last successful `capture_checkpoint`
+    /// call's per-brick records (terrain only), keyed by coordinate, so an
+    /// unchanged brick's record is reused rather than re-snapshotted /
+    /// reloaded / re-encoded on the next call. Seeded at install time from
+    /// every then-resident brick (the pass's own natural "first checkpoint"
+    /// baseline, mirroring how the backing itself is seeded at install) so
+    /// even a run's *first* real capture already skips untouched bricks.
+    checkpoint_cache: BTreeMap<BrickCoord, (Revision, StoredBrick)>,
+    checkpoint_bricks_captured_total: u64,
+    checkpoint_bricks_logical_total: u64,
 }
 
 impl ResidencyPass {
@@ -227,6 +274,15 @@ impl ResidencyPass {
     /// terrain brick (idempotent -- a fresh backing is fully populated, a
     /// restart-recovered one is simply re-captured at its current, already
     /// correct values) and installs it on `world`.
+    ///
+    /// T23 / G3 row 7 increment 15: the same walk also seeds
+    /// [`Self::checkpoint_cache`] with every currently-resident brick's
+    /// encoded checkpoint record, so this pass's *first* real
+    /// `capture_checkpoint` call already treats every brick untouched since
+    /// install as a cache hit, not just later ones treating a prior real
+    /// checkpoint as the baseline. A brick that fails to encode here (should
+    /// not happen -- the same encode path `capture_checkpoint` itself uses)
+    /// simply misses this seed and is captured fresh on the first real call.
     pub fn install_with_backing(
         world: &mut SimWorld,
         limits: ResidencyLimits,
@@ -234,8 +290,14 @@ impl ResidencyPass {
     ) -> Self {
         let terrain = world.terrain_volume_id();
         let cell_m = world.terrain().volume.cell_size().metres();
+        let mut checkpoint_cache = BTreeMap::new();
         for coord in world.terrain().volume.resident_brick_coords() {
             backing.capture(&world.terrain().volume, coord);
+            if let Ok(Some(snap)) = world.terrain().volume.snapshot_brick(coord)
+                && let Ok(stored) = stored_brick_from_snapshot(terrain, coord, &snap)
+            {
+                checkpoint_cache.insert(coord, (snap.revision(), stored));
+            }
         }
         world.set_backing(backing.clone());
         let resident = world.terrain().volume.resident_brick_count();
@@ -250,6 +312,7 @@ impl ResidencyPass {
             reload_grace: BTreeMap::new(),
             prev_player_feet: BTreeMap::new(),
             prev_body_spheres: BTreeMap::new(),
+            checkpoint_cache,
             evictions_total: 0,
             reloads_total: 0,
             resident_min: resident,
@@ -262,6 +325,8 @@ impl ResidencyPass {
             pinned_max: 0,
             admission_deferred_total: 0,
             required_over_budget_ticks: 0,
+            checkpoint_bricks_captured_total: 0,
+            checkpoint_bricks_logical_total: 0,
         }
     }
 
@@ -472,18 +537,36 @@ impl ResidencyPass {
         tick
     }
 
-    /// T23 / G3 row 7 follow-up (post-merge review P2/P3): captures a
-    /// checkpoint that includes evicted terrain read straight from the
-    /// durable backing, instead of `reload_all`-ing every evicted brick back
-    /// into the live world first just to satisfy `persist::capture`'s
-    /// resident-only brick walk. That old path defeated the point of
-    /// residency during every periodic checkpoint: memory would spike back up
-    /// to the full world right before capture, then evict back down again —
-    /// this keeps the live world's resident set (and its memory) untouched
-    /// throughout. `world_hash` is unaffected either way — it has been the
-    /// logical (resident ∪ evicted-digest) hash since increment 6, so this
-    /// only changes what `capture` does to produce a checkpoint whose
+    /// T23 / G3 row 7 follow-up (post-merge review P2/P3), made incremental in
+    /// increment 15: captures a checkpoint that includes evicted terrain read
+    /// straight from the durable backing, instead of `reload_all`-ing every
+    /// evicted brick back into the live world first just to satisfy
+    /// `persist::capture`'s resident-only brick walk. That old path defeated
+    /// the point of residency during every periodic checkpoint: memory would
+    /// spike back up to the full world right before capture, then evict back
+    /// down again — this keeps the live world's resident set (and its memory)
+    /// untouched throughout. `world_hash` is unaffected either way — it has
+    /// been the logical (resident ∪ evicted-digest) hash since increment 6,
+    /// so this only changes what `capture` does to produce a checkpoint whose
     /// `bricks` actually reproduce that hash on recovery.
+    ///
+    /// **Incremental (increment 15):** every checkpoint's `bricks` list still
+    /// covers the *complete* logical (resident ∪ evicted) terrain set — a
+    /// checkpoint must stand alone for recovery, since older ones are pruned
+    /// (`serve.rs`'s `RETAIN_CHECKPOINTS`) — but a brick whose revision has
+    /// not changed since [`Self::checkpoint_cache`] last recorded it reuses
+    /// that prior [`StoredBrick`] record verbatim: no fresh live snapshot (for
+    /// a resident brick) or backing load (for an evicted one), and no
+    /// re-encode. Only a brick whose revision differs (an edit, a fresh
+    /// eviction/reload at a new revision, or one the cache has never seen) is
+    /// actually re-captured. Revision equality implies content equality
+    /// within one world/session generation — the same assumption
+    /// `EvictedBricks::verify_reload` and the rest of the digest lifecycle
+    /// already rely on (`docs/reports/G3-residency-hash.md`'s digest
+    /// lifecycle table). The cache is seeded at install time
+    /// ([`Self::install_with_backing`]) so even a run's first real checkpoint
+    /// already skips every brick untouched since world creation, not only
+    /// later checkpoints comparing against an earlier real one.
     ///
     /// An evicted brick absent from the backing fails the whole capture
     /// (`PersistError::EvictedBrickUnavailable`) rather than silently
@@ -491,32 +574,78 @@ impl ResidencyPass {
     /// `bricks` do not carry — recovery's rebuilt-hash check would catch that
     /// anyway, but failing here is the earlier, clearer signal. In practice
     /// this should not happen: every terrain brick is captured into the
-    /// backing on install and again on every commit that touches it.
+    /// backing on install and again on every commit that touches it. A failed
+    /// capture leaves [`Self::checkpoint_cache`] untouched (updated only after
+    /// every brick in this call succeeded), matching the rest of this pass's
+    /// fail-closed convention.
     pub fn capture_checkpoint(
-        &self,
+        &mut self,
         sim: &Simulation,
         cfg: &PersistConfig,
         journal_cursor: u64,
     ) -> Result<Checkpoint, PersistError> {
-        let mut checkpoint = crate::persist::capture(sim, cfg, journal_cursor)?;
-        for (coord, _digest) in sim.world().evicted(self.terrain).iter() {
-            let brick = match self.backing.load(self.terrain, coord) {
-                BackingBrick::Loaded(brick) => brick,
-                BackingBrick::KnownEmpty { revision, edited } => {
-                    let air = vec![MaterialId::AIR; CELLS_PER_BRICK];
-                    Brick::restored(&air, revision, edited)
-                }
-                BackingBrick::Unavailable => {
-                    return Err(PersistError::EvictedBrickUnavailable {
-                        volume: self.terrain.get(),
-                        coord: [coord.x, coord.y, coord.z],
-                    });
+        let world = sim.world();
+        let mut new_cache = BTreeMap::new();
+        let mut terrain_bricks = Vec::new();
+        let mut captured = 0u64;
+
+        for coord in world.terrain().volume.resident_brick_coords() {
+            let snap = world
+                .terrain()
+                .volume
+                .snapshot_brick(coord)
+                .ok()
+                .flatten()
+                .expect("coord came from the resident set");
+            let revision = snap.revision();
+            let stored = match self.checkpoint_cache.get(&coord) {
+                Some((cached_rev, cached)) if *cached_rev == revision => cached.clone(),
+                _ => {
+                    captured += 1;
+                    stored_brick_from_snapshot(self.terrain, coord, &snap)?
                 }
             };
-            checkpoint
-                .bricks
-                .push(stored_brick_from_backing(self.terrain, coord, &brick)?);
+            new_cache.insert(coord, (revision, stored.clone()));
+            terrain_bricks.push(stored);
         }
+
+        for (coord, digest) in world.evicted(self.terrain).iter() {
+            let revision = digest.revision;
+            let stored = match self.checkpoint_cache.get(&coord) {
+                Some((cached_rev, cached)) if *cached_rev == revision => cached.clone(),
+                _ => {
+                    captured += 1;
+                    let brick = match self.backing.load(self.terrain, coord) {
+                        BackingBrick::Loaded(brick) => brick,
+                        BackingBrick::KnownEmpty { revision, edited } => {
+                            let air = vec![MaterialId::AIR; CELLS_PER_BRICK];
+                            Brick::restored(&air, revision, edited)
+                        }
+                        BackingBrick::Unavailable => {
+                            return Err(PersistError::EvictedBrickUnavailable {
+                                volume: self.terrain.get(),
+                                coord: [coord.x, coord.y, coord.z],
+                            });
+                        }
+                    };
+                    stored_brick_from_backing(self.terrain, coord, &brick)?
+                }
+            };
+            new_cache.insert(coord, (revision, stored.clone()));
+            terrain_bricks.push(stored);
+        }
+
+        let logical_total = terrain_bricks.len() as u64;
+        let checkpoint = capture_with_terrain_bricks(sim, cfg, journal_cursor, terrain_bricks)?;
+
+        // Only commit the new cache / counters once every brick in this call
+        // succeeded — a failed capture (the `EvictedBrickUnavailable` early
+        // return above) must not leave the pass believing bricks it never
+        // actually re-verified are still accurately cached.
+        self.checkpoint_cache = new_cache;
+        self.checkpoint_bricks_captured_total += captured;
+        self.checkpoint_bricks_logical_total += logical_total;
+
         Ok(checkpoint)
     }
 
@@ -536,6 +665,8 @@ impl ResidencyPass {
             required_over_budget_ticks: self.required_over_budget_ticks,
             digest_bytes_final: 0,
             backing_bytes_final: self.backing.resident_bytes(),
+            checkpoint_bricks_captured_total: self.checkpoint_bricks_captured_total,
+            checkpoint_bricks_logical_total: self.checkpoint_bricks_logical_total,
         }
     }
 
