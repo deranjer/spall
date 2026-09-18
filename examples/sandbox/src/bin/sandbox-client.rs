@@ -93,6 +93,14 @@ struct Args {
     /// Chebyshev brick radius kept resident around the predicted player.
     #[arg(long, default_value_t = 2)]
     residency_radius_bricks: i64,
+    /// T23 / G3 row 7 increment 14: hard ceiling on resident terrain dense
+    /// bytes, enforced the same way as `--residency-budget-bricks` -- an
+    /// interest-driven (box-driven) reload back into the tracked box is
+    /// deferred rather than admitted past it. Only meaningful with
+    /// `--residency-budget-bricks > 0`. Absent (the default) disables the cap,
+    /// matching every prior run's exact behavior.
+    #[arg(long)]
+    residency_budget_dense_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +344,7 @@ fn run_replication(args: Args) -> ExitCode {
             spall_client::ClientResidencyLimits {
                 budget_bricks: args.residency_budget_bricks,
                 interest_radius_bricks: args.residency_radius_bricks,
+                max_dense_bytes: args.residency_budget_dense_bytes.unwrap_or(u64::MAX),
             },
         ),
         on_replica_ready: None,

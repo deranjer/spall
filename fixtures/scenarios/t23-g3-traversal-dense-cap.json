@@ -1,0 +1,43 @@
+{
+  "name": "t23-g3-traversal-dense-cap",
+  "description": "T23 / G3 row 8b, ENG-30 row 7 increment 14 -- identical to t23-g3-traversal but the client-side residency pass also runs with a tight --residency-budget-dense-bytes, tight enough (relative to the 4-brick / 1-radius box) to bind and defer at least one desired reload rather than admitting it over budget. Convergence, replay, and the cold restart must all still reach the same agreed hash as t23-g3-traversal -- the dense-byte admission cap changes only client residency bookkeeping, never the committed logical topology.",
+  "scene": "walk",
+  "server_ticks": 2200,
+  "quiescence_ticks": 2201,
+  "clients": 2,
+  "minimum_transactions": 1,
+  "replay_check": true,
+  "restart_check": true,
+  "residency_budget_bricks": 4,
+  "residency_radius_bricks": 1,
+  "client_residency_budget_bricks": 4,
+  "client_residency_radius_bricks": 1,
+  "client_residency_budget_dense_bytes": 196608,
+  "residency_assertions": {
+    "client": 0,
+    "min_server_evictions": 1,
+    "min_server_reloads": 1,
+    "min_client_evictions": 1,
+    "min_client_reloads_completed": 1,
+    "min_evicted_transaction_gaps": 1,
+    "min_outbound_distance_m": 20.0,
+    "max_return_distance_m": 12.0,
+    "min_pinned_bricks": 5,
+    "min_client_admission_deferred": 1
+  },
+  "player_paths": [
+    {
+      "client": 0,
+      "legs": [
+        { "from": 20, "to": 340, "movement": [0.0, 0.0, 1.0] },
+        { "from": 360, "to": 540, "movement": [0.0, 0.0, -1.0] }
+      ]
+    }
+  ],
+  "movement": {
+    "min_distance_m": 4.0
+  },
+  "cuts": [
+    { "client": 1, "at_tick": 120, "cell": [102, 2, 8], "radius": 1 }
+  ]
+}

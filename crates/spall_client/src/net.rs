@@ -287,13 +287,25 @@ pub type ReplicaReadyHook = Arc<dyn Fn(Arc<Mutex<ReplicaWorld>>) + Send + Sync>;
 #[derive(Debug, Clone, Copy)]
 pub struct ClientResidencyLimits {
     /// Resident-terrain-brick ceiling; the pass never forces it below the
-    /// interest box.
+    /// interest box (eviction is unconditional by box), but an
+    /// interest-driven reload back into the box is deferred rather than
+    /// admitted once this would be exceeded (T23 / G3 row 7 increment 14).
     pub budget_bricks: usize,
     /// Chebyshev brick radius kept resident around the predicted player.
     pub interest_radius_bricks: i64,
+    /// T23 / G3 row 7 increment 14: hard ceiling on resident terrain dense
+    /// bytes, enforced the same way as `budget_bricks` — mirrors the server's
+    /// `ResidencyLimits::max_dense_bytes` (increment 13) for this single
+    /// predicted player's terrain. `u64::MAX` disables the cap while still
+    /// enforcing `budget_bricks` — the historical default.
+    pub max_dense_bytes: u64,
 }
 
 /// Machine-readable result of a client run.
+///
+/// v4 (T23 / G3 row 7 increment 14) adds
+/// `client_residency_admission_deferred_total`, mirroring `ServeSummary`'s
+/// v6->v7 pattern from increment 13.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientSummary {
     pub version: u32,
@@ -338,6 +350,12 @@ pub struct ClientSummary {
     pub client_residency_reloads_completed: u64,
     #[serde(default)]
     pub client_residency_budget_miss_steps: u64,
+    /// T23 / G3 row 7 increment 14: desired (box-driven) reload requests
+    /// skipped because admitting them would have exceeded the brick or
+    /// dense-byte cap. `0` unless `client_residency` is set with a cap tight
+    /// enough to bind.
+    #[serde(default)]
+    pub client_residency_admission_deferred_total: u64,
     /// Transactions that first gapped on a brick this client had evicted.
     #[serde(default)]
     pub client_residency_evicted_transaction_gaps: u64,
@@ -461,6 +479,9 @@ struct Counters {
     residency_reloads_requested: AtomicU64,
     residency_reloads_completed: AtomicU64,
     residency_budget_miss_steps: AtomicU64,
+    /// T23 / G3 row 7 increment 14: see
+    /// `ClientSummary::client_residency_admission_deferred_total`.
+    residency_admission_deferred: AtomicU64,
     residency_evicted_transaction_gaps: AtomicU64,
     /// T23 / G3 row 11: compressed bytes of the installed late-join baseline
     /// transfer (`BaselineBegin.total_bytes`, the same bytes shipped on the
@@ -1161,8 +1182,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             // Slice E2: a scripted mover optionally evicts terrain outside a
             // brick box around its predicted player and pulls it back with
             // `RepairRequest`s as the player returns.
-            let mut residency = client_residency
-                .map(|l| ClientResidencyPass::new(l.budget_bricks, l.interest_radius_bricks));
+            let mut residency = client_residency.map(|l| {
+                ClientResidencyPass::new(l.budget_bricks, l.interest_radius_bricks, l.max_dense_bytes)
+            });
             // A residency gap deliberately holds prediction over unknown
             // ground.  Script legs describe controlled movement, so advancing
             // their clock during that hold would consume the outbound leg
@@ -1374,6 +1396,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     counters
                         .residency_budget_miss_steps
                         .store(pass.budget_miss_steps_total(), Ordering::Relaxed);
+                    counters
+                        .residency_admission_deferred
+                        .store(pass.admission_deferred_total(), Ordering::Relaxed);
                     for req in reqs {
                         let _ = conn.send_record(WireRecord::RepairRequest(req)).await;
                     }
@@ -1576,7 +1601,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         }
     };
     let summary = ClientSummary {
-        version: 3,
+        version: 4,
         result: if catch_up_exhausted {
             "join-failed"
         } else if progressed && movement_ok {
@@ -1617,6 +1642,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             .clone(),
         client_residency_budget_miss_steps: counters
             .residency_budget_miss_steps
+            .load(Ordering::Relaxed),
+        client_residency_admission_deferred_total: counters
+            .residency_admission_deferred
             .load(Ordering::Relaxed),
         client_residency_evicted_transaction_gaps: counters
             .residency_evicted_transaction_gaps
