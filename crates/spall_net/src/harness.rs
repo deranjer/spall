@@ -500,6 +500,14 @@ pub async fn run_client(
             // exact replay of seq 0
             conn.send_datagram(0, &frame).await.ok();
         }
+        // The process acceptance test puts an opaque, lossy proxy between the
+        // peers.  Quinn may coalesce a burst of DATAGRAM frames into one UDP
+        // packet; if that packet is dropped, the receiver can observe zero
+        // motion snapshots even though the datagram path is healthy.  Give
+        // each input a scheduling turn so the acceptance check exercises the
+        // best-effort path without making one packet loss erase the whole
+        // sample.
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     let records_recv = tokio::time::timeout(Duration::from_secs(8), reader)

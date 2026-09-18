@@ -126,7 +126,11 @@ fn process_role() {
                 assert!(outcome.connected);
                 assert_eq!(outcome.records_recv, 8);
                 assert_eq!(outcome.bulk_parts_recv, 3);
-                assert!(outcome.datagrams_recv > 0);
+                assert!(
+                    outcome.datagrams_recv > 0,
+                    "client {index} received no motion datagrams (sent {})",
+                    outcome.datagrams_sent
+                );
                 assert!(outcome.app_bytes_recv > outcome.records_recv);
             }
             _ => panic!("unknown child role"),
