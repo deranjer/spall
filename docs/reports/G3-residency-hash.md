@@ -141,8 +141,10 @@ grace (never evicted, always reloaded regardless of budget), and enforces
 `budget_bricks` / a new `max_dense_bytes` on the admission path (an
 interest-driven, non-required reload is deferred rather than admitted past
 either cap), plus digest/backing/process-peak-memory retained-memory evidence.
-Durable exact-revision acknowledgement and bounded (non-full-reload) capture
-remain open.
+ENG-30 row 7 increment 14 (`docs/reports/G3.md` increment 34) mirrors the
+`max_dense_bytes` admission half on `ClientResidencyPass` for its single
+predicted player. Durable exact-revision acknowledgement and bounded
+(non-full-reload) capture remain open.
 
 ## Safe serve-loop integration (slice D)
 
@@ -220,6 +222,7 @@ cargo test -p spall_server --test residency_pass
 cargo test -p spall_server --test client_residency
 cargo xtask scenario --name t23-g3-residency
 cargo xtask scenario --name t23-g3-traversal
+cargo xtask scenario --name t23-g3-traversal-dense-cap
 cargo xtask scenario --name t23-g3
 cargo xtask scenario --name t23-g3 --loss-percent 3
 cargo xtask scenario --name t23-g3-impaired-join
