@@ -38,22 +38,20 @@ impl RenderContext {
     pub fn headless() -> Result<Self, RenderError> {
         let requested_backends = match std::env::var("SPALL_WGPU_BACKEND").as_deref() {
             Ok("dx12") => wgpu::Backends::DX12,
-            Ok("vulkan") => {
-                // The pinned wgpu 24 / naga 24 Vulkan path crashes the NVIDIA
-                // Windows driver (STATUS_ACCESS_VIOLATION) while compiling this
-                // renderer's pipelines — before any draw. D3D12 with the
-                // identical shaders is unaffected and is the accepted default.
-                // Diagnosis and the regression probe: docs/reports/ENG-60.md.
-                if cfg!(target_os = "windows") {
-                    eprintln!(
-                        "spall_render: SPALL_WGPU_BACKEND=vulkan forces a Windows backend that \
-                         crashes NVIDIA's driver during pipeline compilation (ENG-60); \
-                         unset it to use the supported D3D12 path."
-                    );
-                }
-                wgpu::Backends::VULKAN
-            }
-            // D3D12 is the stable native baseline on Windows; see the comment
+            // ENG-60 (fixed): the pinned wgpu 24 / naga 24 Vulkan path used to
+            // crash the NVIDIA Windows driver (STATUS_ACCESS_VIOLATION) while
+            // compiling `create_tone_pipeline` — a naga/driver defect in how a
+            // vertex shader's dynamically-indexed `array<vec2<f32>, N>`
+            // fullscreen-triangle table interacted with a fragment-stage
+            // uniform-buffer read, not a resource/binding bug in this crate.
+            // `shaders/tonemap.wgsl` now generates that position with index
+            // arithmetic instead, and the full `capture_gpu` suite plus a
+            // 1920x1080 six-view capture pass on both backends with
+            // pixel-identical (max abs diff 1/255) output. Vulkan is an
+            // accepted backend again; D3D12 stays the Windows default only
+            // because nothing required changing it. See docs/reports/ENG-60.md.
+            Ok("vulkan") => wgpu::Backends::VULKAN,
+            // D3D12 is the stable native default on Windows; see the comment
             // above and docs/reports/ENG-60.md.
             _ if cfg!(target_os = "windows") => wgpu::Backends::DX12,
             _ => wgpu::Backends::all(),

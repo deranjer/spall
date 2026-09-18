@@ -204,15 +204,22 @@ impl ScenePipeline {
             ],
         });
 
+        crate::probe::mark(
+            "ScenePipeline::new: IndirectPipeline::new (3x vkCreateComputePipelines)",
+        );
         let indirect = IndirectPipeline::new(device);
+        crate::probe::mark("ScenePipeline::new: vkCreateGraphicsPipelines(opaque)");
         let opaque = create_opaque_pipeline(
             device,
             &opaque_shader,
             &scene_layout,
             indirect.display_layout(),
         );
+        crate::probe::mark("ScenePipeline::new: vkCreateGraphicsPipelines(shadow)");
         let shadow = create_shadow_pipeline(device, &shadow_shader, &shadow_layout);
+        crate::probe::mark("ScenePipeline::new: vkCreateGraphicsPipelines(tone_map)");
         let tone_map = create_tone_pipeline(device, &tone_shader, &tone_layout);
+        crate::probe::mark("ScenePipeline::new: all 6 pipelines OK (3 compute + 3 graphics)");
         let globals_buffer = uniform_buffer::<Globals>(device, "spall-t12-globals");
         let shadow_globals_buffers = (0..CASCADE_COUNT)
             .map(|_| uniform_buffer::<ShadowGlobals>(device, "spall-shadow-globals"))
