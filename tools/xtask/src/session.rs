@@ -247,6 +247,16 @@ struct Scenario {
     /// `client_residency_budget_bricks` is set. Defaults to the client's default.
     #[serde(default)]
     client_residency_radius_bricks: Option<i64>,
+    /// ENG-30 row 7 increment 14: hard ceiling on resident terrain dense bytes
+    /// for a movement-scripted client (`--residency-budget-dense-bytes`),
+    /// enforced the same way as `client_residency_budget_bricks` — an
+    /// interest-driven (box-driven) reload back into the tracked box is
+    /// deferred rather than admitted past it. Only meaningful when
+    /// `client_residency_budget_bricks` is set; absent (the default) leaves
+    /// the cap disabled, preserving every existing scenario's exact prior
+    /// behavior.
+    #[serde(default)]
+    client_residency_budget_dense_bytes: Option<u64>,
     /// Enforced end-to-end proof that residency actually ran during this
     /// scenario. A configured block makes zero/default counters a failure.
     #[serde(default)]
@@ -742,6 +752,14 @@ struct ResidencyAssertions {
     /// scenario whose budget is meant to always cover its own interest.
     #[serde(default)]
     forbid_required_over_budget: bool,
+    /// ENG-30 row 7 increment 14: the configured client must have deferred at
+    /// least this many desired (box-driven) reload requests under capacity
+    /// pressure — real evidence the client-side brick/dense-byte admission cap
+    /// actually bound, rather than only being reported. `0` (the default)
+    /// does not require this — most scenarios pair a comfortable client
+    /// residency budget with the box, and never trip it.
+    #[serde(default)]
+    min_client_admission_deferred: u64,
 }
 
 /// T21 / ENG-28 increment 4 (3c): minimum dormancy pass activity the server's
@@ -910,6 +928,9 @@ struct ClientSummary {
     client_residency_reloads_completed: u64,
     #[serde(default)]
     client_residency_budget_miss_steps: u64,
+    /// ENG-30 row 7 increment 14 (`ClientSummary` v4).
+    #[serde(default)]
+    client_residency_admission_deferred_total: u64,
     #[serde(default)]
     client_residency_evicted_transaction_gaps: u64,
     #[serde(default)]
@@ -1079,6 +1100,7 @@ struct ClientRow {
     client_residency_reloads_requested: u64,
     client_residency_reloads_completed: u64,
     client_residency_budget_miss_steps: u64,
+    client_residency_admission_deferred_total: u64,
     client_residency_evicted_transaction_gaps: u64,
     hash_matches_server: bool,
     late_join_baseline_compressed_bytes: u64,
@@ -1200,6 +1222,8 @@ fn residency_requirements_met(
         && server.residency_admission_deferred_total >= required.min_admission_deferred
         && (!required.forbid_required_over_budget
             || server.residency_required_over_budget_ticks == 0)
+        && client.client_residency_admission_deferred_total
+            >= required.min_client_admission_deferred
 }
 
 /// T21 / ENG-28 increment 4 (3c): when the scenario configured
@@ -1312,6 +1336,7 @@ mod requirement_tests {
             client_residency_reloads_requested: 0,
             client_residency_reloads_completed: 0,
             client_residency_budget_miss_steps: 0,
+            client_residency_admission_deferred_total: 0,
             client_residency_evicted_transaction_gaps: 0,
             late_join_baseline_compressed_bytes: 0,
             late_join_baseline_install_ms: 0,
@@ -1465,6 +1490,45 @@ mod requirement_tests {
             !residency_requirements_met(&scenario, &server, &[Some(mover)]),
             "forbid_required_over_budget was opted into"
         );
+    }
+
+    /// ENG-30 row 7 increment 14: `min_client_admission_deferred` requires
+    /// real client-side dense-byte/brick admission-enforcement evidence, not
+    /// only that the client evicted and reloaded terrain.
+    #[test]
+    fn residency_assertions_cover_client_admission_deferral() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "residency_assertions": {
+                    "client": 0,
+                    "min_client_admission_deferred": 1
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut mover = client(1);
+        mover.movement = Some(MovementRow {
+            ticks: 10,
+            distance_travelled_m: 0.0,
+            max_distance_from_start_m: 0.0,
+            max_correction_m: 0.0,
+            ground_contact_ratio: 1.0,
+            hovered_after_floor_removal: false,
+            held_button_release_ok: true,
+        });
+        let server = ServerSummary::default();
+        assert!(
+            !residency_requirements_met(&scenario, &server, &[Some(mover.clone())]),
+            "no admission deferral yet reported"
+        );
+
+        mover.client_residency_admission_deferred_total = 1;
+        assert!(residency_requirements_met(
+            &scenario,
+            &server,
+            &[Some(mover)]
+        ));
     }
 
     #[test]
@@ -2184,6 +2248,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             if let Some(r) = scenario.client_residency_radius_bricks {
                 c.args(["--residency-radius-bricks", &r.to_string()]);
             }
+            if let Some(bytes) = scenario.client_residency_budget_dense_bytes {
+                c.args(["--residency-budget-dense-bytes", &bytes.to_string()]);
+            }
         }
         if scenario.late_join_clients.contains(&i) {
             c.args([
@@ -2356,6 +2423,8 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     client_residency_reloads_requested: c.client_residency_reloads_requested,
                     client_residency_reloads_completed: c.client_residency_reloads_completed,
                     client_residency_budget_miss_steps: c.client_residency_budget_miss_steps,
+                    client_residency_admission_deferred_total: c
+                        .client_residency_admission_deferred_total,
                     client_residency_evicted_transaction_gaps: c
                         .client_residency_evicted_transaction_gaps,
                     hash_matches_server: hash_ok,
@@ -2383,6 +2452,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     client_residency_reloads_requested: 0,
                     client_residency_reloads_completed: 0,
                     client_residency_budget_miss_steps: 0,
+                    client_residency_admission_deferred_total: 0,
                     client_residency_evicted_transaction_gaps: 0,
                     hash_matches_server: false,
                     late_join_baseline_compressed_bytes: 0,
