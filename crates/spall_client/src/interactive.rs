@@ -63,6 +63,17 @@ impl LiveInput {
             guard.buttons &= !bit;
         }
     }
+
+    /// Drops every held action while retaining the current view direction.
+    ///
+    /// A window can lose focus without delivering the matching key/button-up
+    /// events.  Retaining a movement or jump bit in that case would make the
+    /// client keep sending that intent after the person has switched away.
+    pub fn clear_held_actions(&self) {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.movement = [0.0; 3];
+        guard.buttons = 0;
+    }
 }
 
 /// The local player's predicted pose, published once per mover tick so the
