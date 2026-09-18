@@ -872,6 +872,14 @@ struct ServerSummary {
     residency_backing_resident_bytes: Option<u64>,
     #[serde(default)]
     process_peak_memory_bytes: Option<u64>,
+    // ENG-30 row 7 increment 15 (`ServeSummary` v8): incremental checkpoint
+    // capture evidence -- cumulative terrain bricks actually re-captured vs.
+    // each checkpoint's complete logical set, summed across every periodic +
+    // shutdown checkpoint this run.
+    #[serde(default)]
+    residency_checkpoint_bricks_captured_total: u64,
+    #[serde(default)]
+    residency_checkpoint_bricks_logical_total: u64,
 }
 
 /// Mirrors `spall_server::PerClientEgress`.
@@ -1017,6 +1025,14 @@ struct SessionSummary {
     /// This process's peak resident/working-set memory in bytes, independent
     /// of residency being on -- `None` on an unsupported platform.
     process_peak_memory_bytes: Option<u64>,
+    /// ENG-30 row 7 increment 15: incremental checkpoint capture evidence,
+    /// always surfaced (not only on pass) matching every other residency
+    /// counter's convention. `captured_total < logical_total` (once more than
+    /// one checkpoint has run against unchanged state) is the direct evidence
+    /// that checkpoint capture is incremental, not a full walk with a cache
+    /// wrapped around it. Both `0` when residency is off.
+    residency_checkpoint_bricks_captured_total: u64,
+    residency_checkpoint_bricks_logical_total: u64,
     /// T23 / G3 row 10: `late_join_may_fail` was set and an impaired late joiner
     /// ended in an accepted bounded explicit failure (`join-failed`, real exit)
     /// while the live clients + server still converged.
@@ -2312,7 +2328,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             return finish(
                 &output,
                 SessionSummary {
-                    version: 4,
+                    version: 5,
                     result: "failed",
                     scenario: scenario.name.clone(),
                     clients,
@@ -2338,6 +2354,8 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     residency_digest_bytes_final: 0,
                     residency_backing_resident_bytes: None,
                     process_peak_memory_bytes: None,
+                    residency_checkpoint_bricks_captured_total: 0,
+                    residency_checkpoint_bricks_logical_total: 0,
                     impaired_late_join_bounded_failure: false,
                     agreed_world_hash: String::new(),
                     all_hashes_match: false,
@@ -2573,7 +2591,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     finish(
         &output,
         SessionSummary {
-            version: 4,
+            version: 5,
             result: if all_match { "passed" } else { "failed" },
             scenario: scenario.name,
             clients,
@@ -2608,6 +2626,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             residency_digest_bytes_final: server.residency_digest_bytes_final,
             residency_backing_resident_bytes: server.residency_backing_resident_bytes,
             process_peak_memory_bytes: server.process_peak_memory_bytes,
+            residency_checkpoint_bricks_captured_total: server
+                .residency_checkpoint_bricks_captured_total,
+            residency_checkpoint_bricks_logical_total: server
+                .residency_checkpoint_bricks_logical_total,
             impaired_late_join_bounded_failure: bounded_join_failure_seen,
             agreed_world_hash: agreed,
             all_hashes_match: all_match,

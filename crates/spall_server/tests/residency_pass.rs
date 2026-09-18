@@ -312,6 +312,18 @@ fn capture_checkpoint_round_trips_through_real_persistence_while_bricks_stay_evi
 /// capture closed, not publish one whose `world_hash` (logical, so it already
 /// counts every evicted brick) claims geometry its `bricks` do not actually
 /// carry.
+///
+/// T23 / G3 row 7 increment 15: `capture_checkpoint` is now incremental — a
+/// brick whose revision has not changed since it was last captured (at
+/// install, or at an earlier real checkpoint) reuses that prior record and
+/// never touches the backing at all, so a `mark_unavailable` on a brick that
+/// was never actually edited would prove nothing here (its cached record is
+/// already known-correct and the capture would legitimately, correctly,
+/// succeed without reading it). This test targets the *east* region brick
+/// specifically: the script edits it (`SCRIPT`'s tick-30/90 cuts both land in
+/// it), so its digest revision differs from whatever the pass cached for it
+/// at install, forcing a real cache-miss backing read on this call — the
+/// exact case this fail-closed guarantee protects.
 #[test]
 fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
     use spall_server::persist::{self, PersistConfig};
@@ -358,18 +370,16 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
         pass.run(sim.world_mut(), &player_feet, &Default::default());
     }
 
-    let evicted_coord = sim
-        .world()
-        .evicted(terrain)
-        .iter()
-        .next()
-        .map(|(c, _)| c)
-        .expect("the run must still have evicted terrain, or this test proves nothing");
+    let evicted_coord = GlobalCell::new(82, 6, 75).split().0;
+    assert!(
+        sim.world().evicted(terrain).contains(evicted_coord),
+        "the edited east brick must be evicted by end of run, or this test proves nothing"
+    );
     backing.mark_unavailable(terrain, evicted_coord);
 
     let err = pass
         .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
-        .expect_err("a missing durable record for an evicted brick must fail capture");
+        .expect_err("a missing durable record for a dirtied evicted brick must fail capture");
     assert!(
         matches!(
             err,
@@ -985,5 +995,243 @@ fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budg
     assert!(
         !sim.world().evicted(terrain).contains(east),
         "once the cap has headroom, the previously deferred reload must succeed"
+    );
+}
+
+/// T23 / G3 row 7 increment 15: a checkpoint captured after only one more
+/// small edit must re-capture just the brick(s) that edit actually touched,
+/// not the whole resident set again -- the direct evidence that
+/// `capture_checkpoint` is incremental, not a full walk with a cache
+/// decoration around it.
+#[test]
+fn a_second_checkpoint_only_recaptures_bricks_that_changed() {
+    use spall_server::persist::PersistConfig;
+
+    let cfg = PersistConfig {
+        world_id: 0x5A11_0000_0000_D157,
+        seed: 11,
+        generator_version: 1,
+    };
+
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    // No eviction pressure at all: isolates the checkpoint cache's own
+    // dirty-tracking from the eviction/reload paths already covered by the
+    // other tests in this file. `interest_radius_bricks` is a literal
+    // `(2r+1)^3` box per player per tick (`ResidencyPass::interest_bricks`),
+    // so `8` (covering this whole small fixture many times over) is "no
+    // pressure" here, not `1_000`, which would be billions of iterations.
+    let mut pass = ResidencyPass::install(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 1_000,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 8,
+        },
+    );
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+
+    // The first two scripted cuts only (ticks 2 and 30) -- two terrain
+    // bricks (west and east) dirtied since install.
+    let mut next = 0usize;
+    for tick in 1..=40u64 {
+        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
+            let (_, cell, r) = SCRIPT[next];
+            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
+            next += 1;
+        }
+        let report = sim.tick().unwrap();
+        for (_, done) in &report.committed {
+            let touched: Vec<BrickCoord> = done
+                .topology
+                .after
+                .iter()
+                .filter(|br| br.volume == terrain)
+                .map(|br| br.coord)
+                .collect();
+            pass.on_commit(sim.world(), touched);
+        }
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
+    }
+
+    let total_bricks = sim.world().terrain().volume.resident_brick_count() as u64;
+    assert!(
+        total_bricks > 2,
+        "need more than the 2 already-dirty bricks for this test to mean anything \
+         (got {total_bricks} total)"
+    );
+
+    pass.capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect("first checkpoint succeeds");
+    let captured_after_first = pass.stats().checkpoint_bricks_captured_total;
+
+    // One more small cut, well inside the west brick (0,0,0) only.
+    sim.submit(cut(99, [5, 1, 5], 1)).unwrap();
+    let report = sim.tick().unwrap();
+    for (_, done) in &report.committed {
+        let touched: Vec<BrickCoord> = done
+            .topology
+            .after
+            .iter()
+            .filter(|br| br.volume == terrain)
+            .map(|br| br.coord)
+            .collect();
+        pass.on_commit(sim.world(), touched);
+    }
+    pass.run(sim.world_mut(), &player_feet, &Default::default());
+
+    pass.capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect("second checkpoint succeeds");
+    let captured_after_second = pass.stats().checkpoint_bricks_captured_total;
+    let recaptured_this_call = captured_after_second - captured_after_first;
+
+    assert!(
+        recaptured_this_call >= 1,
+        "the freshly-edited brick must have been recaptured"
+    );
+    assert!(
+        recaptured_this_call < total_bricks,
+        "a single small edit must not re-capture the whole resident set \
+         (recaptured {recaptured_this_call} of {total_bricks} total logical bricks)"
+    );
+}
+
+/// T23 / G3 row 7 increment 15's non-negotiable correctness requirement: a
+/// checkpoint captured incrementally (reusing a per-brick cache warmed across
+/// the whole run) must recover to **exactly** the same world as one captured
+/// by a genuine full walk of the identical live state. The full-walk oracle
+/// here is a second, independently-installed `ResidencyPass` sharing the same
+/// backing: `install_with_backing`'s seed step performs an unconditional
+/// fresh live-snapshot-and-encode over every resident coordinate (it has no
+/// cache yet), and its own first `capture_checkpoint` call then reads every
+/// currently-evicted coordinate straight from the shared backing (its cache
+/// has no entries for those either) -- exactly the pre-increment-15
+/// `capture_checkpoint` behaviour, reconstructed from public API rather than
+/// kept alive as dead code.
+#[test]
+fn incremental_and_full_walk_capture_recover_to_the_same_world() {
+    use spall_physics::PhysicsConfig;
+    use spall_server::persist::{self, PersistConfig};
+    use spall_store::Writer;
+    use spall_structure::AnchorPlane;
+
+    let cfg = PersistConfig {
+        world_id: 0x5A11_0000_0000_FA11,
+        seed: 11,
+        generator_version: 1,
+    };
+
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = Arc::new(MemoryBacking::default());
+    let mut pass = ResidencyPass::install_with_backing(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 1,
+        },
+        backing.clone(),
+    );
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+
+    let mut next = 0usize;
+    for tick in 1..=180u64 {
+        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
+            let (_, cell, r) = SCRIPT[next];
+            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
+            next += 1;
+        }
+        let report = sim.tick().unwrap();
+        for (_, done) in &report.committed {
+            let touched: Vec<BrickCoord> = done
+                .topology
+                .after
+                .iter()
+                .filter(|br| br.volume == terrain)
+                .map(|br| br.coord)
+                .collect();
+            pass.on_commit(sim.world(), touched);
+        }
+        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
+    }
+    assert!(
+        sim.world().has_evicted(),
+        "the run must still have evicted terrain, or this comparison proves nothing"
+    );
+
+    // The incremental checkpoint: `pass`'s cache has been warm since install
+    // and updated across every real edit throughout the run above.
+    let incremental = pass
+        .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect("incremental capture succeeds");
+
+    // The full-walk oracle, at the exact same tick: a brand new pass sharing
+    // the same backing (so the durable evicted-brick records are already
+    // there to read), whose own cache starts empty.
+    let mut oracle = ResidencyPass::install_with_backing(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 1,
+        },
+        backing.clone(),
+    );
+    let full_walk = oracle
+        .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect("full-walk capture succeeds");
+
+    // Byte-identical, not just hash-equal: same bricks, in the same order.
+    assert_eq!(
+        incremental.bricks, full_walk.bricks,
+        "an incremental capture's brick records must be byte-identical to a full walk's"
+    );
+    assert_eq!(incremental.world_hash, full_walk.world_hash);
+    assert_eq!(incremental.tick, full_walk.tick);
+
+    // And the contract's actual non-negotiable: both recover to the same
+    // world through real persistence, matching the live logical hash.
+    let expected_hash = sim.world().world_hash();
+    let expected_solid = sim.world().total_solid_cells();
+    let recover_one = |name: &str, checkpoint: &spall_store::Checkpoint| {
+        let dir = std::env::temp_dir().join(format!(
+            "spall_residency_capture_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("world.db");
+        {
+            let mut w = Writer::open(&db).unwrap();
+            w.publish_checkpoint(checkpoint).unwrap();
+        }
+        let recovery = spall_store::recover(&db).unwrap();
+        let (recovered, _) = persist::restore(
+            &recovery,
+            &cfg,
+            persist::RecoveryChoice::RequireClean,
+            fixtures::stone_manifest(),
+            AnchorPlane::at(0),
+            PhysicsConfig::default(),
+        )
+        .expect("recovers cleanly");
+        let hash = recovered.world().world_hash();
+        let solid = recovered.world().total_solid_cells();
+        let _ = std::fs::remove_dir_all(&dir);
+        (hash, solid)
+    };
+
+    let (incremental_hash, incremental_solid) = recover_one("incremental", &incremental);
+    let (full_walk_hash, full_walk_solid) = recover_one("full_walk", &full_walk);
+
+    assert_eq!(incremental_hash, expected_hash);
+    assert_eq!(full_walk_hash, expected_hash);
+    assert_eq!(incremental_solid, expected_solid);
+    assert_eq!(full_walk_solid, expected_solid);
+    assert_eq!(
+        incremental_hash, full_walk_hash,
+        "restart_recovered_world_hash must be identical between incremental and full-walk capture"
     );
 }

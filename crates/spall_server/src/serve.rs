@@ -693,6 +693,19 @@ pub struct ServeSummary {
     /// memory line item. `None` on a platform `spall_server::mem_stats` does
     /// not support.
     pub process_peak_memory_bytes: Option<u64>,
+    /// ENG-30 row 7 increment 15: cumulative, across every periodic +
+    /// shutdown checkpoint this run, of terrain bricks
+    /// `ResidencyPass::capture_checkpoint` actually re-snapshotted / reloaded
+    /// / re-encoded (its revision differed from the last checkpoint that
+    /// captured it). `0` when residency is off (that path always uses
+    /// `persist::capture`'s unconditional full walk).
+    pub residency_checkpoint_bricks_captured_total: u64,
+    /// ENG-30 row 7 increment 15: cumulative count of terrain bricks each of
+    /// those `capture_checkpoint` calls' complete logical (resident ∪
+    /// evicted) set contained. `captured_total < logical_total` is the
+    /// direct evidence that checkpoint capture is incremental rather than a
+    /// full walk with a cache wrapped around it. `0` when residency is off.
+    pub residency_checkpoint_bricks_logical_total: u64,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -1581,7 +1594,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     // the durable backing's evicted-brick records straight
                     // into the checkpoint, so residency's bounded memory
                     // holds even at checkpoint time.
-                    let captured = match &residency {
+                    let captured = match &mut residency {
                         Some(pass) => {
                             pass.capture_checkpoint(&sim, &persist_cfg, journalled_through)
                         }
@@ -1693,7 +1706,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             // terrain in from the durable backing the same way the periodic
             // checkpoints above do now, instead of reloading it into the live
             // world first.
-            let captured = match &residency {
+            let captured = match &mut residency {
                 Some(pass) => pass.capture_checkpoint(&sim, &persist_cfg, journalled_through),
                 None => persist::capture(&sim, &persist_cfg, journalled_through),
             };
@@ -1859,7 +1872,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // residency_admission_deferred_total, residency_required_over_budget_ticks,
         // residency_digest_bytes_final, residency_backing_resident_bytes, and
         // process_peak_memory_bytes.
-        version: 7,
+        // v8: ENG-30 row 7 increment 15 adds
+        // residency_checkpoint_bricks_captured_total and
+        // residency_checkpoint_bricks_logical_total (incremental checkpoint
+        // capture evidence).
+        version: 8,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -1956,6 +1973,14 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             .unwrap_or(0),
         residency_backing_resident_bytes: sim_result.residency.and_then(|r| r.backing_bytes_final),
         process_peak_memory_bytes: crate::mem_stats::process_peak_bytes(),
+        residency_checkpoint_bricks_captured_total: sim_result
+            .residency
+            .map(|r| r.checkpoint_bricks_captured_total)
+            .unwrap_or(0),
+        residency_checkpoint_bricks_logical_total: sim_result
+            .residency
+            .map(|r| r.checkpoint_bricks_logical_total)
+            .unwrap_or(0),
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {

@@ -30,7 +30,7 @@ use spall_store::{
     StoredWorldMeta, decode_cells, encode_cells,
 };
 use spall_structure::AnchorPlane;
-use spall_voxel::{Brick, BrickBounds, Volume};
+use spall_voxel::{Brick, BrickBounds, BrickSnapshot, Volume};
 
 /// Algorithm versions stamped into saved world metadata (mirrors
 /// `spall_sim::commit::ALGORITHM_VERSION` and the T01/T07 versions).
@@ -155,23 +155,47 @@ pub enum PersistError {
 
 /// Snapshots the live authoritative world into an immutable [`Checkpoint`]
 /// consistent with journal `journal_cursor` (the highest durable `JournalSeq`).
+///
+/// Always walks every currently-resident terrain brick fresh
+/// ([`stored_bricks`]) -- the historical, non-incremental behaviour, used by
+/// every caller that has no per-checkpoint dirty-tracking cache of its own
+/// (the initial world-creation checkpoint, the crash-suite workload, plain
+/// `serve()` with residency off). [`crate::residency_pass::ResidencyPass::
+/// capture_checkpoint`] instead calls [`capture_with_terrain_bricks`]
+/// directly with an incrementally computed terrain-brick list (T23 / G3 row 7
+/// increment 15) -- this function's own output is unchanged either way.
 pub fn capture(
     sim: &Simulation,
     cfg: &PersistConfig,
     journal_cursor: u64,
+) -> Result<Checkpoint, PersistError> {
+    let terrain_bricks = stored_bricks(&sim.world().terrain().volume)?;
+    capture_with_terrain_bricks(sim, cfg, journal_cursor, terrain_bricks)
+}
+
+/// [`capture`], except the terrain volume's brick records are supplied by the
+/// caller instead of always being recomputed by a full resident-brick walk
+/// here. Every non-terrain part (bodies, meta, hash) is captured exactly as
+/// `capture` does. `capture` itself calls this with precisely the same walk
+/// as before it was extracted (`stored_bricks(&terrain.volume)`), so its
+/// output is byte-identical to the pre-increment-15 implementation.
+pub(crate) fn capture_with_terrain_bricks(
+    sim: &Simulation,
+    cfg: &PersistConfig,
+    journal_cursor: u64,
+    terrain_bricks: Vec<StoredBrick>,
 ) -> Result<Checkpoint, PersistError> {
     let world = sim.world();
     let (next_entity, next_volume, next_transaction, next_journal_seq) =
         world.registry().counters();
 
     let mut bodies = Vec::new();
-    let mut bricks = Vec::new();
+    let mut bricks = terrain_bricks;
     let mut cell_sizes = std::collections::BTreeSet::new();
 
     let terrain = world.terrain();
     cell_sizes.insert(terrain.volume.cell_size().to_u8());
     bodies.push(stored_body(world, terrain, StoredBodyKind::Terrain));
-    bricks.extend(stored_bricks(&terrain.volume)?);
 
     for body in world.bodies() {
         cell_sizes.insert(body.volume.cell_size().to_u8());
@@ -252,20 +276,33 @@ fn stored_bricks(v: &Volume) -> Result<Vec<StoredBrick>, PersistError> {
             .ok()
             .flatten()
             .expect("coord came from the resident set");
-        let mut cells = vec![0u16; CELLS_PER_BRICK];
-        for (i, slot) in cells.iter_mut().enumerate() {
-            let local = LocalCell::from_linear_index(i as u16).expect("i < CELLS_PER_BRICK");
-            *slot = snap.get(local).raw();
-        }
-        out.push(StoredBrick {
-            volume_id: v.id().get(),
-            coord: [coord.x, coord.y, coord.z],
-            revision: snap.revision().get(),
-            edited: snap.is_edited(),
-            payload: encode_cells(&cells)?,
-        });
+        out.push(stored_brick_from_snapshot(v.id(), coord, &snap)?);
     }
     Ok(out)
+}
+
+/// Encodes one resident brick's live [`BrickSnapshot`] into a [`StoredBrick`].
+/// T23 / G3 row 7 increment 15: `ResidencyPass::capture_checkpoint`'s
+/// incremental capture calls this only for a brick whose revision has changed
+/// since the last checkpoint that captured it; an unchanged brick reuses its
+/// prior [`StoredBrick`] record instead, skipping this encode entirely.
+pub(crate) fn stored_brick_from_snapshot(
+    volume_id: VolumeId,
+    coord: BrickCoord,
+    snap: &BrickSnapshot,
+) -> Result<StoredBrick, PersistError> {
+    let mut cells = vec![0u16; CELLS_PER_BRICK];
+    for (i, slot) in cells.iter_mut().enumerate() {
+        let local = LocalCell::from_linear_index(i as u16).expect("i < CELLS_PER_BRICK");
+        *slot = snap.get(local).raw();
+    }
+    Ok(StoredBrick {
+        volume_id: volume_id.get(),
+        coord: [coord.x, coord.y, coord.z],
+        revision: snap.revision().get(),
+        edited: snap.is_edited(),
+        payload: encode_cells(&cells)?,
+    })
 }
 
 /// Encodes one durably-backed [`Brick`] into a [`StoredBrick`] record. T23 /
