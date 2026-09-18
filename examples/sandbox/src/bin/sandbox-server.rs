@@ -75,6 +75,13 @@ struct Args {
     /// dropped (connected clients keep running).
     #[arg(long, default_value_t = spall_server::serve::DEFAULT_MAX_JOIN_RETRIES)]
     max_join_retries: u32,
+    /// ENG-30 / T23 row 11: worker threads in the background baseline-capture
+    /// pool (bounds concurrent late-join captures). Defaults to a measured,
+    /// environment-derived value (`docs/reports/G3.md` increment 30) --
+    /// `available_parallelism() / 4`, minimum 1 -- rather than a fixed
+    /// literal, since the safe number depends on the host's real core count.
+    #[arg(long)]
+    capture_workers: Option<usize>,
     /// ENG-47 development-scenario path: skip server-side action-claim
     /// validation and take each `ActionRequest`'s claimed target/brush verbatim.
     /// Lets a fixture harness script arbitrary cuts. Never use on a shared host.
@@ -273,6 +280,9 @@ fn run_serve(args: Args) -> ExitCode {
         seed: args.seed,
         catch_up_cap: args.catch_up_cap,
         max_join_retries: args.max_join_retries,
+        capture_workers: args
+            .capture_workers
+            .unwrap_or_else(spall_server::serve::default_capture_workers),
         dev_unvalidated_actions: args.dev_unvalidated_actions,
         save_faults: None,
         await_body_settle: args.await_body_settle,

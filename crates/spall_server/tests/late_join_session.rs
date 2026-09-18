@@ -16,7 +16,9 @@ use spall_client::{
     BaselineScene, ClientNetConfig, ScriptedAction, cut_request, run_replication_client,
 };
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
-use spall_server::serve::{DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES};
+use spall_server::serve::{
+    DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES, default_capture_workers,
+};
 use spall_server::{Scene, ServeConfig, serve};
 
 fn unique_dir(tag: &str) -> PathBuf {
@@ -74,6 +76,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         seed: 0,
         catch_up_cap: DEFAULT_CATCH_UP_CAP,
         max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
+        capture_workers: default_capture_workers(),
         // Scripted fixture cuts hit arbitrary cells; use the ENG-47
         // dev-scenario path so this late-join plumbing test still runs.
         dev_unvalidated_actions: true,

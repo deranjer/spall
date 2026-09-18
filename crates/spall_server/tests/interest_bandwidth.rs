@@ -72,6 +72,7 @@ fn base_config(
         seed: 0,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        capture_workers: spall_server::serve::default_capture_workers(),
         dev_unvalidated_actions: true,
         save_faults: None,
         await_body_settle: false,
