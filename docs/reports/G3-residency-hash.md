@@ -141,10 +141,23 @@ grace (never evicted, always reloaded regardless of budget), and enforces
 `budget_bricks` / a new `max_dense_bytes` on the admission path (an
 interest-driven, non-required reload is deferred rather than admitted past
 either cap), plus digest/backing/process-peak-memory retained-memory evidence.
-ENG-30 row 7 increment 14 (`docs/reports/G3.md` increment 34) mirrors the
-`max_dense_bytes` admission half on `ClientResidencyPass` for its single
-predicted player. Durable exact-revision acknowledgement and bounded
-(non-full-reload) capture remain open.
+ENG-30 row 7 increment 15 (`docs/reports/G3.md` increment 34) makes checkpoint
+capture incremental: a per-brick revision cache reuses prior-encoded records
+for unchanged terrain, only re-capturing bricks dirtied since the last
+checkpoint. ENG-30 row 7 increment 14 (`docs/reports/G3.md` increment 35)
+mirrors increment 13's `max_dense_bytes` admission half on
+`ClientResidencyPass` for its single predicted player. ENG-30 row 7
+increment 16 (`docs/reports/G3.md` increment 36) audits the durable
+ack-before-evict requirement rather than assuming it unmet: the evict-time
+capture-then-evict boundary was already correct, but checkpoint capture was
+reading evicted-brick backing records into the durable checkpoint without
+verifying them against the retained digest — fixed by reusing the existing
+digest-verification machinery; the same unverified-read pattern on the
+lower-severity baseline/repair-patch path is flagged but not fixed. The
+`ResidencyController`/`ClientResidency` (T18) policy-engine merge remains the
+only item this contract's post-merge qualification named that is still
+unaddressed — an earlier coordinator review rejected literal class
+consolidation as the objective.
 
 ## Safe serve-loop integration (slice D)
 
