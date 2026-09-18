@@ -135,6 +135,20 @@ pub enum PersistError {
          does not actually carry in its bricks"
     )]
     EvictedBrickUnavailable { volume: u64, coord: [i64; 3] },
+    #[error(
+        "evicted brick {coord:?} of volume {volume} disagrees with its retained digest -- backing \
+         offered revision {backing_revision} / {backing_hash:.16}, retained revision \
+         {retained_revision} / {retained_hash:.16} -- refusing to publish a checkpoint whose \
+         bricks would not reproduce the exact revision the logical world_hash already counts"
+    )]
+    EvictedBrickDigestMismatch {
+        volume: u64,
+        coord: [i64; 3],
+        retained_revision: u64,
+        retained_hash: String,
+        backing_revision: u64,
+        backing_hash: String,
+    },
 }
 
 // --- capture --------------------------------------------------------------

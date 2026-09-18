@@ -390,6 +390,106 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
     );
 }
 
+/// T23 / G3 row 7 increment 16 (durable exact-revision backing
+/// acknowledgement, audit + fix). The audit found `capture_checkpoint`
+/// trusted whatever the backing offered for an evicted brick without
+/// checking it against the retained `(revision, content_hash)` digest --
+/// unlike `SimWorld::reload_brick`, which validates a backing candidate with
+/// `EvictedBricks::verify_candidate` before ever publishing it. This is the
+/// fault-injection test that falsifies durability directly: it forges a
+/// backing record for an evicted coord that disagrees with the digest the
+/// eviction actually retained (the exact shape a disk backing's
+/// `synchronous=NORMAL` write rolled back by an OS/power crash, or any other
+/// silent divergence, would produce) and confirms `capture_checkpoint` now
+/// fails closed instead of writing the mismatched bytes into a checkpoint
+/// that `Writer::publish_checkpoint` would then durably (`synchronous=FULL`)
+/// commit under the *correct* recorded `world_hash`.
+#[test]
+fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_retained_digest() {
+    use spall_server::persist::{self, PersistConfig};
+
+    let cfg = PersistConfig {
+        world_id: 0x5A11_0000_0000_C0DE,
+        seed: 11,
+        generator_version: 1,
+    };
+
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = Arc::new(MemoryBacking::default());
+    let mut pass = ResidencyPass::install_with_backing(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 1,
+        },
+        backing.clone(),
+    );
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+
+    let mut next = 0usize;
+    for tick in 1..=180u64 {
+        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
+            let (_, cell, r) = SCRIPT[next];
+            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
+            next += 1;
+        }
+        let report = sim.tick().unwrap();
+        for (_, done) in &report.committed {
+            let touched: Vec<BrickCoord> = done
+                .topology
+                .after
+                .iter()
+                .filter(|br| br.volume == terrain)
+                .map(|br| br.coord)
+                .collect();
+            pass.on_commit(sim.world(), touched);
+        }
+        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
+    }
+
+    let (evicted_coord, retained_digest) = sim
+        .world()
+        .evicted(terrain)
+        .iter()
+        .next()
+        .expect("the run must still have evicted terrain, or this test proves nothing");
+
+    // Overwrite the backing's record for this exact coord with real-looking
+    // geometry at a revision the retained digest never agreed to -- a stand-in
+    // for a durable record that silently drifted from what eviction actually
+    // captured (a lost/rolled-back disk write, or any other bug), not the
+    // simpler "no record at all" case the neighbouring test already covers.
+    backing.insert(
+        terrain,
+        evicted_coord,
+        spall_voxel::Brick::uniform(
+            spall_core::MaterialId(1),
+            spall_core::Revision(retained_digest.revision.get() + 1000),
+        ),
+    );
+
+    let err = pass
+        .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect_err(
+            "a backing record that disagrees with the retained digest must fail capture, \
+             not silently enter the durable checkpoint",
+        );
+    assert!(
+        matches!(
+            &err,
+            persist::PersistError::EvictedBrickDigestMismatch { volume, coord, retained_revision, backing_revision, .. }
+            if *volume == terrain.get()
+                && *coord == [evicted_coord.x, evicted_coord.y, evicted_coord.z]
+                && *retained_revision == retained_digest.revision.get()
+                && *backing_revision == retained_digest.revision.get() + 1000
+        ),
+        "expected EvictedBrickDigestMismatch naming the exact brick and both revisions, got {err:?}"
+    );
+}
+
 /// T23 / G3 row 7 — ack-before-evict. Closes the gap the post-merge review
 /// (P2/P3) and increment 22's own "still open" note flagged against T18's
 /// `ResidencyController::enforce_budget` contract ("persist dirty candidates
