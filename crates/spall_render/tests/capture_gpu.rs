@@ -667,8 +667,11 @@ fn panning_camera_temporal_matches_no_accumulation() {
 }
 
 /// `STATUS_ACCESS_VIOLATION` — the native exit code (`0xC0000005`) the pinned
-/// wgpu 24 / naga 24 Vulkan path faults with on the recorded NVIDIA Windows
-/// driver. As an `i32` process exit code this is `-1_073_741_819`.
+/// wgpu 24 / naga 24 Vulkan path used to fault with on the recorded NVIDIA
+/// Windows driver before the ENG-60 fix. As an `i32` process exit code this is
+/// `-1_073_741_819`. Kept as a regression marker: if this ever comes back out
+/// of `windows_vulkan_backend_compiles_t12_pipelines_without_crashing`, ENG-60
+/// has regressed.
 const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
 
 /// The probe exits `2` for "no usable adapter" / bad mode — a capability problem
@@ -704,42 +707,37 @@ fn wait_with_deadline(child: &mut Child, deadline: Duration) -> Option<ExitStatu
     }
 }
 
-/// ENG-60 regression watch. On Windows the pinned wgpu 24 / naga 24 Vulkan path
-/// crashes NVIDIA's driver (`STATUS_ACCESS_VIOLATION`) while compiling the T12
-/// pipelines — see `docs/reports/ENG-60.md`. This builds the `vulkan_shadow_probe`
-/// example, runs it with the Vulkan backend forced, and asserts it *still* faults
-/// in that exact way: the documented native exit code, crashing at
-/// `ScenePipeline::new` and no earlier. When a `wgpu`/`naga` upgrade or a new
-/// driver fixes it, this test starts failing: at that point re-run the full
-/// `capture_gpu` suite on Vulkan and, if it passes, drop the Windows D3D12-only
-/// guard in `RenderContext::headless` and delete this test.
+/// ENG-60 regression guard (fixed 2026-09-18). On Windows the pinned wgpu 24 /
+/// naga 24 Vulkan path used to crash NVIDIA's driver (`STATUS_ACCESS_VIOLATION`)
+/// while compiling `create_tone_pipeline` — a naga/driver defect triggered by a
+/// vertex shader dynamically indexing a small `array<vec2<f32>, N>` constant
+/// table in a pipeline whose fragment shader also reads a uniform buffer, not a
+/// resource/binding bug in this crate. `shaders/tonemap.wgsl` now generates the
+/// fullscreen-triangle position with index arithmetic instead of an indexed
+/// array, which builds clean on the same driver. Full diagnosis, the minimal
+/// repros that pinned the trigger down, and the acceptance evidence (identical
+/// `capture_gpu` results and a pixel-identical 1920x1080 six-view capture on
+/// both backends) are in `docs/reports/ENG-60.md`.
 ///
-/// The checks are deliberately narrow so this cannot pass on the wrong evidence:
-/// a build break, a missing adapter, a hang, or an ordinary Rust panic are each
-/// distinguished from the real driver crash rather than counted as "still
-/// reproducing". A green run here is confirmation of a *known* failure, never
-/// Vulkan acceptance.
-///
-/// Opt in with `SPALL_ENG60_RECHECK=1` because it shells out and deliberately
-/// provokes a native crash.
+/// This test is the permanent regression guard: it builds the
+/// `vulkan_shadow_probe` example, runs it with the Vulkan backend forced, and
+/// asserts `ScenePipeline::new()` — all 3 T13/T14 compute pipelines plus the
+/// T12 opaque/shadow/tone-map render pipelines — completes cleanly. A build
+/// break, a missing adapter, a hang, or the documented native
+/// `STATUS_ACCESS_VIOLATION` are each reported distinctly rather than being
+/// folded into a single pass/fail.
 #[test]
-#[ignore = "ENG-60: opt in with SPALL_ENG60_RECHECK=1; provokes a native driver crash"]
-fn windows_vulkan_backend_still_crashes_compiling_t12_pipelines() {
-    if std::env::var_os("SPALL_ENG60_RECHECK").is_none() {
-        eprintln!("skipped: set SPALL_ENG60_RECHECK=1 to run the ENG-60 Vulkan recheck");
-        return;
-    }
+#[ignore = "requires a working GPU adapter"]
+fn windows_vulkan_backend_compiles_t12_pipelines_without_crashing() {
     if !cfg!(target_os = "windows") {
-        eprintln!("skipped: ENG-60 is a Windows/NVIDIA Vulkan driver fault");
+        eprintln!("skipped: ENG-60 was a Windows/NVIDIA Vulkan driver fault");
         return;
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
 
     // 1. Build the probe as its own step. A failure here is broken
-    //    infrastructure, not a reproduction — the old `cargo run` form folded
-    //    this into `!status.success()` and would have counted a compile error as
-    //    "the crash is still there".
+    //    infrastructure, not a Vulkan result.
     let build = Command::new(&cargo)
         .args([
             "build",
@@ -753,20 +751,20 @@ fn windows_vulkan_backend_still_crashes_compiling_t12_pipelines() {
         .expect("spawn cargo build for vulkan_shadow_probe");
     assert!(
         build.success(),
-        "ENG-60 recheck could not build the vulkan_shadow_probe example — this is \
+        "ENG-60 guard could not build the vulkan_shadow_probe example — this is \
          a build failure, not a Vulkan result. Fix the build and re-run."
     );
 
     // 2. Run the built binary directly (no `cargo run` wrapper whose own exit
     //    code could be mistaken for the child's) with a synced step log, under a
-    //    wall-clock deadline. The documented fault is a fast native crash during
-    //    pipeline compilation; anything slow is a different failure.
+    //    wall-clock deadline. The historical fault was a fast native crash
+    //    during pipeline compilation; anything slow is a different failure.
     let exe = built_example_path("vulkan_shadow_probe");
     assert!(
         exe.is_file(),
-        "ENG-60 recheck: built probe not found at {exe:?}"
+        "ENG-60 guard: built probe not found at {exe:?}"
     );
-    let log = std::env::temp_dir().join(format!("spall-eng60-recheck-{}.log", std::process::id()));
+    let log = std::env::temp_dir().join(format!("spall-eng60-guard-{}.log", std::process::id()));
     let _ = fs::remove_file(&log);
 
     let mut child = Command::new(&exe)
@@ -781,50 +779,44 @@ fn windows_vulkan_backend_still_crashes_compiling_t12_pipelines() {
         let _ = child.kill();
         let _ = child.wait();
         panic!(
-            "ENG-60: vulkan_shadow_probe did not exit within {}s. The documented \
-             fault is a fast native STATUS_ACCESS_VIOLATION during pipeline \
-             compilation; a hang is a different failure and must be investigated \
-             before this recheck can pass.",
+            "ENG-60: vulkan_shadow_probe did not exit within {}s building the T12/T13/T14 \
+             pipelines on Vulkan. A hang is a different failure from the historical fast \
+             native crash and must be investigated.",
             deadline.as_secs()
         );
     };
 
-    // 3. Interpret the exit code precisely.
     let code = status.code();
 
     if code == Some(PROBE_CAPABILITY_EXIT) {
         eprintln!(
             "skipped: vulkan_shadow_probe exited {PROBE_CAPABILITY_EXIT} (no usable Vulkan \
-             adapter on this host); ENG-60 recheck is inconclusive here"
+             adapter on this host); ENG-60 guard is inconclusive here"
         );
         return;
     }
 
-    // A clean exit means `ScenePipeline::new()` completed on Vulkan — the crash
-    // is gone and Vulkan needs full re-validation.
+    if code == Some(STATUS_ACCESS_VIOLATION) {
+        panic!(
+            "ENG-60 has regressed: vulkan_shadow_probe crashed again with the documented \
+             native STATUS_ACCESS_VIOLATION (0xC0000005) building ScenePipeline::new() on \
+             Vulkan. Re-diagnose per docs/reports/ENG-60.md — the tonemap.wgsl vertex-shader \
+             fix (index arithmetic instead of a dynamically-indexed array) may have been \
+             reverted, or a new pipeline-creation-time construct has reintroduced the \
+             naga/driver defect."
+        );
+    }
+
     assert!(
-        !status.success(),
-        "ENG-60: ScenePipeline::new() completed on the Vulkan backend — the driver \
-         crash is gone. Re-run the full capture_gpu suite on Vulkan and, if it \
-         passes, restore Vulkan as an accepted Windows backend (see docs/reports/ENG-60.md)."
+        status.success(),
+        "ENG-60: vulkan_shadow_probe exited with {code:?} building the pipelines on Vulkan — \
+         not a clean exit and not the historical STATUS_ACCESS_VIOLATION. Investigate before \
+         treating Vulkan as accepted."
     );
 
-    // Non-zero, but is it the *documented* native access violation? An ordinary
-    // Rust panic (exit 101) or any other code means the failure mode changed and
-    // must not be rubber-stamped as "unchanged".
-    assert_eq!(
-        code,
-        Some(STATUS_ACCESS_VIOLATION),
-        "ENG-60: vulkan_shadow_probe exited with {code:?}, not the documented native \
-         STATUS_ACCESS_VIOLATION ({STATUS_ACCESS_VIOLATION} / 0xC0000005). The failure \
-         mode has changed; re-diagnose per docs/reports/ENG-60.md before treating \
-         ENG-60 as still-reproducing."
-    );
-
-    // 4. Confirm it actually reached pipeline creation. The probe fsyncs a marker
-    //    before every GPU step, so the last line of its log must be the
-    //    `ScenePipeline::new` marker — proof the crash is where ENG-60.md puts it
-    //    and not earlier (adapter enumeration, device creation).
+    // Confirm it actually reached and passed pipeline creation. The probe
+    // fsyncs a marker before every GPU step, so the last line of its log must
+    // be the "all pipelines built" marker, not any earlier step.
     let last_step = fs::read_to_string(&log)
         .expect("vulkan_shadow_probe wrote its synced SPALL_PROBE_LOG step log")
         .lines()
@@ -833,10 +825,10 @@ fn windows_vulkan_backend_still_crashes_compiling_t12_pipelines() {
         .unwrap_or_default()
         .to_owned();
     assert!(
-        last_step.starts_with("ScenePipeline::new"),
-        "ENG-60: probe crashed with the right code, but its last logged step was \
-         {last_step:?}, not `ScenePipeline::new (...)`. The crash site moved; \
-         re-diagnose per docs/reports/ENG-60.md."
+        last_step.contains("pipelines built OK"),
+        "ENG-60: vulkan_shadow_probe exited cleanly, but its last logged step was \
+         {last_step:?}, not the \"pipelines built OK\" marker. Re-diagnose per \
+         docs/reports/ENG-60.md."
     );
 
     let _ = fs::remove_file(&log);

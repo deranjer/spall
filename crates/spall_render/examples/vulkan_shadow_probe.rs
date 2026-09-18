@@ -1,13 +1,25 @@
-//! ENG-60 diagnostic probe: the pinned wgpu 24 Vulkan backend crashes natively
-//! (`STATUS_ACCESS_VIOLATION`, 0xC0000005) on the recorded NVIDIA Windows driver
-//! while the T12 renderer's pipelines are compiled. D3D12 with the identical
-//! shaders is unaffected.
+//! ENG-60 diagnostic probe. History: the pinned wgpu 24 Vulkan backend used to
+//! crash natively (`STATUS_ACCESS_VIOLATION`, 0xC0000005) on the recorded
+//! NVIDIA Windows driver while `ScenePipeline::new` compiled its pipelines.
+//! D3D12 with the identical shaders was unaffected. **Fixed 2026-09-18**: the
+//! trigger was `shaders/tonemap.wgsl`'s vertex shader dynamically indexing a
+//! small `array<vec2<f32>, 3>` fullscreen-triangle constant table in a
+//! pipeline whose fragment shader also reads a uniform buffer — a naga/driver
+//! defect, not a resource/binding bug in this crate's shadow or comparison-
+//! sampling code. Replacing the array index with equivalent index arithmetic
+//! (identical `x`/`y` for every `vertex_index`) avoids it. Full isolation
+//! trail and evidence: `docs/reports/ENG-60.md`.
 //!
 //! This binary prints full adapter/driver identification, then builds a series
-//! of isolated one-pipeline cases that pin the trigger, and finally the full
-//! offscreen capture path. Every step is committed to a synced log file
+//! of isolated one-pipeline cases — the ones that originally bounded the fault
+//! (`no-sample` .. `varying+sample-level`) plus the `tone-*` cases that pinned
+//! it down to `create_tone_pipeline` and then to the exact minimal repro
+//! (`tone-bisect-*`) and fix (`tone-real-fix`) — and finally the full offscreen
+//! capture path. Every step is committed to a synced log file
 //! (`SPALL_PROBE_LOG`) before it runs, so a hard native crash still names the
-//! GPU call that faulted.
+//! GPU call that faulted. Kept as a permanent regression tool: if a future
+//! change reintroduces a similar construct and Vulkan starts crashing again,
+//! these cases are the starting point for re-isolating it.
 //!
 //! Usage:
 //!   SPALL_WGPU_BACKEND=vulkan SPALL_PROBE_LOG=probe.log \
@@ -23,15 +35,28 @@
 //!   capture[:WxH]        real six-view capture_scene() + timings (default 1920x1080)
 //!   full                 pipelines + shadow raster + opaque depth-array sample + readback
 //!
-//! case:<name> — the synthetic single-pipeline builds all compile fine on the
-//! recorded driver; they bound the fault (a plain varying + texture-sample
-//! fragment pipeline is NOT enough to trigger it). `case:pipelines` builds the
-//! real T12 pipelines and is the minimal crash:
-//!   no-sample             fragment varying, NO texture sample            (ok)
-//!   sample-no-varying     texture sample, coord from @builtin(position)  (ok)
-//!   varying+sample        fragment varying used as textureSample coord   (ok)
-//!   varying+sample-level  ... textureSampleLevel (explicit LOD)          (ok)
-//!   pipelines             real ScenePipeline::new() (opaque+shadow+tone) CRASH on Vulkan
+//! case:<name> — increment 1 (`no-sample` .. `varying+sample-level`) bounded
+//! the fault to somewhere inside the real T12/T13/T14 pipelines
+//! (`case:pipelines` — now builds clean; historically the minimal crash).
+//! Increment 2 (`tone-*`) narrowed it to `create_tone_pipeline` and then to
+//! the exact minimal repro and fix:
+//!   no-sample             fragment varying, NO texture sample                    (ok)
+//!   sample-no-varying     texture sample, coord from @builtin(position)          (ok)
+//!   varying+sample        fragment varying used as textureSample coord          (ok)
+//!   varying+sample-level  ... textureSampleLevel (explicit LOD)                  (ok)
+//!   pipelines             real ScenePipeline::new() (3 compute + 3 graphics)     (ok, was CRASH)
+//!   tone-real             real tonemap.wgsl, standalone, first pipeline built    (ok, was CRASH)
+//!   tone-bisect-vertex    unsafe (production) triangle table, minimal fragment   (CRASH)
+//!   tone-bisect-triangle-only   safe triangle table, minimal fragment            (ok)
+//!   tone-bisect-uniform-read    safe triangle + fragment reads a uniform field   (CRASH)
+//!   tone-bisect-no-array-index  index arithmetic instead of array + uniform read (ok)
+//!   tone-real-fix         real tonemap.wgsl fragment body + index-arithmetic vertex (ok — the fix)
+//! See the module doc above and `docs/reports/ENG-60.md` for the full trail
+//! (`tone-bisect-clamp`, `tone-bisect-extra-binding`, `tone-bisect-combo`,
+//! `tone-no-uniform`, `tone-uniform-unused`, `tone-no-branch*`,
+//! `tone-branch-no-helper-safe-triangle`, `tone-branchless-fix-candidate`,
+//! `tone-bisect-dedup-scaled`, `tone-bisect-unorm-format`,
+//! `tone-bisect-srgb-format`, `tone-uniform-separate-group`, `tone-fix-candidate`).
 
 use std::io::Write;
 
@@ -153,6 +178,99 @@ fn print_adapters(instance: &wgpu::Instance, backends: wgpu::Backends) {
 }
 
 /// Build one render pipeline from `wgsl` with a texture+sampler bind group
+/// layout. Returns only if the driver did not crash. `format` lets ENG-60
+/// isolation compare an SRGB color target (what `create_tone_pipeline` uses)
+/// against a plain UNORM one with an otherwise byte-identical pipeline.
+fn build_one_pipeline_fmt(
+    ctx: &RenderContext,
+    label: &str,
+    wgsl: &str,
+    format: wgpu::TextureFormat,
+) {
+    let shader = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+    let bgl = ctx
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("probe-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+    let layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("probe-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+    mark(&format!(
+        "  vkCreateGraphicsPipelines({label}, {format:?})..."
+    ));
+    let _pipeline = ctx
+        .device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("probe-pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
+    ctx.wait();
+    mark(&format!("  {label}: pipeline OK (no crash)"));
+}
+
+/// Build one render pipeline from `wgsl` with a texture+sampler bind group
 /// layout. Returns only if the driver did not crash.
 fn build_one_pipeline(ctx: &RenderContext, label: &str, wgsl: &str) {
     let shader = ctx
@@ -226,6 +344,179 @@ fn build_one_pipeline(ctx: &RenderContext, label: &str, wgsl: &str) {
     mark(&format!("  {label}: pipeline OK (no crash)"));
 }
 
+/// `tone-bisect-no-array-index`: the exact `tone-bisect-uniform-read` repro
+/// (fragment reads `globals.exposure`, multiplies it into the sampled
+/// color) but the vertex shader generates the fullscreen-triangle position
+/// with bit tricks on `vertex_index` instead of indexing a local
+/// `array<vec2<f32>, 3>` constant table. Isolates whether *dynamically
+/// indexing a small vec2 constant array by `@builtin(vertex_index)`*, not
+/// the uniform read itself, is what naga/the driver mishandles.
+const TONE_BISECT_NO_ARRAY_INDEX_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let x = f32(i32(index << 1u) & 2) * 2.0 - 1.0;
+    let y = f32(i32(index) & 2) * 2.0 - 1.0;
+    var out: VsOut;
+    out.position = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>(x, y) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    return vec4<f32>(linear * globals.exposure, 1.0);
+}
+"#;
+
+/// `tone-real-fix`: the REAL, byte-identical `tonemap.wgsl` fragment body
+/// (uniform-driven `if`/early-return, `aces_fitted` helper, full 3-binding
+/// layout) with ONLY the vertex shader's `array<vec2<f32>,3>` dynamic
+/// indexing replaced by the bit-trick fullscreen-triangle formula that
+/// `tone-bisect-no-array-index` proved avoids the crash. This is the
+/// candidate fix for `create_tone_pipeline` — if it builds clean, the fix is
+/// real and can be applied to `shaders/tonemap.wgsl` verbatim.
+const TONE_REAL_FIX_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let x = f32(i32(index << 1u) & 2) * 2.0 - 1.0;
+    let y = f32(i32(index) & 2) * 2.0 - 1.0;
+    var out: VsOut;
+    out.position = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>(x, y) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+fn aces_fitted(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    if globals.debug_passthrough > 0.5 {
+        return vec4<f32>(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    }
+    return vec4<f32>(aces_fitted(linear * globals.exposure), 1.0);
+}
+"#;
+
+/// `tone-uniform-separate-group`: the exact minimal repro from
+/// `tone-bisect-uniform-read` (texture-sample result multiplied by a uniform
+/// scalar) but with the uniform buffer moved to its OWN bind group
+/// (`@group(1)`) instead of sharing `@group(0)` with the texture+sampler.
+/// Tests a real, deployable structural workaround: does *separating* the
+/// uniform from the texture/sampler descriptor set avoid the crash, with the
+/// same shader math otherwise?
+fn build_tone_uniform_separate_group(ctx: &RenderContext) {
+    let wgsl = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(1) @binding(0) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -3.0), vec2<f32>(-1.0, 1.0), vec2<f32>(3.0, 1.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    return vec4<f32>(linear * globals.exposure, 1.0);
+}
+"#;
+    let shader = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("probe-tone-separate-group"),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+    let bgl0 = ctx
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("probe-tone-separate-bgl0"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+    let bgl1 = ctx
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("probe-tone-separate-bgl1"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+    let layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("probe-tone-separate-layout"),
+            bind_group_layouts: &[&bgl0, &bgl1],
+            push_constant_ranges: &[],
+        });
+    mark("  vkCreateGraphicsPipelines(tone-uniform-separate-group)...");
+    let _pipeline = ctx
+        .device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("probe-tone-separate-pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
+    ctx.wait();
+    mark("  tone-uniform-separate-group: pipeline OK (no crash)");
+}
+
 fn case_wgsl(name: &str) -> Option<String> {
     Some(match name {
         "no-sample" => case_shader(true, false, false),
@@ -235,6 +526,496 @@ fn case_wgsl(name: &str) -> Option<String> {
         _ => return None,
     })
 }
+
+/// ENG-60 increment 2 isolation: `ScenePipeline::new`'s fine-grained probe
+/// markers (added to `spall_render::pipeline`/`spall_render::indirect`) prove
+/// the crash is specifically `create_tone_pipeline` — the 3 T13/T14 compute
+/// pipelines and the opaque/shadow render pipelines all complete first, every
+/// time, regardless of build order. These `tone-*` cases isolate exactly what
+/// about that one pipeline differs from the already-cleared
+/// `varying+sample`/`varying+sample-level` cases above: a **3rd binding
+/// (a uniform buffer) sharing a bind group with the texture+sampler**, and an
+/// `if`-branch in the fragment shader that returns early. Build a standalone
+/// pipeline (no `ScenePipeline`, no prior pipelines at all) for each variant
+/// and see which one alone reproduces the crash.
+fn build_tone_variant(ctx: &RenderContext, label: &str, wgsl: &str, with_uniform: bool) {
+    let shader = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+    let mut entries = vec![
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
+    ];
+    if with_uniform {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+    }
+    let bgl = ctx
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("probe-tone-bgl"),
+            entries: &entries,
+        });
+    let layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("probe-tone-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+    mark(&format!(
+        "  vkCreateGraphicsPipelines(tone-variant:{label})..."
+    ));
+    let _pipeline = ctx
+        .device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("probe-tone-pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
+    ctx.wait();
+    mark(&format!("  tone-variant:{label}: pipeline OK (no crash)"));
+}
+
+/// `tone-real`: byte-identical to `create_tone_pipeline` + `tonemap.wgsl` —
+/// same bind group shape, same shader text — but standalone, first pipeline
+/// built, nothing else touched. Expected to reproduce the crash alone.
+const TONE_REAL_WGSL: &str = include_str!("../src/shaders/tonemap.wgsl");
+
+/// `tone-no-uniform`: drop binding 2 (the uniform buffer) and hardcode the
+/// exposure/debug values the shader used to read from it. Same texture
+/// sample + `if` branch + helper function otherwise.
+const TONE_NO_UNIFORM_WGSL: &str = r#"
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+fn aces_fitted(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    if false {
+        return vec4<f32>(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    }
+    return vec4<f32>(aces_fitted(linear * 1.0), 1.0);
+}
+"#;
+
+/// `tone-uniform-unused`: keep the 3-binding layout (texture+sampler+uniform
+/// in one group) but never read the uniform buffer's contents or branch on
+/// it — isolates whether the extra *binding* alone (independent of the
+/// shader using it) is the trigger.
+const TONE_UNIFORM_UNUSED_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    return vec4<f32>(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"#;
+
+/// `tone-bisect-clamp`: byte-identical to the already-cleared
+/// `case:varying+sample` (2-binding texture+sampler layout, no uniform, no
+/// helper function, no branch) except the fragment shader wraps the sampled
+/// color in `clamp(..., vec3(0.0), vec3(1.0))` before returning it — the one
+/// operation every crashing `tone-*` variant's reachable code path performs
+/// and the one `case:*` shader from increment 1 never tried.
+const TONE_BISECT_CLAMP_WGSL: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    let tri = array<vec2<f32>,3>(vec2(-1.0,-3.0), vec2(-1.0,1.0), vec2(3.0,1.0));
+    let p = tri[i];
+    var out: VsOut;
+    out.position = vec4<f32>(p, 0.0, 1.0);
+    out.uv = p * 0.5 + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    return vec4<f32>(clamp(textureSample(tex, samp, uv).rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"#;
+
+/// `tone-bisect-extra-binding`: byte-identical to `case:varying+sample`
+/// (2-binding shader body: plain `textureSample`, no `clamp`, no helper
+/// function, no branch) except the bind group layout AND the shader both
+/// declare a 3rd binding — a uniform buffer — that is never read. Isolates
+/// whether the unused 3rd (uniform-buffer) binding sharing a bind group with
+/// the texture+sampler is, by itself, sufficient.
+const TONE_BISECT_EXTRA_BINDING_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    let tri = array<vec2<f32>,3>(vec2(-1.0,-3.0), vec2(-1.0,1.0), vec2(3.0,1.0));
+    let p = tri[i];
+    var out: VsOut;
+    out.position = vec4<f32>(p, 0.0, 1.0);
+    out.uv = p * 0.5 + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    return vec4<f32>(textureSample(tex, samp, uv).rgb, 1.0);
+}
+"#;
+
+/// `tone-bisect-combo`: `case:varying+sample`'s exact vertex shader (original
+/// triangle constants and symmetric UV scale, not the tone-map ones) plus
+/// BOTH the unused 3rd uniform binding AND the `clamp()` call — the two
+/// ingredients that were each independently insufficient
+/// (`tone-bisect-clamp`, `tone-bisect-extra-binding`) — to test whether it is
+/// their combination that is sufficient.
+const TONE_BISECT_COMBO_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    let tri = array<vec2<f32>,3>(vec2(-1.0,-3.0), vec2(-1.0,1.0), vec2(3.0,1.0));
+    let p = tri[i];
+    var out: VsOut;
+    out.position = vec4<f32>(p, 0.0, 1.0);
+    out.uv = p * 0.5 + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    return vec4<f32>(clamp(textureSample(tex, samp, uv).rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"#;
+
+/// `tone-bisect-vertex`: `case:varying+sample`'s exact 2-binding shader body
+/// (no clamp, no 3rd binding) but with the tone-map pipeline's own vertex
+/// shader constants: triangle `(-1,-1)(3,-1)(-1,3)` (vs. the case shader's
+/// `(-1,-3)(-1,1)(3,1)`) and an **asymmetric** UV scale `vec2(0.5,-0.5)` (a
+/// V-flip) instead of the case shader's uniform `0.5`. Isolates whether the
+/// vertex-stage constants/UV computation — not the fragment body — matter.
+const TONE_BISECT_VERTEX_WGSL: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    return vec4<f32>(textureSample(tex, samp, uv).rgb, 1.0);
+}
+"#;
+
+/// `tone-bisect-vertex-symmetric-uv`: identical to `tone-bisect-vertex`
+/// (which crashed) except the UV scale is reverted to the symmetric scalar
+/// `0.5` (no V-flip) — isolates the triangle constants from the asymmetric
+/// `vec2(0.5, -0.5)` multiply.
+const TONE_BISECT_VERTEX_SYMMETRIC_UV_WGSL: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * 0.5 + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    return vec4<f32>(textureSample(tex, samp, uv).rgb, 1.0);
+}
+"#;
+
+/// `tone-bisect-triangle-only`: identical to `case:varying+sample` (original
+/// triangle constants) except the UV scale is the asymmetric
+/// `vec2(0.5, -0.5)` V-flip — isolates the UV multiply from the triangle
+/// constants (the inverse of `tone-bisect-vertex-symmetric-uv`).
+const TONE_BISECT_TRIANGLE_ONLY_WGSL: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    let tri = array<vec2<f32>,3>(vec2(-1.0,-3.0), vec2(-1.0,1.0), vec2(3.0,1.0));
+    let p = tri[i];
+    var out: VsOut;
+    out.position = vec4<f32>(p, 0.0, 1.0);
+    out.uv = p * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    return vec4<f32>(textureSample(tex, samp, uv).rgb, 1.0);
+}
+"#;
+
+/// `tone-bisect-dedup-scaled`: same shape as `tone-bisect-vertex-symmetric-uv`
+/// (which crashed) — a 2-distinct-value, 4x/2x-repeated triangle constant
+/// table — but with different literal magnitudes (`-2.0`/`4.0` instead of
+/// `-1.0`/`3.0`). Tests whether the trigger is the *pattern* of repeated
+/// constants in the array (a plausible SPIR-V constant-dedup compiler bug)
+/// or the specific bit values `-1.0`/`3.0`.
+const TONE_BISECT_DEDUP_SCALED_WGSL: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-2.0, -2.0), vec2<f32>(4.0, -2.0), vec2<f32>(-2.0, 4.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * 0.5 + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    return vec4<f32>(textureSample(tex, samp, uv).rgb, 1.0);
+}
+"#;
+
+/// `tone-fix-candidate`: byte-identical to `tone-real` (real `tonemap.wgsl`
+/// fragment body: uniform-driven `if`/early-return, `aces_fitted` helper,
+/// full 3-binding layout) except the vertex shader's fullscreen-triangle
+/// constant table is swapped for the already-proven-safe
+/// `(-1,-3),(-1,1),(3,1)` values (same NDC coverage, same interpolated `uv`
+/// — see the module doc comment). If this alone stops crashing, it is the
+/// candidate fix for `create_tone_pipeline`.
+const TONE_FIX_CANDIDATE_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -3.0), vec2<f32>(-1.0, 1.0), vec2<f32>(3.0, 1.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+fn aces_fitted(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    if globals.debug_passthrough > 0.5 {
+        return vec4<f32>(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    }
+    return vec4<f32>(aces_fitted(linear * globals.exposure), 1.0);
+}
+"#;
+
+/// `tone-no-branch-safe-triangle`: `tone-no-branch` (helper fn + uniform
+/// `exposure` multiply actually used, NO `if` branch, real 3-binding layout)
+/// with the vertex triangle constants swapped for the proven-safe values.
+/// Tests whether the branch specifically was required, or whether
+/// helper-fn + uniform-buffer-read alone still crashes regardless of the
+/// triangle table.
+const TONE_NO_BRANCH_SAFE_TRIANGLE_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -3.0), vec2<f32>(-1.0, 1.0), vec2<f32>(3.0, 1.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+fn aces_fitted(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    return vec4<f32>(aces_fitted(linear * globals.exposure) + vec3<f32>(globals.debug_passthrough * 0.0), 1.0);
+}
+"#;
+
+/// `tone-branch-no-helper-safe-triangle`: real 3-binding layout + safe
+/// triangle constants + the uniform-driven `if`/early-return branch, but the
+/// ACES tonemap is inlined (no separate `aces_fitted` function call). Tests
+/// whether the branch alone (without a helper-function call) still crashes
+/// with the safe triangle.
+const TONE_BRANCH_NO_HELPER_SAFE_TRIANGLE_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -3.0), vec2<f32>(-1.0, 1.0), vec2<f32>(3.0, 1.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    if globals.debug_passthrough > 0.5 {
+        return vec4<f32>(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    }
+    let x = linear * globals.exposure;
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    return vec4<f32>(clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"#;
+
+/// `tone-branchless-fix-candidate`: real 3-binding layout, real
+/// uniform-driven passthrough/tonemap choice, safe triangle constants — but
+/// with NO separate helper function and NO `if`/early-return. The
+/// passthrough-vs-tonemap choice is expressed with `select()` (compiles to a
+/// single `OpSelect`, not a conditional branch) and the ACES math is inlined.
+/// Same observable behaviour as the real shader (same result for
+/// `debug_passthrough` on/off), no branch, no function call.
+const TONE_BRANCHLESS_FIX_CANDIDATE_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -3.0), vec2<f32>(-1.0, 1.0), vec2<f32>(3.0, 1.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    let passthrough = clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0));
+    let x = linear * globals.exposure;
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    let toned = clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+    let result = select(toned, passthrough, globals.debug_passthrough > 0.5);
+    return vec4<f32>(result, 1.0);
+}
+"#;
+
+/// `tone-bisect-uniform-read`: minimal fragment body that actually *reads*
+/// one uniform field (`globals.exposure`) and uses it, vs.
+/// `tone-bisect-extra-binding`'s declared-but-unread uniform. Real
+/// 3-binding layout, safe triangle. Isolates whether *reading* the uniform
+/// buffer's contents in the fragment shader (as opposed to merely declaring
+/// the binding) is the trigger, independent of branches or helper functions.
+const TONE_BISECT_UNIFORM_READ_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -3.0), vec2<f32>(-1.0, 1.0), vec2<f32>(3.0, 1.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    return vec4<f32>(linear * globals.exposure, 1.0);
+}
+"#;
+
+/// `tone-no-branch`: keep the uniform buffer, read it, but remove the
+/// `if`-with-early-return — always compute the ACES path.
+const TONE_NO_BRANCH_WGSL: &str = r#"
+struct ToneGlobals { exposure: f32, debug_passthrough: f32, _pad: vec2<f32>, };
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(0) @binding(2) var<uniform> globals: ToneGlobals;
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var out: VsOut;
+    out.position = vec4<f32>(p[index], 0.0, 1.0);
+    out.uv = p[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return out;
+}
+fn aces_fitted(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let linear = textureSample(hdr, linear_sampler, in.uv).rgb;
+    return vec4<f32>(aces_fitted(linear * globals.exposure) + vec3<f32>(globals.debug_passthrough * 0.0), 1.0);
+}
+"#;
 
 fn main() {
     let backends = backends_from_env();
@@ -247,6 +1028,11 @@ fn main() {
         dump_spirv("no-sample", &case_shader(true, false, false));
         dump_spirv("sample-no-varying", &case_shader(false, true, false));
         dump_spirv("varying+sample", &case_shader(true, true, false));
+        // ENG-60 increment 2: the two minimal vertex-shader variants that
+        // pin the trigger down to the fullscreen-triangle constant table —
+        // one crashes, one does not, with byte-identical fragment shaders.
+        dump_spirv("bisect-vertex-crash", TONE_BISECT_VERTEX_WGSL);
+        dump_spirv("bisect-triangle-only-ok", TONE_BISECT_TRIANGLE_ONLY_WGSL);
         return;
     }
 
@@ -284,6 +1070,148 @@ fn main() {
             ctx.wait();
             mark("  pipelines built OK (no crash)");
             return;
+        }
+        match stripped {
+            "tone-real" => {
+                build_tone_variant(&ctx, "tone-real", TONE_REAL_WGSL, true);
+                return;
+            }
+            "tone-no-uniform" => {
+                build_tone_variant(&ctx, "tone-no-uniform", TONE_NO_UNIFORM_WGSL, false);
+                return;
+            }
+            "tone-uniform-unused" => {
+                build_tone_variant(&ctx, "tone-uniform-unused", TONE_UNIFORM_UNUSED_WGSL, true);
+                return;
+            }
+            "tone-no-branch" => {
+                build_tone_variant(&ctx, "tone-no-branch", TONE_NO_BRANCH_WGSL, true);
+                return;
+            }
+            "tone-bisect-clamp" => {
+                build_tone_variant(&ctx, "tone-bisect-clamp", TONE_BISECT_CLAMP_WGSL, false);
+                return;
+            }
+            "tone-bisect-extra-binding" => {
+                build_tone_variant(
+                    &ctx,
+                    "tone-bisect-extra-binding",
+                    TONE_BISECT_EXTRA_BINDING_WGSL,
+                    true,
+                );
+                return;
+            }
+            "tone-bisect-combo" => {
+                build_tone_variant(&ctx, "tone-bisect-combo", TONE_BISECT_COMBO_WGSL, true);
+                return;
+            }
+            "tone-bisect-vertex" => {
+                build_tone_variant(&ctx, "tone-bisect-vertex", TONE_BISECT_VERTEX_WGSL, false);
+                return;
+            }
+            "tone-bisect-vertex-symmetric-uv" => {
+                build_tone_variant(
+                    &ctx,
+                    "tone-bisect-vertex-symmetric-uv",
+                    TONE_BISECT_VERTEX_SYMMETRIC_UV_WGSL,
+                    false,
+                );
+                return;
+            }
+            "tone-bisect-triangle-only" => {
+                build_tone_variant(
+                    &ctx,
+                    "tone-bisect-triangle-only",
+                    TONE_BISECT_TRIANGLE_ONLY_WGSL,
+                    false,
+                );
+                return;
+            }
+            "tone-bisect-dedup-scaled" => {
+                build_tone_variant(
+                    &ctx,
+                    "tone-bisect-dedup-scaled",
+                    TONE_BISECT_DEDUP_SCALED_WGSL,
+                    false,
+                );
+                return;
+            }
+            "tone-fix-candidate" => {
+                build_tone_variant(&ctx, "tone-fix-candidate", TONE_FIX_CANDIDATE_WGSL, true);
+                return;
+            }
+            "tone-no-branch-safe-triangle" => {
+                build_tone_variant(
+                    &ctx,
+                    "tone-no-branch-safe-triangle",
+                    TONE_NO_BRANCH_SAFE_TRIANGLE_WGSL,
+                    true,
+                );
+                return;
+            }
+            "tone-branch-no-helper-safe-triangle" => {
+                build_tone_variant(
+                    &ctx,
+                    "tone-branch-no-helper-safe-triangle",
+                    TONE_BRANCH_NO_HELPER_SAFE_TRIANGLE_WGSL,
+                    true,
+                );
+                return;
+            }
+            "tone-branchless-fix-candidate" => {
+                build_tone_variant(
+                    &ctx,
+                    "tone-branchless-fix-candidate",
+                    TONE_BRANCHLESS_FIX_CANDIDATE_WGSL,
+                    true,
+                );
+                return;
+            }
+            "tone-bisect-uniform-read" => {
+                build_tone_variant(
+                    &ctx,
+                    "tone-bisect-uniform-read",
+                    TONE_BISECT_UNIFORM_READ_WGSL,
+                    true,
+                );
+                return;
+            }
+            "tone-uniform-separate-group" => {
+                build_tone_uniform_separate_group(&ctx);
+                return;
+            }
+            "tone-bisect-unorm-format" => {
+                build_one_pipeline_fmt(
+                    &ctx,
+                    "tone-bisect-unorm-format",
+                    TONE_BISECT_UNIFORM_READ_WGSL,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                );
+                return;
+            }
+            "tone-bisect-srgb-format" => {
+                build_one_pipeline_fmt(
+                    &ctx,
+                    "tone-bisect-srgb-format",
+                    TONE_BISECT_UNIFORM_READ_WGSL,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                );
+                return;
+            }
+            "tone-bisect-no-array-index" => {
+                build_tone_variant(
+                    &ctx,
+                    "tone-bisect-no-array-index",
+                    TONE_BISECT_NO_ARRAY_INDEX_WGSL,
+                    true,
+                );
+                return;
+            }
+            "tone-real-fix" => {
+                build_tone_variant(&ctx, "tone-real-fix", TONE_REAL_FIX_WGSL, true);
+                return;
+            }
+            _ => {}
         }
         match case_wgsl(stripped) {
             Some(wgsl) => build_one_pipeline(&ctx, stripped, &wgsl),

@@ -12,6 +12,7 @@ pub mod context;
 pub mod fixtures;
 pub mod indirect;
 pub mod pipeline;
+pub(crate) mod probe;
 pub mod scene;
 pub mod target;
 pub mod upload;
