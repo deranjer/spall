@@ -65,6 +65,19 @@ pub trait BrickBackingWriter: BrickBacking {
     fn disk_bytes(&self) -> Option<u64> {
         None
     }
+
+    /// T23 / G3 row 7 (ENG-30 row 7 increment 13): the backing's own retained
+    /// **in-process memory** in bytes, distinct from [`Self::disk_bytes`] —
+    /// the frozen contract's "backing memory" line item
+    /// (`docs/reports/G3-residency-hash.md`), which the previous
+    /// `resident_dense_bytes_*` figure did not cover because it only walked
+    /// the *live* `SimWorld`, not the durable backing's own captured copies.
+    /// `None` when the backing keeps nothing resident in this process (a pure
+    /// disk-backed store with no cache); `MemoryBacking` overrides this with
+    /// its real captured-brick payload total.
+    fn resident_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 type Key = (u64, i64, i64, i64);
@@ -186,6 +199,22 @@ impl BrickBackingWriter for MemoryBacking {
     /// `.capture(...)` directly compiles unchanged.
     fn capture(&self, volume: &Volume, coord: BrickCoord) -> bool {
         MemoryBacking::capture(self, volume, coord)
+    }
+
+    /// Sum of every captured `Dense` brick's material-layer payload
+    /// (`spall_voxel::brick::DENSE_LAYER_BYTES` each; `Uniform` bricks cost
+    /// metadata only, matching `spall_voxel::MemoryReport`'s convention). This
+    /// is the real bytes this in-process backing keeps alive, independent of
+    /// whether the same brick is *also* resident in the live `SimWorld`.
+    fn resident_bytes(&self) -> Option<u64> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Some(
+            g.bricks
+                .values()
+                .filter(|b| b.is_dense())
+                .map(|_| spall_voxel::MemoryReport::DENSE_BRICK_BYTES as u64)
+                .sum(),
+        )
     }
 }
 

@@ -103,6 +103,14 @@ struct Args {
     /// Chebyshev radius (bricks) of the kept-resident box around each player.
     #[arg(long, default_value_t = 2)]
     residency_radius_bricks: i64,
+    /// T23 / G3 row 7 increment 13: hard ceiling on resident terrain dense
+    /// bytes, enforced the same way as `--residency-budget-bricks` (an
+    /// interest-driven, non-pinned reload is deferred rather than admitted
+    /// past it; over-budget out-of-interest/unpinned bricks are evicted under
+    /// pressure). `0` (default) disables this cap while `--residency-budget-bricks`
+    /// still applies.
+    #[arg(long, default_value_t = 0)]
+    residency_budget_dense_bytes: u64,
     /// T23 / G3 row 7 item 2: back the residency pass with a real on-disk
     /// SQLite store at `<world>/residency.db` instead of the in-process
     /// `MemoryBacking` default. Only meaningful with
@@ -289,6 +297,11 @@ fn run_serve(args: Args) -> ExitCode {
         motion_interest,
         residency: (args.residency_budget_bricks > 0).then_some(spall_server::ResidencyLimits {
             budget_bricks: args.residency_budget_bricks,
+            max_dense_bytes: if args.residency_budget_dense_bytes == 0 {
+                u64::MAX
+            } else {
+                args.residency_budget_dense_bytes
+            },
             interest_radius_bricks: args.residency_radius_bricks,
         }),
         residency_disk_path,

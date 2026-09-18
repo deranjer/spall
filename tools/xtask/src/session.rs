@@ -216,6 +216,14 @@ struct Scenario {
     /// when `residency_budget_bricks` is set. Defaults to the server's default.
     #[serde(default)]
     residency_radius_bricks: Option<i64>,
+    /// ENG-30 row 7 increment 13: hard ceiling on resident terrain dense
+    /// bytes (`--residency-budget-dense-bytes`), enforced the same way as
+    /// `residency_budget_bricks` — an interest-driven, non-pinned reload is
+    /// deferred rather than admitted past it. Only meaningful when
+    /// `residency_budget_bricks` is set; absent (the default) leaves the cap
+    /// disabled, preserving every existing scenario's exact prior behavior.
+    #[serde(default)]
+    residency_budget_dense_bytes: Option<u64>,
     /// T23 / G3 row 7 item 2 (increment 31): back the server's residency pass
     /// with a real on-disk `DiskBrickBacking` (`--residency-disk-backing`)
     /// instead of the in-process `MemoryBacking` default. Only meaningful
@@ -710,6 +718,30 @@ struct ResidencyAssertions {
     min_outbound_distance_m: f64,
     #[serde(default)]
     max_return_distance_m: Option<f64>,
+    /// ENG-30 row 7 increment 13: the server must have pinned at least this
+    /// many bricks in its busiest tick (pending-edit dependencies, swept
+    /// paths, or pipeline reload grace) — real evidence the pin lifecycle
+    /// engaged, not only that eviction/reload happened.
+    #[serde(default)]
+    min_pinned_bricks: u64,
+    /// ENG-30 row 7 increment 13: the server must have deferred at least this
+    /// many interest-driven (non-required) reloads under capacity pressure —
+    /// real evidence the brick/dense-byte admission cap actually bound,
+    /// rather than only being reported.
+    #[serde(default)]
+    min_admission_deferred: u64,
+    /// ENG-30 row 7 increment 13: when set, the *required* (interest ∪
+    /// pinned) set must never have exceeded `budget_bricks` on its own — a
+    /// genuine capacity failure the pass could not resolve without evicting
+    /// needed geometry. `false` (the default, matching every other floor
+    /// here) does not require this: a small `residency_budget_bricks`
+    /// deliberately paired with a comfortable `residency_radius_bricks` (or
+    /// several players' union interest) legitimately exceeds the soft budget
+    /// routinely, and that is not itself a defect -- the pass still never
+    /// evicts required geometry to force a fit. Set `true` only on a
+    /// scenario whose budget is meant to always cover its own interest.
+    #[serde(default)]
+    forbid_required_over_budget: bool,
 }
 
 /// T21 / ENG-28 increment 4 (3c): minimum dormancy pass activity the server's
@@ -808,6 +840,20 @@ struct ServerSummary {
     dormancy_deactivations_total: u64,
     #[serde(default)]
     dormancy_reactivations_total: u64,
+    // ENG-30 row 7 increment 13 (`ServeSummary` v7): pin lifetime + admission
+    // enforcement + expanded retained-memory evidence.
+    #[serde(default)]
+    residency_pinned_bricks_max: u64,
+    #[serde(default)]
+    residency_admission_deferred_total: u64,
+    #[serde(default)]
+    residency_required_over_budget_ticks: u64,
+    #[serde(default)]
+    residency_digest_bytes_final: u64,
+    #[serde(default)]
+    residency_backing_resident_bytes: Option<u64>,
+    #[serde(default)]
+    process_peak_memory_bytes: Option<u64>,
 }
 
 /// Mirrors `spall_server::PerClientEgress`.
@@ -937,6 +983,19 @@ struct SessionSummary {
     /// (not only on pass) so a scenario's `summary.json` shows the measured
     /// value directly.
     residency_backing_disk_bytes: Option<u64>,
+    /// ENG-30 row 7 increment 13: real pin-lifetime + admission-enforcement
+    /// evidence, always surfaced (not only on pass) so a scenario's
+    /// `summary.json` shows the measured values directly, matching
+    /// `residency_backing_disk_bytes`'s convention. All `0`/`None` when
+    /// residency is off.
+    residency_pinned_bricks_max: u64,
+    residency_admission_deferred_total: u64,
+    residency_required_over_budget_ticks: u64,
+    residency_digest_bytes_final: u64,
+    residency_backing_resident_bytes: Option<u64>,
+    /// This process's peak resident/working-set memory in bytes, independent
+    /// of residency being on -- `None` on an unsupported platform.
+    process_peak_memory_bytes: Option<u64>,
     /// T23 / G3 row 10: `late_join_may_fail` was set and an impaired late joiner
     /// ended in an accepted bounded explicit failure (`join-failed`, real exit)
     /// while the live clients + server still converged.
@@ -1137,6 +1196,10 @@ fn residency_requirements_met(
         && client.client_residency_reloads_completed >= required.min_client_reloads_completed
         && client.client_residency_evicted_transaction_gaps >= required.min_evicted_transaction_gaps
         && movement_ok
+        && server.residency_pinned_bricks_max >= required.min_pinned_bricks
+        && server.residency_admission_deferred_total >= required.min_admission_deferred
+        && (!required.forbid_required_over_budget
+            || server.residency_required_over_budget_ticks == 0)
 }
 
 /// T21 / ENG-28 increment 4 (3c): when the scenario configured
@@ -1343,6 +1406,65 @@ mod requirement_tests {
             &server,
             &[Some(mover)]
         ));
+    }
+
+    /// ENG-30 row 7 increment 13: `min_pinned_bricks` / `min_admission_deferred`
+    /// demand real pin-lifetime and admission-enforcement evidence, not only
+    /// eviction/reload counts; an opted-in `forbid_required_over_budget`
+    /// fails the run if the pass ever reported unresolved capacity pressure
+    /// (off by default -- a small budget deliberately paired with a
+    /// comfortable interest radius routinely exceeds it, harmlessly).
+    #[test]
+    fn residency_assertions_cover_pin_lifetime_and_admission_pressure() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "residency_assertions": {
+                    "client": 0,
+                    "min_pinned_bricks": 3,
+                    "min_admission_deferred": 1,
+                    "forbid_required_over_budget": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut mover = client(1);
+        mover.movement = Some(MovementRow {
+            ticks: 10,
+            distance_travelled_m: 0.0,
+            max_distance_from_start_m: 0.0,
+            max_correction_m: 0.0,
+            ground_contact_ratio: 1.0,
+            hovered_after_floor_removal: false,
+            held_button_release_ok: true,
+        });
+        let mut server = ServerSummary::default();
+        assert!(
+            !residency_requirements_met(&scenario, &server, &[Some(mover.clone())]),
+            "no pinning or deferral yet reported"
+        );
+
+        server.residency_pinned_bricks_max = 3;
+        assert!(
+            !residency_requirements_met(&scenario, &server, &[Some(mover.clone())]),
+            "pinning alone, with no admission pressure, is not enough"
+        );
+
+        server.residency_admission_deferred_total = 1;
+        assert!(residency_requirements_met(
+            &scenario,
+            &server,
+            &[Some(mover.clone())]
+        ));
+
+        // Real, unresolved capacity pressure fails the run even though the
+        // other two floors are cleared -- the pass never evicts required
+        // geometry to force a fit, so this must be visible, not hidden.
+        server.residency_required_over_budget_ticks = 1;
+        assert!(
+            !residency_requirements_met(&scenario, &server, &[Some(mover)]),
+            "forbid_required_over_budget was opted into"
+        );
     }
 
     #[test]
@@ -1843,6 +1965,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         if let Some(r) = scenario.residency_radius_bricks {
             server_cmd.args(["--residency-radius-bricks", &r.to_string()]);
         }
+        if let Some(bytes) = scenario.residency_budget_dense_bytes {
+            server_cmd.args(["--residency-budget-dense-bytes", &bytes.to_string()]);
+        }
         if scenario.residency_disk_backing {
             server_cmd.arg("--residency-disk-backing");
         }
@@ -2120,7 +2245,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             return finish(
                 &output,
                 SessionSummary {
-                    version: 3,
+                    version: 4,
                     result: "failed",
                     scenario: scenario.name.clone(),
                     clients,
@@ -2140,6 +2265,12 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     restart_reconnect_hash_matches: false,
                     restart_recovered_world_hash: String::new(),
                     residency_backing_disk_bytes: None,
+                    residency_pinned_bricks_max: 0,
+                    residency_admission_deferred_total: 0,
+                    residency_required_over_budget_ticks: 0,
+                    residency_digest_bytes_final: 0,
+                    residency_backing_resident_bytes: None,
+                    process_peak_memory_bytes: None,
                     impaired_late_join_bounded_failure: false,
                     agreed_world_hash: String::new(),
                     all_hashes_match: false,
@@ -2372,7 +2503,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     finish(
         &output,
         SessionSummary {
-            version: 3,
+            version: 4,
             result: if all_match { "passed" } else { "failed" },
             scenario: scenario.name,
             clients,
@@ -2401,6 +2532,12 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 .map(|r| r.recovered_hash.clone())
                 .unwrap_or_default(),
             residency_backing_disk_bytes: server.residency_backing_disk_bytes,
+            residency_pinned_bricks_max: server.residency_pinned_bricks_max,
+            residency_admission_deferred_total: server.residency_admission_deferred_total,
+            residency_required_over_budget_ticks: server.residency_required_over_budget_ticks,
+            residency_digest_bytes_final: server.residency_digest_bytes_final,
+            residency_backing_resident_bytes: server.residency_backing_resident_bytes,
+            process_peak_memory_bytes: server.process_peak_memory_bytes,
             impaired_late_join_bounded_failure: bounded_join_failure_seen,
             agreed_world_hash: agreed,
             all_hashes_match: all_match,

@@ -73,6 +73,14 @@ pub struct TickReport {
     pub serialized_regions: Vec<RegionKey>,
     /// Intents still waiting after this tick.
     pub pending_after: usize,
+    /// T23 / G3 row 7 (ENG-30 row 7 increment 13): every brick the pipeline
+    /// itself reloaded this tick to satisfy a staging/commit
+    /// `EvictedGeometryRequired`. A residency pass uses this to grant the
+    /// reloaded brick a short pin so it is not evicted again before the
+    /// re-queued intent's retry (next tick) can actually use it — the
+    /// preflight/consumer-lifetime pinning the frozen contract calls for,
+    /// rather than relying only on the reactive reload succeeding.
+    pub reloaded_bricks: Vec<(VolumeId, BrickCoord)>,
 }
 
 /// The bounded staging + commit pipeline.
@@ -267,6 +275,9 @@ impl EditPipeline {
                     match world.reload_bricks(queued.volume_id, bricks.iter().copied()) {
                         Ok(true) => {
                             report.retried.push(request);
+                            report
+                                .reloaded_bricks
+                                .extend(bricks.iter().map(|&b| (queued.volume_id, b)));
                             self.pending.push_back(QueuedIntent {
                                 attempts: queued.attempts + 1,
                                 ..queued
@@ -311,6 +322,9 @@ impl EditPipeline {
                     match world.reload_bricks(volume, bricks.iter().copied()) {
                         Ok(true) => {
                             report.retried.push(request);
+                            report
+                                .reloaded_bricks
+                                .extend(bricks.iter().map(|&b| (volume, b)));
                             self.pending.push_back(QueuedIntent {
                                 attempts: queued.attempts + 1,
                                 ..queued
@@ -352,6 +366,85 @@ impl EditPipeline {
 
         report.pending_after = self.pending.len();
         Ok(report)
+    }
+
+    /// T23 / G3 row 7 (ENG-30 row 7 increment 13): the bounded brick footprint
+    /// every currently-queued (not yet staged/committed) intent targeting
+    /// `volume` will need once it stages — its brush AABB grown by one brick,
+    /// the same halo a structural search can spill into. A residency pass
+    /// pins these so a pending edit's dependencies are reserved *before*
+    /// staging discovers them reactively via `EvictedGeometryRequired`, per
+    /// the frozen preflight-pinning contract
+    /// (`docs/reports/G3-residency-hash.md`).
+    ///
+    /// Bounded: `spall_core::SphereBrush` already caps a single edit's radius
+    /// at `MAX_BRUSH_RADIUS_CELLS` (256 cells), so one intent contributes at
+    /// most a bounded cube of bricks; a pending queue whose combined
+    /// footprint would exceed `MAX_PENDING_PIN_BRICKS` falls back to pinning
+    /// only each remaining intent's centre brick, so this call is never
+    /// unbounded allocation over an adversarial queue.
+    pub fn pending_dependency_bricks(&self, volume: VolumeId) -> HashSet<BrickCoord> {
+        const MAX_PENDING_PIN_BRICKS: usize = 4096;
+        // One brick of margin beyond the brush's own cell bounds, for a
+        // structural search spilling into a neighbour
+        // (`docs/architecture.md`: "Meshing includes a one-cell halo ...").
+        const HALO_BRICKS: i64 = 1;
+        let mut out = HashSet::new();
+        for queued in &self.pending {
+            if queued.volume_id != volume {
+                continue;
+            }
+            let brush = &queued.intent.brush;
+            let unit = spall_core::BRUSH_UNIT;
+            let r = brush.radius_units().div_euclid(unit)
+                + i64::from(brush.radius_units().rem_euclid(unit) != 0);
+            let centre_x = brush.centre.x.div_euclid(unit);
+            let centre_y = brush.centre.y.div_euclid(unit);
+            let centre_z = brush.centre.z.div_euclid(unit);
+            // A per-axis cell AABB converted to its own brick bounds, not a
+            // brick radius applied uniformly around the centre brick -- a
+            // small brush interior to one brick must not pin a disproportionate
+            // box just because a large brush centred at a brick boundary
+            // hypothetically could.
+            let (min_b, _) =
+                spall_core::GlobalCell::new(centre_x - r, centre_y - r, centre_z - r).split();
+            let (max_b, _) =
+                spall_core::GlobalCell::new(centre_x + r, centre_y + r, centre_z + r).split();
+            let lo = BrickCoord::new(
+                min_b.x - HALO_BRICKS,
+                min_b.y - HALO_BRICKS,
+                min_b.z - HALO_BRICKS,
+            );
+            let hi = BrickCoord::new(
+                max_b.x + HALO_BRICKS,
+                max_b.y + HALO_BRICKS,
+                max_b.z + HALO_BRICKS,
+            );
+            let nx = (hi.x - lo.x + 1).max(0);
+            let ny = (hi.y - lo.y + 1).max(0);
+            let nz = (hi.z - lo.z + 1).max(0);
+            let cube = (nx as i128) * (ny as i128) * (nz as i128);
+            if out.len() >= MAX_PENDING_PIN_BRICKS || cube > MAX_PENDING_PIN_BRICKS as i128 {
+                // Pathological (near-maximal-radius) brush: fall back to just
+                // the centre brick rather than skip the intent's dependency
+                // entirely.
+                let (centre_brick, _) =
+                    spall_core::GlobalCell::new(centre_x, centre_y, centre_z).split();
+                out.insert(centre_brick);
+                continue;
+            }
+            'brush: for z in lo.z..=hi.z {
+                for y in lo.y..=hi.y {
+                    for x in lo.x..=hi.x {
+                        out.insert(BrickCoord::new(x, y, z));
+                        if out.len() >= MAX_PENDING_PIN_BRICKS {
+                            break 'brush;
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn record_rejection(&mut self, request: RequestId, reason: String) {

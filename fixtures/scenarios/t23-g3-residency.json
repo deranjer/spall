@@ -1,6 +1,6 @@
 {
   "name": "t23-g3-residency",
-  "description": "T23 / G3 row 7 slice D. Identical to t23-g3 but the server runs with --residency-budget-bricks: it evicts terrain bricks outside every player interest box each tick and reloads them on demand for edits. The committed world, the agreed canonical hash, exact replay, and the late join must all be unchanged from t23-g3 \u2014 eviction is invisible to logical topology.",
+  "description": "T23 / G3 row 7 slice D. Identical to t23-g3 but the server runs with --residency-budget-bricks: it evicts terrain bricks outside every player interest box each tick and reloads them on demand for edits. The committed world, the agreed canonical hash, exact replay, and the late join must all be unchanged from t23-g3 \u2014 eviction is invisible to logical topology. ENG-30 row 7 increment 13 adds a real --residency-budget-dense-bytes cap alongside the brick cap, exercising the enforced (not just reported) admission path end to end.",
   "scene": "separated-regions",
   "server_ticks": 900,
   "quiescence_ticks": 220,
@@ -86,5 +86,6 @@
     }
   ],
   "residency_budget_bricks": 6,
-  "residency_radius_bricks": 0
+  "residency_radius_bricks": 0,
+  "residency_budget_dense_bytes": 262144
 }

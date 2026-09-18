@@ -177,6 +177,17 @@ impl Simulation {
         self.pipeline.committed(request_id)
     }
 
+    /// T23 / G3 row 7 (ENG-30 row 7 increment 13): the bounded brick footprint
+    /// every currently-queued (not yet staged/committed) intent targeting
+    /// `volume` will need. A residency pass uses this as a preflight pin set —
+    /// see [`crate::schedule::EditPipeline::pending_dependency_bricks`].
+    pub fn pending_edit_bricks(
+        &self,
+        volume: spall_core::VolumeId,
+    ) -> std::collections::HashSet<spall_core::BrickCoord> {
+        self.pipeline.pending_dependency_bricks(volume)
+    }
+
     /// The current status of an admitted request, if this simulation has seen
     /// it. Hosts use this before re-validating a reliable retry, because the
     /// original action may already have changed the geometry it targeted.

@@ -86,13 +86,14 @@ fn residency_on_reaches_the_same_committed_world_as_residency_off() {
         sim.world_mut(),
         ResidencyLimits {
             budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
             interest_radius_bricks: 1,
         },
     );
 
     // A single stationary player in the west region; the east region is out of
     // interest and gets evicted, then reloaded for the east cut.
-    let player_feet = [[1.0_f64, 1.0, 1.0]];
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
 
     let initial_resident = sim.world().terrain().volume.resident_brick_count();
     let mut pipeline_retries = 0u64;
@@ -117,7 +118,8 @@ fn residency_on_reaches_the_same_committed_world_as_residency_off() {
                 .collect();
             pass.on_commit(sim.world(), touched);
         }
-        pass.run(sim.world_mut(), &player_feet);
+        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
         // Just before the east cut is submitted, the east region must be
         // evicted (the player is in the west, radius 1).
         if tick == 29 {
@@ -212,10 +214,11 @@ fn capture_checkpoint_round_trips_through_real_persistence_while_bricks_stay_evi
         sim.world_mut(),
         ResidencyLimits {
             budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
             interest_radius_bricks: 1,
         },
     );
-    let player_feet = [[1.0_f64, 1.0, 1.0]];
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
 
     let mut next = 0usize;
     for tick in 1..=180u64 {
@@ -235,7 +238,8 @@ fn capture_checkpoint_round_trips_through_real_persistence_while_bricks_stay_evi
                 .collect();
             pass.on_commit(sim.world(), touched);
         }
-        pass.run(sim.world_mut(), &player_feet);
+        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
     }
 
     assert!(
@@ -325,11 +329,12 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
         sim.world_mut(),
         ResidencyLimits {
             budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
             interest_radius_bricks: 1,
         },
         backing.clone(),
     );
-    let player_feet = [[1.0_f64, 1.0, 1.0]];
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
 
     let mut next = 0usize;
     for tick in 1..=180u64 {
@@ -349,7 +354,8 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
                 .collect();
             pass.on_commit(sim.world(), touched);
         }
-        pass.run(sim.world_mut(), &player_feet);
+        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
     }
 
     let evicted_coord = sim
@@ -394,13 +400,14 @@ fn a_failed_capture_leaves_the_brick_resident_instead_of_evicting_it() {
         sim.world_mut(),
         ResidencyLimits {
             budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
             interest_radius_bricks: 1,
         },
         backing.clone(),
     );
     // Stationary west player; the east region (script cut cell [82, 6, 75],
     // same as the other tests here) is out of interest from tick 1.
-    let player_feet = [[1.0_f64, 1.0, 1.0]];
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
     let east_coord = GlobalCell::new(82, 6, 75).split().0;
     assert!(
         sim.world()
@@ -420,7 +427,7 @@ fn a_failed_capture_leaves_the_brick_resident_instead_of_evicting_it() {
     // is out of interest from tick 1, so the first attempt lands on tick 4.
     for _ in 1..=4u64 {
         sim.tick().unwrap();
-        pass.run(sim.world_mut(), &player_feet);
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
     }
     assert!(
         !sim.world().evicted(terrain).contains(east_coord),
@@ -438,7 +445,7 @@ fn a_failed_capture_leaves_the_brick_resident_instead_of_evicting_it() {
     // The poison was one-shot: the very next tick's capture succeeds, and the
     // brick evicts normally.
     sim.tick().unwrap();
-    pass.run(sim.world_mut(), &player_feet);
+    pass.run(sim.world_mut(), &player_feet, &Default::default());
     assert!(
         sim.world().evicted(terrain).contains(east_coord),
         "once the backing write succeeds, the brick must evict on the next attempt"
@@ -480,11 +487,12 @@ fn residency_on_a_disk_backing_reaches_the_same_committed_world_as_residency_off
         sim.world_mut(),
         ResidencyLimits {
             budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
             interest_radius_bricks: 1,
         },
         backing,
     );
-    let player_feet = [[1.0_f64, 1.0, 1.0]];
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
     let initial_resident = sim.world().terrain().volume.resident_brick_count();
 
     let mut next = 0usize;
@@ -505,7 +513,8 @@ fn residency_on_a_disk_backing_reaches_the_same_committed_world_as_residency_off
                 .collect();
             pass.on_commit(sim.world(), touched);
         }
-        pass.run(sim.world_mut(), &player_feet);
+        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
     }
 
     for r in 1..=SCRIPT.len() as u64 {
@@ -572,17 +581,18 @@ fn a_brick_captured_to_disk_survives_a_process_restart_and_reloads_correctly() {
             sim.world_mut(),
             ResidencyLimits {
                 budget_bricks: 4,
+                max_dense_bytes: u64::MAX,
                 interest_radius_bricks: 1,
             },
             backing,
         );
-        let player_feet = [[1.0_f64, 1.0, 1.0]];
+        let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
         // No cuts submitted -- run just long enough for the stationary-west
         // player's out-of-interest east region to clear `EVICT_SETTLE_TICKS`
         // and evict, exactly as in `a_failed_capture_leaves_...` above.
         for _ in 1..=6u64 {
             sim.tick().unwrap();
-            pass.run(sim.world_mut(), &player_feet);
+            pass.run(sim.world_mut(), &player_feet, &Default::default());
         }
         assert!(
             sim.world().evicted(terrain).contains(east_coord),
@@ -614,4 +624,266 @@ fn a_brick_captured_to_disk_survives_a_process_restart_and_reloads_correctly() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ENG-30 row 7 increment 13: a queued (not yet staged/committed) edit's
+/// dependency footprint must stay resident for as long as it is queued, even
+/// though it sits far outside every player's interest box and well past the
+/// ordinary settle hysteresis. This is the "preflight, consumer-lifetime"
+/// pinning the frozen contract calls for, distinct from the reactive
+/// `EvictedGeometryRequired` reload/retry that already existed.
+#[test]
+fn a_pending_edits_dependency_bricks_stay_resident_while_queued() {
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let mut pass = ResidencyPass::install(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 100,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 0,
+        },
+    );
+    // A stationary west player; the east cut target is nowhere near it.
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+    let target = GlobalCell::new(82, 6, 75).split().0;
+    assert!(
+        sim.world()
+            .terrain()
+            .volume
+            .resident_brick_coords()
+            .contains(&target),
+        "the target brick must start resident, or this test proves nothing"
+    );
+
+    // Queue the east cut but never tick -- it stays in the pipeline's pending
+    // queue, not yet staged or committed, for the whole test.
+    sim.submit(cut(1, [82, 6, 75], 2)).unwrap();
+
+    // Run the pass many times past `EVICT_SETTLE_TICKS` (4, private to this
+    // module) with the pending edit's dependency bricks supplied every time.
+    for _ in 0..10 {
+        let pending = sim.pending_edit_bricks(terrain);
+        assert!(
+            pending.contains(&target),
+            "the queued intent's brush footprint must name its own target brick"
+        );
+        pass.run(sim.world_mut(), &player_feet, &pending);
+    }
+
+    assert!(
+        !sim.world().evicted(terrain).contains(target),
+        "a queued edit's dependency must never be evicted while it is still pending"
+    );
+    assert!(
+        sim.world()
+            .terrain()
+            .volume
+            .resident_brick_coords()
+            .contains(&target)
+    );
+
+    // Control: the identical setup and tick count, but the pass is never told
+    // about the pending edit -- ordinary hysteresis must evict the brick,
+    // proving the pin above (not some other effect) is what protected it.
+    let mut sim2 = crate::sim();
+    let terrain2 = sim2.world().terrain_volume_id();
+    let mut pass2 = ResidencyPass::install(
+        sim2.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 100,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 0,
+        },
+    );
+    for _ in 0..10 {
+        pass2.run(sim2.world_mut(), &player_feet, &Default::default());
+    }
+    assert!(
+        sim2.world().evicted(terrain2).contains(target),
+        "without the pin, ordinary hysteresis must evict the same out-of-interest brick"
+    );
+}
+
+/// ENG-30 row 7 increment 13: a fast player movement's swept path must keep a
+/// brick it crosses resident for the tick it crosses, even one that has
+/// already sat out of interest long enough to be otherwise eligible for
+/// eviction -- swept-collision movement must never see evicted geometry
+/// sampled as air mid-sweep.
+#[test]
+fn a_players_swept_path_pins_a_brick_it_crosses_even_past_the_settle_window() {
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let mut pass = ResidencyPass::install(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 100,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 0,
+        },
+    );
+    let crossed = GlobalCell::new(82, 6, 75).split().0;
+    assert!(
+        sim.world()
+            .terrain()
+            .volume
+            .resident_brick_coords()
+            .contains(&crossed),
+        "the crossed brick must start resident, or this test proves nothing"
+    );
+
+    // Stationary west player for up to (but not including) `EVICT_SETTLE_TICKS`
+    // (4, private to this module) ticks: `crossed`, out of interest the whole
+    // time, is not yet eligible for eviction.
+    let player = 1u64;
+    let west = [1.0_f64, 1.0, 1.0];
+    for _ in 0..3 {
+        pass.run(sim.world_mut(), &[(player, west)], &Default::default());
+    }
+    assert!(
+        !sim.world().evicted(terrain).contains(crossed),
+        "not yet past the settle window"
+    );
+
+    // Tick 4: the player instantly jumps far past the east region in one
+    // step. The bounding segment from the old to the new feet must pin every
+    // brick it crosses, including `crossed`, on this exact tick -- the same
+    // tick its settle counter would otherwise reach the eviction threshold.
+    let far_east = [30.0_f64, 2.0, 30.0];
+    pass.run(sim.world_mut(), &[(player, far_east)], &Default::default());
+    assert!(
+        !sim.world().evicted(terrain).contains(crossed),
+        "the swept path must have pinned the crossed brick on the jump tick"
+    );
+
+    // Once settled at the new position, `crossed` is simply out of interest
+    // again with no more swept protection -- ordinary hysteresis evicts it
+    // like any other stale brick after another `EVICT_SETTLE_TICKS` ticks.
+    for _ in 0..4 {
+        pass.run(sim.world_mut(), &[(player, far_east)], &Default::default());
+    }
+    assert!(
+        sim.world().evicted(terrain).contains(crossed),
+        "once no longer swept or in interest, the brick must eventually evict normally"
+    );
+}
+
+/// ENG-30 row 7 increment 13: a dense-byte cap with no headroom must defer
+/// (never silently admit past) reloading an evicted dense brick back into
+/// interest -- the "loads happen before an `over_budget` count" gap the
+/// coordinator review named. The committed world's logical hash is
+/// completely unaffected by whether that brick happens to be resident.
+#[test]
+fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budget() {
+    let (off_hash, off_solid, _) = run_without_residency();
+
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let mut pass = ResidencyPass::install(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 100,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 1,
+        },
+    );
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])]; // stationary west
+    let east = GlobalCell::new(82, 6, 75).split().0;
+
+    // Run the full script so the east cut actually materialises east's brick
+    // as `Dense`, then let ordinary west-only-interest hysteresis evict it.
+    let mut next = 0usize;
+    for tick in 1..=180u64 {
+        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
+            let (_, cell, r) = SCRIPT[next];
+            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
+            next += 1;
+        }
+        let report = sim.tick().unwrap();
+        for (_, done) in &report.committed {
+            let touched: Vec<BrickCoord> = done
+                .topology
+                .after
+                .iter()
+                .filter(|br| br.volume == terrain)
+                .map(|br| br.coord)
+                .collect();
+            pass.on_commit(sim.world(), touched);
+        }
+        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
+    }
+    assert!(
+        sim.world().evicted(terrain).contains(east),
+        "east must be evicted by the end of the run, or this test proves nothing"
+    );
+    assert_eq!(sim.world().world_hash(), off_hash);
+    assert_eq!(sim.world().total_solid_cells(), off_solid);
+
+    // Tighten the dense-byte cap to exactly the current resident total --
+    // zero headroom for east's dense brick to come back -- and give a small
+    // interest radius, matching an ordinary walking approach rather than a
+    // teleport (a single large jump would swept-pin the whole path as
+    // *required*, which must never be admission-limited -- see
+    // `a_players_swept_path_pins_a_brick_it_crosses_even_past_the_settle_window`).
+    let current_dense = spall_server::total_resident_dense_bytes(sim.world());
+    let mut limits = pass.limits();
+    limits.max_dense_bytes = current_dense;
+    limits.interest_radius_bricks = 1;
+    pass.set_limits(limits);
+
+    // Walk a second player toward (but not physically into) east's own brick
+    // in small steps, stopping one brick short -- close enough for ordinary
+    // proximity `interest` (radius 1) to *want* east back, but never crossing
+    // into it, so the swept-collision path never itself needs to treat east
+    // as *required* (that is
+    // `a_players_swept_path_pins_a_brick_it_crosses_even_past_the_settle_window`'s
+    // job; this test isolates the plain interest-driven admission path). A
+    // first player camps at west the whole time, keeping west's own dense
+    // brick resident and occupying the tight budget throughout, so the cap
+    // does not simply free up on its own as the walker leaves west behind.
+    let west_player = 1u64;
+    let walker = 2u64;
+    let west = [1.0_f64, 1.0, 1.0];
+    let goal = [12.5_f64, 1.5, 18.75]; // one brick short of east, in range
+    let steps = 40;
+    let mut deferred = 0u64;
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        let feet = [
+            west[0] + (goal[0] - west[0]) * t,
+            west[1] + (goal[1] - west[1]) * t,
+            west[2] + (goal[2] - west[2]) * t,
+        ];
+        let tick = pass.run(
+            sim.world_mut(),
+            &[(west_player, west), (walker, feet)],
+            &Default::default(),
+        );
+        deferred += tick.admission_deferred;
+    }
+    assert!(
+        deferred > 0,
+        "the tight dense-byte cap must have deferred at least one admission"
+    );
+    assert!(
+        sim.world().evicted(terrain).contains(east),
+        "a deferred reload must leave the brick evicted, not admit it over budget"
+    );
+    // Logical topology is completely unaffected by residency placement.
+    assert_eq!(sim.world().world_hash(), off_hash);
+    assert_eq!(sim.world().total_solid_cells(), off_solid);
+
+    // Raise the cap and confirm the same desired reload now succeeds.
+    limits.max_dense_bytes = current_dense + spall_voxel::MemoryReport::DENSE_BRICK_BYTES as u64;
+    pass.set_limits(limits);
+    pass.run(
+        sim.world_mut(),
+        &[(west_player, west), (walker, goal)],
+        &Default::default(),
+    );
+    assert!(
+        !sim.world().evicted(terrain).contains(east),
+        "once the cap has headroom, the previously deferred reload must succeed"
+    );
 }

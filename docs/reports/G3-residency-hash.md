@@ -135,7 +135,14 @@ it as proposed are historical. Increment 12 validates reload candidates before
 publication, globally bounds client reload requests, rebuilds prediction
 collision when resident cache placement changes, and makes the row-8b harness
 assert real eviction/completed reload/evicted-edit/outbound-return activity.
-Durable acknowledgement and bounded capture remain open.
+ENG-30 row 7 increment 13 (`docs/reports/G3.md` increment 33) adds explicit
+pin ownership across pending edits, swept-collision paths, and pipeline reload
+grace (never evicted, always reloaded regardless of budget), and enforces
+`budget_bricks` / a new `max_dense_bytes` on the admission path (an
+interest-driven, non-required reload is deferred rather than admitted past
+either cap), plus digest/backing/process-peak-memory retained-memory evidence.
+Durable exact-revision acknowledgement and bounded (non-full-reload) capture
+remain open.
 
 ## Safe serve-loop integration (slice D)
 
