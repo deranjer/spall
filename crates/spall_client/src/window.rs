@@ -33,7 +33,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use crate::ClientError;
-use crate::interactive::{InteractiveSession, InteractiveView};
+use crate::interactive::{InteractiveSession, InteractiveView, LiveInput};
 use crate::net::{ClientNetConfig, run_replication_client};
 use crate::predict::CELL_M;
 
@@ -136,6 +136,13 @@ impl HeldKeys {
             z -= 1.0;
         }
         [x, 0.0, z]
+    }
+
+    /// Clears the window-side key state and the matching cross-thread input
+    /// snapshot as one focus-loss transition.
+    fn clear_on_focus_loss(&mut self, input: &LiveInput) {
+        *self = Self::default();
+        input.clear_held_actions();
     }
 }
 
@@ -431,6 +438,14 @@ impl InteractiveApp {
         self.session.input.set_movement(self.held.movement());
     }
 
+    /// Releases local intent after the operating system moves focus away from
+    /// this window. `winit` does not guarantee matching release events for
+    /// keys/buttons that were down at focus loss, so carrying `held` across
+    /// that boundary could make the server receive a stale walk or jump.
+    fn clear_held_actions(&mut self) {
+        self.held.clear_on_focus_loss(&self.session.input);
+    }
+
     fn set_cursor_locked(&mut self, locked: bool) {
         let Some(window) = &self.window else { return };
         if locked {
@@ -487,6 +502,10 @@ impl ApplicationHandler for InteractiveApp {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size);
                 }
+            }
+            WindowEvent::Focused(false) => {
+                self.clear_held_actions();
+                self.set_cursor_locked(false);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -1475,6 +1494,35 @@ fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Te
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+#[cfg(test)]
+mod input_tests {
+    use spall_core::BUTTON_JUMP;
+
+    use super::{HeldKeys, LiveInput};
+
+    #[test]
+    fn focus_loss_clears_window_keys_and_shared_actions_but_keeps_look() {
+        let mut held = HeldKeys {
+            forward: true,
+            left: true,
+            jump: true,
+            ..HeldKeys::default()
+        };
+        let input = LiveInput::new();
+        input.set_movement(held.movement());
+        input.set_view_dir([0.5, 0.25, -0.75]);
+        input.set_button(BUTTON_JUMP, true);
+
+        held.clear_on_focus_loss(&input);
+
+        assert_eq!(held.movement(), [0.0; 3]);
+        let snapshot = input.snapshot();
+        assert_eq!(snapshot.movement, [0.0; 3]);
+        assert_eq!(snapshot.buttons, 0);
+        assert_eq!(snapshot.view_dir, [0.5, 0.25, -0.75]);
+    }
 }
 
 #[cfg(test)]

@@ -162,8 +162,17 @@ prediction/reconciliation acceptance is CPU tests: `cargo test -p spall_physics
 character::`, `-p spall_sim --test player_movement`, and `-p spall_client --test
 prediction` (predictor vs. a live `spall_sim::Simulation` through an injected
 100 ms link — convergence, floor-removal-no-hover, lost-button-release).
-Interactive window input and full moving-body crush outcomes remain unrun /
-follow-up.
+ENG-69 adds the separate live-input path: `sandbox-client --connect
+--interactive` runs the same network prediction/reconciliation session in a
+winit window, reading WASD, Space, and mouse look from the local window. Its
+minimal debug view draws nearby replicated terrain; it is not the G2 renderer.
+The window releases the cursor with Escape or focus loss, and focus loss clears
+all held actions so a missing OS key-up cannot continue a walk or jump. The
+historical PR #109 record reports a hands-on run of `cargo xtask play --release
+--scene g1 --ticks 18000` in which the investigated frame-pacing jitter was no
+longer observed. That result is historical evidence, not a measurement made by
+the current validation pass; live input has no automated keyboard/mouse
+acceptance scenario. Full moving-body crush outcomes remain follow-up.
 T20 (increment 1) adds opt-in per-client interest + motion bandwidth
 scheduling to the host: `sandbox-server --serve --motion-interest`
 (with `--motion-near-m` / `--motion-far-m` / `--motion-far-interval` /
@@ -261,6 +270,11 @@ cargo xtask scenario --name giant-split --loss-percent 0 --output .local/runs/gi
 # Passes on bounded corrections, ground contact, travel distance, and no hover.
 cargo xtask scenario --name player-movement --loss-percent 0 --output .local/runs/player-movement
 
+# ENG-69 manual interactive launcher. Requires a desktop, so it is not an
+# automated acceptance check. PR #109 records one historical hands-on run;
+# see docs/reports/ENG-69-acceptance.md.
+cargo xtask play --release --scene g1 --ticks 18000
+
 # T12: stable acceptance cameras with six views and per-pass GPU timing.
 # Needs a supported GPU/driver; exit 3 otherwise.
 cargo xtask capture --output .local/runs/t12-1080p --width 1920 --height 1080 --strategy greedy
@@ -292,7 +306,11 @@ cargo xtask crash-test --suite persistence --output .local/runs/crash
 cargo test -p spall_voxel -p spall_client -p spall_server --all-features
 ```
 
-Interactive controls: mouse look, WASD, jump, primary tool, alternate placement, debug free-camera toggle, Escape to exit. Controls are configuration data. Scenarios can run every action without synthesizing keyboard/mouse events.
+The shipped ENG-69 interactive controls are mouse look, WASD, and Space to
+jump. Escape releases the cursor; closing the window exits the interactive
+session. The live-input path is deliberately separate from scenario actions,
+which remain local scripted inputs rather than synthesized keyboard/mouse
+events.
 
 No runtime command shell or arbitrary code execution over the game socket. Agent control uses local scenario files or a loopback authenticated development command channel with a fixed command schema: load scene, move player, use tool, step ticks, capture, inspect hashes, save, quit. Disable the development channel in Internet server builds/configurations.
 
