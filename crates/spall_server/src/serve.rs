@@ -661,6 +661,38 @@ pub struct ServeSummary {
     /// run (proximity or a hard-wake edit). `0` when `ServeConfig.dormancy` is
     /// `None`.
     pub dormancy_reactivations_total: u64,
+    /// ENG-30 row 7 increment 13: largest pin-set size the residency pass
+    /// observed in one tick (pending-edit dependencies, swept-collision
+    /// footprints, and pipeline reload grace, unioned). `0` when residency is
+    /// off.
+    pub residency_pinned_bricks_max: u64,
+    /// ENG-30 row 7 increment 13: interest-driven (non-required) reloads
+    /// skipped because admitting them would have exceeded `budget_bricks` or
+    /// the new dense-byte cap — the "loads happen before an `over_budget`
+    /// count" gap the coordinator review named is now a real, counted
+    /// deferral. `0` when residency is off.
+    pub residency_admission_deferred_total: u64,
+    /// ENG-30 row 7 increment 13: ticks where the *required* (interest ∪
+    /// pinned) set alone exceeded `budget_bricks` — genuine capacity
+    /// pressure the pass could not resolve by evicting only optional
+    /// geometry. `0` when residency is off.
+    pub residency_required_over_budget_ticks: u64,
+    /// ENG-30 row 7 increment 13: approximate bytes of retained evicted-brick
+    /// digest metadata at end of run — the frozen contract's "digest-metadata
+    /// bytes" retained-memory line item, distinct from resident dense payload
+    /// and disk footprint. `0` when residency is off.
+    pub residency_digest_bytes_final: u64,
+    /// ENG-30 row 7 increment 13: the durable backing's own retained
+    /// in-process bytes at end of run (`spall_sim::BrickBackingWriter::resident_bytes`)
+    /// — `None` when residency is off or the installed backing keeps no
+    /// resident cache (a pure disk store).
+    pub residency_backing_resident_bytes: Option<u64>,
+    /// ENG-30 row 7 increment 13: this process's peak resident/working-set
+    /// memory in bytes since start, independent of residency being on —
+    /// `docs/reports/G3-residency-hash.md`'s "process peak memory" retained-
+    /// memory line item. `None` on a platform `spall_server::mem_stats` does
+    /// not support.
+    pub process_peak_memory_bytes: Option<u64>,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -1585,10 +1617,23 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             // every player's interest box, reloads any back in interest. The
             // committed world (hash, conservation, result_hashes) is unchanged;
             // an edit that needs an evicted brick reloads it via the pipeline.
+            //
+            // ENG-30 row 7 increment 13: before running, hand the pass every
+            // brick the pipeline itself reloaded this tick (pinned for a short
+            // grace window) and the bounded dependency footprint of every
+            // still-queued edit (pinned for as long as it stays queued) — the
+            // preflight/consumer-lifetime reservation the frozen contract asks
+            // for, on top of the reactive `EvictedGeometryRequired` protection
+            // that already existed.
             if let Some(pass) = &mut residency {
-                let player_feet: Vec<[f64; 3]> =
-                    sim.world().players().map(|p| p.state.position_m).collect();
-                pass.run(sim.world_mut(), &player_feet);
+                pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+                let pending_edit_bricks = sim.pending_edit_bricks(terrain_vid);
+                let player_feet: Vec<(u64, [f64; 3])> = sim
+                    .world()
+                    .players()
+                    .map(|p| (p.entity.get(), p.state.position_m))
+                    .collect();
+                pass.run(sim.world_mut(), &player_feet, &pending_edit_bricks);
             }
 
             // Quiesce only after the pipeline is drained *and* no client has
@@ -1734,7 +1779,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             actions_staged,
             actions_queued_unresolved: submitted_at.len() as u64,
             latency: commit_latency.report(),
-            residency: residency.as_ref().map(|p| p.stats()),
+            residency: residency.as_ref().map(|p| p.stats_with_world(sim.world())),
             residency_backing_disk_bytes: residency.as_ref().and_then(|p| p.backing_disk_bytes()),
             client_spawns,
             contact_damage_cuts_submitted,
@@ -1810,7 +1855,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // dormancy_reactivations_total; T23 / G3 row 14 adds per_client_egress.
         // v6: T23 / G3 row 7 item 3 adds resident_dense_bytes_min/max/final and
         // residency_backing_disk_bytes.
-        version: 6,
+        // v7: ENG-30 row 7 increment 13 adds residency_pinned_bricks_max,
+        // residency_admission_deferred_total, residency_required_over_budget_ticks,
+        // residency_digest_bytes_final, residency_backing_resident_bytes, and
+        // process_peak_memory_bytes.
+        version: 7,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -1889,6 +1938,24 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         contact_damage_cuts_rejected: sim_result.contact_damage_cuts_rejected,
         dormancy_deactivations_total: sim_result.dormancy_deactivations_total,
         dormancy_reactivations_total: sim_result.dormancy_reactivations_total,
+        residency_pinned_bricks_max: sim_result
+            .residency
+            .map(|r| r.pinned_bricks_max as u64)
+            .unwrap_or(0),
+        residency_admission_deferred_total: sim_result
+            .residency
+            .map(|r| r.admission_deferred_total)
+            .unwrap_or(0),
+        residency_required_over_budget_ticks: sim_result
+            .residency
+            .map(|r| r.required_over_budget_ticks)
+            .unwrap_or(0),
+        residency_digest_bytes_final: sim_result
+            .residency
+            .map(|r| r.digest_bytes_final)
+            .unwrap_or(0),
+        residency_backing_resident_bytes: sim_result.residency.and_then(|r| r.backing_bytes_final),
+        process_peak_memory_bytes: crate::mem_stats::process_peak_bytes(),
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
