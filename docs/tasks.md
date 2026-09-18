@@ -290,10 +290,13 @@ Accept: long weak cantilevers fail, comparable strong supports hold within decla
 ### T23 — G3/G4 integrated engine acceptance
 
 Post-merge follow-ups and evidence limits are recorded in the
-[ENG-30 review](reviews/2026-09-10-eng-30-post-merge.md). T23 stays open; the next
-recommended fix is atomic failed-reload handling, followed by enforced
-residency/traversal assertions. Durable-backing and bounded-capture deferrals
-remain unmet contract requirements, not an accepted waiver.
+[ENG-30 review](reviews/2026-09-10-eng-30-post-merge.md). T23 stays open.
+Those initial atomic-reload and traversal-assertion fixes have landed, as have
+bounded checkpoint capture and disk-backed residency with restart evidence.
+The current [G3 report](reports/G3.md) records increments through 31 and the
+subsequent passing row 11 impaired join-budget run. Row 7's eviction-policy-engine
+unification remains open. Earlier increment notes below are historical evidence,
+not the current remaining-work queue.
 
 Dependencies: T15, T17, T18, T20, T21, T22. Own: complete gate report and targeted fixes.
 

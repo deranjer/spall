@@ -1474,14 +1474,23 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 let snaps = motion.snapshots(sim.world(), tick);
                 if !snaps.is_empty() {
                     match motion_interest {
-                        // Pre-T20: one batch, broadcast unfiltered.
+                        // Pre-T20: one batch, unfiltered *among live replicas*.
+                        // A client still installing its late-join baseline must
+                        // receive neither the live 20 Hz feed nor its stale
+                        // datagram backlog: the baseline barrier supplies a
+                        // current keyframe when it becomes live. The
+                        // interest-aware path below already has this property
+                        // through `LateJoin::live_sessions`; keep the default
+                        // path on the same protocol contract.
                         None => {
-                            let recipients = clients_for_sim
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .len() as u64;
-                            broadcast(&clients_for_sim, Outbound::Motion(Arc::new(snaps.clone())));
-                            motion_egress.snapshots_sent += snaps.len() as u64 * recipients;
+                            let recipients: Vec<_> = lj.live_sessions().collect();
+                            motion_egress.snapshots_sent +=
+                                snaps.len() as u64 * recipients.len() as u64;
+                            send_motion_to_sessions(
+                                &clients_for_sim,
+                                recipients,
+                                Arc::new(snaps.clone()),
+                            );
                         }
                         // T20: per-client interest relevance + bandwidth budget.
                         Some(mi) => {
@@ -2946,6 +2955,19 @@ fn dispatch_motion_by_interest(
     }
 }
 
+/// Sends a single shared, supersedable motion batch to the supplied sessions.
+/// The caller chooses those sessions from [`LateJoin::live_sessions`] so a
+/// joining replica cannot consume link capacity before its baseline barrier.
+fn send_motion_to_sessions(
+    clients: &ClientMap,
+    recipients: impl IntoIterator<Item = SessionId>,
+    batch: Arc<Vec<MotionSnapshot>>,
+) {
+    for session in recipients {
+        send_to(clients, session, Outbound::Motion(Arc::clone(&batch)));
+    }
+}
+
 /// Fans one message to every client. A client whose reliable backlog blew its
 /// bound ([`OutboundOverflow`]) is dropped from the fan-out set here; its
 /// writer task flushes the already-accepted backlog and then closes the
@@ -3781,6 +3803,56 @@ mod tests {
             shutdowns,
             vec![Connection::BYE_REASON_CATCH_UP_EXHAUSTED],
             "the dropped joiner must see the catch-up-exhaustion reason, not the ordinary end-of-session one"
+        );
+    }
+
+    /// A late joiner's baseline/catch-up barrier supplies its first motion
+    /// keyframe. Sending the ordinary live feed before then can saturate a
+    /// shaped link with supersedable traffic and starve the reliable baseline.
+    #[test]
+    fn motion_is_held_until_a_joiner_is_live() {
+        let clients = empty_clients();
+        let live = sess(1, 1);
+        let joining = sess(2, 1);
+        let live_handle = OutboundHandle::new();
+        let joining_handle = OutboundHandle::new();
+        clients
+            .lock()
+            .unwrap()
+            .insert(live.raw(), live_handle.clone());
+        clients
+            .lock()
+            .unwrap()
+            .insert(joining.raw(), joining_handle.clone());
+
+        let mut lj = LateJoin::new(1, 1, 1);
+        lj.on_joined(live);
+        lj.on_joined(joining);
+        lj.links.get_mut(&joining.raw()).unwrap().phase = Phase::Joining {
+            transfer_id: TransferId(1),
+            queue: VecDeque::new(),
+            retries: 0,
+        };
+        let batch = Arc::new(Vec::new());
+        send_motion_to_sessions(&clients, lj.live_sessions(), Arc::clone(&batch));
+
+        assert!(Arc::ptr_eq(
+            &live_handle
+                .take()
+                .motion
+                .expect("live client receives motion"),
+            &batch
+        ));
+        assert!(
+            joining_handle.take().motion.is_none(),
+            "joining client must wait for the post-baseline keyframe"
+        );
+
+        lj.links.get_mut(&joining.raw()).unwrap().phase = Phase::Live;
+        send_motion_to_sessions(&clients, lj.live_sessions(), batch);
+        assert!(
+            joining_handle.take().motion.is_some(),
+            "once the baseline barrier completes, normal motion resumes"
         );
     }
 
