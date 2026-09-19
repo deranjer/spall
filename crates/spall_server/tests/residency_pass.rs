@@ -390,20 +390,29 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
     );
 }
 
-/// T23 / G3 row 7 increment 16 (durable exact-revision backing
-/// acknowledgement, audit + fix). The audit found `capture_checkpoint`
-/// trusted whatever the backing offered for an evicted brick without
-/// checking it against the retained `(revision, content_hash)` digest --
-/// unlike `SimWorld::reload_brick`, which validates a backing candidate with
-/// `EvictedBricks::verify_candidate` before ever publishing it. This is the
-/// fault-injection test that falsifies durability directly: it forges a
-/// backing record for an evicted coord that disagrees with the digest the
-/// eviction actually retained (the exact shape a disk backing's
-/// `synchronous=NORMAL` write rolled back by an OS/power crash, or any other
-/// silent divergence, would produce) and confirms `capture_checkpoint` now
-/// fails closed instead of writing the mismatched bytes into a checkpoint
-/// that `Writer::publish_checkpoint` would then durably (`synchronous=FULL`)
-/// commit under the *correct* recorded `world_hash`.
+/// T23 / G3 row 7 — 2026-09-18 acceptance audit. Increment 16 added this
+/// exact fault-injection test and the verification call it exercises, but
+/// increment 15's incremental-capture rewrite (landed the same day, on the
+/// other side of a merge) reintroduced the unverified read on the
+/// cache-**miss** path without this test noticing: it originally picked
+/// `evicted(...).iter().next()` — the lexicographically-first evicted coord —
+/// which, for this fixture's script, happens to be a brick nothing ever
+/// edited. Its digest revision therefore still equals the revision
+/// `ResidencyPass::install_with_backing` cached for it at install time
+/// (before anything was evicted), so `capture_checkpoint` took the cache
+/// **hit** branch and never read the forged backing record at all — the test
+/// passed for the wrong reason and the missing verification went
+/// unnoticed. Fixed by deliberately picking the evicted coord with the
+/// *highest* retained revision: the script's far-away cuts (`SCRIPT`, cells
+/// `[82, 6, 75]` and `[90, 1, 75]`) touch bricks well outside the player's
+/// residency interest box, so the highest-revision evicted brick is
+/// guaranteed to be one of those edited bricks — its revision changed after
+/// install, so its cache entry is stale and this checkpoint call must
+/// actually read (and now verify) the backing.
+///
+/// The audit's second half — proving reuse of an *unchanged* cached record
+/// stays safe — is the companion test immediately below,
+/// `capture_checkpoint_reuses_a_cached_record_for_an_unedited_evicted_brick_without_touching_the_backing`.
 #[test]
 fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_retained_digest() {
     use spall_server::persist::{self, PersistConfig};
@@ -454,8 +463,15 @@ fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_r
         .world()
         .evicted(terrain)
         .iter()
-        .next()
+        .max_by_key(|(_, digest)| digest.revision.get())
         .expect("the run must still have evicted terrain, or this test proves nothing");
+    assert!(
+        retained_digest.revision.get() > 1,
+        "the picked coord must actually have been edited (and therefore differ from its \
+         install-time cache seed) or this checkpoint call would take the cache-hit branch \
+         and never read the forged backing record at all -- got revision {:?} for {evicted_coord:?}",
+        retained_digest.revision
+    );
 
     // Overwrite the backing's record for this exact coord with real-looking
     // geometry at a revision the retained digest never agreed to -- a stand-in
@@ -487,6 +503,113 @@ fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_r
                 && *backing_revision == retained_digest.revision.get() + 1000
         ),
         "expected EvictedBrickDigestMismatch naming the exact brick and both revisions, got {err:?}"
+    );
+}
+
+/// T23 / G3 row 7 — 2026-09-18 acceptance audit, second half: a checkpoint
+/// re-capture that reuses an unchanged brick's cached record must not merely
+/// *happen* to skip a bad backing read (the way the neighbouring test's
+/// original, since-fixed coordinate pick accidentally did) -- it must be
+/// provably safe to do so. Takes one real checkpoint (verifying and caching
+/// every currently-evicted brick, edited or not), then makes one of those
+/// coords' backing record `Unavailable` before a second, otherwise-identical
+/// checkpoint call (no ticks, no edits, no eviction/reload in between, so
+/// every digest revision is exactly what the first call already cached) --
+/// the strongest possible proof that a no-op re-capture reuses the cache
+/// rather than reading backing at all: reading it would fail closed (see
+/// `capture_checkpoint_fails_closed_on_a_missing_durable_record`), so success
+/// here is only possible via the cached record, not a fresh read.
+#[test]
+fn capture_checkpoint_reuses_a_cached_record_for_an_unedited_evicted_brick_without_touching_the_backing()
+ {
+    use spall_server::persist::PersistConfig;
+
+    let cfg = PersistConfig {
+        world_id: 0x5A11_0000_0000_CACE,
+        seed: 11,
+        generator_version: 1,
+    };
+
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = Arc::new(MemoryBacking::default());
+    let mut pass = ResidencyPass::install_with_backing(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 1,
+        },
+        backing.clone(),
+    );
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+
+    let mut next = 0usize;
+    for tick in 1..=180u64 {
+        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
+            let (_, cell, r) = SCRIPT[next];
+            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
+            next += 1;
+        }
+        let report = sim.tick().unwrap();
+        for (_, done) in &report.committed {
+            let touched: Vec<BrickCoord> = done
+                .topology
+                .after
+                .iter()
+                .filter(|br| br.volume == terrain)
+                .map(|br| br.coord)
+                .collect();
+            pass.on_commit(sim.world(), touched);
+        }
+        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
+    }
+
+    // Any evicted coord works here (edited or not): nothing ticks between the
+    // two `capture_checkpoint` calls below, so whichever revision the first
+    // call verifies and caches is still exactly current for the second --
+    // guaranteeing a cache hit regardless of this brick's edit history.
+    let (evicted_coord, digest) = sim
+        .world()
+        .evicted(terrain)
+        .iter()
+        .next()
+        .expect("the run must still have evicted terrain, or this test proves nothing");
+
+    pass.capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect("first checkpoint establishes a verified cache entry for every evicted brick");
+    let captured_after_first = pass.stats().checkpoint_bricks_captured_total;
+
+    // The backing no longer has a usable record for this coord at all -- a
+    // fresh read would fail closed (`EvictedBrickUnavailable`), so this
+    // second call succeeding is possible only if it never reads backing for
+    // this coord.
+    backing.mark_unavailable(terrain, evicted_coord);
+
+    let checkpoint = pass
+        .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect(
+            "a second checkpoint with nothing changed must reuse every cached record, \
+             including this one, without touching the now-unavailable backing",
+        );
+    let captured_after_second = pass.stats().checkpoint_bricks_captured_total;
+    assert_eq!(
+        captured_after_second, captured_after_first,
+        "nothing changed between the two calls, so nothing should have been re-captured"
+    );
+    let stored = checkpoint
+        .bricks
+        .iter()
+        .find(|b| {
+            b.volume_id == terrain.get()
+                && b.coord == [evicted_coord.x, evicted_coord.y, evicted_coord.z]
+        })
+        .expect("the reused brick is still present in the checkpoint's complete logical set");
+    assert_eq!(
+        stored.revision,
+        digest.revision.get(),
+        "the reused cached record still reports the correct retained revision"
     );
 }
 

@@ -628,6 +628,28 @@ impl ResidencyPass {
                             });
                         }
                     };
+                    // T23 / G3 row 7 increment 15 regressed increment 16's
+                    // durable exact-revision backing ack: this cache-miss
+                    // path (a brick never captured before, or captured at an
+                    // older revision) reads a fresh candidate from the
+                    // backing and must verify it against the retained digest
+                    // before trusting it, exactly like increment 16's
+                    // now-deleted check. Restored here so a stale/wrong
+                    // backing record fails the capture closed instead of
+                    // silently entering the durable checkpoint.
+                    let offered = spall_voxel::logical::BrickDigest::capture_brick(&brick);
+                    if offered.revision != digest.revision
+                        || offered.content_hash != digest.content_hash
+                    {
+                        return Err(PersistError::EvictedBrickDigestMismatch {
+                            volume: self.terrain.get(),
+                            coord: [coord.x, coord.y, coord.z],
+                            retained_revision: digest.revision.get(),
+                            retained_hash: digest.content_hash.to_string(),
+                            backing_revision: offered.revision.get(),
+                            backing_hash: offered.content_hash.to_string(),
+                        });
+                    }
                     stored_brick_from_backing(self.terrain, coord, &brick)?
                 }
             };
