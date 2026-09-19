@@ -61,6 +61,10 @@ struct QueuedIntent {
 /// What one [`EditPipeline::run_tick`] did.
 #[derive(Debug, Default)]
 pub struct TickReport {
+    /// Time spent in the owning world's physics step, including extraction of
+    /// updated body poses. This is populated by `Simulation::tick` so server
+    /// telemetry can report the physics portion without timing a replica.
+    pub physics_duration: std::time::Duration,
     /// Requests that committed this tick, with their transaction summary.
     pub committed: Vec<(RequestId, Committed)>,
     /// Requests whose commit lost a conflict and were re-queued for recompute.

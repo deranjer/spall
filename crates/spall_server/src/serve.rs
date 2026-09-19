@@ -441,6 +441,21 @@ pub struct ServeConfig {
     /// [`Self::await_body_settle`]'s `max_penetration_m`) must keep this off,
     /// which is why it defaults to `None` for every existing gate fixture.
     pub dormancy: Option<spall_sim::DormancyConfig>,
+    /// Optional bounded timing window for the owning server tick. Warmup ticks
+    /// are excluded; measured ticks include ingress through replication and
+    /// residency, ending immediately before pacing sleep.
+    pub timing_window: Option<TimingWindow>,
+}
+
+/// A bounded, explicit server timing window. The server records at most
+/// `max_samples` observations while still reporting whether the requested
+/// measured tick window completed. A caller that wants acceptance evidence
+/// should set `max_samples >= measured_ticks`.
+#[derive(Debug, Clone, Copy)]
+pub struct TimingWindow {
+    pub warmup_ticks: u64,
+    pub measured_ticks: u64,
+    pub max_samples: usize,
 }
 
 /// T20 per-client interest + motion bandwidth policy for a [`serve`] run.
@@ -507,6 +522,7 @@ impl ServeConfig {
             residency_disk_path: None,
             contact_damage: None,
             dormancy: None,
+            timing_window: None,
         }
     }
 }
@@ -706,6 +722,22 @@ pub struct ServeSummary {
     /// direct evidence that checkpoint capture is incremental rather than a
     /// full walk with a cache wrapped around it. `0` when residency is off.
     pub residency_checkpoint_bricks_logical_total: u64,
+    /// T23 / G4: owning server tick busy-time percentiles, excluding the
+    /// configured warmup window and pacing sleep. Zero samples means no timing
+    /// window was configured or the run ended before it completed.
+    pub tick_busy_p95_ms: f64,
+    pub tick_busy_p99_ms: f64,
+    pub tick_busy_max_ms: f64,
+    pub tick_busy_samples: u64,
+    pub tick_busy_window_complete: bool,
+    /// T23 / G4: physics-step duration percentiles. This measures
+    /// `world.step_physics` and body-pose extraction; player sweep/advance is
+    /// reported in the owning tick busy time, not this physics field.
+    pub physics_p95_ms: f64,
+    pub physics_p99_ms: f64,
+    pub physics_max_ms: f64,
+    pub physics_samples: u64,
+    pub physics_window_complete: bool,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -1130,6 +1162,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let residency_disk_path = config.residency_disk_path.clone();
     let contact_damage_cfg = config.contact_damage;
     let dormancy_cfg = config.dormancy;
+    let timing_window = config.timing_window;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
@@ -1218,6 +1251,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut contact_damage_cuts_rejected = 0u64;
         let mut dormancy_deactivations_total = 0u64;
         let mut dormancy_reactivations_total = 0u64;
+        let mut timing = timing_window.map(TimingCollector::new);
 
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
@@ -1649,6 +1683,15 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 pass.run(sim.world_mut(), &player_feet, &pending_edit_bricks);
             }
 
+            // G4 timing ends after all owning-thread work for this tick,
+            // including replication, persistence submission, and residency,
+            // but before the optional pacing sleep below. Warmup is explicit;
+            // a short run therefore remains visibly incomplete instead of
+            // turning absent measurements into a pass.
+            if let Some(stats) = &mut timing {
+                stats.record(ticks_run, started.elapsed(), report.physics_duration);
+            }
+
             // Quiesce only after the pipeline is drained *and* no client has
             // sent anything for `quiescence` ticks — a late scripted action from
             // one client keeps the run alive for the others. A client still
@@ -1799,6 +1842,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             contact_damage_cuts_rejected,
             dormancy_deactivations_total,
             dormancy_reactivations_total,
+            timing: timing.map(|stats| stats.finish(ticks_run)),
         }
     });
 
@@ -1876,7 +1920,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // residency_checkpoint_bricks_captured_total and
         // residency_checkpoint_bricks_logical_total (incremental checkpoint
         // capture evidence).
-        version: 8,
+        // v9: T23 / G4 bounded owning-tick and physics timing telemetry.
+        version: 9,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -1981,6 +2026,16 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             .residency
             .map(|r| r.checkpoint_bricks_logical_total)
             .unwrap_or(0),
+        tick_busy_p95_ms: sim_result.timing.tick_busy_p95_ms,
+        tick_busy_p99_ms: sim_result.timing.tick_busy_p99_ms,
+        tick_busy_max_ms: sim_result.timing.tick_busy_max_ms,
+        tick_busy_samples: sim_result.timing.tick_busy_samples,
+        tick_busy_window_complete: sim_result.timing.window_complete,
+        physics_p95_ms: sim_result.timing.physics_p95_ms,
+        physics_p99_ms: sim_result.timing.physics_p99_ms,
+        physics_max_ms: sim_result.timing.physics_max_ms,
+        physics_samples: sim_result.timing.physics_samples,
+        physics_window_complete: sim_result.timing.window_complete,
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -1995,6 +2050,79 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         return Err(ServeError::Runtime(err));
     }
     Ok(summary)
+}
+
+#[derive(Debug, Clone, Default)]
+struct TimingReport {
+    tick_busy_p95_ms: f64,
+    tick_busy_p99_ms: f64,
+    tick_busy_max_ms: f64,
+    tick_busy_samples: u64,
+    physics_p95_ms: f64,
+    physics_p99_ms: f64,
+    physics_max_ms: f64,
+    physics_samples: u64,
+    window_complete: bool,
+}
+
+struct TimingCollector {
+    window: TimingWindow,
+    tick_busy_ms: Vec<f64>,
+    physics_ms: Vec<f64>,
+}
+
+impl TimingCollector {
+    fn new(window: TimingWindow) -> Self {
+        Self {
+            window,
+            tick_busy_ms: Vec::with_capacity(window.max_samples),
+            physics_ms: Vec::with_capacity(window.max_samples),
+        }
+    }
+
+    fn record(&mut self, tick: u64, busy: Duration, physics: Duration) {
+        let measured_end = self
+            .window
+            .warmup_ticks
+            .saturating_add(self.window.measured_ticks);
+        if tick <= self.window.warmup_ticks || tick > measured_end {
+            return;
+        }
+        if self.tick_busy_ms.len() < self.window.max_samples {
+            self.tick_busy_ms.push(busy.as_secs_f64() * 1_000.0);
+            self.physics_ms.push(physics.as_secs_f64() * 1_000.0);
+        }
+    }
+
+    fn finish(self, ticks_run: u64) -> TimingReport {
+        let window_end = self
+            .window
+            .warmup_ticks
+            .saturating_add(self.window.measured_ticks);
+        TimingReport {
+            tick_busy_p95_ms: percentile(&self.tick_busy_ms, 0.95),
+            tick_busy_p99_ms: percentile(&self.tick_busy_ms, 0.99),
+            tick_busy_max_ms: self.tick_busy_ms.iter().copied().fold(0.0, f64::max),
+            tick_busy_samples: self.tick_busy_ms.len() as u64,
+            physics_p95_ms: percentile(&self.physics_ms, 0.95),
+            physics_p99_ms: percentile(&self.physics_ms, 0.99),
+            physics_max_ms: self.physics_ms.iter().copied().fold(0.0, f64::max),
+            physics_samples: self.physics_ms.len() as u64,
+            window_complete: self.window.measured_ticks > 0 && ticks_run >= window_end,
+        }
+    }
+}
+
+fn percentile(samples: &[f64], fraction: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = (fraction * sorted.len() as f64)
+        .ceil()
+        .clamp(1.0, sorted.len() as f64) as usize;
+    sorted[rank - 1]
 }
 
 struct SimResult {
@@ -2046,6 +2174,7 @@ struct SimResult {
     contact_damage_cuts_rejected: u64,
     dormancy_deactivations_total: u64,
     dormancy_reactivations_total: u64,
+    timing: TimingReport,
 }
 
 impl SimResult {
@@ -2091,6 +2220,7 @@ impl SimResult {
             contact_damage_cuts_rejected: 0,
             dormancy_deactivations_total: 0,
             dormancy_reactivations_total: 0,
+            timing: TimingReport::default(),
         }
     }
 }

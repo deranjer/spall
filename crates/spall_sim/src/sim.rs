@@ -223,7 +223,11 @@ impl Simulation {
             self.tick,
             &mut self.next_control_seq,
         )?;
+        let physics_started = std::time::Instant::now();
         self.world.step_physics();
+        let physics_duration = physics_started.elapsed();
+        let mut report = report;
+        report.physics_duration = physics_duration;
         self.advance_players(&report);
         Ok(report)
     }
