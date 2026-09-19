@@ -58,6 +58,10 @@ struct Args {
     /// Maximum retained samples for each timing percentile series.
     #[arg(long)]
     timing_max_samples: Option<usize>,
+    /// Pace each connection's baseline bulk transfer to this many payload bytes
+    /// per second (the G4 `1 MiB/s/client` baseline budget). Unpaced if absent.
+    #[arg(long)]
+    baseline_rate_limit_bytes_per_sec: Option<u64>,
     /// Built-in scene to serve: `bridge-cut` (default, single brick),
     /// `cross-bridge-cut` (column + beam cross the x = 32 brick boundary), or
     /// `walk` (T19 player-movement arena — every client gets a predicted capsule).
@@ -339,6 +343,7 @@ fn run_serve(args: Args) -> ExitCode {
             .then_some(spall_sim::ContactDamageConfig::DEFAULT),
         dormancy: args.dormancy.then_some(spall_sim::DormancyConfig::DEFAULT),
         timing_window,
+        baseline_rate_limit_bytes_per_sec: args.baseline_rate_limit_bytes_per_sec,
     };
     match spall_server::serve(config) {
         Ok(summary) => {

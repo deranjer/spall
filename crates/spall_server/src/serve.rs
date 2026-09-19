@@ -160,6 +160,10 @@ pub const MAX_REPAIRS_PER_CLIENT_PER_TICK: u32 = 8;
 /// exceeds the bounded window").
 pub const MAX_RELIABLE_BACKLOG: usize = 2048;
 
+/// Count of reliable-backlog overflows (a client disconnected because its
+/// backlog blew a cap) since the last [`serve`] start.
+static RELIABLE_BACKLOG_OVERFLOWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Byte ceiling on that same per-client reliable queue.
 pub const MAX_RELIABLE_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
 
@@ -445,6 +449,10 @@ pub struct ServeConfig {
     /// are excluded; measured ticks include ingress through replication and
     /// residency, ending immediately before pacing sleep.
     pub timing_window: Option<TimingWindow>,
+    /// Optional per-connection pacing of baseline bulk transfers, in payload
+    /// bytes per second (`docs/validation.md`: baselines have a separate capped
+    /// `1 MiB/s/client` budget). `None` (the default) sends unpaced.
+    pub baseline_rate_limit_bytes_per_sec: Option<u64>,
 }
 
 /// A bounded, explicit server timing window. The server records at most
@@ -523,6 +531,7 @@ impl ServeConfig {
             contact_damage: None,
             dormancy: None,
             timing_window: None,
+            baseline_rate_limit_bytes_per_sec: None,
         }
     }
 }
@@ -738,6 +747,40 @@ pub struct ServeSummary {
     pub physics_max_ms: f64,
     pub physics_samples: u64,
     pub physics_window_complete: bool,
+    /// Measured-window ticks whose owning-thread busy time exceeded one 60 Hz
+    /// tick (16.7 ms).
+    pub tick_busy_over_budget_ticks: u64,
+    /// T23 / G4 (v10): one sample per 60 ticks — wall time, process memory,
+    /// reliable-backlog maxima, per-connection cumulative egress.
+    pub telemetry_samples: Vec<TelemetrySample>,
+    /// Server ticks at which a named blast (brush radius >= 8 cells) committed.
+    pub blast_commit_ticks: Vec<u64>,
+    /// Largest per-client unsent reliable backlog (bytes) seen at any sample.
+    pub reliable_backlog_peak_bytes: u64,
+    /// Age (ms) of the oldest unsent reliable message at the worst sample.
+    pub reliable_backlog_peak_age_ms: u64,
+    /// Longest enqueue-to-transport-hand-off wait (ms) of any reliable message.
+    pub reliable_delivery_age_max_ms: u64,
+    /// The configured hard caps on that backlog, for the report.
+    pub reliable_backlog_cap_messages: usize,
+    pub reliable_backlog_cap_bytes: usize,
+    /// Clients disconnected because their reliable backlog blew its cap.
+    pub reliable_backlog_overflows: u64,
+    /// Baseline bulk sends started / failed / peak simultaneous, plus the
+    /// bounded record of completed ones and the configured pacing limit.
+    pub baseline_sends_started: u64,
+    pub baseline_sends_failed: u64,
+    pub baseline_sends_active_max: u64,
+    pub baseline_send_records: Vec<BaselineSendRecord>,
+    pub baseline_rate_limit_bytes_per_sec: Option<u64>,
+    /// Background baseline-capture pool: workers, jobs submitted, peak running
+    /// at once and peak waiting for a worker.
+    pub capture_pool_workers: usize,
+    pub capture_pool_submitted: u64,
+    pub capture_pool_active_max: u64,
+    pub capture_pool_queued_max: u64,
+    /// Working-set bytes of this process when the run ended.
+    pub process_end_memory_bytes: Option<u64>,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -849,7 +892,18 @@ type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
 #[derive(Default)]
 struct OutboundQueue {
     reliable: VecDeque<Outbound>,
+    /// Enqueue time and accounted bytes of each entry of `reliable`, in the same
+    /// order (T23 / G4 backlog age telemetry).
+    reliable_meta: VecDeque<(std::time::Instant, usize)>,
+    /// Bytes of the messages currently in `reliable` only: `take` hands the
+    /// writer everything queued and resets this to zero, so the cap bounds what
+    /// the writer has not yet picked up, not every byte ever queued over the
+    /// connection's life (which would disconnect any long-lived client).
     reliable_bytes: usize,
+    /// Messages the writer has taken but not yet finished handing to the
+    /// transport (FIFO, oldest first). Together with `reliable_meta` this is
+    /// the full unsent reliable backlog.
+    inflight: VecDeque<(std::time::Instant, usize)>,
     motion: Option<Arc<Vec<MotionSnapshot>>>,
     /// Set once a reliable push blew the bound. The writer flushes what is
     /// already queued, says goodbye, and exits.
@@ -873,6 +927,7 @@ impl OutboundQueue {
             // The shutdown marker always goes through — it ends the stream.
             Outbound::Shutdown(reason) => {
                 self.reliable.push_back(Outbound::Shutdown(reason));
+                self.reliable_meta.push_back((std::time::Instant::now(), 0));
                 Ok(())
             }
             reliable => {
@@ -886,11 +941,14 @@ impl OutboundQueue {
                     // Do not enqueue and do not discard the accepted backlog:
                     // the writer still flushes it, then the connection closes
                     // and the client re-baselines.
+                    RELIABLE_BACKLOG_OVERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.overflowed = true;
                     return Err(OutboundOverflow);
                 }
                 self.reliable_bytes += add;
                 self.reliable.push_back(reliable);
+                self.reliable_meta
+                    .push_back((std::time::Instant::now(), add));
                 Ok(())
             }
         }
@@ -923,6 +981,22 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
     }
 }
 
+impl OutboundQueue {
+    /// Unsent reliable backlog: bytes and the age of its oldest message.
+    fn backlog(&self, now: std::time::Instant) -> (usize, Duration) {
+        let inflight_bytes: usize = self.inflight.iter().map(|(_, b)| *b).sum();
+        let oldest = self
+            .inflight
+            .front()
+            .map(|(t, _)| *t)
+            .or_else(|| self.reliable_meta.front().map(|(t, _)| *t));
+        (
+            self.reliable_bytes + inflight_bytes,
+            oldest.map_or(Duration::ZERO, |t| now.saturating_duration_since(t)),
+        )
+    }
+}
+
 /// What one [`OutboundHandle::take`] pass handed the writer.
 struct OutboundBatch {
     reliable: Vec<Outbound>,
@@ -933,6 +1007,55 @@ struct OutboundBatch {
 impl OutboundBatch {
     fn is_empty(&self) -> bool {
         self.reliable.is_empty() && self.motion.is_none()
+    }
+}
+
+/// T23 / G4 server-wide telemetry shared between the tick loop and every
+/// connection writer task. Everything here is a bounded counter or a small
+/// bounded record list.
+#[derive(Default)]
+struct ServerTelemetry {
+    /// Optional per-connection baseline pacing (bytes/s). `None`: unpaced.
+    baseline_rate_limit: Option<u64>,
+    /// Longest wait of any reliable message from enqueue to transport hand-off.
+    max_delivery_age_us: std::sync::atomic::AtomicU64,
+    baseline_sends_started: std::sync::atomic::AtomicU64,
+    baseline_sends_active: std::sync::atomic::AtomicU64,
+    baseline_sends_active_max: std::sync::atomic::AtomicU64,
+    baseline_sends_failed: std::sync::atomic::AtomicU64,
+    baseline_send_bytes: std::sync::atomic::AtomicU64,
+    /// Completed baseline sends (bounded), oldest first.
+    baseline_sends: Mutex<Vec<BaselineSendRecord>>,
+}
+
+/// One completed baseline transfer to one client.
+#[derive(Debug, Clone, Serialize)]
+pub struct BaselineSendRecord {
+    pub session_slot: u32,
+    pub payload_bytes: u64,
+    pub duration_ms: u64,
+}
+
+const MAX_BASELINE_SEND_RECORDS: usize = 256;
+
+/// RAII counter for [`ServerTelemetry::baseline_sends_active`].
+struct ActiveBaselineSend<'a>(&'a ServerTelemetry);
+
+impl<'a> ActiveBaselineSend<'a> {
+    fn begin(t: &'a ServerTelemetry) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        t.baseline_sends_started.fetch_add(1, Relaxed);
+        let now = t.baseline_sends_active.fetch_add(1, Relaxed) + 1;
+        t.baseline_sends_active_max.fetch_max(now, Relaxed);
+        Self(t)
+    }
+}
+
+impl Drop for ActiveBaselineSend<'_> {
+    fn drop(&mut self) {
+        self.0
+            .baseline_sends_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -973,6 +1096,9 @@ impl OutboundHandle {
     /// Takes everything queued in one pass.
     fn take(&self) -> OutboundBatch {
         let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let meta: Vec<_> = q.reliable_meta.drain(..).collect();
+        q.inflight.extend(meta);
+        q.reliable_bytes = 0;
         OutboundBatch {
             reliable: q.reliable.drain(..).collect(),
             motion: q.motion.take(),
@@ -990,12 +1116,29 @@ impl OutboundHandle {
             .reliable_bytes
     }
 
+    /// The writer finished handing the oldest in-flight reliable message to the
+    /// transport. Returns how long it waited from enqueue to hand-off.
+    fn delivered(&self) -> Duration {
+        let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.inflight
+            .pop_front()
+            .map_or(Duration::ZERO, |(t, _)| t.elapsed())
+    }
+
+    /// Unsent reliable bytes (queued plus taken-but-not-handed-off) and the age
+    /// of the oldest unsent message.
+    fn backlog(&self) -> (usize, Duration) {
+        let q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.backlog(std::time::Instant::now())
+    }
+
     async fn woken(&self) {
         self.inner.wake.notified().await;
     }
 }
 
 async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
+    RELIABLE_BACKLOG_OVERFLOWS.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -1054,6 +1197,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     // `session.raw()` — same close-once-counted discipline as the aggregate
     // version above.
     let egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let telemetry = Arc::new(ServerTelemetry {
+        baseline_rate_limit: config.baseline_rate_limit_bytes_per_sec,
+        ..ServerTelemetry::default()
+    });
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -1063,6 +1210,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let server = server.clone();
         let clients = clients.clone();
         let conns = conns.clone();
+        let telemetry = telemetry.clone();
         let egress_closed = egress_closed.clone();
         let inbound_tx = inbound_tx.clone();
         let stop_rx = stop_rx.clone();
@@ -1106,6 +1254,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     clients.clone(),
                     conns.clone(),
                     egress_closed.clone(),
+                    telemetry.clone(),
                     stop_rx.clone(),
                 ));
             }
@@ -1151,6 +1300,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let motion_interest = config.motion_interest;
     let scene = config.scene;
     let clients_for_sim = clients.clone();
+    let conns_for_sim = conns.clone();
     let save = config.save.clone();
     let save_faults = config.save_faults.clone();
     let checkpoint_interval = config.checkpoint_interval_ticks;
@@ -1241,6 +1391,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // instead of every connected client.
         let mut submitted_by: HashMap<RequestId, SessionId> = HashMap::new();
         let mut commit_latency = CommitLatency::default();
+        // T23 / G4: requests that are a "named blast" (4 m diameter or larger)
+        // and the server ticks at which each committed.
+        let mut blast_requests: std::collections::HashSet<RequestId> =
+            std::collections::HashSet::new();
+        let mut blast_commit_ticks: Vec<u64> = Vec::new();
+        let mut sampler = TelemetrySampler::new(std::time::Instant::now(), conns_for_sim.clone());
 
         // T21 / ENG-28 increment 4 (3c): default-off passes. `None` -> every
         // counter below stays `0` and neither pass is ever called, so an
@@ -1382,6 +1538,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                         .entry(req.request_id)
                                         .or_insert_with(std::time::Instant::now);
                                     submitted_by.entry(req.request_id).or_insert(session);
+                                    if req.claimed_brush.radius_units()
+                                        >= BLAST_MIN_RADIUS_CELLS * spall_core::BRUSH_UNIT
+                                    {
+                                        blast_requests.insert(req.request_id);
+                                    }
                                     actions_staged += 1;
                                     send_to(
                                         &clients_for_sim,
@@ -1435,6 +1596,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             };
             ticks_run += 1;
             let tick = sim.current_tick();
+            if ticks_run % 6 == 0 {
+                sampler.observe_backlog(&clients_for_sim);
+            }
+            if ticks_run % 60 == 0 {
+                sampler.sample(ticks_run);
+            }
 
             // T21 / ENG-28 increment 4 (3c): opt-in contact damage + region
             // dormancy, run every tick right after the commit they react to.
@@ -1482,6 +1649,9 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
             for (rid, committed) in &report.committed {
                 committed_total += 1;
+                if blast_requests.remove(rid) {
+                    blast_commit_ticks.push(ticks_run);
+                }
                 // T17 increment 2: a giant split ships its geometry out of band
                 // as a `BaselineTransfer`, keyed to the transaction by
                 // `transfer_id` (= the split's `TransactionId` | high bit).
@@ -1783,6 +1953,14 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         }
 
         SimResult {
+            samples: sampler.samples,
+            blast_commit_ticks,
+            backlog_peak_bytes: sampler.peak_bytes.max(sampler.interval_bytes),
+            backlog_peak_age_ms: sampler.peak_age_ms.max(sampler.interval_age_ms),
+            capture_pool_workers: lj.capture_pool.workers,
+            capture_pool_submitted: lj.capture_pool.stats.submitted.load(std::sync::atomic::Ordering::Relaxed),
+            capture_pool_active_max: lj.capture_pool.stats.active_max.load(std::sync::atomic::Ordering::Relaxed),
+            capture_pool_queued_max: lj.capture_pool.stats.queued_max.load(std::sync::atomic::Ordering::Relaxed),
             ok: shutdown_error.is_none(),
             error: shutdown_error,
             ticks_run,
@@ -1842,7 +2020,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             contact_damage_cuts_rejected,
             dormancy_deactivations_total,
             dormancy_reactivations_total,
-            timing: timing.map(|stats| stats.finish(ticks_run)),
+            timing: timing.map(|stats| stats.finish(ticks_run)).unwrap_or_default(),
         }
     });
 
@@ -1921,7 +2099,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // residency_checkpoint_bricks_logical_total (incremental checkpoint
         // capture evidence).
         // v9: T23 / G4 bounded owning-tick and physics timing telemetry.
-        version: 9,
+        // v10: T23 / G4 per-60-tick samples (memory, backlog, per-connection
+        // egress), blast ticks, backlog peaks/caps, baseline-send and
+        // capture-pool concurrency.
+        version: 10,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -2036,6 +2217,39 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         physics_max_ms: sim_result.timing.physics_max_ms,
         physics_samples: sim_result.timing.physics_samples,
         physics_window_complete: sim_result.timing.window_complete,
+        tick_busy_over_budget_ticks: sim_result.timing.over_budget_ticks,
+        telemetry_samples: sim_result.samples.clone(),
+        blast_commit_ticks: sim_result.blast_commit_ticks.clone(),
+        reliable_backlog_peak_bytes: sim_result.backlog_peak_bytes,
+        reliable_backlog_peak_age_ms: sim_result.backlog_peak_age_ms,
+        reliable_delivery_age_max_ms: telemetry
+            .max_delivery_age_us
+            .load(std::sync::atomic::Ordering::Relaxed)
+            / 1_000,
+        reliable_backlog_cap_messages: MAX_RELIABLE_BACKLOG,
+        reliable_backlog_cap_bytes: MAX_RELIABLE_BACKLOG_BYTES,
+        reliable_backlog_overflows: RELIABLE_BACKLOG_OVERFLOWS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        baseline_sends_started: telemetry
+            .baseline_sends_started
+            .load(std::sync::atomic::Ordering::Relaxed),
+        baseline_sends_failed: telemetry
+            .baseline_sends_failed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        baseline_sends_active_max: telemetry
+            .baseline_sends_active_max
+            .load(std::sync::atomic::Ordering::Relaxed),
+        baseline_send_records: telemetry
+            .baseline_sends
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        baseline_rate_limit_bytes_per_sec: telemetry.baseline_rate_limit,
+        capture_pool_workers: sim_result.capture_pool_workers,
+        capture_pool_submitted: sim_result.capture_pool_submitted,
+        capture_pool_active_max: sim_result.capture_pool_active_max,
+        capture_pool_queued_max: sim_result.capture_pool_queued_max,
+        process_end_memory_bytes: crate::mem_stats::process_current_bytes(),
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -2052,6 +2266,99 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     Ok(summary)
 }
 
+/// A request whose brush radius is at least this many cells (`8` cells at the
+/// `0.25 m` cell size is the G4 "4 m diameter blast") is a named blast for
+/// telemetry.
+pub const BLAST_MIN_RADIUS_CELLS: i64 = 8;
+
+/// Most retained [`TelemetrySample`]s per run (one per 60 ticks: over 2 hours).
+const MAX_TELEMETRY_SAMPLES: usize = 8192;
+
+/// One connection's cumulative egress at a [`TelemetrySample`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientEgressSample {
+    pub slot: u32,
+    pub app_bytes: u64,
+    pub transport_bytes: u64,
+}
+
+/// T23 / G4: one once-per-60-ticks observation. `elapsed_ms` is wall clock
+/// since the tick loop began, so rates are computed against real time, not
+/// nominal ticks. Backlog maxima cover the interval since the previous sample.
+#[derive(Debug, Clone, Serialize)]
+pub struct TelemetrySample {
+    pub tick: u64,
+    pub elapsed_ms: u64,
+    pub process_bytes: Option<u64>,
+    pub backlog_max_bytes: u64,
+    pub backlog_max_age_ms: u64,
+    pub clients: Vec<ClientEgressSample>,
+}
+
+struct TelemetrySampler {
+    start: std::time::Instant,
+    conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
+    samples: Vec<TelemetrySample>,
+    interval_bytes: u64,
+    interval_age_ms: u64,
+    peak_bytes: u64,
+    peak_age_ms: u64,
+}
+
+impl TelemetrySampler {
+    fn new(start: std::time::Instant, conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>) -> Self {
+        Self {
+            start,
+            conns,
+            samples: Vec::new(),
+            interval_bytes: 0,
+            interval_age_ms: 0,
+            peak_bytes: 0,
+            peak_age_ms: 0,
+        }
+    }
+
+    /// Folds every client's current unsent reliable backlog into the interval
+    /// maxima.
+    fn observe_backlog(&mut self, clients: &ClientMap) {
+        let guard = clients.lock().unwrap_or_else(|e| e.into_inner());
+        for handle in guard.values() {
+            let (bytes, age) = handle.backlog();
+            self.interval_bytes = self.interval_bytes.max(bytes as u64);
+            self.interval_age_ms = self.interval_age_ms.max(age.as_millis() as u64);
+        }
+    }
+
+    fn sample(&mut self, tick: u64) {
+        let mut clients: Vec<ClientEgressSample> = self
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|conn| ClientEgressSample {
+                slot: conn.session().slot().0,
+                app_bytes: conn.stats().app_bytes_sent,
+                transport_bytes: conn.transport_stats().udp_tx.bytes,
+            })
+            .collect();
+        clients.sort_by_key(|c| c.slot);
+        self.peak_bytes = self.peak_bytes.max(self.interval_bytes);
+        self.peak_age_ms = self.peak_age_ms.max(self.interval_age_ms);
+        if self.samples.len() < MAX_TELEMETRY_SAMPLES {
+            self.samples.push(TelemetrySample {
+                tick,
+                elapsed_ms: self.start.elapsed().as_millis() as u64,
+                process_bytes: crate::mem_stats::process_current_bytes(),
+                backlog_max_bytes: self.interval_bytes,
+                backlog_max_age_ms: self.interval_age_ms,
+                clients,
+            });
+        }
+        self.interval_bytes = 0;
+        self.interval_age_ms = 0;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct TimingReport {
     tick_busy_p95_ms: f64,
@@ -2062,6 +2369,7 @@ struct TimingReport {
     physics_p99_ms: f64,
     physics_max_ms: f64,
     physics_samples: u64,
+    over_budget_ticks: u64,
     window_complete: bool,
 }
 
@@ -2108,6 +2416,11 @@ impl TimingCollector {
             physics_p99_ms: percentile(&self.physics_ms, 0.99),
             physics_max_ms: self.physics_ms.iter().copied().fold(0.0, f64::max),
             physics_samples: self.physics_ms.len() as u64,
+            over_budget_ticks: self
+                .tick_busy_ms
+                .iter()
+                .filter(|ms| **ms > 1_000.0 / 60.0)
+                .count() as u64,
             window_complete: self.window.measured_ticks > 0 && ticks_run >= window_end,
         }
     }
@@ -2126,6 +2439,14 @@ fn percentile(samples: &[f64], fraction: f64) -> f64 {
 }
 
 struct SimResult {
+    samples: Vec<TelemetrySample>,
+    blast_commit_ticks: Vec<u64>,
+    backlog_peak_bytes: u64,
+    backlog_peak_age_ms: u64,
+    capture_pool_workers: usize,
+    capture_pool_submitted: u64,
+    capture_pool_active_max: u64,
+    capture_pool_queued_max: u64,
     ok: bool,
     error: Option<String>,
     ticks_run: u64,
@@ -2180,6 +2501,14 @@ struct SimResult {
 impl SimResult {
     fn error(msg: String, ticks_run: u64) -> Self {
         Self {
+            samples: Vec::new(),
+            blast_commit_ticks: Vec::new(),
+            backlog_peak_bytes: 0,
+            backlog_peak_age_ms: 0,
+            capture_pool_workers: 0,
+            capture_pool_submitted: 0,
+            capture_pool_active_max: 0,
+            capture_pool_queued_max: 0,
             ok: false,
             error: Some(msg),
             ticks_run,
@@ -2274,8 +2603,20 @@ struct ClientLink {
 /// `spall_server` for one bounded-queue primitive would cut against this
 /// project's stated preference for minimal dependencies; a channel plus a
 /// fixed set of threads is a handful of lines and needs no new crate.
+/// Observed capture-pool load (T23 / G4 join/baseline concurrency evidence).
+#[derive(Default)]
+struct CapturePoolStats {
+    submitted: std::sync::atomic::AtomicU64,
+    started: std::sync::atomic::AtomicU64,
+    finished: std::sync::atomic::AtomicU64,
+    active_max: std::sync::atomic::AtomicU64,
+    queued_max: std::sync::atomic::AtomicU64,
+}
+
 struct CapturePool {
     job_tx: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
+    stats: Arc<CapturePoolStats>,
+    workers: usize,
 }
 
 impl CapturePool {
@@ -2303,7 +2644,11 @@ impl CapturePool {
                 }
             });
         }
-        Self { job_tx }
+        Self {
+            job_tx,
+            stats: Arc::new(CapturePoolStats::default()),
+            workers,
+        }
     }
 
     /// Enqueues `job` for the next free worker. Never blocks the caller (the
@@ -2315,7 +2660,18 @@ impl CapturePool {
         // any known input. If it ever did happen, the caller's
         // `pending_captures` entry simply never resolves rather than
         // panicking the tick loop.
-        let _ = self.job_tx.send(Box::new(job));
+        use std::sync::atomic::Ordering::Relaxed;
+        let stats = Arc::clone(&self.stats);
+        let submitted = stats.submitted.fetch_add(1, Relaxed) + 1;
+        let queued = submitted.saturating_sub(stats.started.load(Relaxed));
+        stats.queued_max.fetch_max(queued, Relaxed);
+        let _ = self.job_tx.send(Box::new(move || {
+            let started = stats.started.fetch_add(1, Relaxed) + 1;
+            let active = started.saturating_sub(stats.finished.load(Relaxed));
+            stats.active_max.fetch_max(active, Relaxed);
+            job();
+            stats.finished.fetch_add(1, Relaxed);
+        }));
     }
 }
 
@@ -3241,7 +3597,44 @@ fn replay_admitted_status(sim: &Simulation, request: RequestId) -> Option<Action
 /// stream, every part on a fresh bulk stream, then `BaselineEnd` on control.
 /// Returns `false` if any leg fails (the writer loop then tears the connection
 /// down).
-async fn send_baseline(conn: &Connection, transfer: &BaselineTransfer) -> bool {
+async fn send_baseline(
+    conn: &Connection,
+    transfer: &BaselineTransfer,
+    telemetry: &ServerTelemetry,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _active = ActiveBaselineSend::begin(telemetry);
+    let started = std::time::Instant::now();
+    let ok = send_baseline_paced(conn, transfer, telemetry.baseline_rate_limit).await;
+    if ok {
+        let bytes = transfer.payload_bytes() as u64;
+        telemetry.baseline_send_bytes.fetch_add(bytes, Relaxed);
+        let mut records = telemetry
+            .baseline_sends
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if records.len() < MAX_BASELINE_SEND_RECORDS {
+            records.push(BaselineSendRecord {
+                session_slot: conn.session().slot().0,
+                payload_bytes: bytes,
+                duration_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+    } else {
+        telemetry.baseline_sends_failed.fetch_add(1, Relaxed);
+    }
+    ok
+}
+
+/// [`send_baseline`]'s wire work. With `rate_limit` set, the transfer is paced
+/// so the cumulative payload never runs ahead of `rate_limit` bytes/s, which
+/// keeps one joiner from consuming the link its neighbours' live topology
+/// shares.
+async fn send_baseline_paced(
+    conn: &Connection,
+    transfer: &BaselineTransfer,
+    rate_limit: Option<u64>,
+) -> bool {
     if conn
         .send_record(WireRecord::BaselineBegin(transfer.begin.clone()))
         .await
@@ -3253,9 +3646,16 @@ async fn send_baseline(conn: &Connection, transfer: &BaselineTransfer) -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
+    let started = tokio::time::Instant::now();
+    let mut sent = 0u64;
     for part in transfer.parts.iter() {
         if bulk.send_part(part).await.is_err() {
             return false;
+        }
+        if let Some(rate) = rate_limit.filter(|r| *r > 0) {
+            sent += part.payload.len() as u64;
+            let due = Duration::from_secs_f64(sent as f64 / rate as f64);
+            tokio::time::sleep_until(started + due).await;
         }
     }
     if bulk.finish().is_err() {
@@ -3286,6 +3686,7 @@ async fn serve_conn(
     clients: ClientMap,
     conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
     egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>>,
+    telemetry: Arc<ServerTelemetry>,
     stop: watch::Receiver<bool>,
 ) {
     debug_assert_eq!(conn.role(), Role::Server);
@@ -3373,7 +3774,7 @@ async fn serve_conn(
                         .send_record(WireRecord::ActionStatus((*s).clone()))
                         .await
                         .is_ok(),
-                    Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
+                    Outbound::Baseline(transfer) => send_baseline(&conn, &transfer, &telemetry).await,
                     // Motion is never queued as reliable; ignore defensively.
                     Outbound::Motion(_) => true,
                     Outbound::Shutdown(reason) => {
@@ -3384,6 +3785,11 @@ async fn serve_conn(
                 if !ok {
                     break 'writer;
                 }
+                let age = handle.delivered();
+                telemetry.max_delivery_age_us.fetch_max(
+                    age.as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             if let Some(snaps) = batch.motion {
                 for snap in snaps.iter() {
@@ -4160,6 +4566,31 @@ mod tests {
             h.push(empty_tx()).is_err(),
             "further reliable traffic stays refused; the client is being dropped"
         );
+    }
+
+    /// Regression: the byte cap used to count every reliable byte ever queued on
+    /// the connection (`take` never reset it), so any long-lived client was
+    /// eventually disconnected however promptly its writer drained.
+    #[test]
+    fn a_draining_writer_never_trips_the_byte_cap_and_backlog_age_is_tracked() {
+        let h = OutboundHandle::new();
+        let per_msg = reliable_msg_bytes(&empty_tx());
+        let rounds = MAX_RELIABLE_BACKLOG_BYTES / per_msg * 3;
+        for i in 0..rounds {
+            assert!(h.push(empty_tx()).is_ok(), "push {i} refused by a drained queue");
+            let batch = h.take();
+            assert_eq!(batch.reliable.len(), 1);
+            let (bytes, _) = h.backlog();
+            assert_eq!(bytes, per_msg, "taken-but-undelivered bytes stay counted");
+            h.delivered();
+            assert_eq!(h.backlog().0, 0);
+        }
+        // A message waiting in the queue ages.
+        h.push(empty_tx()).unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        let (bytes, age) = h.backlog();
+        assert_eq!(bytes, per_msg);
+        assert!(age >= Duration::from_millis(10), "age {age:?}");
     }
 
     #[test]

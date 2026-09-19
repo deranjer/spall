@@ -22,6 +22,13 @@ pub fn process_peak_bytes() -> Option<u64> {
     imp::process_peak_bytes()
 }
 
+/// Current resident-set / working-set size of this process, in bytes (the
+/// sampled counterpart of [`process_peak_bytes`], for a memory-over-time
+/// series). `None` on an unsupported platform.
+pub fn process_current_bytes() -> Option<u64> {
+    imp::process_current_bytes()
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use std::mem::size_of;
@@ -60,6 +67,14 @@ mod imp {
     }
 
     pub fn process_peak_bytes() -> Option<u64> {
+        counters().map(|c| c.peak_working_set_size as u64)
+    }
+
+    pub fn process_current_bytes() -> Option<u64> {
+        counters().map(|c| c.working_set_size as u64)
+    }
+
+    fn counters() -> Option<ProcessMemoryCounters> {
         let mut counters = ProcessMemoryCounters {
             cb: size_of::<ProcessMemoryCounters>() as u32,
             page_fault_count: 0,
@@ -78,12 +93,24 @@ mod imp {
         let ok = unsafe {
             GetProcessMemoryInfo(GetCurrentProcess(), &mut counters as *mut _, counters.cb)
         };
-        (ok != 0).then_some(counters.peak_working_set_size as u64)
+        (ok != 0).then_some(counters)
     }
 }
 
 #[cfg(target_os = "linux")]
 mod imp {
+    /// Parses `VmRSS:` (current resident set, kibibytes).
+    pub fn process_current_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kib: u64 = rest.trim().trim_end_matches(" kB").trim().parse().ok()?;
+                return Some(kib.saturating_mul(1024));
+            }
+        }
+        None
+    }
+
     /// Parses `VmHWM:` (peak resident set, kibibytes) from
     /// `/proc/self/status`. Absent/unparseable -> `None`, never a guess.
     pub fn process_peak_bytes() -> Option<u64> {
@@ -100,6 +127,10 @@ mod imp {
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod imp {
+    pub fn process_current_bytes() -> Option<u64> {
+        None
+    }
+
     pub fn process_peak_bytes() -> Option<u64> {
         None
     }
