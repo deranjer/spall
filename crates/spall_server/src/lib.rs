@@ -45,7 +45,7 @@ pub use residency_pass::{
     PassTick, ResidencyLimits, ResidencyPass, ResidencyStats, total_resident_dense_bytes,
 };
 pub use serve::{
-    MotionInterest, PerClientEgress, Scene, ServeConfig, ServeError, ServeSummary,
+    MotionInterest, PerClientEgress, Scene, ServeConfig, ServeError, ServeSummary, TimingWindow,
     default_capture_workers, serve,
 };
 
