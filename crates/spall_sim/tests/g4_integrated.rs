@@ -519,3 +519,51 @@ fn first_sleeper_wake() {
         }
     }
 }
+
+/// Is the solver-awake set bounded by the *active* comb, not the accumulated
+/// rubble? Runs five minutes of the stream with the dormancy policy.
+#[test]
+#[ignore = "diagnostic: awake / dormant counts over five minutes"]
+fn awake_set_stays_bounded() {
+    let (mut sim, bodies) = scene();
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let (mut req, mut ordinary, mut blast) = (1u64, 0u64, 0u64);
+    for t in 0..(300 * 60u64) {
+        if t == 60 {
+            sim.submit(body_cut(req, vfix::g4_giant_cut())).unwrap();
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 6 == 0 {
+            let e = vfix::g4_ordinary_edit(ordinary).unwrap();
+            ordinary += 1;
+            sim.submit(body_cut(req, e)).unwrap();
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 600 == 300 {
+            sim.submit(body_cut(req, vfix::g4_blast(blast).unwrap())).unwrap();
+            blast += 1;
+            req += 1;
+        }
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+        if t % 3600 == 3599 {
+            let (mut awake, mut asleep, mut dormant) = (0, 0, 0);
+            for b in sim.world().bodies() {
+                if b.dormant {
+                    dormant += 1;
+                } else if b.sleeping {
+                    asleep += 1;
+                } else {
+                    awake += 1;
+                }
+            }
+            println!(
+                "{:>3} s: bodies {} awake {awake} asleep {asleep} dormant {dormant}; solver-active {}",
+                (t + 1) / 60,
+                sim.world().body_count(),
+                sim.world().physics().active_body_count()
+            );
+        }
+    }
+}
