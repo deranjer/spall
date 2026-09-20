@@ -7,7 +7,7 @@
 //! this one structure, so they are always describing exactly the same set of
 //! cells.
 
-use spall_core::{GlobalCell, MaterialId};
+use spall_core::{BrickCoord, GlobalCell, LocalCell, MaterialId};
 use spall_voxel::{Sample, Volume};
 
 /// Why occupancy extraction failed.
@@ -45,6 +45,107 @@ impl OccupancyGrid {
     /// Extracts the solid occupancy of an inclusive global-cell box
     /// `[min, max]`. Every cell in the box must be resident.
     pub fn from_region(
+        volume: &Volume,
+        min: GlobalCell,
+        max: GlobalCell,
+    ) -> Result<Self, ExtractError> {
+        Self::from_region_bricks(volume, min, max)
+    }
+
+    /// Brick-at-a-time extraction: a uniform brick is one comparison (air is
+    /// skipped outright), a dense brick is read straight from its snapshot
+    /// instead of one `Volume::sample` map lookup per cell. Bit-identical to
+    /// [`Self::from_region_reference`]; whenever a brick in the region is not
+    /// resident (or the region leaves the volume bounds) it defers to that
+    /// reference path so the error names exactly the same first unresident cell.
+    fn from_region_bricks(
+        volume: &Volume,
+        min: GlobalCell,
+        max: GlobalCell,
+    ) -> Result<Self, ExtractError> {
+        let extent = [max.x - min.x + 1, max.y - min.y + 1, max.z - min.z + 1];
+        if extent.iter().any(|&e| e <= 0) {
+            return Err(ExtractError::EmptyExtent(extent));
+        }
+        let dims = [extent[0] as u32, extent[1] as u32, extent[2] as u32];
+        let cells = dims[0] as u128 * dims[1] as u128 * dims[2] as u128;
+        if cells > MAX_GRID_CELLS {
+            return Err(ExtractError::TooLarge {
+                cells,
+                limit: MAX_GRID_CELLS,
+            });
+        }
+        let (lo, hi) = (min.split().0, max.split().0);
+        let mut snaps = Vec::new();
+        for bz in lo.z..=hi.z {
+            for by in lo.y..=hi.y {
+                for bx in lo.x..=hi.x {
+                    let coord = BrickCoord::new(bx, by, bz);
+                    match volume.snapshot_brick(coord) {
+                        Ok(Some(snap)) => snaps.push((coord, snap)),
+                        _ => return Self::from_region_reference(volume, min, max),
+                    }
+                }
+            }
+        }
+
+        let mut solid = vec![false; cells as usize];
+        let mut material = vec![MaterialId::AIR; cells as usize];
+        for (coord, snap) in &snaps {
+            let base = [coord.x * 32, coord.y * 32, coord.z * 32];
+            // The brick's overlap with the region, in global cells.
+            let g0 = [base[0].max(min.x), base[1].max(min.y), base[2].max(min.z)];
+            let g1 = [
+                (base[0] + 31).min(max.x),
+                (base[1] + 31).min(max.y),
+                (base[2] + 31).min(max.z),
+            ];
+            let uniform = if snap.is_dense() {
+                None
+            } else {
+                LocalCell::from_linear_index(0).map(|c| snap.get(c))
+            };
+            if uniform.is_some_and(|m| m.is_air()) {
+                continue;
+            }
+            for gz in g0[2]..=g1[2] {
+                for gy in g0[1]..=g1[1] {
+                    let row = Self::linear(
+                        dims,
+                        (g0[0] - min.x) as u32,
+                        (gy - min.y) as u32,
+                        (gz - min.z) as u32,
+                    );
+                    for (i, gx) in (g0[0]..=g1[0]).enumerate() {
+                        let m = match uniform {
+                            Some(m) => m,
+                            None => {
+                                let local = LocalCell::new(
+                                    (gx - base[0]) as u8,
+                                    (gy - base[1]) as u8,
+                                    (gz - base[2]) as u8,
+                                )
+                                .expect("overlap lies inside the brick");
+                                snap.get(local)
+                            }
+                        };
+                        if !m.is_air() {
+                            solid[row + i] = true;
+                            material[row + i] = m;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            origin: min,
+            dims,
+            solid,
+            material,
+        })
+    }
+
+    fn from_region_reference(
         volume: &Volume,
         min: GlobalCell,
         max: GlobalCell,
@@ -102,19 +203,36 @@ impl OccupancyGrid {
         let coords = volume.resident_brick_coords();
         let mut min = [i64::MAX; 3];
         let mut max = [i64::MIN; 3];
+        let mut extend = |cell: [i64; 3]| {
+            for a in 0..3 {
+                min[a] = min[a].min(cell[a]);
+                max[a] = max[a].max(cell[a]);
+            }
+        };
         for c in &coords {
             let base = [c.x * 32, c.y * 32, c.z * 32];
-            for lz in 0..32 {
-                for ly in 0..32 {
-                    for lx in 0..32 {
-                        let cell = GlobalCell::new(base[0] + lx, base[1] + ly, base[2] + lz);
-                        if let Ok(Sample::Filled(_)) = volume.sample(cell) {
-                            min[0] = min[0].min(cell.x);
-                            min[1] = min[1].min(cell.y);
-                            min[2] = min[2].min(cell.z);
-                            max[0] = max[0].max(cell.x);
-                            max[1] = max[1].max(cell.y);
-                            max[2] = max[2].max(cell.z);
+            let Ok(Some(snap)) = volume.snapshot_brick(*c) else {
+                continue;
+            };
+            if !snap.is_dense() {
+                // Uniform brick: one comparison decides the whole brick.
+                let solid = LocalCell::from_linear_index(0).is_some_and(|l| !snap.get(l).is_air());
+                if solid {
+                    extend(base);
+                    extend([base[0] + 31, base[1] + 31, base[2] + 31]);
+                }
+                continue;
+            }
+            for lz in 0..32u8 {
+                for ly in 0..32u8 {
+                    for lx in 0..32u8 {
+                        let local = LocalCell::new(lx, ly, lz).expect("in range");
+                        if !snap.get(local).is_air() {
+                            extend([
+                                base[0] + i64::from(lx),
+                                base[1] + i64::from(ly),
+                                base[2] + i64::from(lz),
+                            ]);
                         }
                     }
                 }
@@ -248,6 +366,55 @@ mod tests {
 
     fn vid(n: u64) -> spall_core::VolumeId {
         spall_core::VolumeId::new(n).unwrap()
+    }
+
+    /// The brick-at-a-time extraction is bit-identical to the original
+    /// cell-by-cell reference on uniform, dense, and partially overlapped
+    /// bricks (regions that start/stop mid-brick), and defers to it — with the
+    /// same error — when a brick is not resident.
+    #[test]
+    fn brick_extraction_matches_the_cell_by_cell_reference() {
+        let scenes = [
+            fixtures::separated_regions_scene(vid(1)),
+            fixtures::hollow_tower(vid(1)),
+            fixtures::giant_collapse_scene(vid(1)),
+        ];
+        for v in &scenes {
+            let full = OccupancyGrid::from_volume(v).unwrap().unwrap();
+            let o = full.origin();
+            let d = full.dims();
+            let hi = GlobalCell::new(
+                o.x + i64::from(d[0]) - 1,
+                o.y + i64::from(d[1]) - 1,
+                o.z + i64::from(d[2]) - 1,
+            );
+            let inner = [
+                (o, hi),
+                (
+                    GlobalCell::new(o.x + 5, o.y + 3, o.z + 7),
+                    GlobalCell::new(hi.x - 9, hi.y - 2, hi.z - 4),
+                ),
+            ];
+            for (lo, hi) in inner {
+                if lo.x > hi.x || lo.y > hi.y || lo.z > hi.z {
+                    continue;
+                }
+                let fast = OccupancyGrid::from_region_bricks(v, lo, hi).unwrap();
+                let slow = OccupancyGrid::from_region_reference(v, lo, hi).unwrap();
+                assert_eq!(fast.origin, slow.origin);
+                assert_eq!(fast.dims, slow.dims);
+                assert_eq!(fast.solid, slow.solid);
+                assert_eq!(fast.material, slow.material);
+            }
+        }
+        // A region reaching an absent brick: same error, same cell.
+        let v = fixtures::separated_regions_scene(vid(1));
+        let lo = GlobalCell::new(0, 0, 0);
+        let hi = GlobalCell::new(400, 5, 5);
+        assert_eq!(
+            OccupancyGrid::from_region_bricks(&v, lo, hi).unwrap_err(),
+            OccupancyGrid::from_region_reference(&v, lo, hi).unwrap_err()
+        );
     }
 
     #[test]
