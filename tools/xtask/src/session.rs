@@ -2529,6 +2529,11 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         let _ = fs::remove_file(&summary);
         client_summary_paths.push(summary.clone());
         let mut c = Command::new(sandbox_binary_profile("sandbox-client", profile));
+        if scenario.network_envelope.is_some() {
+            // Eight simultaneous handshakes over an impaired path exceeded the 5 s
+            // default (docs/reports/G3.md increment 38); the gate run raises it.
+            c.env("SPALL_HANDSHAKE_TIMEOUT_MS", "20000");
+        }
         c.args([
             "--connect",
             &targets[i as usize].to_string(),
