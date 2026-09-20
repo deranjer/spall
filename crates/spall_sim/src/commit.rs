@@ -126,6 +126,54 @@ impl From<crate::transfer::PlanChildError> for CommitError {
     }
 }
 
+/// The cells whose occupancy an edit actually changes in the parent volume (old
+/// vs new), as an inclusive global-cell box, plus how many solid cells leave the
+/// parent. A write that sets a cell to the material it already has changes nothing;
+/// every cell of a detached component leaves the parent.
+struct ChangedRegion {
+    min: [i64; 3],
+    max: [i64; 3],
+    removed_cells: u64,
+}
+
+fn changed_region(world: &SimWorld, vid: VolumeId, staged: &StagedEdit) -> Option<ChangedRegion> {
+    use spall_voxel::Sample;
+    let old = world.volume_ref(vid)?;
+    let mut min = [i64::MAX; 3];
+    let mut max = [i64::MIN; 3];
+    let mut removed = 0u64;
+    let mut touch = |c: spall_core::GlobalCell| {
+        for (a, v) in [c.x, c.y, c.z].into_iter().enumerate() {
+            min[a] = min[a].min(v);
+            max[a] = max[a].max(v);
+        }
+    };
+    for w in &staged.plan.writes {
+        let before = match old.sample(w.cell) {
+            Ok(Sample::Filled(m)) => Some(m),
+            _ => None,
+        };
+        let after = (!w.material.is_air()).then_some(w.material);
+        if before != after {
+            touch(w.cell);
+            if before.is_some() && after.is_none() {
+                removed += 1;
+            }
+        }
+    }
+    for membership in &staged.memberships {
+        for cell in membership.cells() {
+            touch(cell);
+            removed += 1;
+        }
+    }
+    (min[0] != i64::MAX).then_some(ChangedRegion {
+        min,
+        max,
+        removed_cells: removed,
+    })
+}
+
 /// Commits `staged` into `world`, appending a journal entry on success.
 pub fn commit(
     world: &mut SimWorld,
@@ -241,6 +289,12 @@ pub fn commit(
         }
     }
 
+    let changed = changed_region(world, vid, staged);
+    let parent_solid_before = if parent_is_terrain {
+        0
+    } else {
+        world.volume_ref(vid).map_or(0, crate::world::solid_cells)
+    };
     let sp1 = crate::prof::Span::start("commit.clone_apply_edit");
     let mut parent_candidate: Volume = world
         .volume_ref(vid)
@@ -495,13 +549,41 @@ pub fn commit(
     let sp7 = crate::prof::Span::start("commit.publish_parent_collider");
     match parent_rebuild {
         Some((plan, mass_properties)) => {
-            world
-                .physics_mut()
-                .rebuild_collider(parent_phys, &plan.grid, plan.representation);
-            if let Some(mass_properties) = mass_properties {
-                world
-                    .physics_mut()
-                    .set_mass_properties(parent_phys, mass_properties);
+            match &changed {
+                // Wake only what the geometry change can affect (see
+                // `PhysicsWorld::rebuild_collider_localized`).
+                Some(ch) => {
+                    let m = cell_size.metres() as f32;
+                    let lo = [ch.min[0] as f32 * m, ch.min[1] as f32 * m, ch.min[2] as f32 * m];
+                    let hi = [
+                        (ch.max[0] + 1) as f32 * m,
+                        (ch.max[1] + 1) as f32 * m,
+                        (ch.max[2] + 1) as f32 * m,
+                    ];
+                    let removed_fraction = if parent_solid_before == 0 {
+                        0.0
+                    } else {
+                        ch.removed_cells as f32 / parent_solid_before as f32
+                    };
+                    world.physics_mut().rebuild_collider_localized(
+                        parent_phys,
+                        &plan.grid,
+                        plan.representation,
+                        mass_properties,
+                        (lo, hi),
+                        removed_fraction,
+                    );
+                }
+                None => {
+                    world
+                        .physics_mut()
+                        .rebuild_collider(parent_phys, &plan.grid, plan.representation);
+                    if let Some(mass_properties) = mass_properties {
+                        world
+                            .physics_mut()
+                            .set_mass_properties(parent_phys, mass_properties);
+                    }
+                }
             }
             if let Some(parent) = world.volume_body_mut(vid) {
                 parent.collider_revision += 1;

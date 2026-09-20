@@ -12,9 +12,10 @@
 //! dormant. Dormancy deactivate/reactivate themselves woke nobody (0 of ~6,800
 //! each) but churned continuously.
 //!
-//! The first two tests pin the mechanism and its locality; the third states the
-//! required behaviour (a commit must wake only bodies whose support could have
-//! changed) and is `#[ignore]`d until a targeted-wake change is authorised.
+//! The first two tests pin the mechanism and its locality; the rest state the
+//! required behaviour: a commit wakes only bodies whose support could have changed
+//! (`PhysicsWorld::rebuild_collider_localized`), and a body whose support did change
+//! wakes and falls.
 
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
 use spall_core::{EntityId, SphereBrush};
@@ -160,12 +161,12 @@ fn an_edit_does_not_wake_an_unrelated_pile() {
     );
 }
 
-/// Required behaviour, not yet true: a cut near the *top* of a pole cannot change
-/// what supports a pile lying on the plate, so it must not wake that pile.
-/// Fails today because the rebuild wakes everything in contact with the collider.
+/// A cut near the *top* of a pole cannot change what supports a pile lying on the
+/// plate, so it must not wake that pile (or the comb it rests on). Regression for
+/// the mass-wake root cause: the collider rebuild used to wake every body in
+/// contact with the edited body wherever the cut landed.
 #[test]
-#[ignore = "fails until a targeted-wake change (wake only bodies whose support may have changed) is authorised"]
-fn a_commit_far_from_a_resting_pile_should_not_wake_it() {
+fn a_commit_far_from_a_resting_pile_does_not_wake_it() {
     let mut sim = scene();
     let (comb, cubes) = comb_with_pile(&mut sim, [30.0, 1.0, 30.0]);
     settle(&mut sim, 600);
@@ -176,9 +177,135 @@ fn a_commit_far_from_a_resting_pile_should_not_wake_it() {
     for _ in 0..10 {
         sim.tick().unwrap();
     }
-    assert_eq!(
-        awake_count(&sim, &cubes),
-        0,
-        "the pile should have stayed asleep"
+    assert_eq!(awake_count(&sim, &cubes), 0, "the pile stayed asleep");
+    assert!(
+        sim.world().body(comb).unwrap().sleeping,
+        "the comb itself kept sleeping: none of its contacts changed"
     );
+    let commit = sim
+        .world()
+        .wake_audit()
+        .unwrap()
+        .reasons
+        .iter()
+        .find(|(k, _)| k.starts_with("edit.commit_publish"))
+        .map(|(_, s)| *s)
+        .unwrap();
+    assert_eq!(commit.bodies_woken, 0, "the commit woke nobody: {commit:?}");
+}
+
+/// The converse, which must stay true: a body whose actual support was removed
+/// wakes and falls. A hole cut through the plate under one cube wakes that cube,
+/// which drops to the ground, while a cube on the far side of the plate stays put.
+#[test]
+fn removing_the_support_under_a_resting_body_wakes_it_and_it_falls() {
+    let mut sim = scene();
+    let (comb, cubes) = comb_with_pile(&mut sim, [30.0, 1.0, 30.0]);
+    settle(&mut sim, 600);
+    assert_eq!(awake_count(&sim, &cubes), 0);
+    let under = cubes[0];
+    let far = cubes[15];
+    let y0 = sim.world().body(under).unwrap().pose.translation_m[1];
+
+    // A 1 m radius hole through the plate under the first cube (plate cells y 0..1;
+    // the cube spans plate cells x 2..3, z 2..3).
+    sim.submit(EditIntent::cut(
+        RequestId(1),
+        EntityId::new(1).unwrap(),
+        EditTarget::Body(comb),
+        brush_cell([3, 1, 3], 4),
+    ))
+    .unwrap();
+    let mut woke = false;
+    for _ in 0..90 {
+        sim.tick().unwrap();
+        woke |= !sim.world().body(under).unwrap().sleeping;
+    }
+    let y1 = sim.world().body(under).unwrap().pose.translation_m[1];
+    assert!(woke, "the cube over the removed support woke");
+    assert!(y0 - y1 > 0.3, "and fell through the hole: {y0:.2} -> {y1:.2}");
+    // The hole also removes part of the plate's own ground contact, so the comb
+    // (and, through it, the pile) may legitimately wake; what must hold is that the
+    // cube far from the hole is still resting on the plate.
+    let far_y = sim.world().body(far).unwrap().pose.translation_m[1];
+    assert!((far_y - y0).abs() < 0.2, "the far cube stayed on the plate: {far_y:.2} vs {y0:.2}");
+}
+
+/// Terrain digs use the same rule: a dig far from a pile on the ground leaves it
+/// asleep, a dig right under it wakes it.
+#[test]
+fn terrain_digs_wake_only_bodies_near_the_dig() {
+    let mut sim = scene();
+    let mut pile = Vec::new();
+    for i in 0..3 {
+        for j in 0..3 {
+            pile.push(
+                sim.world_mut()
+                    .spawn_body(
+                        solid_block(2),
+                        BodyPose::new(
+                            glam::DQuat::IDENTITY,
+                            [60.0 + 0.6 * i as f64, 1.05, 40.0 + 0.6 * j as f64],
+                        ),
+                        [0.0; 3],
+                        [0.0; 3],
+                        2600.0,
+                        0,
+                    )
+                    .unwrap(),
+            );
+        }
+    }
+    settle(&mut sim, 600);
+    assert_eq!(awake_count(&sim, &pile), 0, "the pile settled");
+
+    // A dig ~20 m away.
+    sim.submit(EditIntent::cut(
+        RequestId(1),
+        EntityId::new(1).unwrap(),
+        EditTarget::Terrain,
+        brush_cell([160, 1, 160], 1),
+    ))
+    .unwrap();
+    for _ in 0..30 {
+        sim.tick().unwrap();
+    }
+    assert_eq!(awake_count(&sim, &pile), 0, "a distant dig woke nothing");
+
+    // A dig under the first cube (world x 60.0..60.5, z 40.0..40.5 -> cell 240, 160).
+    sim.submit(EditIntent::cut(
+        RequestId(2),
+        EntityId::new(1).unwrap(),
+        EditTarget::Terrain,
+        brush_cell([241, 2, 161], 2),
+    ))
+    .unwrap();
+    let mut woke = 0;
+    for _ in 0..30 {
+        sim.tick().unwrap();
+        woke = woke.max(awake_count(&sim, &pile));
+    }
+    assert!(woke > 0, "a dig under the pile woke the bodies above it");
+}
+
+#[test]
+#[ignore = "diagnostic"]
+fn debug_far_cut_audit() {
+    let mut sim = scene();
+    let (comb, cubes) = comb_with_pile(&mut sim, [30.0, 1.0, 30.0]);
+    settle(&mut sim, 600);
+    println!("comb asleep before: {}", sim.world().body(comb).unwrap().sleeping);
+    cut_pole(&mut sim, comb, 1, 38);
+    for k in 0..8 {
+        sim.tick().unwrap();
+        println!(
+            "tick {k}: comb asleep {}, awake cubes {}, bodies {}",
+            sim.world().body(comb).unwrap().sleeping,
+            awake_count(&sim, &cubes),
+            sim.world().body_count()
+        );
+    }
+    for (k, s) in &sim.world().wake_audit().unwrap().reasons {
+        println!("{k}: {s:?}");
+    }
 }

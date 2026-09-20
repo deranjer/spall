@@ -23,6 +23,19 @@ impl BodyId {
     }
 }
 
+/// Padding (metres, one 0.25 m cell) around a geometry edit's changed region when
+/// deciding which resting bodies it could affect.
+pub const WAKE_PAD_M: f32 = 0.25;
+/// A contact within this distance (metres) counts as touching for the support test.
+const WAKE_CONTACT_SLACK_M: f32 = 0.05;
+/// Removing at least this fraction of a body's cells is treated as able to shift its
+/// balance, so an asleep body is woken even if no contact is in the changed region.
+pub const WAKE_MASS_FRACTION: f32 = 0.25;
+const RESLEEP_MAX_DISPLACEMENT_M: f32 = 0.06;
+const RESLEEP_MAX_SPEED_MPS: f32 = 0.6;
+/// Steps over which a rebuilt collider's cold contacts may re-wake the pile.
+const RESLEEP_STEPS: u8 = 3;
+
 /// Fixed simulation configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct PhysicsConfig {
@@ -266,6 +279,9 @@ pub struct PhysicsWorld {
     /// this exists alongside `step`, not instead of it.
     pending_modified: Vec<ColliderHandle>,
     pending_removed: Vec<ColliderHandle>,
+    /// Sleeping, unaffected bodies whose pile a localized rebuild touched; Rapier
+    /// re-wakes them inside the next step (see `rebuild_collider_localized`).
+    pending_resleep: Vec<(RigidBodyHandle, Pose, u8)>,
 }
 
 impl PhysicsWorld {
@@ -299,6 +315,7 @@ impl PhysicsWorld {
             step_count: 0,
             pending_modified: Vec::new(),
             pending_removed: Vec::new(),
+            pending_resleep: Vec::new(),
         }
     }
 
@@ -384,6 +401,17 @@ impl PhysicsWorld {
         grid: &OccupancyGrid,
         rep: Representation,
     ) -> Duration {
+        self.rebuild_collider_impl(id, grid, rep, true, false)
+    }
+
+    fn rebuild_collider_impl(
+        &mut self,
+        id: BodyId,
+        grid: &OccupancyGrid,
+        rep: Representation,
+        wake_touching: bool,
+        in_place: bool,
+    ) -> Duration {
         let entry = &mut self.entries[id.0 as usize];
         debug_assert!(!entry.retired, "rebuild_collider on a retired body");
         if entry.retired {
@@ -399,8 +427,29 @@ impl PhysicsWorld {
         );
 
         let start = Instant::now();
+        if in_place {
+            // In place (only for a sleeping body whose support is untouched): keep the collider handle and every contact pair (and its
+            // warm-started manifolds) so unaffected neighbours see no pair churn;
+            // only the shape and its offset change.
+            let built = build_collider(grid, cell_m, rep);
+            let offset = grid_origin_offset_m(grid, cell_m);
+            if let Some(co) = self.colliders.get_mut(old_collider) {
+                co.set_shape(built.collider.shared_shape().clone());
+                co.set_translation_wrt_parent(Vector::new(offset[0], offset[1], offset[2]));
+                if mass_properties.is_none() {
+                    co.set_density(density);
+                }
+            }
+            if mass_properties.is_some() {
+                self.bodies[body].recompute_mass_properties_from_colliders(&self.colliders);
+            }
+            self.entries[id.0 as usize].representation = rep;
+            self.entries[id.0 as usize].collider_offset_m = offset;
+            self.pending_modified.push(old_collider);
+            return start.elapsed();
+        }
         self.colliders
-            .remove(old_collider, &mut self.islands, &mut self.bodies, true);
+            .remove(old_collider, &mut self.islands, &mut self.bodies, wake_touching);
         let built = build_collider(grid, cell_m, rep);
         let offset = grid_origin_offset_m(grid, cell_m);
         // The installed mass properties live on the rigid body and survive the
@@ -435,6 +484,173 @@ impl PhysicsWorld {
         total
     }
 
+    /// Applies a geometry edit to `id`'s collider **without** the blanket wake of
+    /// [`Self::rebuild_collider`], waking only what the change could affect.
+    ///
+    /// `changed_local_m` is the axis-aligned box, in the body's local frame
+    /// (metres), of the cells whose occupancy actually changed (old vs new). The
+    /// affected set is derived from that region and the current contact state:
+    ///
+    /// * every *other* body whose collider AABB touches the region (padded by
+    ///   [`WAKE_PAD_M`]) is woken: it could have been resting on removed matter or
+    ///   now overlap added matter;
+    /// * the edited body itself is woken only if it was awake, or one of its
+    ///   current contact points (its support: terrain or another body) lies inside
+    ///   the padded region, or the change removed at least [`WAKE_MASS_FRACTION`] of
+    ///   its cells (`removed_fraction`), which can shift its balance.
+    ///
+    /// An asleep body whose contacts are all outside the changed region and whose
+    /// balance is not materially altered stays asleep, and so do the bodies
+    /// resting on it (they are only connected to an awake island through it).
+    /// Returns the rebuild cost, as [`Self::rebuild_collider`] does.
+    pub fn rebuild_collider_localized(
+        &mut self,
+        id: BodyId,
+        grid: &OccupancyGrid,
+        rep: Representation,
+        mass_properties: Option<BodyMassProperties>,
+        changed_local_m: ([f32; 3], [f32; 3]),
+        removed_fraction: f32,
+    ) -> Duration {
+        let entry = &self.entries[id.0 as usize];
+        if entry.retired {
+            return Duration::ZERO;
+        }
+        let body = entry.body;
+        let old_collider = entry.collider;
+        let was_asleep = self.bodies[body].is_sleeping();
+
+        // Padded world-space box of the changed region.
+        let pose = *self.bodies[body].position();
+        let (lo, hi) = changed_local_m;
+        let mut wmin = [f32::MAX; 3];
+        let mut wmax = [f32::MIN; 3];
+        for corner in 0..8 {
+            let p = Vector::new(
+                if corner & 1 == 0 { lo[0] } else { hi[0] },
+                if corner & 2 == 0 { lo[1] } else { hi[1] },
+                if corner & 4 == 0 { lo[2] } else { hi[2] },
+            );
+            let w = pose.transform_point(p);
+            for (a, v) in [w.x, w.y, w.z].into_iter().enumerate() {
+                wmin[a] = wmin[a].min(v - WAKE_PAD_M);
+                wmax[a] = wmax[a].max(v + WAKE_PAD_M);
+            }
+        }
+        let inside = |p: Vector| {
+            p.x >= wmin[0]
+                && p.x <= wmax[0]
+                && p.y >= wmin[1]
+                && p.y <= wmax[1]
+                && p.z >= wmin[2]
+                && p.z <= wmax[2]
+        };
+
+        // Support: does any current contact of the old collider sit in the region?
+        let mut support_changed = false;
+        for pair in self.narrow_phase.contact_pairs_with(old_collider) {
+            let (own, other_is_1) = if pair.collider1 == old_collider {
+                (pair.collider1, false)
+            } else {
+                (pair.collider2, true)
+            };
+            let Some(own_collider) = self.colliders.get(own) else {
+                continue;
+            };
+            let other = if other_is_1 { pair.collider1 } else { pair.collider2 };
+            let other_body = self.colliders.get(other).and_then(|c| c.parent());
+            let other_dynamic = other_body.is_some_and(|b| self.bodies[b].is_dynamic());
+            for manifold in &pair.manifolds {
+                for point in &manifold.points {
+                    if point.dist > WAKE_CONTACT_SLACK_M {
+                        continue;
+                    }
+                    let local = if other_is_1 { point.local_p2 } else { point.local_p1 };
+                    let at = own_collider.position().transform_point(local);
+                    // A dynamic body resting *on* this one is a load, not support:
+                    // its own contact is handled through the affected set.
+                    let is_load = other_dynamic
+                        && other_body.is_some_and(|b| self.bodies[b].center_of_mass().y > at.y);
+                    if !is_load && inside(at) {
+                        support_changed = true;
+                    }
+                }
+            }
+        }
+
+        // Bodies (other than this one) whose collider touches the region.
+        let mut affected: Vec<RigidBodyHandle> = Vec::new();
+        for (_, collider) in self.colliders.iter() {
+            let Some(parent) = collider.parent() else {
+                continue;
+            };
+            if parent == body || !self.bodies[parent].is_dynamic() || !self.bodies[parent].is_sleeping()
+            {
+                continue;
+            }
+            let aabb = collider.compute_aabb();
+            if aabb.maxs.x >= wmin[0]
+                && aabb.mins.x <= wmax[0]
+                && aabb.maxs.y >= wmin[1]
+                && aabb.mins.y <= wmax[1]
+                && aabb.maxs.z >= wmin[2]
+                && aabb.mins.z <= wmax[2]
+            {
+                affected.push(parent);
+            }
+        }
+
+        let wake_self =
+            !was_asleep || support_changed || removed_fraction >= WAKE_MASS_FRACTION;
+
+        // Nothing this body rests on changed, so neither did the balance of
+        // anything resting on it. Rapier still re-wakes a modified collider's
+        // contact partners (and their sleeping islands) inside the next step;
+        // record the sleeping contact-connected set — derived from the contact
+        // graph *before* the old collider (and its pairs) is removed, minus every
+        // body the change could affect — so `step` can put back exactly those
+        // bodies if they were not actually moved.
+        let mut resleep: Vec<(RigidBodyHandle, Pose, u8)> = Vec::new();
+        if !wake_self {
+            let mut seen = vec![body];
+            let mut queue = vec![body];
+            while let Some(b) = queue.pop() {
+                let colliders: Vec<ColliderHandle> = self.bodies[b].colliders().to_vec();
+                for c in colliders {
+                    for pair in self.narrow_phase.contact_pairs_with(c) {
+                        let other = if pair.collider1 == c { pair.collider2 } else { pair.collider1 };
+                        let Some(p) = self.colliders.get(other).and_then(|c| c.parent()) else {
+                            continue;
+                        };
+                        if seen.contains(&p)
+                            || affected.contains(&p)
+                            || !self.bodies[p].is_dynamic()
+                            || !self.bodies[p].is_sleeping()
+                        {
+                            continue;
+                        }
+                        seen.push(p);
+                        queue.push(p);
+                    }
+                }
+            }
+            resleep = seen.into_iter().map(|b| (b, *self.bodies[b].position(), RESLEEP_STEPS)).collect();
+        }
+
+        let cost = self.rebuild_collider_impl(id, grid, rep, false, !wake_self);
+        if let Some(props) = mass_properties {
+            self.set_mass_properties_impl(id, props, false);
+        }
+        for handle in &affected {
+            self.bodies[*handle].wake_up(true);
+        }
+        if wake_self {
+            self.bodies[body].wake_up(true);
+        }
+        self.pending_resleep.extend(resleep);
+        cost
+    }
+
     /// Installs `props` — mass / COM / full inertia derived from a body's fine
     /// material grid — into the body, replacing whatever it carried. The
     /// collision shape is untouched and contributes no mass. Call this after a
@@ -445,6 +661,10 @@ impl PhysicsWorld {
     /// its collider is already massless); otherwise the shape's own mass would
     /// be added on top of `props`.
     pub fn set_mass_properties(&mut self, id: BodyId, props: BodyMassProperties) {
+        self.set_mass_properties_impl(id, props, true);
+    }
+
+    fn set_mass_properties_impl(&mut self, id: BodyId, props: BodyMassProperties, wake: bool) {
         let entry = &mut self.entries[id.0 as usize];
         debug_assert!(!entry.retired, "set_mass_properties on a retired body");
         if entry.retired {
@@ -458,7 +678,7 @@ impl PhysicsWorld {
         let body = entry.body;
         let offset = entry.collider_offset_m;
         let rb = &mut self.bodies[body];
-        rb.set_additional_mass_properties(rapier_mass_properties(props, offset), true);
+        rb.set_additional_mass_properties(rapier_mass_properties(props, offset), wake);
         rb.recompute_mass_properties_from_colliders(&self.colliders);
     }
 
@@ -704,6 +924,33 @@ impl PhysicsWorld {
             &(),
             &(),
         );
+        // Put back the bodies a localized rebuild left untouched (see
+        // `rebuild_collider_localized`). Swapping the collider re-creates its
+        // contacts cold, so the re-woken pile shifts by a few centimetres while
+        // they re-converge; that is a solver artefact, not a response to a change
+        // in support (those bodies are excluded from this list). A body that moved
+        // more than the tolerance was genuinely disturbed and stays awake.
+        for (handle, at, left) in std::mem::take(&mut self.pending_resleep) {
+            let Some(rb) = self.bodies.get_mut(handle) else {
+                continue;
+            };
+            let moved = (rb.position().translation - at.translation).length();
+            if !rb.is_sleeping() {
+                if moved < RESLEEP_MAX_DISPLACEMENT_M
+                    && rb.linvel().length() < RESLEEP_MAX_SPEED_MPS
+                    && rb.angvel().length() < RESLEEP_MAX_SPEED_MPS
+                {
+                    rb.set_linvel(Vector::ZERO, false);
+                    rb.set_angvel(Vector::ZERO, false);
+                    rb.sleep();
+                } else {
+                    continue; // genuinely disturbed: stays awake, no longer tracked
+                }
+            }
+            if left > 1 {
+                self.pending_resleep.push((handle, at, left - 1));
+            }
+        }
         let pipeline = start.elapsed();
         self.step_count += 1;
         StepTiming {
