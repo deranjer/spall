@@ -824,6 +824,9 @@ pub struct ServeSummary {
     pub capture_pool_queued_max: u64,
     /// Working-set bytes of this process when the run ended.
     pub process_end_memory_bytes: Option<u64>,
+    /// Joins refused with `server at capacity` (live connections were at
+    /// `max_clients`).
+    pub admission_refused_at_capacity: u64,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -1069,6 +1072,22 @@ struct ServerTelemetry {
     baseline_send_bytes: std::sync::atomic::AtomicU64,
     /// Completed baseline sends (bounded), oldest first.
     baseline_sends: Mutex<Vec<BaselineSendRecord>>,
+    /// Connections admitted and not yet finished (the admission cap counts
+    /// these, not connections ever accepted).
+    live_connections: std::sync::atomic::AtomicUsize,
+    /// Joins refused because `max_clients` connections were already live.
+    admission_refused: std::sync::atomic::AtomicU64,
+}
+
+/// Releases one admission slot when a connection's task ends, however it ends.
+struct LiveConnection(Arc<ServerTelemetry>);
+
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        self.0
+            .live_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// One completed baseline transfer to one client.
@@ -1275,10 +1294,24 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         continue;
                     }
                 };
-                if connected >= max_clients {
+                // Admission counts connections that are *live now*. It used to
+                // count every connection ever accepted, so a server that had
+                // admitted `max_clients` sessions over its life -- however
+                // many had since left -- refused every later join forever.
+                if telemetry
+                    .live_connections
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    >= max_clients
+                {
+                    telemetry
+                        .admission_refused
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     conn.close("server at capacity");
                     continue;
                 }
+                telemetry
+                    .live_connections
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 connected += 1;
                 let _ = count_tx.send(connected);
                 let handle = OutboundHandle::new();
@@ -1650,7 +1683,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 sampler.observe_backlog(&clients_for_sim);
             }
             if ticks_run % 60 == 0 {
-                sampler.sample(ticks_run, body_census(sim.world(), observer));
+                sampler.sample(ticks_run, body_census(sim.world(), observer, !agitated.is_empty()));
             }
 
             // T21 / ENG-28 increment 4 (3c): opt-in contact damage + region
@@ -2300,6 +2333,9 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         capture_pool_active_max: sim_result.capture_pool_active_max,
         capture_pool_queued_max: sim_result.capture_pool_queued_max,
         process_end_memory_bytes: crate::mem_stats::process_current_bytes(),
+        admission_refused_at_capacity: telemetry
+            .admission_refused
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -2349,6 +2385,10 @@ pub struct TelemetrySample {
     pub bodies_dormant: u64,
     pub bodies_awake: u64,
     pub near_observer_awake: u64,
+    /// T23 / G4: `y` (m) of the giant body's origin (entity `1`) in the
+    /// integrated scene; `None` elsewhere. It falls `~8 m` when the column is
+    /// severed and the 64-brick block comes down.
+    pub giant_origin_y_m: Option<f64>,
 }
 
 /// A [`TelemetrySample`]'s body census.
@@ -2358,10 +2398,21 @@ struct BodyCensus {
     dormant: u64,
     awake: u64,
     near_observer_awake: u64,
+    giant_y: Option<f64>,
 }
 
-fn body_census(world: &spall_sim::SimWorld, observer: [f64; 3]) -> BodyCensus {
+fn body_census(
+    world: &spall_sim::SimWorld,
+    observer: [f64; 3],
+    integrated: bool,
+) -> BodyCensus {
     let mut c = BodyCensus::default();
+    if integrated {
+        c.giant_y = spall_core::EntityId::new(spall_voxel::fixtures::G4_ENTITY_FIRST)
+            .ok()
+            .and_then(|e| world.body(e))
+            .map(|b| b.pose.translation_m[1]);
+    }
     for b in world.bodies() {
         c.total += 1;
         if b.dormant {
@@ -2441,6 +2492,7 @@ impl TelemetrySampler {
                 bodies_dormant: census.dormant,
                 bodies_awake: census.awake,
                 near_observer_awake: census.near_observer_awake,
+                giant_origin_y_m: census.giant_y,
             });
         }
         self.interval_bytes = 0;
@@ -2965,7 +3017,7 @@ impl LateJoin {
             }
         }
         // A current motion keyframe for every body (`docs/protocol.md` step 4).
-        let keyframe = motion.snapshots(sim.world(), sim.current_tick());
+        let keyframe = motion.full_snapshots(sim.world(), sim.current_tick());
         if !keyframe.is_empty() {
             send_to(clients, session, Outbound::Motion(Arc::new(keyframe)));
         }
@@ -3778,6 +3830,7 @@ async fn serve_conn(
     telemetry: Arc<ServerTelemetry>,
     stop: watch::Receiver<bool>,
 ) {
+    let _slot = LiveConnection(telemetry.clone());
     debug_assert_eq!(conn.role(), Role::Server);
     let session = conn.session();
 
