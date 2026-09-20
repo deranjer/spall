@@ -336,3 +336,66 @@ fn repair_reply_reconstructs_a_diverged_brick() {
         in_brick(&solid_cells(&world.volume_ref(terrain).unwrap().clone())),
     );
 }
+
+/// A body at rest (dormant) is published once when it comes to rest, then only
+/// on the 5 s resync batch; a joiner's `full_snapshots` still carries it; and a
+/// body that wakes is published every batch again. (Measured cost of the old
+/// behaviour: 4,096 resting bodies within a client's near interest streamed at
+/// 20 Hz cost one client 4.5 MB/s.)
+#[test]
+fn resting_bodies_publish_once_then_only_on_resync() {
+    use spall_sim::REST_RESYNC_TICKS;
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let e = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(2),
+            spall_sim::BodyPose::new(glam::DQuat::IDENTITY, [2.0, 6.0, 2.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    let mut publisher = MotionPublisher::new(60, 20);
+    let has = |snaps: &[spall_protocol::MotionSnapshot]| snaps.iter().any(|s| s.body == e);
+
+    // Awake: every batch.
+    for t in [3u64, 6, 9] {
+        assert!(
+            has(&publisher.snapshots(sim.world(), Tick(t))),
+            "awake @{t}"
+        );
+    }
+    assert!(sim.world_mut().deactivate_body(e));
+    // First resting batch publishes the resting pose ...
+    assert!(has(&publisher.snapshots(sim.world(), Tick(12))));
+    // ... then it is skipped until a resync batch.
+    for t in [15u64, 18, 21, 60, 120] {
+        assert!(
+            !has(&publisher.snapshots(sim.world(), Tick(t))),
+            "resting @{t}"
+        );
+    }
+    assert!(has(
+        &publisher.snapshots(sim.world(), Tick(REST_RESYNC_TICKS))
+    ));
+    assert!(!has(
+        &publisher.snapshots(sim.world(), Tick(REST_RESYNC_TICKS + 3))
+    ));
+    // A late joiner's keyframe always has it.
+    assert!(has(
+        &publisher.full_snapshots(sim.world(), Tick(REST_RESYNC_TICKS + 4))
+    ));
+    // Waking restores per-batch publication.
+    assert!(sim.world_mut().reactivate_body(e));
+    // The solver refreshes the body's asleep flag on the next step.
+    sim.tick().unwrap();
+    for t in [REST_RESYNC_TICKS + 6, REST_RESYNC_TICKS + 9] {
+        assert!(
+            has(&publisher.snapshots(sim.world(), Tick(t))),
+            "woken @{t}"
+        );
+    }
+}

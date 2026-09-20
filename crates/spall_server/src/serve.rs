@@ -801,6 +801,50 @@ enum Outbound {
     Shutdown(&'static str),
 }
 
+/// Admission control for live connections. The cap counts connections that are
+/// live *now*: a slot is released when the connection's task ends, however it
+/// ends. (It used to count every connection ever accepted, so a server that had
+/// admitted `max_clients` sessions over its life refused every later join
+/// forever, however many had since left.)
+struct AdmissionGate {
+    max: usize,
+    live: std::sync::atomic::AtomicUsize,
+    refused: std::sync::atomic::AtomicU64,
+}
+
+/// One admitted connection's slot; dropping it frees the slot.
+struct AdmissionSlot(Arc<AdmissionGate>);
+
+impl AdmissionGate {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max,
+            live: std::sync::atomic::AtomicUsize::new(0),
+            refused: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// `Some(slot)` if fewer than `max` connections are live; otherwise counts a
+    /// refusal and returns `None`.
+    fn try_admit(self: &Arc<Self>) -> Option<AdmissionSlot> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.live.load(Relaxed) >= self.max {
+            self.refused.fetch_add(1, Relaxed);
+            return None;
+        }
+        self.live.fetch_add(1, Relaxed);
+        Some(AdmissionSlot(Arc::clone(self)))
+    }
+}
+
+impl Drop for AdmissionSlot {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
 
 /// A bounded per-client outbound queue (ENG-48).
@@ -941,6 +985,10 @@ impl OutboundHandle {
     /// Takes everything queued in one pass.
     fn take(&self) -> OutboundBatch {
         let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        // The writer now owns everything queued: reset the byte count with the
+        // queue, or the cap would count every reliable byte ever sent on this
+        // connection rather than what is waiting.
+        q.reliable_bytes = 0;
         OutboundBatch {
             reliable: q.reliable.drain(..).collect(),
             motion: q.motion.take(),
@@ -1034,7 +1082,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let egress_closed = egress_closed.clone();
         let inbound_tx = inbound_tx.clone();
         let stop_rx = stop_rx.clone();
-        let max_clients = config.max_clients;
+        let admission = AdmissionGate::new(config.max_clients);
         tokio::spawn(async move {
             let mut connected = 0usize;
             loop {
@@ -1052,10 +1100,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         continue;
                     }
                 };
-                if connected >= max_clients {
+                let Some(slot) = admission.try_admit() else {
                     conn.close("server at capacity");
                     continue;
-                }
+                };
                 connected += 1;
                 let _ = count_tx.send(connected);
                 let handle = OutboundHandle::new();
@@ -1075,6 +1123,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     conns.clone(),
                     egress_closed.clone(),
                     stop_rx.clone(),
+                    slot,
                 ));
             }
         })
@@ -2390,7 +2439,7 @@ impl LateJoin {
             }
         }
         // A current motion keyframe for every body (`docs/protocol.md` step 4).
-        let keyframe = motion.snapshots(sim.world(), sim.current_tick());
+        let keyframe = motion.full_snapshots(sim.world(), sim.current_tick());
         if !keyframe.is_empty() {
             send_to(clients, session, Outbound::Motion(Arc::new(keyframe)));
         }
@@ -3149,6 +3198,7 @@ async fn wait_true(mut rx: watch::Receiver<bool>) {
 
 /// One client connection: a reader that forwards records to the bridge and a
 /// writer that drains this client's outbound queue.
+#[allow(clippy::too_many_arguments)]
 async fn serve_conn(
     conn: Arc<Connection>,
     inbound: mpsc::Sender<Inbound>,
@@ -3157,6 +3207,7 @@ async fn serve_conn(
     conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
     egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>>,
     stop: watch::Receiver<bool>,
+    _slot: AdmissionSlot,
 ) {
     debug_assert_eq!(conn.role(), Role::Server);
     let session = conn.session();
@@ -4030,6 +4081,52 @@ mod tests {
             h.push(empty_tx()).is_err(),
             "further reliable traffic stays refused; the client is being dropped"
         );
+    }
+
+    /// Regression: the byte cap used to count every reliable byte ever queued on
+    /// the connection (`take` never reset it), so any long-lived client was
+    /// eventually disconnected however promptly its writer drained.
+    #[test]
+    fn a_draining_writer_never_trips_the_byte_cap() {
+        let h = OutboundHandle::new();
+        let per_msg = reliable_msg_bytes(&empty_tx());
+        let rounds = MAX_RELIABLE_BACKLOG_BYTES / per_msg * 3;
+        for i in 0..rounds {
+            assert!(
+                h.push(empty_tx()).is_ok(),
+                "push {i} refused by a drained queue"
+            );
+            assert_eq!(h.take().reliable.len(), 1);
+            assert_eq!(
+                h.reliable_bytes(),
+                0,
+                "take hands the writer the whole queue"
+            );
+        }
+    }
+
+    /// Regression: admission counted connections ever accepted, so after
+    /// `max_clients` lifetime sessions every later join was refused forever.
+    #[test]
+    fn admission_counts_live_connections_and_frees_slots() {
+        let gate = AdmissionGate::new(2);
+        let a = gate.try_admit().expect("first");
+        let b = gate.try_admit().expect("second");
+        assert!(
+            gate.try_admit().is_none(),
+            "third refused while two are live"
+        );
+        assert_eq!(gate.refused.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(a);
+        let c = gate
+            .try_admit()
+            .expect("a slot freed by a departed connection");
+        assert!(gate.try_admit().is_none());
+        drop((b, c));
+        // Far more sessions than `max` over the gate's life still admit.
+        for _ in 0..50 {
+            let _s = gate.try_admit().expect("no permanent lockout");
+        }
     }
 
     #[test]

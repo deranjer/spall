@@ -71,7 +71,8 @@ pub use journal::{JournalEntry, JournalSink};
 pub use player::{HELD_INPUT_TIMEOUT_TICKS, Player, transaction_world_box};
 pub use registry::IdRegistry;
 pub use replication::{
-    MotionPublisher, ReplicationError, action_statuses, committed_transactions, repair_ops,
+    MotionPublisher, REST_RESYNC_TICKS, ReplicationError, action_statuses, committed_transactions,
+    repair_ops,
 };
 pub use schedule::{EditPipeline, RegionKey, TickReport};
 pub use sim::{
