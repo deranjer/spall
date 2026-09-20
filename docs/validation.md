@@ -17,6 +17,18 @@ with shaded and indirect-only PNGs, a fixed 128-cubed lighting cache, separate
 upload/trace/denoise timings, and deterministic closed/open and thin-wall
 probes.
 
+ENG-74 adds a separate editor package, outside the engine gate harness:
+`cargo check -p spall_editor`, `cargo test -p spall_editor --lib`, and
+`cargo clippy -p spall_editor --all-targets -- -D warnings` validate its CPU
+documents/commands and leaf dependency boundary. `cargo run -p spall_editor`
+opens the native shell for a manual project/scene/voxel editing pass. Native
+window interaction and launching an offline sandbox client require an available
+desktop GPU and remain a hands-on check rather than a CPU-CI claim.
+
+Editor command coverage includes stable asset-reference round trips, single-cell
+undo/redo, and mixed-colour box-stroke undo: each prior voxel material/tint must
+be restored exactly rather than replacing the whole selection with one colour.
+
 T14 adds incremental cache updates. `LightingUpdate` is a plain
 (non-simulation) description of what changed — world-space AABBs cleared to air
 plus solid regions refilled in order; `LightingVolume::apply_update` applies one

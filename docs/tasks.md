@@ -365,6 +365,16 @@ Produce a game-facing API/examples for authoritative tools, placement, material 
 
 Accept: one example game tool is added without editing renderer, transport, or storage internals; agents can reproduce all engine gate scenes from a clean checkout. UI/editor work remains unassigned.
 
+### ENG-74 — Editor MVP (user-authorized follow-up)
+
+Dependencies: current engine workspace. Own: `tools/spall_editor`, editor-owned RON schemas, and editor documentation. This is intentionally outside the G0–G5 engine gate sequence and must not alter those gate claims.
+
+Build a separate native editor crate using Rust, winit, wgpu, egui, and egui-wgpu. It may depend on Spall rendering/voxel libraries, but no engine/runtime crate may depend on it or on egui. Add versioned, human-readable RON project and scene documents, plus portable `.spvox` voxel assets according to `docs/spvox-format.md`. Project/scene references must use a stable `AssetId`, never an authored absolute or raw asset path.
+
+Implement an AssetDatabase and an EditorCommand-based undo/redo layer before UI mutations. The MVP launcher supports recent/open/new projects. Keep **Scenes** (placed objects and transforms) distinct from **Assets** (reusable authored voxel objects): the scene view has a collapsible hierarchy/inspector and a collapsible bottom toolbox that searches named assets, previews them, and places an asset as a new scene object. The asset view supports single-cell and bounded box painting/removal, selected material and RGB color, deterministic per-cell color jitter within a selected margin, and save. Keep advanced docking, procedural tools, animation, material authoring, and engine-management UI out of scope.
+
+Accept: commands are the sole mutation route and undo/redo restores entity and voxel edits; saving/reloading preserves stable references; a created voxel asset can be assigned to an entity and persisted with a scene; the editor opens as a native window and can launch the real sandbox runtime. CPU tests cover document round-trips and command invariants; graphical interaction is a separate hands-on check.
+
 ## Assignment template
 
 ```text

@@ -32,6 +32,25 @@ pub enum RenderError {
 }
 
 impl RenderContext {
+    /// Acquire the engine GPU device for a host-owned presentation surface.
+    /// The caller retains window/surface lifetime and presentation policy;
+    /// Spall retains device/queue ownership so tools can compose their UI over
+    /// an engine-rendered frame without creating a second GPU device.
+    pub fn for_surface(
+        instance: &wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+    ) -> Result<(Self, wgpu::SurfaceCapabilities), RenderError> {
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: Some(surface),
+        }))
+        .ok_or(RenderError::NoAdapter)?;
+        let capabilities = surface.get_capabilities(&adapter);
+        let context = Self::from_adapter(adapter, "spall-render-surface")?;
+        Ok((context, capabilities))
+    }
+
     /// Acquire a headless device. Returns [`RenderError::NoAdapter`] when the
     /// host has no usable GPU — the caller maps that to the "missing
     /// environment capability" exit code.
@@ -67,6 +86,10 @@ impl RenderContext {
         }))
         .ok_or(RenderError::NoAdapter)?;
 
+        Self::from_adapter(adapter, "spall-render-headless")
+    }
+
+    fn from_adapter(adapter: wgpu::Adapter, label: &str) -> Result<Self, RenderError> {
         // Opt into render-pass timestamp queries when (and only when) the adapter
         // reports support. Where they are unavailable the capture path reports
         // GPU timing as unavailable rather than substituting a CPU figure.
@@ -82,7 +105,7 @@ impl RenderContext {
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
-                label: Some("spall-render-headless"),
+                label: Some(label),
                 required_features,
                 required_limits: wgpu::Limits::downlevel_defaults(),
                 memory_hints: wgpu::MemoryHints::Performance,

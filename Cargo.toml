@@ -15,6 +15,7 @@ members = [
     "crates/spall_client",
     "examples/sandbox",
     "examples/poc_local",
+    "tools/spall_editor",
     "tools/xtask",
 ]
 resolver = "3"
@@ -59,6 +60,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "0.4.0"
 wgpu = "24.0.5"
 winit = "0.30.12"
+egui = "0.31.1"
+egui-wgpu = "0.31.1"
+egui-winit = "0.31.1"
+ron = "0.10.1"
 
 [profile.dev]
 debug = 1
