@@ -799,7 +799,10 @@ fn sustained_counts(s: &SustainedEdits, server_ticks: u64) -> (u64, u64, f64) {
     let mut n_blasts = (available as f64 / blast_step).floor() as u64;
     if s.mode == SustainedMode::G4Bodies {
         n_small = n_small.min(spall_voxel::fixtures::g4_comb_cut_capacity() as u64);
-        n_blasts = n_blasts.min(spall_voxel::fixtures::G4_TOWER_COUNT as u64);
+        n_blasts = n_blasts.min(
+                spall_voxel::fixtures::G4_TOWER_COUNT as u64
+                    * spall_voxel::fixtures::G4_TOWER_BLASTS as u64,
+            );
     }
     (n_small, n_blasts, small_step)
 }
@@ -2190,7 +2193,7 @@ mod requirement_tests {
         let mut cells = std::collections::HashSet::new();
         for c in &terrain {
             assert!(cells.insert(c.cell), "terrain dig repeats {:?}", c.cell);
-            assert!(c.cell[2] >= 200 && c.cell[1] == 1);
+            assert!(c.cell[1] == 1 && c.cell[2] >= 128);
         }
         let body_edits = all
             .iter()

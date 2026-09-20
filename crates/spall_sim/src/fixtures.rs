@@ -875,10 +875,10 @@ pub const G4_INTEGRATED_SEPARATED_SPAWNS: [[f64; 3]; 8] = [
     [17.0, 1.0, 40.0],
     [16.0, 1.0, 41.0],
     [17.0, 1.0, 41.0],
-    [90.0, 1.0, 20.0],
-    [91.0, 1.0, 20.0],
-    [90.0, 1.0, 21.0],
-    [91.0, 1.0, 21.0],
+    [90.0, 1.0, 8.0],
+    [91.0, 1.0, 8.0],
+    [90.0, 1.0, 9.0],
+    [91.0, 1.0, 9.0],
 ];
 
 /// The integrated workload's terrain (the ground slab) and its collider region.
@@ -996,25 +996,11 @@ fn cells_of(build: impl FnOnce(VolumeId) -> Volume) -> u64 {
     crate::world::solid_cells(&build(VolumeId::new(1).unwrap()))
 }
 
-/// Sleeping debris: `2`-cell (`0.5 m`) cubes stacked in a `25 x 25 x 7` block
-/// on the east strip (`x 83..96 m`, `z 4..17 m`), spaced `0.52 m`.
-const G4_SLEEPER_ORIGIN_M: [f64; 2] = [83.0, 4.0];
+/// Sleeping debris: `2`-cell (`0.5 m`) cubes stacked in a `16 x 16 x 16` block
+/// on the east strip (`x 33..41 m`, `z 4..17 m`), spaced `0.52 m`.
+const G4_SLEEPER_ORIGIN_M: [f64; 2] = [33.0, 46.0];
 const G4_SLEEPER_SPACING_M: f64 = 0.52;
-const G4_SLEEPER_SIDE: usize = 25;
-
-/// Position (metres, body origin) of a stacked destructible body: `column`
-/// picks an `(x, z)` slot on a `13 x 5` grid of `4.2 m` pitch in the yard's
-/// north band (`x 26..77 m`, `z 0.5..21 m`, clear of the giant, the plaza, and
-/// the sleepers), `layer * layer_pitch_m` the height above the ground. The
-/// bodies are dormant (no collider) until woken, so vertical stacking is
-/// physically inert; a woken body falls onto the ground or the rubble below.
-fn stack_position(column: usize, layer: usize, layer_pitch_m: f64) -> [f64; 3] {
-    [
-        26.0 + (column % 13) as f64 * 4.2,
-        1.0 + layer as f64 * layer_pitch_m,
-        0.5 + (column / 13) as f64 * 4.2,
-    ]
-}
+const G4_SLEEPER_SIDE: usize = 16;
 
 /// Populates the integrated yard's bodies on an already-constructed world, in
 /// this order (entity ids follow it; see [`spall_voxel::fixtures::G4_ENTITY_FIRST`]):
@@ -1046,20 +1032,22 @@ pub fn spawn_g4_integrated_bodies(
     };
 
     // The giant: block centred over x 40..72 m, z 24..56 m, plate on the ground.
-    let giant = spawn(world, Box::new(v::g4_giant_body), [40.0, 1.0, 24.0]);
+    let giant = spawn(world, Box::new(v::g4_giant_body), [62.0, 1.0, 24.0]);
     world.deactivate_body(giant);
     out.giant = Some(giant);
     out.giant_cells = cells_of(v::g4_giant_body);
 
+    // Combs: a 6 x 6 grid on the west band (x 2..24 m, z 2..28 m); towers: 13 x 5
+    // slots on the north band (x 26..77 m, z 2..21 m). All stand on the ground.
     for c in 0..v::G4_COMB_COUNT {
-        let at = stack_position(c % 36, c / 36, 4.0);
+        let at = [2.0 + (c % 6) as f64 * 4.4, 1.0, 2.0 + (c / 6) as f64 * 4.4];
         let e = spawn(world, Box::new(v::g4_comb_body), at);
         world.deactivate_body(e);
         out.combs.push(e);
     }
     out.comb_cells = cells_of(v::g4_comb_body);
     for t in 0..v::G4_TOWER_COUNT {
-        let at = stack_position(36 + t % 23, t / 23, 10.0);
+        let at = [30.0 + (t % 12) as f64 * 4.0, 1.0, 2.0 + (t / 12) as f64 * 4.0];
         let e = spawn(world, Box::new(v::g4_tower_body), at);
         world.deactivate_body(e);
         out.towers.push(e);
@@ -1155,7 +1143,7 @@ pub fn agitate_g4_bodies(world: &mut crate::world::SimWorld, bodies: &[G4ActiveB
 
 /// Where each of the 256 active debris bodies spawns (and is steered back to),
 /// in spawn order: `64` within `12 m` of the observer (an `8 x 8` grid at
-/// `1.05 m`, `3.5 m` up), then `192` (`8 x 24` at `1.25 m`) across the west
+/// `1.05 m`, `3.5 m` up), then `192` (`12 x 16` at `1.25 m`) across the west
 /// plaza.
 pub fn g4_integrated_active_homes() -> Vec<[f64; 3]> {
     let mut homes = Vec::with_capacity(G4_ACTIVE_BODY_COUNT);
@@ -1164,9 +1152,9 @@ pub fn g4_integrated_active_homes() -> Vec<[f64; 3]> {
             homes.push([19.0 + i as f64 * 1.05, 3.5, 37.0 + j as f64 * 1.05]);
         }
     }
-    for i in 0..8 {
-        for j in 0..24 {
-            homes.push([2.0 + i as f64 * 1.25, 3.0, 26.0 + j as f64 * 1.25]);
+    for i in 0..12 {
+        for j in 0..16 {
+            homes.push([2.0 + i as f64 * 1.25, 3.0, 32.0 + j as f64 * 1.25]);
         }
     }
     homes

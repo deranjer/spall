@@ -1060,6 +1060,8 @@ pub const G4_YARD_WIDTH_CELLS: i64 = 384;
 pub const G4_YARD_DEPTH_CELLS: i64 = 224;
 /// Top cell row (`y`) of the ground slab: `y 0..=3`, top surface at `1.0 m`.
 pub const G4_YARD_GROUND_TOP_CELL: i64 = 3;
+/// Height (cells) of the perimeter wall above the slab: `24` cells = `6 m`.
+pub const G4_YARD_WALL_HEIGHT_CELLS: i64 = 24;
 
 /// The integrated world's terrain: a bounded `256 x 128 x 256 m` volume holding
 /// only the `384 x 224 x 4` ground slab (`344,064` solid cells) in a resident
@@ -1088,6 +1090,27 @@ pub fn g4_integrated_scene(id: VolumeId) -> Volume {
         STONE,
     ))
     .expect("g4 ground slab");
+    // Perimeter wall (1 m thick, 6 m tall): split debris leaves a body with a
+    // few m/s of sideways speed, and the first census found 229 rubble bodies
+    // (and one agitated body) walking off the slab edge into the void, awake
+    // forever. The wall keeps every body on the slab; it is terrain, so solid
+    // matter is conserved and durable.
+    let top = G4_YARD_GROUND_TOP_CELL + 1;
+    let (w, d, h) = (G4_YARD_WIDTH_CELLS, G4_YARD_DEPTH_CELLS, G4_YARD_WALL_HEIGHT_CELLS);
+    for (a, b) in [
+        ([0, top, 0], [w - 1, top + h - 1, 3]),
+        ([0, top, d - 4], [w - 1, top + h - 1, d - 1]),
+        ([0, top, 0], [3, top + h - 1, d - 1]),
+        ([w - 4, top, 0], [w - 1, top + h - 1, d - 1]),
+    ] {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(a[0], a[1], a[2]),
+            GlobalCell::new(b[0], b[1], b[2]),
+            STONE,
+        ))
+        .expect("g4 perimeter wall");
+    }
     v
 }
 
@@ -1159,18 +1182,25 @@ pub fn g4_full_yard_terrain_scene(id: VolumeId) -> Volume {
 }
 
 // --- Destructible bodies -------------------------------------------------------
+//
+// Every destructible stands on the ground slab (never in the air): a split
+// child inherits its parent's velocity, and floating stacks that woke and
+// tumbled threw rubble out over the yard edge (measured: 229 bodies lost).
 
-/// Combs: a `16 x 16 x 2` plate carrying an `8 x 8` grid of `1 x 1 x 10` teeth
-/// (`y 2..=11`) at a `2`-cell pitch (cells `x, z = 1, 3, ..., 15`). A radius-1
-/// cut centred at `y = 4` on a tooth severs it; the tip (`y 6..=11`, `6` cells)
-/// detaches as one rubble body and the plate keeps standing. `64` cuts per comb.
-pub const G4_COMB_COUNT: usize = 282;
+/// Combs: a `16 x 16 x 2` plate carrying an `8 x 8` grid of `1 x 1 x 40` poles
+/// (`y 2..=41`, `10 m`) at a `2`-cell pitch (cells `x, z = 1, 3, ..., 15`). Each
+/// pole is cut **top-down** every 5 cells with a radius-1 cut
+/// (`y = 38, 33, ..., 3`, [`G4_COMB_LEVELS`] cuts); each cut severs the pole and
+/// the segment above detaches as one small rubble body, while the plate and the
+/// remaining pole keep standing. `36 x 64 x 8 = 18,432` distinct cuts from
+/// `576 m^2` of ground (a tooth-per-comb design needed ~4,500 m^2).
+pub const G4_COMB_COUNT: usize = 36;
 pub const G4_COMB_TEETH_PER_SIDE: i64 = 8;
-pub const G4_COMB_CUT_Y: i64 = 4;
+pub const G4_COMB_LEVELS: i64 = 8;
 pub const G4_COMB_CUT_RADIUS_CELLS: i64 = 1;
-/// Ordinary pillar-style edits the combs supply: `282 x 64 = 18,048`.
+/// Ordinary comb cuts the combs supply: `36 x 64 x 8 = 18,432`.
 pub const fn g4_comb_cut_capacity() -> i64 {
-    G4_COMB_COUNT as i64 * G4_COMB_TEETH_PER_SIDE * G4_COMB_TEETH_PER_SIDE
+    G4_COMB_COUNT as i64 * G4_COMB_TEETH_PER_SIDE * G4_COMB_TEETH_PER_SIDE * G4_COMB_LEVELS
 }
 
 /// A comb body volume.
@@ -1189,30 +1219,27 @@ pub fn g4_comb_body(id: VolumeId) -> Volume {
             v.apply_edit(&EditPlan::filled_box(
                 id,
                 GlobalCell::new(x, 2, z),
-                GlobalCell::new(x, 11, z),
+                GlobalCell::new(x, 41, z),
                 STONE,
             ))
-            .expect("comb tooth");
+            .expect("comb pole");
         }
     }
     v
 }
 
-/// Body-local cell of the `tooth`-th tooth's cut (`0..64`).
-pub fn g4_comb_cut_cell(tooth: i64) -> [i64; 3] {
-    let (tx, tz) = (
-        tooth % G4_COMB_TEETH_PER_SIDE,
-        tooth / G4_COMB_TEETH_PER_SIDE,
-    );
-    [1 + 2 * tx, G4_COMB_CUT_Y, 1 + 2 * tz]
+/// Body-local cell of pole `pole` (`0..64`)'s cut at `level` (`0..8`, top-down).
+pub fn g4_comb_cut_cell(pole: i64, level: i64) -> [i64; 3] {
+    let (tx, tz) = (pole % G4_COMB_TEETH_PER_SIDE, pole / G4_COMB_TEETH_PER_SIDE);
+    [1 + 2 * tx, 38 - 5 * level, 1 + 2 * tz]
 }
 
 /// Towers (blast targets): a `16 x 16 x 2` plate under an `8 x 8` column
-/// (`x, z 4..=11`, `y 2..=37`). A `r = 8` blast at `(8, 20, 8)` (a `4 m`
-/// diameter) severs the shaft; the segment above (`y 29..=37`, `576` cells)
-/// detaches as one large rubble body. One blast per tower.
-pub const G4_TOWER_COUNT: usize = 180;
-pub const G4_TOWER_BLAST_CELL: [i64; 3] = [8, 20, 8];
+/// (`x, z 4..=11`, `y 2..=89`, `22 m`). Three `r = 8` blasts (a `4 m` diameter)
+/// at `y = 74, 50, 26` each sever the shaft; the segment above detaches as one
+/// large rubble body: `60 x 3 = 180` named blasts from `960 m^2`.
+pub const G4_TOWER_COUNT: usize = 60;
+pub const G4_TOWER_BLASTS: i64 = 3;
 pub const G4_BLAST_RADIUS_CELLS: i64 = 8;
 
 /// A tower body volume.
@@ -1228,7 +1255,7 @@ pub fn g4_tower_body(id: VolumeId) -> Volume {
     v.apply_edit(&EditPlan::filled_box(
         id,
         GlobalCell::new(4, 2, 4),
-        GlobalCell::new(11, 37, 11),
+        GlobalCell::new(11, 89, 11),
         STONE,
     ))
     .expect("tower column");
@@ -1309,36 +1336,39 @@ pub struct G4BodyEdit {
     pub radius: i64,
 }
 
-/// The `index`-th ordinary edit: a tooth cut on a comb. Tooth-major (`index /
-/// combs` picks the tooth), and the comb walk is a bijective stride so
-/// consecutive edits hit different combs (rubble from one does not land on the
-/// next comb's plate). `None` once every tooth of every comb is spent.
+/// The `index`-th ordinary comb edit. Level-major (`index / (combs * 64)` is the
+/// top-down level), and within a level a bijective stride-7 walk over all
+/// `combs x 64` poles so consecutive edits hit different combs. `None` once every
+/// pole of every comb is spent.
 pub fn g4_ordinary_edit(index: u64) -> Option<G4BodyEdit> {
-    let combs = G4_COMB_COUNT as u64;
-    let tooth = (index / combs) as i64;
-    if tooth >= G4_COMB_TEETH_PER_SIDE * G4_COMB_TEETH_PER_SIDE {
+    let poles = G4_COMB_COUNT as u64 * (G4_COMB_TEETH_PER_SIDE * G4_COMB_TEETH_PER_SIDE) as u64;
+    let level = (index / poles) as i64;
+    if level >= G4_COMB_LEVELS {
         return None;
     }
-    // gcd(11, 282) = 1, so `c` visits every comb once per tooth.
-    let c = (index % combs * 11) % combs;
+    // gcd(7, 36 * 64) = 1: every pole once per level.
+    let p = (index % poles * 7) % poles;
+    let (comb, pole) = (p / 64, (p % 64) as i64);
     Some(G4BodyEdit {
-        entity: g4_comb_entity(c),
-        cell: g4_comb_cut_cell(tooth),
+        entity: g4_comb_entity(comb),
+        cell: g4_comb_cut_cell(pole, level),
         radius: G4_COMB_CUT_RADIUS_CELLS,
     })
 }
 
-/// The `index`-th named blast: one tower each. `None` past the last tower.
+/// The `index`-th named blast: level-major over the towers (top blast first).
+/// `None` past the last.
 pub fn g4_blast(index: u64) -> Option<G4BodyEdit> {
     let towers = G4_TOWER_COUNT as u64;
-    if index >= towers {
+    let step = (index / towers) as i64;
+    if step >= G4_TOWER_BLASTS {
         return None;
     }
-    // gcd(7, 180) = 1.
-    let t = (index * 7) % towers;
+    // gcd(7, 60) = 1.
+    let t = (index % towers * 7) % towers;
     Some(G4BodyEdit {
         entity: g4_tower_entity(t),
-        cell: G4_TOWER_BLAST_CELL,
+        cell: [8, 74 - 24 * step, 8],
         radius: G4_BLAST_RADIUS_CELLS,
     })
 }
@@ -1352,22 +1382,33 @@ pub fn g4_giant_cut() -> G4BodyEdit {
     }
 }
 
-/// Terrain "dig lane" for the integrated workload's terrain share of ordinary
-/// edits: a strip of the ground slab (`z 200..=218`, `x 4..=380`, cells) on
-/// which each dig is a distinct radius-1 sphere at `y = 1` (a hole through the
-/// 4-cell slab), `2` cells apart so no two overlap: `189 x 10 = 1,890` distinct
-/// digs, enough for the 30-minute lane's terrain share.
-pub const G4_TERRAIN_DIG_CAPACITY: i64 = 189 * 10;
+/// Terrain digs for the integrated workload's terrain share of ordinary edits:
+/// distinct radius-1 spheres at `y = 1` (a hole through the 4-cell slab), `2`
+/// cells apart, on two lanes of ground kept clear of every dormant body — a
+/// terrain edit within `4 m` hard-wakes dormant bodies (`Simulation::apply_dormancy`),
+/// and a dig in the sleeping block woke all 4,096 of them.
+///
+/// - lane A: `x 46..58 m`, `z 32..54.5 m` — between the sleeping block (`x <=
+///   41.3 m`) and the giant (`x >= 62 m`): `25 x 46 = 1,150` digs;
+/// - lane B: `x 2..28 m`, `z 46..54.5 m` — the west plaza's back strip: `53 x 18
+///   = 954` digs.
+pub const G4_TERRAIN_DIG_CAPACITY: i64 = 25 * 46 + 53 * 18;
 
-/// The `index`-th terrain dig: `(cell, radius)`, or `None` past the lane.
+/// The `index`-th terrain dig: `(cell, radius)`, or `None` past both lanes.
 pub fn g4_terrain_dig(index: u64) -> Option<([i64; 3], i64)> {
     if index >= G4_TERRAIN_DIG_CAPACITY as u64 {
         return None;
     }
     let i = index as i64;
-    // Stride-7 walk (gcd(7, 1890) = 7 is not coprime, so use 11: gcd(11, 1890) = 1)
-    // so consecutive digs are far apart and every slot is visited once.
+    // Stride-11 walk (coprime with the capacity) so consecutive digs are far
+    // apart and every slot is used once.
     let q = (i * 11) % G4_TERRAIN_DIG_CAPACITY;
-    let (col, row) = (q % 189, q / 189);
-    Some(([4 + col * 2, 1, 200 + row * 2], 1))
+    let lane_a = 25 * 46;
+    let cell = if q < lane_a {
+        [184 + (q % 25) * 2, 1, 128 + (q / 25) * 2]
+    } else {
+        let r = q - lane_a;
+        [8 + (r % 53) * 2, 1, 184 + (r / 53) * 2]
+    };
+    Some((cell, 1))
 }

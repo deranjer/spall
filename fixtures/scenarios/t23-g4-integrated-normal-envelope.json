@@ -11,6 +11,7 @@
   "minimum_transactions": 1213,
   "replay_check": true,
   "restart_check": true,
+  "dormancy": true,
   "cuts": [],
   "sustained_edits": {
     "start_tick": 3600,

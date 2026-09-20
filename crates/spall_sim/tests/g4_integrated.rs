@@ -121,13 +121,15 @@ fn edit_geometry_capacity_covers_the_thirty_minute_lane() {
     }
     assert!(vfix::g4_ordinary_edit(vfix::g4_comb_cut_capacity() as u64).is_none());
     let mut blasts = std::collections::HashSet::new();
-    for i in 0..vfix::G4_TOWER_COUNT as u64 {
+    for i in 0..(vfix::G4_TOWER_COUNT as i64 * vfix::G4_TOWER_BLASTS) as u64 {
         let e = vfix::g4_blast(i).expect("tower available");
         assert_eq!(e.radius, vfix::G4_BLAST_RADIUS_CELLS);
-        assert!(blasts.insert(e.entity), "blast {i} repeats a tower");
+        assert!(blasts.insert((e.entity, e.cell)), "blast {i} repeats");
     }
     assert_eq!(blasts.len(), 180, "180 blasts in the 30-minute lane");
     assert!(vfix::g4_blast(180).is_none());
+    let towers: std::collections::HashSet<_> = blasts.iter().map(|(e, _)| *e).collect();
+    assert_eq!(towers.len(), vfix::G4_TOWER_COUNT, "three blasts per tower");
 }
 
 /// A comb cut wakes the dormant comb, commits, and detaches exactly the tooth
@@ -165,7 +167,7 @@ fn a_comb_cut_a_tower_blast_and_the_giant_cut_each_commit_and_detach() {
         .max_by_key(|b| b.entity.map(|e| e.get()))
         .unwrap();
     assert!(
-        spall_sim::world::solid_cells(&shed.volume) >= 500,
+        spall_sim::world::solid_cells(&shed.volume) >= 400,
         "the blast shed a large segment"
     );
 
@@ -393,5 +395,127 @@ fn rubble_census() {
         );
     }
     let low_y = rows.iter().filter(|r| r.2 < -1.0).count();
+    let first_debris = vfix::G4_ENTITY_FIRST + 1 + vfix::G4_COMB_COUNT as u64 + vfix::G4_TOWER_COUNT as u64;
+    let (mut comb, mut tower, mut tip) = (0, 0, 0);
+    for r in rows.iter().filter(|r| r.2 < -1.0) {
+        if r.3 < vfix::g4_tower_entity(0) { comb += 1 } else if r.3 < first_debris { tower += 1 } else { tip += 1 }
+    }
+    println!("  fallen: comb parents {comb}, tower parents {tower}, detached rubble {tip}");
     println!("  below the ground (y < -1 m): {low_y}");
+}
+
+/// Does a body dropped from height H stay on the 1 m ground slab?
+#[test]
+#[ignore = "diagnostic: tunnelling versus drop height"]
+fn tunnelling_vs_drop_height() {
+    for (label, comb) in [("comb plate", true), ("4-cell cube", false)] {
+        for h in [3.0f64, 6.0, 10.0, 15.0, 20.0, 30.0] {
+            let mut sim =
+                Simulation::new(SimulationConfig::new(fixtures::g4_integrated_setup())).unwrap();
+            let pose = spall_sim::BodyPose::new(glam::DQuat::IDENTITY, [60.0, 1.0 + h, 40.0]);
+            let e = if comb {
+                sim.world_mut().spawn_body(vfix::g4_comb_body, pose, [0.0; 3], [0.0; 3], 2600.0, 0)
+            } else {
+                sim.world_mut().spawn_body(fixtures::solid_block(4), pose, [0.0; 3], [0.0; 3], 2600.0, 0)
+            }
+            .unwrap();
+            for _ in 0..600 {
+                sim.tick().unwrap();
+            }
+            let b = sim.world().body(e).unwrap();
+            println!("{label} from {h:>4} m: y = {:.2} m, asleep {}", b.pose.translation_m[1], b.sleeping);
+        }
+    }
+}
+
+/// When and where does a body first pass below the ground?
+#[test]
+#[ignore = "diagnostic: first fall-through events"]
+fn first_fall_through_events() {
+    let (mut sim, bodies) = scene();
+    let mut seen = std::collections::HashSet::new();
+    let (mut req, mut ordinary) = (1u64, 0u64);
+    let mut printed = 0;
+    for t in 0..(60 * 60u64) {
+        if t % 6 == 0 {
+            let e = vfix::g4_ordinary_edit(ordinary).unwrap();
+            ordinary += 1;
+            sim.submit(body_cut(req, e)).unwrap();
+            req += 1;
+        }
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        sim.tick().unwrap();
+        for b in sim.world().bodies() {
+            let Some(e) = b.entity else { continue };
+            if b.dormant || b.pose.translation_m[1] > -0.3 || !seen.insert(e.get()) {
+                continue;
+            }
+            if printed < 12 {
+                printed += 1;
+                let p = b.pose.translation_m;
+                let v = b.linvel_m_s;
+                println!(
+                    "t={t}: entity {} first below ground at ({:.2},{:.2},{:.2}) v=({:.1},{:.1},{:.1}) cells={}",
+                    e.get(), p[0], p[1], p[2], v[0], v[1], v[2],
+                    spall_sim::world::solid_cells(&b.volume)
+                );
+            }
+        }
+    }
+    println!("total fallen: {}", seen.len());
+}
+
+/// With the dormancy policy on, what first wakes the sleeping block?
+#[test]
+#[ignore = "diagnostic: first sleeper reactivation"]
+fn first_sleeper_wake() {
+    let (mut sim, bodies) = scene();
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let first_sleeper = vfix::G4_ENTITY_FIRST
+        + 1
+        + vfix::G4_COMB_COUNT as u64
+        + vfix::G4_TOWER_COUNT as u64
+        + G4_ACTIVE_BODY_COUNT as u64;
+    let (mut req, mut ordinary, mut blast) = (1u64, 0u64, 0u64);
+    for t in 0..(200 * 60u64) {
+        if t == 60 {
+            sim.submit(body_cut(req, vfix::g4_giant_cut())).unwrap();
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 6 == 0 {
+            let e = vfix::g4_ordinary_edit(ordinary).unwrap();
+            ordinary += 1;
+            sim.submit(body_cut(req, e)).unwrap();
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 600 == 300 {
+            sim.submit(body_cut(req, vfix::g4_blast(blast).unwrap())).unwrap();
+            blast += 1;
+            req += 1;
+        }
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        let report = sim.tick().unwrap();
+        let plan = sim.apply_dormancy(&mut policy, &report);
+        let woke: Vec<_> = plan
+            .reactivate
+            .iter()
+            .filter(|e| (first_sleeper..first_sleeper + 4096).contains(&e.get()))
+            .collect();
+        if !woke.is_empty() {
+            println!("t={t}: {} sleepers reactivated (of {} reactivations)", woke.len(), plan.reactivate.len());
+            let w = sim.world().body(*woke[0]).unwrap();
+            println!("  first at {:?}", w.pose.translation_m);
+            // nearest awake moving body
+            let mut best = (f64::MAX, 0u64, [0.0; 3], 0.0);
+            for b in sim.world().bodies() {
+                if b.dormant { continue; }
+                let sp = b.linvel_m_s.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if sp <= 0.05 { continue; }
+                let d: f64 = (0..3).map(|i| (b.pose.translation_m[i] - w.pose.translation_m[i]).powi(2)).sum::<f64>().sqrt();
+                if d < best.0 { best = (d, b.entity.map_or(0, |e| e.get()), b.pose.translation_m, sp); }
+            }
+            println!("  nearest moving body: entity {} at {:?} dist {:.2} speed {:.2}", best.1, best.2, best.0, best.3);
+            break;
+        }
+    }
 }
