@@ -527,6 +527,16 @@ impl InteractiveApp {
         };
         let g = replica.lock().unwrap_or_else(|e| e.into_inner());
         let cm = f64::from(CELL_M);
+        // In the small review scene (a beam on a base) pick the beam out by its cell count.
+        let counts: Vec<_> = g
+            .body_ids()
+            .map(|e| (e, g.body_solid_cells(e).unwrap_or(0)))
+            .collect();
+        let beam = if counts.len() <= 4 {
+            pick_review_lever(&counts)
+        } else {
+            None
+        };
         for (entity, volume_id) in g.body_volumes() {
             let Some(volume) = g.volume(volume_id) else {
                 continue;
@@ -558,7 +568,9 @@ impl InteractiveApp {
                 .or_insert_with(|| (u64::MAX, Vec::new()));
             if cells.0 != rev {
                 cells.0 = rev;
-                cells.1 = body_local_cells(volume, cm);
+                let color = BODY_PALETTE[(entity.get() as usize) % BODY_PALETTE.len()];
+                let foot = (beam == Some(entity)).then_some(FOOT_COLOR);
+                cells.1 = body_local_cells(volume, cm, color, foot);
             }
             if out.len() + cells.1.len() > MAX_BODY_INSTANCES {
                 continue;
@@ -1189,7 +1201,12 @@ fn build_instances_with(volume: &Volume, request: RebuildRequest) -> Vec<Instanc
 
 /// A body volume's visible cells as `(local centre in the body frame, colour)`; cells
 /// buried inside solid matter are skipped, like the terrain draw.
-fn body_local_cells(volume: &Volume, cell_m: f64) -> Vec<([f32; 3], [f32; 3])> {
+fn body_local_cells(
+    volume: &Volume,
+    cell_m: f64,
+    body_color: [f32; 3],
+    foot_color: Option<[f32; 3]>,
+) -> Vec<([f32; 3], [f32; 3])> {
     let mut out = Vec::new();
     for coord in volume.resident_brick_coords() {
         for lz in 0..32i64 {
@@ -1209,7 +1226,15 @@ fn body_local_cells(volume: &Volume, cell_m: f64) -> Vec<([f32; 3], [f32; 3])> {
                             ((cell.y as f64 + 0.5) * cell_m) as f32,
                             ((cell.z as f64 + 0.5) * cell_m) as f32,
                         ],
-                        material_color(material),
+                        // Each body gets its own colour (terrain keeps the material palette)
+                        // so separate bodies read apart; the review beam's foot is picked out.
+                        match foot_color {
+                            Some(foot) if cell.y < 4 => foot,
+                            _ => {
+                                let _ = material;
+                                body_color
+                            }
+                        },
                     ));
                 }
             }
@@ -1217,6 +1242,19 @@ fn body_local_cells(volume: &Volume, cell_m: f64) -> Vec<([f32; 3], [f32; 3])> {
     }
     out
 }
+
+/// Distinct, saturated colours for detached bodies, by entity id (index 1 = blue, 2 = orange:
+/// the review scene's base and beam).
+const BODY_PALETTE: [[f32; 3]; 6] = [
+    [0.35, 0.85, 0.40],
+    [0.25, 0.55, 0.95],
+    [0.95, 0.55, 0.15],
+    [0.90, 0.30, 0.70],
+    [0.95, 0.85, 0.20],
+    [0.30, 0.85, 0.85],
+];
+/// The review beam's foot (its local cells below y = 4): the pivot it must balance on.
+const FOOT_COLOR: [f32; 3] = [0.95, 0.20, 0.20];
 
 /// A cell whose six face neighbours are all solid contributes no visible
 /// surface; skipping it keeps the instance count near the visible shell
