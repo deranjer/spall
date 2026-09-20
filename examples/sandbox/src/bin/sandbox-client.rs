@@ -151,6 +151,10 @@ struct CutFileEntry {
     radius: i64,
     #[serde(default)]
     target: CutFileTarget,
+    /// With `"target": "body"`: aim at this raw entity id instead of the sole
+    /// detached body.
+    #[serde(default)]
+    entity: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
@@ -181,7 +185,9 @@ fn read_cuts_file(path: &std::path::Path) -> Vec<Cut> {
                 radius: e.radius,
                 target: match e.target {
                     CutFileTarget::Terrain => ScriptTarget::Terrain,
-                    CutFileTarget::Body => ScriptTarget::DetachedBody,
+                    CutFileTarget::Body => e
+                        .entity
+                        .map_or(ScriptTarget::DetachedBody, ScriptTarget::Body),
                 },
             })
             .collect(),

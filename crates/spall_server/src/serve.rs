@@ -218,6 +218,14 @@ pub enum Scene {
     /// [`spall_sim::fixtures::g4_workload_setup`] /
     /// [`spall_sim::fixtures::spawn_g4_workload_bodies`].
     G4Workload,
+    /// T23 / G4 integrated workload, players **clustered**: the ground slab, a
+    /// dormant 64-brick giant, comb and tower bodies as edit targets, 256
+    /// agitated active + 4,096 sleeping debris bodies. See
+    /// [`spall_sim::fixtures::g4_integrated_setup`].
+    G4IntegratedClustered,
+    /// As [`Scene::G4IntegratedClustered`] with the players **separated** (two
+    /// clusters about 77 m apart).
+    G4IntegratedSeparated,
     /// Full-envelope separated regions joined by a causeway (T23 / G3 row 2).
     SeparatedRegionsFar,
     /// T11a / ENG-62: the full G1 gate envelope — `64 x 32 x 64 m` of real,
@@ -247,12 +255,32 @@ impl Scene {
             "bulk-split" | "giant-split" => Some(Scene::BulkSplit),
             "separated-regions" | "t23-g3" | "g3" => Some(Scene::SeparatedRegions),
             "g4-workload" | "t23-g4" | "g4" => Some(Scene::G4Workload),
+            "g4-integrated-clustered" => Some(Scene::G4IntegratedClustered),
+            "g4-integrated-separated" | "g4-integrated" => Some(Scene::G4IntegratedSeparated),
             "separated-regions-far" | "t23-g3-full-envelope" | "g3-far" => {
                 Some(Scene::SeparatedRegionsFar)
             }
             "g1-full-envelope" | "g1-full-workload" | "g1" => Some(Scene::G1FullEnvelope),
             "sleep-wake" | "sleepwake" | "t21-sleep-wake" => Some(Scene::SleepWake),
             _ => None,
+        }
+    }
+
+    /// `true` for the two T23 / G4 integrated-workload scenes.
+    pub fn is_g4_integrated(self) -> bool {
+        matches!(
+            self,
+            Scene::G4IntegratedClustered | Scene::G4IntegratedSeparated
+        )
+    }
+
+    /// The scene's always-awake debris the fixture agitator keeps in the solver
+    /// (empty for every scene but the integrated workload).
+    pub fn agitated_bodies(self) -> Vec<spall_sim::fixtures::G4ActiveBody> {
+        if self.is_g4_integrated() {
+            spall_sim::fixtures::g4_integrated_active_bodies()
+        } else {
+            Vec::new()
         }
     }
 
@@ -266,6 +294,8 @@ impl Scene {
             Scene::BulkSplit => "bulk-split",
             Scene::SeparatedRegions => "separated-regions",
             Scene::G4Workload => "g4-workload",
+            Scene::G4IntegratedClustered => "g4-integrated-clustered",
+            Scene::G4IntegratedSeparated => "g4-integrated-separated",
             Scene::SeparatedRegionsFar => "separated-regions-far",
             Scene::G1FullEnvelope => "g1-full-envelope",
             Scene::SleepWake => "sleep-wake",
@@ -279,6 +309,8 @@ impl Scene {
             Scene::Walk
                 | Scene::SeparatedRegions
                 | Scene::G4Workload
+                | Scene::G4IntegratedClustered
+                | Scene::G4IntegratedSeparated
                 | Scene::SeparatedRegionsFar
                 | Scene::G1FullEnvelope
                 | Scene::SleepWake
@@ -292,6 +324,8 @@ impl Scene {
             Scene::Walk => &WALK_ARENA_SPAWNS,
             Scene::SeparatedRegions => &SEPARATED_REGION_SPAWNS,
             Scene::G4Workload => &G4_WORKLOAD_SPAWNS,
+            Scene::G4IntegratedClustered => &spall_sim::fixtures::G4_INTEGRATED_CLUSTERED_SPAWNS,
+            Scene::G4IntegratedSeparated => &spall_sim::fixtures::G4_INTEGRATED_SEPARATED_SPAWNS,
             Scene::SeparatedRegionsFar => &SEPARATED_REGION_FAR_SPAWNS,
             Scene::G1FullEnvelope => &spall_sim::fixtures::G1_WORKLOAD_SPAWNS,
             Scene::SleepWake => &WALK_ARENA_SPAWNS,
@@ -308,6 +342,9 @@ impl Scene {
             Scene::BulkSplit => spall_sim::fixtures::bulk_split_setup(),
             Scene::SeparatedRegions => spall_sim::fixtures::separated_regions_setup(),
             Scene::G4Workload => spall_sim::fixtures::g4_workload_setup(),
+            Scene::G4IntegratedClustered | Scene::G4IntegratedSeparated => {
+                spall_sim::fixtures::g4_integrated_setup()
+            }
             Scene::SeparatedRegionsFar => {
                 spall_sim::fixtures::separated_regions_full_envelope_setup()
             }
@@ -328,6 +365,12 @@ impl Scene {
             // 4096 sleeping debris bodies, built once at scene-construction
             // time (docs/reports/G3.md increment for this row).
             spall_sim::fixtures::spawn_g4_workload_bodies(sim.world_mut(), G4_WORKLOAD_SPAWNS[0]);
+        }
+        if self.is_g4_integrated() {
+            // The integrated workload's destructible bodies and debris, built
+            // once at scene-construction time (entity-id order is part of the
+            // harness's edit generator; see `spall_voxel::fixtures`).
+            spall_sim::fixtures::spawn_g4_integrated_bodies(sim.world_mut(), self.player_spawns()[0]);
         }
         if matches!(self, Scene::G1FullEnvelope) {
             // The gate's "moving hollow test volume" — built once at
@@ -1431,6 +1474,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut body_stable_ticks = 0u64;
 
         // T17 late-join / reconnect state.
+        // T23 / G4: the integrated scene's always-awake debris, and the observer
+        // (client slot 0's spawn) the near-observer census is taken around.
+        let agitated = scene.agitated_bodies();
+        let observer: [f64; 3] = scene.player_spawns().first().copied().unwrap_or([0.0; 3]);
         let mut lj = LateJoin::new(catch_up_cap, max_join_retries, capture_workers);
         // T23 / G3 row 7, slice D: a late-join baseline or repair patch over a
         // brick the residency pass has evicted is filled from its durable
@@ -1590,6 +1637,9 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             }
 
             lj.publish_ready_captures(&clients_for_sim);
+            if !agitated.is_empty() {
+                spall_sim::fixtures::agitate_g4_bodies(sim.world_mut(), &agitated, ticks_run);
+            }
             let report = match sim.tick() {
                 Ok(r) => r,
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
@@ -1600,7 +1650,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 sampler.observe_backlog(&clients_for_sim);
             }
             if ticks_run % 60 == 0 {
-                sampler.sample(ticks_run);
+                sampler.sample(ticks_run, body_census(sim.world(), observer));
             }
 
             // T21 / ENG-28 increment 4 (3c): opt-in contact damage + region
@@ -2293,6 +2343,41 @@ pub struct TelemetrySample {
     pub backlog_max_bytes: u64,
     pub backlog_max_age_ms: u64,
     pub clients: Vec<ClientEgressSample>,
+    /// Body census: all bodies, dormant ones, solver-awake ones (neither dormant
+    /// nor asleep), and solver-awake ones within `12 m` of the observer.
+    pub bodies_total: u64,
+    pub bodies_dormant: u64,
+    pub bodies_awake: u64,
+    pub near_observer_awake: u64,
+}
+
+/// A [`TelemetrySample`]'s body census.
+#[derive(Debug, Clone, Copy, Default)]
+struct BodyCensus {
+    total: u64,
+    dormant: u64,
+    awake: u64,
+    near_observer_awake: u64,
+}
+
+fn body_census(world: &spall_sim::SimWorld, observer: [f64; 3]) -> BodyCensus {
+    let mut c = BodyCensus::default();
+    for b in world.bodies() {
+        c.total += 1;
+        if b.dormant {
+            c.dormant += 1;
+        } else if !b.sleeping {
+            c.awake += 1;
+            let t = b.pose.translation_m;
+            let d2 = (t[0] - observer[0]).powi(2)
+                + (t[1] - observer[1]).powi(2)
+                + (t[2] - observer[2]).powi(2);
+            if d2 <= 12.0 * 12.0 {
+                c.near_observer_awake += 1;
+            }
+        }
+    }
+    c
 }
 
 struct TelemetrySampler {
@@ -2329,7 +2414,7 @@ impl TelemetrySampler {
         }
     }
 
-    fn sample(&mut self, tick: u64) {
+    fn sample(&mut self, tick: u64, census: BodyCensus) {
         let mut clients: Vec<ClientEgressSample> = self
             .conns
             .lock()
@@ -2352,6 +2437,10 @@ impl TelemetrySampler {
                 backlog_max_bytes: self.interval_bytes,
                 backlog_max_age_ms: self.interval_age_ms,
                 clients,
+                bodies_total: census.total,
+                bodies_dormant: census.dormant,
+                bodies_awake: census.awake,
+                near_observer_awake: census.near_observer_awake,
             });
         }
         self.interval_bytes = 0;

@@ -106,6 +106,9 @@ pub enum ScriptTarget {
     #[default]
     Terrain,
     DetachedBody,
+    /// A specific persistent body, by raw entity id (T23 / G4: the integrated
+    /// workload targets combs, towers, and the giant by their fixed ids).
+    Body(u64),
 }
 
 /// One scripted tool use.
@@ -197,6 +200,9 @@ impl BaselineScene {
             "bulk-split" | "giant-split" => Some(Self::BulkSplit),
             "separated-regions" | "t23-g3" | "g3" => Some(Self::SeparatedRegions),
             "g4-workload" | "t23-g4" | "g4" => Some(Self::SeparatedRegions),
+            "g4-integrated-clustered" | "g4-integrated-separated" | "g4-integrated" => {
+                Some(Self::SeparatedRegions)
+            }
             "separated-regions-far" | "t23-g3-full-envelope" | "g3-far" => {
                 Some(Self::SeparatedRegionsFar)
             }
@@ -1445,6 +1451,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 }
 
                 let mut request = action.request.clone();
+                if let ScriptTarget::Body(raw) = action.target {
+                    if let Ok(entity) = spall_core::EntityId::new(raw) {
+                        request.claimed_target = ClaimedTarget::Body(entity);
+                    }
+                }
                 if action.target == ScriptTarget::DetachedBody {
                     // Aim at the sole detached body. It only exists once an
                     // earlier cut has detached it, so wait a bounded while for

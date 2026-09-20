@@ -308,3 +308,16 @@ fn full_terrain_edit_cost_scales_with_terrain() {
         times.last().unwrap()
     );
 }
+
+/// The agitator list reconstructed from the fixed spawn order (as used on a
+/// restored world) is exactly the list the spawner produced.
+#[test]
+fn reconstructed_active_list_matches_the_spawner() {
+    let (_, bodies) = scene();
+    let rebuilt = fixtures::g4_integrated_active_bodies();
+    assert_eq!(rebuilt.len(), bodies.active.len());
+    for (a, b) in rebuilt.iter().zip(&bodies.active) {
+        assert_eq!(a.entity, b.entity);
+        assert_eq!(a.home, b.home);
+    }
+}

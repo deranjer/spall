@@ -1080,28 +1080,14 @@ pub fn spawn_g4_integrated_bodies(
         out.active_cells += cells;
         n += 1;
     };
-    // 64 near the observer: 8 x 8 at 1.05 m, 3.5 m up (2.5 m above the ground).
-    for i in 0..8 {
-        for j in 0..8 {
-            let at = [19.0 + i as f64 * 1.05, 3.5, 37.0 + j as f64 * 1.05];
-            spawn_active(world, &mut out, at);
-            let d = ((at[0] - observer[0]).powi(2)
-                + (at[1] - observer[1]).powi(2)
-                + (at[2] - observer[2]).powi(2))
-            .sqrt();
-            if d <= G4_NEAR_OBSERVER_RADIUS_M {
-                out.active_near_observer += 1;
-            }
-        }
-    }
-    // The other 192: 8 x 24 at 1.25 m across the west plaza.
-    for i in 0..8 {
-        for j in 0..24 {
-            spawn_active(
-                world,
-                &mut out,
-                [2.0 + i as f64 * 1.25, 3.0, 26.0 + j as f64 * 1.25],
-            );
+    for at in g4_integrated_active_homes() {
+        spawn_active(world, &mut out, at);
+        let d = ((at[0] - observer[0]).powi(2)
+            + (at[1] - observer[1]).powi(2)
+            + (at[2] - observer[2]).powi(2))
+        .sqrt();
+        if d <= G4_NEAR_OBSERVER_RADIUS_M {
+            out.active_near_observer += 1;
         }
     }
     debug_assert_eq!(out.active.len(), G4_ACTIVE_BODY_COUNT);
@@ -1166,4 +1152,40 @@ pub fn agitate_g4_bodies(world: &mut crate::world::SimWorld, bodies: &[G4ActiveB
         let ang = [2.0 * h(4), 2.0 * h(5), 2.0 * h(6)];
         world.physics_mut().set_body_velocity(phys, lin, ang);
     }
+}
+
+/// Where each of the 256 active debris bodies spawns (and is steered back to),
+/// in spawn order: `64` within `12 m` of the observer (an `8 x 8` grid at
+/// `1.05 m`, `3.5 m` up), then `192` (`8 x 24` at `1.25 m`) across the west
+/// plaza.
+pub fn g4_integrated_active_homes() -> Vec<[f64; 3]> {
+    let mut homes = Vec::with_capacity(G4_ACTIVE_BODY_COUNT);
+    for i in 0..8 {
+        for j in 0..8 {
+            homes.push([19.0 + i as f64 * 1.05, 3.5, 37.0 + j as f64 * 1.05]);
+        }
+    }
+    for i in 0..8 {
+        for j in 0..24 {
+            homes.push([2.0 + i as f64 * 1.25, 3.0, 26.0 + j as f64 * 1.25]);
+        }
+    }
+    homes
+}
+
+/// The integrated scene's active debris (entity + home), reconstructed from the
+/// fixed spawn order — usable on a world restored from a checkpoint, where the
+/// spawn-time list is not at hand. Entries whose body no longer exists are
+/// dropped by the agitator.
+pub fn g4_integrated_active_bodies() -> Vec<G4ActiveBody> {
+    use spall_voxel::fixtures as v;
+    let first = v::G4_ENTITY_FIRST + 1 + v::G4_COMB_COUNT as u64 + v::G4_TOWER_COUNT as u64;
+    g4_integrated_active_homes()
+        .into_iter()
+        .enumerate()
+        .map(|(i, home)| G4ActiveBody {
+            entity: spall_core::EntityId::new(first + i as u64).expect("nonzero"),
+            home,
+        })
+        .collect()
 }
