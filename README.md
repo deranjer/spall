@@ -4,6 +4,8 @@ Planning baseline: 2026-09-06. T00 implements the Rust workspace, headless serve
 
 Run `cargo xtask check` for formatting, lint, and tests; `cargo xtask smoke` for a bounded server lifecycle; or `cargo xtask smoke --graphical` to include real window presentation and resize. Run the window directly with `cargo run -p sandbox --features client --bin sandbox-client -- --offline`.
 
+The editor MVP is a separate leaf package: run `cargo run -p spall_editor`. It creates versioned RON project/scene documents and canonical `.spvox` voxel assets, and never adds egui to the game runtime dependency graph.
+
 Build a custom engine for one survival/building game: Minecraft/Vintage Story-style world interaction, detailed voxel materials and Teardown-inspired lighting, **full-world destruction and multiplayer from the foundation**. No editor, menus, or UI framework is required. A render window, direct controls, command-line tools, and automated scenarios are required.
 
 User requirements are full-world destruction and multiplayer. The remaining numbers below are proposed engineering defaults, not confirmed product requirements or measured performance.

@@ -27,6 +27,17 @@ package's active graph GPU/window-free. The server currently records the
 requested listen address but deliberately does not bind it: QUIC transport,
 authentication, and multiplayer start in T09.
 
+## ENG-74 — editor MVP (verified 2026-09-19)
+
+The editor is a leaf workspace package (`tools/spall_editor`). Its egui integration shares the device and queue selected by `spall_render::RenderContext` for the presentation surface; no Spall runtime crate imports egui or editor document types.
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by ENG-74 |
+| --- | ---: | --- | --- | --- |
+| egui | 0.31.1 | default features | `MIT OR Apache-2.0` | panels, menus, inspectors and voxel controls |
+| egui-wgpu | 0.31.1 | default features | `MIT OR Apache-2.0` | compositing the editor UI on the native surface |
+| egui-winit | 0.31.1 | default features | `MIT OR Apache-2.0` | native input/window event translation |
+| ron | 0.10.1 | default features | `MIT OR Apache-2.0` | versioned human-readable project, scene and voxel documents |
+
 ## T01 — IDs, schemas, canonical encoding (verified 2026-09-06)
 
 Added for `spall_protocol`. Both are pure-Rust and build GPU/window/network-free.
