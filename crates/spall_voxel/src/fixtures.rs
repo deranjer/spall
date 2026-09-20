@@ -1351,3 +1351,23 @@ pub fn g4_giant_cut() -> G4BodyEdit {
         radius: G4_GIANT_CUT_RADIUS_CELLS,
     }
 }
+
+/// Terrain "dig lane" for the integrated workload's terrain share of ordinary
+/// edits: a strip of the ground slab (`z 200..=218`, `x 4..=380`, cells) on
+/// which each dig is a distinct radius-1 sphere at `y = 1` (a hole through the
+/// 4-cell slab), `2` cells apart so no two overlap: `189 x 10 = 1,890` distinct
+/// digs, enough for the 30-minute lane's terrain share.
+pub const G4_TERRAIN_DIG_CAPACITY: i64 = 189 * 10;
+
+/// The `index`-th terrain dig: `(cell, radius)`, or `None` past the lane.
+pub fn g4_terrain_dig(index: u64) -> Option<([i64; 3], i64)> {
+    if index >= G4_TERRAIN_DIG_CAPACITY as u64 {
+        return None;
+    }
+    let i = index as i64;
+    // Stride-7 walk (gcd(7, 1890) = 7 is not coprime, so use 11: gcd(11, 1890) = 1)
+    // so consecutive digs are far apart and every slot is visited once.
+    let q = (i * 11) % G4_TERRAIN_DIG_CAPACITY;
+    let (col, row) = (q % 189, q / 189);
+    Some(([4 + col * 2, 1, 200 + row * 2], 1))
+}

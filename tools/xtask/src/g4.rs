@@ -309,6 +309,14 @@ fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+/// One client's measured end-to-end topology lag (server tick of each
+/// transaction versus the freshest tick that client had seen on the wire).
+#[derive(Debug, Clone, Copy)]
+pub struct ClientLag {
+    pub p95_ms: u64,
+    pub max_ms: u64,
+}
+
 /// Evaluates `facts` against `cfg`. `process_peak_bytes` is the server's OS peak
 /// working set; `committed` its committed-transaction count; `clients` how many
 /// clients the scenario runs; `large_collapse_samples` how many commits the
@@ -319,6 +327,7 @@ pub fn evaluate(
     process_peak_bytes: Option<u64>,
     clients: u64,
     large_collapse_samples: u64,
+    client_lags: &[ClientLag],
 ) -> G4Row {
     let mut checks: Vec<Check> = Vec::new();
     let mut add = |name: &str, passed: bool, measured: String, target: String| {
@@ -443,7 +452,7 @@ pub fn evaluate(
 
     // --- reliable backlog: caps and per-blast recovery ----------------------
     add(
-        "reliable backlog never exceeded its hard cap",
+        "application send-queue never exceeded its hard cap",
         facts.reliable_backlog_overflows == 0
             && facts.reliable_backlog_cap_bytes > 0
             && facts.reliable_backlog_peak_bytes <= facts.reliable_backlog_cap_bytes,
@@ -456,13 +465,35 @@ pub fn evaluate(
         "peak <= cap, 0 overflow disconnects".to_string(),
     );
     add(
-        "reliable backlog age capped at all times",
+        "application send-queue age capped at all times",
         !all.is_empty() && facts.reliable_backlog_peak_age_ms <= cfg.backlog_cap_age_ms,
         format!(
             "peak sampled age {} ms (worst enqueue-to-transport wait {} ms)",
             facts.reliable_backlog_peak_age_ms, facts.reliable_delivery_age_max_ms
         ),
         format!("<= {} ms", cfg.backlog_cap_age_ms),
+    );
+
+    // The application-level queue above cannot see data already handed to the
+    // transport (QUIC buffers unsent reliable bytes when the congestion window
+    // is small), so it read "recovered" while replicas were 76 s behind. The
+    // client-observed lag is the end-to-end measure.
+    let worst_lag_p95 = client_lags.iter().map(|l| l.p95_ms).max();
+    let worst_lag_max = client_lags.iter().map(|l| l.max_ms).max();
+    add(
+        "end-to-end topology lag (client-observed) within cap for every client",
+        client_lags.len() as u64 >= clients
+            && worst_lag_max.is_some_and(|m| m <= cfg.backlog_cap_age_ms),
+        format!(
+            "{} clients reporting; worst p95 {:?} ms, worst max {:?} ms",
+            client_lags.len(),
+            worst_lag_p95,
+            worst_lag_max
+        ),
+        format!(
+            "{clients} clients, max lag <= {} ms",
+            cfg.backlog_cap_age_ms
+        ),
     );
 
     let recovery_ticks = (cfg.blast_recovery_sec as f64 * 60.0) as u64;
@@ -513,7 +544,7 @@ pub fn evaluate(
         format!(">= {}", cfg.expected_blasts),
     );
     add(
-        "reliable backlog back to normal within the recovery window after every blast",
+        "application send-queue back to normal within the recovery window after every blast",
         !blast_rows.is_empty() && recovered == blast_rows.len(),
         format!(
             "{recovered} of {} recovered (worst first-window peak {} KiB / {} ms; worst tail {} KiB / {} ms)",
@@ -789,7 +820,17 @@ mod tests {
 
     #[test]
     fn a_healthy_run_passes_every_check() {
-        let row = evaluate(&cfg(), &healthy(), Some(2_000_000_000), 2, 1);
+        let row = evaluate(
+            &cfg(),
+            &healthy(),
+            Some(2_000_000_000),
+            2,
+            1,
+            &[ClientLag {
+                p95_ms: 100,
+                max_ms: 400,
+            }; 2],
+        );
         let failed: Vec<_> = row.checks.iter().filter(|c| !c.passed).collect();
         assert!(failed.is_empty(), "{failed:#?}");
         assert!(row.requirements_met);
@@ -797,12 +838,12 @@ mod tests {
 
     #[test]
     fn missing_measurements_fail_closed() {
-        let row = evaluate(&cfg(), &G4ServerFacts::default(), None, 2, 0);
+        let row = evaluate(&cfg(), &G4ServerFacts::default(), None, 2, 0, &[]);
         assert!(!row.requirements_met);
         for name in [
             "measured window completed with samples",
             "server process peak memory within cap",
-            "reliable backlog back to normal within the recovery window after every blast",
+            "application send-queue back to normal within the recovery window after every blast",
             "steady per-client egress p95 <= cap",
             "active (solver-awake) bodies throughout the window",
         ] {
@@ -820,7 +861,7 @@ mod tests {
                 s.backlog_max_age_ms = 4_000;
             }
         }
-        let row = evaluate(&cfg(), &facts, Some(1), 2, 1);
+        let row = evaluate(&cfg(), &facts, Some(1), 2, 1, &[]);
         let c = row
             .checks
             .iter()
@@ -837,7 +878,7 @@ mod tests {
                 c.transport_bytes = s.tick * 8_000; // 480 KB/s
             }
         }
-        let row = evaluate(&cfg(), &facts, Some(1), 2, 1);
+        let row = evaluate(&cfg(), &facts, Some(1), 2, 1, &[]);
         assert!(
             !row.checks
                 .iter()
@@ -848,7 +889,7 @@ mod tests {
         // Run that stopped before the window ended.
         let mut short = healthy();
         short.telemetry_samples.truncate(15);
-        let row = evaluate(&cfg(), &short, Some(1), 2, 1);
+        let row = evaluate(&cfg(), &short, Some(1), 2, 1, &[]);
         assert!(
             !row.checks
                 .iter()

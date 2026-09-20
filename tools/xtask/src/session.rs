@@ -335,6 +335,10 @@ struct Scenario {
     /// refuse are not assigned edits.
     #[serde(default)]
     edit_clients: Option<u64>,
+    /// Diagnostic: raise the clients' QUIC handshake timeout (ms). Unset = the
+    /// production 5 s.
+    #[serde(default)]
+    client_handshake_timeout_ms: Option<u64>,
     /// T21 / ENG-28 increment 4 (3c): run the server with `--dormancy` — a
     /// settled body with nothing active nearby deactivates, and a dormant body
     /// a player or edit approaches reactivates. Never combine with
@@ -658,6 +662,9 @@ struct MotionInterestSpec {
     far_interval: u64,
     #[serde(default)]
     client_budget_bytes: usize,
+    /// Pass `--motion-congestion-aware`.
+    #[serde(default)]
+    congestion_aware: bool,
     /// `x,y,z` metres for a scene with no player spawns. Omitted → those
     /// clients stay unfiltered (matches the CLI default).
     #[serde(default)]
@@ -706,6 +713,11 @@ struct SustainedEdits {
     /// collapse (`None`: no giant in this run).
     #[serde(default)]
     giant_at_offset_ticks: Option<u64>,
+    /// `g4_bodies` only: every `terrain_edit_every`-th ordinary edit is a **terrain**
+    /// dig on the ground slab instead of a body cut (`0` = none). The declared
+    /// mix is `1` terrain edit per `terrain_edit_every` ordinary edits.
+    #[serde(default)]
+    terrain_edit_every: u64,
 }
 
 /// Edit geometry for [`SustainedEdits`].
@@ -825,13 +837,31 @@ fn generate_sustained_cuts(
             target: Some("body"),
             entity: Some(e.entity),
         };
+        // The declared mix: with `terrain_edit_every = N`, ordinary edit `i` is a
+        // terrain dig when `i % N == N - 1`, else the next unused comb-tooth cut.
+        let every = s.terrain_edit_every;
+        let mut digs = 0u64;
+        let mut comb_edits = 0u64;
         for i in 0..n_small {
             let tick = start + (i as f64 * small_step) as u64;
-            let e = yard::g4_ordinary_edit(i).expect("count is capped by the yard's capacity");
-            by_client
-                .entry(i % clients)
-                .or_default()
-                .push(body(tick, e));
+            let cut = if every > 0 && i % every == every - 1 {
+                let (cell, radius) =
+                    yard::g4_terrain_dig(digs).expect("terrain digs within the dig lane");
+                digs += 1;
+                GeneratedCut {
+                    tick,
+                    cell,
+                    radius,
+                    target: None,
+                    entity: None,
+                }
+            } else {
+                let e = yard::g4_ordinary_edit(comb_edits)
+                    .expect("count is capped by the yard's capacity");
+                comb_edits += 1;
+                body(tick, e)
+            };
+            by_client.entry(i % clients).or_default().push(cut);
         }
         for i in 0..n_blasts {
             // Half a blast step in: the first blast is 5 s into the stream.
@@ -1123,6 +1153,12 @@ fn body_settled(scenario: &Scenario, server: &ServerSummary) -> bool {
 #[derive(Debug, Clone, Deserialize)]
 struct ClientSummary {
     result: String,
+    #[serde(default)]
+    topology_lag_p95_ms: u64,
+    #[serde(default)]
+    topology_lag_max_ms: u64,
+    #[serde(default)]
+    tx_received: u64,
     #[serde(default)]
     transactions_applied: u64,
     #[serde(default)]
@@ -1600,6 +1636,9 @@ mod requirement_tests {
 
     fn client(motion_snapshots: u64) -> ClientSummary {
         ClientSummary {
+            topology_lag_p95_ms: 0,
+            topology_lag_max_ms: 0,
+            tx_received: 0,
             result: "passed".into(),
             transactions_applied: 1,
             repair_requests_sent: 0,
@@ -2123,6 +2162,43 @@ mod requirement_tests {
         assert!(!join_budget_row(&unconfigured, &[]).configured);
     }
 
+    /// The declared ordinary-edit mix: 1 terrain dig per 10 ordinary edits, the
+    /// rest comb-tooth cuts; every terrain dig is distinct and on the dig lane,
+    /// and the 30-minute lane stays inside both supplies.
+    #[test]
+    fn the_declared_edit_mix_includes_terrain_digs() {
+        let s = SustainedEdits {
+            start_tick: 1800,
+            small_rate_per_sec: 10.0,
+            blast_interval_sec: 10.0,
+            trailing_buffer_ticks: 300,
+            mode: SustainedMode::G4Bodies,
+            ordinary_offset_ticks: 120,
+            giant_at_offset_ticks: Some(60),
+            terrain_edit_every: 10,
+        };
+        let server_ticks = 1800 + 108_000 + 300;
+        let (n_small, _, _) = sustained_counts(&s, server_ticks);
+        assert_eq!(n_small, (108_000 - 120) / 6, "the full 10 edits/s is kept");
+        let by_client = generate_sustained_cuts(&s, server_ticks, 8);
+        let all: Vec<&GeneratedCut> = by_client.values().flatten().collect();
+        let terrain: Vec<&&GeneratedCut> = all
+            .iter()
+            .filter(|c| c.target.is_none() && c.radius == 1)
+            .collect();
+        assert_eq!(terrain.len() as u64, n_small / 10, "one in ten is terrain");
+        let mut cells = std::collections::HashSet::new();
+        for c in &terrain {
+            assert!(cells.insert(c.cell), "terrain dig repeats {:?}", c.cell);
+            assert!(c.cell[2] >= 200 && c.cell[1] == 1);
+        }
+        let body_edits = all
+            .iter()
+            .filter(|c| c.target == Some("body") && c.radius == 1)
+            .count() as u64;
+        assert_eq!(body_edits + terrain.len() as u64, n_small);
+    }
+
     /// T23 / G4 integrated stream: 10 ordinary comb-tooth cuts/s, one tower blast
     /// per 10 s, and the giant collapse first; every cut is aimed at a real
     /// body by entity id, no (entity, cell) repeats, and the 30-minute lane
@@ -2137,6 +2213,7 @@ mod requirement_tests {
             mode: SustainedMode::G4Bodies,
             ordinary_offset_ticks: 120,
             giant_at_offset_ticks: Some(60),
+            terrain_edit_every: 0,
         };
         for measured in [7_200u64, 108_000] {
             let server_ticks = 1800 + measured + 300;
@@ -2188,6 +2265,7 @@ mod requirement_tests {
             mode: SustainedMode::TerrainCells,
             ordinary_offset_ticks: 0,
             giant_at_offset_ticks: None,
+            terrain_edit_every: 0,
         };
         let server_ticks = 1800 + 7200 + 120; // 30 s warmup + 2 measured minutes + buffer
         let (n_small, n_blasts, _) = sustained_counts(&s, server_ticks);
@@ -2244,6 +2322,7 @@ mod requirement_tests {
             mode: SustainedMode::TerrainCells,
             ordinary_offset_ticks: 0,
             giant_at_offset_ticks: None,
+            terrain_edit_every: 0,
         };
         let server_ticks = 1800 + 108_000 + 200; // 30 s warmup + 30 measured minutes + buffer
         let (n_small, n_blasts, _) = sustained_counts(&s, server_ticks);
@@ -2399,6 +2478,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             "--motion-client-budget-bytes",
             &mi.client_budget_bytes.to_string(),
         ]);
+        if mi.congestion_aware {
+            server_cmd.arg("--motion-congestion-aware");
+        }
         if let Some(a) = mi.static_anchor {
             server_cmd.args([
                 "--motion-static-anchor",
@@ -2540,10 +2622,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         let _ = fs::remove_file(&summary);
         client_summary_paths.push(summary.clone());
         let mut c = Command::new(sandbox_binary_profile("sandbox-client", profile));
-        if scenario.network_envelope.is_some() {
-            // Eight simultaneous handshakes over an impaired path exceeded the 5 s
-            // default (docs/reports/G3.md increment 38); the gate run raises it.
-            c.env("SPALL_HANDSHAKE_TIMEOUT_MS", "20000");
+        if let Some(ms) = scenario.client_handshake_timeout_ms {
+            // Diagnostic override only (never the production default): lets a run
+            // separate handshake-queueing from other join failures.
+            c.env("SPALL_HANDSHAKE_TIMEOUT_MS", ms.to_string());
         }
         c.args([
             "--connect",
@@ -2950,12 +3032,22 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             if cfg.expected_baseline_sends == 0 {
                 cfg.expected_baseline_sends = scenario.late_join_clients.len() as u64;
             }
+            let lags: Vec<g4::ClientLag> = client_summaries
+                .iter()
+                .filter_map(|c| c.as_ref())
+                .filter(|c| c.tx_received > 0)
+                .map(|c| g4::ClientLag {
+                    p95_ms: c.topology_lag_p95_ms,
+                    max_ms: c.topology_lag_max_ms,
+                })
+                .collect();
             g4::evaluate(
                 &cfg,
                 &server.g4,
                 server.process_peak_memory_bytes,
                 clients,
                 server.large_collapse_samples,
+                &lags,
             )
         });
     if !g4_row.requirements_met {

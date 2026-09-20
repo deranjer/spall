@@ -19,11 +19,12 @@
     "trailing_buffer_ticks": 2100,
     "mode": "g4_bodies",
     "ordinary_offset_ticks": 120,
-    "giant_at_offset_ticks": 60
+    "giant_at_offset_ticks": 60,
+    "terrain_edit_every": 10
   },
-  "motion_interest": { "near_m": 12.0, "far_m": 24.0, "far_interval": 4, "client_budget_bytes": 6000 },
+  "motion_interest": { "near_m": 12.0, "far_m": 24.0, "far_interval": 4, "client_budget_bytes": 6000, "congestion_aware": true },
   "baseline_rate_limit_bytes_per_sec": 1048576,
   "server_timing": { "warmup_ticks": 3600, "measured_ticks": 7200, "max_samples": 7200 },
-  "g4_telemetry": { "warmup_ticks": 3600, "measured_ticks": 7200, "baseline_rate_cap_bytes_per_sec": 1048576, "blast_recovery_sec": 8, "backlog_normal_age_ms": 5000, "backlog_cap_age_ms": 15000 },
+  "g4_telemetry": { "min_rubble_fraction": 0.8, "warmup_ticks": 3600, "measured_ticks": 7200, "baseline_rate_cap_bytes_per_sec": 1048576, "blast_recovery_sec": 8, "backlog_normal_age_ms": 5000, "backlog_cap_age_ms": 15000 },
   "network_envelope": { "rtt_ms": 200, "jitter_ms": 0, "loss_percent": 5.0 }
 }

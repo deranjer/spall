@@ -20,7 +20,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::replication::{BodyDigest, ClientReplication, InterestSet, MotionBudget};
+use crate::replication::{
+    BodyDigest, ClientReplication, InterestSet, MOTION_SNAPSHOT_WIRE_BYTES, MotionBudget,
+};
 use glam::DVec3;
 use serde::Serialize;
 use spall_core::{
@@ -151,6 +153,10 @@ pub const MAX_ACTIONS_PER_CLIENT_PER_TICK: u32 = 4;
 /// (`docs/protocol.md`: `RepairRequest` is "rate-limited"). Surplus is dropped;
 /// the replica re-requests, itself rate-limited (ENG-49).
 pub const MAX_REPAIRS_PER_CLIENT_PER_TICK: u32 = 8;
+
+/// Concurrent accept loops (each runs one QUIC handshake + authentication at a
+/// time).
+const ACCEPT_WORKERS: usize = 8;
 
 /// Most reliable messages (committed topology, `ActionStatus`, baseline
 /// transfers) that may sit unsent in one client's outbound queue before that
@@ -539,7 +545,22 @@ pub struct MotionInterest {
     /// bridge scenes). `None` there leaves that client unfiltered
     /// ([`InterestSet::Global`]).
     pub static_anchor_m: Option<[f64; 3]>,
+    /// Cap each client's per-batch motion by its measured QUIC path: no more
+    /// than [`MOTION_CWND_SHARE`] of `cwnd / rtt`. Datagrams share the
+    /// congestion window with the reliable topology stream, so on a lossy
+    /// path unbounded motion starves committed topology (measured: cwnd 3-8 KB
+    /// at 100 ms / 2% loss, replicas 76 s behind by the end of a run).
+    pub congestion_aware: bool,
 }
+
+/// Fraction of a connection's `cwnd / rtt` motion may use when
+/// [`MotionInterest::congestion_aware`] is set.
+const MOTION_CWND_SHARE: f64 = 0.25;
+/// Floor on the congestion-aware budget: a batch always carries at least this
+/// many snapshots (the client's own player and the nearest bodies).
+const MOTION_MIN_BATCH_SNAPSHOTS: usize = 4;
+/// Seconds between motion batches (20 Hz).
+const MOTION_BATCH_SECONDS: f64 = 0.05;
 
 /// A player capsule's bounding radius for interest tests, metres. Small and
 /// fixed — a player is prioritised and never `Excluded` regardless.
@@ -831,6 +852,20 @@ pub struct ServeSummary {
     /// Joins refused with `server at capacity` (live connections were at
     /// `max_clients`).
     pub admission_refused_at_capacity: u64,
+    /// Per-session join timelines and replication counters (T23 / G4).
+    pub session_timelines: Vec<SessionTimeline>,
+    /// Per-stage owning-thread timing (sim staging/commit/physics and server
+    /// stages), measured window only when one is configured; sorted by total.
+    pub stage_timings: Vec<StageTimingRow>,
+    /// Worker-thread encode time (ms) of each background baseline capture.
+    pub baseline_capture_encode_ms: Vec<f64>,
+    /// `(ms, outcome)` per accept attempt (success with time since the previous
+    /// attempt finished, or the error), for join-failure root-causing.
+    pub accept_log: Vec<(u64, String)>,
+    /// Server startup stages before the first tick: scene build, initial
+    /// checkpoint capture and publish. Clients connect while these run, so they
+    /// are inside every joiner's readiness time.
+    pub startup_ms: Vec<(String, f64)>,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -1060,6 +1095,33 @@ impl OutboundBatch {
     }
 }
 
+/// T23 / G4: one client session's server-side join timeline and replication
+/// counters, for root-causing join readiness and replica divergence. Event
+/// times are ms since the server's serve loop began.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionTimeline {
+    pub session: u64,
+    pub slot: u32,
+    pub generation: u32,
+    /// `(ms, event)`: joined, baseline_requested, capture_submitted,
+    /// capture_ready, baseline_queued_for_send, promoted_live,
+    /// catch_up_overflow, rebaseline, join_failed, connection_ended: <reason>.
+    pub events: Vec<(u64, String)>,
+    /// Transactions sent to this session while it was `Live`.
+    pub tx_sent_live: u64,
+    /// Transactions queued while it was joining (catch-up queue), and how many
+    /// of those were flushed at promotion.
+    pub tx_queued_joining: u64,
+    pub tx_flushed_at_promotion: u64,
+    pub max_catch_up_queue: u64,
+    /// Highest transaction id handed to this session (live or flushed).
+    pub last_tx_id_sent: u64,
+    pub retries: u64,
+    pub ended_reason: Option<String>,
+}
+
+const MAX_TIMELINE_EVENTS: usize = 64;
+
 /// T23 / G4 server-wide telemetry shared between the tick loop and every
 /// connection writer task. Everything here is a bounded counter or a small
 /// bounded record list.
@@ -1076,6 +1138,17 @@ struct ServerTelemetry {
     baseline_send_bytes: std::sync::atomic::AtomicU64,
     /// Completed baseline sends (bounded), oldest first.
     baseline_sends: Mutex<Vec<BaselineSendRecord>>,
+    /// Per-session timelines, keyed by `session.raw()`, and the run origin they
+    /// are measured from.
+    sessions: Mutex<HashMap<u64, SessionTimeline>>,
+    /// Worker-thread time (ms) of each background baseline encode.
+    capture_encode_ms: Mutex<Vec<f64>>,
+    /// `(ms, outcome)` of each accept attempt: handshake + authentication are
+    /// performed inside `Server::accept`, one connection at a time.
+    accept_log: Mutex<Vec<(u64, String)>>,
+    /// Startup stages (`(name, ms)`) run on the sim thread before the first tick.
+    startup_ms: Mutex<Vec<(String, f64)>>,
+    origin: std::sync::OnceLock<std::time::Instant>,
     /// Connections admitted and not yet finished (the admission cap counts
     /// these, not connections ever accepted).
     live_connections: std::sync::atomic::AtomicUsize,
@@ -1114,6 +1187,38 @@ impl<'a> ActiveBaselineSend<'a> {
         let now = t.baseline_sends_active.fetch_add(1, Relaxed) + 1;
         t.baseline_sends_active_max.fetch_max(now, Relaxed);
         Self(t)
+    }
+}
+
+impl ServerTelemetry {
+    /// Milliseconds since the first call (made when the serve loop starts).
+    fn now_ms(&self) -> u64 {
+        self.origin
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+
+    /// Runs `f` on `session`'s timeline (creating it), under the lock.
+    fn with_session(&self, session: SessionId, f: impl FnOnce(&mut SessionTimeline, u64)) {
+        let now = self.now_ms();
+        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let t = map.entry(session.raw()).or_insert_with(|| SessionTimeline {
+            session: session.raw(),
+            slot: session.slot().0,
+            generation: session.generation(),
+            ..SessionTimeline::default()
+        });
+        f(t, now);
+    }
+
+    fn session_event(&self, session: SessionId, event: impl Into<String>) {
+        let event = event.into();
+        self.with_session(session, |t, now| {
+            if t.events.len() < MAX_TIMELINE_EVENTS {
+                t.events.push((now, event));
+            }
+        });
     }
 }
 
@@ -1267,12 +1372,24 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         baseline_rate_limit: config.baseline_rate_limit_bytes_per_sec,
         ..ServerTelemetry::default()
     });
+    telemetry.now_ms(); // start the timeline clock
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
 
     // Accept loop.
-    let accept = {
+    // Handshake + authentication run *inside* `Server::accept`, so a single
+    // accept loop serialises them: under a 100 ms RTT / 2% loss path each takes
+    // 1-3 s (measured, `accept_log`), and the N-th simultaneous joiner waits for
+    // the N-1 before it -- past the client's 5 s handshake timeout from N ~ 4.
+    // Several loops accept concurrently (bounded by the endpoint's
+    // pre-authentication budget).
+    let accept_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count_tx = Arc::new(count_tx);
+    let mut accept_tasks = Vec::new();
+    for _ in 0..ACCEPT_WORKERS {
+        let accept_count = accept_count.clone();
+        let count_tx = count_tx.clone();
         let server = server.clone();
         let clients = clients.clone();
         let conns = conns.clone();
@@ -1281,20 +1398,43 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let inbound_tx = inbound_tx.clone();
         let stop_rx = stop_rx.clone();
         let max_clients = config.max_clients;
-        tokio::spawn(async move {
-            let mut connected = 0usize;
+        accept_tasks.push(tokio::spawn(async move {
             loop {
                 if *stop_rx.borrow() {
                     break;
                 }
+                let attempt_started = std::time::Instant::now();
                 let accepted = tokio::select! {
                     r = server.accept() => r,
                     _ = wait_true(stop_rx.clone()) => break,
                 };
                 let conn = match accepted {
-                    Ok(c) => Arc::new(c),
+                    Ok(c) => {
+                        let mut log = telemetry
+                            .accept_log
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if log.len() < 256 {
+                            log.push((
+                                telemetry.now_ms(),
+                                format!(
+                                    "accepted {} (this accept() call took {} ms incl. idle wait)",
+                                    c.session(),
+                                    attempt_started.elapsed().as_millis()
+                                ),
+                            ));
+                        }
+                        Arc::new(c)
+                    }
                     Err(e) => {
                         tracing::warn!("accept failed: {e}");
+                        let mut log = telemetry
+                            .accept_log
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if log.len() < 256 {
+                            log.push((telemetry.now_ms(), format!("accept failed: {e}")));
+                        }
                         continue;
                     }
                 };
@@ -1316,7 +1456,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 telemetry
                     .live_connections
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                connected += 1;
+                let connected = accept_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let _ = count_tx.send(connected);
                 let handle = OutboundHandle::new();
                 clients
@@ -1338,8 +1478,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     stop_rx.clone(),
                 ));
             }
-        })
-    };
+        }));
+    }
 
     // Wait for the first `min_clients` (or time out).
     if config.min_clients > 0 {
@@ -1380,6 +1520,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let motion_interest = config.motion_interest;
     let scene = config.scene;
     let clients_for_sim = clients.clone();
+    let telemetry_for_lj = telemetry.clone();
     let conns_for_sim = conns.clone();
     let save = config.save.clone();
     let save_faults = config.save_faults.clone();
@@ -1418,6 +1559,13 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 return SimResult::error(format!("persistence setup failed: {e}"), 0);
             }
         };
+        for (name, d) in spall_sim::prof::drain() {
+            telemetry_for_lj
+                .startup_ms
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((name.to_string(), d.as_secs_f64() * 1000.0));
+        }
         let mut journal_records_written: u64 = 0;
 
         // T23 / G3 row 7, slice D: default-off residency pass. `None` -> the
@@ -1488,6 +1636,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut dormancy_deactivations_total = 0u64;
         let mut dormancy_reactivations_total = 0u64;
         let mut timing = timing_window.map(TimingCollector::new);
+        let mut stage_agg = StageAgg::new(timing_window);
 
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
@@ -1520,6 +1669,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // brick the residency pass has evicted is filled from its durable
         // backing.
         lj.backing = residency.as_ref().map(|p| p.backing());
+        lj.telemetry = Some(telemetry_for_lj.clone());
 
         for _ in 0..max_ticks {
             let started = std::time::Instant::now();
@@ -1533,6 +1683,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             let mut actions_admitted: HashMap<u64, u32> = HashMap::new();
             let mut repairs_admitted: HashMap<u64, u32> = HashMap::new();
             let mut drained = 0usize;
+            let sp_ingress = spall_sim::prof::Span::start("srv.ingress_drain");
             while drained < MAX_INBOUND_PER_TICK {
                 let Ok(msg) = inbound_rx.try_recv() else {
                     break;
@@ -1673,6 +1824,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
+            drop(sp_ingress);
             lj.publish_ready_captures(&clients_for_sim);
             if !agitated.is_empty() {
                 spall_sim::fixtures::agitate_g4_bodies(sim.world_mut(), &agitated, ticks_run);
@@ -1737,6 +1889,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
+            let sp_fan = spall_sim::prof::Span::start("srv.commit_fanout");
             for (rid, committed) in &report.committed {
                 committed_total += 1;
                 if blast_requests.remove(rid) {
@@ -1787,6 +1940,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     );
                 }
             }
+            drop(sp_fan);
             for status in action_statuses(&report) {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
                     rejected_total += 1;
@@ -1809,6 +1963,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             // The 20 Hz motion batch: send it to replicas *and* keep the full
             // batch for the durable pose journal below (durability is never
             // interest-filtered).
+            let sp_motion = spall_sim::prof::Span::start("srv.motion_publish");
             let pose_batch: Option<Vec<MotionSnapshot>> = if motion.due(tick) {
                 let snaps = motion.snapshots(sim.world(), tick);
                 if !snaps.is_empty() {
@@ -1841,6 +1996,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                 &sim,
                                 &lj,
                                 &clients_for_sim,
+                                &conns_for_sim,
                                 &mut client_repl,
                                 &mut motion_egress,
                             );
@@ -1860,6 +2016,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             // The sim thread never blocks on the disk; when the backlog fills or
             // a durable write has failed, the run stops rather than silently
             // continuing an unsavable world (`docs/protocol.md` Persistence).
+            drop(sp_motion);
+            let sp_persist = spall_sim::prof::Span::start("srv.persistence_submit");
             if let Some(pipe) = pipeline.as_ref() {
                 let batch = match tick_journal_batch(
                     &mut sim,
@@ -1920,6 +2078,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
+            drop(sp_persist);
+            let sp_resid = spall_sim::prof::Span::start("srv.residency_pass");
             // Slice D: post-tick residency pass. Evicts terrain bricks outside
             // every player's interest box, reloads any back in interest. The
             // committed world (hash, conservation, result_hashes) is unchanged;
@@ -1943,6 +2103,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 pass.run(sim.world_mut(), &player_feet, &pending_edit_bricks);
             }
 
+            drop(sp_resid);
+            stage_agg.ingest(ticks_run, started.elapsed());
             // G4 timing ends after all owning-thread work for this tick,
             // including replication, persistence submission, and residency,
             // but before the optional pacing sleep below. Warmup is explicit;
@@ -2043,6 +2205,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         }
 
         SimResult {
+            stage_timings: stage_agg.finish(),
             samples: sampler.samples,
             blast_commit_ticks,
             backlog_peak_bytes: sampler.peak_bytes.max(sampler.interval_bytes),
@@ -2136,7 +2299,9 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let _ = stop_tx.send(true);
     server.close();
     let _ = tokio::time::timeout(Duration::from_secs(3), server.wait_idle()).await;
-    let _ = accept.await;
+    for task in accept_tasks {
+        let _ = task.await;
+    }
 
     // T20: total egress. Hold the `conns` lock across the whole read so a
     // late-closing `serve_conn` can neither remove-and-accumulate an entry
@@ -2357,6 +2522,33 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         admission_refused_at_capacity: telemetry
             .admission_refused
             .load(std::sync::atomic::Ordering::Relaxed),
+        stage_timings: sim_result.stage_timings.clone(),
+        baseline_capture_encode_ms: telemetry
+            .capture_encode_ms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        accept_log: telemetry
+            .accept_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        startup_ms: telemetry
+            .startup_ms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        session_timelines: {
+            let mut v: Vec<SessionTimeline> = telemetry
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .cloned()
+                .collect();
+            v.sort_by_key(|s| s.session);
+            v
+        },
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -2387,6 +2579,13 @@ pub struct ClientEgressSample {
     pub slot: u32,
     pub app_bytes: u64,
     pub transport_bytes: u64,
+    /// QUIC path state at the sample: smoothed RTT (ms), congestion window
+    /// (bytes), and cumulative lost packets / congestion events. The window is
+    /// what caps *all* traffic on the connection, motion datagrams included.
+    pub rtt_ms: u64,
+    pub cwnd_bytes: u64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
 }
 
 /// T23 / G4: one once-per-60-ticks observation. `elapsed_ms` is wall clock
@@ -2488,10 +2687,17 @@ impl TelemetrySampler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|conn| ClientEgressSample {
-                slot: conn.session().slot().0,
-                app_bytes: conn.stats().app_bytes_sent,
-                transport_bytes: conn.transport_stats().udp_tx.bytes,
+            .map(|conn| {
+                let t = conn.transport_stats();
+                ClientEgressSample {
+                    slot: conn.session().slot().0,
+                    app_bytes: conn.stats().app_bytes_sent,
+                    transport_bytes: t.udp_tx.bytes,
+                    rtt_ms: t.path.rtt.as_millis() as u64,
+                    cwnd_bytes: t.path.cwnd,
+                    lost_packets: t.path.lost_packets,
+                    congestion_events: t.path.congestion_events,
+                }
             })
             .collect();
         clients.sort_by_key(|c| c.slot);
@@ -2514,6 +2720,119 @@ impl TelemetrySampler {
         }
         self.interval_bytes = 0;
         self.interval_age_ms = 0;
+    }
+}
+
+/// One stage's timing over the measured window (all ticks when no window is set).
+#[derive(Debug, Clone, Serialize)]
+pub struct StageTimingRow {
+    pub stage: String,
+    /// Spans recorded (a stage may fire several times per tick).
+    pub count: u64,
+    pub total_ms: f64,
+    pub mean_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    /// Ticks the stage fired in and how long the worst *tick's* sum of it was
+    /// (a stage that fires many times per tick shows there, not in `max_ms`).
+    pub ticks_active: u64,
+    pub worst_tick_total_ms: f64,
+}
+
+/// Aggregates [`spall_sim::prof`] spans (plus the whole-tick busy time) per stage.
+struct StageAgg {
+    window: Option<(u64, u64)>,
+    stages: HashMap<&'static str, StageSamples>,
+}
+
+#[derive(Default)]
+struct StageSamples {
+    spans_ms: Vec<f32>,
+    /// `(tick, summed ms that tick)`, one entry per active tick.
+    per_tick: Vec<(u64, f32)>,
+}
+
+const MAX_STAGE_SAMPLES: usize = 400_000;
+
+impl StageAgg {
+    fn new(window: Option<TimingWindow>) -> Self {
+        Self {
+            window: window.map(|w| (w.warmup_ticks, w.warmup_ticks + w.measured_ticks)),
+            stages: HashMap::new(),
+        }
+    }
+
+    /// Drains this thread's spans for `tick` and folds them in, plus the tick's
+    /// total owning-thread busy time under `srv.tick_busy`.
+    fn ingest(&mut self, tick: u64, busy: Duration) {
+        let spans = spall_sim::prof::drain();
+        if let Some((lo, hi)) = self.window
+            && (tick <= lo || tick > hi)
+        {
+            return;
+        }
+        let mut per_tick: HashMap<&'static str, f32> = HashMap::new();
+        for (name, d) in spans
+            .into_iter()
+            .chain(std::iter::once(("srv.tick_busy", busy)))
+        {
+            let ms = d.as_secs_f64() as f32 * 1000.0;
+            let s = self.stages.entry(name).or_default();
+            if s.spans_ms.len() < MAX_STAGE_SAMPLES {
+                s.spans_ms.push(ms);
+            }
+            *per_tick.entry(name).or_default() += ms;
+        }
+        for (name, ms) in per_tick {
+            let s = self.stages.entry(name).or_default();
+            if s.per_tick.len() < MAX_STAGE_SAMPLES {
+                s.per_tick.push((tick, ms));
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<StageTimingRow> {
+        let mut rows: Vec<StageTimingRow> = self
+            .stages
+            .into_iter()
+            .map(|(name, mut s)| {
+                s.spans_ms
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let pct = |q: f64| -> f64 {
+                    if s.spans_ms.is_empty() {
+                        return 0.0;
+                    }
+                    let rank =
+                        ((q * s.spans_ms.len() as f64).ceil() as usize).clamp(1, s.spans_ms.len());
+                    f64::from(s.spans_ms[rank - 1])
+                };
+                let total: f64 = s.spans_ms.iter().map(|v| f64::from(*v)).sum();
+                StageTimingRow {
+                    stage: name.to_string(),
+                    count: s.spans_ms.len() as u64,
+                    total_ms: total,
+                    mean_ms: total / s.spans_ms.len().max(1) as f64,
+                    p50_ms: pct(0.50),
+                    p95_ms: pct(0.95),
+                    p99_ms: pct(0.99),
+                    max_ms: s.spans_ms.last().copied().map_or(0.0, f64::from),
+                    ticks_active: s.per_tick.len() as u64,
+                    worst_tick_total_ms: s
+                        .per_tick
+                        .iter()
+                        .map(|(_, v)| f64::from(*v))
+                        .fold(0.0, f64::max),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.total_ms
+                .partial_cmp(&a.total_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
     }
 }
 
@@ -2597,6 +2916,7 @@ fn percentile(samples: &[f64], fraction: f64) -> f64 {
 }
 
 struct SimResult {
+    stage_timings: Vec<StageTimingRow>,
     samples: Vec<TelemetrySample>,
     blast_commit_ticks: Vec<u64>,
     backlog_peak_bytes: u64,
@@ -2659,6 +2979,7 @@ struct SimResult {
 impl SimResult {
     fn error(msg: String, ticks_run: u64) -> Self {
         Self {
+            stage_timings: Vec::new(),
             samples: Vec::new(),
             blast_commit_ticks: Vec::new(),
             backlog_peak_bytes: 0,
@@ -2734,6 +3055,16 @@ enum Phase {
         queue: VecDeque<QueuedItem>,
         retries: u32,
     },
+}
+
+/// One in-flight background baseline capture and the sessions waiting on it.
+struct PendingCapture {
+    /// Journal cursor the snapshot was taken at; a joiner may share the capture
+    /// only while the world's cursor still equals it (no commit since).
+    cursor: JournalSeq,
+    rx: std::sync::mpsc::Receiver<Result<BaselineTransfer, baseline::BaselineError>>,
+    /// `(session.raw(), that session's transfer id)`.
+    waiters: Vec<(u64, TransferId)>,
 }
 
 struct ClientLink {
@@ -2855,18 +3186,18 @@ struct LateJoin {
     /// it with a fresh transfer id; transactions after its cursor remain in the
     /// ordinary per-client catch-up queue.
     cached_baseline: Option<std::sync::Arc<BaselineTransfer>>,
-    /// Bounded worker results keyed by the joining session. The simulation owns
-    /// publication and only polls these at tick boundaries.
-    pending_captures: HashMap<
-        u64,
-        (
-            TransferId,
-            std::sync::mpsc::Receiver<Result<BaselineTransfer, baseline::BaselineError>>,
-        ),
-    >,
+    /// Background baseline captures in flight. Joiners that request a baseline
+    /// while one is being captured *at the same journal cursor* wait on it
+    /// instead of each taking their own world snapshot on the tick thread (which
+    /// measured ~2 s per joiner: eight simultaneous joiners spent ~16 s of tick
+    /// thread on snapshots alone). The simulation owns publication and only
+    /// polls these at tick boundaries.
+    pending_captures: Vec<PendingCapture>,
     /// ENG-30 / T23 row 11, increment 30: bounds concurrent background
     /// baseline captures. See [`CapturePool`].
     capture_pool: CapturePool,
+    /// T23 / G4 session timelines (`None` in unit tests).
+    telemetry: Option<Arc<ServerTelemetry>>,
 }
 
 impl LateJoin {
@@ -2884,8 +3215,15 @@ impl LateJoin {
             baseline_bytes: 0,
             backing: None,
             cached_baseline: None,
-            pending_captures: HashMap::new(),
+            pending_captures: Vec::new(),
             capture_pool: CapturePool::new(capture_workers),
+            telemetry: None,
+        }
+    }
+
+    fn ev(&self, session: SessionId, event: &str) {
+        if let Some(t) = &self.telemetry {
+            t.session_event(session, event);
         }
     }
 
@@ -2894,6 +3232,7 @@ impl LateJoin {
     }
 
     fn on_joined(&mut self, session: SessionId) {
+        self.ev(session, "joined");
         self.latest_gen
             .entry(session.slot().0)
             .and_modify(|g| *g = (*g).max(session.generation()))
@@ -2908,10 +3247,13 @@ impl LateJoin {
     }
 
     fn on_gone(&mut self, session: SessionId) {
+        self.ev(session, "gone (reader ended)");
         // Keep `latest_gen` so a straggler record from this session is still
         // rejected after the link is gone.
         self.links.remove(&session.raw());
-        self.pending_captures.remove(&session.raw());
+        for c in &mut self.pending_captures {
+            c.waiters.retain(|(raw, _)| *raw != session.raw());
+        }
     }
 
     /// Every connected client currently in normal (`Live`) replication. A client
@@ -2975,6 +3317,7 @@ impl LateJoin {
 
         if want_baseline {
             let id = self.next_id();
+            self.ev(session, "baseline_requested");
             match self
                 .cached_baseline
                 .as_ref()
@@ -2982,6 +3325,7 @@ impl LateJoin {
             {
                 Some(transfer) => {
                     let transfer = transfer.reissue(id);
+                    self.ev(session, "baseline_reused_cached");
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&session.raw()) {
                         link.phase = Phase::Joining {
@@ -2993,22 +3337,52 @@ impl LateJoin {
                     send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
                 }
                 None => {
+                    let cursor = JournalSeq(sim.journal_cursor());
+                    let raw = session.raw();
+                    let joining = Phase::Joining {
+                        transfer_id: id,
+                        queue: VecDeque::new(),
+                        retries: 0,
+                    };
+                    if let Some(existing) = self
+                        .pending_captures
+                        .iter_mut()
+                        .find(|c| c.cursor == cursor)
+                    {
+                        // A capture at this very cursor is already running:
+                        // wait on it rather than snapshotting the world again.
+                        existing.waiters.push((raw, id));
+                        if let Some(link) = self.links.get_mut(&raw) {
+                            link.phase = joining;
+                        }
+                        self.ev(session, "capture_shared_with_inflight");
+                        return;
+                    }
+                    let sp_snap = spall_sim::prof::Span::start("srv.baseline_snapshot_world");
                     let snapshot = baseline::snapshot_world(sim, self.backing_ref());
+                    drop(sp_snap);
+                    self.ev(session, "capture_submitted");
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    let telemetry = self.telemetry.clone();
                     self.capture_pool.spawn(move || {
-                        let _ = tx.send(baseline::transfer_from_snapshot(
-                            snapshot,
-                            id,
-                            InterestEpoch(1),
-                        ));
+                        let started = std::time::Instant::now();
+                        let result =
+                            baseline::transfer_from_snapshot(snapshot, id, InterestEpoch(1));
+                        if let Some(t) = telemetry {
+                            t.capture_encode_ms
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(started.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        let _ = tx.send(result);
                     });
-                    if let Some(link) = self.links.get_mut(&session.raw()) {
-                        link.phase = Phase::Joining {
-                            transfer_id: id,
-                            queue: VecDeque::new(),
-                            retries: 0,
-                        };
-                        self.pending_captures.insert(session.raw(), (id, rx));
+                    if let Some(link) = self.links.get_mut(&raw) {
+                        link.phase = joining;
+                        self.pending_captures.push(PendingCapture {
+                            cursor,
+                            rx,
+                            waiters: vec![(raw, id)],
+                        });
                     }
                 }
             }
@@ -3027,6 +3401,31 @@ impl LateJoin {
             }) => queue.drain(..).collect(),
             _ => Vec::new(),
         };
+        let flushed_txs = drained
+            .iter()
+            .filter(|i| matches!(i, QueuedItem::Tx(_)))
+            .count() as u64;
+        let last_flushed_id = drained
+            .iter()
+            .filter_map(|i| match i {
+                QueuedItem::Tx(tx) => Some(tx.transaction_id.get()),
+                _ => None,
+            })
+            .max();
+        if let Some(t) = &self.telemetry {
+            t.with_session(session, |s, now| {
+                s.tx_flushed_at_promotion += flushed_txs;
+                if let Some(id) = last_flushed_id {
+                    s.last_tx_id_sent = s.last_tx_id_sent.max(id);
+                }
+                if s.events.len() < MAX_TIMELINE_EVENTS {
+                    s.events.push((
+                        now,
+                        format!("promoted_live (flushed {flushed_txs} queued txs)"),
+                    ));
+                }
+            });
+        }
         for item in drained {
             match item {
                 QueuedItem::Tx(tx) => send_to(clients, session, Outbound::Transaction(tx)),
@@ -3068,6 +3467,20 @@ impl LateJoin {
         for (raw, link) in self.links.iter_mut() {
             match &mut link.phase {
                 Phase::Live => {
+                    if let Some(t) = &self.telemetry {
+                        let id = tx.transaction_id.get();
+                        t.with_session(link.session, move |s, now_for_event| {
+                            s.tx_sent_live += 1;
+                            if s.tx_sent_live.is_multiple_of(100)
+                                && s.events.len() < MAX_TIMELINE_EVENTS
+                            {
+                                let n = s.tx_sent_live;
+                                let now = now_for_event;
+                                s.events.push((now, format!("tx_sent_live #{n} id={id}")));
+                            }
+                            s.last_tx_id_sent = s.last_tx_id_sent.max(id);
+                        });
+                    }
                     send_to(clients, link.session, Outbound::Transaction(tx.clone()));
                     if let Some(t) = &split_transfer {
                         send_to(clients, link.session, Outbound::Baseline(t.clone()));
@@ -3075,6 +3488,13 @@ impl LateJoin {
                 }
                 Phase::Joining { queue, .. } => {
                     queue.push_back(QueuedItem::Tx(tx.clone()));
+                    if let Some(t) = &self.telemetry {
+                        let qlen = queue.len() as u64;
+                        t.with_session(link.session, move |s, _| {
+                            s.tx_queued_joining += 1;
+                            s.max_catch_up_queue = s.max_catch_up_queue.max(qlen);
+                        });
+                    }
                     if let Some(t) = &split_transfer {
                         queue.push_back(QueuedItem::Blob(t.clone()));
                     }
@@ -3091,6 +3511,11 @@ impl LateJoin {
                     phase: Phase::Joining { retries, .. },
                 }) => {
                     *retries += 1;
+                    if let Some(t) = &self.telemetry {
+                        let r = *retries;
+                        t.with_session(*session, move |s, _| s.retries = u64::from(r));
+                        t.session_event(*session, format!("catch_up_overflow -> rebaseline #{r}"));
+                    }
                     (*session, *retries)
                 }
                 _ => continue,
@@ -3175,35 +3600,48 @@ impl LateJoin {
     }
 
     fn publish_ready_captures(&mut self, clients: &ClientMap) {
-        let ready: Vec<(u64, Result<BaselineTransfer, baseline::BaselineError>)> = self
-            .pending_captures
-            .iter()
-            .filter_map(|(&raw, (_, rx))| rx.try_recv().ok().map(|result| (raw, result)))
-            .collect();
-        for (raw, result) in ready {
-            let Some((id, _)) = self.pending_captures.remove(&raw) else {
+        let mut i = 0;
+        while i < self.pending_captures.len() {
+            let Ok(result) = self.pending_captures[i].rx.try_recv() else {
+                i += 1;
                 continue;
             };
+            let capture = self.pending_captures.swap_remove(i);
             match result {
                 Ok(transfer) => {
-                    self.baseline_bytes += transfer.payload_bytes() as u64;
-                    self.cached_baseline = Some(Arc::new(transfer.reissue(id)));
-                    if let Some(link) = self.links.get(&raw) {
+                    let transfer = Arc::new(transfer);
+                    if let Some((_, first_id)) = capture.waiters.first() {
+                        self.cached_baseline = Some(Arc::new(transfer.reissue(*first_id)));
+                    }
+                    for (raw, id) in capture.waiters {
+                        // Only a session still joining on exactly this transfer.
+                        let Some(link) = self.links.get(&raw) else {
+                            continue;
+                        };
+                        if !matches!(&link.phase, Phase::Joining { transfer_id, .. } if *transfer_id == id)
+                        {
+                            continue;
+                        }
+                        let s = link.session;
+                        self.ev(s, "capture_ready");
+                        self.baseline_bytes += transfer.payload_bytes() as u64;
                         send_to(
                             clients,
-                            link.session,
-                            Outbound::Baseline(Arc::new(transfer)),
+                            s,
+                            Outbound::Baseline(Arc::new(transfer.reissue(id))),
                         );
                     }
                 }
-                _ => {
-                    self.failed += 1;
-                    if let Some(link) = self.links.remove(&raw) {
-                        send_to(
-                            clients,
-                            link.session,
-                            Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
-                        );
+                Err(_) => {
+                    for (raw, _) in capture.waiters {
+                        self.failed += 1;
+                        if let Some(link) = self.links.remove(&raw) {
+                            send_to(
+                                clients,
+                                link.session,
+                                Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                            );
+                        }
                     }
                 }
             }
@@ -3270,8 +3708,13 @@ fn setup_persistence(
         }
         // A genuinely new/empty database: seed it with the built-in scene.
         Err(spall_store::StoreError::NoCheckpoint) => {
+            let sp = spall_sim::prof::Span::start("startup.scene_build");
             let sim = scene.simulation();
+            drop(sp);
+            let sp = spall_sim::prof::Span::start("startup.initial_checkpoint_capture");
             let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
+            drop(sp);
+            let _sp = spall_sim::prof::Span::start("startup.initial_checkpoint_publish");
             writer
                 .publish_checkpoint(&checkpoint)
                 .map_err(|e| e.to_string())?;
@@ -3646,6 +4089,7 @@ fn dispatch_motion_by_interest(
     sim: &Simulation,
     lj: &LateJoin,
     clients: &ClientMap,
+    conns: &Mutex<HashMap<u64, Arc<Connection>>>,
     client_repl: &mut HashMap<u64, ClientReplication>,
     egress: &mut MotionEgress,
 ) {
@@ -3679,7 +4123,30 @@ fn dispatch_motion_by_interest(
 
         let repl = client_repl.entry(session.raw()).or_default();
         repl.set_interest(interest);
-        let kept = repl.select(batch_index, own_player_key, snaps, &digests, &budget);
+        let mut session_budget = budget;
+        if mi.congestion_aware
+            && let Some(conn) = conns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&session.raw())
+        {
+            let path = conn.transport_stats().path;
+            let rtt_s = path.rtt.as_secs_f64().max(0.02);
+            let cap =
+                ((path.cwnd as f64 / rtt_s) * MOTION_CWND_SHARE * MOTION_BATCH_SECONDS) as usize;
+            let cap = cap.max(MOTION_MIN_BATCH_SNAPSHOTS * MOTION_SNAPSHOT_WIRE_BYTES);
+            session_budget.per_batch_bytes = match budget.per_batch_bytes {
+                0 => cap,
+                fixed => fixed.min(cap),
+            };
+        }
+        let kept = repl.select(
+            batch_index,
+            own_player_key,
+            snaps,
+            &digests,
+            &session_budget,
+        );
         let outcome = repl.last_outcome();
         egress.snapshots_sent += outcome.kept;
         egress.interest_culled += outcome.interest_culled;
@@ -3917,6 +4384,7 @@ async fn serve_conn(
     };
 
     let mut motion_seq = 0u64;
+    let end_reason;
     'writer: loop {
         // Flush everything queued, in commit order, before parking.
         loop {
@@ -3945,6 +4413,8 @@ async fn serve_conn(
                     }
                 };
                 if !ok {
+                    end_reason = "reliable record send failed (connection lost or closed by peer)"
+                        .to_string();
                     break 'writer;
                 }
                 let age = handle.delivered();
@@ -3955,6 +4425,7 @@ async fn serve_conn(
             if let Some(snaps) = batch.motion {
                 for snap in snaps.iter() {
                     if conn.send_datagram(motion_seq, snap).await.is_err() {
+                        end_reason = "motion datagram send failed".to_string();
                         break 'writer;
                     }
                     motion_seq += 1;
@@ -3966,12 +4437,13 @@ async fn serve_conn(
                 // so it re-baselines on reconnect rather than the host holding
                 // an unbounded queue or discarding committed topology in place.
                 let _ = conn.say_bye("reliable backlog exceeded").await;
+                end_reason = "reliable backlog exceeded".to_string();
                 break 'writer;
             }
         }
         tokio::select! {
             _ = handle.woken() => {}
-            _ = wait_true(stop.clone()) => break 'writer,
+            _ = wait_true(stop.clone()) => { end_reason = "server stop".to_string(); break 'writer },
         }
     }
 
@@ -3995,6 +4467,8 @@ async fn serve_conn(
             );
         }
     }
+    telemetry.session_event(session, format!("connection_ended: {end_reason}"));
+    telemetry.with_session(session, |s, _| s.ended_reason = Some(end_reason.clone()));
     conn.close("connection complete");
     reader.abort();
     dgram_reader.abort();
@@ -4474,6 +4948,66 @@ mod tests {
                 .expect("both jobs run concurrently, not serialized");
         }
         assert_eq!(max_concurrent.load(Ordering::SeqCst), 2);
+    }
+
+    /// Joiners that ask for a baseline while a capture at the same journal
+    /// cursor is in flight share it: one world snapshot on the tick thread, one
+    /// encode, every waiter gets its own transfer id. (Measured: eight
+    /// simultaneous joiners each took a ~2 s snapshot on the tick thread.)
+    #[test]
+    fn simultaneous_joiners_share_one_capture() {
+        let sim = Scene::BridgeCut.simulation();
+        let clients = empty_clients();
+        let mut lj = LateJoin::new(64, 1, 2);
+        let mut handles = Vec::new();
+        let joiners: Vec<SessionId> = (0..4).map(|s| sess(s, 1)).collect();
+        for j in &joiners {
+            let h = OutboundHandle::new();
+            clients.lock().unwrap().insert(j.raw(), h.clone());
+            handles.push(h);
+            lj.on_joined(*j);
+            lj.on_baseline_ack(
+                *j,
+                BaselineAck {
+                    transfer_id: BASELINE_REQUEST_SENTINEL,
+                    verified_manifest_hash: Hash32::ZERO,
+                    installed_cursor: spall_core::JournalSeq(0),
+                },
+                &sim,
+                &clients,
+                &mut MotionPublisher::new(60, 20),
+            );
+        }
+        assert_eq!(lj.pending_captures.len(), 1, "one capture for all four");
+        assert_eq!(lj.pending_captures[0].waiters.len(), 4);
+
+        // Publish once the worker finishes; each joiner gets its own transfer id.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !lj.pending_captures.is_empty() {
+            lj.publish_ready_captures(&clients);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "capture never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut ids = Vec::new();
+        for h in &handles {
+            let batch = h.take();
+            let baselines: Vec<_> = batch
+                .reliable
+                .iter()
+                .filter_map(|m| match m {
+                    Outbound::Baseline(t) => Some(t.begin.transfer_id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(baselines.len(), 1, "exactly one baseline per joiner");
+            ids.push(baselines[0]);
+        }
+        ids.sort_by_key(|i| i.0);
+        ids.dedup();
+        assert_eq!(ids.len(), 4, "distinct transfer ids per joiner");
     }
 
     #[test]

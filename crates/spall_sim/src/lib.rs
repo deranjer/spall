@@ -45,6 +45,7 @@ pub mod fixtures;
 pub mod intent;
 pub mod journal;
 pub mod player;
+pub mod prof;
 pub mod registry;
 pub mod replication;
 pub mod schedule;

@@ -228,6 +228,7 @@ impl Simulation {
         let physics_duration = physics_started.elapsed();
         let mut report = report;
         report.physics_duration = physics_duration;
+        let _sp_players = crate::prof::Span::start("sim.advance_players");
         self.advance_players(&report);
         Ok(report)
     }

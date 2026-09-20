@@ -58,6 +58,10 @@ struct Args {
     /// Maximum retained samples for each timing percentile series.
     #[arg(long)]
     timing_max_samples: Option<usize>,
+    /// Cap each client's motion by its measured QUIC congestion window (with
+    /// `--motion-interest`).
+    #[arg(long)]
+    motion_congestion_aware: bool,
     /// Pace each connection's baseline bulk transfer to this many payload bytes
     /// per second (the G4 `1 MiB/s/client` baseline budget). Unpaced if absent.
     #[arg(long)]
@@ -276,6 +280,7 @@ fn run_serve(args: Args) -> ExitCode {
             far_interval: args.motion_far_interval,
             per_client_budget_bytes: args.motion_client_budget_bytes,
             static_anchor_m,
+            congestion_aware: args.motion_congestion_aware,
         })
     } else {
         None

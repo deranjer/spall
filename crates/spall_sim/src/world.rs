@@ -400,7 +400,10 @@ impl SimWorld {
     /// (T21) have no physics body and are skipped — their stored pose stays
     /// authoritative until [`Self::reactivate_body`].
     pub fn step_physics(&mut self) {
+        let sp_step = crate::prof::Span::start("physics.rapier_step");
         self.physics.step();
+        drop(sp_step);
+        let _sp_extract = crate::prof::Span::start("physics.pose_extract");
         let physics = &self.physics;
         for body in self.bodies.values_mut() {
             if body.dormant {

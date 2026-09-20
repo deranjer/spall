@@ -329,3 +329,69 @@ fn reconstructed_active_list_matches_the_spawner() {
         assert_eq!(a.home, b.home);
     }
 }
+
+/// Why does rubble never fall asleep? Runs 90 s of the edit stream and reports
+/// what the awake, non-agitated bodies are doing.
+///
+/// ```sh
+/// cargo test -p spall_sim --release --test g4_integrated -- --ignored --nocapture rubble_census
+/// ```
+#[test]
+#[ignore = "diagnostic: what are the awake rubble bodies doing"]
+fn rubble_census() {
+    let (mut sim, bodies) = scene();
+    let agit: std::collections::HashSet<_> = bodies.active.iter().map(|b| b.entity).collect();
+    let mut req = 1u64;
+    let mut ordinary = 0u64;
+    for t in 0..(90 * 60u64) {
+        if t % 6 == 0 {
+            let e = vfix::g4_ordinary_edit(ordinary).unwrap();
+            ordinary += 1;
+            sim.submit(body_cut(req, e)).unwrap();
+            req += 1;
+        }
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        sim.tick().unwrap();
+        if t % 1800 == 1799 {
+            let (mut awake, mut asleep, mut dormant) = (0, 0, 0);
+            for b in sim.world().bodies() {
+                if agit.contains(&b.entity.unwrap()) {
+                    continue;
+                }
+                if b.dormant {
+                    dormant += 1;
+                } else if b.sleeping {
+                    asleep += 1;
+                } else {
+                    awake += 1;
+                }
+            }
+            println!("t={t}: non-agitated awake={awake} asleep={asleep} dormant={dormant}");
+        }
+    }
+    // Speed / height distribution of the awake rubble.
+    let mut rows: Vec<(f64, f64, f64, u64)> = Vec::new();
+    for b in sim.world().bodies() {
+        let Some(e) = b.entity else { continue };
+        if agit.contains(&e) || b.dormant || b.sleeping {
+            continue;
+        }
+        let v = b.linvel_m_s;
+        let speed = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let w = b.angvel_rad_s;
+        let spin = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+        rows.push((speed, spin, b.pose.translation_m[1], e.get()));
+    }
+    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let n = rows.len();
+    println!("awake rubble: {n}");
+    for q in [0, n / 4, n / 2, 3 * n / 4, n - 1] {
+        let r = rows[q.min(n - 1)];
+        println!(
+            "  q{q}: speed {:.3} m/s spin {:.3} rad/s y {:.2} m (entity {})",
+            r.0, r.1, r.2, r.3
+        );
+    }
+    let low_y = rows.iter().filter(|r| r.2 < -1.0).count();
+    println!("  below the ground (y < -1 m): {low_y}");
+}

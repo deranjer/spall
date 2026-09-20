@@ -132,6 +132,7 @@ fn a_scene_covering_interest_set_changes_nothing_and_reports_egress() {
             far_interval: 1,
             per_client_budget_bytes: 0,
             static_anchor_m: Some([0.0, 0.0, 0.0]),
+            congestion_aware: false,
         },
     );
     let fp_path = cfg.fingerprint_out.clone().unwrap();
@@ -205,6 +206,7 @@ fn a_far_interest_anchor_culls_body_motion_but_never_geometry() {
             far_interval: 4,
             per_client_budget_bytes: 0,
             static_anchor_m: Some([1000.0, 0.0, 0.0]),
+            congestion_aware: false,
         },
     );
     let fp_path = cfg.fingerprint_out.clone().unwrap();
