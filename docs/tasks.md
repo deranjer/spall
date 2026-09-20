@@ -324,6 +324,23 @@ acceptance is still a judgment call for an integrator reviewing the whole
 report, not a claim made here. Earlier increment notes below are historical
 evidence, not the current remaining-work queue.
 
+**2026-09-19 update (increment 38, `docs/reports/G3.md`).** The G4 workload is now
+the full integrated fixture (giant collapse, 18k-edit stream, 256 awake + 4,096
+sleeping bodies, both player arrangements) with warmup-excluded, fail-closed
+telemetry, and evidence exists for two-minute loopback and both impairment
+envelopes plus an overload case. **Still not accepted, and the misses are real:**
+tick/physics p95 over target on loopback (17.5/13.9 ms vs 12/6), the 30-minute lane
+did not complete (server ~22 Hz, 8,866/18,181 commits, cost grows with body count),
+replicas do not converge under either impairment envelope (server, replay, restart
+do), joins time out at the 5 s handshake under impairment, baseline install is
+35-41 s, and "queue full" edit rejections are not retried by clients. Fixed on the
+way: 4.5 MB/s resting-body motion, the reliable byte cap never resetting, admission
+counting connections ever accepted. Terrain-edit commits are O(terrain) (~0.2-0.3 s
+at yard scale), so the workload's edits target bodies. Client frame time is
+unavailable in the headless harness; the hardware `g2-frames` capture measured GPU
+p95 14.8 ms vs 12 ms, and G2's human/cross-GPU review is still open. Acceptance
+remains an integrator decision; ENG-30 is not marked done here.
+
 Dependencies: T15, T17, T18, T20, T21, T22. Own: complete gate report and targeted fixes.
 
 Run all correctness, crash, impairment, visual, and eight-client workload scenarios. Include geographically separated players inside the bounded world, a multi-region collapse, prolonged rubble accumulation, and late join after heavy edits.

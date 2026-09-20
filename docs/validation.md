@@ -660,6 +660,19 @@ residency or total-memory requirements.
 
 Run for two measured minutes after 30 seconds warmup; also run a 30-minute reduced-telemetry soak. Eight players in both clustered and separated arrangements, 256 active nontrivial voxel bodies server-wide, at least 64 nearby to one observer, and an accumulated population of 4,096 sleeping persistent bodies. Drive 10 ordinary edits/s total and one 4 m diameter blast every 10 seconds. Include one 64-brick connected collapse. Geometry fixtures must specify occupied cells and collider complexity, not only body count.
 
+**Evidence status (2026-09-19, `docs/reports/G3.md` increment 38).** The
+integrated fixture (`g4-integrated-{clustered,separated}`; 64-brick giant body,
+282 comb / 180 tower destructible bodies, 256 always-awake + 4,096 sleeping debris
+bodies) and fail-closed telemetry (`tools/xtask/src/g4.rs`, `ServeSummary` v10)
+are in; measured-vs-target is tabulated there. Not met on the loaded reference
+machine: tick p95/p99 and physics p95 (loopback 17.5/21.9/13.9 ms), the 30-minute
+soak (did not complete), impaired-connection convergence, and the G2 GPU p95
+(14.8 ms). Met: per-client steady egress, blast backlog recovery, memory, body
+populations, baseline pacing/concurrency. Ordinary edits target bodies because a
+terrain commit is O(terrain). "Bounded degradation" for the stress envelope has no
+numbers in this document; the stress scenario's limits are author-chosen and await
+ratification. Client frame time from the networked harness is *unavailable*.
+
 Targets on the recorded reference hardware:
 
 | Resource | Provisional target |
