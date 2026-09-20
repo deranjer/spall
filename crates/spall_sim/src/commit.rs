@@ -241,12 +241,15 @@ pub fn commit(
         }
     }
 
+    let sp1 = crate::prof::Span::start("commit.clone_apply_edit");
     let mut parent_candidate: Volume = world
         .volume_ref(vid)
         .ok_or(CommitError::UnknownVolume(vid))?
         .clone();
     let cut_outcome = parent_candidate.apply_edit(&staged.plan)?;
 
+    drop(sp1);
+    let sp2 = crate::prof::Span::start("commit.build_children");
     // 5. Build every child from the post-cut candidate (components are still
     //    solid), and capture the canonical cell-run ops a replica needs to
     //    reconstruct the child without any structural code (`docs/protocol.md`).
@@ -271,6 +274,8 @@ pub fn commit(
     }
     transfer::apply_explosion(&mut children, staged.explosion);
 
+    drop(sp2);
+    let sp3 = crate::prof::Span::start("commit.remove_detached");
     // 6. Remove the detached cells from the candidate.
     let remove_outcome = if staged.splits() {
         let mut remove = EditPlan::new(vid);
@@ -284,6 +289,7 @@ pub fn commit(
         None
     };
 
+    drop(sp3);
     // 7. Plan the parent collider rebuild from the candidate's final geometry,
     //    plus the mass / COM / inertia to reinstall from its post-cut fine
     //    material grid (a dynamic parent lost mass to the cut / to its children;
@@ -300,6 +306,7 @@ pub fn commit(
     // pass re-evict an already-reloaded one before the set is ever whole. Ask
     // for every evicted brick in the volume at once so a single reload makes the
     // candidate's whole bounding box resident and the retry commits next tick.
+    let sp4 = crate::prof::Span::start("commit.occupancy_extract");
     let occupancy = match OccupancyGrid::from_volume(&parent_candidate) {
         Ok(o) => o,
         Err(spall_physics::ExtractError::Unresident(_)) if !world.evicted(vid).is_empty() => {
@@ -310,6 +317,8 @@ pub fn commit(
         }
         Err(e) => return Err(e.into()),
     };
+    drop(sp4);
+    let sp5 = crate::prof::Span::start("commit.plan_collider");
     let parent_rebuild = match occupancy {
         Some(grid) => {
             let plan = plan_collider(&grid)?;
@@ -321,6 +330,7 @@ pub fn commit(
         }
         None => None,
     };
+    drop(sp5);
     // The cut cleared the parent's last solid cell: its ownership is retired on
     // publish (`ENG-56`). A retired body emits no participant snapshot.
     let parent_emptied = !parent_is_terrain && parent_rebuild.is_none();
@@ -368,6 +378,7 @@ pub fn commit(
     // digests (unchanged — the guard above proved the edit touched none of
     // them). A replica that holds those bricks resident computes the same value.
     // Identical to `volume_topology_hash_for` when nothing is evicted.
+    let sp6 = crate::prof::Span::start("commit.hash_and_assemble");
     let parent_result_hash =
         spall_protocol::canonical_topology_hash(&[canonical_logical_volume_for(
             &parent_candidate,
@@ -479,6 +490,9 @@ pub fn commit(
         parent.volume = parent_candidate;
     }
 
+    drop(sp6);
+    let wake_probe = world.wake_probe();
+    let sp7 = crate::prof::Span::start("commit.publish_parent_collider");
     match parent_rebuild {
         Some((plan, mass_properties)) => {
             world
@@ -505,6 +519,10 @@ pub fn commit(
         }
     }
 
+    drop(sp7);
+    world.wake_probe_end("edit.commit.parent_collider_publish", wake_probe);
+    let wake_probe = world.wake_probe();
+    let sp8 = crate::prof::Span::start("commit.install_children");
     // 8. Install every child body and its collider. Mass / COM / inertia come
     //    from the child's fine material grid (`child.mass_properties`), installed
     //    into the body independently of the collision shape, so coarse collider
@@ -550,6 +568,8 @@ pub fn commit(
         child_entities.push(child.entity);
     }
 
+    drop(sp8);
+    world.wake_probe_end("edit.commit.child_install", wake_probe);
     if bumped_epoch {
         world.bump_topology_epoch();
     }

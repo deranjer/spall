@@ -1,0 +1,901 @@
+//! T23 / G4: fail-closed evaluation of the server's measured telemetry
+//! (`spall_server::ServeSummary` v10) against `docs/validation.md`'s G4 targets.
+//!
+//! Every check states what it measured and the target it was held to. A check
+//! whose input is absent (no samples, a missing client, no blast recorded)
+//! **fails**; nothing here can pass because a measurement was never taken.
+//! Warmup is excluded from every steady-state statistic.
+
+use serde::{Deserialize, Serialize};
+
+/// The 60 Hz tick period in milliseconds.
+const TICK_MS: f64 = 1000.0 / 60.0;
+
+/// One per-60-ticks server observation (mirrors `spall_server::TelemetrySample`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Sample {
+    pub tick: u64,
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub process_bytes: Option<u64>,
+    #[serde(default)]
+    pub backlog_max_bytes: u64,
+    #[serde(default)]
+    pub backlog_max_age_ms: u64,
+    #[serde(default)]
+    pub clients: Vec<ClientSample>,
+    #[serde(default)]
+    pub bodies_total: u64,
+    #[serde(default)]
+    pub bodies_dormant: u64,
+    #[serde(default)]
+    pub bodies_awake: u64,
+    #[serde(default)]
+    pub near_observer_awake: u64,
+    #[serde(default)]
+    pub giant_origin_y_m: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClientSample {
+    pub slot: u32,
+    pub transport_bytes: u64,
+}
+
+/// Mirrors `spall_server::BaselineSendRecord`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct BaselineSend {
+    pub session_slot: u32,
+    pub payload_bytes: u64,
+    pub duration_ms: u64,
+}
+
+/// The G4 fields of the server summary, flattened into `ServerSummary`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct G4ServerFacts {
+    #[serde(default)]
+    pub telemetry_samples: Vec<Sample>,
+    #[serde(default)]
+    pub blast_commit_ticks: Vec<u64>,
+    #[serde(default)]
+    pub reliable_backlog_peak_bytes: u64,
+    #[serde(default)]
+    pub reliable_backlog_peak_age_ms: u64,
+    #[serde(default)]
+    pub reliable_delivery_age_max_ms: u64,
+    #[serde(default)]
+    pub reliable_backlog_cap_bytes: u64,
+    #[serde(default)]
+    pub reliable_backlog_overflows: u64,
+    #[serde(default)]
+    pub baseline_sends_started: u64,
+    #[serde(default)]
+    pub baseline_sends_failed: u64,
+    #[serde(default)]
+    pub baseline_sends_active_max: u64,
+    #[serde(default)]
+    pub baseline_send_records: Vec<BaselineSend>,
+    #[serde(default)]
+    pub baseline_rate_limit_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    pub capture_pool_workers: u64,
+    #[serde(default)]
+    pub capture_pool_submitted: u64,
+    #[serde(default)]
+    pub capture_pool_active_max: u64,
+    #[serde(default)]
+    pub capture_pool_queued_max: u64,
+    #[serde(default)]
+    pub process_end_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub admission_refused_at_capacity: u64,
+}
+
+/// Scenario opt-in: the measured window and the thresholds it is held to.
+/// Defaults are `docs/validation.md`'s G4 numbers; a scenario overrides one only
+/// where the validation doc names no number (stated in the scenario text).
+#[derive(Debug, Clone, Deserialize)]
+pub struct G4Telemetry {
+    /// Server ticks excluded from every steady statistic.
+    pub warmup_ticks: u64,
+    /// Server ticks measured after warmup.
+    pub measured_ticks: u64,
+    /// Ordinary edits and blasts the scenario drives inside the measured
+    /// window; the giant collapse is counted separately.
+    #[serde(default)]
+    pub expected_ordinary_edits: u64,
+    #[serde(default)]
+    pub expected_blasts: u64,
+    /// `docs/validation.md`: `<= 256 KiB/s` server egress per client.
+    #[serde(default = "d_egress")]
+    pub egress_cap_bytes_per_sec: u64,
+    /// "Returns to normal within 5 s after named blast".
+    #[serde(default = "d_recovery")]
+    pub blast_recovery_sec: u64,
+    /// What "normal" is for the unsent reliable backlog once recovered.
+    #[serde(default = "d_normal_bytes")]
+    pub backlog_normal_bytes: u64,
+    #[serde(default = "d_normal_age")]
+    pub backlog_normal_age_ms: u64,
+    /// "Capped bytes/age at all times": the oldest unsent message may never be
+    /// older than this. The bytes cap is the server's own hard limit.
+    #[serde(default = "d_cap_age")]
+    pub backlog_cap_age_ms: u64,
+    /// `docs/validation.md`: server resident memory `<= 8 GiB`.
+    #[serde(default = "d_mem")]
+    pub server_memory_cap_bytes: u64,
+    /// Working-set growth over the window above which memory is called runaway.
+    #[serde(default = "d_growth")]
+    pub memory_growth_cap_mib_per_min: f64,
+    /// "256 active bodies, at least 64 near one observer, throughout".
+    #[serde(default = "d_awake")]
+    pub min_awake_bodies: u64,
+    #[serde(default = "d_near")]
+    pub min_near_observer_awake: u64,
+    /// "An accumulated population of 4,096 sleeping persistent bodies".
+    #[serde(default = "d_dormant")]
+    pub min_dormant_bodies: u64,
+    /// Fraction of expected edits that must have added a rubble body.
+    #[serde(default = "d_rubble")]
+    pub min_rubble_fraction: f64,
+    /// The 64-brick collapse must have committed inside the run.
+    #[serde(default = "d_true")]
+    pub require_giant_collapse: bool,
+    /// `docs/validation.md`: baselines have a separate `1 MiB/s/client` cap.
+    #[serde(default)]
+    pub baseline_rate_cap_bytes_per_sec: Option<u64>,
+    /// Clients that must have completed their late-join baseline.
+    #[serde(default)]
+    pub expected_baseline_sends: u64,
+}
+
+fn d_egress() -> u64 {
+    256 * 1024
+}
+fn d_recovery() -> u64 {
+    5
+}
+fn d_normal_bytes() -> u64 {
+    64 * 1024
+}
+fn d_normal_age() -> u64 {
+    1_000
+}
+fn d_cap_age() -> u64 {
+    5_000
+}
+fn d_mem() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+fn d_growth() -> f64 {
+    256.0
+}
+fn d_awake() -> u64 {
+    256
+}
+fn d_near() -> u64 {
+    64
+}
+fn d_dormant() -> u64 {
+    4096
+}
+fn d_rubble() -> f64 {
+    0.9
+}
+fn d_true() -> bool {
+    true
+}
+
+/// One evaluated requirement.
+#[derive(Debug, Clone, Serialize)]
+pub struct Check {
+    pub name: String,
+    pub passed: bool,
+    pub measured: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientEgressRow {
+    pub slot: u32,
+    /// One-second intervals inside the measured window.
+    pub intervals: u64,
+    pub mean_bytes_per_sec: f64,
+    pub p95_bytes_per_sec: f64,
+    pub max_bytes_per_sec: f64,
+    pub window_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BlastRow {
+    pub commit_tick: u64,
+    /// Worst unsent reliable backlog / oldest-message age, per client, during
+    /// the 5 s after the blast committed.
+    pub peak_bytes_first_window: u64,
+    pub peak_age_ms_first_window: u64,
+    /// Samples wholly after the recovery window and before the next blast.
+    pub tail_samples: u64,
+    pub tail_max_bytes: u64,
+    pub tail_max_age_ms: u64,
+    pub recovered: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRow {
+    pub process_peak_bytes: Option<u64>,
+    pub process_end_bytes: Option<u64>,
+    pub window_first_bytes: Option<u64>,
+    pub window_last_bytes: Option<u64>,
+    pub window_max_bytes: Option<u64>,
+    pub growth_mib_per_min: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BodyRow {
+    pub min_awake: Option<u64>,
+    pub min_near_observer_awake: Option<u64>,
+    pub min_dormant: Option<u64>,
+    pub first_total: Option<u64>,
+    pub last_total: Option<u64>,
+    pub rubble_gained: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JoinRow {
+    pub baseline_sends_started: u64,
+    pub baseline_sends_failed: u64,
+    pub baseline_sends_active_max: u64,
+    pub baseline_rate_limit_bytes_per_sec: Option<u64>,
+    pub max_baseline_rate_bytes_per_sec: Option<f64>,
+    pub capture_pool_workers: u64,
+    pub capture_pool_submitted: u64,
+    pub capture_pool_active_max: u64,
+    pub capture_pool_queued_max: u64,
+    pub admission_refused_at_capacity: u64,
+}
+
+/// The G4 evidence and its verdict, written into `summary.json`.
+#[derive(Debug, Clone, Serialize)]
+pub struct G4Row {
+    pub configured: bool,
+    pub warmup_ticks: u64,
+    pub measured_ticks: u64,
+    pub window_samples: u64,
+    pub window_wall_seconds: f64,
+    pub checks: Vec<Check>,
+    pub per_client_egress: Vec<ClientEgressRow>,
+    pub blasts: Vec<BlastRow>,
+    pub memory: Option<MemoryRow>,
+    pub bodies: Option<BodyRow>,
+    pub joins: Option<JoinRow>,
+    /// Client frame time is a G2 hardware measurement; the networked harness
+    /// has no windowed GPU client, so it is reported unavailable rather than
+    /// approximated from CPU submission time.
+    pub client_frame_time: &'static str,
+    pub requirements_met: bool,
+}
+
+impl G4Row {
+    pub fn unconfigured() -> Self {
+        Self {
+            configured: false,
+            warmup_ticks: 0,
+            measured_ticks: 0,
+            window_samples: 0,
+            window_wall_seconds: 0.0,
+            checks: Vec::new(),
+            per_client_egress: Vec::new(),
+            blasts: Vec::new(),
+            memory: None,
+            bodies: None,
+            joins: None,
+            client_frame_time: FRAME_TIME_UNAVAILABLE,
+            requirements_met: true,
+        }
+    }
+}
+
+const FRAME_TIME_UNAVAILABLE: &str = "unavailable: the networked scenario harness runs headless clients; client frame time (G2) needs the windowed GPU-timestamp path and is not approximated from CPU submission time";
+
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    sorted[rank - 1]
+}
+
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// One client's measured end-to-end topology lag (server tick of each
+/// transaction versus the freshest tick that client had seen on the wire).
+#[derive(Debug, Clone, Copy)]
+pub struct ClientLag {
+    pub p95_ms: u64,
+    pub max_ms: u64,
+}
+
+/// Evaluates `facts` against `cfg`. `process_peak_bytes` is the server's OS peak
+/// working set; `committed` its committed-transaction count; `clients` how many
+/// clients the scenario runs; `large_collapse_samples` how many commits the
+/// server classified as a large structural collapse.
+pub fn evaluate(
+    cfg: &G4Telemetry,
+    facts: &G4ServerFacts,
+    process_peak_bytes: Option<u64>,
+    clients: u64,
+    large_collapse_samples: u64,
+    client_lags: &[ClientLag],
+) -> G4Row {
+    let mut checks: Vec<Check> = Vec::new();
+    let mut add = |name: &str, passed: bool, measured: String, target: String| {
+        checks.push(Check {
+            name: name.to_string(),
+            passed,
+            measured,
+            target,
+        });
+    };
+
+    let win_lo = cfg.warmup_ticks;
+    let win_hi = cfg.warmup_ticks + cfg.measured_ticks;
+    let all = &facts.telemetry_samples;
+    // Samples whose whole interval (previous sample .. this one) lies inside the
+    // measured window.
+    let in_window: Vec<&Sample> = all
+        .iter()
+        .filter(|s| s.tick > win_lo + 60 && s.tick <= win_hi)
+        .collect();
+    let expected_samples = cfg.measured_ticks / 60;
+    let last_tick = all.last().map(|s| s.tick).unwrap_or(0);
+    let wall_seconds = match (in_window.first(), in_window.last()) {
+        (Some(a), Some(b)) => (b.elapsed_ms.saturating_sub(a.elapsed_ms)) as f64 / 1000.0,
+        _ => 0.0,
+    };
+    add(
+        "measured window completed with samples",
+        !in_window.is_empty()
+            && last_tick >= win_hi
+            && in_window.len() as u64 + 2 >= expected_samples,
+        format!(
+            "{} samples over {:.1} s wall (last tick {last_tick})",
+            in_window.len(),
+            wall_seconds
+        ),
+        format!(
+            ">= {} samples, run reached tick {win_hi}",
+            expected_samples.saturating_sub(2)
+        ),
+    );
+
+    // --- per-client steady egress -------------------------------------------
+    let mut slots: Vec<u32> = in_window
+        .iter()
+        .flat_map(|s| s.clients.iter().map(|c| c.slot))
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    let mut egress_rows = Vec::new();
+    for slot in &slots {
+        let mut series: Vec<(u64, u64)> = Vec::new(); // (elapsed_ms, transport_bytes)
+        for s in all.iter().filter(|s| s.tick >= win_lo && s.tick <= win_hi) {
+            if let Some(c) = s.clients.iter().find(|c| c.slot == *slot) {
+                series.push((s.elapsed_ms, c.transport_bytes));
+            }
+        }
+        let mut rates: Vec<f64> = series
+            .windows(2)
+            .filter(|w| w[1].0 > w[0].0)
+            .map(|w| (w[1].1.saturating_sub(w[0].1)) as f64 / ((w[1].0 - w[0].0) as f64 / 1000.0))
+            .collect();
+        let window_bytes = match (series.first(), series.last()) {
+            (Some(a), Some(b)) => b.1.saturating_sub(a.1),
+            _ => 0,
+        };
+        let mean = if rates.is_empty() {
+            0.0
+        } else {
+            rates.iter().sum::<f64>() / rates.len() as f64
+        };
+        rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        egress_rows.push(ClientEgressRow {
+            slot: *slot,
+            intervals: rates.len() as u64,
+            mean_bytes_per_sec: mean,
+            p95_bytes_per_sec: percentile(&rates, 0.95),
+            max_bytes_per_sec: rates.last().copied().unwrap_or(0.0),
+            window_bytes,
+        });
+    }
+    let cap = cfg.egress_cap_bytes_per_sec as f64;
+    let worst_p95 = egress_rows
+        .iter()
+        .map(|r| r.p95_bytes_per_sec)
+        .fold(0.0, f64::max);
+    let worst_mean = egress_rows
+        .iter()
+        .map(|r| r.mean_bytes_per_sec)
+        .fold(0.0, f64::max);
+    add(
+        "every client observed for the whole window",
+        egress_rows.len() as u64 >= clients
+            && egress_rows
+                .iter()
+                .all(|r| r.intervals + 2 >= expected_samples),
+        format!(
+            "{} of {clients} clients, min intervals {}",
+            egress_rows.len(),
+            egress_rows.iter().map(|r| r.intervals).min().unwrap_or(0)
+        ),
+        format!(
+            "{clients} clients x >= {} intervals",
+            expected_samples.saturating_sub(2)
+        ),
+    );
+    add(
+        "steady per-client egress p95 <= cap",
+        !egress_rows.is_empty() && worst_p95 <= cap,
+        format!(
+            "worst p95 {:.1} KiB/s (worst mean {:.1} KiB/s, worst max {:.1} KiB/s; transport bytes incl. overhead)",
+            worst_p95 / 1024.0,
+            worst_mean / 1024.0,
+            egress_rows
+                .iter()
+                .map(|r| r.max_bytes_per_sec)
+                .fold(0.0, f64::max)
+                / 1024.0
+        ),
+        format!("<= {:.0} KiB/s per client", cap / 1024.0),
+    );
+
+    // --- reliable backlog: caps and per-blast recovery ----------------------
+    add(
+        "application send-queue never exceeded its hard cap",
+        facts.reliable_backlog_overflows == 0
+            && facts.reliable_backlog_cap_bytes > 0
+            && facts.reliable_backlog_peak_bytes <= facts.reliable_backlog_cap_bytes,
+        format!(
+            "peak {} of cap {}, overflow disconnects {}",
+            mib(facts.reliable_backlog_peak_bytes),
+            mib(facts.reliable_backlog_cap_bytes),
+            facts.reliable_backlog_overflows
+        ),
+        "peak <= cap, 0 overflow disconnects".to_string(),
+    );
+    add(
+        "application send-queue age capped at all times",
+        !all.is_empty() && facts.reliable_backlog_peak_age_ms <= cfg.backlog_cap_age_ms,
+        format!(
+            "peak sampled age {} ms (worst enqueue-to-transport wait {} ms)",
+            facts.reliable_backlog_peak_age_ms, facts.reliable_delivery_age_max_ms
+        ),
+        format!("<= {} ms", cfg.backlog_cap_age_ms),
+    );
+
+    // The application-level queue above cannot see data already handed to the
+    // transport (QUIC buffers unsent reliable bytes when the congestion window
+    // is small), so it read "recovered" while replicas were 76 s behind. The
+    // client-observed lag is the end-to-end measure.
+    let worst_lag_p95 = client_lags.iter().map(|l| l.p95_ms).max();
+    let worst_lag_max = client_lags.iter().map(|l| l.max_ms).max();
+    add(
+        "end-to-end topology lag (client-observed) within cap for every client",
+        client_lags.len() as u64 >= clients
+            && worst_lag_max.is_some_and(|m| m <= cfg.backlog_cap_age_ms),
+        format!(
+            "{} clients reporting; worst p95 {:?} ms, worst max {:?} ms",
+            client_lags.len(),
+            worst_lag_p95,
+            worst_lag_max
+        ),
+        format!(
+            "{clients} clients, max lag <= {} ms",
+            cfg.backlog_cap_age_ms
+        ),
+    );
+
+    let recovery_ticks = (cfg.blast_recovery_sec as f64 * 60.0) as u64;
+    let blasts_in_window: Vec<u64> = facts
+        .blast_commit_ticks
+        .iter()
+        .copied()
+        .filter(|t| *t > win_lo && *t <= win_hi)
+        .collect();
+    let mut blast_rows = Vec::new();
+    for (i, &t) in blasts_in_window.iter().enumerate() {
+        let next = blasts_in_window.get(i + 1).copied().unwrap_or(win_hi);
+        let first: Vec<&Sample> = all
+            .iter()
+            .filter(|s| s.tick > t && s.tick <= t + recovery_ticks + 60)
+            .collect();
+        // A tail sample's interval must start at or after t + recovery.
+        let tail: Vec<&Sample> = all
+            .iter()
+            .filter(|s| s.tick >= t + recovery_ticks + 60 && s.tick <= next)
+            .collect();
+        let tail_bytes = tail.iter().map(|s| s.backlog_max_bytes).max().unwrap_or(0);
+        let tail_age = tail.iter().map(|s| s.backlog_max_age_ms).max().unwrap_or(0);
+        blast_rows.push(BlastRow {
+            commit_tick: t,
+            peak_bytes_first_window: first.iter().map(|s| s.backlog_max_bytes).max().unwrap_or(0),
+            peak_age_ms_first_window: first
+                .iter()
+                .map(|s| s.backlog_max_age_ms)
+                .max()
+                .unwrap_or(0),
+            tail_samples: tail.len() as u64,
+            tail_max_bytes: tail_bytes,
+            tail_max_age_ms: tail_age,
+            recovered: !tail.is_empty()
+                && tail_bytes <= cfg.backlog_normal_bytes
+                && tail_age <= cfg.backlog_normal_age_ms,
+        });
+    }
+    let recovered = blast_rows.iter().filter(|b| b.recovered).count();
+    add(
+        "every named blast committed",
+        cfg.expected_blasts > 0 && blasts_in_window.len() as u64 >= cfg.expected_blasts,
+        format!(
+            "{} blast commits in the measured window",
+            blasts_in_window.len()
+        ),
+        format!(">= {}", cfg.expected_blasts),
+    );
+    add(
+        "application send-queue back to normal within the recovery window after every blast",
+        !blast_rows.is_empty() && recovered == blast_rows.len(),
+        format!(
+            "{recovered} of {} recovered (worst first-window peak {} KiB / {} ms; worst tail {} KiB / {} ms)",
+            blast_rows.len(),
+            blast_rows
+                .iter()
+                .map(|b| b.peak_bytes_first_window)
+                .max()
+                .unwrap_or(0)
+                / 1024,
+            blast_rows
+                .iter()
+                .map(|b| b.peak_age_ms_first_window)
+                .max()
+                .unwrap_or(0),
+            blast_rows
+                .iter()
+                .map(|b| b.tail_max_bytes)
+                .max()
+                .unwrap_or(0)
+                / 1024,
+            blast_rows
+                .iter()
+                .map(|b| b.tail_max_age_ms)
+                .max()
+                .unwrap_or(0),
+        ),
+        format!(
+            "<= {} KiB and <= {} ms within {} s of each blast",
+            cfg.backlog_normal_bytes / 1024,
+            cfg.backlog_normal_age_ms,
+            cfg.blast_recovery_sec
+        ),
+    );
+
+    // --- memory ---------------------------------------------------------------
+    let mem_pts: Vec<(f64, u64)> = in_window
+        .iter()
+        .filter_map(|s| s.process_bytes.map(|b| (s.elapsed_ms as f64 / 60_000.0, b)))
+        .collect();
+    let growth = if mem_pts.len() >= 4 {
+        let n = mem_pts.len() as f64;
+        let (sx, sy) = mem_pts
+            .iter()
+            .fold((0.0, 0.0), |(x, y), (t, b)| (x + t, y + *b as f64));
+        let (mx, my) = (sx / n, sy / n);
+        let num: f64 = mem_pts
+            .iter()
+            .map(|(t, b)| (t - mx) * (*b as f64 - my))
+            .sum();
+        let den: f64 = mem_pts.iter().map(|(t, _)| (t - mx).powi(2)).sum();
+        (den > 0.0).then(|| num / den / (1024.0 * 1024.0))
+    } else {
+        None
+    };
+    let memory = MemoryRow {
+        process_peak_bytes,
+        process_end_bytes: facts.process_end_memory_bytes,
+        window_first_bytes: mem_pts.first().map(|p| p.1),
+        window_last_bytes: mem_pts.last().map(|p| p.1),
+        window_max_bytes: mem_pts.iter().map(|p| p.1).max(),
+        growth_mib_per_min: growth,
+    };
+    add(
+        "server process peak memory within cap",
+        process_peak_bytes.is_some_and(|b| b <= cfg.server_memory_cap_bytes),
+        process_peak_bytes.map_or("unavailable".into(), mib),
+        format!("<= {}", mib(cfg.server_memory_cap_bytes)),
+    );
+    add(
+        "no runaway memory growth over the window",
+        growth.is_some_and(|g| g <= cfg.memory_growth_cap_mib_per_min),
+        growth.map_or("unavailable (too few samples)".into(), |g| {
+            format!("{g:.1} MiB/min (least-squares over the window)")
+        }),
+        format!("<= {:.0} MiB/min", cfg.memory_growth_cap_mib_per_min),
+    );
+
+    // --- body populations throughout the window -------------------------------
+    let bodies = BodyRow {
+        min_awake: in_window.iter().map(|s| s.bodies_awake).min(),
+        min_near_observer_awake: in_window.iter().map(|s| s.near_observer_awake).min(),
+        min_dormant: in_window.iter().map(|s| s.bodies_dormant).min(),
+        first_total: in_window.first().map(|s| s.bodies_total),
+        last_total: in_window.last().map(|s| s.bodies_total),
+        rubble_gained: match (in_window.first(), in_window.last()) {
+            (Some(a), Some(b)) => Some(b.bodies_total.saturating_sub(a.bodies_total)),
+            _ => None,
+        },
+    };
+    add(
+        "active (solver-awake) bodies throughout the window",
+        bodies.min_awake.is_some_and(|m| m >= cfg.min_awake_bodies),
+        format!("min {:?}", bodies.min_awake),
+        format!(">= {}", cfg.min_awake_bodies),
+    );
+    add(
+        "active bodies near the observer throughout the window",
+        bodies
+            .min_near_observer_awake
+            .is_some_and(|m| m >= cfg.min_near_observer_awake),
+        format!("min {:?}", bodies.min_near_observer_awake),
+        format!(">= {} within 12 m", cfg.min_near_observer_awake),
+    );
+    add(
+        "sleeping persistent bodies throughout the window",
+        bodies
+            .min_dormant
+            .is_some_and(|m| m >= cfg.min_dormant_bodies),
+        format!("min {:?}", bodies.min_dormant),
+        format!(">= {}", cfg.min_dormant_bodies),
+    );
+    let want_rubble = (cfg.expected_ordinary_edits as f64 * cfg.min_rubble_fraction) as u64;
+    add(
+        "rubble accumulates as edits land",
+        cfg.expected_ordinary_edits > 0 && bodies.rubble_gained.is_some_and(|g| g >= want_rubble),
+        format!(
+            "{:?} bodies gained ({:?} -> {:?})",
+            bodies.rubble_gained, bodies.first_total, bodies.last_total
+        ),
+        format!(">= {want_rubble}"),
+    );
+    if cfg.require_giant_collapse {
+        let ys: Vec<f64> = all.iter().filter_map(|s| s.giant_origin_y_m).collect();
+        let standing = ys.first().copied();
+        let lowest = ys.iter().copied().fold(f64::INFINITY, f64::min);
+        add(
+            "64-brick connected collapse: the block came down inside the run",
+            standing.is_some_and(|y| y >= 0.0) && lowest <= -3.0,
+            format!(
+                "giant origin y {:?} m -> lowest {:.1} m; {large_collapse_samples} commit(s) classed large (the block stays the parent, so the detached plate is small)",
+                standing, lowest
+            ),
+            "starts >= 0 m, falls to <= -3 m".to_string(),
+        );
+    }
+
+    // --- join / baseline concurrency and backpressure -------------------------
+    let max_rate = facts
+        .baseline_send_records
+        .iter()
+        .filter(|r| r.duration_ms >= 20)
+        .map(|r| r.payload_bytes as f64 / (r.duration_ms as f64 / 1000.0))
+        .fold(None, |m: Option<f64>, r| Some(m.map_or(r, |m| m.max(r))));
+    let joins = JoinRow {
+        baseline_sends_started: facts.baseline_sends_started,
+        baseline_sends_failed: facts.baseline_sends_failed,
+        baseline_sends_active_max: facts.baseline_sends_active_max,
+        baseline_rate_limit_bytes_per_sec: facts.baseline_rate_limit_bytes_per_sec,
+        max_baseline_rate_bytes_per_sec: max_rate,
+        capture_pool_workers: facts.capture_pool_workers,
+        capture_pool_submitted: facts.capture_pool_submitted,
+        capture_pool_active_max: facts.capture_pool_active_max,
+        capture_pool_queued_max: facts.capture_pool_queued_max,
+        admission_refused_at_capacity: facts.admission_refused_at_capacity,
+    };
+    add(
+        "every expected baseline transfer completed, none failed",
+        facts.baseline_sends_failed == 0
+            && facts.baseline_send_records.len() as u64 >= cfg.expected_baseline_sends,
+        format!(
+            "{} completed, {} failed",
+            facts.baseline_send_records.len(),
+            facts.baseline_sends_failed
+        ),
+        format!(">= {} completed, 0 failed", cfg.expected_baseline_sends),
+    );
+    add(
+        "baseline concurrency bounded",
+        facts.capture_pool_workers > 0
+            && facts.capture_pool_active_max <= facts.capture_pool_workers
+            && facts.baseline_sends_active_max <= clients.max(1),
+        format!(
+            "captures active max {} of {} workers (queued max {}); transfers in flight max {}",
+            facts.capture_pool_active_max,
+            facts.capture_pool_workers,
+            facts.capture_pool_queued_max,
+            facts.baseline_sends_active_max
+        ),
+        format!("captures <= workers, transfers <= {clients} clients"),
+    );
+    if let Some(cap) = cfg.baseline_rate_cap_bytes_per_sec {
+        add(
+            "per-client baseline rate within its cap",
+            facts.baseline_rate_limit_bytes_per_sec.is_some()
+                && max_rate.is_none_or(|r| r <= cap as f64 * 1.05),
+            max_rate.map_or("no transfer long enough to time".into(), |r| {
+                format!("max {:.0} KiB/s", r / 1024.0)
+            }),
+            format!(
+                "<= {:.0} KiB/s and a server-side limiter configured",
+                cap as f64 / 1024.0
+            ),
+        );
+    }
+
+    let requirements_met = checks.iter().all(|c| c.passed);
+    let _ = TICK_MS;
+    G4Row {
+        configured: true,
+        warmup_ticks: cfg.warmup_ticks,
+        measured_ticks: cfg.measured_ticks,
+        window_samples: in_window.len() as u64,
+        window_wall_seconds: wall_seconds,
+        checks,
+        per_client_egress: egress_rows,
+        blasts: blast_rows,
+        memory: Some(memory),
+        bodies: Some(bodies),
+        joins: Some(joins),
+        client_frame_time: FRAME_TIME_UNAVAILABLE,
+        requirements_met,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> G4Telemetry {
+        serde_json::from_str(r#"{"warmup_ticks":600,"measured_ticks":1200,"expected_blasts":1,"expected_ordinary_edits":10,"expected_baseline_sends":1}"#)
+            .unwrap()
+    }
+
+    /// A healthy synthetic run: 2 clients at 100 KiB/s, tiny backlog, one blast
+    /// at tick 900 that recovers.
+    fn healthy() -> G4ServerFacts {
+        let mut samples = Vec::new();
+        for i in 1..=40u64 {
+            let tick = i * 60;
+            samples.push(Sample {
+                tick,
+                elapsed_ms: tick * 1000 / 60,
+                process_bytes: Some(1_000_000_000),
+                backlog_max_bytes: if (900..960).contains(&tick) {
+                    500_000
+                } else {
+                    100
+                },
+                backlog_max_age_ms: if (900..960).contains(&tick) { 900 } else { 5 },
+                clients: (0..2)
+                    .map(|slot| ClientSample {
+                        slot,
+
+                        transport_bytes: i * 102_400,
+                    })
+                    .collect(),
+                bodies_total: 5000 + tick / 6,
+                bodies_dormant: 4400,
+                bodies_awake: 300,
+                near_observer_awake: 70,
+                giant_origin_y_m: Some(if tick < 1000 { 1.0 } else { -7.0 }),
+            });
+        }
+        G4ServerFacts {
+            telemetry_samples: samples,
+            blast_commit_ticks: vec![900],
+            reliable_backlog_cap_bytes: 8 << 20,
+            reliable_backlog_peak_bytes: 500_000,
+            reliable_backlog_peak_age_ms: 900,
+            baseline_sends_started: 1,
+            baseline_sends_active_max: 1,
+            baseline_send_records: vec![BaselineSend {
+                session_slot: 0,
+                payload_bytes: 50_000,
+                duration_ms: 100,
+            }],
+            capture_pool_workers: 4,
+            capture_pool_active_max: 1,
+            ..G4ServerFacts::default()
+        }
+    }
+
+    #[test]
+    fn a_healthy_run_passes_every_check() {
+        let row = evaluate(
+            &cfg(),
+            &healthy(),
+            Some(2_000_000_000),
+            2,
+            1,
+            &[ClientLag {
+                p95_ms: 100,
+                max_ms: 400,
+            }; 2],
+        );
+        let failed: Vec<_> = row.checks.iter().filter(|c| !c.passed).collect();
+        assert!(failed.is_empty(), "{failed:#?}");
+        assert!(row.requirements_met);
+    }
+
+    #[test]
+    fn missing_measurements_fail_closed() {
+        let row = evaluate(&cfg(), &G4ServerFacts::default(), None, 2, 0, &[]);
+        assert!(!row.requirements_met);
+        for name in [
+            "measured window completed with samples",
+            "server process peak memory within cap",
+            "application send-queue back to normal within the recovery window after every blast",
+            "steady per-client egress p95 <= cap",
+            "active (solver-awake) bodies throughout the window",
+        ] {
+            let c = row.checks.iter().find(|c| c.name == name).expect(name);
+            assert!(!c.passed, "{name} must not pass on no data");
+        }
+    }
+
+    #[test]
+    fn a_backlog_that_never_drains_after_a_blast_fails() {
+        let mut facts = healthy();
+        for s in &mut facts.telemetry_samples {
+            if s.tick >= 900 {
+                s.backlog_max_bytes = 2_000_000;
+                s.backlog_max_age_ms = 4_000;
+            }
+        }
+        let row = evaluate(&cfg(), &facts, Some(1), 2, 1, &[]);
+        let c = row
+            .checks
+            .iter()
+            .find(|c| c.name.contains("back to normal"))
+            .unwrap();
+        assert!(!c.passed, "{c:?}");
+    }
+
+    #[test]
+    fn over_cap_egress_and_short_windows_fail() {
+        let mut facts = healthy();
+        for s in &mut facts.telemetry_samples {
+            for c in &mut s.clients {
+                c.transport_bytes = s.tick * 8_000; // 480 KB/s
+            }
+        }
+        let row = evaluate(&cfg(), &facts, Some(1), 2, 1, &[]);
+        assert!(
+            !row.checks
+                .iter()
+                .find(|c| c.name.starts_with("steady per-client egress"))
+                .unwrap()
+                .passed
+        );
+        // Run that stopped before the window ended.
+        let mut short = healthy();
+        short.telemetry_samples.truncate(15);
+        let row = evaluate(&cfg(), &short, Some(1), 2, 1, &[]);
+        assert!(
+            !row.checks
+                .iter()
+                .find(|c| c.name.starts_with("measured window"))
+                .unwrap()
+                .passed
+        );
+    }
+}

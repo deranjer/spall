@@ -660,6 +660,18 @@ residency or total-memory requirements.
 
 Run for two measured minutes after 30 seconds warmup; also run a 30-minute reduced-telemetry soak. Eight players in both clustered and separated arrangements, 256 active nontrivial voxel bodies server-wide, at least 64 nearby to one observer, and an accumulated population of 4,096 sleeping persistent bodies. Drive 10 ordinary edits/s total and one 4 m diameter blast every 10 seconds. Include one 64-brick connected collapse. Geometry fixtures must specify occupied cells and collider complexity, not only body count.
 
+**Evidence status (2026-09-20, `docs/reports/G3.md` increment 38).** The integrated
+fixture (`g4-integrated-{clustered,separated}`), a declared ordinary-edit mix (1
+terrain dig : 9 body edits), and fail-closed telemetry (`tools/xtask/src/g4.rs`) are
+in; measured-versus-target is tabulated there. Not met on the loaded reference
+machine: tick p95/p99 and physics p95, the 30-minute soak (did not complete), and G2
+GPU p95 (14.8 ms). Met on final runs: per-client steady egress, memory, body
+populations, baseline pacing/concurrency, join readiness under 30 s, and replica
+convergence under both impairment envelopes. This document names no numeric bound for
+the stress envelope's "bounded degradation/recovery"; none has been adopted, and the
+stress lane is recorded as measured-but-unaccepted. Client frame time from the
+networked harness is *unavailable*; GPU/visual evidence is separately open.
+
 Targets on the recorded reference hardware:
 
 | Resource | Provisional target |

@@ -324,6 +324,28 @@ acceptance is still a judgment call for an integrator reviewing the whole
 report, not a claim made here. Earlier increment notes below are historical
 evidence, not the current remaining-work queue.
 
+**2026-09-20 update (increment 38, `docs/reports/G3.md`).** T23 stays **not accepted**.
+
+**2026-09-20 follow-up (increment 39, `docs/reports/G3.md`).** T23 stays **not accepted**. The checkpoint CI failure was reproduced on main `7d3ca00` and fixed by `8e0cbb2` (not yet on main). The first wake-locality fix (`8a18476`) was unsafe — its forced re-sleep trapped awake neighbours and pushed bodies out of the world (fixed and regression-tested in `ea4f1ae`/`6e55b82`); the corrected fix does not measurably change the workload (~99% of sleeping-body wakes are physics-step island propagation, unattributed). On the reviewed revision the 30-minute soak still **fails** (server cannot hold 60 Hz; awake bodies reach ~5,000) and rubble bodies still escape the world under soak-scale load; containment has no acceptance check. Physics p95, tick p95/p99, impaired-lane send-queue recovery, residency-under-G4 and GPU/visual evidence remain open. No compaction or lifecycle redesign is authorised.
+
+**2026-09-20 update 2 (increment 40, `docs/reports/G3.md`).** T23 stays **not accepted**. The forced re-sleep wake optimisation was withdrawn after an external review reproduced a stability regression; increment 39's origin-based containment claims are retracted (a rubble rod's geometry sits ~10 m from its body origin). Containment is now judged from transformed cells and collider bounds: no solver embeddings on the current revision; rubble crossing the west wall is physically legitimate but leaves the bounded world, and README's dormant external-body set is **declared but unimplemented** (Open items rows 17-18). Whole-world terrain collider replacement on each dig accounts for ~70% of sleeping-body wakes (control run without digs). Checkpoint-integrity fix prepared on local branch `fix/t23-checkpoint-integrity` (`a0b4907`; `cargo xtask check` and `smoke` pass), not pushed. Reviewer demos: `.local/reviews/2026-09-20-wake-locality/demos/wake_demos.html`. Compaction and lifecycle redesign remain unauthorised.
+The integrated G4 fixture, a declared terrain+body edit mix, and per-stage /
+per-client-timeline instrumentation are in. The three hard gate failures were
+root-caused and fixed on this branch: replica divergence (motion datagrams starved
+the reliable stream inside the QUIC congestion window -> congestion-aware motion
+budget), simultaneous-join failures (serial handshakes in one accept loop ->
+concurrent accept), and 35-41 s join readiness (serial per-joiner tick-thread
+snapshots -> shared capture; now 27-30 s). Final loopback and both impairment lanes
+converge on all 8 replicas with matching replay/restart hashes. **Still failing:**
+tick p95/p99 and physics p95 (17/50-60/12 ms vs 12/16.7/6), terrain-commit hashing
+(~32 ms per terrain edit) and physics are the identified costs; the 30-minute soak
+did not complete (rubble tunnels through the ground and never sleeps; one new body
+per edit; journal writes every awake body 20x/s); the overload client-retry gap; the
+stress lane is measured-but-unaccepted (its bounds are unratified candidates). GPU
+p95 14.8 ms vs 12 ms and human/cross-GPU review are separately open. Four
+independent fixes are in PR #136 (open; CI red only from a pre-existing `main`
+failure). **Gate blockers remain until the fixes above are reviewed:** the 2-minute physics p95 miss, the failed 30-minute soak, the impaired-convergence failures (fixed on this branch, not yet accepted) and the baseline-readiness miss (27-30 s, thin margin). Acceptance is an integrator decision; ENG-30 is not marked done here.
+
 Dependencies: T15, T17, T18, T20, T21, T22. Own: complete gate report and targeted fixes.
 
 Run all correctness, crash, impairment, visual, and eight-client workload scenarios. Include geographically separated players inside the bounded world, a multi-region collapse, prolonged rubble accumulation, and late join after heavy edits.

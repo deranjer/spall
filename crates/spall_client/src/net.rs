@@ -106,6 +106,9 @@ pub enum ScriptTarget {
     #[default]
     Terrain,
     DetachedBody,
+    /// A specific persistent body, by raw entity id (T23 / G4: the integrated
+    /// workload targets combs, towers, and the giant by their fixed ids).
+    Body(u64),
 }
 
 /// One scripted tool use.
@@ -197,6 +200,9 @@ impl BaselineScene {
             "bulk-split" | "giant-split" => Some(Self::BulkSplit),
             "separated-regions" | "t23-g3" | "g3" => Some(Self::SeparatedRegions),
             "g4-workload" | "t23-g4" | "g4" => Some(Self::SeparatedRegions),
+            "g4-integrated-clustered" | "g4-integrated-separated" | "g4-integrated" => {
+                Some(Self::SeparatedRegions)
+            }
             "separated-regions-far" | "t23-g3-full-envelope" | "g3-far" => {
                 Some(Self::SeparatedRegionsFar)
             }
@@ -389,6 +395,32 @@ pub struct ClientSummary {
     /// `client_residency_reloads_completed`) despite it.
     #[serde(default)]
     pub baseline_transfer_failures: u64,
+    /// T23 / G4 join/convergence timeline: `(ms since the client started, event)`.
+    #[serde(default)]
+    pub timeline: Vec<(u64, String)>,
+    /// Topology-transaction outcomes on the control stream: received, applied
+    /// (published), duplicate, gapped (needs repair), held awaiting a bulk split.
+    #[serde(default)]
+    pub tx_received: u64,
+    #[serde(default)]
+    pub tx_duplicate: u64,
+    #[serde(default)]
+    pub tx_needs_repair: u64,
+    #[serde(default)]
+    pub tx_awaiting_bulk: u64,
+    /// Highest transaction id received / applied, and the id of the first one applied.
+    #[serde(default)]
+    pub last_tx_id_received: u64,
+    #[serde(default)]
+    pub last_tx_id_applied: u64,
+    #[serde(default)]
+    pub first_tx_id_applied: u64,
+    /// End-to-end topology lag when each transaction arrived, in milliseconds
+    /// (server ticks at 60 Hz): how far the reliable stream ran behind the wire.
+    #[serde(default)]
+    pub topology_lag_p95_ms: u64,
+    #[serde(default)]
+    pub topology_lag_max_ms: u64,
     /// A sent `ActionRequest` the server declined to admit or stage
     /// (`ActionOutcome::Rejected`) — the scripted-action retrier only retries
     /// a `"throttled"` reason, so anything else is a lost scripted action.
@@ -448,6 +480,21 @@ fn client_handshake() -> Handshake {
 
 #[derive(Default)]
 struct Counters {
+    timeline: Mutex<Vec<(u64, String)>>,
+    /// Highest server tick seen on a motion datagram (unreliable, so it tracks
+    /// the wire even while the reliable topology stream is behind).
+    last_motion_tick: AtomicU64,
+    /// End-to-end topology lag samples, in server ticks: the freshest motion tick
+    /// minus the tick the transaction was committed at, taken as each is received.
+    topology_lag_ticks: Mutex<Vec<u32>>,
+    origin: std::sync::OnceLock<std::time::Instant>,
+    tx_received: AtomicU64,
+    tx_duplicate: AtomicU64,
+    tx_needs_repair: AtomicU64,
+    tx_awaiting_bulk: AtomicU64,
+    last_tx_id_received: AtomicU64,
+    last_tx_id_applied: AtomicU64,
+    first_tx_id_applied: AtomicU64,
     applied: AtomicU64,
     repairs: AtomicU64,
     rejected: AtomicU64,
@@ -663,6 +710,7 @@ async fn perform_late_join(
     counters: &Counters,
     connect_at: std::time::Instant,
 ) -> Result<(), ClientNetError> {
+    counters.mark("baseline_requested");
     conn.send_record(WireRecord::BaselineAck(BaselineAck {
         transfer_id: BASELINE_REQUEST_SENTINEL,
         verified_manifest_hash: Hash32::ZERO,
@@ -688,6 +736,10 @@ async fn perform_late_join(
             }
         }
     };
+    counters.mark(format!(
+        "baseline_begin id={} bytes={}",
+        begin.transfer_id.0, begin.total_bytes
+    ));
     let Some(world) = receive_baseline_body(conn).await else {
         return Err(ClientNetError::Baseline(
             "transfer failed to assemble / verify".into(),
@@ -702,6 +754,7 @@ async fn perform_late_join(
     counters
         .late_join_baseline_install_ms
         .store(connect_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+    counters.mark("baseline_received");
     counters
         .late_join_has_bodies
         .store(u64::from(world.volumes.len() > 1), Ordering::Relaxed);
@@ -712,6 +765,7 @@ async fn perform_late_join(
             .install_baseline_world(&world)
             .map_err(ClientNetError::Baseline)?;
     }
+    counters.mark("baseline_installed");
     counters
         .baseline_bricks
         .store(world.brick_count() as u64, Ordering::Relaxed);
@@ -726,7 +780,23 @@ async fn perform_late_join(
     }))
     .await
     .map_err(ClientNetError::Transport)?;
+    counters.mark("promotion_ack_sent");
     Ok(())
+}
+
+impl Counters {
+    /// Records a timeline event at the current time since the first call.
+    fn mark(&self, event: impl Into<String>) {
+        let ms = self
+            .origin
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64;
+        let mut t = self.timeline.lock().unwrap_or_else(|e| e.into_inner());
+        if t.len() < 256 {
+            t.push((ms, event.into()));
+        }
+    }
 }
 
 async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetError> {
@@ -735,6 +805,8 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     // imposed network profile that handshake is itself part of the cost a
     // late-joining player actually experiences.
     let session_start = std::time::Instant::now();
+    let counters = Arc::new(Counters::default());
+    counters.mark("client_started");
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -751,8 +823,12 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     )
     .await
     {
-        Ok(c) => Arc::new(c),
+        Ok(c) => {
+            counters.mark("connected");
+            Arc::new(c)
+        }
         Err(e) => {
+            counters.mark(format!("connect_failed: {e}"));
             log.write(&ProcessRecord::new(
                 ProcessEvent::Failed,
                 ProcessRole::Client,
@@ -797,7 +873,6 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             ReplicaConfig::default(),
         )
     }));
-    let counters = Arc::new(Counters::default());
 
     // The window reads live terrain straight off the replica for its debug
     // draw; publish the handle once, up front, rather than threading it
@@ -866,6 +941,28 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             loop {
                 match conn.recv_record().await {
                     Ok(Some(WireRecord::TopologyTransaction(tx))) => {
+                        let n_rx = counters.tx_received.fetch_add(1, Ordering::Relaxed) + 1;
+                        {
+                            let seen = counters.last_motion_tick.load(Ordering::Relaxed);
+                            let lag = seen.saturating_sub(tx.server_tick.get());
+                            let mut v = counters
+                                .topology_lag_ticks
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if v.len() < 8192 {
+                                v.push(lag.min(u64::from(u32::MAX)) as u32);
+                            }
+                        }
+                        if n_rx.is_multiple_of(100) {
+                            counters.mark(format!(
+                                "rx_tx #{n_rx} id={} server_tick={}",
+                                tx.transaction_id.get(),
+                                tx.server_tick.get()
+                            ));
+                        }
+                        counters
+                            .last_tx_id_received
+                            .fetch_max(tx.transaction_id.get(), Ordering::Relaxed);
                         counters
                             .last_tick
                             .fetch_max(tx.server_tick.get(), Ordering::Relaxed);
@@ -888,6 +985,41 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                 counters
                                     .residency_evicted_transaction_gaps
                                     .fetch_add(1, Ordering::Relaxed);
+                            }
+                            match &primary {
+                                ApplyOutcome::Published { .. } => {
+                                    if counters.first_tx_id_applied.load(Ordering::Relaxed) == 0 {
+                                        counters
+                                            .first_tx_id_applied
+                                            .store(tx.transaction_id.get(), Ordering::Relaxed);
+                                        counters.mark(format!(
+                                            "first_tx_applied id={}",
+                                            tx.transaction_id.get()
+                                        ));
+                                    }
+                                    counters
+                                        .last_tx_id_applied
+                                        .fetch_max(tx.transaction_id.get(), Ordering::Relaxed);
+                                }
+                                ApplyOutcome::Duplicate => {
+                                    counters.tx_duplicate.fetch_add(1, Ordering::Relaxed);
+                                }
+                                ApplyOutcome::NeedsRepair(_) => {
+                                    counters.tx_needs_repair.fetch_add(1, Ordering::Relaxed);
+                                    counters.mark(format!(
+                                        "tx_needs_repair id={}",
+                                        tx.transaction_id.get()
+                                    ));
+                                }
+                                ApplyOutcome::AwaitingBulkSplit { .. } => {
+                                    counters.tx_awaiting_bulk.fetch_add(1, Ordering::Relaxed);
+                                }
+                                ApplyOutcome::Rejected { .. } => {
+                                    counters.mark(format!(
+                                        "tx_rejected id={}",
+                                        tx.transaction_id.get()
+                                    ));
+                                }
                             }
                             let publish = matches!(primary, ApplyOutcome::Published { .. });
                             outcomes.push(primary);
@@ -992,9 +1124,16 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner()) = Some(reason);
                         }
+                        counters.mark(format!(
+                            "control_stream_closed (bye reason: {:?})",
+                            conn.bye_reason()
+                        ));
                         break;
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        counters.mark(format!("control_stream_error: {e}"));
+                        break;
+                    }
                 }
             }
         })
@@ -1042,6 +1181,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             loop {
                 match conn.recv_datagram().await {
                     Ok(Some(DatagramRecord::Motion(snap))) => {
+                        counters
+                            .last_motion_tick
+                            .fetch_max(snap.server_tick.get(), Ordering::Relaxed);
                         counters
                             .last_tick
                             .fetch_max(snap.server_tick.get(), Ordering::Relaxed);
@@ -1445,6 +1587,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 }
 
                 let mut request = action.request.clone();
+                if let ScriptTarget::Body(raw) = action.target
+                    && let Ok(entity) = spall_core::EntityId::new(raw)
+                {
+                    request.claimed_target = ClaimedTarget::Body(entity);
+                }
                 if action.target == ScriptTarget::DetachedBody {
                     // Aim at the sole detached body. It only exists once an
                     // earlier cut has detached it, so wait a bounded while for
@@ -1496,6 +1643,41 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         })
     };
 
+    // Interactive sender: the window queues tool uses (reviewer cut keys / clicks);
+    // send each as a reliable `ActionRequest` and remember it for the retrier, exactly
+    // as the scripter does for scripted actions.
+    let interactive_sender = config.interactive.clone().map(|session| {
+        let conn = conn.clone();
+        let counters = counters.clone();
+        let sent_actions = sent_actions.clone();
+        let stop_rx = stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if *stop_rx.borrow() {
+                    return;
+                }
+                let batch: Vec<ActionRequest> = std::mem::take(
+                    &mut *session
+                        .action_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                );
+                for request in batch {
+                    let request_id = request.request_id.0;
+                    let record = WireRecord::ActionRequest(request);
+                    if conn.send_record(record.clone()).await.is_ok() {
+                        counters.actions.fetch_add(1, Ordering::Relaxed);
+                        sent_actions
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(request_id, (record, 0));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    });
+
     // Wait for the server to finish (control stream closes), or the observed
     // server tick to reach `run_ticks`, or the overall deadline.
     let done = {
@@ -1532,6 +1714,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let _ = tokio::time::timeout(config.overall_timeout, done).await;
     let _ = stop_tx.send(true);
     scripter.abort();
+    if let Some(sender) = interactive_sender {
+        sender.abort();
+    }
     if let Some(m) = mover {
         m.abort();
     }
@@ -1658,6 +1843,37 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         late_join_ready_ms: counters.late_join_ready_ms.load(Ordering::Relaxed),
         late_join_ready_confirmed: counters.late_join_ready_confirmed.load(Ordering::Relaxed) != 0,
         baseline_transfer_failures: counters.baseline_transfer_failures.load(Ordering::Relaxed),
+        timeline: counters
+            .timeline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        tx_received: counters.tx_received.load(Ordering::Relaxed),
+        tx_duplicate: counters.tx_duplicate.load(Ordering::Relaxed),
+        tx_needs_repair: counters.tx_needs_repair.load(Ordering::Relaxed),
+        tx_awaiting_bulk: counters.tx_awaiting_bulk.load(Ordering::Relaxed),
+        last_tx_id_received: counters.last_tx_id_received.load(Ordering::Relaxed),
+        last_tx_id_applied: counters.last_tx_id_applied.load(Ordering::Relaxed),
+        first_tx_id_applied: counters.first_tx_id_applied.load(Ordering::Relaxed),
+        topology_lag_p95_ms: {
+            let mut v = counters
+                .topology_lag_ticks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            v.sort_unstable();
+            v.get(((v.len() * 95).div_ceil(100)).saturating_sub(1))
+                .copied()
+                .map_or(0, |t| u64::from(t) * 1000 / 60)
+        },
+        topology_lag_max_ms: counters
+            .topology_lag_ticks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |t| u64::from(t) * 1000 / 60),
     };
     drop(guard);
 

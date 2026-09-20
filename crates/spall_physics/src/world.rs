@@ -895,6 +895,49 @@ impl PhysicsWorld {
         }
     }
 
+    /// Diagnostic (wake-burst attribution): for each id in `ids`, the *other dynamic*
+    /// bodies it currently has an active contact manifold with, as
+    /// `(queried, partner)` pairs. Read-only; builds
+    /// a handle -> id map per call, so call it only for bursts.
+    pub fn touching_dynamic_bodies(&self, ids: &[BodyId]) -> Vec<(BodyId, BodyId)> {
+        let by_handle: std::collections::HashMap<RigidBodyHandle, BodyId> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.retired && !e.dormant)
+            .map(|(i, e)| (e.body, BodyId(i as u32)))
+            .collect();
+        let mut out = Vec::new();
+        for &id in ids {
+            let entry = &self.entries[id.0 as usize];
+            if entry.retired || entry.dormant {
+                continue;
+            }
+            for &c in self.bodies[entry.body].colliders() {
+                for pair in self.narrow_phase.contact_pairs_with(c) {
+                    if !pair.has_any_active_contact() {
+                        continue;
+                    }
+                    let other = if pair.collider1 == c {
+                        pair.collider2
+                    } else {
+                        pair.collider1
+                    };
+                    let Some(parent) = self.colliders.get(other).and_then(|o| o.parent()) else {
+                        continue;
+                    };
+                    if !self.bodies[parent].is_dynamic() {
+                        continue;
+                    }
+                    if let Some(&pid) = by_handle.get(&parent) {
+                        out.push((id, pid));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Number of narrow-phase contact pairs currently tracked.
     pub fn contact_pair_count(&self) -> usize {
         self.narrow_phase.contact_pairs().count()

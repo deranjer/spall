@@ -33,7 +33,10 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use crate::ClientError;
-use crate::interactive::{InteractiveSession, InteractiveView, LiveInput};
+use crate::interactive::{
+    InteractiveSession, InteractiveView, LiveInput, ReviewCut, pick_review_lever,
+    review_cut_request,
+};
 use crate::net::{ClientNetConfig, run_replication_client};
 use crate::predict::CELL_M;
 
@@ -45,7 +48,7 @@ use crate::predict::CELL_M;
 /// pop in a little later after a big camera jump, never stalls a frame.
 /// `10.0` (the original value) left almost the whole scene invisible until
 /// the player was standing right in front of it — raised after user report.
-const VIEW_RADIUS_M: f32 = 48.0;
+const VIEW_RADIUS_M: f32 = 96.0;
 const VIEW_HEIGHT_UP_M: f32 = 10.0;
 const VIEW_HEIGHT_DOWN_M: f32 = 8.0;
 /// Rebuild the instanced terrain draw once the player has moved this far
@@ -57,6 +60,25 @@ const REBUILD_DISTANCE_M: f64 = 1.0;
 /// frame time — see [`RebuildWorker`] — so it only needs to be "responsive
 /// enough for a person to notice", not "cheap".
 const TERRAIN_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Reviewer (fly) camera: a much wider terrain draw around the camera, a fixed vertical
+/// band (the scenes of interest sit within a few metres of the ground), and a coarser
+/// rebuild step so flying does not chase the rebuild worker.
+const FLY_VIEW_RADIUS_M: f32 = 160.0;
+const FLY_CENTER_Y_M: f64 = 6.0;
+const FLY_BAND_M: f32 = 9.0;
+const FLY_REBUILD_DISTANCE_M: f64 = 20.0;
+const FLY_SPEED_M_S: f32 = 10.0;
+const FLY_FAST_FACTOR: f32 = 5.0;
+
+/// What the background worker should build: where, how wide, and how tall a band.
+#[derive(Clone, Copy)]
+struct RebuildRequest {
+    center_m: [f64; 3],
+    radius_m: f32,
+    up_m: f32,
+    down_m: f32,
+}
 
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 const MAX_PITCH: f32 = 1.5;
@@ -146,6 +168,44 @@ impl HeldKeys {
     }
 }
 
+/// Reviewer tools: a free-fly camera (no physics, no collision, no server input) and
+/// keybinds that kick off the wake-locality demo edits. Client-side only; the edits are
+/// ordinary server-validated `Cut` actions.
+///
+/// Keys: `F` toggles fly mode; in fly mode `WASD` move, `Space` up, `Ctrl` down, `Shift` x5.
+/// `1` cut the beam's left end (the counterweight; the beam must tip), `2` cut its right
+/// end, `3` nibble its far tip (a harmless edit), `-`/`=` change the cut radius, `H` prints
+/// this help.
+struct ReviewCam {
+    fly: bool,
+    pos: [f64; 3],
+    up: bool,
+    down: bool,
+    fast: bool,
+    cut_radius_cells: i64,
+    seq: u64,
+}
+
+impl Default for ReviewCam {
+    fn default() -> Self {
+        Self {
+            fly: false,
+            pos: [0.0, 10.0, 0.0],
+            up: false,
+            down: false,
+            fast: false,
+            cut_radius_cells: 6,
+            seq: 0,
+        }
+    }
+}
+
+const REVIEW_HELP: &str = "reviewer keys: F fly camera (WASD move, Space up, Ctrl down, Shift fast) | \
+1 cut the beam's LEFT end (must tip) | 2 cut RIGHT end | 3 nibble the far tip (harmless) | \
+- / = cut radius | H help";
+/// Cached visible cells of one body: `(volume revision, [(local centre, colour)])`.
+type BodyCells = (u64, Vec<([f32; 3], [f32; 3])>);
+
 struct InteractiveApp {
     session: Arc<InteractiveSession>,
     window: Option<Arc<Window>>,
@@ -164,6 +224,15 @@ struct InteractiveApp {
     /// directly every frame. See [`smoothed_eye`].
     display_feet: Option<([f64; 3], Instant)>,
     hud: Hud,
+    /// Reviewer camera state (see [`ReviewCam`]).
+    review: ReviewCam,
+    /// Terrain draw list from the last completed rebuild (bodies are appended per frame).
+    terrain_instances: Vec<Instance>,
+    /// Local-cell splats per body, keyed by entity id and volume revision.
+    body_cache: std::collections::HashMap<u64, BodyCells>,
+    /// Hash of every drawn body's pose and revision at the last combined upload.
+    last_bodies_sig: u64,
+    last_frame_at: Option<Instant>,
     result: Result<(), ClientError>,
 }
 
@@ -197,7 +266,7 @@ struct InteractiveApp {
 /// keeps presenting the last completed result rather than blocking on a new
 /// one.
 struct RebuildWorker {
-    request_tx: mpsc::Sender<[f64; 3]>,
+    request_tx: mpsc::Sender<RebuildRequest>,
     result_rx: mpsc::Receiver<RebuildOutcome>,
     in_flight: bool,
 }
@@ -213,12 +282,13 @@ impl RebuildWorker {
     /// last sender (owned by the `InteractiveApp` this returns into) drops —
     /// no explicit shutdown signal or join needed.
     fn spawn(session: Arc<InteractiveSession>) -> Result<Self, ClientError> {
-        let (request_tx, request_rx) = mpsc::channel::<[f64; 3]>();
+        let (request_tx, request_rx) = mpsc::channel::<RebuildRequest>();
         let (result_tx, result_rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("spall-client-rebuild".into())
             .spawn(move || {
-                for center_m in request_rx {
+                for request in request_rx {
+                    let center_m = request.center_m;
                     let Some(replica) = session.replica.get() else {
                         continue;
                     };
@@ -229,7 +299,7 @@ impl RebuildWorker {
                         .cloned();
                     let Some(volume) = volume else { continue };
                     let start = Instant::now();
-                    let instances = build_instances(&volume, center_m);
+                    let instances = build_instances_with(&volume, request);
                     let elapsed = start.elapsed();
                     if result_tx
                         .send(RebuildOutcome {
@@ -422,6 +492,11 @@ impl InteractiveApp {
             last_dispatch_at: None,
             display_feet: None,
             hud: Hud::default(),
+            review: ReviewCam::default(),
+            terrain_instances: Vec::new(),
+            body_cache: std::collections::HashMap::new(),
+            last_bodies_sig: 0,
+            last_frame_at: None,
             result: Ok(()),
         })
     }
@@ -434,8 +509,153 @@ impl InteractiveApp {
         self.session.input.set_view_dir(self.view_dir());
     }
 
+    /// Splat instances for every replicated detached body near `cam`, plus a signature
+    /// of the drawn state (pose bits and volume revision per body). Each occupied
+    /// cell is an axis-aligned cube placed at the *rotated* cell centre — enough to
+    /// see a body's real voxels move and tip; cubes do not themselves rotate.
+    fn body_splats(&mut self, cam: [f64; 3]) -> (Vec<Instance>, u64) {
+        const MAX_BODY_INSTANCES: usize = 400_000;
+        const BODY_CULL_M: f64 = 220.0;
+        let mut out = Vec::new();
+        let mut sig: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |v: u64| {
+            sig ^= v;
+            sig = sig.wrapping_mul(0x0100_0000_01b3);
+        };
+        let Some(replica) = self.session.replica.get() else {
+            return (out, 0);
+        };
+        let g = replica.lock().unwrap_or_else(|e| e.into_inner());
+        let cm = f64::from(CELL_M);
+        for (entity, volume_id) in g.body_volumes() {
+            let Some(volume) = g.volume(volume_id) else {
+                continue;
+            };
+            let tick = g.latest_motion_tick(entity).unwrap_or(0) as f64;
+            let Some(pose) = g.interpolated_pose(entity, tick) else {
+                continue;
+            };
+            let t = pose.translation_m;
+            let dist2 = (t[0] - cam[0]).powi(2) + (t[1] - cam[1]).powi(2) + (t[2] - cam[2]).powi(2);
+            if dist2 > BODY_CULL_M * BODY_CULL_M {
+                continue;
+            }
+            let Ok(q) = pose.rotation.to_unit() else {
+                continue;
+            };
+            let rev = volume.next_revision().0;
+            mix(entity.get());
+            mix(rev);
+            for v in t {
+                mix(v.to_bits());
+            }
+            for v in q {
+                mix(u64::from(v.to_bits()));
+            }
+            let cells = self
+                .body_cache
+                .entry(entity.get())
+                .or_insert_with(|| (u64::MAX, Vec::new()));
+            if cells.0 != rev {
+                cells.0 = rev;
+                cells.1 = body_local_cells(volume, cm);
+            }
+            if out.len() + cells.1.len() > MAX_BODY_INSTANCES {
+                continue;
+            }
+            let rot = glam::DQuat::from_xyzw(
+                f64::from(q[0]),
+                f64::from(q[1]),
+                f64::from(q[2]),
+                f64::from(q[3]),
+            );
+            let origin = glam::DVec3::from_array(t);
+            for (local, color) in &cells.1 {
+                let w = origin
+                    + rot
+                        * glam::DVec3::new(
+                            f64::from(local[0]),
+                            f64::from(local[1]),
+                            f64::from(local[2]),
+                        );
+                out.push(Instance {
+                    offset: [w.x as f32, w.y as f32, w.z as f32],
+                    color: *color,
+                });
+            }
+        }
+        (out, sig)
+    }
+
+    /// Queues a review cut on the beam (see [`ReviewCam`]): a server-validated `Cut`
+    /// aimed from 3 m in front of the chosen end, so the ray hits the beam's front face
+    /// wherever the fly camera happens to be.
+    fn review_cut(&mut self, cut: ReviewCut) {
+        let Some(replica) = self.session.replica.get() else {
+            eprintln!("spall-review: not connected yet");
+            return;
+        };
+        let picked = {
+            let g = replica.lock().unwrap_or_else(|e| e.into_inner());
+            let counts: Vec<_> = g
+                .body_ids()
+                .map(|e| (e, g.body_solid_cells(e).unwrap_or(0)))
+                .collect();
+            pick_review_lever(&counts).and_then(|e| {
+                let tick = g.latest_motion_tick(e).unwrap_or(0) as f64;
+                let pose = g.interpolated_pose(e, tick)?;
+                Some((e, pose.translation_m, pose.rotation.to_unit().ok()?))
+            })
+        };
+        let Some((entity, t, q)) = picked else {
+            eprintln!("spall-review: no bodies here — start with `--scene review-lever`");
+            return;
+        };
+        self.review.seq += 1;
+        let seq = self.review.seq;
+        let Some(request) =
+            review_cut_request(entity, t, q, cut, self.review.cut_radius_cells, seq)
+        else {
+            return;
+        };
+        self.session.push_action(request);
+        let (cx, cy, radius_override) = cut.target();
+        let radius = radius_override
+            .unwrap_or(self.review.cut_radius_cells)
+            .clamp(1, 8);
+        eprintln!(
+            "spall-review: cut #{seq} sent (entity {}, local cell ({cx},{cy}), radius {radius} cells)",
+            entity.get()
+        );
+    }
+
+    /// Toggles the fly camera, starting from wherever the player's eye is.
+    fn toggle_fly(&mut self) {
+        self.review.fly = !self.review.fly;
+        if self.review.fly {
+            let eye = self.display_feet.map(|(f, _)| f).unwrap_or([0.0, 1.0, 0.0]);
+            self.review.pos = [eye[0], eye[1] + 3.0, eye[2] + 2.0];
+        }
+        self.last_built_pos = None; // rebuild around the new centre
+        self.publish_movement();
+        eprintln!(
+            "spall-review: fly camera {} — {REVIEW_HELP}",
+            if self.review.fly {
+                "ON (no physics, no server input)"
+            } else {
+                "off"
+            }
+        );
+    }
+
     fn publish_movement(&self) {
-        self.session.input.set_movement(self.held.movement());
+        // The reviewer camera never drives the player.
+        let movement = if self.review.fly {
+            [0.0; 3]
+        } else {
+            self.held.movement()
+        };
+        self.session.input.set_movement(movement);
     }
 
     /// Releases local intent after the operating system moves focus away from
@@ -525,8 +745,37 @@ impl ApplicationHandler for InteractiveApp {
                     KeyCode::KeyA => self.held.left = held,
                     KeyCode::KeyD => self.held.right = held,
                     KeyCode::Space => {
-                        self.held.jump = held;
-                        self.session.input.set_button(BUTTON_JUMP, held);
+                        if self.review.fly {
+                            self.review.up = held;
+                        } else {
+                            self.held.jump = held;
+                            self.session.input.set_button(BUTTON_JUMP, held);
+                        }
+                    }
+                    KeyCode::ControlLeft => self.review.down = held,
+                    KeyCode::ShiftLeft => self.review.fast = held,
+                    KeyCode::KeyF if held && !event.repeat => self.toggle_fly(),
+                    KeyCode::KeyH if held && !event.repeat => {
+                        eprintln!("spall-review: {REVIEW_HELP}")
+                    }
+                    KeyCode::Digit1 if held && !event.repeat => self.review_cut(ReviewCut::LeftEnd),
+                    KeyCode::Digit2 if held && !event.repeat => {
+                        self.review_cut(ReviewCut::RightEnd)
+                    }
+                    KeyCode::Digit3 if held && !event.repeat => self.review_cut(ReviewCut::FarTip),
+                    KeyCode::Equal if held && !event.repeat => {
+                        self.review.cut_radius_cells = (self.review.cut_radius_cells + 1).min(8);
+                        eprintln!(
+                            "spall-review: cut radius {} cells",
+                            self.review.cut_radius_cells
+                        );
+                    }
+                    KeyCode::Minus if held && !event.repeat => {
+                        self.review.cut_radius_cells = (self.review.cut_radius_cells - 1).max(1);
+                        eprintln!(
+                            "spall-review: cut radius {} cells",
+                            self.review.cut_radius_cells
+                        );
                     }
                     KeyCode::Escape if held && !event.repeat => {
                         self.set_cursor_locked(false);
@@ -542,22 +791,88 @@ impl ApplicationHandler for InteractiveApp {
                 // Drain the background worker's result, if a fresh one has
                 // landed since the last frame (never blocks — `try_recv`).
                 // Only the newest matters if somehow more than one queued up.
-                let mut new_instances = None;
+                // Fly-camera movement (reviewer mode): free of physics, collision and
+                // the server.
+                let dt = self
+                    .last_frame_at
+                    .map_or(0.0, |t| (now - t).as_secs_f32())
+                    .min(0.1);
+                self.last_frame_at = Some(now);
+                if self.review.fly {
+                    let fwd = Vec3::from_array(view_dir_from(self.yaw, self.pitch));
+                    let right = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
+                    let mut v = Vec3::ZERO;
+                    if self.held.forward {
+                        v += fwd;
+                    }
+                    if self.held.back {
+                        v -= fwd;
+                    }
+                    if self.held.right {
+                        v += right;
+                    }
+                    if self.held.left {
+                        v -= right;
+                    }
+                    if self.review.up {
+                        v += Vec3::Y;
+                    }
+                    if self.review.down {
+                        v -= Vec3::Y;
+                    }
+                    let speed = FLY_SPEED_M_S
+                        * if self.review.fast {
+                            FLY_FAST_FACTOR
+                        } else {
+                            1.0
+                        };
+                    let step = v * speed * dt;
+                    for (a, s) in [step.x, step.y, step.z].into_iter().enumerate() {
+                        self.review.pos[a] += f64::from(s);
+                    }
+                }
+
+                // Drain the background worker's result, if a fresh one has
+                // landed since the last frame (never blocks — `try_recv`).
+                // Only the newest matters if somehow more than one queued up.
+                let mut new_terrain = false;
                 while let Ok(outcome) = self.rebuild.result_rx.try_recv() {
                     self.hud
                         .record_rebuild(outcome.elapsed, outcome.instances.len());
                     self.last_built_pos = Some(outcome.center_m);
-                    new_instances = Some(outcome.instances);
+                    self.terrain_instances = outcome.instances;
+                    new_terrain = true;
                     self.rebuild.in_flight = false;
                 }
 
                 let view = *self.session.view.lock().unwrap_or_else(|e| e.into_inner());
 
-                if let Some(v) = view {
-                    let feet = v.predicted.position_m;
+                let fly = self.review.fly;
+                let request = if fly {
+                    Some(RebuildRequest {
+                        center_m: [self.review.pos[0], FLY_CENTER_Y_M, self.review.pos[2]],
+                        radius_m: FLY_VIEW_RADIUS_M,
+                        up_m: FLY_BAND_M,
+                        down_m: FLY_BAND_M,
+                    })
+                } else {
+                    view.map(|v| RebuildRequest {
+                        center_m: v.predicted.position_m,
+                        radius_m: VIEW_RADIUS_M,
+                        up_m: VIEW_HEIGHT_UP_M,
+                        down_m: VIEW_HEIGHT_DOWN_M,
+                    })
+                };
+                if let Some(request) = request {
+                    let c = request.center_m;
+                    let step = if fly {
+                        FLY_REBUILD_DISTANCE_M
+                    } else {
+                        REBUILD_DISTANCE_M
+                    };
                     let moved_far_enough = self.last_built_pos.is_none_or(|p| {
-                        let d = [feet[0] - p[0], feet[1] - p[1], feet[2] - p[2]];
-                        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() >= REBUILD_DISTANCE_M
+                        let d = [c[0] - p[0], c[1] - p[1], c[2] - p[2]];
+                        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() >= step
                     });
                     let due_for_recheck = self
                         .last_dispatch_at
@@ -567,17 +882,37 @@ impl ApplicationHandler for InteractiveApp {
                     // draw rather than queuing requests it'll never need.
                     if !self.rebuild.in_flight
                         && (moved_far_enough || due_for_recheck)
-                        && self.rebuild.request_tx.send(feet).is_ok()
+                        && self.rebuild.request_tx.send(request).is_ok()
                     {
                         self.rebuild.in_flight = true;
                         self.last_dispatch_at = Some(now);
                     }
                 }
 
+                // Detached bodies: drawn as rotated cell splats from the replica's body
+                // volumes and interpolated poses, re-uploaded only when a pose or a
+                // volume revision changes (or the terrain list is replaced).
+                let cam_pos = if fly {
+                    self.review.pos
+                } else {
+                    view.map_or([0.0; 3], |v| v.predicted.position_m)
+                };
+                let (body_instances, sig) = self.body_splats(cam_pos);
+                let combined = if new_terrain || sig != self.last_bodies_sig {
+                    self.last_bodies_sig = sig;
+                    let mut all =
+                        Vec::with_capacity(self.terrain_instances.len() + body_instances.len());
+                    all.extend_from_slice(&self.terrain_instances);
+                    all.extend(body_instances);
+                    Some(all)
+                } else {
+                    None
+                };
+
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
-                let outcome = match renderer.begin_frame(new_instances.as_ref()) {
+                let outcome = match renderer.begin_frame(combined.as_ref()) {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         self.fail(event_loop, error);
@@ -602,12 +937,17 @@ impl ApplicationHandler for InteractiveApp {
                             *self.session.view.lock().unwrap_or_else(|e| e.into_inner());
                         let look_dir = Vec3::from_array(view_dir_from(self.yaw, self.pitch));
                         let render_now = Instant::now();
-                        let cam = fresh_view.map(|v| {
-                            (
-                                compute_smoothed_eye(&mut self.display_feet, v, render_now),
-                                look_dir,
-                            )
-                        });
+                        let cam = if self.review.fly {
+                            let p = self.review.pos;
+                            Some((Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32), look_dir))
+                        } else {
+                            fresh_view.map(|v| {
+                                (
+                                    compute_smoothed_eye(&mut self.display_feet, v, render_now),
+                                    look_dir,
+                                )
+                            })
+                        };
                         match renderer.finish_frame(acquired, cam.as_ref()) {
                             Ok(timing) => timing,
                             Err(error) => {
@@ -796,16 +1136,30 @@ fn compute_smoothed_eye(
     )
 }
 
+#[cfg(test)]
 fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
+    build_instances_with(
+        volume,
+        RebuildRequest {
+            center_m,
+            radius_m: VIEW_RADIUS_M,
+            up_m: VIEW_HEIGHT_UP_M,
+            down_m: VIEW_HEIGHT_DOWN_M,
+        },
+    )
+}
+
+fn build_instances_with(volume: &Volume, request: RebuildRequest) -> Vec<Instance> {
+    let center_m = request.center_m;
     let cell_m = f64::from(CELL_M);
     let center_cell = GlobalCell::new(
         (center_m[0] / cell_m).floor() as i64,
         (center_m[1] / cell_m).floor() as i64,
         (center_m[2] / cell_m).floor() as i64,
     );
-    let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
-    let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
-    let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
+    let horiz = (request.radius_m / CELL_M).ceil() as i64;
+    let up = (request.up_m / CELL_M).ceil() as i64;
+    let down = (request.down_m / CELL_M).ceil() as i64;
 
     let mut instances = Vec::new();
     for dz in -horiz..=horiz {
@@ -831,6 +1185,37 @@ fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
         }
     }
     instances
+}
+
+/// A body volume's visible cells as `(local centre in the body frame, colour)`; cells
+/// buried inside solid matter are skipped, like the terrain draw.
+fn body_local_cells(volume: &Volume, cell_m: f64) -> Vec<([f32; 3], [f32; 3])> {
+    let mut out = Vec::new();
+    for coord in volume.resident_brick_coords() {
+        for lz in 0..32i64 {
+            for ly in 0..32i64 {
+                for lx in 0..32i64 {
+                    let cell =
+                        GlobalCell::new(coord.x * 32 + lx, coord.y * 32 + ly, coord.z * 32 + lz);
+                    let Ok(Sample::Filled(material)) = volume.sample(cell) else {
+                        continue;
+                    };
+                    if is_buried(volume, cell) {
+                        continue;
+                    }
+                    out.push((
+                        [
+                            ((cell.x as f64 + 0.5) * cell_m) as f32,
+                            ((cell.y as f64 + 0.5) * cell_m) as f32,
+                            ((cell.z as f64 + 0.5) * cell_m) as f32,
+                        ],
+                        material_color(material),
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A cell whose six face neighbours are all solid contributes no visible

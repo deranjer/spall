@@ -1,0 +1,31 @@
+{
+  "name": "t23-g4-integrated-normal-envelope",
+  "description": "T23 / G4 integrated workload, two measured minutes after a 60 s warmup (joins staggered 800 ms apart: with all eight handshakes at once under this envelope, four exceeded the 5 s handshake timeout -- see docs/reports/G3.md increment 38), players SEPARATED (~77 m apart), under the NORMAL impairment envelope (100 ms RTT, +/-20 ms jitter, 2% loss; docs/validation.md). Eight late-joining clients on the g4-integrated yard: ground slab, 282 comb bodies (ordinary-edit targets, 64 tooth cuts each), 180 tower bodies (blast targets), one dormant 64-brick giant body, 256 always-awake nontrivial debris bodies (64 within 12 m of client 0, kept awake by the fixture agitator) and 4,096 sleeping persistent bodies. The generated stream fires the giant collapse 1 s after warmup, then 10 ordinary comb-tooth edits/s and one 4 m tower blast per 10 s, each aimed at a persistent body by entity id (fresh geometry every edit). Edits target bodies, not terrain, because a terrain commit is O(terrain) (~300 ms at yard scale; docs/reports/G3.md increment 38). Fail-closed telemetry: warmup-excluded tick/physics percentiles, per-client steady egress vs 256 KiB/s, backlog recovery within 5 s of every blast, memory, body populations, baseline concurrency and 1 MiB/s pacing.",
+  "scene": "g4-integrated-separated",
+  "release_profile": true,
+  "server_ticks": 13020,
+  "quiescence_ticks": 1500,
+  "clients": 8,
+  "late_join_clients": [0, 1, 2, 3, 4, 5, 6, 7],
+  "late_join_connect_delay_ms": 800,
+  "minimum_transactions": 1213,
+  "replay_check": true,
+  "restart_check": true,
+  "dormancy": true,
+  "cuts": [],
+  "sustained_edits": {
+    "start_tick": 3600,
+    "small_rate_per_sec": 10.0,
+    "blast_interval_sec": 10.0,
+    "trailing_buffer_ticks": 2100,
+    "mode": "g4_bodies",
+    "ordinary_offset_ticks": 120,
+    "giant_at_offset_ticks": 60,
+    "terrain_edit_every": 10
+  },
+  "motion_interest": { "near_m": 12.0, "far_m": 24.0, "far_interval": 4, "client_budget_bytes": 6000, "congestion_aware": true },
+  "baseline_rate_limit_bytes_per_sec": 1048576,
+  "server_timing": { "warmup_ticks": 3600, "measured_ticks": 7200, "max_samples": 7200 },
+  "g4_telemetry": { "min_rubble_fraction": 0.8, "warmup_ticks": 3600, "measured_ticks": 7200, "baseline_rate_cap_bytes_per_sec": 1048576 },
+  "network_envelope": { "rtt_ms": 100, "jitter_ms": 20, "loss_percent": 2.0 }
+}

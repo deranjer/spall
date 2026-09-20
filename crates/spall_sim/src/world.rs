@@ -108,6 +108,61 @@ pub struct WorldSetup {
     pub physics: PhysicsConfig,
 }
 
+// --- wake-reason telemetry (T23 / G4 diagnostics) -------------------------------
+
+/// Per-reason wake accounting: how many operations of that kind ran and how
+/// many *previously rapier-asleep, non-dormant* bodies were awake afterwards
+/// that were not asleep-and-untouched before it. Off by default (each probe is
+/// an O(bodies) scan); enable with [`SimWorld::enable_wake_audit`].
+#[derive(Debug, Clone, Default)]
+pub struct WakeAudit {
+    pub reasons: BTreeMap<&'static str, WakeStat>,
+    /// Attributed physics-step wake bursts (capped at 8,192).
+    pub bursts: Vec<WakeBurst>,
+}
+
+/// One reason's totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WakeStat {
+    /// Operations of this kind that woke at least one asleep body.
+    pub waking_operations: u64,
+    /// All operations of this kind that were probed.
+    pub operations: u64,
+    /// Asleep bodies woken in total.
+    pub bodies_woken: u64,
+    /// Largest number woken by one operation.
+    pub max_woken_by_one: u64,
+}
+
+/// An awake body found touching bodies a physics step just woke (a candidate initiator).
+#[derive(Debug, Clone)]
+pub struct WakeInitiator {
+    pub entity: u64,
+    /// Its linear speed before the step, m/s (a legitimate impact is fast; a near-zero
+    /// speed is a body that is awake but effectively at rest).
+    pub speed_m_s: f64,
+    pub angular_speed_rad_s: f64,
+    /// How many of the woken bodies it touches.
+    pub touches_woken: u32,
+}
+
+/// One physics step that woke at least [`WAKE_BURST_MIN`] sleeping bodies.
+#[derive(Debug, Clone)]
+pub struct WakeBurst {
+    pub woken: u64,
+    /// Woken bodies with an awake-before dynamic contact partner.
+    pub directly_touched: u64,
+    /// Woken bodies touching only other woken bodies (propagated through the island).
+    pub chained: u64,
+    /// Awake-before bodies touching the woken set, most contacts first (top 8).
+    pub initiators: Vec<WakeInitiator>,
+}
+
+/// Bursts smaller than this are counted in the totals but not attributed.
+pub const WAKE_BURST_MIN: u64 = 20;
+/// The set of asleep body ids at the moment an operation began.
+pub struct WakeProbe(std::collections::BTreeSet<u64>);
+
 /// The authoritative simulation world.
 pub struct SimWorld {
     registry: IdRegistry,
@@ -124,6 +179,8 @@ pub struct SimWorld {
     /// (T19). Not bodies: no volume, never split, never in the dynamic set.
     players: BTreeMap<u64, Player>,
     physics: PhysicsWorld,
+    /// Wake-reason accounting; `None` unless enabled.
+    wake_audit: Option<WakeAudit>,
     /// ENG-69 round 18: each live player's own bounded terrain-query window
     /// (`spall_physics::query_cache`'s own doc has the full design) — keyed
     /// the same as `players`, kept in sync with it by `advance_players`
@@ -210,6 +267,7 @@ impl SimWorld {
             volume_owner: BTreeMap::new(),
             players: BTreeMap::new(),
             physics,
+            wake_audit: None,
             query_caches: BTreeMap::new(),
             window_stats: spall_physics::WindowStats::default(),
             evicted: BTreeMap::new(),
@@ -400,7 +458,12 @@ impl SimWorld {
     /// (T21) have no physics body and are skipped — their stored pose stays
     /// authoritative until [`Self::reactivate_body`].
     pub fn step_physics(&mut self) {
+        let probe = self.wake_probe();
+        let sp_step = crate::prof::Span::start("physics.rapier_step");
         self.physics.step();
+        drop(sp_step);
+        self.wake_probe_end("physics.step (contact / island wake)", probe);
+        let _sp_extract = crate::prof::Span::start("physics.pose_extract");
         let physics = &self.physics;
         for body in self.bodies.values_mut() {
             if body.dormant {
@@ -881,12 +944,148 @@ impl SimWorld {
             return false;
         }
         let phys = body.phys;
+        let probe = self.wake_probe();
+        let body = self.bodies.get_mut(&entity.get()).expect("checked above");
         body.dormant = true;
         body.sleeping = true;
         body.linvel_m_s = [0.0; 3];
         body.angvel_rad_s = [0.0; 3];
         self.physics.deactivate_body(phys);
+        self.wake_probe_end("dormancy.deactivate", probe);
         true
+    }
+
+    // --- wake-reason telemetry ------------------------------------------------
+
+    /// Turns on wake-reason accounting (an O(bodies) scan per probed operation).
+    pub fn enable_wake_audit(&mut self) {
+        self.wake_audit.get_or_insert_with(WakeAudit::default);
+    }
+
+    /// The accounting so far, if enabled.
+    pub fn wake_audit(&self) -> Option<&WakeAudit> {
+        self.wake_audit.as_ref()
+    }
+
+    /// Ids of the bodies the solver currently has asleep (non-dormant).
+    fn solver_asleep_ids(&self) -> std::collections::BTreeSet<u64> {
+        self.bodies
+            .iter()
+            .filter(|(_, b)| !b.dormant && self.physics.body_state(b.phys).sleeping)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Which awake-before bodies touch the bodies this step woke (diagnostic).
+    fn attribute_wake_burst(
+        &self,
+        before_asleep: &std::collections::BTreeSet<u64>,
+        now_asleep: &std::collections::BTreeSet<u64>,
+    ) -> WakeBurst {
+        let woken: std::collections::BTreeSet<u64> = before_asleep
+            .iter()
+            .filter(|id| {
+                self.bodies
+                    .get(id)
+                    .is_some_and(|b| !b.dormant && !now_asleep.contains(id))
+            })
+            .copied()
+            .collect();
+        let phys_to_entity: std::collections::HashMap<_, _> = self
+            .bodies
+            .iter()
+            .filter(|(_, b)| !b.dormant && b.kind == BodyKind::Dynamic)
+            .map(|(id, b)| (b.phys, *id))
+            .collect();
+        let queried: Vec<_> = woken
+            .iter()
+            .filter_map(|id| self.bodies.get(id).map(|b| b.phys))
+            .collect();
+        let mut touching_awake: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
+        let mut directly = std::collections::BTreeSet::new();
+        for (w, p) in self.physics.touching_dynamic_bodies(&queried) {
+            let (Some(&we), Some(&pe)) = (phys_to_entity.get(&w), phys_to_entity.get(&p)) else {
+                continue;
+            };
+            if woken.contains(&pe) || before_asleep.contains(&pe) {
+                continue; // partner was asleep before: not an initiator
+            }
+            *touching_awake.entry(pe).or_default() += 1;
+            directly.insert(we);
+        }
+        let mut initiators: Vec<WakeInitiator> = touching_awake
+            .into_iter()
+            .filter_map(|(e, touches)| {
+                let b = self.bodies.get(&e)?;
+                let v = b.linvel_m_s;
+                let w = b.angvel_rad_s;
+                Some(WakeInitiator {
+                    entity: e,
+                    speed_m_s: (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt(),
+                    angular_speed_rad_s: (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt(),
+                    touches_woken: touches,
+                })
+            })
+            .collect();
+        initiators.sort_by(|a, b| {
+            b.touches_woken
+                .cmp(&a.touches_woken)
+                .then(a.entity.cmp(&b.entity))
+        });
+        initiators.truncate(8);
+        WakeBurst {
+            woken: woken.len() as u64,
+            directly_touched: directly.len() as u64,
+            chained: woken.len() as u64 - directly.len() as u64,
+            initiators,
+        }
+    }
+
+    /// Starts a wake probe (`None` when auditing is off): call
+    /// [`Self::wake_probe_end`] after the operation under test.
+    pub fn wake_probe(&self) -> Option<WakeProbe> {
+        self.wake_audit
+            .as_ref()
+            .map(|_| WakeProbe(self.solver_asleep_ids()))
+    }
+
+    /// Records, under `reason`, how many bodies asleep at the probe are awake now.
+    /// A body that went dormant or vanished during the operation is not a wake.
+    pub fn wake_probe_end(&mut self, reason: &'static str, probe: Option<WakeProbe>) {
+        let Some(WakeProbe(before)) = probe else {
+            return;
+        };
+        let now = self.solver_asleep_ids();
+        let woken = before
+            .iter()
+            .filter(|id| {
+                self.bodies
+                    .get(id)
+                    .is_some_and(|b| !b.dormant && !now.contains(id))
+            })
+            .count() as u64;
+        if woken >= WAKE_BURST_MIN
+            && reason.starts_with("physics.step")
+            && self
+                .wake_audit
+                .as_ref()
+                .is_some_and(|a| a.bursts.len() < 8192)
+        {
+            let burst = self.attribute_wake_burst(&before, &now);
+            if let Some(audit) = &mut self.wake_audit {
+                audit.bursts.push(burst);
+            }
+        }
+        if let Some(audit) = &mut self.wake_audit {
+            let s = audit.reasons.entry(reason).or_default();
+            s.operations += 1;
+            if woken > 0 {
+                s.waking_operations += 1;
+                s.bodies_woken += woken;
+                s.max_woken_by_one = s.max_woken_by_one.max(woken);
+            }
+        }
     }
 
     /// Restores a dormant body to the physics world at its stored pose (awake;
@@ -908,11 +1107,13 @@ impl SimWorld {
         let trans = [t[0] as f32, t[1] as f32, t[2] as f32];
         let r = body.pose.rotation;
         let rot = [r.x as f32, r.y as f32, r.z as f32, r.w as f32];
+        let probe = self.wake_probe();
         self.physics
             .reactivate_body(phys, &grid, trans, rot, [0.0; 3], [0.0; 3]);
         if let Some(body) = self.bodies.get_mut(&entity.get()) {
             body.dormant = false;
         }
+        self.wake_probe_end("dormancy.reactivate", probe);
         true
     }
 

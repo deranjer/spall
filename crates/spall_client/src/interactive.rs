@@ -288,6 +288,9 @@ pub struct InteractiveSession {
     pub corrections: Option<CorrectionLog>,
     /// `None` only if the log file could not be created — see [`FrameLog`].
     pub frames: Option<FrameLog>,
+    /// Tool uses the window wants sent (reviewer cut keys / clicks): the network thread
+    /// drains this and sends each as a reliable `ActionRequest`.
+    pub action_queue: Mutex<Vec<spall_protocol::ActionRequest>>,
 }
 
 impl std::fmt::Debug for InteractiveSession {
@@ -335,10 +338,109 @@ impl InteractiveSession {
             stop: AtomicBool::new(false),
             corrections,
             frames,
+            action_queue: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Queues an action for the network thread to send.
+    pub fn push_action(&self, request: spall_protocol::ActionRequest) {
+        self.action_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(request);
     }
 
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// Which review cut a key asks for (the `review-lever` scene's beam): the beam spans
+/// local cells x 9..51, y 4..11, z 8..15, and every cut aims at its front (`+z`) face.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewCut {
+    /// The counterweight end: the beam must tip.
+    LeftEnd,
+    RightEnd,
+    /// The far tip with a 1-cell brush: a harmless edit.
+    FarTip,
+}
+
+impl ReviewCut {
+    /// `(cell x, cell y, radius override)` on the beam's front face.
+    pub fn target(self) -> (i64, i64, Option<i64>) {
+        match self {
+            ReviewCut::LeftEnd => (13, 7, None),
+            ReviewCut::RightEnd => (47, 7, None),
+            ReviewCut::FarTip => (51, 7, Some(1)),
+        }
+    }
+}
+
+/// Builds the server-validated `Cut` a review key sends: aimed from 3 m in front of the
+/// chosen end of the body at `translation_m` / `rotation_xyzw`, so the ray hits the
+/// beam's front face wherever the camera is (the server only checks that the aim hits
+/// the claimed body within the tool's 12 m reach of the ray origin).
+pub fn review_cut_request(
+    entity: spall_core::EntityId,
+    translation_m: [f64; 3],
+    rotation_xyzw: [f32; 4],
+    cut: ReviewCut,
+    default_radius_cells: i64,
+    seq: u64,
+) -> Option<spall_protocol::ActionRequest> {
+    use glam::{DQuat, DVec3};
+    use spall_core::SphereBrush;
+    use spall_core::units::{BRUSH_UNIT, BrushPoint};
+    use spall_protocol::{ActionKind, ActionRequest, ClaimedTarget, InputSeq, RequestId};
+
+    let (cx, cy, radius_override) = cut.target();
+    let radius = radius_override.unwrap_or(default_radius_cells).clamp(1, 8);
+    let cm = f64::from(crate::predict::CELL_M);
+    let q = rotation_xyzw;
+    let rot = DQuat::from_xyzw(
+        f64::from(q[0]),
+        f64::from(q[1]),
+        f64::from(q[2]),
+        f64::from(q[3]),
+    );
+    let target = DVec3::from_array(translation_m)
+        + rot * DVec3::new((cx as f64 + 0.5) * cm, (cy as f64 + 0.5) * cm, 15.5 * cm);
+    let dir = rot * DVec3::new(0.0, 0.0, -1.0);
+    // 3 m in front: inside the body volume's resident bricks (local z <= 31 cells), which the
+    // server's ray march needs — it does not cross non-resident space.
+    let origin = target - dir * 3.0;
+    let h = BRUSH_UNIT / 2;
+    let brush = SphereBrush::new(
+        BrushPoint::from_units(
+            cx * BRUSH_UNIT + h,
+            cy * BRUSH_UNIT + h,
+            15 * BRUSH_UNIT + h,
+        ),
+        radius * BRUSH_UNIT,
+    )
+    .ok()?;
+    Some(ActionRequest {
+        request_id: RequestId(1_000_000 + seq),
+        input_seq: InputSeq(seq),
+        action: ActionKind::Cut,
+        tool: 0,
+        aim_origin_m: origin.to_array(),
+        aim_dir: [dir.x as f32, dir.y as f32, dir.z as f32],
+        claimed_target: ClaimedTarget::Body(entity),
+        claimed_brush: brush,
+    })
+}
+
+/// Solid cells in the `review-lever` beam before any cut (`43 x 8 x 8` beam + `1 x 4 x 8`
+/// foot). Cuts only remove cells, so the beam is the body whose count is closest to
+/// this (the broad base under it has ~4x more).
+pub const REVIEW_LEVER_CELLS: u64 = 2784;
+
+/// Picks the review beam out of `(entity, solid cells)` pairs.
+pub fn pick_review_lever(bodies: &[(spall_core::EntityId, u64)]) -> Option<spall_core::EntityId> {
+    bodies
+        .iter()
+        .min_by_key(|(_, n)| n.abs_diff(REVIEW_LEVER_CELLS))
+        .map(|(e, _)| *e)
 }

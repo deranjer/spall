@@ -61,6 +61,10 @@ struct QueuedIntent {
 /// What one [`EditPipeline::run_tick`] did.
 #[derive(Debug, Default)]
 pub struct TickReport {
+    /// Time spent in the owning world's physics step, including extraction of
+    /// updated body poses. This is populated by `Simulation::tick` so server
+    /// telemetry can report the physics portion without timing a replica.
+    pub physics_duration: std::time::Duration,
     /// Requests that committed this tick, with their transaction summary.
     pub committed: Vec<(RequestId, Committed)>,
     /// Requests whose commit lost a conflict and were re-queued for recompute.
@@ -194,6 +198,7 @@ impl EditPipeline {
         let mut report = TickReport::default();
         self.active_regions.clear();
 
+        let sp1 = crate::prof::Span::start("sim.stage_submit");
         // 1. Submit eligible pending intents to the staging scheduler.
         let generation = world.generation();
         let epoch = world.topology_epoch();
@@ -242,12 +247,16 @@ impl EditPipeline {
         }
         self.pending.append(&mut deferred);
 
+        drop(sp1);
+        let sp2 = crate::prof::Span::start("sim.stage_run");
         // 2. Run every dispatched staging job (deterministic, no threads).
         for dispatch in self.scheduler.dispatch() {
             let completion = dispatch.run();
             self.scheduler.apply(completion);
         }
 
+        drop(sp2);
+        let sp3 = crate::prof::Span::start("sim.install");
         // 3. Install: fresh staged results in completion (== request) order.
         let installed = self.scheduler.install(&*world);
         for discarded in installed.discarded {
@@ -257,6 +266,7 @@ impl EditPipeline {
             }
         }
 
+        drop(sp3);
         // 4. Commit in order.
         for entry in installed.installed {
             let Some(queued) = self.inflight.remove(&entry.id) else {
@@ -306,6 +316,7 @@ impl EditPipeline {
             }
 
             let control_seq = ControlSeq(*next_control_seq);
+            let _sp_commit = crate::prof::Span::start("sim.commit");
             match commit(world, journal, &staged, server_tick, control_seq) {
                 Ok(CommitOutcome::Committed(done)) => {
                     *next_control_seq += 1;

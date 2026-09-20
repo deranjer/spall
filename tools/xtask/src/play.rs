@@ -149,6 +149,11 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         "--log-json",
         &output.join("client.jsonl").display().to_string(),
     ]);
+    // Review scenes hold detached bodies built at server start; only a late-join
+    // baseline (captured from the live world) carries them to the window.
+    if args.scene.starts_with("review-") {
+        client_cmd.arg("--late-join");
+    }
     // Deliberately not hidden and not captured: the window is the point, and
     // a connect failure's error message should land directly in this
     // terminal instead of a log nobody's watching.

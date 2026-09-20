@@ -1,3 +1,4 @@
+mod g4;
 mod netcheck;
 mod play;
 mod process;

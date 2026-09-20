@@ -1,0 +1,46 @@
+{
+  "name": "t23-g4-integrated-overload",
+  "description": "T23 / G4 overload/burst case. Ten clients try to join a server capped at 8 live clients (server_max_clients=8): the two surplus joins must be refused explicitly (\"server at capacity\"), not hang or corrupt anything. Meanwhile the admitted eight drive 6x the spec edit rate (60 edits/s, one per tick, fresh comb-tooth geometry) and a 4 m tower blast every 2 s (5x), plus the giant collapse, with baselines paced at 1 MiB/s. Requirements: every scripted edit commits (no loss), all admitted replicas + replay + restart converge on one hash, no reliable-backlog overflow, the refusal counter equals the surplus joins, memory stays bounded.",
+  "scene": "g4-integrated-clustered",
+  "release_profile": true,
+  "server_ticks": 4020,
+  "quiescence_ticks": 600,
+  "clients": 10,
+  "late_join_clients": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "late_join_connect_delay_ms": 200,
+  "late_join_may_fail": true,
+  "edit_clients": 8,
+  "minimum_transactions": 1816,
+  "replay_check": true,
+  "restart_check": true,
+  "dormancy": true,
+  "cuts": [],
+  "sustained_edits": {
+    "start_tick": 1800,
+    "small_rate_per_sec": 60.0,
+    "blast_interval_sec": 2.0,
+    "trailing_buffer_ticks": 300,
+    "mode": "g4_bodies",
+    "ordinary_offset_ticks": 120,
+    "giant_at_offset_ticks": 60
+  },
+  "motion_interest": {
+    "near_m": 12.0,
+    "far_m": 24.0,
+    "far_interval": 4,
+    "client_budget_bytes": 6000
+  },
+  "baseline_rate_limit_bytes_per_sec": 1048576,
+  "server_max_clients": 8
+}
