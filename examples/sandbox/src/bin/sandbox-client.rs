@@ -101,6 +101,15 @@ struct Args {
     /// matching every prior run's exact behavior.
     #[arg(long)]
     residency_budget_dense_bytes: Option<u64>,
+    /// **Testing only.** Gives this client runtime authority over its player
+    /// and detached-body physics: it ignores server pose corrections, steps
+    /// dynamic bodies locally, transfers player push impulses, and drives the
+    /// playground emitters from its own clock. Replicated topology still
+    /// supplies the terrain/body voxel shapes. Only meaningful for a local,
+    /// single-player debug session (e.g. `cargo xtask play`), never over a
+    /// real network or with other players.
+    #[arg(long)]
+    client_authoritative: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -349,6 +358,7 @@ fn run_replication(args: Args) -> ExitCode {
         ),
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: args.client_authoritative,
     };
     match run_replication_client(config) {
         Ok(summary) => {
@@ -484,6 +494,7 @@ fn run_interactive(args: Args) -> ExitCode {
         client_residency: None,
         on_replica_ready: None,
         interactive: None, // set by `run_interactive_window` itself
+        client_authoritative: args.client_authoritative,
     };
     match spall_client::run_interactive_window(config) {
         Ok(()) => ExitCode::SUCCESS,

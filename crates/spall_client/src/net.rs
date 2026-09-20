@@ -40,7 +40,10 @@ use spall_protocol::{
 };
 
 use crate::interactive::{InteractiveSession, InteractiveView};
-use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer, WindowStats};
+use crate::predict::{
+    BodyMotion, ClientBodyCollision, ClientPhysics, PlayerMovementSummary, PredictedPlayer,
+    WindowStats,
+};
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
 use crate::residency::ClientResidencyPass;
 use crate::tick_accumulator::TickAccumulator;
@@ -277,6 +280,11 @@ pub struct ClientNetConfig {
     /// and never auto-stops on a script end tick. `None` (every existing
     /// scripted/headless run) is byte-for-byte unchanged.
     pub interactive: Option<Arc<InteractiveSession>>,
+    /// **Testing only.** Makes the local player and detached bodies authoritative
+    /// for runtime physics. Server motion still arrives as a shadow simulation,
+    /// but does not correct player/body poses; replicated topology remains the
+    /// source of voxel shapes. `false` leaves normal behavior unchanged.
+    pub client_authoritative: bool,
 }
 
 /// A shared handle to the live replica, and a callback invoked with it — see
@@ -339,6 +347,11 @@ pub struct ClientSummary {
     /// client ran a `movement_script`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub movement: Option<PlayerMovementSummary>,
+    /// Per-reconcile / per-input-change timeline of a scripted player, for
+    /// diagnosing prediction lead and stop/reverse behaviour. Bounded; empty
+    /// unless this client ran a `movement_script`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub movement_trace: Option<MovementTrace>,
     /// T23 / G3 row 7 slice E2: terrain bricks this client evicted around its
     /// predicted player, and reload `RepairRequest`s it sent as the player
     /// returned. Both `0` unless `client_residency` was set.
@@ -538,6 +551,98 @@ fn state_from_snapshot(snap: &MotionSnapshot) -> CharacterState {
     }
 }
 
+/// Most rows kept per trace list.
+const MAX_TRACE_ROWS: usize = 16_384;
+
+/// One reconcile against an authoritative snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconcileTraceRow {
+    pub wall_ms: u64,
+    pub server_tick: u64,
+    /// Highest input sequence the server had accepted at that snapshot.
+    pub acked_input: u64,
+    /// Predicted ticks the snapshot's tick had not yet covered (the lead, and
+    /// the number of steps replayed).
+    pub lead_ticks: usize,
+    /// The controller's target for `lead_ticks`, and its timeline rate.
+    pub target_lead_ticks: f64,
+    pub timeline_rate: f64,
+    pub grounded: bool,
+    pub authoritative_pos_m: [f64; 3],
+    pub authoritative_vel_m_s: [f32; 3],
+    pub predicted_before_pos_m: [f64; 3],
+    pub predicted_after_pos_m: [f64; 3],
+    /// Distance the predicted position moved because of this reconcile, and the
+    /// horizontal component of that move along the last commanded direction
+    /// (negative = the correction pulled the player backwards).
+    pub shift_m: f64,
+    pub shift_along_input_m: f64,
+    /// Input being sent when this reconcile ran.
+    pub current_movement: [f32; 3],
+}
+
+/// One change of the sampled movement input.
+#[derive(Debug, Clone, Serialize)]
+pub struct InputTraceRow {
+    pub wall_ms: u64,
+    pub input_seq: u64,
+    pub movement: [f32; 3],
+    pub server_tick_seen: u64,
+    pub predicted_pos_m: [f64; 3],
+}
+
+/// One box as seen at a predicted tick, in the three places it exists on the
+/// client: the pose prediction collides with, the pose drawn, and the newest
+/// authoritative snapshot it came from.
+#[derive(Debug, Clone, Serialize)]
+pub struct BodyTick {
+    pub entity: u64,
+    /// The mirrored pose the character sweep for this tick collided with.
+    pub collision_pos_m: [f64; 3],
+    /// The pose the renderer would draw at this instant.
+    pub displayed_pos_m: [f64; 3],
+    /// Newest snapshot's tick and pose (the authoritative box).
+    pub snapshot_tick: u64,
+    pub snapshot_pos_m: [f64; 3],
+    pub snapshot_vel_m_s: [f32; 3],
+}
+
+/// One predicted tick, recorded by the mover right after the local step.
+#[derive(Debug, Clone, Serialize)]
+pub struct TickTraceRow {
+    pub wall_ms: u64,
+    /// The tick the step just simulated.
+    pub tick: u64,
+    pub predicted_pos_m: [f64; 3],
+    pub predicted_vel_m_s: [f32; 3],
+    pub grounded: bool,
+    pub movement: [f32; 3],
+    pub bodies: Vec<BodyTick>,
+}
+
+/// A body's mirrored pose jumping when a fresh snapshot replaces the
+/// extrapolation it was following.
+#[derive(Debug, Clone, Serialize)]
+pub struct BodyJumpRow {
+    pub wall_ms: u64,
+    pub entity: u64,
+    pub snapshot_tick: u64,
+    /// Distance between where the previous snapshot's constant-velocity
+    /// extrapolation put the body at `snapshot_tick` and where the new
+    /// snapshot says it is.
+    pub extrapolation_error_m: f64,
+    pub speed_m_s: f32,
+}
+
+/// The recorded timeline of one scripted run.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MovementTrace {
+    pub reconciles: Vec<ReconcileTraceRow>,
+    pub input_changes: Vec<InputTraceRow>,
+    pub ticks: Vec<TickTraceRow>,
+    pub body_jumps: Vec<BodyJumpRow>,
+}
+
 /// T19 predicted-player state shared by the mover and motion tasks. The mover
 /// owns terrain rebuilds and prediction ticks; the motion task only reconciles.
 struct Predictor {
@@ -560,19 +665,127 @@ struct Predictor {
     /// (and the mover sends nothing) until it arrives, so it is the true
     /// "tick zero" for the script.
     script_origin_tick: Option<u64>,
+    /// Testing-only client authority: the terrain the fixed-rate physics
+    /// thread ticks the local player against, so the player's push impulses
+    /// land in the same step as the body integration (see that thread).
+    local_terrain: Option<spall_voxel::Volume>,
+    /// Steers the prediction timeline's rate so its lead over the server stays
+    /// bounded (see [`crate::tick_accumulator::LeadController`]).
+    lead: crate::tick_accumulator::LeadController,
+    /// When each recent input frame was sent, to time its acknowledgement.
+    sent_at: std::collections::VecDeque<(u64, std::time::Instant)>,
+    /// Every replicated body's newest motion (geometry stripped), as of the
+    /// mover's last pass; what a reconcile replays against.
+    bodies_motion: Vec<ClientBodyCollision>,
+    /// Recorded only for scripted movement (`Some`).
+    trace: Option<MovementTrace>,
+    trace_started: std::time::Instant,
+    last_traced_movement: Option<[f32; 3]>,
+    current_movement: [f32; 3],
 }
 
 impl Predictor {
-    fn new(entity: EntityId) -> Self {
+    fn new(entity: EntityId, client_authoritative: bool) -> Self {
+        let mut phys = ClientPhysics::new();
+        phys.set_client_authoritative(client_authoritative);
         Self {
             entity,
             params: CharacterParams::DEFAULT,
-            phys: ClientPhysics::new(),
+            phys,
             player: None,
             terrain_hash: None,
             input_seq: 0,
             recent: std::collections::VecDeque::new(),
             script_origin_tick: None,
+            local_terrain: None,
+            lead: crate::tick_accumulator::LeadController::default(),
+            sent_at: std::collections::VecDeque::new(),
+            bodies_motion: Vec::new(),
+            trace: None,
+            trace_started: std::time::Instant::now(),
+            last_traced_movement: None,
+            current_movement: [0.0; 3],
+        }
+    }
+
+    fn trace_reconcile(
+        &mut self,
+        outcome: &crate::predict::ReconcileOutcome,
+        authoritative: CharacterState,
+        acked: InputSeq,
+        now: std::time::Instant,
+    ) {
+        let Some(trace) = &mut self.trace else { return };
+        if trace.reconciles.len() >= MAX_TRACE_ROWS {
+            return;
+        }
+        let (before, after) = (outcome.predicted_before, outcome.predicted_after);
+        let d = [
+            after.position_m[0] - before.position_m[0],
+            after.position_m[2] - before.position_m[2],
+        ];
+        let m = self.current_movement;
+        let norm = f64::from(m[0]).hypot(f64::from(m[2]));
+        let along = if norm > 1e-6 {
+            (d[0] * f64::from(m[0]) + d[1] * f64::from(m[2])) / norm
+        } else {
+            0.0
+        };
+        trace.reconciles.push(ReconcileTraceRow {
+            wall_ms: now.duration_since(self.trace_started).as_millis() as u64,
+            server_tick: outcome.server_tick.0,
+            acked_input: acked.0,
+            lead_ticks: outcome.records_replayed,
+            target_lead_ticks: self.lead.target_lead_ticks(),
+            timeline_rate: self.lead.rate(),
+            grounded: authoritative.grounded,
+            authoritative_pos_m: authoritative.position_m,
+            authoritative_vel_m_s: authoritative.velocity_m_s,
+            predicted_before_pos_m: before.position_m,
+            predicted_after_pos_m: after.position_m,
+            shift_m: before.distance_m(&after),
+            shift_along_input_m: along,
+            current_movement: m,
+        });
+    }
+
+    fn trace_input(&mut self, seq: u64, movement: [f32; 3], server_tick: u64, pos: [f64; 3]) {
+        self.current_movement = movement;
+        let Some(trace) = &mut self.trace else { return };
+        if self.last_traced_movement == Some(movement)
+            || trace.input_changes.len() >= MAX_TRACE_ROWS
+        {
+            return;
+        }
+        self.last_traced_movement = Some(movement);
+        trace.input_changes.push(InputTraceRow {
+            wall_ms: self.trace_started.elapsed().as_millis() as u64,
+            input_seq: seq,
+            movement,
+            server_tick_seen: server_tick,
+            predicted_pos_m: pos,
+        });
+    }
+
+    /// Feeds a reconcile's outcome to the lead controller: the lead it saw, and
+    /// a round-trip sample if `acked` names a frame we timed.
+    fn observe_reconcile(&mut self, lead_ticks: usize, acked: InputSeq, now: std::time::Instant) {
+        // Round trip first, then the lead: both describe the same snapshot, so a
+        // snapshot that was delayed in transit raises the target it is judged
+        // against as well as the lead it reports.
+        if let Some(&(_, sent)) = self.sent_at.iter().find(|(seq, _)| *seq == acked.0) {
+            self.lead.observe_rtt(now.saturating_duration_since(sent));
+        }
+        self.lead.observe_lead(lead_ticks);
+        while self.sent_at.front().is_some_and(|(seq, _)| *seq < acked.0) {
+            self.sent_at.pop_front();
+        }
+    }
+
+    fn note_input_sent(&mut self, seq: u64, now: std::time::Instant) {
+        self.sent_at.push_back((seq, now));
+        while self.sent_at.len() > 256 {
+            self.sent_at.pop_front();
         }
     }
 }
@@ -843,9 +1056,14 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     // own player capsule.
     let predictor =
         (!config.movement_script.is_empty() || config.interactive.is_some()).then(|| {
-            Arc::new(Mutex::new(Predictor::new(session_player_entity(
-                conn.session(),
-            ))))
+            let mut predictor = Predictor::new(
+                session_player_entity(conn.session()),
+                config.client_authoritative,
+            );
+            if !config.movement_script.is_empty() {
+                predictor.trace = Some(MovementTrace::default());
+            }
+            Arc::new(Mutex::new(predictor))
         });
 
     // Bounded resend of `ActionRequest`s the server throttled (its per-tick
@@ -1038,6 +1256,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let counters = counters.clone();
         let predictor = predictor.clone();
         let interactive = config.interactive.clone();
+        let client_authoritative = config.client_authoritative;
         tokio::spawn(async move {
             loop {
                 match conn.recv_datagram().await {
@@ -1062,11 +1281,10 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                 let st = state_from_snapshot(&snap);
                                 match &mut p.player {
                                     None => {
-                                        p.player = Some(PredictedPlayer::new(
-                                            p.params,
-                                            st,
-                                            snap.server_tick,
-                                        ));
+                                        let mut player =
+                                            PredictedPlayer::new(p.params, st, snap.server_tick);
+                                        player.client_authoritative = client_authoritative;
+                                        p.player = Some(player);
                                         p.script_origin_tick.get_or_insert(snap.server_tick.get());
                                     }
                                     // The live HUD path only needs `PredictedPlayer`'s own
@@ -1081,13 +1299,16 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                     // reconciliation this one time is the same as any
                                     // other not-ready tick, not a hard failure.
                                     Some(pl) => {
-                                        if let Some(volume) = &terrain_volume {
-                                            let outcome = pl.reconcile(
+                                        if !client_authoritative
+                                            && let Some(volume) = &terrain_volume
+                                        {
+                                            let outcome = pl.reconcile_with_bodies(
                                                 &mut p.phys,
                                                 volume,
                                                 st,
                                                 snap.acked_input,
                                                 snap.server_tick,
+                                                Some(&p.bodies_motion),
                                             );
                                             // Logged unconditionally, not only
                                             // when `outcome.comparison` is
@@ -1097,6 +1318,13 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                             // possible — is exactly the case
                                             // that must never read as "zero
                                             // corrections".
+                                            let now = std::time::Instant::now();
+                                            p.observe_reconcile(
+                                                outcome.records_replayed,
+                                                snap.acked_input,
+                                                now,
+                                            );
+                                            p.trace_reconcile(&outcome, st, snap.acked_input, now);
                                             if let Some(session) = &interactive
                                                 && let Some(log) = &session.corrections
                                             {
@@ -1168,6 +1396,100 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     // three recent copies for loss recovery. It also rebuilds the predicted
     // terrain collider (and rebases prediction) when the replica terrain hash
     // changes — a committed edit near the player.
+    //
+    // Testing-only client authority: rigid-body physics runs on its own
+    // fixed-rate thread instead of inside the mover loop below. That loop's
+    // per-iteration cost (terrain/body clones, a coarse sleep) is neither
+    // constant nor small, so stepping there made bodies advance in bursts and
+    // fall behind wall-clock time. The thread publishes two consecutive states
+    // per step so the renderer can interpolate at display rate.
+    if config.client_authoritative
+        && let (Some(pred), Some(session)) = (predictor.clone(), config.interactive.clone())
+    {
+        let stop_rx = stop_rx.clone();
+        let _ = std::thread::Builder::new()
+            .name("spall-client-physics".into())
+            .spawn(move || {
+                use crate::interactive::LocalBodyPoses;
+                // Fail loudly: a panic here would otherwise leave the window
+                // running with every locally simulated body silently frozen.
+                struct ExitOnPanic;
+                impl Drop for ExitOnPanic {
+                    fn drop(&mut self) {
+                        if std::thread::panicking() {
+                            eprintln!("spall-client-physics panicked; exiting");
+                            std::process::exit(101);
+                        }
+                    }
+                }
+                let _exit_on_panic = ExitOnPanic;
+                let step = Duration::from_secs_f32(MOVEMENT_DT_S);
+                let mut next = std::time::Instant::now();
+                let mut prev = std::collections::BTreeMap::new();
+                loop {
+                    if *stop_rx.borrow() || session.stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let now = std::time::Instant::now();
+                    if now < next {
+                        std::thread::sleep((next - now).min(Duration::from_millis(1)));
+                        continue;
+                    }
+                    // Fixed-step catch-up; a long stall drops the backlog
+                    // rather than spiralling.
+                    if now.duration_since(next) > step * 8 {
+                        next = now;
+                    }
+                    next += step;
+                    let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
+                    if !guard.phys.has_terrain() {
+                        continue;
+                    }
+                    // Tick the player (and its push impulses) exactly once per
+                    // body step. Ticking from the async mover loop instead
+                    // gave a step 0 or 2 pushes depending on where its
+                    // sleep landed, which shows as ball speed snapping.
+                    let p: &mut Predictor = &mut guard;
+                    let mut player_state = None;
+                    if let (Some(pl), Some(volume)) = (&mut p.player, &p.local_terrain)
+                        && p.phys.covers(pl.predicted().position_m)
+                    {
+                        let input = session.input.snapshot();
+                        pl.tick(
+                            &mut p.phys,
+                            volume,
+                            input,
+                            InputSeq(p.input_seq),
+                            MOVEMENT_DT_S,
+                        );
+                        player_state = Some(pl.predicted());
+                    }
+                    p.phys.step_client_authority();
+                    let curr = p.phys.local_body_states();
+                    drop(guard);
+                    if let Some(predicted) = player_state
+                        && let Some(view) = session
+                            .view
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_mut()
+                    {
+                        view.predicted = predicted;
+                        view.published_at = std::time::Instant::now();
+                    }
+                    *session
+                        .local_body_poses
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(LocalBodyPoses {
+                        prev: std::mem::replace(&mut prev, curr.clone()),
+                        curr,
+                        curr_at: std::time::Instant::now(),
+                        step,
+                    });
+                }
+            });
+    }
+
     let mover = predictor.clone().map(|pred| {
         let conn = conn.clone();
         let replica = replica.clone();
@@ -1177,13 +1499,18 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let stop_rx = stop_rx.clone();
         let client_residency = config.client_residency;
         let interactive = config.interactive.clone();
+        let client_authoritative = config.client_authoritative;
         tokio::spawn(async move {
             let end_tick = script_end_tick(&script);
             // Slice E2: a scripted mover optionally evicts terrain outside a
             // brick box around its predicted player and pulls it back with
             // `RepairRequest`s as the player returns.
             let mut residency = client_residency.map(|l| {
-                ClientResidencyPass::new(l.budget_bricks, l.interest_radius_bricks, l.max_dense_bytes)
+                ClientResidencyPass::new(
+                    l.budget_bricks,
+                    l.interest_radius_bricks,
+                    l.max_dense_bytes,
+                )
             });
             // A residency gap deliberately holds prediction over unknown
             // ground.  Script legs describe controlled movement, so advancing
@@ -1203,16 +1530,23 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             // correction log (844 of 844 reconciles unmatched,
             // `records_replayed` pinned at 0 the entire session). See
             // `crate::tick_accumulator` for the fix.
-            let mut tick_accumulator =
-                TickAccumulator::new(Duration::from_secs_f32(MOVEMENT_DT_S));
+            let mut tick_accumulator = TickAccumulator::new(Duration::from_secs_f32(MOVEMENT_DT_S));
             let mut last_tick_accumulator_at = std::time::Instant::now();
+            // Geometry changes rarely; motion snapshots do not. Remember the
+            // last topology version so ordinary 60 Hz pose refreshes do not
+            // clone every replicated voxel volume under the replica lock.
+            let mut body_collision_versions = HashMap::<u64, u64>::new();
+            let trace_bodies = !script.is_empty();
             loop {
                 if *stop_rx.borrow() {
                     return;
                 }
                 let now = std::time::Instant::now();
-                let ticks_to_run =
-                    tick_accumulator.advance(now.duration_since(last_tick_accumulator_at));
+                // The timeline rate comes from the lead controller (1.0 until
+                // a reconcile has reported a lead); read under a brief lock.
+                let timeline_rate = pred.lock().unwrap_or_else(|e| e.into_inner()).lead.rate();
+                let ticks_to_run = tick_accumulator
+                    .advance_scaled(now.duration_since(last_tick_accumulator_at), timeline_rate);
                 last_tick_accumulator_at = now;
                 let tick = counters.last_tick.load(Ordering::Relaxed);
 
@@ -1222,11 +1556,55 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 // borrowable both for the dirty-check block below *and* for
                 // every `pl.tick` call afterward, which now also needs a
                 // fresh `&Volume` each tick for its own window cache.
-                let (terrain_hash, terrain_volume) = {
-                    let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                let (terrain_hash, terrain_volume, body_collisions, traced_samplers) = {
+                    let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                    // Scripted runs only: what the renderer would draw, for the
+                    // trace (see `BodyTick`).
+                    let traced_samplers: Option<(f64, Vec<(u64, crate::replica::BodySampler)>)> =
+                        trace_bodies.then(|| {
+                            let render_tick = guard.render_tick(now);
+                            let samplers = guard
+                                .body_volumes()
+                                .filter_map(|(entity, _)| {
+                                    Some((entity.get(), guard.body_sampler(entity)?))
+                                })
+                                .collect();
+                            (render_tick, samplers)
+                        });
+                    let mut bodies = Vec::new();
+                    let mut live = std::collections::HashSet::new();
+                    for (entity, volume_id) in guard.body_volumes() {
+                        let Some(volume) = guard.volume(volume_id) else {
+                            continue;
+                        };
+                        let Some(latest) = guard.latest_motion(entity) else {
+                            continue;
+                        };
+                        let raw_entity = entity.get();
+                        let topology_version = volume.next_revision().get();
+                        live.insert(raw_entity);
+                        let changed = body_collision_versions.get(&raw_entity).copied()
+                            != Some(topology_version);
+                        bodies.push(ClientBodyCollision {
+                            entity,
+                            topology_version,
+                            volume: changed.then(|| volume.clone()),
+                            pose: latest.pose,
+                            motion: BodyMotion {
+                                snapshot_tick: latest.server_tick,
+                                linear_velocity_m_s: latest.linear_velocity_m_s,
+                                angular_velocity_rad_s: latest.angular_velocity_rad_s,
+                                sleeping: latest.sleeping,
+                            },
+                        });
+                        body_collision_versions.insert(raw_entity, topology_version);
+                    }
+                    body_collision_versions.retain(|entity, _| live.contains(entity));
                     (
                         guard.terrain_resident_hash(),
                         guard.terrain_volume().cloned(),
+                        bodies,
+                        traced_samplers,
                     )
                 };
                 // All predictor-lock work happens in this non-async block, which
@@ -1243,13 +1621,64 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 let (frame, feet, script_tick, predicted_state, correction_stats, window_stats): MoverTickOutcome = {
                     let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
                     let p: &mut Predictor = &mut guard;
+                    // Bodies are advanced to the tick each predicted step
+                    // simulates (below and in `reconcile_with_bodies`); this
+                    // first sync installs new bodies / topology changes and
+                    // parks everything at the next predicted tick.
+                    let next_tick = p.player.as_ref().map(|pl| pl.next_tick().0 as f64);
+                    p.phys.sync_bodies_at(&body_collisions, next_tick);
+                    if let Some(trace) = &mut p.trace {
+                        let wall_ms = p.trace_started.elapsed().as_millis() as u64;
+                        for new in &body_collisions {
+                            let Some(old) = p.bodies_motion.iter().find(|b| b.entity == new.entity)
+                            else {
+                                continue;
+                            };
+                            if old.motion.snapshot_tick == new.motion.snapshot_tick
+                                || trace.body_jumps.len() >= MAX_TRACE_ROWS
+                            {
+                                continue;
+                            }
+                            let expected = old.pose_at(new.motion.snapshot_tick as f64);
+                            let error = expected
+                                .translation_m
+                                .iter()
+                                .zip(new.pose.translation_m)
+                                .map(|(a, b)| (a - b) * (a - b))
+                                .sum::<f64>()
+                                .sqrt();
+                            let v = new.motion.linear_velocity_m_s;
+                            trace.body_jumps.push(BodyJumpRow {
+                                wall_ms,
+                                entity: new.entity.get(),
+                                snapshot_tick: new.motion.snapshot_tick,
+                                extrapolation_error_m: error,
+                                speed_m_s: (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt(),
+                            });
+                        }
+                    }
+                    // Reconciles (on the motion task) replay against the same
+                    // set; keep it without the geometry, which `phys` now holds.
+                    p.bodies_motion = body_collisions
+                        .iter()
+                        .map(|b| ClientBodyCollision {
+                            volume: None,
+                            ..b.clone()
+                        })
+                        .collect();
                     if let (Some(hash), Some(volume)) = (terrain_hash, &terrain_volume)
                         && p.terrain_hash != Some(hash)
                     {
                         p.phys.set_terrain(volume);
                         let first = p.terrain_hash.is_none();
                         p.terrain_hash = Some(hash);
-                        if !first && let Some(pl) = &mut p.player {
+                        if client_authoritative {
+                            p.local_terrain = Some(volume.clone());
+                        }
+                        if !client_authoritative
+                            && !first
+                            && let Some(pl) = &mut p.player
+                        {
                             pl.invalidate();
                         }
                     }
@@ -1283,7 +1712,16 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         };
                         p.input_seq += 1;
                         let seq = InputSeq(p.input_seq);
-                        if let Some(pl) = &mut p.player
+                        p.note_input_sent(seq.0, now);
+                        let predicted_pos = p
+                            .player
+                            .as_ref()
+                            .map_or([0.0; 3], |pl| pl.predicted().position_m);
+                        p.trace_input(seq.0, input.movement, tick, predicted_pos);
+                        // Client authority: the physics thread ticks the
+                        // player in lockstep with body stepping instead.
+                        if !client_authoritative
+                            && let Some(pl) = &mut p.player
                             && let Some(volume) = &terrain_volume
                         {
                             // Catch local prediction up to however many real
@@ -1294,7 +1732,54 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             // every tick in the burst, exactly like ordinary
                             // held-input reuse already does.
                             for _ in 0..ticks_to_run {
+                                p.phys.sync_bodies_at(
+                                    &p.bodies_motion,
+                                    Some(pl.next_tick().0 as f64),
+                                );
                                 pl.tick(&mut p.phys, volume, input, seq, MOVEMENT_DT_S);
+                                if p.trace.is_some() {
+                                    let simulated = pl.next_tick().0 - 1;
+                                    let st = pl.predicted();
+                                    let bodies = p
+                                        .bodies_motion
+                                        .iter()
+                                        .map(|b| {
+                                            let collision = b.pose_at(simulated as f64);
+                                            let displayed = traced_samplers
+                                                .as_ref()
+                                                .and_then(|(tick, samplers)| {
+                                                    let (_, s) = samplers
+                                                        .iter()
+                                                        .find(|(e, _)| *e == b.entity.get())?;
+                                                    s.presented(*tick, Some(st.position_m))
+                                                })
+                                                .unwrap_or(collision);
+                                            BodyTick {
+                                                entity: b.entity.get(),
+                                                collision_pos_m: collision.translation_m,
+                                                displayed_pos_m: displayed.translation_m,
+                                                snapshot_tick: b.motion.snapshot_tick,
+                                                snapshot_pos_m: b.pose.translation_m,
+                                                snapshot_vel_m_s: b.motion.linear_velocity_m_s,
+                                            }
+                                        })
+                                        .collect();
+                                    let wall_ms = p.trace_started.elapsed().as_millis() as u64;
+                                    let movement = p.current_movement;
+                                    if let Some(trace) = &mut p.trace
+                                        && trace.ticks.len() < MAX_TRACE_ROWS * 4
+                                    {
+                                        trace.ticks.push(TickTraceRow {
+                                            wall_ms,
+                                            tick: simulated,
+                                            predicted_pos_m: st.position_m,
+                                            predicted_vel_m_s: st.velocity_m_s,
+                                            grounded: st.grounded,
+                                            movement,
+                                            bodies,
+                                        });
+                                    }
+                                }
                             }
                         }
                         // Preserve the script's server-tick cadence.  The
@@ -1361,11 +1846,19 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 }
                 if let (Some(session), Some(predicted)) = (&interactive, predicted_state) {
                     let stats = correction_stats.unwrap_or_default();
-                    *session.view.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(InteractiveView {
+                    let mut slot = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                    // Client authority: the physics thread owns the pose and
+                    // its timestamp (one sample per fixed step); overwriting
+                    // them here would inject irregular samples into the
+                    // camera's interpolation.
+                    let (predicted, published_at) = match *slot {
+                        Some(old) if client_authoritative => (old.predicted, old.published_at),
+                        _ => (predicted, std::time::Instant::now()),
+                    };
+                    *slot = Some(InteractiveView {
                             predicted,
                             server_tick: tick,
-                            published_at: std::time::Instant::now(),
+                            published_at,
                             corrections: stats.corrections,
                             max_correction_m: stats.max_correction_m,
                             idle_corrections: stats.idle_corrections,
@@ -1377,7 +1870,6 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             window_stats,
                         });
                 }
-
                 // Slice E2: evict / request-reload terrain around the player.
                 if let (Some(pass), Some(feet)) = (residency.as_mut(), feet) {
                     let reqs = {
@@ -1561,6 +2053,10 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         })
     });
 
+    let movement_trace = predictor
+        .as_ref()
+        .and_then(|pred| pred.lock().unwrap_or_else(|e| e.into_inner()).trace.take());
+
     let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
     let last_tick = counters.last_tick.load(Ordering::Relaxed);
     let applied = counters.applied.load(Ordering::Relaxed);
@@ -1627,6 +2123,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         max_body_displacement_m,
         body_cut_committed,
         movement,
+        movement_trace,
         client_residency_evictions: counters.residency_evictions.load(Ordering::Relaxed),
         client_residency_reloads_requested: counters
             .residency_reloads_requested

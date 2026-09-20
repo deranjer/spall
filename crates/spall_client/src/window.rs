@@ -36,6 +36,7 @@ use crate::ClientError;
 use crate::interactive::{InteractiveSession, InteractiveView, LiveInput};
 use crate::net::{ClientNetConfig, run_replication_client};
 use crate::predict::CELL_M;
+use crate::replica::ReplicaWorld;
 
 /// Debug-view visible radius (metres) around the player's feet. This
 /// renderer walks the raw volume every rebuild (no meshing/culling beyond a
@@ -155,15 +156,39 @@ struct InteractiveApp {
     pitch: f32,
     cursor_locked: bool,
     rebuild: RebuildWorker,
+    body_worker: BodyWorker,
     /// Centre the *last completed* background rebuild was built around — not
     /// the centre of the most recent request, which may still be in flight.
     last_built_pos: Option<[f64; 3]>,
     last_dispatch_at: Option<Instant>,
-    /// The camera's own displayed feet position — deliberately a separate,
-    /// smoothed value rather than reading `InteractiveView::predicted`
-    /// directly every frame. See [`smoothed_eye`].
-    display_feet: Option<([f64; 3], Instant)>,
+    /// One-sample-delayed camera interpolation and correction smoothing.
+    /// Keeping the two newest mover publications prevents forward
+    /// extrapolation from overshooting the actual stop point.
+    camera_follow: CameraFollow,
     hud: Hud,
+    /// The last completed background terrain rebuild's instances, kept so
+    /// every frame can re-combine them with this frame's *fresh* body
+    /// instances (see [`build_body_instances`]) — bodies move continuously
+    /// and are cheap to rebuild, so they must not wait on the throttled,
+    /// much more expensive terrain rebuild to appear or move.
+    last_terrain_instances: Vec<Instance>,
+    /// [`BodyWorker`]'s most recently completed result — see that struct's
+    /// doc for why this moved off the render thread entirely (first a
+    /// blocking lock, then even a `try_lock`-gated build, both measurably
+    /// stalled frames under a real ~200-body debris load).
+    last_body_draws: Vec<BodyDraw>,
+    pose_stats: PoseStats,
+    /// `F1`: hide terrain instances entirely, leaving only bodies — useful
+    /// for finding debris hidden inside/behind geometry. `F2`: hide body
+    /// instances (isolate terrain). Both default on.
+    show_terrain: bool,
+    show_bodies: bool,
+    /// `F3`: draw the player's own predicted capsule bounds (see
+    /// [`build_capsule_debug_instances`]) — the closest thing to a collision
+    /// outline this renderer's cube-only instancing can produce. Off by
+    /// default (adds a small number of bright markers around the player,
+    /// which can otherwise obscure the view up close).
+    show_capsule: bool,
     result: Result<(), ClientError>,
 }
 
@@ -249,6 +274,84 @@ impl RebuildWorker {
             result_rx,
             in_flight: false,
         })
+    }
+}
+
+/// Runs [`build_body_instances`] on its own dedicated background thread, at
+/// roughly 60 Hz, unconditionally (no request/distance gating — unlike
+/// [`RebuildWorker`], bodies need to look freshly-moved every frame, not
+/// only after the *player* has moved far). Exists because a first version of
+/// body rendering called `build_body_instances` directly in
+/// `RedrawRequested`, gated only by a non-blocking `try_lock` on the shared
+/// `Mutex<ReplicaWorld>` so it could never *stall waiting for* the lock --
+/// but the walk itself (per body: extract its resident bricks, sample every
+/// near cell, and for each solid one sample all six neighbours again for the
+/// buried-cell check) is real per-frame CPU work, and with a full
+/// [`crate::playground`] debris population (~200 bodies) it was measurably
+/// too much to redo on the render thread every frame: average frame time
+/// climbed past 100 ms while the renderer's own internal timing stayed
+/// under 20 ms the whole time -- the cost was real, just outside what that
+/// measurement covers. Same fix as terrain's own `RebuildWorker` for the
+/// identical shape of problem: move the walk off the thread that has to hit
+/// 60 fps, and let the render thread just draw whatever the worker most
+/// recently finished.
+struct BodyWorker {
+    result_rx: mpsc::Receiver<Vec<BodyDraw>>,
+}
+
+impl BodyWorker {
+    fn spawn(session: Arc<InteractiveSession>) -> Result<Self, ClientError> {
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("spall-client-bodies".into())
+            .spawn(move || {
+                let mut templates = BodyTemplates::new();
+                loop {
+                    // Two phases, deliberately: hold the lock only long
+                    // enough to read each body's pose (and clone its small
+                    // volume *only* when its topology changed since the last
+                    // pass — `snapshot_bodies`), then release it *before*
+                    // doing any per-cell work (`collect_body_draws`) — see
+                    // `snapshot_bodies`'s doc for why the walk itself must
+                    // never run while this lock is held.
+                    let now = Instant::now();
+                    let local_poses = session
+                        .local_body_poses
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let views = match session.replica.get() {
+                        Some(replica) => {
+                            let focus_m = session
+                                .view
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .map(|v| v.predicted.position_m);
+                            let mut replica = replica.lock().unwrap_or_else(|e| e.into_inner());
+                            let render_tick = replica.render_tick(now);
+                            snapshot_bodies(
+                                &replica,
+                                render_tick,
+                                focus_m,
+                                local_poses.as_ref(),
+                                now,
+                                &templates,
+                            )
+                        }
+                        None => Vec::new(),
+                    };
+                    let draws = collect_body_draws(&views, &mut templates);
+                    if result_tx.send(draws).is_err() {
+                        return; // the window is gone
+                    }
+                    // Not a hard 60 Hz guarantee (the build above takes real
+                    // time too), just a floor so this never busy-spins faster
+                    // than the render thread could possibly use it.
+                    std::thread::sleep(Duration::from_millis(4));
+                }
+            })
+            .map_err(|e| ClientError::Gpu(format!("spawning the body-instance thread: {e}")))?;
+        Ok(Self { result_rx })
     }
 }
 
@@ -408,6 +511,7 @@ impl Hud {
 impl InteractiveApp {
     fn new(session: Arc<InteractiveSession>) -> Result<Self, ClientError> {
         let rebuild = RebuildWorker::spawn(session.clone())?;
+        let body_worker = BodyWorker::spawn(session.clone())?;
         Ok(Self {
             session,
             window: None,
@@ -418,10 +522,17 @@ impl InteractiveApp {
             pitch: 0.0,
             cursor_locked: false,
             rebuild,
+            body_worker,
             last_built_pos: None,
             last_dispatch_at: None,
-            display_feet: None,
+            camera_follow: CameraFollow::default(),
             hud: Hud::default(),
+            last_terrain_instances: Vec::new(),
+            last_body_draws: Vec::new(),
+            pose_stats: PoseStats::default(),
+            show_terrain: true,
+            show_bodies: true,
+            show_capsule: false,
             result: Ok(()),
         })
     }
@@ -531,6 +642,30 @@ impl ApplicationHandler for InteractiveApp {
                     KeyCode::Escape if held && !event.repeat => {
                         self.set_cursor_locked(false);
                     }
+                    KeyCode::F1 if held && !event.repeat => {
+                        self.show_terrain = !self.show_terrain;
+                        println!(
+                            "spall-interactive: terrain instances {}",
+                            if self.show_terrain { "ON" } else { "OFF" }
+                        );
+                        return;
+                    }
+                    KeyCode::F2 if held && !event.repeat => {
+                        self.show_bodies = !self.show_bodies;
+                        println!(
+                            "spall-interactive: body instances {}",
+                            if self.show_bodies { "ON" } else { "OFF" }
+                        );
+                        return;
+                    }
+                    KeyCode::F3 if held && !event.repeat => {
+                        self.show_capsule = !self.show_capsule;
+                        println!(
+                            "spall-interactive: capsule debug markers {}",
+                            if self.show_capsule { "ON" } else { "OFF" }
+                        );
+                        return;
+                    }
                     _ => return,
                 }
                 self.publish_movement();
@@ -542,12 +677,11 @@ impl ApplicationHandler for InteractiveApp {
                 // Drain the background worker's result, if a fresh one has
                 // landed since the last frame (never blocks — `try_recv`).
                 // Only the newest matters if somehow more than one queued up.
-                let mut new_instances = None;
                 while let Ok(outcome) = self.rebuild.result_rx.try_recv() {
                     self.hud
                         .record_rebuild(outcome.elapsed, outcome.instances.len());
                     self.last_built_pos = Some(outcome.center_m);
-                    new_instances = Some(outcome.instances);
+                    self.last_terrain_instances = outcome.instances;
                     self.rebuild.in_flight = false;
                 }
 
@@ -574,10 +708,38 @@ impl ApplicationHandler for InteractiveApp {
                     }
                 }
 
+                // Bodies rebuild fresh every frame (cheap — never more than
+                // each live body's own resident bricks) and get combined
+                // with the last completed (throttled, background) terrain
+                // rebuild, so the combined buffer is re-uploaded every frame
+                // regardless of whether terrain itself changed. Bodies move
+                // continuously; waiting on the terrain rebuild cadence to
+                // show that would make them look like they teleport between
+                // rebuilds instead of falling.
+                let mut combined = if self.show_terrain {
+                    self.last_terrain_instances.clone()
+                } else {
+                    Vec::new()
+                };
+                // Drain the body worker the same way as the terrain one
+                // above: never blocks, only the newest result matters.
+                while let Ok(draws) = self.body_worker.result_rx.try_recv() {
+                    self.last_body_draws = draws;
+                }
+                if self.show_capsule
+                    && let Some(v) = view
+                {
+                    const CAPSULE_DEBUG_COLOR: [f32; 3] = [0.1, 1.0, 1.0]; // bright cyan
+                    combined.extend(build_capsule_debug_instances(
+                        v.predicted.position_m,
+                        CAPSULE_DEBUG_COLOR,
+                    ));
+                }
+
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
-                let outcome = match renderer.begin_frame(new_instances.as_ref()) {
+                let outcome = match renderer.begin_frame(Some(&combined)) {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         self.fail(event_loop, error);
@@ -602,13 +764,35 @@ impl ApplicationHandler for InteractiveApp {
                             *self.session.view.lock().unwrap_or_else(|e| e.into_inner());
                         let look_dir = Vec3::from_array(view_dir_from(self.yaw, self.pitch));
                         let render_now = Instant::now();
+                        // Client-authoritative bodies are posed here, at the
+                        // exact instant the camera is sampled, rather than by
+                        // the background worker at some earlier moment: the
+                        // worker's result is reused for several frames, so a
+                        // body would hold still and then jump while the
+                        // camera glided.
+                        let local_poses = self
+                            .session
+                            .local_body_poses
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        let mut body_instances = Vec::new();
+                        if self.show_bodies {
+                            pose_body_instances(
+                                &self.last_body_draws,
+                                local_poses.as_ref(),
+                                render_now,
+                                &mut self.pose_stats,
+                                &mut body_instances,
+                            );
+                        }
                         let cam = fresh_view.map(|v| {
                             (
-                                compute_smoothed_eye(&mut self.display_feet, v, render_now),
+                                self.camera_follow.eye(v, render_now, local_poses.is_none()),
                                 look_dir,
                             )
                         });
-                        match renderer.finish_frame(acquired, cam.as_ref()) {
+                        match renderer.finish_frame(acquired, cam.as_ref(), &body_instances) {
                             Ok(timing) => timing,
                             Err(error) => {
                                 self.fail(event_loop, error);
@@ -655,6 +839,7 @@ impl ApplicationHandler for InteractiveApp {
                         max_unmatched_displacement_m,
                         window_stats,
                     );
+                    let line = format!("{line} | {}", self.pose_stats.take_report());
                     if let Some(window) = &self.window {
                         window.set_title(&format!("Spall sandbox — interactive | {line}"));
                     }
@@ -700,24 +885,8 @@ impl ApplicationHandler for InteractiveApp {
     }
 }
 
-/// The eye position for the current predicted pose: feet, raised to (90% of)
-/// standing eye height. Cheap — no lock, no volume access — so it stays
-/// directly on the render/input thread; only the terrain draw list
-/// ([`RebuildWorker`]) is expensive enough to need moving off of it.
-/// A render frame lands on its own (vsync-paced) clock, independent of the
-/// mover's own ~60 Hz tick clock — see [`InteractiveView::published_at`] — so
-/// extrapolate the feet forward by the time elapsed since that tick was
-/// published, using the velocity it reported, rather than redrawing the
-/// exact same discrete pose on every frame between ticks (the jitter that
-/// produces is a beat pattern between the two unsynchronized clocks, not
-/// anything wrong with the underlying motion). Clamped short in case the
-/// mover has stalled (a lost connection, a debugger break) — extrapolating
-/// indefinitely would fling the camera off in whatever direction it was last
-/// moving.
-const MAX_EXTRAPOLATION_S: f32 = 0.1;
-
-/// How quickly the *displayed* camera position catches up to the raw
-/// (extrapolated) predicted one — see [`compute_smoothed_eye`].
+/// How quickly the displayed camera position catches up to the interpolated
+/// prediction — see [`CameraFollow::eye`].
 /// Short enough to add well under a frame's worth of lag to genuinely
 /// continuous movement (WASD keeps moving the target every frame, so
 /// smoothing barely touches it), long enough to turn a `PredictedPlayer`
@@ -728,22 +897,76 @@ const MAX_EXTRAPOLATION_S: f32 = 0.1;
 /// instead of a snap.
 const CORRECTION_SMOOTHING_TAU_S: f32 = 0.05;
 
-/// The raw predicted feet position, extrapolated forward by the time elapsed
-/// since the mover published it — not yet smoothed for a correction (see
-/// [`compute_smoothed_eye`], which is what callers actually want).
-fn extrapolated_feet(view: InteractiveView) -> [f64; 3] {
-    let dt = view
-        .published_at
-        .elapsed()
-        .as_secs_f32()
-        .min(MAX_EXTRAPOLATION_S);
-    let feet = view.predicted.position_m;
-    let v = view.predicted.velocity_m_s;
-    [
-        feet[0] + f64::from(v[0] * dt),
-        feet[1] + f64::from(v[1] * dt),
-        feet[2] + f64::from(v[2] * dt),
-    ]
+/// Render-follow state for the two independently paced mover/render clocks.
+///
+/// The old camera extrapolated the newest pose by `velocity * elapsed`. That
+/// hid the clocks' beat pattern while movement continued, but necessarily put
+/// the camera ahead of the simulation. On the first zero-velocity publication
+/// after releasing WASD, its target jumped back to the actual stop position —
+/// the small backward jerk observed in UAT. Interpolating from the previous
+/// publication to the newest one is one sample later, but never invents travel
+/// beyond a position the predictor actually reached.
+#[derive(Default)]
+struct CameraFollow {
+    previous: Option<InteractiveView>,
+    current: Option<InteractiveView>,
+    displayed: Option<([f64; 3], Instant)>,
+}
+
+impl CameraFollow {
+    fn target(&mut self, view: InteractiveView, now: Instant) -> [f64; 3] {
+        if self
+            .current
+            .is_none_or(|current| current.published_at != view.published_at)
+        {
+            self.previous = self.current;
+            self.current = Some(view);
+        }
+
+        let current = self.current.expect("just installed above");
+        let Some(previous) = self.previous else {
+            return current.predicted.position_m;
+        };
+        let sample_span = current
+            .published_at
+            .saturating_duration_since(previous.published_at)
+            .as_secs_f64();
+        if sample_span <= f64::EPSILON {
+            return current.predicted.position_m;
+        }
+        let elapsed = now
+            .saturating_duration_since(current.published_at)
+            .as_secs_f64();
+        let t = (elapsed / sample_span).clamp(0.0, 1.0);
+        std::array::from_fn(|axis| {
+            previous.predicted.position_m[axis]
+                + (current.predicted.position_m[axis] - previous.predicted.position_m[axis]) * t
+        })
+    }
+
+    /// `smooth` applies [`CORRECTION_SMOOTHING_TAU_S`]; it is off for
+    /// client-authoritative sessions, which have no corrections to hide and
+    /// would otherwise show the camera lagging the bodies it pushes.
+    fn eye(&mut self, view: InteractiveView, now: Instant, smooth: bool) -> Vec3 {
+        let target = self.target(view, now);
+        let feet = match self.displayed {
+            Some((prev, prev_at)) if smooth => {
+                let dt = now.saturating_duration_since(prev_at).as_secs_f32();
+                let factor = 1.0 - (-dt / CORRECTION_SMOOTHING_TAU_S).exp();
+                std::array::from_fn(|axis| {
+                    prev[axis] + (target[axis] - prev[axis]) * f64::from(factor)
+                })
+            }
+            _ => target,
+        };
+        self.displayed = Some((feet, now));
+        let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
+        Vec3::new(
+            feet[0] as f32,
+            (feet[1] + eye_height_m) as f32,
+            feet[2] as f32,
+        )
+    }
 }
 
 /// Local wish-independent world-space look direction from yaw/pitch — a free
@@ -755,45 +978,6 @@ fn view_dir_from(yaw: f32, pitch: f32) -> [f32; 3] {
     let (sin_y, cos_y) = yaw.sin_cos();
     let (sin_p, cos_p) = pitch.sin_cos();
     [sin_y * cos_p, sin_p, -cos_y * cos_p]
-}
-
-/// The eye position to render this frame: [`extrapolated_feet`], smoothed
-/// ([`CORRECTION_SMOOTHING_TAU_S`]) against `*display_feet` — the camera's
-/// own previous displayed position — rather than the target position used
-/// outright. See that constant's doc for why: this exists to turn a
-/// reconciliation correction into a glide instead of a snap, without adding
-/// meaningfully more lag to intentional movement.
-///
-/// A free function taking `display_feet` directly (not an `InteractiveApp`
-/// method) for the same borrow-checker reason as [`view_dir_from`]: the
-/// `RedrawRequested` handler calls this after `WorldRenderer::begin_frame`,
-/// while `self.renderer` is still mutably borrowed for the matching
-/// `finish_frame` call — see ENG-69 round 13's doc on `begin_frame`.
-fn compute_smoothed_eye(
-    display_feet: &mut Option<([f64; 3], Instant)>,
-    view: InteractiveView,
-    now: Instant,
-) -> Vec3 {
-    let target = extrapolated_feet(view);
-    let feet = match *display_feet {
-        Some((prev, prev_at)) => {
-            let dt = (now - prev_at).as_secs_f32().max(0.0);
-            let factor = 1.0 - (-dt / CORRECTION_SMOOTHING_TAU_S).exp();
-            [
-                prev[0] + (target[0] - prev[0]) * f64::from(factor),
-                prev[1] + (target[1] - prev[1]) * f64::from(factor),
-                prev[2] + (target[2] - prev[2]) * f64::from(factor),
-            ]
-        }
-        None => target,
-    };
-    *display_feet = Some((feet, now));
-    let eye_height_m = f64::from(CharacterParams::DEFAULT.total_height_m()) * 0.9;
-    Vec3::new(
-        feet[0] as f32,
-        (feet[1] + eye_height_m) as f32,
-        feet[2] as f32,
-    )
 }
 
 fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
@@ -825,10 +1009,382 @@ fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
                         ((cell.y as f64 + 0.5) * cell_m) as f32,
                         ((cell.z as f64 + 0.5) * cell_m) as f32,
                     ],
-                    color: material_color(material),
+                    color: jittered_color(material_color(material), cell),
+                    scale: [1.0; 3],
+                    rotation: IDENTITY_ROTATION,
                 });
             }
         }
+    }
+    instances
+}
+
+/// One body as [`BodyWorker`] sees it for a single pass: identity, the
+/// topology revision its cached template is keyed on, its volume (cloned only
+/// on a template miss), and where to draw it.
+struct BodyView {
+    entity: u64,
+    revision: u64,
+    volume: Option<Volume>,
+    translation_m: [f64; 3],
+    /// Unit quaternion `[x, y, z, w]`.
+    rotation: [f32; 4],
+    /// Network bodies only: what the renderer needs to re-pose at draw time.
+    net: Option<NetPose>,
+}
+
+/// A replicated body's motion history plus the render clock and focus it was
+/// sampled against, so the render thread can pose it at its own frame time.
+#[derive(Clone)]
+struct NetPose {
+    sampler: crate::replica::BodySampler,
+    /// Fractional server tick of the replica's render clock at `sampled_at`.
+    tick_at_sample: f64,
+    sampled_at: Instant,
+    focus_m: Option<[f64; 3]>,
+}
+
+impl NetPose {
+    fn render_tick(&self, now: Instant) -> f64 {
+        self.tick_at_sample
+            + now.saturating_duration_since(self.sampled_at).as_secs_f64() * self.sampler.hz()
+    }
+}
+
+/// Per-body cell instances in body-local space, keyed by topology revision.
+/// A body's cells only change when its topology does, so the per-cell volume
+/// walk (thousands of `sample` calls with ~200 debris bodies) happens once per
+/// topology, not once per frame; each frame only re-poses the cached cells.
+type BodyTemplates = std::collections::HashMap<u64, (u64, Arc<Vec<Instance>>)>;
+
+/// A body's cached cells plus the pose the worker last saw for it. The render
+/// thread re-poses `template` itself at draw time (see
+/// [`pose_body_instances`]); the worker's pose is only the fallback for bodies
+/// with no locally simulated pose.
+struct BodyDraw {
+    entity: u64,
+    template: Arc<Vec<Instance>>,
+    translation_m: [f64; 3],
+    rotation: [f32; 4],
+    net: Option<NetPose>,
+}
+
+/// Every live body's pose (and, only when its cached template is missing or
+/// stale, a clone of its volume), read from the locked replica —
+/// deliberately the *only* thing [`BodyWorker`] does while holding the lock,
+/// same reason [`RebuildWorker`] clones the terrain volume out instead of
+/// walking it locked (see that struct's doc). An earlier version had
+/// [`build_body_instances`] itself take `&ReplicaWorld` and do the whole
+/// per-cell walk while still holding the lock: moving that walk to its own
+/// thread stopped it from stalling the *render* thread, but the walk still
+/// held the lock for its entire duration every ~16 ms, which measurably
+/// stalled the *network/prediction* thread instead — same underlying mistake
+/// (expensive work performed while a shared lock most other threads also
+/// need is held), just relocated to a different pair of threads and a
+/// different symptom (predicted movement stuttering — "move, pause, move,
+/// pause" while holding a direction key — instead of dropped frames).
+///
+/// `local_poses` (testing-only client authority) is sampled at `now`, so
+/// locally simulated bodies interpolate between fixed physics steps.
+fn snapshot_bodies(
+    replica: &ReplicaWorld,
+    render_tick: f64,
+    focus_m: Option<[f64; 3]>,
+    local_poses: Option<&crate::interactive::LocalBodyPoses>,
+    now: Instant,
+    templates: &BodyTemplates,
+) -> Vec<BodyView> {
+    replica
+        .body_volumes()
+        .filter_map(|(entity, volume_id)| {
+            let volume = replica.volume(volume_id)?;
+            let raw = entity.get();
+            let mut net = None;
+            let (translation_m, rotation) =
+                match local_poses.and_then(|poses| poses.sample(raw, now)) {
+                    Some(pose) => (pose.translation_m, pose.rotation),
+                    None => {
+                        let sampler = replica.body_sampler(entity)?;
+                        let pose = sampler.presented(render_tick, focus_m)?;
+                        net = Some(NetPose {
+                            sampler,
+                            tick_at_sample: render_tick,
+                            sampled_at: now,
+                            focus_m,
+                        });
+                        (
+                            pose.translation_m,
+                            pose.rotation.to_unit().unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                        )
+                    }
+                };
+            let revision = volume.next_revision().get();
+            let cached = templates.get(&raw).is_some_and(|(rev, _)| *rev == revision);
+            Some(BodyView {
+                entity: raw,
+                revision,
+                volume: (!cached).then(|| volume.clone()),
+                translation_m,
+                rotation,
+                net,
+            })
+        })
+        .collect()
+}
+
+/// Body-local cube positions/colours for `volume` (no pose applied).
+fn build_body_template(volume: &Volume) -> Vec<Instance> {
+    let mut instances = Vec::new();
+    let bricks = volume.resident_brick_coords();
+    if bricks.is_empty() {
+        return instances;
+    }
+    let (mut min, mut max) = (bricks[0], bricks[0]);
+    for b in &bricks {
+        min.x = min.x.min(b.x);
+        min.y = min.y.min(b.y);
+        min.z = min.z.min(b.z);
+        max.x = max.x.max(b.x);
+        max.y = max.y.max(b.y);
+        max.z = max.z.max(b.z);
+    }
+    let edge = spall_core::BRICK_EDGE as i64;
+    let cell_min = GlobalCell::new(min.x * edge, min.y * edge, min.z * edge);
+    let cell_max = GlobalCell::new(
+        max.x * edge + edge - 1,
+        max.y * edge + edge - 1,
+        max.z * edge + edge - 1,
+    );
+    let cell_m = volume.cell_size().metres();
+    for gz in cell_min.z..=cell_max.z {
+        for gy in cell_min.y..=cell_max.y {
+            for gx in cell_min.x..=cell_max.x {
+                let cell = GlobalCell::new(gx, gy, gz);
+                let Ok(Sample::Filled(material)) = volume.sample(cell) else {
+                    continue;
+                };
+                // No `is_buried` check here (unlike terrain's own
+                // `build_instances`): these bodies are at most a few
+                // cells per axis, so buried interior cells are rare and
+                // small in number, while the check itself costs up to
+                // six more `volume.sample` calls per solid cell —
+                // proportionally far more expensive here than for
+                // terrain's much larger, mostly-interior volumes. A few
+                // wasted, fully-occluded cubes are cheaper than the
+                // lookups that would have culled them.
+                instances.push(Instance {
+                    offset: [
+                        ((cell.x as f64 + 0.5) * cell_m) as f32,
+                        ((cell.y as f64 + 0.5) * cell_m) as f32,
+                        ((cell.z as f64 + 0.5) * cell_m) as f32,
+                    ],
+                    color: jittered_color(material_color(material), cell),
+                    scale: [1.0; 3],
+                    rotation: IDENTITY_ROTATION,
+                });
+            }
+        }
+    }
+    instances
+}
+
+/// Every detached body's cached cells and last-seen pose, built from
+/// [`snapshot_bodies`]'s output entirely after the replica lock has been
+/// released (see that function's doc for why this split exists). Nothing in
+/// this renderer built body instances before this feature (`build_instances`
+/// only ever walks the *terrain* volume) — a hands-on playground session with
+/// a live debris spawner found this the hard way: bodies were replicating and
+/// reconciling correctly the whole time, just never once drawn.
+fn collect_body_draws(views: &[BodyView], templates: &mut BodyTemplates) -> Vec<BodyDraw> {
+    let live: std::collections::HashSet<u64> = views.iter().map(|v| v.entity).collect();
+    templates.retain(|entity, _| live.contains(entity));
+
+    let mut draws = Vec::with_capacity(views.len());
+    for view in views {
+        if let Some(volume) = &view.volume {
+            templates.insert(
+                view.entity,
+                (view.revision, Arc::new(build_body_template(volume))),
+            );
+        }
+        let Some((_, template)) = templates.get(&view.entity) else {
+            continue;
+        };
+        draws.push(BodyDraw {
+            entity: view.entity,
+            template: template.clone(),
+            translation_m: view.translation_m,
+            rotation: view.rotation,
+            net: view.net.clone(),
+        });
+    }
+    draws
+}
+
+/// Poses every body's cached cells for drawing at `now`: the locally
+/// simulated pose interpolated to `now` when there is one, else the pose the
+/// worker last saw. Each cube gets the body's full rotation (its centre is
+/// rotated and so is its mesh), not just its centre.
+fn pose_body_instances(
+    draws: &[BodyDraw],
+    local_poses: Option<&crate::interactive::LocalBodyPoses>,
+    now: Instant,
+    stats: &mut PoseStats,
+    out: &mut Vec<Instance>,
+) {
+    for draw in draws {
+        let (translation_m, rotation) = match local_poses.and_then(|p| p.sample(draw.entity, now)) {
+            Some(pose) => (pose.translation_m, pose.rotation),
+            None => match &draw.net {
+                Some(net) => {
+                    let tick = net.render_tick(now);
+                    match net.sampler.presented(tick, net.focus_m) {
+                        Some(pose) => {
+                            if net.sampler.is_moving() {
+                                let age_ms = net.sampler.latest_age_ticks(tick).unwrap_or(0.0)
+                                    / net.sampler.hz()
+                                    * 1000.0;
+                                stats.record(draw.entity, pose.translation_m, age_ms);
+                            }
+                            (
+                                pose.translation_m,
+                                pose.rotation.to_unit().unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                            )
+                        }
+                        None => (draw.translation_m, draw.rotation),
+                    }
+                }
+                None => (draw.translation_m, draw.rotation),
+            },
+        };
+        let [rx, ry, rz, rw] = rotation;
+        let quat = glam::Quat::from_xyzw(rx, ry, rz, rw);
+        let translation = Vec3::new(
+            translation_m[0] as f32,
+            translation_m[1] as f32,
+            translation_m[2] as f32,
+        );
+        out.extend(draw.template.iter().map(|cell| Instance {
+            offset: (quat * Vec3::from_array(cell.offset) + translation).to_array(),
+            rotation,
+            ..*cell
+        }));
+    }
+}
+
+/// Draw-time pose diagnostics for moving network bodies: how old the newest
+/// snapshot is at each draw, and how often a moving body is drawn at exactly
+/// the pose it had the previous frame (a visible hold).
+#[derive(Default)]
+struct PoseStats {
+    last: std::collections::HashMap<u64, [f64; 3]>,
+    draws: u64,
+    repeats: u64,
+    age_sum_ms: f64,
+    age_max_ms: f64,
+}
+
+impl PoseStats {
+    fn record(&mut self, entity: u64, translation_m: [f64; 3], age_ms: f64) {
+        self.draws += 1;
+        self.age_sum_ms += age_ms;
+        self.age_max_ms = self.age_max_ms.max(age_ms);
+        if self.last.insert(entity, translation_m) == Some(translation_m) {
+            self.repeats += 1;
+        }
+    }
+
+    /// Report text; resets the counters (not the per-entity history).
+    fn take_report(&mut self) -> String {
+        let text = if self.draws == 0 {
+            "net bodies: none moving".to_string()
+        } else {
+            format!(
+                "net bodies: {} moving draws, {} repeated poses, snapshot age {:.0} ms (avg) / {:.0} ms (max)",
+                self.draws,
+                self.repeats,
+                self.age_sum_ms / self.draws as f64,
+                self.age_max_ms
+            )
+        };
+        self.draws = 0;
+        self.repeats = 0;
+        self.age_sum_ms = 0.0;
+        self.age_max_ms = 0.0;
+        text
+    }
+}
+
+/// One thin axis-aligned cuboid from `a` to `b`. Capsule-box edges are all
+/// axis aligned, so this gives the cube-only debug renderer true continuous
+/// wire-like strokes without adding a separate line pipeline.
+fn debug_line(a: Vec3, b: Vec3, color: [f32; 3]) -> impl Iterator<Item = Instance> {
+    const THICKNESS_M: f32 = 0.0125;
+    let delta = (b - a).abs();
+    let mut dimensions = [THICKNESS_M; 3];
+    let axis = if delta.x >= delta.y && delta.x >= delta.z {
+        0
+    } else if delta.y >= delta.z {
+        1
+    } else {
+        2
+    };
+    dimensions[axis] = delta[axis] + THICKNESS_M;
+    let midpoint = (a + b) * 0.5;
+    std::iter::once(Instance {
+        offset: midpoint.to_array(),
+        color,
+        scale: std::array::from_fn(|component| dimensions[component] / CELL_M),
+        rotation: IDENTITY_ROTATION,
+    })
+}
+
+/// `F3`: a stand-in for real collision-shape wireframes. This renderer has
+/// no line/wireframe pipeline at all (see the module doc: a single unit-cube
+/// mesh instanced by position + colour, nothing else) -- building one is a
+/// real render-pipeline change, out of scope for a debug toggle. This reuses
+/// the existing instancing mechanism instead: very thin cuboids along all
+/// twelve edges of the player's actual collision bounds
+/// (`CharacterParams::DEFAULT`'s capsule, approximated here as its own
+/// bounding box -- `0.6 m x 0.6 m` footprint, `1.8 m` tall -- since the
+/// capsule's rounded ends are a much smaller visual difference than "is
+/// there an outline here at all"). It is not a raster-line primitive, but the
+/// 1.25 cm strokes read as a wireframe instead of voxel-sized bars and show
+/// exactly where the client believes its own collision volume is relative
+/// to the terrain and debris around it, which is the concrete, useful
+/// question "collision outlines" is usually really asking. A first version
+/// only drew the four vertical edges (no top/bottom rings connecting them),
+/// which read as four floating dashed lines rather than anything box-shaped
+/// -- the full 12-edge wireframe below is what actually looks like "a body
+/// cube."
+fn build_capsule_debug_instances(feet_m: [f64; 3], color: [f32; 3]) -> Vec<Instance> {
+    let params = CharacterParams::DEFAULT;
+    let r = f64::from(params.radius_m) as f32;
+    let height = f64::from(params.total_height_m()) as f32;
+    let feet = Vec3::new(feet_m[0] as f32, feet_m[1] as f32, feet_m[2] as f32);
+
+    // The box's 8 corners: bottom ring (y=0) then top ring (y=height), each
+    // in (+x+z, +x-z, -x-z, -x+z) order.
+    let corner = |dx: f32, dz: f32, dy: f32| feet + Vec3::new(dx * r, dy * height, dz * r);
+    let bottom = [
+        corner(1.0, 1.0, 0.0),
+        corner(1.0, -1.0, 0.0),
+        corner(-1.0, -1.0, 0.0),
+        corner(-1.0, 1.0, 0.0),
+    ];
+    let top = [
+        corner(1.0, 1.0, 1.0),
+        corner(1.0, -1.0, 1.0),
+        corner(-1.0, -1.0, 1.0),
+        corner(-1.0, 1.0, 1.0),
+    ];
+
+    let mut instances = Vec::new();
+    for i in 0..4 {
+        let j = (i + 1) % 4;
+        instances.extend(debug_line(bottom[i], bottom[j], color)); // bottom ring
+        instances.extend(debug_line(top[i], top[j], color)); // top ring
+        instances.extend(debug_line(bottom[i], top[i], color)); // vertical edge
     }
     instances
 }
@@ -856,17 +1412,56 @@ fn is_buried(volume: &Volume, cell: GlobalCell) -> bool {
 /// A small deterministic palette. This debug renderer intentionally does not
 /// read the scene's real `MaterialManifest` albedo — it exists to prove live
 /// input -> network -> predicted movement works end to end, not to preview
-/// real material art.
+/// real material art. The playground's own materials (ids `10`-`20`,
+/// `spall_sim::fixtures::playground_manifest`) are the one exception: they
+/// were chosen specifically to make that scene visually varied for a
+/// hands-on session through *this* renderer, so they get an explicit,
+/// matching entry here instead of landing on an arbitrary colour via the
+/// generic palette's modulo.
+/// Peak brightness variation applied per voxel by [`jittered_color`].
+const COLOR_JITTER: f32 = 0.08;
+
+/// `base` scaled by a stable pseudo-random brightness in
+/// `1 +/- COLOR_JITTER`, hashed from the cell's coordinates so a voxel keeps
+/// the same shade every rebuild and frame. Lets individual voxels read as
+/// distinct without changing what material they are.
+fn jittered_color(base: [f32; 3], cell: GlobalCell) -> [f32; 3] {
+    let mut h = (cell.x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (cell.y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ (cell.z as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    h ^= h >> 32;
+    let unit = (h & 0xFFFF) as f32 / 65_535.0; // 0..=1
+    let factor = 1.0 + (unit * 2.0 - 1.0) * COLOR_JITTER;
+    base.map(|c| (c * factor).clamp(0.0, 1.0))
+}
+
 fn material_color(id: MaterialId) -> [f32; 3] {
-    const PALETTE: [[f32; 3]; 6] = [
-        [0.55, 0.55, 0.58],
-        [0.45, 0.32, 0.20],
-        [0.30, 0.55, 0.30],
-        [0.60, 0.55, 0.35],
-        [0.35, 0.35, 0.60],
-        [0.60, 0.35, 0.35],
-    ];
-    PALETTE[id.0 as usize % PALETTE.len()]
+    match id.0 {
+        10 => [0.25, 0.55, 0.2],  // grass
+        11 => [0.4, 0.28, 0.15],  // loam
+        12 => [0.65, 0.25, 0.18], // brick
+        13 => [0.82, 0.7, 0.45],  // sandstone
+        14 => [0.35, 0.38, 0.42], // slate
+        15 => [0.85, 0.15, 0.15], // debris red
+        16 => [0.9, 0.5, 0.1],    // debris orange
+        17 => [0.9, 0.85, 0.15],  // debris yellow
+        18 => [0.2, 0.75, 0.3],   // debris green
+        19 => [0.2, 0.4, 0.9],    // debris blue
+        20 => [0.6, 0.25, 0.8],   // debris purple
+        _ => {
+            const PALETTE: [[f32; 3]; 6] = [
+                [0.55, 0.55, 0.58],
+                [0.45, 0.32, 0.20],
+                [0.30, 0.55, 0.30],
+                [0.60, 0.55, 0.35],
+                [0.35, 0.35, 0.60],
+                [0.60, 0.35, 0.35],
+            ];
+            PALETTE[id.0 as usize % PALETTE.len()]
+        }
+    }
 }
 
 #[repr(C)]
@@ -881,7 +1476,14 @@ struct Vertex {
 struct Instance {
     offset: [f32; 3],
     color: [f32; 3],
+    /// Per-axis multiplier of the shared `CELL_M` cube mesh.
+    scale: [f32; 3],
+    /// Unit quaternion `[x, y, z, w]` applied to the cube mesh and its
+    /// normals about its own centre. Identity for terrain and debug strokes.
+    rotation: [f32; 4],
 }
+
+const IDENTITY_ROTATION: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -904,6 +1506,8 @@ struct VertexIn {
 struct InstanceIn {
     @location(2) offset: vec3<f32>,
     @location(3) color: vec3<f32>,
+    @location(4) scale: vec3<f32>,
+    @location(5) rotation: vec4<f32>,
 };
 struct VertexOut {
     @builtin(position) clip_position: vec4<f32>,
@@ -911,12 +1515,17 @@ struct VertexOut {
     @location(1) color: vec3<f32>,
 };
 
+fn quat_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+    let t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
 @vertex
 fn vs_main(v: VertexIn, inst: InstanceIn) -> VertexOut {
     var out: VertexOut;
-    let world_pos = v.position + inst.offset;
+    let world_pos = quat_rotate(inst.rotation, v.position * inst.scale) + inst.offset;
     out.clip_position = globals.view_proj * vec4<f32>(world_pos, 1.0);
-    out.normal = v.normal;
+    out.normal = quat_rotate(inst.rotation, v.normal);
     out.color = inst.color;
     return out;
 }
@@ -1010,6 +1619,9 @@ struct WorldRenderer {
     index_buffer: wgpu::Buffer,
     index_count: u32,
     instance_buffer: Option<(wgpu::Buffer, u32)>,
+    /// Bodies, re-posed every frame after the swapchain acquire (see
+    /// `finish_frame`).
+    body_buffer: Option<(wgpu::Buffer, u32)>,
     /// The last camera basis the window built (`InteractiveApp` computes eye
     /// position / look direction; this struct only knows the surface aspect
     /// ratio needed to finish the projection).
@@ -1220,6 +1832,16 @@ impl WorldRenderer {
                     offset: 12,
                     shader_location: 3,
                 },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 24,
+                    shader_location: 4,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 36,
+                    shader_location: 5,
+                },
             ],
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1284,6 +1906,7 @@ impl WorldRenderer {
             index_buffer,
             index_count: indices.len() as u32,
             instance_buffer: None,
+            body_buffer: None,
             aspect,
         })
     }
@@ -1375,7 +1998,10 @@ impl WorldRenderer {
         &mut self,
         acquired: AcquiredFrame,
         cam: Option<&(Vec3, Vec3)>,
+        bodies: &[Instance],
     ) -> Result<FrameTiming, ClientError> {
+        use wgpu::util::DeviceExt as _;
+
         let AcquiredFrame {
             frame_start,
             surface_texture,
@@ -1411,6 +2037,18 @@ impl WorldRenderer {
                 .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
         }
 
+        self.body_buffer = (!bodies.is_empty()).then(|| {
+            (
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("spall-interactive-body-instances"),
+                        contents: bytemuck::cast_slice(bodies),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+                bodies.len() as u32,
+            )
+        });
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1438,16 +2076,20 @@ impl WorldRenderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            if cam.is_some()
-                && let Some((instance_buffer, count)) = &self.instance_buffer
-                && *count > 0
-            {
+            if cam.is_some() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.globals_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.set_vertex_buffer(1, instance_buffer.slice(..));
                 pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                pass.draw_indexed(0..self.index_count, 0, 0..*count);
+                for (buffer, count) in [&self.instance_buffer, &self.body_buffer]
+                    .into_iter()
+                    .flatten()
+                {
+                    if *count > 0 {
+                        pass.set_vertex_buffer(1, buffer.slice(..));
+                        pass.draw_indexed(0..self.index_count, 0, 0..*count);
+                    }
+                }
             }
         }
         let submit_start = Instant::now();
@@ -1500,7 +2142,33 @@ fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Te
 mod input_tests {
     use spall_core::BUTTON_JUMP;
 
-    use super::{HeldKeys, LiveInput};
+    use super::*;
+
+    fn view(
+        position_m: [f64; 3],
+        velocity_m_s: [f32; 3],
+        published_at: Instant,
+    ) -> InteractiveView {
+        InteractiveView {
+            predicted: spall_physics::CharacterState {
+                position_m,
+                velocity_m_s,
+                grounded: true,
+                jump_held_last: false,
+            },
+            server_tick: 0,
+            published_at,
+            corrections: 0,
+            max_correction_m: 0.0,
+            idle_corrections: 0,
+            max_idle_correction_m: 0.0,
+            max_vertical_correction_m: 0.0,
+            max_horizontal_correction_m: 0.0,
+            unmatched_reconciles: 0,
+            max_unmatched_displacement_m: 0.0,
+            window_stats: crate::predict::WindowStats::default(),
+        }
+    }
 
     #[test]
     fn focus_loss_clears_window_keys_and_shared_actions_but_keeps_look() {
@@ -1522,6 +2190,42 @@ mod input_tests {
         assert_eq!(snapshot.movement, [0.0; 3]);
         assert_eq!(snapshot.buttons, 0);
         assert_eq!(snapshot.view_dir, [0.5, 0.25, -0.75]);
+    }
+
+    #[test]
+    fn camera_interpolation_does_not_overshoot_and_jerk_back_at_a_stop() {
+        let start = Instant::now();
+        let tick = Duration::from_millis(16);
+        let mut follow = CameraFollow::default();
+        let samples = [
+            view([0.0, 0.0, 0.0], [4.5, 0.0, 0.0], start),
+            view([0.072, 0.0, 0.0], [4.5, 0.0, 0.0], start + tick),
+            view([0.144, 0.0, 0.0], [0.0; 3], start + tick * 2),
+        ];
+        let mut last = f64::NEG_INFINITY;
+        for (index, sample) in samples.into_iter().enumerate() {
+            for frame in 0..2 {
+                let now = start + tick * index as u32 + Duration::from_millis(frame * 8);
+                let x = follow.target(sample, now)[0];
+                assert!(x >= last, "camera target moved backward: {last} -> {x}");
+                assert!(x <= sample.predicted.position_m[0] + f64::EPSILON);
+                last = x;
+            }
+        }
+    }
+
+    #[test]
+    fn capsule_debug_edges_are_thin_continuous_wire_strokes() {
+        let lines = build_capsule_debug_instances([0.0; 3], [0.1, 1.0, 1.0]);
+        assert_eq!(lines.len(), 12, "one cuboid per bounding-box edge");
+        for line in lines {
+            let dimensions = line.scale.map(|scale| scale * CELL_M);
+            let thin_axes = dimensions
+                .into_iter()
+                .filter(|dimension| *dimension <= 0.013)
+                .count();
+            assert_eq!(thin_axes, 2, "line dimensions were {dimensions:?}");
+        }
     }
 }
 

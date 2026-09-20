@@ -27,11 +27,13 @@ pub use spall_core::PlayerInput;
 pub mod tuning {
     /// Ground move speed, m/s.
     pub const WALK_SPEED_M_S: f32 = 4.5;
-    /// Upward speed imparted by a jump, m/s (≈ 1.1 m apex under `GRAVITY_M_S2`).
-    pub const JUMP_SPEED_M_S: f32 = 4.7;
-    /// Downward acceleration applied to the capsule, m/s². Matches the default
-    /// [`crate::PhysicsConfig`] gravity magnitude.
-    pub const GRAVITY_M_S2: f32 = 9.81;
+    /// Upward speed imparted by a jump, m/s (≈ 1.0 m apex under `GRAVITY_M_S2`).
+    pub const JUMP_SPEED_M_S: f32 = 5.7;
+    /// Downward acceleration applied to the capsule, m/s². Characters use a
+    /// deliberately tighter arc than free rigid bodies: the nearly unchanged
+    /// apex remains useful, while takeoff-to-landing time falls from about
+    /// `0.96 s` to `0.71 s` and no longer feels floaty.
+    pub const GRAVITY_M_S2: f32 = 16.0;
     /// Tallest obstacle the capsule steps onto without jumping, m (2 × 0.25 m
     /// terrain cells).
     pub const MAX_STEP_M: f32 = 0.5;
@@ -58,6 +60,10 @@ pub struct CharacterParams {
     pub half_height_m: f32,
     /// Capsule radius.
     pub radius_m: f32,
+    /// Effective player mass used when an authoritative character sweep
+    /// transfers momentum to a dynamic body. The capsule remains kinematic;
+    /// this value only controls equal-and-opposite contact impulse magnitude.
+    pub mass_kg: f32,
 }
 
 impl CharacterParams {
@@ -66,6 +72,7 @@ impl CharacterParams {
     pub const DEFAULT: Self = Self {
         half_height_m: 0.6,
         radius_m: 0.3,
+        mass_kg: 80.0,
     };
 
     /// Total standing height, feet to crown, metres.
@@ -169,10 +176,21 @@ pub fn step_character(
         wish[0] /= wish_len;
         wish[1] /= wish_len;
     }
-    let horiz = [
+    let wish_horiz = [
         wish[0] * tuning::WALK_SPEED_M_S,
         wish[1] * tuning::WALK_SPEED_M_S,
     ];
+
+    // Ground input chooses horizontal velocity. Once airborne, preserve the
+    // takeoff momentum until contact is regained: changing/letting go of WASD
+    // must not let a player steer or brake in mid-air. A jump begins from a
+    // grounded state, so the input on the takeoff tick still determines the
+    // launch direction.
+    let horiz = if state.grounded {
+        wish_horiz
+    } else {
+        [state.velocity_m_s[0], state.velocity_m_s[2]]
+    };
 
     // --- vertical velocity: jump (rising edge, grounded) then gravity -------
     let jump_now = input.wants_jump();
@@ -240,7 +258,7 @@ mod tests {
     use crate::occupancy::OccupancyGrid;
     use crate::world::{BodyId, BodyKind, BodySpec, PhysicsConfig, PhysicsWorld};
     use crate::{Representation, fixtures};
-    use spall_core::{CellSizeCode, GlobalCell, VolumeId};
+    use spall_core::{BUTTON_JUMP, CellSizeCode, GlobalCell, VolumeId};
     use spall_voxel::{EditPlan, Volume, fixtures as vox};
 
     const DT: f32 = 1.0 / 60.0;
@@ -295,6 +313,88 @@ mod tests {
     /// Feet spawn at the centre of the 16 m × 16 m floor.
     fn spawn(top: f64) -> CharacterState {
         CharacterState::at([8.0, top, 8.0])
+    }
+
+    #[test]
+    fn airborne_input_cannot_revector_or_brake_takeoff_momentum() {
+        let mut state = CharacterState {
+            position_m: [0.0; 3],
+            velocity_m_s: [0.0; 3],
+            grounded: true,
+            jump_held_last: false,
+        };
+        let launch = PlayerInput {
+            movement: [0.0, 0.0, 1.0],
+            view_dir: [0.0, 0.0, -1.0],
+            buttons: BUTTON_JUMP,
+        };
+        state = step_character(state, launch, DT, |_, desired| CharacterMove {
+            translation_m: desired,
+            grounded: false,
+        });
+        let takeoff = [state.velocity_m_s[0], state.velocity_m_s[2]];
+        assert!(takeoff[1] < -4.0, "launch should carry forward momentum");
+
+        let reverse_and_turn = PlayerInput {
+            movement: [1.0, 0.0, -1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+        for input in [reverse_and_turn, PlayerInput::NEUTRAL, reverse_and_turn] {
+            state = step_character(state, input, DT, |_, desired| CharacterMove {
+                translation_m: desired,
+                grounded: false,
+            });
+            assert_eq!([state.velocity_m_s[0], state.velocity_m_s[2]], takeoff);
+        }
+    }
+
+    #[test]
+    fn jump_arc_keeps_useful_height_but_lands_in_under_eight_tenths() {
+        let mut state = CharacterState {
+            position_m: [0.0; 3],
+            velocity_m_s: [0.0; 3],
+            grounded: true,
+            jump_held_last: false,
+        };
+        let jump = PlayerInput {
+            buttons: BUTTON_JUMP,
+            ..PlayerInput::NEUTRAL
+        };
+        let mut apex = 0.0_f64;
+        let mut airborne_ticks = 0usize;
+        for tick in 0..120 {
+            let input = if tick == 0 {
+                jump
+            } else {
+                PlayerInput::NEUTRAL
+            };
+            state = step_character(state, input, DT, |pos, desired| {
+                let next_y = pos[1] + f64::from(desired[1]);
+                if desired[1] <= 0.0 && next_y <= 0.0 {
+                    CharacterMove {
+                        translation_m: [desired[0], -(pos[1] as f32), desired[2]],
+                        grounded: true,
+                    }
+                } else {
+                    CharacterMove {
+                        translation_m: desired,
+                        grounded: false,
+                    }
+                }
+            });
+            apex = apex.max(state.position_m[1]);
+            airborne_ticks += 1;
+            if tick > 0 && state.grounded {
+                break;
+            }
+        }
+        let airtime_s = airborne_ticks as f32 * DT;
+        assert!((0.9..=1.1).contains(&apex), "jump apex was {apex:.3} m");
+        assert!(
+            (0.6..0.8).contains(&airtime_s),
+            "jump airtime was {airtime_s:.3} s"
+        );
     }
 
     /// **Known upstream defect (T23 / G3 row 15, `docs/reports/G3.md`).** A

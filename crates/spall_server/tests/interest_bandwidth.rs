@@ -111,6 +111,7 @@ fn column_cut_client(
         client_residency: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     }
 }
 

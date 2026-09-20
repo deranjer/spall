@@ -227,6 +227,16 @@ pub enum Scene {
     /// column-and-beam in the player lane. See
     /// [`spall_sim::fixtures::sleep_wake_setup`].
     SleepWake,
+    /// Not a gate scene: a hands-on playground (plaza, stairs, maze, jump
+    /// course) with a live debris spawner, for `cargo xtask play --scene
+    /// playground`. See [`spall_sim::fixtures::playground_setup`] /
+    /// [`spall_sim::playground`].
+    Playground,
+    /// Not a gate scene: [`Scene::Walk`]'s arena with one dynamic 0.75 m box
+    /// resting in the player lane, for the headless prediction/push repro
+    /// (`crates/spall_server/tests/prediction_timeline.rs`). See
+    /// [`spall_sim::spawn_push_test_box`].
+    PushTest,
 }
 
 impl Scene {
@@ -248,6 +258,8 @@ impl Scene {
             }
             "g1-full-envelope" | "g1-full-workload" | "g1" => Some(Scene::G1FullEnvelope),
             "sleep-wake" | "sleepwake" | "t21-sleep-wake" => Some(Scene::SleepWake),
+            "playground" | "play" | "sandbox-playground" => Some(Scene::Playground),
+            "push-test" | "pushtest" => Some(Scene::PushTest),
             _ => None,
         }
     }
@@ -265,6 +277,8 @@ impl Scene {
             Scene::SeparatedRegionsFar => "separated-regions-far",
             Scene::G1FullEnvelope => "g1-full-envelope",
             Scene::SleepWake => "sleep-wake",
+            Scene::Playground => "playground",
+            Scene::PushTest => "push-test",
         }
     }
 
@@ -278,6 +292,8 @@ impl Scene {
                 | Scene::SeparatedRegionsFar
                 | Scene::G1FullEnvelope
                 | Scene::SleepWake
+                | Scene::Playground
+                | Scene::PushTest
         )
     }
 
@@ -291,6 +307,8 @@ impl Scene {
             Scene::SeparatedRegionsFar => &SEPARATED_REGION_FAR_SPAWNS,
             Scene::G1FullEnvelope => &spall_sim::fixtures::G1_WORKLOAD_SPAWNS,
             Scene::SleepWake => &WALK_ARENA_SPAWNS,
+            Scene::Playground => &spall_sim::fixtures::PLAYGROUND_SPAWNS,
+            Scene::PushTest => &WALK_ARENA_SPAWNS,
             _ => &[],
         }
     }
@@ -309,6 +327,8 @@ impl Scene {
             }
             Scene::G1FullEnvelope => spall_sim::fixtures::g1_full_envelope_setup(),
             Scene::SleepWake => spall_sim::fixtures::sleep_wake_setup(),
+            Scene::Playground => spall_sim::fixtures::playground_setup(),
+            Scene::PushTest => spall_sim::fixtures::walk_arena_setup(),
         };
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
@@ -330,6 +350,21 @@ impl Scene {
             // scene-construction time, same as G4Workload's debris.
             spall_sim::fixtures::spawn_g1_hollow_test_volume(sim.world_mut())
                 .expect("hollow test volume spawns");
+        }
+        if matches!(self, Scene::PushTest) {
+            spall_sim::spawn_push_test_box(sim.world_mut());
+        }
+        if matches!(self, Scene::Playground) {
+            // Not a gate scene: the interactive playground's debris pile,
+            // built once at scene-construction time for the same reason
+            // G4Workload's and G1FullEnvelope's populations are — a body
+            // `spawn_body` creates bypasses the commit pipeline, so it must
+            // exist before any client's baseline pull to ever be seen (see
+            // `spall_sim::playground`'s module doc).
+            spall_sim::populate_playground_debris(
+                sim.world_mut(),
+                &spall_sim::playground_drop_zones(),
+            );
         }
         sim
     }
@@ -1268,6 +1303,26 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut dormancy_deactivations_total = 0u64;
         let mut dormancy_reactivations_total = 0u64;
 
+        // Not a gate pass: the interactive playground's timed debris drops
+        // (`cargo xtask play --scene playground`). `populate_playground_debris`
+        // (called earlier, in `Scene::simulation`) already spawned every
+        // debris body dormant; nothing else in this scene ever creates a
+        // dormant body, so every currently-dormant entity is exactly this
+        // population, found by a fresh scan rather than threading a
+        // `Vec<EntityId>` all the way through `setup_persistence`.
+        let mut playground_drops = matches!(scene, Scene::Playground).then(|| {
+            let pools = spall_sim::pending_drop_pools(sim.world());
+            const SHOWCASE_INTERVAL_TICKS: u64 = 300; // 5 s at 60 Hz
+            const PLINKO_INTERVAL_TICKS: u64 = 60; // 1 s at 60 Hz
+            (
+                spall_sim::DropSchedule::new(pools.showcase, SHOWCASE_INTERVAL_TICKS)
+                    .at_height(7.0),
+                spall_sim::DropSchedule::new(pools.plinko, PLINKO_INTERVAL_TICKS)
+                    .at_height(10.5)
+                    .with_restitution(spall_sim::PLINKO_RESTITUTION),
+            )
+        });
+
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
         let tick_dt = Duration::from_nanos(1_000_000_000 / 60);
@@ -1296,9 +1351,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // backing.
         lj.backing = residency.as_ref().map(|p| p.backing());
 
+        let mut pacer = crate::pacing::TickPacer::new(tick_dt, std::time::Instant::now());
         for _ in 0..max_ticks {
-            let started = std::time::Instant::now();
-
             // ENG-48: drain a bounded slice of what the clients have sent since
             // the last tick, with a per-session admission quota so one flooding
             // client can neither stall this loop nor starve the others. The
@@ -1466,6 +1520,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 let dp = sim.apply_dormancy(policy, &report);
                 dormancy_deactivations_total += dp.deactivate.len() as u64;
                 dormancy_reactivations_total += dp.reactivate.len() as u64;
+            }
+            if let Some((showcase, plinko)) = playground_drops.as_mut() {
+                showcase.tick(sim.world_mut(), tick.get());
+                plinko.tick(sim.world_mut(), tick.get());
             }
 
             // ENG-61: fold this tick into the "bodies holding still" window.
@@ -1726,8 +1784,23 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
-            if paced && let Some(rem) = tick_dt.checked_sub(started.elapsed()) {
-                std::thread::sleep(rem);
+            if paced {
+                // Absolute deadlines, not `tick_dt - work`: a relative sleep
+                // drifted the server to ~58.8 Hz under Windows sleep overshoot.
+                let now = std::time::Instant::now();
+                if let Some(rem) = pacer.finish_tick(now) {
+                    std::thread::sleep(rem);
+                }
+                if pacer.ticks().is_multiple_of(600) {
+                    tracing::info!(
+                        target: "spall_server::pacing",
+                        ticks = pacer.ticks(),
+                        achieved_hz = pacer.achieved_hz(std::time::Instant::now()),
+                        max_lag_ms = pacer.max_lag().as_secs_f64() * 1e3,
+                        resyncs = pacer.resyncs(),
+                        "tick pacing"
+                    );
+                }
             }
         }
 

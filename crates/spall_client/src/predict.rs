@@ -7,20 +7,21 @@
 //! against a known revision."
 //!
 //! [`PredictedPlayer`] runs the *same* [`spall_physics::step_character`] kernel
-//! the server runs, against [`ClientPhysics`] — a physics world holding just the
-//! terrain collider, rebuilt from the replica. Because physics is not lockstep,
+//! the server runs, against [`ClientPhysics`] — a physics world holding replica
+//! terrain plus query-only mirrors of detached bodies. Because physics is not lockstep,
 //! the predicted state drifts from the authoritative one; [`PredictedPlayer::reconcile`]
 //! snaps to each snapshot and replays the still-unacknowledged inputs, and the
 //! residual is reported as a bounded correction.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::Serialize;
-use spall_core::{BrickCoord, GlobalCell, MaterialId, PlayerInput, Tick};
+use spall_core::{BrickCoord, EntityId, GlobalCell, MaterialId, PlayerInput, Tick, units::Pose};
 pub use spall_physics::WindowStats;
 use spall_physics::{
     BodyId, BodyKind, BodySpec, CharacterMove, CharacterParams, CharacterQueryCache,
-    CharacterState, OccupancyGrid, PhysicsConfig, PhysicsWorld, Representation, step_character,
+    CharacterState, OccupancyGrid, PhysicsConfig, PhysicsWorld, Representation,
+    analytic_mass_properties, step_character,
 };
 use spall_protocol::InputSeq;
 use spall_voxel::{Sample, Volume};
@@ -32,11 +33,104 @@ pub const CELL_M: f32 = 0.25;
 /// Cells per brick edge (`docs/architecture.md`'s fixed brick size).
 const BRICK_CELLS: i64 = 32;
 
-/// A physics world that mirrors only the replica's terrain collider, so the
-/// predictor sweeps the capsule against the geometry the server used.
+/// Must equal `spall_sim::PLINKO_RESTITUTION` / `SHOWCASE_RESTITUTION` (the
+/// server's values; this crate cannot depend on `spall_sim`) so client-
+/// authoritative and server-authoritative playgrounds bounce identically.
+const PLINKO_RESTITUTION: f32 = 0.45;
+const SHOWCASE_RESTITUTION: f32 = 0.15;
+
+/// One replicated detached body as seen by the prediction collision mirror.
+/// Geometry is body-local; `pose` places it in the same world frame used by
+/// rendering and authoritative motion snapshots.
+#[derive(Clone)]
+pub(crate) struct ClientBodyCollision {
+    pub entity: EntityId,
+    pub topology_version: u64,
+    /// Present only when this body is new or its topology version changed.
+    /// Ordinary motion ticks update just the lightweight pose.
+    pub volume: Option<Volume>,
+    /// The pose in the body's newest snapshot, taken at `motion.snapshot_tick`.
+    pub pose: Pose,
+    pub motion: BodyMotion,
+}
+
+/// What a body's newest snapshot says about how it is moving, so its pose can
+/// be advanced to whichever server tick a prediction step is simulating.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct BodyMotion {
+    /// Server tick `ClientBodyCollision::pose` was sampled at.
+    pub snapshot_tick: u64,
+    pub linear_velocity_m_s: [f32; 3],
+    pub angular_velocity_rad_s: [f32; 3],
+    pub sleeping: bool,
+}
+
+impl BodyMotion {
+    /// A body that never moves (tests, sleeping bodies at a fixed pose).
+    #[cfg(test)]
+    pub const STATIC: Self = Self {
+        snapshot_tick: 0,
+        linear_velocity_m_s: [0.0; 3],
+        angular_velocity_rad_s: [0.0; 3],
+        sleeping: false,
+    };
+}
+
+/// Farthest a snapshot pose is advanced (either direction) to reach a
+/// simulated tick. A body the server last reported more than this long ago is
+/// held at the extrapolation limit rather than flung along a stale velocity.
+const MAX_BODY_EXTRAPOLATION_TICKS: f64 = 10.0;
+
+impl ClientBodyCollision {
+    /// This body's pose at server tick `tick`: the snapshot pose advanced along
+    /// its reported linear velocity and, for orientation, rotated about its
+    /// angular velocity. Sleeping bodies stay put. Deliberately the same
+    /// constant-velocity model for translation and rotation, so a rolling or
+    /// tumbling box's collision shape turns with it instead of translating with
+    /// a frozen orientation.
+    ///
+    /// Limits: no contact response (a body that is about to bounce or be
+    /// pushed is advanced as if free), bounded by
+    /// [`MAX_BODY_EXTRAPOLATION_TICKS`].
+    pub fn pose_at(&self, tick: f64) -> Pose {
+        let m = self.motion;
+        let ticks = (tick - m.snapshot_tick as f64)
+            .clamp(-MAX_BODY_EXTRAPOLATION_TICKS, MAX_BODY_EXTRAPOLATION_TICKS);
+        crate::replica::advance_pose(
+            &self.pose,
+            m.linear_velocity_m_s,
+            m.angular_velocity_rad_s,
+            m.sleeping,
+            ticks,
+            60.0,
+        )
+    }
+}
+
+struct MirroredBody {
+    physics: BodyId,
+    topology_version: u64,
+    grid: OccupancyGrid,
+    staged_translation_m: [f32; 3],
+    staged_rotation: [f32; 4],
+    active: bool,
+    emitter: Option<LocalEmitter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalEmitter {
+    Showcase,
+    Plinko,
+}
+
+/// A physics world that mirrors replica terrain and detached-body colliders, so
+/// the predictor sweeps the capsule against the geometry the server used.
 pub struct ClientPhysics {
     world: PhysicsWorld,
     terrain: Option<BodyId>,
+    /// Query-only fixed mirrors of authoritative detached bodies. Their poses
+    /// are refreshed from motion snapshots; the client never simulates them.
+    bodies: BTreeMap<u64, MirroredBody>,
     /// Bricks the collider currently installed on `terrain` was actually built
     /// from, as of the last [`set_terrain`](Self::set_terrain) — empty
     /// whenever nothing is resident yet. Residency streams bricks
@@ -72,6 +166,10 @@ pub struct ClientPhysics {
     /// `spall_sim::world::SimWorld` can track the same shape server-side —
     /// see its own `window_stats` field.
     window_stats: WindowStats,
+    /// Testing-only mode: detached bodies are dynamic and stepped here; server
+    /// motion snapshots seed topology/initial poses but never correct them.
+    client_authoritative: bool,
+    local_tick: u64,
 }
 
 impl Default for ClientPhysics {
@@ -83,13 +181,28 @@ impl Default for ClientPhysics {
 impl ClientPhysics {
     pub fn new() -> Self {
         Self {
-            world: PhysicsWorld::new(PhysicsConfig::default()),
+            // No client body enables CCD, and this world's colliders (terrain
+            // window, bodies) are rebuilt constantly; rapier's CCD pass can
+            // then hit a stale proxy and panic ("No element at index") on the
+            // physics thread -- see `PhysicsConfig::disable_ccd`.
+            world: PhysicsWorld::new(PhysicsConfig {
+                disable_ccd: true,
+                ..PhysicsConfig::default()
+            }),
             terrain: None,
+            bodies: BTreeMap::new(),
             resident_bricks: BTreeSet::new(),
             query_cache: CharacterQueryCache::new(),
             revision: 0,
             window_stats: WindowStats::default(),
+            client_authoritative: false,
+            local_tick: 0,
         }
+    }
+
+    /// Enables the deliberately non-network-correct local physics sandbox.
+    pub fn set_client_authoritative(&mut self, enabled: bool) {
+        self.client_authoritative = enabled;
     }
 
     /// Live proof [`Self::query_cache`] is actually serving sweeps, not
@@ -181,8 +294,233 @@ impl ClientPhysics {
         }
         // Refresh the broad-phase BVH so the next character sweep sees the new
         // collider (the sweep runs no physics step of its own).
-        self.world.step();
+        self.world.sync_queries();
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Mirrors all currently replicated detached bodies into the prediction
+    /// query world. They are fixed/query-only locally because server motion is
+    /// authoritative; the character sweep still collides with their exact
+    /// voxel shapes at the newest interpolated pose.
+    #[cfg(test)]
+    pub(crate) fn sync_bodies(&mut self, snapshots: &[ClientBodyCollision]) {
+        self.sync_bodies_at(snapshots, None);
+    }
+
+    /// [`Self::sync_bodies`], with each body advanced to server tick `tick`
+    /// ([`ClientBodyCollision::pose_at`]) instead of held at its snapshot pose.
+    /// Prediction and replay call this with the tick they are about to simulate
+    /// so the character collides with bodies where the server has them *then*.
+    pub(crate) fn sync_bodies_at(&mut self, snapshots: &[ClientBodyCollision], tick: Option<f64>) {
+        let live: BTreeSet<u64> = snapshots.iter().map(|body| body.entity.get()).collect();
+        let retired: Vec<u64> = self
+            .bodies
+            .keys()
+            .copied()
+            .filter(|entity| !live.contains(entity))
+            .collect();
+        for entity in retired {
+            if let Some(body) = self.bodies.remove(&entity) {
+                self.world.retire_body(body.physics);
+            }
+        }
+
+        for snapshot in snapshots {
+            let entity = snapshot.entity.get();
+            let pose = tick.map_or(snapshot.pose, |t| snapshot.pose_at(t));
+            let translation = pose.translation_m.map(|value| value as f32);
+            let rotation = pose.rotation.to_unit().unwrap_or([0.0, 0.0, 0.0, 1.0]);
+
+            if let Some(existing) = self.bodies.get_mut(&entity) {
+                if existing.topology_version != snapshot.topology_version {
+                    let Some(volume) = &snapshot.volume else {
+                        continue;
+                    };
+                    let Ok(Some(grid)) = OccupancyGrid::from_volume(volume) else {
+                        let removed = self.bodies.remove(&entity).expect("entry exists");
+                        self.world.retire_body(removed.physics);
+                        continue;
+                    };
+                    let representation = self.world.representation(existing.physics);
+                    self.world
+                        .rebuild_collider(existing.physics, &grid, representation);
+                    existing.grid = grid;
+                    existing.topology_version = snapshot.topology_version;
+                }
+                if !self.client_authoritative {
+                    self.world
+                        .set_body_pose(existing.physics, translation, rotation);
+                }
+                continue;
+            }
+
+            let Some(volume) = &snapshot.volume else {
+                continue;
+            };
+            let Ok(Some(grid)) = OccupancyGrid::from_volume(volume) else {
+                continue;
+            };
+            let local_dynamic = self.client_authoritative;
+            let mass_properties = local_dynamic.then(|| {
+                analytic_mass_properties(&grid, volume.cell_size().metres(), |_| 2_000.0)
+                    .to_body_properties()
+            });
+            // Plinko balls are the only local bodies pushed and rolled around
+            // by hand; a faceted voxel collider makes them catch and step, so
+            // they get a smooth convex hull instead.
+            let smooth = local_dynamic && translation[1] < -40.0 && translation[2] >= 20.0;
+            let physics = self.world.add_body(BodySpec {
+                kind: if local_dynamic {
+                    BodyKind::Dynamic { ccd: false }
+                } else {
+                    BodyKind::Fixed
+                },
+                representation: if smooth {
+                    Representation::SmoothConvex
+                } else {
+                    Representation::NativeVoxels
+                },
+                grid: grid.clone(),
+                cell_m: volume.cell_size().metres() as f32,
+                density_kg_m3: if local_dynamic { 2_000.0 } else { 1.0 },
+                mass_properties,
+                translation_m: translation,
+                linvel_m_s: [0.0; 3],
+            });
+            self.world.set_body_pose(physics, translation, rotation);
+            let emitter = if translation[1] < -40.0 {
+                Some(if translation[2] >= 20.0 {
+                    LocalEmitter::Plinko
+                } else {
+                    LocalEmitter::Showcase
+                })
+            } else {
+                None
+            };
+            let active = !local_dynamic || emitter.is_none();
+            if local_dynamic {
+                self.world.set_restitution(
+                    physics,
+                    if emitter == Some(LocalEmitter::Plinko) {
+                        PLINKO_RESTITUTION
+                    } else {
+                        SHOWCASE_RESTITUTION
+                    },
+                );
+                if !active {
+                    self.world.deactivate_body(physics);
+                }
+            } else {
+                self.world.set_query_only(physics);
+            }
+            self.bodies.insert(
+                entity,
+                MirroredBody {
+                    physics,
+                    topology_version: snapshot.topology_version,
+                    grid,
+                    staged_translation_m: translation,
+                    staged_rotation: rotation,
+                    active,
+                    emitter,
+                },
+            );
+        }
+        self.world.sync_queries();
+    }
+
+    fn release_next(&mut self, emitter: LocalEmitter, height_m: f32, restitution: f32) {
+        let Some(entity) = self.bodies.iter().find_map(|(entity, body)| {
+            (!body.active && body.emitter == Some(emitter)).then_some(*entity)
+        }) else {
+            return;
+        };
+        let body = self.bodies.get_mut(&entity).expect("selected body exists");
+        body.staged_translation_m[1] = height_m;
+        self.world.reactivate_body(
+            body.physics,
+            &body.grid,
+            body.staged_translation_m,
+            body.staged_rotation,
+            [0.0; 3],
+            [0.0; 3],
+        );
+        self.world.set_restitution(body.physics, restitution);
+        body.active = true;
+    }
+
+    /// Advances testing-only local rigid-body authority by one fixed tick.
+    pub fn step_client_authority(&mut self) {
+        if !self.client_authoritative {
+            return;
+        }
+        if self.local_tick.is_multiple_of(300) {
+            self.release_next(LocalEmitter::Showcase, 7.0, SHOWCASE_RESTITUTION);
+        }
+        if self.local_tick.is_multiple_of(60) {
+            self.release_next(LocalEmitter::Plinko, 10.5, PLINKO_RESTITUTION);
+        }
+        self.world.step();
+        self.local_tick = self.local_tick.saturating_add(1);
+    }
+
+    /// Unquantized locally-simulated body states, for interpolated rendering.
+    pub fn local_body_states(&self) -> BTreeMap<u64, crate::interactive::LocalPose> {
+        if !self.client_authoritative {
+            return BTreeMap::new();
+        }
+        self.bodies
+            .iter()
+            .map(|(entity, body)| {
+                let (translation_m, rotation) = if body.active {
+                    let state = self.world.body_state(body.physics);
+                    (state.translation_m, state.rotation)
+                } else {
+                    (body.staged_translation_m, body.staged_rotation)
+                };
+                (
+                    *entity,
+                    crate::interactive::LocalPose {
+                        translation_m: translation_m.map(f64::from),
+                        rotation,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Latest locally-simulated poses for renderer override in testing mode.
+    pub fn local_body_poses(&self) -> BTreeMap<u64, Pose> {
+        if !self.client_authoritative {
+            return BTreeMap::new();
+        }
+        self.bodies
+            .iter()
+            .map(|(entity, body)| {
+                let (translation_m, rotation) = if body.active {
+                    let state = self.world.body_state(body.physics);
+                    (state.translation_m, state.rotation)
+                } else {
+                    (body.staged_translation_m, body.staged_rotation)
+                };
+                let q = spall_core::QuantizedQuat::from_unit(
+                    rotation[0],
+                    rotation[1],
+                    rotation[2],
+                    rotation[3],
+                )
+                .unwrap_or_else(|_| {
+                    spall_core::QuantizedQuat::from_unit(0.0, 0.0, 0.0, 1.0).unwrap()
+                });
+                (
+                    *entity,
+                    Pose {
+                        translation_m: translation_m.map(f64::from),
+                        rotation: q,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Sweeps the capsule one tick, preferring [`Self::query_cache`]'s own
@@ -214,13 +552,18 @@ impl ClientPhysics {
             if cost.is_some() {
                 self.window_stats.window_rebuilds += 1;
             }
-            return self.world.sweep_character_excluding(
-                params,
-                feet_m,
-                desired_m,
-                dt_s,
-                &[terrain_id],
-            );
+            return if self.client_authoritative {
+                self.world.sweep_character_pushing_excluding(
+                    params,
+                    feet_m,
+                    desired_m,
+                    dt_s,
+                    &[terrain_id],
+                )
+            } else {
+                self.world
+                    .sweep_character_excluding(params, feet_m, desired_m, dt_s, &[terrain_id])
+            };
         }
         // No window *this call* — either the cache couldn't build one (too
         // close to the residency edge) or it legitimately found no solid
@@ -235,15 +578,30 @@ impl ClientPhysics {
         // query.
         self.window_stats.terrain_fallbacks += 1;
         if let Some(stale_window_id) = self.query_cache.window_body_id() {
-            return self.world.sweep_character_excluding(
-                params,
-                feet_m,
-                desired_m,
-                dt_s,
-                &[stale_window_id],
-            );
+            return if self.client_authoritative {
+                self.world.sweep_character_pushing_excluding(
+                    params,
+                    feet_m,
+                    desired_m,
+                    dt_s,
+                    &[stale_window_id],
+                )
+            } else {
+                self.world.sweep_character_excluding(
+                    params,
+                    feet_m,
+                    desired_m,
+                    dt_s,
+                    &[stale_window_id],
+                )
+            };
         }
-        self.world.sweep_character(params, feet_m, desired_m, dt_s)
+        if self.client_authoritative {
+            self.world
+                .sweep_character_pushing_excluding(params, feet_m, desired_m, dt_s, &[])
+        } else {
+            self.world.sweep_character(params, feet_m, desired_m, dt_s)
+        }
     }
 
     pub fn has_terrain(&self) -> bool {
@@ -463,6 +821,18 @@ pub struct PredictedPlayer {
     history: VecDeque<Record>,
     start_pos_m: [f64; 3],
     max_distance_from_start_m: f64,
+    /// **Testing only.** `true` disables [`Self::reconcile`]'s rebase step:
+    /// the server's `authoritative` snapshot is still recorded (so
+    /// `authoritative()`, the correction-magnitude metrics, and
+    /// `unmatched_reconciles` all keep reporting exactly what they always
+    /// have — how far the server disagrees), but `predicted` is never
+    /// replaced or replayed from it, so the player's on-screen position
+    /// never snaps. Ordinary `tick()`-driven local prediction is completely
+    /// unaffected either way. Never enable this outside a local, single-
+    /// player debug session: over real network conditions the server and
+    /// client will simply diverge without limit, and (unlike a normal
+    /// prediction gap) nothing ever pulls them back together.
+    pub client_authoritative: bool,
 
     // --- metrics -------------------------------------------------------------
     /// Snapshots whose predicted-at-ack state differed from authoritative.
@@ -529,6 +899,7 @@ impl PredictedPlayer {
             history: VecDeque::new(),
             start_pos_m: spawn.position_m,
             max_distance_from_start_m: 0.0,
+            client_authoritative: false,
             corrections: 0,
             max_correction_m: 0.0,
             idle_corrections: 0,
@@ -549,6 +920,11 @@ impl PredictedPlayer {
 
     pub fn authoritative(&self) -> CharacterState {
         self.authoritative
+    }
+
+    /// The server tick the next predicted step simulates.
+    pub(crate) fn next_tick(&self) -> Tick {
+        self.next_tick
     }
 
     /// Advances the prediction one tick and records the input for replay.
@@ -623,6 +999,22 @@ impl PredictedPlayer {
         acked: InputSeq,
         server_tick: Tick,
     ) -> ReconcileOutcome {
+        self.reconcile_with_bodies(phys, volume, authoritative, acked, server_tick, None)
+    }
+
+    /// [`Self::reconcile`], replaying each surviving record against the
+    /// replicated bodies *as of the tick that record simulates*
+    /// (`bodies` advanced to `server_tick + 1 + i`), not one fixed arrangement.
+    /// `None` keeps whatever poses `phys` currently holds.
+    pub(crate) fn reconcile_with_bodies(
+        &mut self,
+        phys: &mut ClientPhysics,
+        volume: &Volume,
+        authoritative: CharacterState,
+        acked: InputSeq,
+        server_tick: Tick,
+        bodies: Option<&[ClientBodyCollision]>,
+    ) -> ReconcileOutcome {
         let server_tick_delta = server_tick.0 as i64 - self.last_server_tick.0 as i64;
         self.last_server_tick = server_tick;
 
@@ -673,6 +1065,21 @@ impl PredictedPlayer {
             self.hovered_after_floor_removal = true;
         }
 
+        // The wire carries neither `grounded` nor `jump_held_last`, so
+        // `authoritative` holds guesses for both. Replaying held-jump inputs
+        // from a guessed "grounded, not yet holding jump" state (the velocity
+        // heuristic also reads true at the jump apex) re-fires the jump in
+        // mid-air. Take both from the newest record the server has covered
+        // (matched or not): it is this client's own step of that same tick, so
+        // when it agrees with authority on position it also knows the flags.
+        let mut authoritative = authoritative;
+        if let Some(covered) = self.history.iter().rfind(|r| r.tick <= server_tick) {
+            authoritative.jump_held_last = covered.input.wants_jump();
+            if covered.predicted_after.distance_m(&authoritative) < 0.1 {
+                authoritative.grounded = covered.predicted_after.grounded;
+            }
+        }
+
         self.authoritative = authoritative;
         self.acked = acked;
         // Drop exactly the records the server has covered — identified by
@@ -698,14 +1105,25 @@ impl PredictedPlayer {
 
         let params = self.params;
         let mut state = authoritative;
-        for rec in self.history.iter_mut() {
+        for (i, rec) in self.history.iter_mut().enumerate() {
+            if let Some(bodies) = bodies {
+                phys.sync_bodies_at(bodies, Some((server_tick.0 + 1 + i as u64) as f64));
+            }
             let dt = rec.dt;
             state = step_character(state, rec.input, dt, |p, d| {
                 phys.sweep(volume, params, p, d, dt)
             });
             rec.predicted_after = state;
         }
-        self.predicted = state;
+        // `client_authoritative` (testing only — see its own doc): the
+        // rebase-from-authoritative-and-replay above still runs, so
+        // `rec.predicted_after` and the correction/displacement metrics stay
+        // exactly as informative as ever; only this one assignment — the
+        // part that would actually move the player's on-screen position —
+        // is skipped, so nothing the server sends can ever snap it.
+        if !self.client_authoritative {
+            self.predicted = state;
+        }
 
         if comparison.is_none() {
             self.unmatched_reconciles += 1;
@@ -818,4 +1236,360 @@ pub struct PlayerMovementSummary {
     pub held_button_release_ok: bool,
     pub final_predicted_pos_m: [f64; 3],
     pub final_authoritative_pos_m: [f64; 3],
+}
+
+#[cfg(test)]
+mod body_collision_tests {
+    use super::*;
+    use spall_core::{CellSizeCode, QuantizedQuat, VolumeId};
+    use spall_voxel::EditPlan;
+
+    fn pose(x: f64) -> Pose {
+        pose_at([x, 0.0, 0.0])
+    }
+
+    fn pose_at(translation_m: [f64; 3]) -> Pose {
+        Pose {
+            translation_m,
+            rotation: QuantizedQuat::from_unit(0.0, 0.0, 0.0, 1.0).unwrap(),
+        }
+    }
+
+    fn one_voxel_body(id: u64) -> Volume {
+        let body_id = VolumeId::new(id).unwrap();
+        let mut body = Volume::new(body_id, CellSizeCode::Quarter);
+        body.apply_edit(&EditPlan::filled_box(
+            body_id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(0, 0, 0),
+            MaterialId(1),
+        ))
+        .unwrap();
+        body
+    }
+
+    #[test]
+    fn replicated_body_blocks_prediction_and_tracks_its_new_pose() {
+        let terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        let body_id = VolumeId::new(2).unwrap();
+        let mut body = Volume::new(body_id, CellSizeCode::Quarter);
+        body.apply_edit(&EditPlan::filled_box(
+            body_id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(3, 3, 3),
+            MaterialId(1),
+        ))
+        .unwrap();
+        let entity = EntityId::new(2).unwrap();
+        let version = body.next_revision().get();
+        let mut physics = ClientPhysics::new();
+
+        physics.sync_bodies(&[ClientBodyCollision {
+            entity,
+            topology_version: version,
+            volume: Some(body.clone()),
+            pose: pose(2.0),
+            motion: BodyMotion::STATIC,
+        }]);
+        let blocked = physics.sweep(
+            &terrain,
+            CharacterParams::DEFAULT,
+            [0.0, 0.0, 0.5],
+            [3.0, 0.0, 0.0],
+            1.0 / 60.0,
+        );
+        assert!(
+            blocked.translation_m[0] < 1.75,
+            "replicated body did not block the capsule: {blocked:?}"
+        );
+
+        physics.sync_bodies(&[ClientBodyCollision {
+            entity,
+            topology_version: version,
+            volume: None,
+            pose: pose(5.0),
+            motion: BodyMotion::STATIC,
+        }]);
+        let cleared = physics.sweep(
+            &terrain,
+            CharacterParams::DEFAULT,
+            [0.0, 0.0, 0.5],
+            [3.0, 0.0, 0.0],
+            1.0 / 60.0,
+        );
+        assert!(
+            cleared.translation_m[0] > 2.9,
+            "moved collider left stale collision behind: {cleared:?}"
+        );
+    }
+
+    #[test]
+    fn client_authority_integrates_body_and_ignores_server_pose_updates() {
+        let body = one_voxel_body(2);
+        let entity = EntityId::new(2).unwrap();
+        let version = body.next_revision().get();
+        let mut physics = ClientPhysics::new();
+        physics.set_client_authoritative(true);
+
+        physics.sync_bodies(&[ClientBodyCollision {
+            entity,
+            topology_version: version,
+            volume: Some(body),
+            pose: pose_at([2.0, 5.0, 2.0]),
+            motion: BodyMotion::STATIC,
+        }]);
+        physics.step_client_authority();
+        let locally_fallen = physics.local_body_poses()[&entity.get()].translation_m;
+        assert!(
+            locally_fallen[1] < 5.0,
+            "body did not fall: {locally_fallen:?}"
+        );
+
+        physics.sync_bodies(&[ClientBodyCollision {
+            entity,
+            topology_version: version,
+            volume: None,
+            pose: pose_at([50.0, 50.0, 50.0]),
+            motion: BodyMotion::STATIC,
+        }]);
+        let after_server_update = physics.local_body_poses()[&entity.get()].translation_m;
+        assert!(
+            (after_server_update[0] - locally_fallen[0]).abs() < 1.0e-5
+                && (after_server_update[1] - locally_fallen[1]).abs() < 1.0e-5,
+            "server pose replaced local authority: before={locally_fallen:?} after={after_server_update:?}"
+        );
+    }
+
+    #[test]
+    fn client_authority_releases_both_playground_emitters_on_local_schedule() {
+        let showcase = one_voxel_body(2);
+        let plinko = one_voxel_body(3);
+        let showcase_entity = EntityId::new(2).unwrap();
+        let plinko_entity = EntityId::new(3).unwrap();
+        let mut physics = ClientPhysics::new();
+        physics.set_client_authoritative(true);
+        physics.sync_bodies(&[
+            ClientBodyCollision {
+                entity: showcase_entity,
+                topology_version: showcase.next_revision().get(),
+                volume: Some(showcase),
+                pose: pose_at([4.0, -80.0, 16.0]),
+                motion: BodyMotion::STATIC,
+            },
+            ClientBodyCollision {
+                entity: plinko_entity,
+                topology_version: plinko.next_revision().get(),
+                volume: Some(plinko),
+                pose: pose_at([4.0, -80.0, 21.0]),
+                motion: BodyMotion::STATIC,
+            },
+        ]);
+        let staged = physics.local_body_poses();
+        assert_eq!(staged[&showcase_entity.get()].translation_m[1], -80.0);
+        assert_eq!(staged[&plinko_entity.get()].translation_m[1], -80.0);
+
+        physics.step_client_authority();
+        let released = physics.local_body_poses();
+        let showcase_y = released[&showcase_entity.get()].translation_m[1];
+        let plinko_y = released[&plinko_entity.get()].translation_m[1];
+        assert!((6.9..7.0).contains(&showcase_y), "showcase y={showcase_y}");
+        assert!((10.4..10.5).contains(&plinko_y), "plinko y={plinko_y}");
+    }
+
+    #[test]
+    fn client_authority_player_sweep_pushes_a_light_body() {
+        let terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        let body = one_voxel_body(2);
+        let entity = EntityId::new(2).unwrap();
+        let mut physics = ClientPhysics::new();
+        physics.set_client_authoritative(true);
+        physics.sync_bodies(&[ClientBodyCollision {
+            entity,
+            topology_version: body.next_revision().get(),
+            volume: Some(body),
+            pose: pose_at([1.0, 0.0, 0.5]),
+            motion: BodyMotion::STATIC,
+        }]);
+
+        let swept = physics.sweep(
+            &terrain,
+            CharacterParams::DEFAULT,
+            [0.0, 0.0, 0.5],
+            [1.5, 0.0, 0.0],
+            1.0 / 60.0,
+        );
+        assert!(
+            swept.translation_m[0] > 0.0,
+            "player failed to advance: {swept:?}"
+        );
+        physics.step_client_authority();
+        let moved_x = physics.local_body_poses()[&entity.get()].translation_m[0];
+        assert!(
+            moved_x > 1.0,
+            "player impulse did not move light body: x={moved_x}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod restitution_parity_tests {
+    #[test]
+    fn local_playground_restitution_matches_the_servers() {
+        assert_eq!(super::PLINKO_RESTITUTION, spall_sim::PLINKO_RESTITUTION);
+        assert_eq!(super::SHOWCASE_RESTITUTION, spall_sim::SHOWCASE_RESTITUTION);
+    }
+}
+
+#[cfg(test)]
+mod moving_body_replay_tests {
+    use super::*;
+    use spall_core::{CellSizeCode, QuantizedQuat, VolumeId};
+    use spall_voxel::EditPlan;
+
+    fn identity() -> QuantizedQuat {
+        QuantizedQuat::from_unit(0.0, 0.0, 0.0, 1.0).unwrap()
+    }
+
+    fn cube(id: u64) -> Volume {
+        let vid = VolumeId::new(id).unwrap();
+        let mut v = Volume::new(vid, CellSizeCode::Quarter);
+        v.apply_edit(&EditPlan::filled_box(
+            vid,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(3, 3, 3),
+            MaterialId(1),
+        ))
+        .unwrap();
+        v
+    }
+
+    fn body(x: f64, snapshot_tick: u64, vx: f32, sleeping: bool) -> ClientBodyCollision {
+        body_at([x, 0.0, 0.5], snapshot_tick, vx, sleeping)
+    }
+
+    fn body_at(
+        translation_m: [f64; 3],
+        snapshot_tick: u64,
+        vx: f32,
+        sleeping: bool,
+    ) -> ClientBodyCollision {
+        let volume = cube(2);
+        ClientBodyCollision {
+            entity: EntityId::new(2).unwrap(),
+            topology_version: volume.next_revision().get(),
+            volume: Some(volume),
+            pose: Pose {
+                translation_m,
+                rotation: identity(),
+            },
+            motion: BodyMotion {
+                snapshot_tick,
+                linear_velocity_m_s: [vx, 0.0, 0.0],
+                angular_velocity_rad_s: [0.0; 3],
+                sleeping,
+            },
+        }
+    }
+
+    #[test]
+    fn pose_at_advances_translation_and_orientation_and_is_bounded() {
+        let mut b = body(1.0, 10, 6.0, false);
+        // 6 ticks = 0.1 s at 6 m/s.
+        assert!((b.pose_at(16.0).translation_m[0] - 1.6).abs() < 1e-6);
+        // Backwards too (a replayed tick older than the snapshot).
+        assert!((b.pose_at(4.0).translation_m[0] - 0.4).abs() < 1e-6);
+        // Bounded: never more than MAX_BODY_EXTRAPOLATION_TICKS from the snapshot.
+        let far = b.pose_at(10_000.0).translation_m[0];
+        assert!((far - (1.0 + 6.0 * (MAX_BODY_EXTRAPOLATION_TICKS / 60.0))).abs() < 1e-6);
+        // A quarter turn about +Y in 0.25 s (1.5 rad at 6 rad/s -> use 15 ticks).
+        b.motion.angular_velocity_rad_s = [0.0, 3.0, 0.0];
+        b.motion.linear_velocity_m_s = [0.0; 3];
+        let [_, y, _, w] = b.pose_at(20.0).rotation.to_unit().unwrap();
+        let angle = 2.0 * y.atan2(w);
+        assert!((angle - 3.0 * (10.0 / 60.0)).abs() < 1e-3, "angle {angle}");
+        // Sleeping bodies stay exactly where the snapshot put them.
+        b.motion.sleeping = true;
+        b.motion.linear_velocity_m_s = [6.0, 0.0, 0.0];
+        assert_eq!(b.pose_at(16.0), b.pose);
+    }
+
+    /// Walks a capsule +x for 8 ticks toward a cube coming the other way, then
+    /// reconciles against the authoritative start. With per-tick body poses the
+    /// replay meets the cube where it *is* at each replayed tick; against one
+    /// frozen arrangement it walks much further before contact.
+    fn replayed_x(per_tick_bodies: bool) -> f64 {
+        // A floor whose top is y = 0.25 m, so the capsule stays grounded and walks.
+        let floor_id = VolumeId::new(1).unwrap();
+        let mut floor = Volume::new(floor_id, CellSizeCode::Quarter);
+        floor
+            .apply_edit(&EditPlan::filled_box(
+                floor_id,
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(79, 0, 15),
+                MaterialId(1),
+            ))
+            .unwrap();
+        let list = [body_at([1.9, 0.25, 1.5], 10, -3.0, false)];
+        let mut phys = ClientPhysics::new();
+        phys.set_terrain(&floor);
+        phys.sync_bodies(&list);
+        let mut start = CharacterState::at([1.0, 0.25, 2.0]);
+        start.grounded = true;
+        let mut pl = PredictedPlayer::new(CharacterParams::DEFAULT, start, Tick(10));
+        let input = PlayerInput {
+            movement: [0.0, 0.0, 1.0],
+            view_dir: [1.0, 0.0, 0.0],
+            buttons: 0,
+        };
+        for k in 0..8u64 {
+            pl.tick(&mut phys, &floor, input, InputSeq(k + 1), 1.0 / 60.0);
+        }
+        let outcome = if per_tick_bodies {
+            pl.reconcile_with_bodies(&mut phys, &floor, start, InputSeq(0), Tick(10), Some(&list))
+        } else {
+            pl.reconcile(&mut phys, &floor, start, InputSeq(0), Tick(10))
+        };
+        assert_eq!(outcome.records_replayed, 8);
+        outcome.predicted_after.position_m[0]
+    }
+
+    #[test]
+    fn replay_meets_a_moving_body_where_it_is_at_each_replayed_tick() {
+        let frozen = replayed_x(false);
+        let per_tick = replayed_x(true);
+        assert!(
+            per_tick < frozen - 0.1,
+            "per-tick replay should stop earlier against the approaching cube: \
+             per_tick={per_tick:.3} frozen={frozen:.3}"
+        );
+    }
+
+    #[test]
+    fn sync_bodies_at_parks_each_body_at_the_requested_tick() {
+        let terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        let list = [body(1.2, 0, 60.0, false)];
+        let mut phys = ClientPhysics::new();
+        let sweep = |phys: &mut ClientPhysics| {
+            phys.sweep(
+                &terrain,
+                CharacterParams::DEFAULT,
+                [0.0, 0.0, 0.5],
+                [3.0, 0.0, 0.0],
+                1.0 / 60.0,
+            )
+            .translation_m[0]
+        };
+        phys.sync_bodies_at(&list, Some(0.0));
+        let at_snapshot = sweep(&mut phys);
+        phys.sync_bodies_at(&list, Some(6.0)); // 60 m/s * 0.1 s = 6 m away
+        let later = sweep(&mut phys);
+        assert!(
+            at_snapshot < 1.0,
+            "cube at 1.2 m should block: {at_snapshot}"
+        );
+        assert!(
+            later > at_snapshot + 1.0,
+            "cube moved away by tick 6: {later}"
+        );
+    }
 }

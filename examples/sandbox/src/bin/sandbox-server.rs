@@ -223,7 +223,7 @@ fn run_serve(args: Args) -> ExitCode {
         Some(s) => s,
         None => {
             eprintln!(
-                "sandbox-server: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, walk, checkerboard-split, bulk-split, separated-regions, g4-workload, separated-regions-far, g1-full-envelope, or sleep-wake)",
+                "sandbox-server: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, walk, checkerboard-split, bulk-split, separated-regions, g4-workload, separated-regions-far, g1-full-envelope, sleep-wake, or playground)",
                 args.scene
             );
             return ExitCode::from(2);

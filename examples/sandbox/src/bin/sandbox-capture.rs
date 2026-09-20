@@ -952,6 +952,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         client_residency: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     };
     let cutter_thread = std::thread::spawn(move || run_replication_client(cutter_cfg));
 
@@ -981,6 +982,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
             *replica_slot_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         })),
         interactive: None,
+        client_authoritative: false,
     };
     let observer_thread = std::thread::spawn(move || run_replication_client(observer_cfg));
 

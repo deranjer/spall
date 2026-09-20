@@ -10,6 +10,7 @@ pub mod baseline;
 pub mod commit_latency;
 pub mod disk_backing;
 pub mod mem_stats;
+pub mod pacing;
 pub mod persist;
 pub mod persist_pipeline;
 pub mod replication;

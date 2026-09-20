@@ -50,9 +50,30 @@ pub struct PlayArgs {
     /// omitted.
     #[arg(long)]
     output: Option<PathBuf>,
+    /// T17: request a full late-join baseline instead of installing the
+    /// fixed scene. Required to actually see a scene whose state is
+    /// populated directly on the server at startup rather than through the
+    /// ordinary commit pipeline (e.g. `g4-workload`'s debris bodies) — a
+    /// normal tick-0 scene install never learns about that population.
+    /// Implied automatically for `playground`, whose two emitters use staged
+    /// server-side bodies.
+    #[arg(long)]
+    late_join: bool,
+    /// **Testing only.** Forwarded to `sandbox-client --client-authoritative`:
+    /// the client owns player and detached-body runtime physics, including
+    /// push impulses and playground emitter timing, while replicated topology
+    /// still supplies voxel shapes. Only meaningful for this local,
+    /// single-player session.
+    #[arg(long)]
+    client_authoritative: bool,
 }
 
 pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskError> {
+    let needs_server_baseline = args.late_join
+        || matches!(
+            args.scene.as_str(),
+            "playground" | "play" | "sandbox-playground"
+        );
     let output = args.output.unwrap_or_else(unique_output);
     fs::create_dir_all(&output).map_err(|source| XtaskError::Output {
         path: output.display().to_string(),
@@ -149,6 +170,12 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         "--log-json",
         &output.join("client.jsonl").display().to_string(),
     ]);
+    if needs_server_baseline {
+        client_cmd.arg("--late-join");
+    }
+    if args.client_authoritative {
+        client_cmd.arg("--client-authoritative");
+    }
     // Deliberately not hidden and not captured: the window is the point, and
     // a connect failure's error message should land directly in this
     // terminal instead of a log nobody's watching.
