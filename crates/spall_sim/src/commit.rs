@@ -491,6 +491,7 @@ pub fn commit(
     }
 
     drop(sp6);
+    let wake_probe = world.wake_probe();
     let sp7 = crate::prof::Span::start("commit.publish_parent_collider");
     match parent_rebuild {
         Some((plan, mass_properties)) => {
@@ -566,6 +567,10 @@ pub fn commit(
     }
 
     drop(sp8);
+    world.wake_probe_end(
+        "edit.commit_publish (collider rebuild + child spawn)",
+        wake_probe,
+    );
     if bumped_epoch {
         world.bump_topology_epoch();
     }

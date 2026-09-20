@@ -335,6 +335,9 @@ struct Scenario {
     /// refuse are not assigned edits.
     #[serde(default)]
     edit_clients: Option<u64>,
+    /// Pass `--wake-audit` (per-reason wake accounting in the server summary).
+    #[serde(default)]
+    wake_audit: bool,
     /// Diagnostic: raise the clients' QUIC handshake timeout (ms). Unset = the
     /// production 5 s.
     #[serde(default)]
@@ -800,9 +803,9 @@ fn sustained_counts(s: &SustainedEdits, server_ticks: u64) -> (u64, u64, f64) {
     if s.mode == SustainedMode::G4Bodies {
         n_small = n_small.min(spall_voxel::fixtures::g4_comb_cut_capacity() as u64);
         n_blasts = n_blasts.min(
-                spall_voxel::fixtures::G4_TOWER_COUNT as u64
-                    * spall_voxel::fixtures::G4_TOWER_BLASTS as u64,
-            );
+            spall_voxel::fixtures::G4_TOWER_COUNT as u64
+                * spall_voxel::fixtures::G4_TOWER_BLASTS as u64,
+        );
     }
     (n_small, n_blasts, small_step)
 }
@@ -2439,6 +2442,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         // produce; the harness is the authenticated dev-scenario path (ENG-47).
         "--dev-unvalidated-actions",
     ]);
+    if scenario.wake_audit {
+        server_cmd.arg("--wake-audit");
+    }
     if let Some(rate) = scenario.baseline_rate_limit_bytes_per_sec {
         server_cmd.args(["--baseline-rate-limit-bytes-per-sec", &rate.to_string()]);
     }

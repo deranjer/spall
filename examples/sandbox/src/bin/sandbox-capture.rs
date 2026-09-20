@@ -898,6 +898,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         dormancy: None,
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: None,
+        wake_audit: false,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 

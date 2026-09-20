@@ -58,6 +58,9 @@ struct Args {
     /// Maximum retained samples for each timing percentile series.
     #[arg(long)]
     timing_max_samples: Option<usize>,
+    /// Account which operations wake asleep bodies (`wake_reasons` in the summary).
+    #[arg(long)]
+    wake_audit: bool,
     /// Cap each client's motion by its measured QUIC congestion window (with
     /// `--motion-interest`).
     #[arg(long)]
@@ -352,6 +355,7 @@ fn run_serve(args: Args) -> ExitCode {
         dormancy: args.dormancy.then_some(spall_sim::DormancyConfig::DEFAULT),
         timing_window,
         baseline_rate_limit_bytes_per_sec: args.baseline_rate_limit_bytes_per_sec,
+        wake_audit: args.wake_audit,
     };
     match spall_server::serve(config) {
         Ok(summary) => {

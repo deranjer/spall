@@ -83,6 +83,7 @@ fn base_config(
         dormancy: None,
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: None,
+        wake_audit: false,
     }
 }
 

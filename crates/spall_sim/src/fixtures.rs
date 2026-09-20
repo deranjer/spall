@@ -1047,7 +1047,11 @@ pub fn spawn_g4_integrated_bodies(
     }
     out.comb_cells = cells_of(v::g4_comb_body);
     for t in 0..v::G4_TOWER_COUNT {
-        let at = [30.0 + (t % 12) as f64 * 4.0, 1.0, 2.0 + (t / 12) as f64 * 4.0];
+        let at = [
+            30.0 + (t % 12) as f64 * 4.0,
+            1.0,
+            2.0 + (t / 12) as f64 * 4.0,
+        ];
         let e = spawn(world, Box::new(v::g4_tower_body), at);
         world.deactivate_body(e);
         out.towers.push(e);

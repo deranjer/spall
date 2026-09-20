@@ -395,10 +395,17 @@ fn rubble_census() {
         );
     }
     let low_y = rows.iter().filter(|r| r.2 < -1.0).count();
-    let first_debris = vfix::G4_ENTITY_FIRST + 1 + vfix::G4_COMB_COUNT as u64 + vfix::G4_TOWER_COUNT as u64;
+    let first_debris =
+        vfix::G4_ENTITY_FIRST + 1 + vfix::G4_COMB_COUNT as u64 + vfix::G4_TOWER_COUNT as u64;
     let (mut comb, mut tower, mut tip) = (0, 0, 0);
     for r in rows.iter().filter(|r| r.2 < -1.0) {
-        if r.3 < vfix::g4_tower_entity(0) { comb += 1 } else if r.3 < first_debris { tower += 1 } else { tip += 1 }
+        if r.3 < vfix::g4_tower_entity(0) {
+            comb += 1
+        } else if r.3 < first_debris {
+            tower += 1
+        } else {
+            tip += 1
+        }
     }
     println!("  fallen: comb parents {comb}, tower parents {tower}, detached rubble {tip}");
     println!("  below the ground (y < -1 m): {low_y}");
@@ -414,16 +421,27 @@ fn tunnelling_vs_drop_height() {
                 Simulation::new(SimulationConfig::new(fixtures::g4_integrated_setup())).unwrap();
             let pose = spall_sim::BodyPose::new(glam::DQuat::IDENTITY, [60.0, 1.0 + h, 40.0]);
             let e = if comb {
-                sim.world_mut().spawn_body(vfix::g4_comb_body, pose, [0.0; 3], [0.0; 3], 2600.0, 0)
+                sim.world_mut()
+                    .spawn_body(vfix::g4_comb_body, pose, [0.0; 3], [0.0; 3], 2600.0, 0)
             } else {
-                sim.world_mut().spawn_body(fixtures::solid_block(4), pose, [0.0; 3], [0.0; 3], 2600.0, 0)
+                sim.world_mut().spawn_body(
+                    fixtures::solid_block(4),
+                    pose,
+                    [0.0; 3],
+                    [0.0; 3],
+                    2600.0,
+                    0,
+                )
             }
             .unwrap();
             for _ in 0..600 {
                 sim.tick().unwrap();
             }
             let b = sim.world().body(e).unwrap();
-            println!("{label} from {h:>4} m: y = {:.2} m, asleep {}", b.pose.translation_m[1], b.sleeping);
+            println!(
+                "{label} from {h:>4} m: y = {:.2} m, asleep {}",
+                b.pose.translation_m[1], b.sleeping
+            );
         }
     }
 }
@@ -456,7 +474,13 @@ fn first_fall_through_events() {
                 let v = b.linvel_m_s;
                 println!(
                     "t={t}: entity {} first below ground at ({:.2},{:.2},{:.2}) v=({:.1},{:.1},{:.1}) cells={}",
-                    e.get(), p[0], p[1], p[2], v[0], v[1], v[2],
+                    e.get(),
+                    p[0],
+                    p[1],
+                    p[2],
+                    v[0],
+                    v[1],
+                    v[2],
                     spall_sim::world::solid_cells(&b.volume)
                 );
             }
@@ -489,7 +513,8 @@ fn first_sleeper_wake() {
             req += 1;
         }
         if t >= 120 && (t - 120) % 600 == 300 {
-            sim.submit(body_cut(req, vfix::g4_blast(blast).unwrap())).unwrap();
+            sim.submit(body_cut(req, vfix::g4_blast(blast).unwrap()))
+                .unwrap();
             blast += 1;
             req += 1;
         }
@@ -502,19 +527,35 @@ fn first_sleeper_wake() {
             .filter(|e| (first_sleeper..first_sleeper + 4096).contains(&e.get()))
             .collect();
         if !woke.is_empty() {
-            println!("t={t}: {} sleepers reactivated (of {} reactivations)", woke.len(), plan.reactivate.len());
+            println!(
+                "t={t}: {} sleepers reactivated (of {} reactivations)",
+                woke.len(),
+                plan.reactivate.len()
+            );
             let w = sim.world().body(*woke[0]).unwrap();
             println!("  first at {:?}", w.pose.translation_m);
             // nearest awake moving body
             let mut best = (f64::MAX, 0u64, [0.0; 3], 0.0);
             for b in sim.world().bodies() {
-                if b.dormant { continue; }
+                if b.dormant {
+                    continue;
+                }
                 let sp = b.linvel_m_s.iter().map(|v| v * v).sum::<f64>().sqrt();
-                if sp <= 0.05 { continue; }
-                let d: f64 = (0..3).map(|i| (b.pose.translation_m[i] - w.pose.translation_m[i]).powi(2)).sum::<f64>().sqrt();
-                if d < best.0 { best = (d, b.entity.map_or(0, |e| e.get()), b.pose.translation_m, sp); }
+                if sp <= 0.05 {
+                    continue;
+                }
+                let d: f64 = (0..3)
+                    .map(|i| (b.pose.translation_m[i] - w.pose.translation_m[i]).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                if d < best.0 {
+                    best = (d, b.entity.map_or(0, |e| e.get()), b.pose.translation_m, sp);
+                }
             }
-            println!("  nearest moving body: entity {} at {:?} dist {:.2} speed {:.2}", best.1, best.2, best.0, best.3);
+            println!(
+                "  nearest moving body: entity {} at {:?} dist {:.2} speed {:.2}",
+                best.1, best.2, best.0, best.3
+            );
             break;
         }
     }
@@ -540,7 +581,8 @@ fn awake_set_stays_bounded() {
             req += 1;
         }
         if t >= 120 && (t - 120) % 600 == 300 {
-            sim.submit(body_cut(req, vfix::g4_blast(blast).unwrap())).unwrap();
+            sim.submit(body_cut(req, vfix::g4_blast(blast).unwrap()))
+                .unwrap();
             blast += 1;
             req += 1;
         }
@@ -565,5 +607,114 @@ fn awake_set_stays_bounded() {
                 sim.world().physics().active_body_count()
             );
         }
+    }
+}
+
+/// Which operation collapses the asleep set? Counts rapier-asleep, non-dormant
+/// bodies after each phase of every tick and reports any phase that drops the
+/// count sharply.
+#[test]
+#[ignore = "diagnostic: which phase mass-wakes asleep rubble"]
+fn mass_wake_phase_attribution() {
+    let (mut sim, bodies) = scene();
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let asleep = |sim: &Simulation| -> i64 {
+        sim.world()
+            .bodies()
+            .filter(|b| !b.dormant && b.sleeping)
+            .count() as i64
+    };
+    let (mut req, mut ordinary, mut blast) = (1u64, 0u64, 0u64);
+    let mut prev = 0i64;
+    let mut reported = 0;
+    for t in 0..(420 * 60u64) {
+        if t == 60 {
+            sim.submit(body_cut(req, vfix::g4_giant_cut())).unwrap();
+            req += 1;
+        }
+        let mut submitted = String::new();
+        if t >= 120 && (t - 120) % 6 == 0 {
+            let e = vfix::g4_ordinary_edit(ordinary).unwrap();
+            ordinary += 1;
+            submitted = format!("comb-cut#{ordinary}");
+            sim.submit(body_cut(req, e)).unwrap();
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 600 == 300 {
+            submitted = format!("blast#{blast}");
+            sim.submit(body_cut(req, vfix::g4_blast(blast).unwrap()))
+                .unwrap();
+            blast += 1;
+            req += 1;
+        }
+        let a0 = asleep(&sim);
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        let a1 = asleep(&sim);
+        let report = sim.tick().unwrap();
+        let a2 = asleep(&sim);
+        let plan = sim.apply_dormancy(&mut policy, &report);
+        let a3 = asleep(&sim);
+        let worst = [
+            (a1 - a0, "agitate"),
+            (a2 - a1, "tick"),
+            (a3 - a2, "dormancy"),
+        ]
+        .into_iter()
+        .min_by_key(|x| x.0)
+        .unwrap();
+        if worst.0 <= -100 && reported < 8 {
+            reported += 1;
+            println!(
+                "t={t} ({}s): {} dropped asleep by {} ({a0}->{a3}); committed={} submitted='{submitted}' deact={} react={}",
+                t / 60,
+                worst.1,
+                -worst.0,
+                report.committed.len(),
+                plan.deactivate.len(),
+                plan.reactivate.len()
+            );
+        }
+        prev = a3;
+    }
+    println!("final asleep {prev}");
+}
+
+/// Wake-reason attribution over the same run: which operation wakes asleep bodies?
+#[test]
+#[ignore = "diagnostic: wake reasons over five minutes"]
+fn wake_reasons_over_the_workload() {
+    let (mut sim, bodies) = scene();
+    sim.world_mut().enable_wake_audit();
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let (mut req, mut ordinary, mut blast) = (1u64, 0u64, 0u64);
+    for t in 0..(240 * 60u64) {
+        if t == 60 {
+            sim.submit(body_cut(req, vfix::g4_giant_cut())).unwrap();
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 6 == 0 {
+            let e = vfix::g4_ordinary_edit(ordinary).unwrap();
+            ordinary += 1;
+            sim.submit(body_cut(req, e)).unwrap();
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 600 == 300 {
+            sim.submit(body_cut(req, vfix::g4_blast(blast).unwrap()))
+                .unwrap();
+            blast += 1;
+            req += 1;
+        }
+        let probe = sim.world().wake_probe();
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        sim.world_mut().wake_probe_end("fixture.agitator", probe);
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+    }
+    let audit = sim.world().wake_audit().unwrap();
+    for (reason, s) in &audit.reasons {
+        println!(
+            "{reason:<58} ops {:>6}, waking ops {:>5}, bodies woken {:>7}, max by one {:>4}",
+            s.operations, s.waking_operations, s.bodies_woken, s.max_woken_by_one
+        );
     }
 }

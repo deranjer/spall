@@ -89,6 +89,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         dormancy: None,
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: None,
+        wake_audit: false,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 

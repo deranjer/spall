@@ -1096,7 +1096,11 @@ pub fn g4_integrated_scene(id: VolumeId) -> Volume {
     // forever. The wall keeps every body on the slab; it is terrain, so solid
     // matter is conserved and durable.
     let top = G4_YARD_GROUND_TOP_CELL + 1;
-    let (w, d, h) = (G4_YARD_WIDTH_CELLS, G4_YARD_DEPTH_CELLS, G4_YARD_WALL_HEIGHT_CELLS);
+    let (w, d, h) = (
+        G4_YARD_WIDTH_CELLS,
+        G4_YARD_DEPTH_CELLS,
+        G4_YARD_WALL_HEIGHT_CELLS,
+    );
     for (a, b) in [
         ([0, top, 0], [w - 1, top + h - 1, 3]),
         ([0, top, d - 4], [w - 1, top + h - 1, d - 1]),

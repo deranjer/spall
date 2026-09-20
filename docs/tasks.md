@@ -340,7 +340,7 @@ per edit; journal writes every awake body 20x/s); the overload client-retry gap;
 stress lane is measured-but-unaccepted (its bounds are unratified candidates). GPU
 p95 14.8 ms vs 12 ms and human/cross-GPU review are separately open. Four
 independent fixes are in PR #136 (open; CI red only from a pre-existing `main`
-failure). Acceptance is an integrator decision; ENG-30 is not marked done here.
+failure). **Gate blockers remain until the fixes above are reviewed:** the 2-minute physics p95 miss, the failed 30-minute soak, the impaired-convergence failures (fixed on this branch, not yet accepted) and the baseline-readiness miss (27-30 s, thin margin). Acceptance is an integrator decision; ENG-30 is not marked done here.
 
 Dependencies: T15, T17, T18, T20, T21, T22. Own: complete gate report and targeted fixes.
 

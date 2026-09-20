@@ -86,6 +86,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         dormancy: None,
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: None,
+        wake_audit: false,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -200,6 +201,7 @@ fn server_persists_and_recovers_across_a_restart() {
         dormancy: None,
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: None,
+        wake_audit: false,
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {
@@ -323,6 +325,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         dormancy: None,
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: None,
+        wake_audit: false,
     };
 
     let server_thread = std::thread::spawn(move || serve(cfg));

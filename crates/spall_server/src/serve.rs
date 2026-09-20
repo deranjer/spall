@@ -506,6 +506,9 @@ pub struct ServeConfig {
     /// bytes per second (`docs/validation.md`: baselines have a separate capped
     /// `1 MiB/s/client` budget). `None` (the default) sends unpaced.
     pub baseline_rate_limit_bytes_per_sec: Option<u64>,
+    /// Account which operations wake rapier-asleep bodies (`ServeSummary::wake_reasons`).
+    /// Each probed operation scans every body, so it is off by default.
+    pub wake_audit: bool,
 }
 
 /// A bounded, explicit server timing window. The server records at most
@@ -600,6 +603,7 @@ impl ServeConfig {
             dormancy: None,
             timing_window: None,
             baseline_rate_limit_bytes_per_sec: None,
+            wake_audit: false,
         }
     }
 }
@@ -866,6 +870,8 @@ pub struct ServeSummary {
     /// checkpoint capture and publish. Clients connect while these run, so they
     /// are inside every joiner's readiness time.
     pub startup_ms: Vec<(String, f64)>,
+    /// Wake-reason accounting (empty unless `ServeConfig::wake_audit`).
+    pub wake_reasons: Vec<WakeReasonRow>,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -1534,6 +1540,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let contact_damage_cfg = config.contact_damage;
     let dormancy_cfg = config.dormancy;
     let timing_window = config.timing_window;
+    let wake_audit_on = config.wake_audit;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
@@ -1565,6 +1572,9 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((name.to_string(), d.as_secs_f64() * 1000.0));
+        }
+        if wake_audit_on {
+            sim.world_mut().enable_wake_audit();
         }
         let mut journal_records_written: u64 = 0;
 
@@ -2206,6 +2216,22 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
         SimResult {
             stage_timings: stage_agg.finish(),
+            wake_reasons: sim
+                .world()
+                .wake_audit()
+                .map(|a| {
+                    a.reasons
+                        .iter()
+                        .map(|(reason, s)| WakeReasonRow {
+                            reason: (*reason).to_string(),
+                            operations: s.operations,
+                            waking_operations: s.waking_operations,
+                            bodies_woken: s.bodies_woken,
+                            max_woken_by_one: s.max_woken_by_one,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             samples: sampler.samples,
             blast_commit_ticks,
             backlog_peak_bytes: sampler.peak_bytes.max(sampler.interval_bytes),
@@ -2523,6 +2549,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             .admission_refused
             .load(std::sync::atomic::Ordering::Relaxed),
         stage_timings: sim_result.stage_timings.clone(),
+        wake_reasons: sim_result.wake_reasons.clone(),
         baseline_capture_encode_ms: telemetry
             .capture_encode_ms
             .lock()
@@ -2723,6 +2750,16 @@ impl TelemetrySampler {
     }
 }
 
+/// One wake reason's totals (see `spall_sim::WakeAudit`).
+#[derive(Debug, Clone, Serialize)]
+pub struct WakeReasonRow {
+    pub reason: String,
+    pub operations: u64,
+    pub waking_operations: u64,
+    pub bodies_woken: u64,
+    pub max_woken_by_one: u64,
+}
+
 /// One stage's timing over the measured window (all ticks when no window is set).
 #[derive(Debug, Clone, Serialize)]
 pub struct StageTimingRow {
@@ -2916,6 +2953,7 @@ fn percentile(samples: &[f64], fraction: f64) -> f64 {
 }
 
 struct SimResult {
+    wake_reasons: Vec<WakeReasonRow>,
     stage_timings: Vec<StageTimingRow>,
     samples: Vec<TelemetrySample>,
     blast_commit_ticks: Vec<u64>,
@@ -2980,6 +3018,7 @@ impl SimResult {
     fn error(msg: String, ticks_run: u64) -> Self {
         Self {
             stage_timings: Vec::new(),
+            wake_reasons: Vec::new(),
             samples: Vec::new(),
             blast_commit_ticks: Vec::new(),
             backlog_peak_bytes: 0,
