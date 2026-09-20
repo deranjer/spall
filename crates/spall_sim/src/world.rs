@@ -696,9 +696,9 @@ impl SimWorld {
 
             let input = player.effective_input();
             let params = player.params;
-            let physics = &self.physics;
+            let physics = &mut self.physics;
             player.state = step_character(player.state, input, dt_s, |pos, desired| {
-                physics.sweep_character_excluding(params, pos, desired, dt_s, &exclude)
+                physics.sweep_character_pushing_excluding(params, pos, desired, dt_s, &exclude)
             });
 
             // Bounded-fixture safety net: a capsule that leaves the world (bad
@@ -869,6 +869,15 @@ impl SimWorld {
         self.bodies.get(&entity.get()).is_some_and(|b| b.dormant)
     }
 
+    /// Sets the contact restitution of one detached body's collider.
+    pub fn set_body_restitution(&mut self, entity: EntityId, restitution: f32) -> bool {
+        let Some(body) = self.bodies.get(&entity.get()) else {
+            return false;
+        };
+        self.physics.set_restitution(body.phys, restitution);
+        true
+    }
+
     /// Deactivates a settled detached body: its physics rigid body and collider
     /// are removed, its record is frozen (`sleeping = true`, zero velocity), and
     /// its pose stays authoritative. Returns `false` for terrain, an unknown
@@ -914,6 +923,20 @@ impl SimWorld {
             body.dormant = false;
         }
         true
+    }
+
+    /// Moves a dormant body's stored pose to `height_m` and reactivates it.
+    /// Used by pre-staged replicated emitters so future bodies remain out of
+    /// sight until their scheduled release.
+    pub fn reactivate_body_at_height(&mut self, entity: EntityId, height_m: f64) -> bool {
+        let Some(body) = self.bodies.get_mut(&entity.get()) else {
+            return false;
+        };
+        if !body.dormant || !height_m.is_finite() {
+            return false;
+        }
+        body.pose.translation_m[1] = height_m;
+        self.reactivate_body(entity)
     }
 
     // --- save recovery (T16) ------------------------------------------------

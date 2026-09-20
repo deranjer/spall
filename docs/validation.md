@@ -150,7 +150,14 @@ T19 adds headless player movement: `sandbox-server --serve --scene walk` runs th
 flat `walk_arena` and gives each connecting client an authoritative capsule;
 `sandbox-client --move FROM:TO:MX,MY,MZ:BUTTONS` (repeatable) scripts a movement
 path, predicts the capsule locally with the shared `step_character` kernel, sends
-`InputFrame` datagrams, and reconciles against the server's player snapshots. A
+`InputFrame` datagrams, and reconciles against the server's player snapshots.
+Horizontal input applies while grounded; a jump keeps its takeoff momentum and
+does not accept mid-air steering or braking. The tightened jump acceptance is a
+`0.9..=1.1 m` apex and `0.6..<0.8 s` airtime at 60 Hz. The server gives the
+kinematic capsule an `80 kg` effective contact mass and transfers its contact
+impulse into dynamic bodies; `character_push_uses_fine_voxel_mass` proves an
+identical sweep accelerates a small exact-voxel-mass body more than a heavy one.
+A
 scenario file may set `scene` and list `player_paths` (per-client legs) plus a
 `movement` acceptance block (`max_correction_m`, `min_distance_m`,
 `min_ground_contact_ratio`, `expect_no_hover`). Built-in `player-movement` runs
@@ -165,14 +172,36 @@ prediction` (predictor vs. a live `spall_sim::Simulation` through an injected
 ENG-69 adds the separate live-input path: `sandbox-client --connect
 --interactive` runs the same network prediction/reconciliation session in a
 winit window, reading WASD, Space, and mouse look from the local window. Its
-minimal debug view draws nearby replicated terrain; it is not the G2 renderer.
+minimal debug view draws nearby replicated terrain and detached bodies; its
+prediction collision world mirrors both, with detached-body poses remaining
+server-driven. F3 shows the local capsule bounds as 1.25 cm wire-like strokes
+rather than voxel-sized markers. It is not the G2 renderer.
 The window releases the cursor with Escape or focus loss, and focus loss clears
 all held actions so a missing OS key-up cannot continue a walk or jump. The
 historical PR #109 record reports a hands-on run of `cargo xtask play --release
 --scene g1 --ticks 18000` in which the investigated frame-pacing jitter was no
 longer observed. That result is historical evidence, not a measurement made by
 the current validation pass; live input has no automated keyboard/mouse
-acceptance scenario. Full moving-body crush outcomes remain follow-up.
+acceptance scenario. `cargo xtask play --release --scene playground` adds two
+spawn-side UAT stations: a unique varied block is released every five seconds,
+and a unique 0.5 m block is released every second over a staggered Plinko board
+with high restitution. Pending replicated bodies are staged below the playable
+scene, then moved to their emitter on activation. `spall_sim::playground` tests
+pin both cadences and prove each staged body's mass equals the sum of its
+quarter-metre voxels at the current material density. Full moving-body crush
+outcomes remain follow-up.
+
+For isolated physics UAT, `cargo xtask play --scene playground --late-join
+--client-authoritative` makes the interactive client authoritative for player
+and detached-body runtime motion. It locally releases both emitter populations,
+steps gravity/contact/bounce, transfers player push impulses using voxel-count
+mass, and renders local body poses while ignoring server pose corrections.
+Topology and voxel shapes still arrive from the server baseline/transactions;
+the flag is a single-client testing mode, not an alternate multiplayer
+authority model. Automated coverage in `spall_client::predict::body_collision_tests`
+checks local falling without server correction, both local emitter releases,
+and a player sweep moving a light body. Hands-on window feel/bounce remains a
+desktop UAT check.
 T20 (increment 1) adds opt-in per-client interest + motion bandwidth
 scheduling to the host: `sandbox-server --serve --motion-interest`
 (with `--motion-near-m` / `--motion-far-m` / `--motion-far-interval` /
@@ -275,6 +304,10 @@ cargo xtask scenario --name player-movement --loss-percent 0 --output .local/run
 # see docs/reports/ENG-69-acceptance.md.
 cargo xtask play --release --scene g1 --ticks 18000
 
+# Testing-only playground client authority: local player + rigid-body physics,
+# including emitter timing, bounce, voxel-count mass, and player pushing.
+cargo xtask play --scene playground --late-join --client-authoritative
+
 # T12: stable acceptance cameras with six views and per-pass GPU timing.
 # Needs a supported GPU/driver; exit 3 otherwise.
 cargo xtask capture --output .local/runs/t12-1080p --width 1920 --height 1080 --strategy greedy
@@ -307,8 +340,9 @@ cargo test -p spall_voxel -p spall_client -p spall_server --all-features
 ```
 
 The shipped ENG-69 interactive controls are mouse look, WASD, and Space to
-jump. Escape releases the cursor; closing the window exits the interactive
-session. The live-input path is deliberately separate from scenario actions,
+jump. F1 toggles terrain, F2 toggles detached bodies, and F3 toggles the thin
+local collision outline. Escape releases the cursor; closing the window exits
+the interactive session. The live-input path is deliberately separate from scenario actions,
 which remain local scripted inputs rather than synthesized keyboard/mouse
 events.
 

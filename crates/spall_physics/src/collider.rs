@@ -24,6 +24,12 @@ pub enum Representation {
     NativeVoxels,
     /// A compound of greedily merged cuboids.
     MergedCuboids,
+    /// A rounded convex hull of the solid cell centres, inflated by half a
+    /// cell. Only valid for (near-)convex bodies such as balls: it trades
+    /// exact voxel occupancy for smooth contact, so a body rolls and is pushed
+    /// without catching on cube edges. Falls back to
+    /// [`Representation::NativeVoxels`] when the hull is degenerate.
+    SmoothConvex,
 }
 
 impl Representation {
@@ -32,6 +38,7 @@ impl Representation {
         match self {
             Self::NativeVoxels => "native_voxels",
             Self::MergedCuboids => "merged_cuboids",
+            Self::SmoothConvex => "smooth_convex",
         }
     }
 }
@@ -100,6 +107,35 @@ pub fn build_collider(grid: &OccupancyGrid, cell_m: f32, rep: Representation) ->
     match rep {
         Representation::NativeVoxels => build_native(grid, cell_m),
         Representation::MergedCuboids => build_compound(grid, cell_m),
+        Representation::SmoothConvex => build_smooth_convex(grid, cell_m),
+    }
+}
+
+fn build_smooth_convex(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
+    let start = Instant::now();
+    let points: Vec<Vector> = grid
+        .solid_indices()
+        .into_iter()
+        .map(|[x, y, z]| {
+            Vector::new(
+                (x as f32 + 0.5) * cell_m,
+                (y as f32 + 0.5) * cell_m,
+                (z as f32 + 0.5) * cell_m,
+            )
+        })
+        .collect();
+    let Some(shape) = SharedShape::round_convex_hull(&points, cell_m * 0.5) else {
+        return build_native(grid, cell_m);
+    };
+    let wrap_start = Instant::now();
+    let collider = ColliderBuilder::new(shape).build();
+    let wrap = wrap_start.elapsed();
+    ColliderBuild {
+        collider,
+        primitives: 1,
+        build: start.elapsed(),
+        wrap,
+        est_bytes: points.len() * 12 + 512,
     }
 }
 
