@@ -1035,3 +1035,316 @@ mod tests {
     const BULK_SPLIT_DIGEST: &str =
         "03f5ef01144a1d927f4caf372181c052cd375cbd4b644f6f3e504838982aceea";
 }
+
+// ---------------------------------------------------------------------------
+// T23 / G4 integrated workload: the "demolition yard".
+// ---------------------------------------------------------------------------
+//
+// Terrain is a `96 m x 56 m` ground slab and nothing else. The workload's
+// destructible content is **bodies**: 282 combs (ordinary-edit targets), 180
+// towers (blast targets), and one 64-brick giant, all persistent bodies that
+// wake when first edited, plus 256 always-awake and 4,096 sleeping debris
+// bodies. Why bodies and not terrain: every *terrain* commit re-indexes,
+// re-extracts, re-hashes and re-plans the whole terrain volume (measured
+// `~210 ms` per commit at 3.2 M solid cells even after the occupancy-extraction
+// fast path; see `crates/spall_sim/tests/g4_integrated.rs`
+// `full_terrain_edit_cost_*`), so a 10 edits/s terrain stream cannot be
+// sustained at yard scale. A body commit costs only its own volume.
+//
+// All lengths below are cells (`0.25 m`); body-local coordinates put the
+// body's origin at its `(0,0,0)` cell.
+
+/// Yard width (`x`): `384` cells = `96 m`.
+pub const G4_YARD_WIDTH_CELLS: i64 = 384;
+/// Yard depth (`z`): `224` cells = `56 m`.
+pub const G4_YARD_DEPTH_CELLS: i64 = 224;
+/// Top cell row (`y`) of the ground slab: `y 0..=3`, top surface at `1.0 m`.
+pub const G4_YARD_GROUND_TOP_CELL: i64 = 3;
+
+/// The integrated world's terrain: a bounded `256 x 128 x 256 m` volume holding
+/// only the `384 x 224 x 4` ground slab (`344,064` solid cells) in a resident
+/// air envelope one brick tall.
+pub fn g4_integrated_scene(id: VolumeId) -> Volume {
+    let bounds = BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(31, 15, 31))
+        .expect("valid G4 world bounds");
+    let mut v = Volume::bounded(id, CellSizeCode::Quarter, bounds);
+    for x in 0..G4_YARD_WIDTH_CELLS / 32 {
+        for z in 0..G4_YARD_DEPTH_CELLS / 32 {
+            v.insert_brick(
+                BrickCoord::new(x, 0, z),
+                Brick::uniform(MaterialId::AIR, Revision(1)),
+            )
+            .expect("g4 ground air envelope");
+        }
+    }
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(
+            G4_YARD_WIDTH_CELLS - 1,
+            G4_YARD_GROUND_TOP_CELL,
+            G4_YARD_DEPTH_CELLS - 1,
+        ),
+        STONE,
+    ))
+    .expect("g4 ground slab");
+    v
+}
+
+/// The *terrain-edit scale* fixture: the same ground slab plus a pillar field, a
+/// tower field, and the 64-brick giant as **terrain**, filling the engine's
+/// 8,388,608-cell occupancy budget (`384 x 224 x 96`). It exists only to
+/// measure what a terrain commit costs at yard scale; the networked workload
+/// does not use it. Solid cells: ground `344,064`; `1,150` pillars (`2 x 2 x
+/// 88`) `404,800`; `60` towers (`8 x 8 x 88`) `337,920`; giant block `8 x 2 x 4`
+/// bricks `2,097,152` plus its column.
+pub fn g4_full_yard_terrain_scene(id: VolumeId) -> Volume {
+    let bounds = BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(31, 15, 31))
+        .expect("valid G4 world bounds");
+    let mut v = Volume::bounded(id, CellSizeCode::Quarter, bounds);
+    for x in 0..G4_YARD_WIDTH_CELLS / 32 {
+        for y in 0..3 {
+            for z in 0..G4_YARD_DEPTH_CELLS / 32 {
+                v.insert_brick(
+                    BrickCoord::new(x, y, z),
+                    Brick::uniform(MaterialId::AIR, Revision(1)),
+                )
+                .expect("air envelope");
+            }
+        }
+    }
+    let solid = |v: &mut Volume, a: [i64; 3], b: [i64; 3]| {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(a[0], a[1], a[2]),
+            GlobalCell::new(b[0], b[1], b[2]),
+            STONE,
+        ))
+        .expect("solid box");
+    };
+    solid(
+        &mut v,
+        [0, 0, 0],
+        [
+            G4_YARD_WIDTH_CELLS - 1,
+            G4_YARD_GROUND_TOP_CELL,
+            G4_YARD_DEPTH_CELLS - 1,
+        ],
+    );
+    for col in 0..50 {
+        for row in 0..23 {
+            let (x, z) = (4 + col * 4, 4 + row * 4);
+            solid(&mut v, [x, 4, z], [x + 1, 91, z + 1]);
+        }
+    }
+    for col in 0..10 {
+        for row in 0..6 {
+            let (x, z) = (212 + col * 12, 12 + row * 12);
+            solid(&mut v, [x, 4, z], [x + 7, 91, z + 7]);
+        }
+    }
+    solid(&mut v, [131, 4, 99], [132, 31, 100]);
+    for bx in 0..8 {
+        for by in 0..2 {
+            for bz in 0..4 {
+                v.insert_brick(
+                    BrickCoord::new(4 + bx, 1 + by, 3 + bz),
+                    Brick::uniform(STONE, Revision(1)),
+                )
+                .expect("giant block brick");
+            }
+        }
+    }
+    v
+}
+
+// --- Destructible bodies -------------------------------------------------------
+
+/// Combs: a `16 x 16 x 2` plate carrying an `8 x 8` grid of `1 x 1 x 10` teeth
+/// (`y 2..=11`) at a `2`-cell pitch (cells `x, z = 1, 3, ..., 15`). A radius-1
+/// cut centred at `y = 4` on a tooth severs it; the tip (`y 6..=11`, `6` cells)
+/// detaches as one rubble body and the plate keeps standing. `64` cuts per comb.
+pub const G4_COMB_COUNT: usize = 282;
+pub const G4_COMB_TEETH_PER_SIDE: i64 = 8;
+pub const G4_COMB_CUT_Y: i64 = 4;
+pub const G4_COMB_CUT_RADIUS_CELLS: i64 = 1;
+/// Ordinary pillar-style edits the combs supply: `282 x 64 = 18,048`.
+pub const fn g4_comb_cut_capacity() -> i64 {
+    G4_COMB_COUNT as i64 * G4_COMB_TEETH_PER_SIDE * G4_COMB_TEETH_PER_SIDE
+}
+
+/// A comb body volume.
+pub fn g4_comb_body(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(15, 1, 15),
+        STONE,
+    ))
+    .expect("comb plate");
+    for tx in 0..G4_COMB_TEETH_PER_SIDE {
+        for tz in 0..G4_COMB_TEETH_PER_SIDE {
+            let (x, z) = (1 + 2 * tx, 1 + 2 * tz);
+            v.apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(x, 2, z),
+                GlobalCell::new(x, 11, z),
+                STONE,
+            ))
+            .expect("comb tooth");
+        }
+    }
+    v
+}
+
+/// Body-local cell of the `tooth`-th tooth's cut (`0..64`).
+pub fn g4_comb_cut_cell(tooth: i64) -> [i64; 3] {
+    let (tx, tz) = (tooth % G4_COMB_TEETH_PER_SIDE, tooth / G4_COMB_TEETH_PER_SIDE);
+    [1 + 2 * tx, G4_COMB_CUT_Y, 1 + 2 * tz]
+}
+
+/// Towers (blast targets): a `16 x 16 x 2` plate under an `8 x 8` column
+/// (`x, z 4..=11`, `y 2..=37`). A `r = 8` blast at `(8, 20, 8)` (a `4 m`
+/// diameter) severs the shaft; the segment above (`y 29..=37`, `576` cells)
+/// detaches as one large rubble body. One blast per tower.
+pub const G4_TOWER_COUNT: usize = 180;
+pub const G4_TOWER_BLAST_CELL: [i64; 3] = [8, 20, 8];
+pub const G4_BLAST_RADIUS_CELLS: i64 = 8;
+
+/// A tower body volume.
+pub fn g4_tower_body(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(15, 1, 15),
+        STONE,
+    ))
+    .expect("tower plate");
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(4, 2, 4),
+        GlobalCell::new(11, 37, 11),
+        STONE,
+    ))
+    .expect("tower column");
+    v
+}
+
+/// The 64-brick connected structure, as one body: a `16 x 16 x 2` base plate, a
+/// slender `2 x 2` column (`y 2..=31`), and a `4 x 4 x 4` brick block
+/// (`x, z 0..=127`, `y 32..=159`, `2,097,152` uniform stone cells) held up by
+/// the column alone. A radius-3 cut at [`G4_GIANT_CUT_CELL`] severs the column.
+pub const G4_GIANT_CUT_CELL: [i64; 3] = [63, 16, 63];
+pub const G4_GIANT_CUT_RADIUS_CELLS: i64 = 3;
+
+/// The giant body volume.
+pub fn g4_giant_body(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    // Plate and column live in brick row y = 0 (block bricks start at row 1):
+    // insert the resident air first, as `giant_collapse_scene` does, so every
+    // brick in the body's solid bounding box is resident.
+    for bx in 0..4 {
+        for bz in 0..4 {
+            v.insert_brick(
+                BrickCoord::new(bx, 0, bz),
+                Brick::uniform(MaterialId::AIR, Revision(1)),
+            )
+            .expect("giant air row");
+        }
+    }
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(56, 0, 56),
+        GlobalCell::new(71, 1, 71),
+        STONE,
+    ))
+    .expect("giant plate");
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(63, 2, 63),
+        GlobalCell::new(64, 31, 64),
+        STONE,
+    ))
+    .expect("giant column");
+    for bx in 0..4 {
+        for by in 1..5 {
+            for bz in 0..4 {
+                v.insert_brick(
+                    BrickCoord::new(bx, by, bz),
+                    Brick::uniform(STONE, Revision(1)),
+                )
+                .expect("giant block brick");
+            }
+        }
+    }
+    v
+}
+
+/// Entity id of the first body the integrated scene spawns (the giant); combs,
+/// towers, then debris follow consecutively. Asserted against the real registry
+/// in `crates/spall_sim/tests/g4_integrated.rs`.
+pub const G4_ENTITY_FIRST: u64 = 1;
+
+/// Entity id (raw) of comb `c` (`0..G4_COMB_COUNT`).
+pub const fn g4_comb_entity(c: u64) -> u64 {
+    G4_ENTITY_FIRST + 1 + c
+}
+
+/// Entity id (raw) of tower `t` (`0..G4_TOWER_COUNT`).
+pub const fn g4_tower_entity(t: u64) -> u64 {
+    G4_ENTITY_FIRST + 1 + G4_COMB_COUNT as u64 + t
+}
+
+/// One scripted destructive edit against a persistent body: which body (raw
+/// entity id), the body-local cell, and the brush radius in cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct G4BodyEdit {
+    pub entity: u64,
+    pub cell: [i64; 3],
+    pub radius: i64,
+}
+
+/// The `index`-th ordinary edit: a tooth cut on a comb. Tooth-major (`index /
+/// combs` picks the tooth), and the comb walk is a bijective stride so
+/// consecutive edits hit different combs (rubble from one does not land on the
+/// next comb's plate). `None` once every tooth of every comb is spent.
+pub fn g4_ordinary_edit(index: u64) -> Option<G4BodyEdit> {
+    let combs = G4_COMB_COUNT as u64;
+    let tooth = (index / combs) as i64;
+    if tooth >= G4_COMB_TEETH_PER_SIDE * G4_COMB_TEETH_PER_SIDE {
+        return None;
+    }
+    // gcd(11, 282) = 1, so `c` visits every comb once per tooth.
+    let c = (index % combs * 11) % combs;
+    Some(G4BodyEdit {
+        entity: g4_comb_entity(c),
+        cell: g4_comb_cut_cell(tooth),
+        radius: G4_COMB_CUT_RADIUS_CELLS,
+    })
+}
+
+/// The `index`-th named blast: one tower each. `None` past the last tower.
+pub fn g4_blast(index: u64) -> Option<G4BodyEdit> {
+    let towers = G4_TOWER_COUNT as u64;
+    if index >= towers {
+        return None;
+    }
+    // gcd(7, 180) = 1.
+    let t = (index * 7) % towers;
+    Some(G4BodyEdit {
+        entity: g4_tower_entity(t),
+        cell: G4_TOWER_BLAST_CELL,
+        radius: G4_BLAST_RADIUS_CELLS,
+    })
+}
+
+/// The one 64-brick collapse.
+pub fn g4_giant_cut() -> G4BodyEdit {
+    G4BodyEdit {
+        entity: G4_ENTITY_FIRST,
+        cell: G4_GIANT_CUT_CELL,
+        radius: G4_GIANT_CUT_RADIUS_CELLS,
+    }
+}

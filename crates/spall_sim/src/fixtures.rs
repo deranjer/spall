@@ -848,3 +848,322 @@ pub fn oblique_spin() -> DQuat {
         std::f64::consts::FRAC_PI_4,
     )
 }
+
+// ---------------------------------------------------------------------------
+// T23 / G4 integrated workload (the "demolition yard"; see
+// `spall_voxel::fixtures` for the terrain, the destructible bodies, and the
+// edit-target functions). Metres below are on the `96 m x 56 m` ground slab.
+// ---------------------------------------------------------------------------
+
+/// Feet spawns (metres) for the **clustered** integrated arrangement: all eight
+/// players inside a `4 m x 2 m` patch of the west plaza.
+pub const G4_INTEGRATED_CLUSTERED_SPAWNS: [[f64; 3]; 8] = [
+    [16.0, 1.0, 40.0],
+    [17.0, 1.0, 40.0],
+    [18.0, 1.0, 40.0],
+    [19.0, 1.0, 40.0],
+    [16.0, 1.0, 41.0],
+    [17.0, 1.0, 41.0],
+    [18.0, 1.0, 41.0],
+    [19.0, 1.0, 41.0],
+];
+
+/// Feet spawns (metres) for the **separated** integrated arrangement: two
+/// four-player clusters about `77 m` apart (west plaza / east strip).
+pub const G4_INTEGRATED_SEPARATED_SPAWNS: [[f64; 3]; 8] = [
+    [16.0, 1.0, 40.0],
+    [17.0, 1.0, 40.0],
+    [16.0, 1.0, 41.0],
+    [17.0, 1.0, 41.0],
+    [90.0, 1.0, 20.0],
+    [91.0, 1.0, 20.0],
+    [90.0, 1.0, 21.0],
+    [91.0, 1.0, 21.0],
+];
+
+/// The integrated workload's terrain (the ground slab) and its collider region.
+pub fn g4_integrated_setup() -> WorldSetup {
+    use spall_voxel::fixtures as v;
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: v::g4_integrated_scene(id),
+        terrain_collider_region: (
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(v::G4_YARD_WIDTH_CELLS - 1, 31, v::G4_YARD_DEPTH_CELLS - 1),
+        ),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
+/// The *terrain-edit scale* setup ([`spall_voxel::fixtures::g4_full_yard_terrain_scene`]).
+pub fn g4_full_yard_terrain_setup() -> WorldSetup {
+    use spall_voxel::fixtures as v;
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: v::g4_full_yard_terrain_scene(id),
+        terrain_collider_region: (
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(v::G4_YARD_WIDTH_CELLS - 1, 95, v::G4_YARD_DEPTH_CELLS - 1),
+        ),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
+/// One agitated (kept-awake) active body and the yard position it is steered
+/// back toward.
+#[derive(Debug, Clone, Copy)]
+pub struct G4ActiveBody {
+    pub entity: spall_core::EntityId,
+    pub home: [f64; 3],
+}
+
+/// What [`spawn_g4_integrated_bodies`] built.
+#[derive(Debug, Clone, Default)]
+pub struct G4IntegratedBodies {
+    /// The 64-brick giant (dormant until its column is cut).
+    pub giant: Option<spall_core::EntityId>,
+    /// Dormant comb / tower bodies, in entity-id order.
+    pub combs: Vec<spall_core::EntityId>,
+    pub towers: Vec<spall_core::EntityId>,
+    /// Awake bodies the fixture agitator keeps awake, with their home spots.
+    pub active: Vec<G4ActiveBody>,
+    /// Of `active`, how many started within [`G4_NEAR_OBSERVER_RADIUS_M`] of
+    /// the observer.
+    pub active_near_observer: usize,
+    /// Sleeping (deactivated, persistent) debris bodies.
+    pub sleeping_total: usize,
+    /// Solid cells summed over the active bodies.
+    pub active_cells: u64,
+    /// Solid cells summed over the sleeping debris bodies.
+    pub sleeping_cells: u64,
+    /// Solid cells of the giant, one comb, and one tower (collider-complexity
+    /// reporting).
+    pub giant_cells: u64,
+    pub comb_cells: u64,
+    pub tower_cells: u64,
+}
+
+/// A `size`-cube hollow shell with `wall`-cell walls: outer solid, inner carved
+/// to air (`size = 4`, `wall = 1` is `64 - 8 = 56` cells).
+fn hollow_crate(size: i64, wall: i64) -> impl FnOnce(VolumeId) -> Volume {
+    move |id| {
+        let mut v = Volume::new(id, CellSizeCode::Quarter);
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(size - 1, size - 1, size - 1),
+            STONE,
+        ))
+        .unwrap();
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(wall, wall, wall),
+            GlobalCell::new(size - 1 - wall, size - 1 - wall, size - 1 - wall),
+            spall_core::MaterialId::AIR,
+        ))
+        .unwrap();
+        v
+    }
+}
+
+/// An L-shaped beam: a `4 x 2 x 2` bar with a `2 x 3 x 2` leg (`28` cells).
+fn l_beam() -> impl FnOnce(VolumeId) -> Volume {
+    move |id| {
+        let mut v = Volume::new(id, CellSizeCode::Quarter);
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(3, 1, 1),
+            STONE,
+        ))
+        .unwrap();
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(0, 2, 0),
+            GlobalCell::new(1, 4, 1),
+            STONE,
+        ))
+        .unwrap();
+        v
+    }
+}
+
+fn cells_of(build: impl FnOnce(VolumeId) -> Volume) -> u64 {
+    crate::world::solid_cells(&build(VolumeId::new(1).unwrap()))
+}
+
+/// Sleeping debris: `2`-cell (`0.5 m`) cubes stacked in a `25 x 25 x 7` block
+/// on the east strip (`x 83..96 m`, `z 4..17 m`), spaced `0.52 m`.
+const G4_SLEEPER_ORIGIN_M: [f64; 2] = [83.0, 4.0];
+const G4_SLEEPER_SPACING_M: f64 = 0.52;
+const G4_SLEEPER_SIDE: usize = 25;
+
+/// Position (metres, body origin) of a stacked destructible body: `column`
+/// picks an `(x, z)` slot on a `13 x 5` grid of `4.2 m` pitch in the yard's
+/// north band (`x 26..77 m`, `z 0.5..21 m`, clear of the giant, the plaza, and
+/// the sleepers), `layer * layer_pitch_m` the height above the ground. The
+/// bodies are dormant (no collider) until woken, so vertical stacking is
+/// physically inert; a woken body falls onto the ground or the rubble below.
+fn stack_position(column: usize, layer: usize, layer_pitch_m: f64) -> [f64; 3] {
+    [
+        26.0 + (column % 13) as f64 * 4.2,
+        1.0 + layer as f64 * layer_pitch_m,
+        0.5 + (column / 13) as f64 * 4.2,
+    ]
+}
+
+/// Populates the integrated yard's bodies on an already-constructed world, in
+/// this order (entity ids follow it; see [`spall_voxel::fixtures::G4_ENTITY_FIRST`]):
+/// the 64-brick giant, [`G4_COMB_COUNT`] combs, [`G4_TOWER_COUNT`] towers (all
+/// dormant, waking on their first edit), 256 **active** nontrivial debris bodies
+/// (a rotation of `4^3` solid cubes, `4^3` hollow crates, and L-beams: 64, 56
+/// and 28 cells) — 64 within `12 m` of the observer, the other 192 in the west
+/// plaza — and [`G4_SLEEPING_BODY_COUNT`] deactivated `2^3` cubes. Every body is
+/// inside the world bounds and over the ground slab.
+pub fn spawn_g4_integrated_bodies(
+    world: &mut crate::world::SimWorld,
+    observer: [f64; 3],
+) -> G4IntegratedBodies {
+    use spall_voxel::fixtures as v;
+    let mut out = G4IntegratedBodies::default();
+    let spawn = |world: &mut crate::world::SimWorld,
+                 build: Box<dyn FnOnce(VolumeId) -> Volume>,
+                 at: [f64; 3]| {
+        world
+            .spawn_body(
+                build,
+                BodyPose::new(DQuat::IDENTITY, at),
+                [0.0; 3],
+                [0.0; 3],
+                G4_BODY_DENSITY_KG_M3,
+                0,
+            )
+            .expect("g4 integrated body spawns")
+    };
+
+    // The giant: block centred over x 40..72 m, z 24..56 m, plate on the ground.
+    let giant = spawn(world, Box::new(v::g4_giant_body), [40.0, 1.0, 24.0]);
+    world.deactivate_body(giant);
+    out.giant = Some(giant);
+    out.giant_cells = cells_of(v::g4_giant_body);
+
+    for c in 0..v::G4_COMB_COUNT {
+        let at = stack_position(c % 36, c / 36, 4.0);
+        let e = spawn(world, Box::new(v::g4_comb_body), at);
+        world.deactivate_body(e);
+        out.combs.push(e);
+    }
+    out.comb_cells = cells_of(v::g4_comb_body);
+    for t in 0..v::G4_TOWER_COUNT {
+        let at = stack_position(36 + t % 23, t / 23, 10.0);
+        let e = spawn(world, Box::new(v::g4_tower_body), at);
+        world.deactivate_body(e);
+        out.towers.push(e);
+    }
+    out.tower_cells = cells_of(v::g4_tower_body);
+
+    let mut n = 0usize;
+    let mut spawn_active = |world: &mut crate::world::SimWorld,
+                            out: &mut G4IntegratedBodies,
+                            at: [f64; 3]| {
+        let (build, cells): (Box<dyn FnOnce(VolumeId) -> Volume>, u64) = match n % 3 {
+            0 => (Box::new(solid_block(4)), cells_of(solid_block(4))),
+            1 => (Box::new(hollow_crate(4, 1)), cells_of(hollow_crate(4, 1))),
+            _ => (Box::new(l_beam()), cells_of(l_beam())),
+        };
+        let entity = spawn(world, build, at);
+        out.active.push(G4ActiveBody { entity, home: at });
+        out.active_cells += cells;
+        n += 1;
+    };
+    // 64 near the observer: 8 x 8 at 1.05 m, 3.5 m up (2.5 m above the ground).
+    for i in 0..8 {
+        for j in 0..8 {
+            let at = [19.0 + i as f64 * 1.05, 3.5, 37.0 + j as f64 * 1.05];
+            spawn_active(world, &mut out, at);
+            let d = ((at[0] - observer[0]).powi(2)
+                + (at[1] - observer[1]).powi(2)
+                + (at[2] - observer[2]).powi(2))
+            .sqrt();
+            if d <= G4_NEAR_OBSERVER_RADIUS_M {
+                out.active_near_observer += 1;
+            }
+        }
+    }
+    // The other 192: 8 x 24 at 1.25 m across the west plaza.
+    for i in 0..8 {
+        for j in 0..24 {
+            spawn_active(
+                world,
+                &mut out,
+                [2.0 + i as f64 * 1.25, 3.0, 26.0 + j as f64 * 1.25],
+            );
+        }
+    }
+    debug_assert_eq!(out.active.len(), G4_ACTIVE_BODY_COUNT);
+
+    let per_layer = G4_SLEEPER_SIDE * G4_SLEEPER_SIDE;
+    let sleeper_cells = cells_of(solid_block(2));
+    for k in 0..G4_SLEEPING_BODY_COUNT {
+        let layer = k / per_layer;
+        let slot = k % per_layer;
+        let x = G4_SLEEPER_ORIGIN_M[0] + (slot % G4_SLEEPER_SIDE) as f64 * G4_SLEEPER_SPACING_M;
+        let z = G4_SLEEPER_ORIGIN_M[1] + (slot / G4_SLEEPER_SIDE) as f64 * G4_SLEEPER_SPACING_M;
+        let entity = spawn(
+            world,
+            Box::new(solid_block(2)),
+            [x, 1.0 + layer as f64 * 0.5, z],
+        );
+        let deactivated = world.deactivate_body(entity);
+        debug_assert!(deactivated);
+        out.sleeping_total += 1;
+        out.sleeping_cells += sleeper_cells;
+    }
+    out
+}
+
+/// Keeps the fixture's designated active bodies genuinely awake and in the
+/// solver for the whole run: every `HOP_PERIOD` ticks (staggered per body) a
+/// body that has slowed below `0.6 m/s` is hopped upward with a steering
+/// velocity back toward its home spot, plus a deterministic jitter. This is
+/// **fixture stimulus** applied to authoritative physics state (motion is
+/// replicated to clients as ordinary snapshots); it is not an edit, and
+/// committed topology, replay, and hashes are unaffected by it.
+pub fn agitate_g4_bodies(world: &mut crate::world::SimWorld, bodies: &[G4ActiveBody], tick: u64) {
+    const HOP_PERIOD: u64 = 45;
+    for (i, b) in bodies.iter().enumerate() {
+        if !(tick + i as u64).is_multiple_of(HOP_PERIOD) {
+            continue;
+        }
+        let Some(body) = world.body(b.entity) else {
+            continue;
+        };
+        if body.dormant || body.linvel_m_s.iter().map(|v| v * v).sum::<f64>().sqrt() > 0.6 {
+            continue;
+        }
+        let phys = body.phys;
+        let pos = body.pose.translation_m;
+        let h = |salt: u64| -> f32 {
+            let mut x = (i as u64 + 1)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add((tick / HOP_PERIOD).wrapping_mul(0xBF58_476D_1CE4_E5B9))
+                .wrapping_add(salt);
+            x ^= x >> 31;
+            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^= x >> 29;
+            ((x % 2001) as f32 / 1000.0) - 1.0
+        };
+        let steer = |d: f64| (d * 0.8).clamp(-1.5, 1.5) as f32;
+        let lin = [
+            steer(b.home[0] - pos[0]) + 0.4 * h(1),
+            2.5 + 0.5 * h(2),
+            steer(b.home[2] - pos[2]) + 0.4 * h(3),
+        ];
+        let ang = [2.0 * h(4), 2.0 * h(5), 2.0 * h(6)];
+        world.physics_mut().set_body_velocity(phys, lin, ang);
+    }
+}
