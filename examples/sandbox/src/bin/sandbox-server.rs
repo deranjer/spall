@@ -288,11 +288,14 @@ fn run_serve(args: Args) -> ExitCode {
     ) {
         (None, None, None) => None,
         (Some(warmup_ticks), Some(measured_ticks), Some(max_samples))
-            if measured_ticks > 0 && max_samples > 0 => Some(TimingWindow {
+            if measured_ticks > 0 && max_samples > 0 =>
+        {
+            Some(TimingWindow {
                 warmup_ticks,
                 measured_ticks,
                 max_samples,
-            }),
+            })
+        }
         _ => {
             eprintln!(
                 "sandbox-server: --timing-warmup-ticks, --timing-measured-ticks (>0), and --timing-max-samples (>0) must be supplied together"

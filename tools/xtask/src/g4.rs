@@ -355,7 +355,10 @@ pub fn evaluate(
             in_window.len(),
             wall_seconds
         ),
-        format!(">= {} samples, run reached tick {win_hi}", expected_samples.saturating_sub(2)),
+        format!(
+            ">= {} samples, run reached tick {win_hi}",
+            expected_samples.saturating_sub(2)
+        ),
     );
 
     // --- per-client steady egress -------------------------------------------
@@ -376,9 +379,7 @@ pub fn evaluate(
         let mut rates: Vec<f64> = series
             .windows(2)
             .filter(|w| w[1].0 > w[0].0)
-            .map(|w| {
-                (w[1].1.saturating_sub(w[0].1)) as f64 / ((w[1].0 - w[0].0) as f64 / 1000.0)
-            })
+            .map(|w| (w[1].1.saturating_sub(w[0].1)) as f64 / ((w[1].0 - w[0].0) as f64 / 1000.0))
             .collect();
         let window_bytes = match (series.first(), series.last()) {
             (Some(a), Some(b)) => b.1.saturating_sub(a.1),
@@ -419,7 +420,10 @@ pub fn evaluate(
             egress_rows.len(),
             egress_rows.iter().map(|r| r.intervals).min().unwrap_or(0)
         ),
-        format!("{clients} clients x >= {} intervals", expected_samples.saturating_sub(2)),
+        format!(
+            "{clients} clients x >= {} intervals",
+            expected_samples.saturating_sub(2)
+        ),
     );
     add(
         "steady per-client egress p95 <= cap",
@@ -502,7 +506,10 @@ pub fn evaluate(
     add(
         "every named blast committed",
         cfg.expected_blasts > 0 && blasts_in_window.len() as u64 >= cfg.expected_blasts,
-        format!("{} blast commits in the measured window", blasts_in_window.len()),
+        format!(
+            "{} blast commits in the measured window",
+            blasts_in_window.len()
+        ),
         format!(">= {}", cfg.expected_blasts),
     );
     add(
@@ -511,10 +518,28 @@ pub fn evaluate(
         format!(
             "{recovered} of {} recovered (worst first-window peak {} KiB / {} ms; worst tail {} KiB / {} ms)",
             blast_rows.len(),
-            blast_rows.iter().map(|b| b.peak_bytes_first_window).max().unwrap_or(0) / 1024,
-            blast_rows.iter().map(|b| b.peak_age_ms_first_window).max().unwrap_or(0),
-            blast_rows.iter().map(|b| b.tail_max_bytes).max().unwrap_or(0) / 1024,
-            blast_rows.iter().map(|b| b.tail_max_age_ms).max().unwrap_or(0),
+            blast_rows
+                .iter()
+                .map(|b| b.peak_bytes_first_window)
+                .max()
+                .unwrap_or(0)
+                / 1024,
+            blast_rows
+                .iter()
+                .map(|b| b.peak_age_ms_first_window)
+                .max()
+                .unwrap_or(0),
+            blast_rows
+                .iter()
+                .map(|b| b.tail_max_bytes)
+                .max()
+                .unwrap_or(0)
+                / 1024,
+            blast_rows
+                .iter()
+                .map(|b| b.tail_max_age_ms)
+                .max()
+                .unwrap_or(0),
         ),
         format!(
             "<= {} KiB and <= {} ms within {} s of each blast",
@@ -595,7 +620,9 @@ pub fn evaluate(
     );
     add(
         "sleeping persistent bodies throughout the window",
-        bodies.min_dormant.is_some_and(|m| m >= cfg.min_dormant_bodies),
+        bodies
+            .min_dormant
+            .is_some_and(|m| m >= cfg.min_dormant_bodies),
         format!("min {:?}", bodies.min_dormant),
         format!(">= {}", cfg.min_dormant_bodies),
     );
@@ -618,8 +645,7 @@ pub fn evaluate(
             standing.is_some_and(|y| y >= 0.0) && lowest <= -3.0,
             format!(
                 "giant origin y {:?} m -> lowest {:.1} m; {large_collapse_samples} commit(s) classed large (the block stays the parent, so the detached plate is small)",
-                standing,
-                lowest
+                standing, lowest
             ),
             "starts >= 0 m, falls to <= -3 m".to_string(),
         );
@@ -677,7 +703,10 @@ pub fn evaluate(
             max_rate.map_or("no transfer long enough to time".into(), |r| {
                 format!("max {:.0} KiB/s", r / 1024.0)
             }),
-            format!("<= {:.0} KiB/s and a server-side limiter configured", cap as f64 / 1024.0),
+            format!(
+                "<= {:.0} KiB/s and a server-side limiter configured",
+                cap as f64 / 1024.0
+            ),
         );
     }
 
@@ -719,7 +748,11 @@ mod tests {
                 tick,
                 elapsed_ms: tick * 1000 / 60,
                 process_bytes: Some(1_000_000_000),
-                backlog_max_bytes: if (900..960).contains(&tick) { 500_000 } else { 100 },
+                backlog_max_bytes: if (900..960).contains(&tick) {
+                    500_000
+                } else {
+                    100
+                },
                 backlog_max_age_ms: if (900..960).contains(&tick) { 900 } else { 5 },
                 clients: (0..2)
                     .map(|slot| ClientSample {

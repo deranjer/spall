@@ -162,7 +162,8 @@ pub const MAX_RELIABLE_BACKLOG: usize = 2048;
 
 /// Count of reliable-backlog overflows (a client disconnected because its
 /// backlog blew a cap) since the last [`serve`] start.
-static RELIABLE_BACKLOG_OVERFLOWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RELIABLE_BACKLOG_OVERFLOWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Byte ceiling on that same per-client reliable queue.
 pub const MAX_RELIABLE_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
@@ -370,7 +371,10 @@ impl Scene {
             // The integrated workload's destructible bodies and debris, built
             // once at scene-construction time (entity-id order is part of the
             // harness's edit generator; see `spall_voxel::fixtures`).
-            spall_sim::fixtures::spawn_g4_integrated_bodies(sim.world_mut(), self.player_spawns()[0]);
+            spall_sim::fixtures::spawn_g4_integrated_bodies(
+                sim.world_mut(),
+                self.player_spawns()[0],
+            );
         }
         if matches!(self, Scene::G1FullEnvelope) {
             // The gate's "moving hollow test volume" — built once at
@@ -1679,11 +1683,14 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             };
             ticks_run += 1;
             let tick = sim.current_tick();
-            if ticks_run % 6 == 0 {
+            if ticks_run.is_multiple_of(6) {
                 sampler.observe_backlog(&clients_for_sim);
             }
-            if ticks_run % 60 == 0 {
-                sampler.sample(ticks_run, body_census(sim.world(), observer, !agitated.is_empty()));
+            if ticks_run.is_multiple_of(60) {
+                sampler.sample(
+                    ticks_run,
+                    body_census(sim.world(), observer, !agitated.is_empty()),
+                );
             }
 
             // T21 / ENG-28 increment 4 (3c): opt-in contact damage + region
@@ -2041,9 +2048,21 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             backlog_peak_bytes: sampler.peak_bytes.max(sampler.interval_bytes),
             backlog_peak_age_ms: sampler.peak_age_ms.max(sampler.interval_age_ms),
             capture_pool_workers: lj.capture_pool.workers,
-            capture_pool_submitted: lj.capture_pool.stats.submitted.load(std::sync::atomic::Ordering::Relaxed),
-            capture_pool_active_max: lj.capture_pool.stats.active_max.load(std::sync::atomic::Ordering::Relaxed),
-            capture_pool_queued_max: lj.capture_pool.stats.queued_max.load(std::sync::atomic::Ordering::Relaxed),
+            capture_pool_submitted: lj
+                .capture_pool
+                .stats
+                .submitted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            capture_pool_active_max: lj
+                .capture_pool
+                .stats
+                .active_max
+                .load(std::sync::atomic::Ordering::Relaxed),
+            capture_pool_queued_max: lj
+                .capture_pool
+                .stats
+                .queued_max
+                .load(std::sync::atomic::Ordering::Relaxed),
             ok: shutdown_error.is_none(),
             error: shutdown_error,
             ticks_run,
@@ -2103,7 +2122,9 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             contact_damage_cuts_rejected,
             dormancy_deactivations_total,
             dormancy_reactivations_total,
-            timing: timing.map(|stats| stats.finish(ticks_run)).unwrap_or_default(),
+            timing: timing
+                .map(|stats| stats.finish(ticks_run))
+                .unwrap_or_default(),
         }
     });
 
@@ -2401,11 +2422,7 @@ struct BodyCensus {
     giant_y: Option<f64>,
 }
 
-fn body_census(
-    world: &spall_sim::SimWorld,
-    observer: [f64; 3],
-    integrated: bool,
-) -> BodyCensus {
+fn body_census(world: &spall_sim::SimWorld, observer: [f64; 3], integrated: bool) -> BodyCensus {
     let mut c = BodyCensus::default();
     if integrated {
         c.giant_y = spall_core::EntityId::new(spall_voxel::fixtures::G4_ENTITY_FIRST)
@@ -3820,6 +3837,7 @@ async fn wait_true(mut rx: watch::Receiver<bool>) {
 
 /// One client connection: a reader that forwards records to the bridge and a
 /// writer that drains this client's outbound queue.
+#[allow(clippy::too_many_arguments)]
 async fn serve_conn(
     conn: Arc<Connection>,
     inbound: mpsc::Sender<Inbound>,
@@ -3916,7 +3934,9 @@ async fn serve_conn(
                         .send_record(WireRecord::ActionStatus((*s).clone()))
                         .await
                         .is_ok(),
-                    Outbound::Baseline(transfer) => send_baseline(&conn, &transfer, &telemetry).await,
+                    Outbound::Baseline(transfer) => {
+                        send_baseline(&conn, &transfer, &telemetry).await
+                    }
                     // Motion is never queued as reliable; ignore defensively.
                     Outbound::Motion(_) => true,
                     Outbound::Shutdown(reason) => {
@@ -3928,10 +3948,9 @@ async fn serve_conn(
                     break 'writer;
                 }
                 let age = handle.delivered();
-                telemetry.max_delivery_age_us.fetch_max(
-                    age.as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                telemetry
+                    .max_delivery_age_us
+                    .fetch_max(age.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(snaps) = batch.motion {
                 for snap in snaps.iter() {
@@ -4719,7 +4738,10 @@ mod tests {
         let per_msg = reliable_msg_bytes(&empty_tx());
         let rounds = MAX_RELIABLE_BACKLOG_BYTES / per_msg * 3;
         for i in 0..rounds {
-            assert!(h.push(empty_tx()).is_ok(), "push {i} refused by a drained queue");
+            assert!(
+                h.push(empty_tx()).is_ok(),
+                "push {i} refused by a drained queue"
+            );
             let batch = h.take();
             assert_eq!(batch.reliable.len(), 1);
             let (bytes, _) = h.backlog();

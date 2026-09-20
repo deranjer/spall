@@ -1067,19 +1067,18 @@ pub fn spawn_g4_integrated_bodies(
     out.tower_cells = cells_of(v::g4_tower_body);
 
     let mut n = 0usize;
-    let mut spawn_active = |world: &mut crate::world::SimWorld,
-                            out: &mut G4IntegratedBodies,
-                            at: [f64; 3]| {
-        let (build, cells): (Box<dyn FnOnce(VolumeId) -> Volume>, u64) = match n % 3 {
-            0 => (Box::new(solid_block(4)), cells_of(solid_block(4))),
-            1 => (Box::new(hollow_crate(4, 1)), cells_of(hollow_crate(4, 1))),
-            _ => (Box::new(l_beam()), cells_of(l_beam())),
+    let mut spawn_active =
+        |world: &mut crate::world::SimWorld, out: &mut G4IntegratedBodies, at: [f64; 3]| {
+            let (build, cells): (Box<dyn FnOnce(VolumeId) -> Volume>, u64) = match n % 3 {
+                0 => (Box::new(solid_block(4)), cells_of(solid_block(4))),
+                1 => (Box::new(hollow_crate(4, 1)), cells_of(hollow_crate(4, 1))),
+                _ => (Box::new(l_beam()), cells_of(l_beam())),
+            };
+            let entity = spawn(world, build, at);
+            out.active.push(G4ActiveBody { entity, home: at });
+            out.active_cells += cells;
+            n += 1;
         };
-        let entity = spawn(world, build, at);
-        out.active.push(G4ActiveBody { entity, home: at });
-        out.active_cells += cells;
-        n += 1;
-    };
     for at in g4_integrated_active_homes() {
         spawn_active(world, &mut out, at);
         let d = ((at[0] - observer[0]).powi(2)

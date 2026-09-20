@@ -94,11 +94,7 @@ impl OccupancyGrid {
         for (coord, snap) in &snaps {
             let base = [coord.x * 32, coord.y * 32, coord.z * 32];
             // The brick's overlap with the region, in global cells.
-            let g0 = [
-                base[0].max(min.x),
-                base[1].max(min.y),
-                base[2].max(min.z),
-            ];
+            let g0 = [base[0].max(min.x), base[1].max(min.y), base[2].max(min.z)];
             let g1 = [
                 (base[0] + 31).min(max.x),
                 (base[1] + 31).min(max.y),

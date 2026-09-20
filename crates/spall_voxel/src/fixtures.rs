@@ -1200,7 +1200,10 @@ pub fn g4_comb_body(id: VolumeId) -> Volume {
 
 /// Body-local cell of the `tooth`-th tooth's cut (`0..64`).
 pub fn g4_comb_cut_cell(tooth: i64) -> [i64; 3] {
-    let (tx, tz) = (tooth % G4_COMB_TEETH_PER_SIDE, tooth / G4_COMB_TEETH_PER_SIDE);
+    let (tx, tz) = (
+        tooth % G4_COMB_TEETH_PER_SIDE,
+        tooth / G4_COMB_TEETH_PER_SIDE,
+    );
     [1 + 2 * tx, G4_COMB_CUT_Y, 1 + 2 * tz]
 }
 

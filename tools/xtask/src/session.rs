@@ -330,6 +330,11 @@ struct Scenario {
     /// clients (default: the scenario's `clients`).
     #[serde(default)]
     server_max_clients: Option<usize>,
+    /// T23 / G4 overload: the generated edit stream is spread over only the first
+    /// this-many clients (default: all `clients`), so clients the server will
+    /// refuse are not assigned edits.
+    #[serde(default)]
+    edit_clients: Option<u64>,
     /// T21 / ENG-28 increment 4 (3c): run the server with `--dormancy` — a
     /// settled body with nothing active nearby deactivates, and a dormant body
     /// a player or edit approaches reactivates. Never combine with
@@ -2142,7 +2147,10 @@ mod requirement_tests {
             let by_client = generate_sustained_cuts(&s, server_ticks, 8);
             let all: Vec<&GeneratedCut> = by_client.values().flatten().collect();
             assert_eq!(all.len() as u64, n_small + n_blasts + 1);
-            assert!(all.iter().all(|c| c.target == Some("body") && c.entity.is_some()));
+            assert!(
+                all.iter()
+                    .all(|c| c.target == Some("body") && c.entity.is_some())
+            );
             let mut seen = std::collections::HashSet::new();
             for c in &all {
                 assert!(
@@ -2336,7 +2344,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         "--min-clients",
         &min_clients.to_string(),
         "--max-clients",
-        &scenario.server_max_clients.unwrap_or(clients as usize).to_string(),
+        &scenario
+            .server_max_clients
+            .unwrap_or(clients as usize)
+            .to_string(),
         "--scene",
         &scenario.scene,
         "--quiescence-ticks",
@@ -2515,7 +2526,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     let generated_by_client: BTreeMap<u64, Vec<GeneratedCut>> = scenario
         .sustained_edits
         .as_ref()
-        .map(|s| generate_sustained_cuts(s, server_ticks, clients))
+        .map(|s| generate_sustained_cuts(s, server_ticks, scenario.edit_clients.unwrap_or(clients)))
         .unwrap_or_default();
 
     // Spawn the clients.
@@ -2831,7 +2842,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         server_ticks,
         server.transactions_committed,
         &client_summaries,
-        run.loss_percent > 0 || scenario.join_budget.is_some() || scenario.network_envelope.is_some(),
+        run.loss_percent > 0
+            || scenario.join_budget.is_some()
+            || scenario.network_envelope.is_some(),
     );
     if !residency_requirements_met(&scenario, &server, &client_summaries) {
         requirements_met = false;
@@ -2918,30 +2931,33 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     if scenario.server_timing.is_some() && !server_timing_ok {
         requirements_met = false;
     }
-    let g4_row = scenario.g4_telemetry.as_ref().map_or_else(g4::G4Row::unconfigured, |cfg| {
-        // The harness knows what it drove: fill the expectations the scenario
-        // left at zero from the very counts the generator used.
-        let mut cfg = cfg.clone();
-        if let Some(s) = &scenario.sustained_edits {
-            let (n_small, n_blasts, _) = sustained_counts(s, server_ticks);
-            if cfg.expected_ordinary_edits == 0 {
-                cfg.expected_ordinary_edits = n_small;
+    let g4_row = scenario
+        .g4_telemetry
+        .as_ref()
+        .map_or_else(g4::G4Row::unconfigured, |cfg| {
+            // The harness knows what it drove: fill the expectations the scenario
+            // left at zero from the very counts the generator used.
+            let mut cfg = cfg.clone();
+            if let Some(s) = &scenario.sustained_edits {
+                let (n_small, n_blasts, _) = sustained_counts(s, server_ticks);
+                if cfg.expected_ordinary_edits == 0 {
+                    cfg.expected_ordinary_edits = n_small;
+                }
+                if cfg.expected_blasts == 0 {
+                    cfg.expected_blasts = n_blasts;
+                }
             }
-            if cfg.expected_blasts == 0 {
-                cfg.expected_blasts = n_blasts;
+            if cfg.expected_baseline_sends == 0 {
+                cfg.expected_baseline_sends = scenario.late_join_clients.len() as u64;
             }
-        }
-        if cfg.expected_baseline_sends == 0 {
-            cfg.expected_baseline_sends = scenario.late_join_clients.len() as u64;
-        }
-        g4::evaluate(
-            &cfg,
-            &server.g4,
-            server.process_peak_memory_bytes,
-            clients,
-            server.large_collapse_samples,
-        )
-    });
+            g4::evaluate(
+                &cfg,
+                &server.g4,
+                server.process_peak_memory_bytes,
+                clients,
+                server.large_collapse_samples,
+            )
+        });
     if !g4_row.requirements_met {
         requirements_met = false;
     }
@@ -2960,27 +2976,28 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         latency_targets_configured: scenario.latency_targets.is_some(),
         latency_targets_met: latency_ok,
     };
-    let server_timing = scenario.server_timing.as_ref().map_or_else(
-        ServerTimingRow::unconfigured,
-        |t| ServerTimingRow {
-            configured: true,
-            warmup_ticks: t.warmup_ticks,
-            measured_ticks: t.measured_ticks,
-            max_samples: t.max_samples,
-            tick_busy_p95_ms: server.tick_busy_p95_ms,
-            tick_busy_p99_ms: server.tick_busy_p99_ms,
-            tick_busy_max_ms: server.tick_busy_max_ms,
-            tick_busy_samples: server.tick_busy_samples,
-            tick_busy_window_complete: server.tick_busy_window_complete,
-            physics_p95_ms: server.physics_p95_ms,
-            physics_p99_ms: server.physics_p99_ms,
-            physics_max_ms: server.physics_max_ms,
-            physics_samples: server.physics_samples,
-            physics_window_complete: server.physics_window_complete,
-            process_peak_memory_bytes: server.process_peak_memory_bytes,
-            requirements_met: server_timing_ok,
-        },
-    );
+    let server_timing =
+        scenario
+            .server_timing
+            .as_ref()
+            .map_or_else(ServerTimingRow::unconfigured, |t| ServerTimingRow {
+                configured: true,
+                warmup_ticks: t.warmup_ticks,
+                measured_ticks: t.measured_ticks,
+                max_samples: t.max_samples,
+                tick_busy_p95_ms: server.tick_busy_p95_ms,
+                tick_busy_p99_ms: server.tick_busy_p99_ms,
+                tick_busy_max_ms: server.tick_busy_max_ms,
+                tick_busy_samples: server.tick_busy_samples,
+                tick_busy_window_complete: server.tick_busy_window_complete,
+                physics_p95_ms: server.physics_p95_ms,
+                physics_p99_ms: server.physics_p99_ms,
+                physics_max_ms: server.physics_max_ms,
+                physics_samples: server.physics_samples,
+                physics_window_complete: server.physics_window_complete,
+                process_peak_memory_bytes: server.process_peak_memory_bytes,
+                requirements_met: server_timing_ok,
+            });
 
     all_match &= requirements_met;
     finish(

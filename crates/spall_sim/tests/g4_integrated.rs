@@ -141,7 +141,11 @@ fn a_comb_cut_a_tower_blast_and_the_giant_cut_each_commit_and_detach() {
     let e = vfix::g4_ordinary_edit(0).unwrap();
     sim.submit(body_cut(1, e)).unwrap();
     let (committed, rejected) = run(&mut sim, 8);
-    assert_eq!((committed, rejected.len()), (1, 0), "comb cut: {rejected:?}");
+    assert_eq!(
+        (committed, rejected.len()),
+        (1, 0),
+        "comb cut: {rejected:?}"
+    );
     assert_eq!(sim.world().body_count(), bodies_before + 1, "one tooth tip");
     let comb = sim.world().body(EntityId::new(e.entity).unwrap()).unwrap();
     assert!(!comb.dormant, "the edit woke the comb");
@@ -150,7 +154,11 @@ fn a_comb_cut_a_tower_blast_and_the_giant_cut_each_commit_and_detach() {
     sim.submit(body_cut(2, b)).unwrap();
     let (committed, rejected) = run(&mut sim, 8);
     assert_eq!((committed, rejected.len()), (1, 0), "blast: {rejected:?}");
-    assert_eq!(sim.world().body_count(), bodies_before + 2, "the upper shaft");
+    assert_eq!(
+        sim.world().body_count(),
+        bodies_before + 2,
+        "the upper shaft"
+    );
     let shed = sim
         .world()
         .bodies()

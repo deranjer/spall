@@ -1451,10 +1451,10 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 }
 
                 let mut request = action.request.clone();
-                if let ScriptTarget::Body(raw) = action.target {
-                    if let Ok(entity) = spall_core::EntityId::new(raw) {
-                        request.claimed_target = ClaimedTarget::Body(entity);
-                    }
+                if let ScriptTarget::Body(raw) = action.target
+                    && let Ok(entity) = spall_core::EntityId::new(raw)
+                {
+                    request.claimed_target = ClaimedTarget::Body(entity);
                 }
                 if action.target == ScriptTarget::DetachedBody {
                     // Aim at the sole detached body. It only exists once an
