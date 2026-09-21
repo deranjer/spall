@@ -205,6 +205,8 @@ pub struct SimWorld {
     /// one; with `None`, an edit that needs evicted geometry is rejected rather
     /// than reloaded.
     backing: Option<std::sync::Arc<dyn crate::backing::BrickBacking>>,
+    /// Per-brick terrain colliders (prototype, default off): see [`crate::terrain_bricks`].
+    pub(crate) terrain_bricks: Option<crate::terrain_bricks::TerrainBricks>,
 }
 
 /// A shared empty digest set, so [`SimWorld::evicted`] can return a reference
@@ -272,6 +274,7 @@ impl SimWorld {
             window_stats: spall_physics::WindowStats::default(),
             evicted: BTreeMap::new(),
             backing: None,
+            terrain_bricks: None,
         })
     }
 
@@ -731,7 +734,7 @@ impl SimWorld {
         // else's sweep. Ordinary dynamic bodies (debris, detached
         // structures) are *never* excluded either way: they stay fully
         // visible, exactly as before this round.
-        let terrain_id = self.terrain.phys;
+        let terrain_ids = self.terrain_physics_bodies();
         for (key, player) in &mut self.players {
             let my = windows.iter().find(|w| w.key == *key);
             let my_fresh = my.is_some_and(|w| w.fresh);
@@ -746,7 +749,7 @@ impl SimWorld {
             }
             let mut exclude: Vec<PhysBodyId> = Vec::with_capacity(windows.len());
             if my_fresh {
-                exclude.push(terrain_id);
+                exclude.extend(terrain_ids.iter().copied());
             } else if let Some(id) = my_window_id {
                 exclude.push(id);
             }
@@ -901,7 +904,9 @@ impl SimWorld {
     /// Idempotent; a no-op for an unknown volume.
     pub fn retire_empty_volume(&mut self, volume: VolumeId) {
         if volume == self.terrain.volume_id {
-            self.physics.remove_collider(self.terrain.phys);
+            for id in self.terrain_physics_bodies() {
+                self.physics.remove_collider(id);
+            }
             self.terrain.collider_revision += 1;
             return;
         }

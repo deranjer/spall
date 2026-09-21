@@ -894,6 +894,9 @@ pub struct ServeSummary {
     /// Coverage of the containment census that produced `out_of_world_bodies`.
     #[serde(default)]
     pub containment_coverage: ContainmentCoverage,
+    /// `(elapsed_ms, max unsent reliable bytes, max age ms)` over all clients, every 6 ticks.
+    #[serde(default)]
+    pub backlog_series: Vec<(u64, u64, u64)>,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -2290,6 +2293,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 sampler.escapes.clone()
             },
             containment_coverage: sampler.coverage.clone(),
+            backlog_series: sampler.backlog_series.clone(),
             samples: sampler.samples,
             blast_commit_ticks,
             blast_commit_elapsed_ms,
@@ -2610,6 +2614,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         wake_reasons: sim_result.wake_reasons.clone(),
         out_of_world_bodies: sim_result.out_of_world.clone(),
         containment_coverage: sim_result.containment_coverage.clone(),
+        backlog_series: sim_result.backlog_series.clone(),
         baseline_capture_encode_ms: telemetry
             .capture_encode_ms
             .lock()
@@ -2741,6 +2746,7 @@ struct TelemetrySampler {
     escapes: Vec<OutOfWorldRow>,
     census_offset: usize,
     coverage: ContainmentCoverage,
+    backlog_series: Vec<(u64, u64, u64)>,
     start: std::time::Instant,
     conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
     samples: Vec<TelemetrySample>,
@@ -2765,6 +2771,7 @@ impl TelemetrySampler {
             escapes: Vec::new(),
             census_offset: 0,
             coverage: ContainmentCoverage::default(),
+            backlog_series: Vec::new(),
         }
     }
 
@@ -2772,10 +2779,19 @@ impl TelemetrySampler {
     /// maxima.
     fn observe_backlog(&mut self, clients: &ClientMap) {
         let guard = clients.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut now_bytes, mut now_age) = (0u64, 0u64);
         for handle in guard.values() {
             let (bytes, age) = handle.backlog();
-            self.interval_bytes = self.interval_bytes.max(bytes as u64);
-            self.interval_age_ms = self.interval_age_ms.max(age.as_millis() as u64);
+            now_bytes = now_bytes.max(bytes as u64);
+            now_age = now_age.max(age.as_millis() as u64);
+        }
+        self.interval_bytes = self.interval_bytes.max(now_bytes);
+        self.interval_age_ms = self.interval_age_ms.max(now_age);
+        // A fine-grained (every 6 ticks) series: the once-per-second samples are too coarse to judge
+        // a recovery window that ends a couple of seconds before the next blast.
+        if self.backlog_series.len() < BACKLOG_SERIES_MAX {
+            self.backlog_series
+                .push((self.start.elapsed().as_millis() as u64, now_bytes, now_age));
         }
     }
 
@@ -2853,6 +2869,8 @@ pub struct OutOfWorldRow {
 }
 
 const ESCAPE_MAX_ROWS: usize = 64;
+/// Upper bound on the fine-grained backlog series (one entry per 6 ticks: ~4.6 h at 60 Hz).
+const BACKLOG_SERIES_MAX: usize = 100_000;
 /// Per-body prefilter cap (terrain samples over the collider bounds) and per-scan budget: bodies
 /// beyond either are *counted* in [`ContainmentCoverage`], never treated as clear.
 const CENSUS_MAX_AABB_SAMPLES: u64 = 65_536;
@@ -3185,6 +3203,7 @@ fn percentile(samples: &[f64], fraction: f64) -> f64 {
 struct SimResult {
     out_of_world: Vec<OutOfWorldRow>,
     containment_coverage: ContainmentCoverage,
+    backlog_series: Vec<(u64, u64, u64)>,
     wake_reasons: Vec<WakeReasonRow>,
     stage_timings: Vec<StageTimingRow>,
     samples: Vec<TelemetrySample>,
@@ -3252,6 +3271,7 @@ impl SimResult {
         Self {
             out_of_world: Vec::new(),
             containment_coverage: ContainmentCoverage::default(),
+            backlog_series: Vec::new(),
             stage_timings: Vec::new(),
             wake_reasons: Vec::new(),
             samples: Vec::new(),

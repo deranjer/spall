@@ -306,31 +306,57 @@ pub fn commit(
     // pass re-evict an already-reloaded one before the set is ever whole. Ask
     // for every evicted brick in the volume at once so a single reload makes the
     // candidate's whole bounding box resident and the retry commits next tick.
-    let sp4 = crate::prof::Span::start("commit.occupancy_extract");
-    let occupancy = match OccupancyGrid::from_volume(&parent_candidate) {
-        Ok(o) => o,
-        Err(spall_physics::ExtractError::Unresident(_)) if !world.evicted(vid).is_empty() => {
-            return Err(CommitError::EvictedGeometryRequired {
-                volume: vid,
-                bricks: world.evicted(vid).iter().map(|(c, _)| c).collect(),
-            });
+    // Per-brick terrain colliders (prototype, off by default): plan only the bricks this edit
+    // changed, before publish, instead of extracting and planning the whole terrain.
+    let terrain_brick_plans = if parent_is_terrain && world.terrain_brick_colliders_enabled() {
+        let mut coords: Vec<BrickCoord> = cut_outcome.bricks.iter().map(|b| b.coord).collect();
+        if let Some(remove) = &remove_outcome {
+            coords.extend(remove.bricks.iter().map(|b| b.coord));
         }
-        Err(e) => return Err(e.into()),
+        coords.sort_by_key(|c| c.sort_key());
+        coords.dedup();
+        Some(
+            crate::terrain_bricks::plan_terrain_bricks(&parent_candidate, &coords).map_err(
+                |e| match e {
+                    crate::world::WorldError::Occupancy(x) => CommitError::Occupancy(x),
+                    crate::world::WorldError::Collider(x) => CommitError::Collider(x),
+                    other => unreachable!("brick collider planning cannot fail with {other}"),
+                },
+            )?,
+        )
+    } else {
+        None
     };
-    drop(sp4);
-    let sp5 = crate::prof::Span::start("commit.plan_collider");
-    let parent_rebuild = match occupancy {
-        Some(grid) => {
-            let plan = plan_collider(&grid)?;
-            let mass_properties = (!parent_is_terrain).then(|| {
-                analytic_mass_properties(&grid, cell_size.metres(), |m| world.density(m))
-                    .to_body_properties()
-            });
-            Some((plan, mass_properties))
-        }
-        None => None,
+    let parent_rebuild = if terrain_brick_plans.is_some() {
+        None
+    } else {
+        let sp4 = crate::prof::Span::start("commit.occupancy_extract");
+        let occupancy = match OccupancyGrid::from_volume(&parent_candidate) {
+            Ok(o) => o,
+            Err(spall_physics::ExtractError::Unresident(_)) if !world.evicted(vid).is_empty() => {
+                return Err(CommitError::EvictedGeometryRequired {
+                    volume: vid,
+                    bricks: world.evicted(vid).iter().map(|(c, _)| c).collect(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        drop(sp4);
+        let sp5 = crate::prof::Span::start("commit.plan_collider");
+        let parent_rebuild = match occupancy {
+            Some(grid) => {
+                let plan = plan_collider(&grid)?;
+                let mass_properties = (!parent_is_terrain).then(|| {
+                    analytic_mass_properties(&grid, cell_size.metres(), |m| world.density(m))
+                        .to_body_properties()
+                });
+                Some((plan, mass_properties))
+            }
+            None => None,
+        };
+        drop(sp5);
+        parent_rebuild
     };
-    drop(sp5);
     // The cut cleared the parent's last solid cell: its ownership is retired on
     // publish (`ENG-56`). A retired body emits no participant snapshot.
     let parent_emptied = !parent_is_terrain && parent_rebuild.is_none();
@@ -493,29 +519,37 @@ pub fn commit(
     drop(sp6);
     let wake_probe = world.wake_probe();
     let sp7 = crate::prof::Span::start("commit.publish_parent_collider");
-    match parent_rebuild {
-        Some((plan, mass_properties)) => {
-            world
-                .physics_mut()
-                .rebuild_collider(parent_phys, &plan.grid, plan.representation);
-            if let Some(mass_properties) = mass_properties {
+    if let Some(plans) = terrain_brick_plans {
+        // Per-brick terrain colliders: swap only the bricks this edit changed.
+        world.publish_terrain_brick_plans(plans);
+        if let Some(parent) = world.volume_body_mut(vid) {
+            parent.collider_revision += 1;
+        }
+    } else {
+        match parent_rebuild {
+            Some((plan, mass_properties)) => {
                 world
                     .physics_mut()
-                    .set_mass_properties(parent_phys, mass_properties);
+                    .rebuild_collider(parent_phys, &plan.grid, plan.representation);
+                if let Some(mass_properties) = mass_properties {
+                    world
+                        .physics_mut()
+                        .set_mass_properties(parent_phys, mass_properties);
+                }
+                if let Some(parent) = world.volume_body_mut(vid) {
+                    parent.collider_revision += 1;
+                    parent.coarsen_k = plan.coarsen_k;
+                }
             }
-            if let Some(parent) = world.volume_body_mut(vid) {
-                parent.collider_revision += 1;
-                parent.coarsen_k = plan.coarsen_k;
+            None => {
+                // The cut cleared the parent's last solid cell. Retire its
+                // ownership atomically with the edit (`ENG-56`): a detached body
+                // and its physics handle are removed; terrain loses its collider.
+                // Nothing keeps colliding with the obsolete solid shape, and the
+                // transaction's cell-removal ops already carry the emptying for
+                // replicas and for journal replay.
+                world.retire_empty_volume(vid);
             }
-        }
-        None => {
-            // The cut cleared the parent's last solid cell. Retire its
-            // ownership atomically with the edit (`ENG-56`): a detached body
-            // and its physics handle are removed; terrain loses its collider.
-            // Nothing keeps colliding with the obsolete solid shape, and the
-            // transaction's cell-removal ops already carry the emptying for
-            // replicas and for journal replay.
-            world.retire_empty_volume(vid);
         }
     }
 

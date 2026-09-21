@@ -52,6 +52,7 @@ pub mod replication;
 pub mod schedule;
 pub mod sim;
 pub mod stage;
+pub mod terrain_bricks;
 pub mod transfer;
 pub mod world;
 

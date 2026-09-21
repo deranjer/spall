@@ -3052,9 +3052,17 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     max_ms: c.topology_lag_max_ms,
                 })
                 .collect();
+            // `#[serde(flatten)]` leaves fields that ServerSummary also names itself (consumed by
+            // the outer struct) at their defaults in `g4`, so copy them across.
+            let mut facts = server.g4.clone();
+            facts.actions_requested = server.actions_requested;
+            facts.actions_staged = server.actions_staged;
+            facts.actions_rejected = server.actions_rejected;
+            facts.actions_queued_unresolved = server.actions_queued_unresolved;
+            facts.transactions_committed = server.transactions_committed;
             g4::evaluate(
                 &cfg,
-                &server.g4,
+                &facts,
                 server.process_peak_memory_bytes,
                 clients,
                 server.large_collapse_samples,

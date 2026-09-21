@@ -263,7 +263,7 @@ impl Simulation {
         }
 
         let terrain_volume = self.world.terrain_volume_id();
-        let terrain_phys = self.world.terrain().phys;
+        let terrain_bodies = self.world.terrain_physics_bodies();
         let cell_m = self.world.terrain().cell_size().metres();
         let g = {
             let a = self.world.physics().gravity_m_s2();
@@ -293,7 +293,7 @@ impl Simulation {
                 // the world grid (increment 1).
                 (true, false) | (false, true) => {
                     let striker_idx = if contact.dynamic[0] { 0 } else { 1 };
-                    if contact.bodies[1 - striker_idx] != terrain_phys {
+                    if !terrain_bodies.contains(&contact.bodies[1 - striker_idx]) {
                         continue;
                     }
                     let striker_phys = contact.bodies[striker_idx];

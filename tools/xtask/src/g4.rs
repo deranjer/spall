@@ -60,6 +60,10 @@ pub struct G4ServerFacts {
     /// Wall-clock commit time of each blast, parallel to `blast_commit_ticks`.
     #[serde(default)]
     pub blast_commit_elapsed_ms: Vec<u64>,
+    /// Fine-grained `(elapsed_ms, max bytes, max age ms)` backlog series (every 6 ticks); when
+    /// present it is what blast recovery is judged on.
+    #[serde(default)]
+    pub backlog_series: Vec<(u64, u64, u64)>,
     /// Server admission accounting for the whole run (from `ServeSummary`).
     #[serde(default)]
     pub actions_requested: u64,
@@ -288,6 +292,8 @@ fn tick_to_ms(samples: &[Sample], tick: u64) -> Option<u64> {
 /// overlapping blasts explicitly and never turning a missing measurement into either a pass or a
 /// claim of measured excess.
 ///
+/// `samples` are the backlog observations judged (the fine series when there is one); `tick_ref`
+/// are the per-60-tick telemetry samples, used only to map ticks to wall time.
 /// `blast_ticks[i]` is the server tick of blast `i`'s commit; `blast_ms[i]`, when present, is its
 /// wall-clock commit time (otherwise it is interpolated from the samples). Only blasts with
 /// `win_lo < tick <= win_hi` are judged. A sample's interval is `(previous sample's elapsed,
@@ -295,6 +301,7 @@ fn tick_to_ms(samples: &[Sample], tick: u64) -> Option<u64> {
 pub fn assess_blast_recovery(
     cfg: &G4Telemetry,
     samples: &[Sample],
+    tick_ref: &[Sample],
     blast_ticks: &[u64],
     blast_ms: &[u64],
     win_lo: u64,
@@ -309,7 +316,7 @@ pub fn assess_blast_recovery(
             let ms = blast_ms
                 .get(i)
                 .copied()
-                .or_else(|| tick_to_ms(samples, t))?;
+                .or_else(|| tick_to_ms(tick_ref, t))?;
             Some((t, ms))
         })
         .collect();
@@ -324,7 +331,7 @@ pub fn assess_blast_recovery(
             _ => clusters.push(vec![b]),
         }
     }
-    let window_end_ms = tick_to_ms(samples, win_hi).unwrap_or(u64::MAX);
+    let window_end_ms = tick_to_ms(tick_ref, win_hi).unwrap_or(u64::MAX);
     // (interval start, interval end, sample) for every sample.
     let intervals: Vec<(u64, u64, &Sample)> = samples
         .iter()
@@ -709,8 +716,20 @@ pub fn evaluate(
         ),
     );
 
+    // Judge recovery on the fine series when the server recorded one.
+    let series: Vec<Sample> = facts
+        .backlog_series
+        .iter()
+        .map(|(ms, bytes, age)| Sample {
+            elapsed_ms: *ms,
+            backlog_max_bytes: *bytes,
+            backlog_max_age_ms: *age,
+            ..Sample::default()
+        })
+        .collect();
     let blast_rows = assess_blast_recovery(
         cfg,
+        if series.is_empty() { all } else { &series },
         all,
         &facts.blast_commit_ticks,
         &facts.blast_commit_elapsed_ms,
@@ -1099,7 +1118,8 @@ mod tests {
     fn a_blast_that_recovers_is_measured_in_wall_time() {
         // Blast committed at 60 s; the backlog is high for the three seconds after it.
         let samples = per_second(50..=90, 61..64);
-        let rows = assess_blast_recovery(&cfg(), &samples, &[3_600], &[60_000], 0, 90 * 60);
+        let rows =
+            assess_blast_recovery(&cfg(), &samples, &samples, &[3_600], &[60_000], 0, 90 * 60);
         assert_eq!(rows.len(), 1);
         let r = &rows[0];
         assert_eq!(r.status, BlastStatus::Recovered, "{r:#?}");
@@ -1116,7 +1136,7 @@ mod tests {
         let samples: Vec<Sample> = (10..=30u64)
             .map(|k| bsample(k * 60, k * 4_000, (15..18).contains(&k))) // high through 68 s
             .collect();
-        let rows = assess_blast_recovery(&cfg(), &samples, &[900], &[60_000], 0, 30 * 60);
+        let rows = assess_blast_recovery(&cfg(), &samples, &samples, &[900], &[60_000], 0, 30 * 60);
         let r = &rows[0];
         // The interval (64 s, 68 s] straddles the end of the window and is high: the backlog may
         // have recovered late or on time and this sampling cannot say -- not "recovered", and not
@@ -1126,7 +1146,7 @@ mod tests {
         assert!(!r.recovered);
         // The same backlog sampled once a second is unambiguous: excess after the window.
         let fine = per_second(50..=90, 61..70);
-        let rows = assess_blast_recovery(&cfg(), &fine, &[3_600], &[60_000], 0, 90 * 60);
+        let rows = assess_blast_recovery(&cfg(), &fine, &fine, &[3_600], &[60_000], 0, 90 * 60);
         assert_eq!(
             rows[0].status,
             BlastStatus::MeasuredExcess,
@@ -1142,6 +1162,7 @@ mod tests {
         let samples = per_second(50..=100, 61..63);
         let rows = assess_blast_recovery(
             &cfg(),
+            &samples,
             &samples,
             &[3_600, 3_603, 3_606, 4_500],
             &[60_000, 60_050, 60_100, 75_000],
@@ -1164,6 +1185,7 @@ mod tests {
         let rows = assess_blast_recovery(
             &cfg(),
             &samples,
+            &samples,
             &[3_600, 3_780, 3_960],
             &[60_000, 63_000, 66_000],
             0,
@@ -1177,10 +1199,26 @@ mod tests {
     }
 
     #[test]
+    fn a_fine_backlog_series_resolves_what_coarse_tick_samples_cannot() {
+        // Tick references every 10 s cannot judge a 5 s window; a 1 s series can.
+        let coarse: Vec<Sample> = per_second(50..=100, 61..71)
+            .into_iter()
+            .filter(|s| s.tick % 600 == 0)
+            .collect();
+        let fine = per_second(50..=100, 61..63);
+        let rows =
+            assess_blast_recovery(&cfg(), &coarse, &coarse, &[3_600], &[60_000], 0, 100 * 60);
+        assert_eq!(rows[0].status, BlastStatus::NoEvidence, "{:#?}", rows[0]);
+        let rows = assess_blast_recovery(&cfg(), &fine, &coarse, &[3_600], &[60_000], 0, 100 * 60);
+        assert_eq!(rows[0].status, BlastStatus::Recovered, "{:#?}", rows[0]);
+    }
+
+    #[test]
     fn missing_samples_are_no_evidence_not_measured_excess_and_still_fail_closed() {
         // The run stopped 2 s after the blast: nothing was measured after the window.
         let samples = per_second(50..=62, 61..62);
-        let rows = assess_blast_recovery(&cfg(), &samples, &[3_600], &[60_000], 0, 100 * 60);
+        let rows =
+            assess_blast_recovery(&cfg(), &samples, &samples, &[3_600], &[60_000], 0, 100 * 60);
         assert_eq!(rows[0].status, BlastStatus::NoEvidence, "{:#?}", rows[0]);
         assert_eq!(rows[0].tail_samples, 0);
         assert!(rows[0].evidence_gap.is_some());
@@ -1190,6 +1228,7 @@ mod tests {
         let sparse: Vec<Sample> = samples.into_iter().filter(|s| s.tick % 600 == 0).collect();
         let rows = assess_blast_recovery(
             &cfg(),
+            &sparse,
             &sparse,
             &[3_600, 4_200],
             &[60_000, 70_000],
@@ -1227,6 +1266,7 @@ mod tests {
         let measured = g4["measured_ticks"].as_u64().unwrap();
         let rows = assess_blast_recovery(
             &cfg(),
+            &facts.telemetry_samples,
             &facts.telemetry_samples,
             &facts.blast_commit_ticks,
             &facts.blast_commit_elapsed_ms,

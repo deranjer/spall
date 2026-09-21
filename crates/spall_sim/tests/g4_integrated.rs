@@ -37,6 +37,9 @@ fn body_cut(rid: u64, e: G4BodyEdit) -> EditIntent {
 
 fn scene() -> (Simulation, fixtures::G4IntegratedBodies) {
     let mut sim = Simulation::new(SimulationConfig::new(fixtures::g4_integrated_setup())).unwrap();
+    if std::env::var("TERRAIN_BRICKS").is_ok() {
+        sim.world_mut().enable_terrain_brick_colliders().unwrap();
+    }
     let bodies = fixtures::spawn_g4_integrated_bodies(
         sim.world_mut(),
         fixtures::G4_INTEGRATED_SEPARATED_SPAWNS[0],
@@ -1304,4 +1307,71 @@ fn wake_burst_initiators() {
     for ((c, s, a), (n, k)) in rows.iter().take(20) {
         println!("  {c:<14} {s:<12} {a:<14} {n:>5} bursts, {k:>7} woken bodies touched");
     }
+}
+
+/// Full tick cost vs physics-stage cost of the unchanged short workload (declared edit mix
+/// with terrain digs, dormancy on, no audit, no census), for the whole-world terrain collider
+/// (`TERRAIN_BRICKS` unset) or per-brick colliders (`TERRAIN_BRICKS=1`). One mode per
+/// invocation; alternate invocations to compare (`TRACE_TICKS`, default 3600).
+#[test]
+#[ignore = "measurement: full tick and physics cost, terrain collider mode"]
+fn terrain_collider_cost() {
+    use std::time::{Duration, Instant};
+    let ticks: u64 = std::env::var("TRACE_TICKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    let (mut sim, bodies) = scene();
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let mut counters = (1u64, 0u64, 0u64, 0u64, 0u64);
+    let mut total = Vec::new();
+    let mut physics = Vec::new();
+    let mut commit = Vec::new();
+    let mut awake_sum = 0u64;
+    let _ = spall_sim::prof::drain();
+    for t in 0..ticks {
+        workload_step(&mut sim, t, &mut counters);
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        let s = Instant::now();
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+        let d = s.elapsed();
+        let (mut ph, mut cm) = (Duration::ZERO, Duration::ZERO);
+        for (name, dur) in spall_sim::prof::drain() {
+            match name {
+                "physics.rapier_step" | "physics.pose_extract" => ph += dur,
+                "sim.commit" => cm += dur,
+                _ => {}
+            }
+        }
+        if t >= 600 {
+            total.push(d);
+            physics.push(ph);
+            commit.push(cm);
+            awake_sum += sim.world().physics().active_body_count() as u64;
+        }
+    }
+    let stat = |v: &[Duration]| {
+        let mut s = v.to_vec();
+        s.sort();
+        let q = |p: usize| s[(s.len() * p / 100).min(s.len() - 1)].as_secs_f64() * 1e3;
+        let mean = v.iter().sum::<Duration>().as_secs_f64() * 1e3 / v.len() as f64;
+        format!(
+            "mean {mean:.2} p50 {:.2} p95 {:.2} p99 {:.2} max {:.2} ms",
+            q(50),
+            q(95),
+            q(99),
+            q(100)
+        )
+    };
+    println!(
+        "MODE terrain_bricks={} ticks {} (after 600 warmup) digs {}: awake solver bodies avg {}",
+        std::env::var("TERRAIN_BRICKS").is_ok(),
+        total.len(),
+        counters.3,
+        awake_sum / total.len() as u64
+    );
+    println!("  full tick   : {}", stat(&total));
+    println!("  physics     : {}", stat(&physics));
+    println!("  sim.commit  : {}", stat(&commit));
 }

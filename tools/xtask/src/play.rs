@@ -90,7 +90,11 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     run_cargo(&server_build)?;
     run_cargo(&client_build)?;
     let play_binary = |name: &str| {
-        let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_owned() };
+        let exe = if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_owned()
+        };
         target_dir.join(profile).join(exe)
     };
 
