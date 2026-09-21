@@ -880,8 +880,9 @@ pub fn evaluate(
             && facts.actions_queued_unresolved == 0
             && facts.transactions_committed == facts.actions_requested,
         format!(
-            "{} requested, {} committed, {} rejected, {} unresolved (convergence of the committed work is checked separately)",
+            "{} requested, {} staged, {} committed, {} rejected, {} unresolved (convergence of the committed work is checked separately)",
             facts.actions_requested,
+            facts.actions_staged,
             facts.transactions_committed,
             facts.actions_rejected,
             facts.actions_queued_unresolved
