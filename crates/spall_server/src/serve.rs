@@ -839,6 +839,10 @@ pub struct ServeSummary {
     pub telemetry_samples: Vec<TelemetrySample>,
     /// Server ticks at which a named blast (brush radius >= 8 cells) committed.
     pub blast_commit_ticks: Vec<u64>,
+    /// Wall-clock commit time (ms since the timeline clock started) of each blast, parallel to
+    /// `blast_commit_ticks`; the recovery check is measured in wall time, not ticks.
+    #[serde(default)]
+    pub blast_commit_elapsed_ms: Vec<u64>,
     /// Largest per-client unsent reliable backlog (bytes) seen at any sample.
     pub reliable_backlog_peak_bytes: u64,
     /// Age (ms) of the oldest unsent reliable message at the worst sample.
@@ -1676,6 +1680,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut blast_requests: std::collections::HashSet<RequestId> =
             std::collections::HashSet::new();
         let mut blast_commit_ticks: Vec<u64> = Vec::new();
+        let mut blast_commit_elapsed_ms: Vec<u64> = Vec::new();
         let mut sampler = TelemetrySampler::new(std::time::Instant::now(), conns_for_sim.clone());
 
         // T21 / ENG-28 increment 4 (3c): default-off passes. `None` -> every
@@ -1947,6 +1952,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 committed_total += 1;
                 if blast_requests.remove(rid) {
                     blast_commit_ticks.push(ticks_run);
+                    // Same clock as the telemetry samples' `elapsed_ms`.
+                    blast_commit_elapsed_ms.push(sampler.start.elapsed().as_millis() as u64);
                 }
                 // T17 increment 2: a giant split ships its geometry out of band
                 // as a `BaselineTransfer`, keyed to the transaction by
@@ -2281,6 +2288,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             },
             samples: sampler.samples,
             blast_commit_ticks,
+            blast_commit_elapsed_ms,
             backlog_peak_bytes: sampler.peak_bytes.max(sampler.interval_bytes),
             backlog_peak_age_ms: sampler.peak_age_ms.max(sampler.interval_age_ms),
             capture_pool_workers: lj.capture_pool.workers,
@@ -2562,6 +2570,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         tick_busy_over_budget_ticks: sim_result.timing.over_budget_ticks,
         telemetry_samples: sim_result.samples.clone(),
         blast_commit_ticks: sim_result.blast_commit_ticks.clone(),
+        blast_commit_elapsed_ms: sim_result.blast_commit_elapsed_ms.clone(),
         reliable_backlog_peak_bytes: sim_result.backlog_peak_bytes,
         reliable_backlog_peak_age_ms: sim_result.backlog_peak_age_ms,
         reliable_delivery_age_max_ms: telemetry
@@ -3119,6 +3128,7 @@ struct SimResult {
     stage_timings: Vec<StageTimingRow>,
     samples: Vec<TelemetrySample>,
     blast_commit_ticks: Vec<u64>,
+    blast_commit_elapsed_ms: Vec<u64>,
     backlog_peak_bytes: u64,
     backlog_peak_age_ms: u64,
     capture_pool_workers: usize,
@@ -3184,6 +3194,7 @@ impl SimResult {
             wake_reasons: Vec::new(),
             samples: Vec::new(),
             blast_commit_ticks: Vec::new(),
+            blast_commit_elapsed_ms: Vec::new(),
             backlog_peak_bytes: 0,
             backlog_peak_age_ms: 0,
             capture_pool_workers: 0,

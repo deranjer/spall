@@ -57,6 +57,9 @@ pub struct G4ServerFacts {
     pub telemetry_samples: Vec<Sample>,
     #[serde(default)]
     pub blast_commit_ticks: Vec<u64>,
+    /// Wall-clock commit time of each blast, parallel to `blast_commit_ticks`.
+    #[serde(default)]
+    pub blast_commit_elapsed_ms: Vec<u64>,
     #[serde(default)]
     pub reliable_backlog_peak_bytes: u64,
     #[serde(default)]
@@ -206,18 +209,217 @@ pub struct ClientEgressRow {
     pub window_bytes: u64,
 }
 
+/// Whether the unsent-reliable backlog is *measured* to have recovered after a blast (cluster),
+/// measured to have stayed excessive, or was never measured well enough to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlastStatus {
+    /// Every sample interval after the recovery window, up to the next blast cluster, was normal.
+    Recovered,
+    /// A sample interval wholly after the recovery window measured a backlog above normal.
+    MeasuredExcess,
+    /// No verdict is possible: see `evidence_gap`. Acceptance treats this as a failure
+    /// (fail-closed), but it is **not** a measured excessive backlog.
+    NoEvidence,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BlastRow {
-    pub commit_tick: u64,
-    /// Worst unsent reliable backlog / oldest-message age, per client, during
-    /// the 5 s after the blast committed.
+    /// Commit ticks of the blasts in this cluster. Blasts whose commits land within one recovery
+    /// window (wall time) of each other overlap; they are judged together, from the last commit.
+    pub commit_ticks: Vec<u64>,
+    pub first_commit_ms: u64,
+    pub last_commit_ms: u64,
+    /// The recovery window, wall-clock milliseconds after `last_commit_ms`.
+    pub recovery_window_ms: u64,
+    /// Worst unsent reliable backlog / oldest-message age, per client, over samples whose
+    /// intervals overlap the cluster and its recovery window.
     pub peak_bytes_first_window: u64,
     pub peak_age_ms_first_window: u64,
-    /// Samples wholly after the recovery window and before the next blast.
+    /// Samples whose whole interval lies after the recovery window and before the next cluster.
     pub tail_samples: u64,
     pub tail_max_bytes: u64,
     pub tail_max_age_ms: u64,
+    /// Wall time from the last commit to the start of the first sample interval from which the
+    /// backlog stayed normal to the end of the cluster's span; `None` if it never did / unknown.
+    pub recovery_wall_ms: Option<u64>,
+    pub status: BlastStatus,
+    pub evidence_gap: Option<String>,
+    /// Kept for readers of older summaries: `status == Recovered`.
     pub recovered: bool,
+}
+
+/// Maps a server tick to wall-clock milliseconds by linear interpolation between telemetry
+/// samples (used only when the server did not record the commit's wall time).
+fn tick_to_ms(samples: &[Sample], tick: u64) -> Option<u64> {
+    let first = samples.first()?;
+    if tick <= first.tick {
+        return Some(first.elapsed_ms * tick / first.tick.max(1));
+    }
+    for w in samples.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if tick <= b.tick {
+            let span = (b.tick - a.tick).max(1) as f64;
+            let f = (tick - a.tick) as f64 / span;
+            return Some(a.elapsed_ms + ((b.elapsed_ms - a.elapsed_ms) as f64 * f) as u64);
+        }
+    }
+    let last = samples.last()?;
+    // Past the last sample: extrapolate at the last interval's rate.
+    let prev = samples.iter().rev().nth(1).unwrap_or(last);
+    let ms_per_tick =
+        (last.elapsed_ms - prev.elapsed_ms) as f64 / (last.tick - prev.tick).max(1) as f64;
+    Some(last.elapsed_ms + ((tick - last.tick) as f64 * ms_per_tick) as u64)
+}
+
+/// Judges the backlog's recovery after each named blast **in wall-clock time** (a 5 s recovery
+/// window must not stretch to 20 s because the server was running slow ticks), handling
+/// overlapping blasts explicitly and never turning a missing measurement into either a pass or a
+/// claim of measured excess.
+///
+/// `blast_ticks[i]` is the server tick of blast `i`'s commit; `blast_ms[i]`, when present, is its
+/// wall-clock commit time (otherwise it is interpolated from the samples). Only blasts with
+/// `win_lo < tick <= win_hi` are judged. A sample's interval is `(previous sample's elapsed,
+/// its elapsed]`; its backlog maxima describe that whole interval.
+pub fn assess_blast_recovery(
+    cfg: &G4Telemetry,
+    samples: &[Sample],
+    blast_ticks: &[u64],
+    blast_ms: &[u64],
+    win_lo: u64,
+    win_hi: u64,
+) -> Vec<BlastRow> {
+    let recovery_ms = cfg.blast_recovery_sec * 1000;
+    let mut blasts: Vec<(u64, u64)> = blast_ticks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t > win_lo && **t <= win_hi)
+        .filter_map(|(i, &t)| {
+            let ms = blast_ms
+                .get(i)
+                .copied()
+                .or_else(|| tick_to_ms(samples, t))?;
+            Some((t, ms))
+        })
+        .collect();
+    blasts.sort_by_key(|b| b.1);
+    // Blasts whose commits are within one recovery window of the previous one overlap: one cluster.
+    let mut clusters: Vec<Vec<(u64, u64)>> = Vec::new();
+    for b in blasts {
+        match clusters.last_mut() {
+            Some(c) if b.1.saturating_sub(c.last().expect("non-empty").1) <= recovery_ms => {
+                c.push(b)
+            }
+            _ => clusters.push(vec![b]),
+        }
+    }
+    let window_end_ms = tick_to_ms(samples, win_hi).unwrap_or(u64::MAX);
+    // (interval start, interval end, sample) for every sample.
+    let intervals: Vec<(u64, u64, &Sample)> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let start = if i == 0 { 0 } else { samples[i - 1].elapsed_ms };
+            (start, s.elapsed_ms, s)
+        })
+        .collect();
+    let normal = |s: &Sample| {
+        s.backlog_max_bytes <= cfg.backlog_normal_bytes
+            && s.backlog_max_age_ms <= cfg.backlog_normal_age_ms
+    };
+    let mut rows = Vec::new();
+    for (ci, c) in clusters.iter().enumerate() {
+        let first_ms = c[0].1;
+        let last_ms = c.last().expect("non-empty").1;
+        let recovered_by = last_ms + recovery_ms;
+        let next_first = clusters.get(ci + 1).map_or(window_end_ms, |n| n[0].1);
+        let last_cluster = ci + 1 == clusters.len();
+        // Intervals overlapping [first commit, recovered_by].
+        let first_window: Vec<&Sample> = intervals
+            .iter()
+            .filter(|(st, en, _)| *en > first_ms && *st < recovered_by)
+            .map(|(_, _, s)| *s)
+            .collect();
+        // Intervals wholly after the recovery window and ending before the next cluster.
+        let tail: Vec<&Sample> = intervals
+            .iter()
+            .filter(|(st, en, _)| *st >= recovered_by && *en <= next_first)
+            .map(|(_, _, s)| *s)
+            .collect();
+        // The interval that straddles the end of the recovery window (cannot be attributed to
+        // either side of it).
+        let straddle = intervals
+            .iter()
+            .find(|(st, en, _)| *st < recovered_by && *en > recovered_by && *st < next_first)
+            .map(|(_, _, s)| *s);
+        let tail_bytes = tail.iter().map(|s| s.backlog_max_bytes).max().unwrap_or(0);
+        let tail_age = tail.iter().map(|s| s.backlog_max_age_ms).max().unwrap_or(0);
+        let tail_excess = tail.iter().any(|s| !normal(s));
+        let straddle_excess = straddle.is_some_and(|s| !normal(s));
+        let (status, gap) = if tail_excess {
+            (BlastStatus::MeasuredExcess, None)
+        } else if tail.is_empty() {
+            (
+                BlastStatus::NoEvidence,
+                Some(format!(
+                    "no sample interval lies wholly between {recovery_ms} ms after the last commit and the {}",
+                    if last_cluster {
+                        "end of the measured window"
+                    } else {
+                        "next blast cluster"
+                    }
+                )),
+            )
+        } else if straddle_excess {
+            (
+                BlastStatus::NoEvidence,
+                Some(
+                    "the sample interval straddling the end of the recovery window measured excess \
+                     and is too coarse to say whether it fell before or after it"
+                        .to_string(),
+                ),
+            )
+        } else {
+            (BlastStatus::Recovered, None)
+        };
+        // Wall time from the last commit until the backlog stayed normal for the rest of the span.
+        let span: Vec<&(u64, u64, &Sample)> = intervals
+            .iter()
+            .filter(|(st, en, _)| *en > last_ms && *st < next_first)
+            .collect();
+        let mut quiet_from: Option<u64> = None;
+        for (st, _, s) in span.iter().map(|t| (t.0, t.1, t.2)).rev() {
+            if normal(s) {
+                quiet_from = Some(st);
+            } else {
+                break;
+            }
+        }
+        rows.push(BlastRow {
+            commit_ticks: c.iter().map(|b| b.0).collect(),
+            first_commit_ms: first_ms,
+            last_commit_ms: last_ms,
+            recovery_window_ms: recovery_ms,
+            peak_bytes_first_window: first_window
+                .iter()
+                .map(|s| s.backlog_max_bytes)
+                .max()
+                .unwrap_or(0),
+            peak_age_ms_first_window: first_window
+                .iter()
+                .map(|s| s.backlog_max_age_ms)
+                .max()
+                .unwrap_or(0),
+            tail_samples: tail.len() as u64,
+            tail_max_bytes: tail_bytes,
+            tail_max_age_ms: tail_age,
+            recovery_wall_ms: quiet_from.map(|q| q.saturating_sub(last_ms)),
+            status,
+            evidence_gap: gap,
+            recovered: status == BlastStatus::Recovered,
+        });
+    }
+    rows
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -496,58 +698,42 @@ pub fn evaluate(
         ),
     );
 
-    let recovery_ticks = (cfg.blast_recovery_sec as f64 * 60.0) as u64;
-    let blasts_in_window: Vec<u64> = facts
+    let blast_rows = assess_blast_recovery(
+        cfg,
+        all,
+        &facts.blast_commit_ticks,
+        &facts.blast_commit_elapsed_ms,
+        win_lo,
+        win_hi,
+    );
+    let blasts_in_window = facts
         .blast_commit_ticks
         .iter()
-        .copied()
-        .filter(|t| *t > win_lo && *t <= win_hi)
-        .collect();
-    let mut blast_rows = Vec::new();
-    for (i, &t) in blasts_in_window.iter().enumerate() {
-        let next = blasts_in_window.get(i + 1).copied().unwrap_or(win_hi);
-        let first: Vec<&Sample> = all
-            .iter()
-            .filter(|s| s.tick > t && s.tick <= t + recovery_ticks + 60)
-            .collect();
-        // A tail sample's interval must start at or after t + recovery.
-        let tail: Vec<&Sample> = all
-            .iter()
-            .filter(|s| s.tick >= t + recovery_ticks + 60 && s.tick <= next)
-            .collect();
-        let tail_bytes = tail.iter().map(|s| s.backlog_max_bytes).max().unwrap_or(0);
-        let tail_age = tail.iter().map(|s| s.backlog_max_age_ms).max().unwrap_or(0);
-        blast_rows.push(BlastRow {
-            commit_tick: t,
-            peak_bytes_first_window: first.iter().map(|s| s.backlog_max_bytes).max().unwrap_or(0),
-            peak_age_ms_first_window: first
-                .iter()
-                .map(|s| s.backlog_max_age_ms)
-                .max()
-                .unwrap_or(0),
-            tail_samples: tail.len() as u64,
-            tail_max_bytes: tail_bytes,
-            tail_max_age_ms: tail_age,
-            recovered: !tail.is_empty()
-                && tail_bytes <= cfg.backlog_normal_bytes
-                && tail_age <= cfg.backlog_normal_age_ms,
-        });
-    }
-    let recovered = blast_rows.iter().filter(|b| b.recovered).count();
+        .filter(|t| **t > win_lo && **t <= win_hi)
+        .count();
+    let recovered = blast_rows
+        .iter()
+        .filter(|b| b.status == BlastStatus::Recovered)
+        .count();
+    let excess = blast_rows
+        .iter()
+        .filter(|b| b.status == BlastStatus::MeasuredExcess)
+        .count();
+    let no_evidence = blast_rows
+        .iter()
+        .filter(|b| b.status == BlastStatus::NoEvidence)
+        .count();
     add(
         "every named blast committed",
-        cfg.expected_blasts > 0 && blasts_in_window.len() as u64 >= cfg.expected_blasts,
-        format!(
-            "{} blast commits in the measured window",
-            blasts_in_window.len()
-        ),
+        cfg.expected_blasts > 0 && blasts_in_window as u64 >= cfg.expected_blasts,
+        format!("{blasts_in_window} blast commits in the measured window"),
         format!(">= {}", cfg.expected_blasts),
     );
     add(
         "application send-queue back to normal within the recovery window after every blast",
         !blast_rows.is_empty() && recovered == blast_rows.len(),
         format!(
-            "{recovered} of {} recovered (worst first-window peak {} KiB / {} ms; worst tail {} KiB / {} ms)",
+            "{recovered} of {} blast clusters recovered, {excess} measured excessive, {no_evidence} with no usable evidence (not measured); {blasts_in_window} blast commits (worst first-window peak {} KiB / {} ms; worst tail {} KiB / {} ms)",
             blast_rows.len(),
             blast_rows
                 .iter()
@@ -573,7 +759,7 @@ pub fn evaluate(
                 .unwrap_or(0),
         ),
         format!(
-            "<= {} KiB and <= {} ms within {} s of each blast",
+            "<= {} KiB and <= {} ms within {} s (wall clock) of each blast cluster",
             cfg.backlog_normal_bytes / 1024,
             cfg.backlog_normal_age_ms,
             cfg.blast_recovery_sec
@@ -852,6 +1038,199 @@ mod tests {
         }
     }
 
+    // --- blast recovery: wall-clock windows, overlapping blasts, missing evidence -----------
+
+    fn bsample(tick: u64, elapsed_ms: u64, high: bool) -> Sample {
+        Sample {
+            tick,
+            elapsed_ms,
+            backlog_max_bytes: if high { 2_000_000 } else { 100 },
+            backlog_max_age_ms: if high { 4_000 } else { 5 },
+            ..Sample::default()
+        }
+    }
+
+    /// One sample per second of wall time (60 ticks each), `high` between the given seconds.
+    fn per_second(secs: std::ops::RangeInclusive<u64>, high: std::ops::Range<u64>) -> Vec<Sample> {
+        secs.map(|k| bsample(k * 60, k * 1000, high.contains(&k)))
+            .collect()
+    }
+
+    #[test]
+    fn a_blast_that_recovers_is_measured_in_wall_time() {
+        // Blast committed at 60 s; the backlog is high for the three seconds after it.
+        let samples = per_second(50..=90, 61..64);
+        let rows = assess_blast_recovery(&cfg(), &samples, &[3_600], &[60_000], 0, 90 * 60);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.status, BlastStatus::Recovered, "{r:#?}");
+        assert!(r.recovered);
+        assert_eq!(r.recovery_wall_ms, Some(3_000), "{r:#?}");
+        assert!(r.tail_samples > 0 && r.evidence_gap.is_none());
+    }
+
+    #[test]
+    fn slow_ticks_stretch_ticks_not_the_wall_clock_recovery_window() {
+        // The server runs at ~15 ticks/s: a sample (60 ticks) covers 4 s. The backlog is high
+        // until 68 s; the blast committed at 60 s, so the 5 s window ends at 65 s. A tick-based
+        // window (300 ticks) would have ended at ~80 s and called this recovered.
+        let samples: Vec<Sample> = (10..=30u64)
+            .map(|k| bsample(k * 60, k * 4_000, (15..18).contains(&k))) // high through 68 s
+            .collect();
+        let rows = assess_blast_recovery(&cfg(), &samples, &[900], &[60_000], 0, 30 * 60);
+        let r = &rows[0];
+        // The interval (64 s, 68 s] straddles the end of the window and is high: the backlog may
+        // have recovered late or on time and this sampling cannot say -- not "recovered", and not
+        // a *measured* excess either.
+        assert_eq!(r.status, BlastStatus::NoEvidence, "{r:#?}");
+        assert!(r.evidence_gap.as_deref().unwrap().contains("straddling"));
+        assert!(!r.recovered);
+        // The same backlog sampled once a second is unambiguous: excess after the window.
+        let fine = per_second(50..=90, 61..70);
+        let rows = assess_blast_recovery(&cfg(), &fine, &[3_600], &[60_000], 0, 90 * 60);
+        assert_eq!(
+            rows[0].status,
+            BlastStatus::MeasuredExcess,
+            "{:#?}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn bunched_commits_are_one_cluster_judged_from_the_last_commit() {
+        // Three blasts committed within 100 ms of each other (a backed-up intent queue drained
+        // in one burst), then a separate blast 15 s later.
+        let samples = per_second(50..=100, 61..63);
+        let rows = assess_blast_recovery(
+            &cfg(),
+            &samples,
+            &[3_600, 3_603, 3_606, 4_500],
+            &[60_000, 60_050, 60_100, 75_000],
+            0,
+            100 * 60,
+        );
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        assert_eq!(rows[0].commit_ticks, vec![3_600, 3_603, 3_606]);
+        assert_eq!(rows[0].last_commit_ms, 60_100);
+        assert_eq!(rows[0].status, BlastStatus::Recovered, "{:#?}", rows[0]);
+        assert_eq!(rows[1].commit_ticks, vec![4_500]);
+        assert_eq!(rows[1].status, BlastStatus::Recovered, "{:#?}", rows[1]);
+    }
+
+    #[test]
+    fn overlapping_blasts_are_judged_after_the_last_one_not_the_first() {
+        // Blasts 3 s apart with a 5 s window overlap: one cluster whose window runs from the last
+        // commit (66 s) to 71 s; the backlog is high until 68 s, normal after.
+        let samples = per_second(50..=100, 61..69);
+        let rows = assess_blast_recovery(
+            &cfg(),
+            &samples,
+            &[3_600, 3_780, 3_960],
+            &[60_000, 63_000, 66_000],
+            0,
+            100 * 60,
+        );
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert_eq!(rows[0].commit_ticks.len(), 3);
+        assert_eq!(rows[0].recovery_window_ms, 5_000);
+        assert_eq!(rows[0].status, BlastStatus::Recovered, "{:#?}", rows[0]);
+        assert_eq!(rows[0].recovery_wall_ms, Some(2_000), "{:#?}", rows[0]);
+    }
+
+    #[test]
+    fn missing_samples_are_no_evidence_not_measured_excess_and_still_fail_closed() {
+        // The run stopped 2 s after the blast: nothing was measured after the window.
+        let samples = per_second(50..=62, 61..62);
+        let rows = assess_blast_recovery(&cfg(), &samples, &[3_600], &[60_000], 0, 100 * 60);
+        assert_eq!(rows[0].status, BlastStatus::NoEvidence, "{:#?}", rows[0]);
+        assert_eq!(rows[0].tail_samples, 0);
+        assert!(rows[0].evidence_gap.is_some());
+        assert!(!rows[0].recovered);
+        // A window that never contained samples between blast clusters is also a gap.
+        let samples = per_second(50..=100, 100..100);
+        let sparse: Vec<Sample> = samples.into_iter().filter(|s| s.tick % 600 == 0).collect();
+        let rows = assess_blast_recovery(
+            &cfg(),
+            &sparse,
+            &[3_600, 4_200],
+            &[60_000, 70_000],
+            0,
+            100 * 60,
+        );
+        assert_eq!(rows[0].status, BlastStatus::NoEvidence, "{:#?}", rows[0]);
+        // And through `evaluate`: the acceptance check fails and says why, without claiming excess.
+        let mut facts = healthy();
+        facts.telemetry_samples.retain(|s| s.tick <= 960);
+        let row = evaluate(&cfg(), &facts, Some(1), 2, 1, &[]);
+        let c = row
+            .checks
+            .iter()
+            .find(|c| c.name.contains("back to normal"))
+            .unwrap();
+        assert!(!c.passed, "{c:?}");
+        assert!(c.measured.contains("no usable evidence"), "{c:?}");
+        assert!(c.measured.contains("0 measured excessive"), "{c:?}");
+    }
+
+    /// Diagnostic: re-judge the blast recovery of a finished run with the current logic.
+    /// `RUN_DIR=<dir> cargo test -p xtask --release g4::tests::reassess_run -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic: needs RUN_DIR"]
+    fn reassess_run() {
+        let dir = std::path::PathBuf::from(std::env::var("RUN_DIR").expect("RUN_DIR"));
+        let facts: G4ServerFacts =
+            serde_json::from_slice(&std::fs::read(dir.join("server.summary.json")).unwrap())
+                .unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("summary.json")).unwrap()).unwrap();
+        let g4 = &summary["g4"];
+        let warmup = g4["warmup_ticks"].as_u64().unwrap();
+        let measured = g4["measured_ticks"].as_u64().unwrap();
+        let rows = assess_blast_recovery(
+            &cfg(),
+            &facts.telemetry_samples,
+            &facts.blast_commit_ticks,
+            &facts.blast_commit_elapsed_ms,
+            warmup,
+            warmup + measured,
+        );
+        let count = |s: BlastStatus| rows.iter().filter(|r| r.status == s).count();
+        println!(
+            "{}: {} blast commits -> {} clusters: {} recovered, {} measured excess, {} no evidence",
+            dir.display(),
+            facts
+                .blast_commit_ticks
+                .iter()
+                .filter(|t| **t > warmup && **t <= warmup + measured)
+                .count(),
+            rows.len(),
+            count(BlastStatus::Recovered),
+            count(BlastStatus::MeasuredExcess),
+            count(BlastStatus::NoEvidence),
+        );
+        let tick_ms = facts
+            .telemetry_samples
+            .windows(2)
+            .map(|w| {
+                (w[1].elapsed_ms - w[0].elapsed_ms) as f64 / (w[1].tick - w[0].tick).max(1) as f64
+            })
+            .fold(0.0, f64::max);
+        println!("worst sample-interval wall ms per tick: {tick_ms:.1}");
+        for r in rows.iter().take(12) {
+            println!(
+                "  ticks {:?} commit_ms {}..{} recovery_wall {:?} tail {} ({} KiB / {} ms) {:?} {}",
+                r.commit_ticks,
+                r.first_commit_ms,
+                r.last_commit_ms,
+                r.recovery_wall_ms,
+                r.tail_samples,
+                r.tail_max_bytes / 1024,
+                r.tail_max_age_ms,
+                r.status,
+                r.evidence_gap.as_deref().unwrap_or("")
+            );
+        }
+    }
     #[test]
     fn a_backlog_that_never_drains_after_a_blast_fails() {
         let mut facts = healthy();
