@@ -143,6 +143,20 @@ impl EditPipeline {
         self.pending.len()
     }
 
+    /// Bodies targeted by an intent that is queued or staged but not yet committed. Dormancy
+    /// must not deactivate these: a commit rebuilds the target's collider, which needs a live
+    /// physics body.
+    pub fn targeted_bodies(&self) -> HashSet<spall_core::EntityId> {
+        self.pending
+            .iter()
+            .chain(self.inflight.values())
+            .filter_map(|q| match q.intent.target {
+                EditTarget::Body(e) => Some(e),
+                EditTarget::Terrain => None,
+            })
+            .collect()
+    }
+
     /// Whether `region` has been promoted to strictly-serial commit.
     pub fn is_serialized(&self, region: RegionKey) -> bool {
         self.serialized.contains(&region)
@@ -203,7 +217,19 @@ impl EditPipeline {
         let generation = world.generation();
         let epoch = world.topology_epoch();
         let mut deferred: VecDeque<QueuedIntent> = VecDeque::new();
+        // Submit no more jobs than the Edit lane can dispatch this tick. A job submitted beyond
+        // that waits in the scheduler queue holding the world token it was stamped with; the next
+        // commit moves the topology epoch, so it is dispatched later only to be discarded as
+        // stale, occupying dispatch slots that fresh work needed and collapsing throughput once
+        // more than a lane's worth of edits is pending. Held back here, an intent is simply
+        // submitted with a fresh token on a later tick.
+        let max_submit = self.scheduler.config().lane(Lane::Edit).max_in_flight as usize;
+        let mut submitted = 0usize;
         while let Some(queued) = self.pending.pop_front() {
+            if submitted >= max_submit {
+                deferred.push_back(queued);
+                continue;
+            }
             // A serialized region admits at most one job per tick.
             if self.serialized.contains(&queued.region)
                 && self.active_regions.contains(&queued.region)
@@ -235,6 +261,7 @@ impl EditPipeline {
             );
             match self.scheduler.submit(request) {
                 Ok(handle) => {
+                    submitted += 1;
                     self.active_regions.insert(queued.region);
                     self.inflight.insert(handle.id(), queued);
                 }
@@ -315,6 +342,14 @@ impl EditPipeline {
                 continue; // idempotent: already committed
             }
 
+            // Defensive: a body-targeted commit rebuilds its collider, which needs the live
+            // physics body. `submit` reactivates a dormant target and dormancy skips targeted
+            // bodies, but never let a commit reach a dormant body (it would panic in the solver).
+            if let EditTarget::Body(entity) = queued.intent.target
+                && world.body_is_dormant(entity)
+            {
+                world.reactivate_body(entity);
+            }
             let control_seq = ControlSeq(*next_control_seq);
             let _sp_commit = crate::prof::Span::start("sim.commit");
             match commit(world, journal, &staged, server_tick, control_seq) {

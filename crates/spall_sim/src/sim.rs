@@ -500,7 +500,13 @@ impl Simulation {
             .collect();
 
         let plan = policy.plan(self.tick.get(), &inputs, &regions);
+        // A body with a queued or staged edit stays live until that edit commits (the commit
+        // rebuilds its collider); it is retried on a later tick.
+        let targeted = self.pipeline.targeted_bodies();
         for &entity in &plan.deactivate {
+            if targeted.contains(&entity) {
+                continue;
+            }
             self.world.deactivate_body(entity);
         }
         for &entity in &plan.reactivate {

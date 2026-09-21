@@ -291,3 +291,81 @@ fn dormancy_is_invisible_to_the_authoritative_state() {
     assert_eq!(plain.1, dormant.1, "conservation identical");
     assert_eq!(plain.2, dormant.2, "same body count");
 }
+
+/// Regression (found by the overload scenario): a body with a queued edit must not go dormant
+/// before the edit commits. The commit rebuilds the target's collider, which needs the live
+/// physics body; a dormant body has none and the solver panicked with "Parent rigid body not
+/// found" whenever a backlog kept an intent pending across the dormancy pass.
+#[test]
+fn a_body_with_a_pending_edit_is_never_deactivated_and_the_edit_commits() {
+    let spawn = |sim: &mut Simulation| {
+        sim.world_mut()
+            .spawn_body(
+                fixtures::solid_block(4),
+                BodyPose::new(DQuat::IDENTITY, [4.0, 5.0, 4.0]),
+                [0.0; 3],
+                [0.0; 3],
+                2600.0,
+                0,
+            )
+            .unwrap()
+    };
+    // Control run: the tick at which this body goes dormant undisturbed.
+    let mut sim = Simulation::new(SimulationConfig::new(thick_slab_setup())).unwrap();
+    let mut policy = DormancyPolicy::new(test_config());
+    let entity = spawn(&mut sim);
+    let mut dormant_tick = None;
+    for tick in 1..=500u64 {
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+        if sim.world().body_is_dormant(entity) {
+            dormant_tick = Some(tick);
+            break;
+        }
+    }
+    let dormant_tick = dormant_tick.expect("the control body goes dormant");
+
+    // Identical run, but an edit for the body is queued exactly when the pass would deactivate it.
+    let mut sim = Simulation::new(SimulationConfig::new(thick_slab_setup())).unwrap();
+    let mut policy = DormancyPolicy::new(test_config());
+    let entity = spawn(&mut sim);
+    for tick in 1..=dormant_tick {
+        let report = sim.tick().unwrap();
+        if tick == dormant_tick {
+            sim.submit(cut_body(entity, 1, 2, 2, 2, 1)).unwrap();
+        }
+        sim.apply_dormancy(&mut policy, &report);
+    }
+    assert!(
+        !sim.world().body_is_dormant(entity),
+        "a body with a queued edit was deactivated at tick {dormant_tick}"
+    );
+    let report = sim.tick().unwrap();
+    assert_eq!(report.committed.len(), 1, "{:?}", report.rejected);
+}
+
+/// Belt and braces: even if a body is deactivated behind the pipeline's back, committing an
+/// edit that targets it reactivates it first instead of panicking in the solver.
+#[test]
+fn a_commit_that_reaches_a_dormant_target_reactivates_it_instead_of_panicking() {
+    let mut sim = Simulation::new(SimulationConfig::new(thick_slab_setup())).unwrap();
+    let entity = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(16),
+            BodyPose::new(DQuat::IDENTITY, [4.0, 5.0, 4.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    for _ in 0..120 {
+        sim.tick().unwrap();
+    }
+    sim.submit(cut_body(entity, 1, 8, 8, 8, 2)).unwrap();
+    assert!(sim.world_mut().deactivate_body(entity));
+    assert!(sim.world().body_is_dormant(entity));
+    let report = sim.tick().unwrap();
+    assert_eq!(report.committed.len(), 1, "{:?}", report.rejected);
+}

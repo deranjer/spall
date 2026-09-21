@@ -1471,7 +1471,7 @@ fn awake_body_time() {
                 let p = b.pose.translation_m;
                 let near = |v: f64| {
                     let m = v.rem_euclid(8.0);
-                    m < 0.6 || m > 7.4
+                    !(0.6..=7.4).contains(&m)
                 };
                 let e = near_seam_ep.entry(id).or_default();
                 e.0 |= near(p[0]) || near(p[2]);
@@ -1571,4 +1571,128 @@ fn awake_body_time() {
         q(95),
         q(100)
     );
+}
+
+/// Edit-pipeline drain capacity under offered load (in-process, no network). Offers one ordinary
+/// body edit every `OFFER_EVERY` ticks (default 1 = 60/s, the overload scenario) and a blast every
+/// `BLAST_EVERY` ticks (default 120 = every 2 s) and reports, per tick, how the pipeline drained:
+/// commits, pending depth, conflicts retried, staged results discarded as stale.
+#[test]
+#[ignore = "measurement: edit pipeline drain capacity"]
+fn overload_drain() {
+    let ticks: u64 = std::env::var("TRACE_TICKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800);
+    let offer_every: u64 = std::env::var("OFFER_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let blast_every: u64 = std::env::var("BLAST_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let per_tick: u64 = std::env::var("OFFER_PER_TICK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let (mut sim, bodies) = scene();
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let (mut req, mut comb, mut blast) = (1u64, 0u64, 0u64);
+    let (mut offered, mut rejected_full, mut committed) = (0u64, 0u64, 0u64);
+    let (mut retried, mut stale, mut serialized) = (0u64, 0u64, 0u64);
+    let (mut pending_max, mut pending_sum, mut pending_ticks) = (0usize, 0usize, 0u64);
+    let mut latency_ticks: Vec<u64> = Vec::new();
+    let mut submitted_at: std::collections::HashMap<u64, u64> = Default::default();
+    let mut rejected_other = 0u64;
+    for t in 0..ticks {
+        if t == 60 {
+            sim.submit(body_cut(req, vfix::g4_giant_cut())).unwrap();
+            submitted_at.insert(req, t);
+            req += 1;
+        }
+        // OFFER_PER_TICK edits on every offering tick: a slow server (wall-clock clients) sees
+        // several ticks' worth of edits at once.
+        for _ in 0..per_tick {
+            if t >= 120
+                && (t - 120).is_multiple_of(offer_every)
+                && let Some(e) = vfix::g4_ordinary_edit(comb)
+            {
+                comb += 1;
+                offered += 1;
+                match sim.submit(body_cut(req, e)) {
+                    Ok(_) => {
+                        submitted_at.insert(req, t);
+                    }
+                    Err(spall_sim::IntentError::QueueFull { .. }) => rejected_full += 1,
+                    Err(_) => rejected_other += 1,
+                }
+                req += 1;
+            }
+        }
+        if t >= 120
+            && (t - 120) % blast_every == blast_every / 2
+            && let Some(b) = vfix::g4_blast(blast)
+        {
+            blast += 1;
+            offered += 1;
+            match sim.submit(body_cut(req, b)) {
+                Ok(_) => {
+                    submitted_at.insert(req, t);
+                }
+                Err(spall_sim::IntentError::QueueFull { .. }) => rejected_full += 1,
+                Err(_) => rejected_other += 1,
+            }
+            req += 1;
+        }
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+        committed += report.committed.len() as u64;
+        retried += report.retried.len() as u64;
+        stale += report.discarded_stale.len() as u64;
+        serialized += report.serialized_regions.len() as u64;
+        for (r, _) in &report.committed {
+            if let Some(at) = submitted_at.remove(&r.0) {
+                latency_ticks.push(t - at);
+            }
+        }
+        pending_max = pending_max.max(report.pending_after);
+        pending_sum += report.pending_after;
+        if report.pending_after > 0 {
+            pending_ticks += 1;
+        }
+    }
+    latency_ticks.sort_unstable();
+    let q = |p: usize| {
+        latency_ticks
+            .get((latency_ticks.len() * p / 100).min(latency_ticks.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(0)
+    };
+    println!(
+        "OFFER_PER_TICK={per_tick} OFFER_EVERY={offer_every} BLAST_EVERY={blast_every} ticks {ticks}: offered {offered}, queue-full {rejected_full}, other rejects {rejected_other}, committed {committed}, unresolved {}",
+        submitted_at.len()
+    );
+    println!(
+        "  retried(conflict) {retried}, stale-discards {stale}, serialized regions {serialized}; pending max {pending_max} mean {:.1}, ticks with pending {pending_ticks}",
+        pending_sum as f64 / ticks as f64
+    );
+    println!(
+        "  request->commit latency (ticks): p50 {} p95 {} p99 {} max {}",
+        q(50),
+        q(95),
+        q(99),
+        q(100)
+    ); // Regression guard for the overload collapse (stale queued jobs starving fresh ones): with
+    // more edits offered than the pipeline can commit it must still commit about one per tick
+    // and never discard staged work as stale (`ASSERT_DRAIN=1`; before the fix, 3 edits/tick
+    // committed 105 of 1200 ticks' worth with 15,782 stale discards).
+    if std::env::var("ASSERT_DRAIN").is_ok() {
+        assert_eq!(stale, 0, "queued jobs must not go stale");
+        assert!(
+            committed * 2 >= ticks,
+            "throughput collapsed under overload: {committed} commits in {ticks} ticks"
+        );
+    }
 }

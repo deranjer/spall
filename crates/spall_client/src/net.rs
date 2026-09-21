@@ -569,6 +569,18 @@ struct Counters {
     disconnect_reason: std::sync::Mutex<Option<String>>,
 }
 
+/// Bounded re-send schedule for a rejected `ActionRequest`. `throttled` (per-tick quota) retries
+/// up to 4 times at 40 ms; `overloaded` (intent queue full) up to 5 times with exponential
+/// back-off 100, 200, 400, 800, 1600 ms (about 3.1 s in total). `None` when the budget is spent:
+/// retries are never unlimited, and the request then counts as rejected in the summary.
+pub(crate) fn retry_backoff(overloaded: bool, tries_done: u8) -> Option<Duration> {
+    if overloaded {
+        (tries_done < 5).then(|| Duration::from_millis(100 << tries_done))
+    } else {
+        (tries_done < 4).then(|| Duration::from_millis(40))
+    }
+}
+
 /// Cap on `Counters::action_reject_reasons` — a diagnostic log, not something
 /// that should grow unbounded if a script somehow floods rejections.
 const MAX_RECORDED_ACTION_REJECT_REASONS: usize = 8;
@@ -933,7 +945,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     // throttled request ids here; the retrier re-sends, capped per request.
     let sent_actions: Arc<Mutex<HashMap<u64, (WireRecord, u8)>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let (throttle_tx, mut throttle_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    // (request id, overloaded?) -- `throttled` is a per-tick quota bounce (short back-off);
+    // `overloaded` is the server's intent queue being full (exponential back-off).
+    let (throttle_tx, mut throttle_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
 
     // Control reader: apply transactions, answer repair gaps.
     let control = {
@@ -1098,7 +1112,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     Ok(Some(WireRecord::ActionStatus(st))) => {
                         if let ActionOutcome::Rejected { reason } = &st.outcome {
                             if reason.starts_with("throttled") {
-                                let _ = throttle_tx.send(st.request_id.0);
+                                let _ = throttle_tx.send((st.request_id.0, false));
+                            } else if reason.starts_with("overloaded") {
+                                let _ = throttle_tx.send((st.request_id.0, true));
                             } else {
                                 // Anything other than "throttled" is not
                                 // retried (see the retrier below) — record it
@@ -1150,25 +1166,46 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let conn = conn.clone();
         let sent_actions = sent_actions.clone();
         let stop_rx = stop_rx.clone();
+        let counters = counters.clone();
         tokio::spawn(async move {
-            const MAX_ACTION_RETRIES: u8 = 4;
-            while let Some(id) = throttle_rx.recv().await {
+            while let Some((id, overloaded)) = throttle_rx.recv().await {
                 if *stop_rx.borrow() {
                     break;
                 }
-                let record = {
+                let attempt = {
                     let mut g = sent_actions.lock().unwrap_or_else(|e| e.into_inner());
-                    match g.get_mut(&id) {
-                        Some((rec, tries)) if *tries < MAX_ACTION_RETRIES => {
-                            *tries += 1;
-                            Some(rec.clone())
-                        }
-                        _ => None,
-                    }
+                    g.get_mut(&id).and_then(|(rec, tries)| {
+                        let delay = retry_backoff(overloaded, *tries)?;
+                        *tries += 1;
+                        Some((rec.clone(), delay))
+                    })
                 };
-                if let Some(rec) = record {
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    let _ = conn.send_record(rec).await;
+                match attempt {
+                    Some((rec, delay)) => {
+                        // One task per resend so a long back-off never delays other requests.
+                        let conn = conn.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = conn.send_record(rec).await;
+                        });
+                    }
+                    None => {
+                        // Retries exhausted (bounded on purpose): the edit is lost and that must
+                        // be visible in the summary, not silent.
+                        counters.action_rejected.fetch_add(1, Ordering::Relaxed);
+                        let mut reasons = counters
+                            .action_reject_reasons
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if reasons.len() >= MAX_RECORDED_ACTION_REJECT_REASONS {
+                            reasons.remove(0);
+                        }
+                        reasons.push(if overloaded {
+                            "overloaded: retries exhausted".to_string()
+                        } else {
+                            "throttled: retries exhausted".to_string()
+                        });
+                    }
                 }
             }
         })
@@ -1899,4 +1936,35 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         )?;
     }
     Ok(summary)
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::retry_backoff;
+    use std::time::Duration;
+
+    #[test]
+    fn overload_retries_back_off_exponentially_and_are_bounded() {
+        let delays: Vec<_> = (0..8).map(|t| retry_backoff(true, t)).collect();
+        assert_eq!(
+            delays,
+            vec![
+                Some(Duration::from_millis(100)),
+                Some(Duration::from_millis(200)),
+                Some(Duration::from_millis(400)),
+                Some(Duration::from_millis(800)),
+                Some(Duration::from_millis(1600)),
+                None,
+                None,
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn throttle_retries_keep_their_short_bounded_schedule() {
+        assert_eq!(retry_backoff(false, 0), Some(Duration::from_millis(40)));
+        assert_eq!(retry_backoff(false, 3), Some(Duration::from_millis(40)));
+        assert_eq!(retry_backoff(false, 4), None);
+    }
 }

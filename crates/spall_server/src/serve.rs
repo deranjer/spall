@@ -528,6 +528,25 @@ pub struct ServeConfig {
     pub terrain_brick_colliders: bool,
 }
 
+/// How the edit pipeline behaved under the offered load. `queue_full_rejections` are the explicit
+/// overload rejections; `pending_max` is the deepest the intent queue got (cap 256 by default);
+/// `retried_conflicts` / `stale_discards` count staged work redone because the world moved;
+/// `pending_ticks` is the number of ticks that ended with intents still waiting, and
+/// `commits_in_pending_ticks` the commits landed on those ticks (throughput while backlogged).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct IntentStats {
+    pub queue_full_rejections: u64,
+    pub pending_max: u64,
+    pub retried_conflicts: u64,
+    pub stale_discards: u64,
+    pub serialized_regions: u64,
+    pub ticks: u64,
+    pub pending_ticks: u64,
+    pub commits_in_pending_ticks: u64,
+    /// `pending_after` summed over ticks (mean depth = sum / ticks).
+    pub pending_depth_sum: u64,
+}
+
 /// Refuses configurations the server cannot honour, explicitly and before any state is built.
 pub fn validate_config(config: &ServeConfig) -> Result<(), String> {
     if config.terrain_brick_colliders && config.residency.is_some() {
@@ -908,6 +927,9 @@ pub struct ServeSummary {
     /// Number of per-brick terrain colliders (0 when the experimental mode is off).
     #[serde(default)]
     pub terrain_brick_colliders: u64,
+    /// Edit-intent admission and pipeline pressure (see [`IntentStats`]).
+    #[serde(default)]
+    pub intent_stats: IntentStats,
     /// Bodies observed below the world floor (see [`OutOfWorldRow`]); empty when none.
     #[serde(default)]
     pub out_of_world_bodies: Vec<OutOfWorldRow>,
@@ -1696,6 +1718,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // per-tick admission quota and were bounced with a retry response
         // (actions) or dropped (repairs).
         let mut actions_throttled = 0u64;
+        let mut intent_stats = IntentStats::default();
         let mut repairs_throttled = 0u64;
 
         // T11a / ENG-62: commit-latency measurement + admission accounting.
@@ -1880,12 +1903,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                     );
                                 }
                                 Err(e) => {
-                                    reject(
-                                        &clients_for_sim,
-                                        session,
-                                        req.request_id,
-                                        &e.to_string(),
-                                    );
+                                    if matches!(e, spall_sim::IntentError::QueueFull { .. }) {
+                                        intent_stats.queue_full_rejections += 1;
+                                    }
+                                    // Overload is an explicit, *retryable* answer: clients back off
+                                    // and resend a bounded number of times. The request id was never
+                                    // admitted, so a resend is a fresh admission attempt (a request
+                                    // that was admitted replays its stored status instead).
+                                    let reason =
+                                        if matches!(e, spall_sim::IntentError::QueueFull { .. }) {
+                                            format!("overloaded: {e}; retry with backoff")
+                                        } else {
+                                            e.to_string()
+                                        };
+                                    reject(&clients_for_sim, session, req.request_id, &reason);
                                     rejected_total += 1;
                                 }
                             },
@@ -1928,6 +1959,16 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
             };
             ticks_run += 1;
+            intent_stats.ticks += 1;
+            intent_stats.pending_max = intent_stats.pending_max.max(report.pending_after as u64);
+            intent_stats.pending_depth_sum += report.pending_after as u64;
+            intent_stats.retried_conflicts += report.retried.len() as u64;
+            intent_stats.stale_discards += report.discarded_stale.len() as u64;
+            intent_stats.serialized_regions += report.serialized_regions.len() as u64;
+            if report.pending_after > 0 {
+                intent_stats.pending_ticks += 1;
+                intent_stats.commits_in_pending_ticks += report.committed.len() as u64;
+            }
             let tick = sim.current_tick();
             if ticks_run.is_multiple_of(6) {
                 sampler.observe_backlog(&clients_for_sim);
@@ -2303,6 +2344,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
         SimResult {
             terrain_brick_colliders: sim.world().terrain_brick_collider_count() as u64,
+            intent_stats: intent_stats.clone(),
             stage_timings: stage_agg.finish(),
             wake_reasons: sim
                 .world()
@@ -2645,6 +2687,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         stage_timings: sim_result.stage_timings.clone(),
         wake_reasons: sim_result.wake_reasons.clone(),
         terrain_brick_colliders: sim_result.terrain_brick_colliders,
+        intent_stats: sim_result.intent_stats.clone(),
         out_of_world_bodies: sim_result.out_of_world.clone(),
         containment_coverage: sim_result.containment_coverage.clone(),
         backlog_series: sim_result.backlog_series.clone(),
@@ -3239,6 +3282,7 @@ struct SimResult {
     backlog_series: Vec<(u64, u64, u64)>,
     wake_reasons: Vec<WakeReasonRow>,
     terrain_brick_colliders: u64,
+    intent_stats: IntentStats,
     stage_timings: Vec<StageTimingRow>,
     samples: Vec<TelemetrySample>,
     blast_commit_ticks: Vec<u64>,
@@ -3309,6 +3353,7 @@ impl SimResult {
             stage_timings: Vec::new(),
             wake_reasons: Vec::new(),
             terrain_brick_colliders: 0,
+            intent_stats: IntentStats::default(),
             samples: Vec::new(),
             blast_commit_ticks: Vec::new(),
             blast_commit_elapsed_ms: Vec::new(),
