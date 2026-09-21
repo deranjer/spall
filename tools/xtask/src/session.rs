@@ -1298,8 +1298,12 @@ struct SessionSummary {
     /// while the live clients + server still converged.
     impaired_late_join_bounded_failure: bool,
     agreed_world_hash: String,
+    /// Hash agreement **only**: every expected replica reached the agreed hash and, when
+    /// checked, the replay did. Timing, workload and recovery do not feed this flag.
     all_hashes_match: bool,
     requirements_met: bool,
+    /// Independent verdict dimensions; `overall` is what `result` reports.
+    verdict: SessionVerdict,
     /// T11a / ENG-62: the gate's requested / rejected / queued / committed
     /// breakdown (server-authoritative) and the measured commit-latency p95s.
     admission: AdmissionRow,
@@ -2805,6 +2809,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     agreed_world_hash: String::new(),
                     all_hashes_match: false,
                     requirements_met: false,
+                    verdict: SessionVerdict::server_missing(),
                     admission: AdmissionRow::empty(),
                     server_timing: ServerTimingRow::unconfigured(),
                     g4: g4::G4Row::unconfigured(),
@@ -2821,6 +2826,8 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
 
     let agreed = server.final_world_hash.clone();
     let mut all_match = server_ok && server.result == "passed";
+    // Hash agreement is tracked apart from every other requirement.
+    let mut hash_agree = true;
     let mut rows = Vec::new();
     let mut bounded_join_failure_seen = false;
     for (i, summary) in client_summaries.iter().enumerate() {
@@ -2874,6 +2881,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                         && movement_ok
                         && c.transactions_rejected == 0);
                 all_match &= client_ok;
+                hash_agree &= hash_ok || bounded_join_failure;
                 rows.push(ClientRow {
                     index: i as u64,
                     result: c.result.clone(),
@@ -2903,6 +2911,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             }
             None => {
                 all_match = false;
+                hash_agree = false;
                 rows.push(ClientRow {
                     index: i as u64,
                     result: "no-summary".into(),
@@ -2976,6 +2985,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         let r = run_replay_check(&replay_db, &agreed, &output, profile);
         if !(r.ran && r.matches) {
             requirements_met = false;
+            hash_agree = false;
         }
         Some(r)
     } else {
@@ -3111,6 +3121,20 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             });
 
     all_match &= requirements_met;
+    let verdict = SessionVerdict::compute(VerdictInputs {
+        hash_agreement: hash_agree,
+        workload_completion: g4_row
+            .checks
+            .iter()
+            .find(|c| c.name.starts_with("workload completed"))
+            .map(|c| c.passed),
+        recovery_reconnect: restart
+            .as_ref()
+            .map(|r| r.ran && r.recovered_matches && r.reconnect_matches),
+        timing: scenario.server_timing.is_some().then_some(server_timing_ok),
+        overall_before_dimensions: all_match,
+    });
+    all_match = verdict.overall;
     finish(
         &output,
         SessionSummary {
@@ -3159,8 +3183,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 .residency_checkpoint_bricks_logical_total,
             impaired_late_join_bounded_failure: bounded_join_failure_seen,
             agreed_world_hash: agreed,
-            all_hashes_match: all_match,
+            all_hashes_match: hash_agree,
             requirements_met,
+            verdict,
             admission,
             server_timing,
             g4: g4_row,
@@ -3414,6 +3439,86 @@ fn run_restart_check(
     }
 }
 
+/// The session's verdict, one dimension per question. A pass on one dimension says nothing about
+/// another: replicas can agree on a hash while timing fails, and vice versa.
+/// `None` = the scenario did not configure that dimension.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct SessionVerdict {
+    /// Every expected replica (and the replay, when checked) reached the agreed hash.
+    hash_agreement: bool,
+    /// Every requested edit committed, none rejected or left unresolved (`g4` check).
+    workload_completion: Option<bool>,
+    /// Cold-restart recovery and fresh-client reconnect both reached the agreed hash.
+    recovery_reconnect: Option<bool>,
+    /// Owning-server tick/physics/memory targets.
+    timing: Option<bool>,
+    /// Everything else combined (required by `result`).
+    overall: bool,
+    /// The dimensions above that failed, for the failure line.
+    failing: Vec<&'static str>,
+}
+
+struct VerdictInputs {
+    hash_agreement: bool,
+    workload_completion: Option<bool>,
+    recovery_reconnect: Option<bool>,
+    timing: Option<bool>,
+    /// Server result, client checks and every other requirement combined.
+    overall_before_dimensions: bool,
+}
+
+impl SessionVerdict {
+    fn compute(i: VerdictInputs) -> Self {
+        let mut failing = Vec::new();
+        if !i.hash_agreement {
+            failing.push("hash_agreement");
+        }
+        if i.workload_completion == Some(false) {
+            failing.push("workload_completion");
+        }
+        if i.recovery_reconnect == Some(false) {
+            failing.push("recovery_reconnect");
+        }
+        if i.timing == Some(false) {
+            failing.push("timing");
+        }
+        Self {
+            hash_agreement: i.hash_agreement,
+            workload_completion: i.workload_completion,
+            recovery_reconnect: i.recovery_reconnect,
+            timing: i.timing,
+            overall: i.overall_before_dimensions && failing.is_empty(),
+            failing,
+        }
+    }
+
+    fn server_missing() -> Self {
+        Self::compute(VerdictInputs {
+            hash_agreement: false,
+            workload_completion: None,
+            recovery_reconnect: None,
+            timing: None,
+            overall_before_dimensions: false,
+        })
+    }
+
+    fn describe(&self) -> String {
+        let f = |v: Option<bool>| match v {
+            Some(true) => "pass",
+            Some(false) => "FAIL",
+            None => "n/a",
+        };
+        format!(
+            "hash agreement {}, workload completion {}, recovery/reconnect {}, timing {}, overall {}",
+            if self.hash_agreement { "pass" } else { "FAIL" },
+            f(self.workload_completion),
+            f(self.recovery_reconnect),
+            f(self.timing),
+            if self.overall { "pass" } else { "FAIL" },
+        )
+    }
+}
+
 fn finish(output: &Path, summary: SessionSummary) -> Result<(), XtaskError> {
     let passed = summary.result == "passed";
     let path = output.join("summary.json");
@@ -3424,10 +3529,10 @@ fn finish(output: &Path, summary: SessionSummary) -> Result<(), XtaskError> {
         Ok(())
     } else {
         eprintln!(
-            "session FAILED: {} (agreed hash `{}`, all match = {})",
+            "session FAILED: {} (agreed hash `{}`; {})",
             output.display(),
             summary.agreed_world_hash,
-            summary.all_hashes_match
+            summary.verdict.describe()
         );
         Err(XtaskError::Cargo(vec!["session".into()], 1))
     }
@@ -3672,5 +3777,91 @@ impl ProxyFarm {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+
+    fn inputs() -> VerdictInputs {
+        VerdictInputs {
+            hash_agreement: true,
+            workload_completion: Some(true),
+            recovery_reconnect: Some(true),
+            timing: Some(true),
+            overall_before_dimensions: true,
+        }
+    }
+
+    #[test]
+    fn everything_passing_is_an_overall_pass() {
+        let v = SessionVerdict::compute(inputs());
+        assert!(v.overall && v.failing.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn hashes_agree_but_timing_fails_is_an_overall_failure_that_names_timing_only() {
+        let v = SessionVerdict::compute(VerdictInputs {
+            timing: Some(false),
+            ..inputs()
+        });
+        assert!(
+            v.hash_agreement,
+            "timing must not clear or corrupt hash agreement"
+        );
+        assert_eq!(v.timing, Some(false));
+        assert_eq!(v.workload_completion, Some(true));
+        assert_eq!(v.recovery_reconnect, Some(true));
+        assert!(!v.overall);
+        assert_eq!(v.failing, vec!["timing"]);
+        assert!(v.describe().contains("hash agreement pass"));
+        assert!(v.describe().contains("timing FAIL"));
+    }
+
+    #[test]
+    fn reconnect_failing_while_hashes_agree_is_its_own_dimension() {
+        let v = SessionVerdict::compute(VerdictInputs {
+            recovery_reconnect: Some(false),
+            ..inputs()
+        });
+        assert!(v.hash_agreement && !v.overall);
+        assert_eq!(v.failing, vec!["recovery_reconnect"]);
+    }
+
+    #[test]
+    fn incomplete_workload_is_not_hidden_by_converged_replicas() {
+        let v = SessionVerdict::compute(VerdictInputs {
+            workload_completion: Some(false),
+            ..inputs()
+        });
+        assert!(v.hash_agreement && !v.overall);
+        assert_eq!(v.failing, vec!["workload_completion"]);
+    }
+
+    #[test]
+    fn unconfigured_dimensions_do_not_fail_and_other_failures_still_do() {
+        let v = SessionVerdict::compute(VerdictInputs {
+            workload_completion: None,
+            recovery_reconnect: None,
+            timing: None,
+            ..inputs()
+        });
+        assert!(v.overall);
+        let v = SessionVerdict::compute(VerdictInputs {
+            overall_before_dimensions: false,
+            ..inputs()
+        });
+        assert!(!v.overall && v.failing.is_empty());
+    }
+
+    #[test]
+    fn a_hash_mismatch_alone_names_hash_agreement() {
+        let v = SessionVerdict::compute(VerdictInputs {
+            hash_agreement: false,
+            ..inputs()
+        });
+        assert!(!v.overall);
+        assert_eq!(v.failing, vec!["hash_agreement"]);
     }
 }

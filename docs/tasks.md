@@ -343,8 +343,7 @@ did not complete (rubble tunnels through the ground and never sleeps; one new bo
 per edit; journal writes every awake body 20x/s); the overload client-retry gap; the
 stress lane is measured-but-unaccepted (its bounds are unratified candidates). GPU
 p95 14.8 ms vs 12 ms and human/cross-GPU review are separately open. Four
-independent fixes are in PR #136 (open; CI red only from a pre-existing `main`
-failure). **Gate blockers remain until the fixes above are reviewed:** the 2-minute physics p95 miss, the failed 30-minute soak, the impaired-convergence failures (fixed on this branch, not yet accepted) and the baseline-readiness miss (27-30 s, thin margin). Acceptance is an integrator decision; ENG-30 is not marked done here.
+independent fixes are in PR #136 (merged 2026-09-20 with the checkpoint-integrity fix, PR #137). **Gate blockers remain until the fixes above are reviewed:** the 2-minute physics p95 miss, the failed 30-minute soak, the impaired-convergence failures (fixed on this branch, not yet accepted) and the baseline-readiness miss (27-30 s, thin margin). Acceptance is an integrator decision; ENG-30 is not marked done here.
 
 **Update 2026-09-20 (G3.md increment 41; ENG-30 open, T23 not accepted):** v2 soak: 8,259 of 18,181 requested edits committed, 9,922 rejected (queue-full); convergence of committed work is reported separately from workload completion. Server restart recovery passes; fresh-client reconnect fails (baseline 377 MiB > 256 MiB `TooLarge` cap; the 300-tick lifetime theory is disproved). Blast-recovery rows with zero tail samples are missing evidence, not measured backlog (wall-clock clusters, fail-closed, thresholds unchanged; stress recovery unproven). Per-brick terrain colliders prototyped default-off (`docs/reports/terrain-collider-locality.md`). The 30-minute soak was not re-run.
 

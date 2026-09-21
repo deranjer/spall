@@ -287,6 +287,13 @@ fn tick_to_ms(samples: &[Sample], tick: u64) -> Option<u64> {
     Some(last.elapsed_ms + ((tick - last.tick) as f64 * ms_per_tick) as u64)
 }
 
+/// **Recovery deadline.** For a blast cluster whose last commit is at wall time `T`, the deadline is
+/// `T + blast_recovery_sec` (per-scenario; the default 5 s is `docs/validation.md`'s number, the
+/// stress-envelope scenario uses 8 s). The backlog must be normal (`<= backlog_normal_bytes` and
+/// `<= backlog_normal_age_ms`) in every sample interval that starts at or after the deadline and
+/// ends before the next cluster's first commit (or the end of the measured window). An interval that
+/// straddles the deadline is not attributed to either side. With blasts `B` seconds apart the
+/// judged span per cluster is therefore `B - blast_recovery_sec` seconds long.
 /// Judges the backlog's recovery after each named blast **in wall-clock time** (a 5 s recovery
 /// window must not stretch to 20 s because the server was running slow ticks), handling
 /// overlapping blasts explicitly and never turning a missing measurement into either a pass or a
