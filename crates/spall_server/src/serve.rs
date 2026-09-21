@@ -568,6 +568,41 @@ pub struct SlowTickRow {
     pub intents_pending: usize,
 }
 
+/// Tick cost over one successive window of measured ticks (`TICK_WINDOW_TICKS`), split so an
+/// occasional expensive dig can be told apart from a rising ordinary-tick cost.
+#[derive(Debug, Clone, Serialize)]
+pub struct TickWindowRow {
+    /// 0-based window index and the first measured tick it covers.
+    pub window: u32,
+    pub first_tick: u64,
+    pub ticks: u64,
+    /// Every tick in the window.
+    pub busy_p50_ms: f64,
+    pub busy_p95_ms: f64,
+    pub busy_p99_ms: f64,
+    pub busy_max_ms: f64,
+    /// Ticks that committed no edit ("ordinary" ticks).
+    pub ordinary_ticks: u64,
+    pub ordinary_p50_ms: f64,
+    pub ordinary_p95_ms: f64,
+    pub ordinary_p99_ms: f64,
+    /// Ticks that committed a terrain dig, and their mean and worst busy time.
+    pub dig_ticks: u64,
+    pub dig_mean_ms: f64,
+    pub dig_max_ms: f64,
+    /// Ticks that committed a body cut / blast / giant / a mix, and their mean busy time.
+    pub other_edit_ticks: u64,
+    pub other_edit_mean_ms: f64,
+    /// Mean physics (`rapier_step` + `pose_extract`) time per tick in the window.
+    pub physics_mean_ms: f64,
+    /// Mean of the terrain-commit hash stage over the window's dig ticks.
+    pub dig_hash_mean_ms: f64,
+    pub over_16_7_ms: u64,
+}
+
+/// Ticks per reporting window: one minute of server time.
+const TICK_WINDOW_TICKS: u64 = 3_600;
+
 /// Tick busy time and mean stage time for one class of tick, from the same ticks.
 #[derive(Debug, Clone, Serialize)]
 pub struct TickClassRow {
@@ -993,6 +1028,9 @@ pub struct ServeSummary {
     /// Tick busy time by what the tick committed, with per-class mean stage times.
     #[serde(default)]
     pub tick_classes: Vec<TickClassRow>,
+    /// Per-minute tick cost windows (bounded: one row per 3,600 measured ticks).
+    #[serde(default)]
+    pub tick_windows: Vec<TickWindowRow>,
     /// Bodies observed below the world floor (see [`OutOfWorldRow`]); empty when none.
     #[serde(default)]
     pub out_of_world_bodies: Vec<OutOfWorldRow>,
@@ -2445,12 +2483,13 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             );
         }
 
-        let (slow_ticks, tick_classes) = stage_agg.traces();
+        let (slow_ticks, tick_classes, tick_windows) = stage_agg.traces();
         SimResult {
             terrain_brick_colliders: sim.world().terrain_brick_collider_count() as u64,
             intent_stats: intent_stats.clone(),
             slow_ticks: slow_ticks.clone(),
             tick_classes: tick_classes.clone(),
+            tick_windows: tick_windows.clone(),
             stage_timings: stage_agg.finish(),
             wake_reasons: sim
                 .world()
@@ -2796,6 +2835,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         intent_stats: sim_result.intent_stats.clone(),
         slow_ticks: sim_result.slow_ticks.clone(),
         tick_classes: sim_result.tick_classes.clone(),
+        tick_windows: sim_result.tick_windows.clone(),
         out_of_world_bodies: sim_result.out_of_world.clone(),
         containment_coverage: sim_result.containment_coverage.clone(),
         backlog_series: sim_result.backlog_series.clone(),
@@ -3242,9 +3282,88 @@ const MAX_SLOW_TICKS: usize = 48;
 const MAX_SLOW_TICK_SPANS: usize = 96;
 
 struct TickRow {
+    tick: u64,
     busy_ms: f32,
     class: &'static str,
     stages: [f32; CLASS_STAGES.len()],
+}
+
+/// Successive per-window cost rows over the measured ticks (a pure fold of the per-tick rows).
+fn tick_windows(ticks: &[TickRow], first: u64) -> Vec<TickWindowRow> {
+    let pct = |v: &mut Vec<f64>, q: f64| -> f64 {
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let rank = ((q * v.len() as f64).ceil() as usize).clamp(1, v.len());
+        v[rank - 1]
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < ticks.len() {
+        let w = (ticks[i].tick.saturating_sub(first + 1)) / TICK_WINDOW_TICKS;
+        let mut j = i;
+        while j < ticks.len() && (ticks[j].tick.saturating_sub(first + 1)) / TICK_WINDOW_TICKS == w
+        {
+            j += 1;
+        }
+        let rows = &ticks[i..j];
+        let mut all: Vec<f64> = rows.iter().map(|t| f64::from(t.busy_ms)).collect();
+        let mut ord: Vec<f64> = rows
+            .iter()
+            .filter(|t| t.class == "no_edit")
+            .map(|t| f64::from(t.busy_ms))
+            .collect();
+        let digs: Vec<&TickRow> = rows.iter().filter(|t| t.class == "terrain_dig").collect();
+        let others: Vec<&TickRow> = rows
+            .iter()
+            .filter(|t| t.class != "no_edit" && t.class != "terrain_dig")
+            .collect();
+        let mean = |v: &[&TickRow]| {
+            v.iter().map(|t| f64::from(t.busy_ms)).sum::<f64>() / v.len().max(1) as f64
+        };
+        let hash_i = CLASS_STAGES
+            .iter()
+            .position(|n| *n == "commit.hash_and_assemble")
+            .unwrap_or(0);
+        out.push(TickWindowRow {
+            window: w as u32,
+            first_tick: rows[0].tick,
+            ticks: rows.len() as u64,
+            busy_p50_ms: pct(&mut all.clone(), 0.50),
+            busy_p95_ms: pct(&mut all.clone(), 0.95),
+            busy_p99_ms: pct(&mut all, 0.99),
+            busy_max_ms: rows
+                .iter()
+                .map(|t| f64::from(t.busy_ms))
+                .fold(0.0, f64::max),
+            ordinary_ticks: ord.len() as u64,
+            ordinary_p50_ms: pct(&mut ord.clone(), 0.50),
+            ordinary_p95_ms: pct(&mut ord.clone(), 0.95),
+            ordinary_p99_ms: pct(&mut ord, 0.99),
+            dig_ticks: digs.len() as u64,
+            dig_mean_ms: mean(&digs),
+            dig_max_ms: digs
+                .iter()
+                .map(|t| f64::from(t.busy_ms))
+                .fold(0.0, f64::max),
+            other_edit_ticks: others.len() as u64,
+            other_edit_mean_ms: mean(&others),
+            physics_mean_ms: rows
+                .iter()
+                .map(|t| f64::from(t.stages[0] + t.stages[1]))
+                .sum::<f64>()
+                / rows.len() as f64,
+            dig_hash_mean_ms: digs
+                .iter()
+                .map(|t| f64::from(t.stages[hash_i]))
+                .sum::<f64>()
+                / digs.len().max(1) as f64,
+            over_16_7_ms: rows.iter().filter(|t| t.busy_ms > 16.7).count() as u64,
+        });
+        i = j;
+    }
+    out
 }
 
 /// The class of a tick from the edits it committed.
@@ -3303,6 +3422,7 @@ impl StageAgg {
         // Same-tick attribution: keep this tick's raw spans and edits together.
         let busy_ms = busy.as_secs_f64() * 1000.0;
         let mut row = TickRow {
+            tick,
             busy_ms: busy_ms as f32,
             class: tick_class(&edits),
             stages: [0.0; CLASS_STAGES.len()],
@@ -3358,7 +3478,7 @@ impl StageAgg {
     }
 
     /// The retained slow ticks and the per-class breakdown (call before [`Self::finish`]).
-    fn traces(&self) -> (Vec<SlowTickRow>, Vec<TickClassRow>) {
+    fn traces(&self) -> (Vec<SlowTickRow>, Vec<TickClassRow>, Vec<TickWindowRow>) {
         let mut classes: Vec<TickClassRow> = Vec::new();
         for class in [
             "no_edit",
@@ -3397,7 +3517,8 @@ impl StageAgg {
                 mean_stage_ms,
             });
         }
-        (self.slow.clone(), classes)
+        let windows = tick_windows(&self.ticks, self.window.map_or(0, |w| w.0));
+        (self.slow.clone(), classes, windows)
     }
 
     fn finish(self) -> Vec<StageTimingRow> {
@@ -3531,6 +3652,7 @@ struct SimResult {
     intent_stats: IntentStats,
     slow_ticks: Vec<SlowTickRow>,
     tick_classes: Vec<TickClassRow>,
+    tick_windows: Vec<TickWindowRow>,
     stage_timings: Vec<StageTimingRow>,
     samples: Vec<TelemetrySample>,
     blast_commit_ticks: Vec<u64>,
@@ -3604,6 +3726,7 @@ impl SimResult {
             intent_stats: IntentStats::default(),
             slow_ticks: Vec::new(),
             tick_classes: Vec::new(),
+            tick_windows: Vec::new(),
             samples: Vec::new(),
             blast_commit_ticks: Vec::new(),
             blast_commit_elapsed_ms: Vec::new(),
@@ -6357,5 +6480,41 @@ mod tests {
             "the corrupt save was not overwritten with the built-in scene"
         );
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+    #[test]
+    fn windows_separate_ordinary_ticks_from_digs_and_split_on_the_boundary() {
+        let row = |tick: u64, busy: f32, class: &'static str| TickRow {
+            tick,
+            busy_ms: busy,
+            class,
+            stages: [0.0; CLASS_STAGES.len()],
+        };
+        let mut ticks = Vec::new();
+        for t in 1..=7_200u64 {
+            let (busy, class) = if t % 60 == 0 {
+                (70.0, "terrain_dig")
+            } else {
+                (8.0, "no_edit")
+            };
+            ticks.push(row(t, busy, class));
+        }
+        let w = tick_windows(&ticks, 0);
+        assert_eq!(w.len(), 2, "7,200 ticks are two 3,600-tick windows");
+        assert_eq!(w[0].ticks, 3_600);
+        assert_eq!(w[0].first_tick, 1);
+        assert_eq!(w[1].first_tick, 3_601);
+        for r in &w {
+            assert_eq!(r.dig_ticks, 60);
+            assert!((r.dig_mean_ms - 70.0).abs() < 1e-6);
+            assert!(
+                (r.ordinary_p99_ms - 8.0).abs() < 1e-6,
+                "ordinary ticks are not the digs"
+            );
+            assert!(
+                r.busy_p99_ms > 60.0,
+                "the all-tick p99 is the digs: {}",
+                r.busy_p99_ms
+            );
+        }
     }
 }
