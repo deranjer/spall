@@ -616,6 +616,12 @@ impl Connection {
         self.quic.close_reason().is_none()
     }
 
+    /// Why the QUIC connection closed (idle timeout, peer application close with its
+    /// reason bytes, reset, ...), or `None` while it is still open. Diagnostic only.
+    pub fn close_reason(&self) -> Option<String> {
+        self.quic.close_reason().map(|e| e.to_string())
+    }
+
     /// Closes the connection with an application code.
     pub fn close(&self, reason: &str) {
         self.quic.close(0u32.into(), reason.as_bytes());

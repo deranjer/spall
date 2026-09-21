@@ -725,13 +725,15 @@ async fn perform_late_join(
             Ok(Some(WireRecord::BaselineBegin(b))) => break b,
             Ok(Some(_)) => continue,
             Ok(None) => {
-                return Err(ClientNetError::Baseline(
-                    "connection closed before the baseline arrived".into(),
-                ));
+                return Err(ClientNetError::Baseline(format!(
+                    "connection closed before the baseline arrived (transport: {})",
+                    conn.close_reason().unwrap_or_else(|| "control stream ended, connection still open".into())
+                )));
             }
             Err(e) => {
                 return Err(ClientNetError::Baseline(format!(
-                    "connection closed before the baseline arrived: {e}"
+                    "connection closed before the baseline arrived: {e} (transport: {})",
+                    conn.close_reason().unwrap_or_else(|| "connection still open".into())
                 )));
             }
         }

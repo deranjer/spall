@@ -3807,6 +3807,7 @@ impl LateJoin {
             InterestEpoch(1),
             cursor,
         )
+        .map_err(|e| tracing::warn!("baseline capture failed: {e:?}"))
         .ok()?;
         self.cached_baseline = Some(std::sync::Arc::new(transfer.reissue(id)));
         Some(transfer)
@@ -3845,10 +3846,14 @@ impl LateJoin {
                         );
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    // A failed capture used to be dropped silently, leaving only a generic bye at the
+                    // client; name the cause where an operator can see it.
+                    tracing::warn!("baseline capture failed: {e:?}");
                     for (raw, _) in capture.waiters {
                         self.failed += 1;
                         if let Some(link) = self.links.remove(&raw) {
+                            self.ev(link.session, format!("capture_failed: {e:?}").as_str());
                             send_to(
                                 clients,
                                 link.session,
@@ -4473,22 +4478,32 @@ async fn send_baseline_paced(
     transfer: &BaselineTransfer,
     rate_limit: Option<u64>,
 ) -> bool {
-    if conn
+    // Every failure names its stage: a bare `false` used to surface upstream only as
+    // "reliable record send failed (connection lost or closed by peer)", which hid the case
+    // where the *record itself* was refused (e.g. over the control-record size limit).
+    let fail = |stage: &str, e: &dyn std::fmt::Display| {
+        tracing::warn!(
+            session = %conn.session(),
+            "baseline transfer failed at {stage}: {e} (parts {}, begin record ok)",
+            transfer.parts.len()
+        );
+        false
+    };
+    if let Err(e) = conn
         .send_record(WireRecord::BaselineBegin(transfer.begin.clone()))
         .await
-        .is_err()
     {
-        return false;
+        return fail("BaselineBegin", &e);
     }
     let mut bulk = match conn.open_bulk().await {
         Ok(b) => b,
-        Err(_) => return false,
+        Err(e) => return fail("open_bulk", &e),
     };
     let started = tokio::time::Instant::now();
     let mut sent = 0u64;
     for part in transfer.parts.iter() {
-        if bulk.send_part(part).await.is_err() {
-            return false;
+        if let Err(e) = bulk.send_part(part).await {
+            return fail("bulk part", &e);
         }
         if let Some(rate) = rate_limit.filter(|r| *r > 0) {
             sent += part.payload.len() as u64;
@@ -4496,12 +4511,13 @@ async fn send_baseline_paced(
             tokio::time::sleep_until(started + due).await;
         }
     }
-    if bulk.finish().is_err() {
-        return false;
+    if let Err(e) = bulk.finish() {
+        return fail("bulk finish", &e);
     }
-    conn.send_record(WireRecord::BaselineEnd(transfer.end))
-        .await
-        .is_ok()
+    match conn.send_record(WireRecord::BaselineEnd(transfer.end)).await {
+        Ok(_) => true,
+        Err(e) => fail("BaselineEnd", &e),
+    }
 }
 
 async fn wait_true(mut rx: watch::Receiver<bool>) {

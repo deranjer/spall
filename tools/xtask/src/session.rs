@@ -1263,6 +1263,7 @@ struct SessionSummary {
     restart_checked: bool,
     restart_recovered_hash_matches: bool,
     restart_reconnect_hash_matches: bool,
+    restart_detail: String,
     restart_recovered_world_hash: String,
     /// T23 / G3 row 7 item 2 (increment 31): the server's reported durable
     /// residency-backing byte count for this run -- `Some(n)` once a
@@ -2789,6 +2790,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     restart_checked: false,
                     restart_recovered_hash_matches: false,
                     restart_reconnect_hash_matches: false,
+                    restart_detail: String::new(),
                     restart_recovered_world_hash: String::new(),
                     residency_backing_disk_bytes: None,
                     residency_pinned_bricks_max: 0,
@@ -3128,6 +3130,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 .as_ref()
                 .map(|r| r.ran && r.reconnect_matches)
                 .unwrap_or(false),
+            restart_detail: restart
+                .as_ref()
+                .map(|r| r.detail.clone())
+                .unwrap_or_default(),
             restart_recovered_world_hash: restart
                 .as_ref()
                 .map(|r| r.recovered_hash.clone())
@@ -3220,7 +3226,17 @@ struct RestartCheck {
     recovered_hash: String,
     recovered_matches: bool,
     reconnect_matches: bool,
+    /// Why a reconnect did not converge (empty when it did): the client's result and the
+    /// restarted server's per-session events, so a failure is diagnosable from the summary.
+    detail: String,
 }
+
+/// Tick budget of the restarted server (nominally 45 s at 60 Hz). A restart run has no edits to
+/// make; it only has to stay up long enough to serve one late-join baseline. The old 300-tick (5 s
+/// nominal) lifetime ended the server 0.3 s after a 5.5k-body baseline finished (measured), and a
+/// larger world at slower ticks would be cut off mid-join; the harness deadline (`run.timeout`)
+/// still bounds the whole phase and the client's own timeout is unchanged.
+const RESTART_SERVER_TICKS: &str = "2700";
 
 /// T23 / G3 row 7 item 2 (increment 31): matching residency + disk-backing
 /// config for the cold-restarted server in [`run_restart_check`], so it
@@ -3250,6 +3266,7 @@ fn run_restart_check(
         recovered_hash: String::new(),
         recovered_matches: false,
         reconnect_matches: false,
+        detail: "restart check did not run".into(),
     };
     if !output.join("world.db").exists() {
         return miss;
@@ -3279,10 +3296,9 @@ fn run_restart_check(
         &srv_summary.display().to_string(),
         "--log-json",
         &output.join("restart.server.jsonl").display().to_string(),
-        // A short bounded run: the recovering server has no edits to make, it
-        // just needs to be up long enough to serve one late-join baseline.
+        // Bounded, but long enough to serve one late-join baseline (see the constant).
         "--ticks",
-        "300",
+        RESTART_SERVER_TICKS,
         "--min-clients",
         "0",
         "--max-clients",
@@ -3363,11 +3379,30 @@ fn run_restart_check(
         .map(|c| c.result == "passed" && c.final_world_hash == expected)
         .unwrap_or(false);
 
+    let detail = if reconnect_matches {
+        String::new()
+    } else {
+        let client = read_json::<serde_json::Value>(&cl_summary)
+            .map(|c| c["result"].as_str().unwrap_or("unknown").to_string())
+            .unwrap_or_else(|| "no client summary".into());
+        let events = read_json::<serde_json::Value>(&srv_summary)
+            .and_then(|s| {
+                s["session_timelines"][0]["events"].as_array().map(|e| {
+                    e.iter()
+                        .filter_map(|ev| Some(format!("{} {}", ev[0], ev[1].as_str()?)))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+            })
+            .unwrap_or_default();
+        format!("client result `{client}`; restarted server session events: {events}")
+    };
     RestartCheck {
         ran: true,
         recovered_hash,
         recovered_matches,
         reconnect_matches,
+        detail,
     }
 }
 

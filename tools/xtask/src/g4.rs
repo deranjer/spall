@@ -60,6 +60,17 @@ pub struct G4ServerFacts {
     /// Wall-clock commit time of each blast, parallel to `blast_commit_ticks`.
     #[serde(default)]
     pub blast_commit_elapsed_ms: Vec<u64>,
+    /// Server admission accounting for the whole run (from `ServeSummary`).
+    #[serde(default)]
+    pub actions_requested: u64,
+    #[serde(default)]
+    pub actions_staged: u64,
+    #[serde(default)]
+    pub actions_rejected: u64,
+    #[serde(default)]
+    pub actions_queued_unresolved: u64,
+    #[serde(default)]
+    pub transactions_committed: u64,
     #[serde(default)]
     pub reliable_backlog_peak_bytes: u64,
     #[serde(default)]
@@ -844,14 +855,35 @@ pub fn evaluate(
         format!(">= {}", cfg.min_dormant_bodies),
     );
     let want_rubble = (cfg.expected_ordinary_edits as f64 * cfg.min_rubble_fraction) as u64;
+    // Not a growth *failure* when short: rubble accumulates one body per committed edit, so a run
+    // that committed fewer edits than the workload scripted cannot reach the required amount.
     add(
-        "rubble accumulates as edits land",
+        "required rubble accumulation reached",
         cfg.expected_ordinary_edits > 0 && bodies.rubble_gained.is_some_and(|g| g >= want_rubble),
         format!(
-            "{:?} bodies gained ({:?} -> {:?})",
-            bodies.rubble_gained, bodies.first_total, bodies.last_total
+            "{:?} bodies gained ({:?} -> {:?}); {} of {} requested edits committed",
+            bodies.rubble_gained,
+            bodies.first_total,
+            bodies.last_total,
+            facts.transactions_committed,
+            facts.actions_requested
         ),
-        format!(">= {want_rubble}"),
+        format!("required >= {want_rubble} bodies gained ({} x expected ordinary edits {})", cfg.min_rubble_fraction, cfg.expected_ordinary_edits),
+    );
+    add(
+        "workload completed: every requested edit committed, none rejected or left unresolved",
+        facts.actions_requested > 0
+            && facts.actions_rejected == 0
+            && facts.actions_queued_unresolved == 0
+            && facts.transactions_committed == facts.actions_requested,
+        format!(
+            "{} requested, {} committed, {} rejected, {} unresolved (convergence of the committed work is checked separately)",
+            facts.actions_requested,
+            facts.transactions_committed,
+            facts.actions_rejected,
+            facts.actions_queued_unresolved
+        ),
+        "committed == requested, 0 rejected, 0 unresolved".to_string(),
     );
     if cfg.require_giant_collapse {
         let ys: Vec<f64> = all.iter().filter_map(|s| s.giant_origin_y_m).collect();
