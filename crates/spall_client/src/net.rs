@@ -727,13 +727,15 @@ async fn perform_late_join(
             Ok(None) => {
                 return Err(ClientNetError::Baseline(format!(
                     "connection closed before the baseline arrived (transport: {})",
-                    conn.close_reason().unwrap_or_else(|| "control stream ended, connection still open".into())
+                    conn.close_reason()
+                        .unwrap_or_else(|| "control stream ended, connection still open".into())
                 )));
             }
             Err(e) => {
                 return Err(ClientNetError::Baseline(format!(
                     "connection closed before the baseline arrived: {e} (transport: {})",
-                    conn.close_reason().unwrap_or_else(|| "connection still open".into())
+                    conn.close_reason()
+                        .unwrap_or_else(|| "connection still open".into())
                 )));
             }
         }

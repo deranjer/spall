@@ -4514,7 +4514,10 @@ async fn send_baseline_paced(
     if let Err(e) = bulk.finish() {
         return fail("bulk finish", &e);
     }
-    match conn.send_record(WireRecord::BaselineEnd(transfer.end)).await {
+    match conn
+        .send_record(WireRecord::BaselineEnd(transfer.end))
+        .await
+    {
         Ok(_) => true,
         Err(e) => fail("BaselineEnd", &e),
     }

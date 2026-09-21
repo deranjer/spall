@@ -868,7 +868,10 @@ pub fn evaluate(
             facts.transactions_committed,
             facts.actions_requested
         ),
-        format!("required >= {want_rubble} bodies gained ({} x expected ordinary edits {})", cfg.min_rubble_fraction, cfg.expected_ordinary_edits),
+        format!(
+            "required >= {want_rubble} bodies gained ({} x expected ordinary edits {})",
+            cfg.min_rubble_fraction, cfg.expected_ordinary_edits
+        ),
     );
     add(
         "workload completed: every requested edit committed, none rejected or left unresolved",
@@ -1020,6 +1023,9 @@ mod tests {
         G4ServerFacts {
             telemetry_samples: samples,
             blast_commit_ticks: vec![900],
+            actions_requested: 10,
+            actions_staged: 10,
+            transactions_committed: 10,
             reliable_backlog_cap_bytes: 8 << 20,
             reliable_backlog_peak_bytes: 500_000,
             reliable_backlog_peak_age_ms: 900,
@@ -1262,6 +1268,47 @@ mod tests {
                 r.evidence_gap.as_deref().unwrap_or("")
             );
         }
+    }
+
+    #[test]
+    fn a_run_that_committed_only_part_of_the_workload_fails_completion_not_convergence() {
+        // 18,181 requested, 8,259 committed, 9,922 rejected (a v2-soak-shaped run).
+        let mut facts = healthy();
+        facts.actions_requested = 18_181;
+        facts.actions_staged = 8_259;
+        facts.transactions_committed = 8_259;
+        facts.actions_rejected = 9_922;
+        let row = evaluate(&cfg(), &facts, Some(1), 2, 1, &[]);
+        let c = row
+            .checks
+            .iter()
+            .find(|c| c.name.starts_with("workload completed"))
+            .unwrap();
+        assert!(!c.passed, "{c:?}");
+        assert!(
+            c.measured.contains("18181 requested") && c.measured.contains("9922 rejected"),
+            "{c:?}"
+        );
+        let r = row
+            .checks
+            .iter()
+            .find(|c| c.name == "required rubble accumulation reached")
+            .unwrap();
+        assert!(
+            r.measured.contains("of 18181 requested edits committed"),
+            "{r:?}"
+        );
+        // Nothing requested is a missing measurement, never a pass.
+        let mut none = healthy();
+        none.actions_requested = 0;
+        let row = evaluate(&cfg(), &none, Some(1), 2, 1, &[]);
+        assert!(
+            !row.checks
+                .iter()
+                .find(|c| c.name.starts_with("workload completed"))
+                .unwrap()
+                .passed
+        );
     }
     #[test]
     fn a_backlog_that_never_drains_after_a_blast_fails() {
