@@ -521,6 +521,22 @@ pub struct ServeConfig {
     /// Account which operations wake rapier-asleep bodies (`ServeSummary::wake_reasons`).
     /// Each probed operation scans every body, so it is off by default.
     pub wake_audit: bool,
+    /// **Experimental, default off.** Split the physics terrain into one collider per solid
+    /// brick so a far terrain edit no longer wakes unrelated resting bodies
+    /// (`docs/reports/terrain-collider-locality.md`). Unsupported combinations are refused by
+    /// [`validate_config`]: it cannot be combined with residency.
+    pub terrain_brick_colliders: bool,
+}
+
+/// Refuses configurations the server cannot honour, explicitly and before any state is built.
+pub fn validate_config(config: &ServeConfig) -> Result<(), String> {
+    if config.terrain_brick_colliders && config.residency.is_some() {
+        return Err(
+            "terrain_brick_colliders is unsupported with residency (per-brick terrain colliders              have no eviction/reload lifecycle); disable one of them"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// A bounded, explicit server timing window. The server records at most
@@ -616,6 +632,7 @@ impl ServeConfig {
             timing_window: None,
             baseline_rate_limit_bytes_per_sec: None,
             wake_audit: false,
+            terrain_brick_colliders: false,
         }
     }
 }
@@ -888,6 +905,9 @@ pub struct ServeSummary {
     pub startup_ms: Vec<(String, f64)>,
     /// Wake-reason accounting (empty unless `ServeConfig::wake_audit`).
     pub wake_reasons: Vec<WakeReasonRow>,
+    /// Number of per-brick terrain colliders (0 when the experimental mode is off).
+    #[serde(default)]
+    pub terrain_brick_colliders: u64,
     /// Bodies observed below the world floor (see [`OutOfWorldRow`]); empty when none.
     #[serde(default)]
     pub out_of_world_bodies: Vec<OutOfWorldRow>,
@@ -925,11 +945,16 @@ pub enum ServeError {
     Io(#[from] std::io::Error),
     #[error("tokio runtime: {0}")]
     Runtime(String),
+    #[error("unsupported configuration: {0}")]
+    UnsupportedConfig(String),
 }
 
 /// Runs the networked host to completion and returns its summary. Builds its own
 /// current-thread-free multi-thread Tokio runtime.
 pub fn serve(config: ServeConfig) -> Result<ServeSummary, ServeError> {
+    if let Err(e) = validate_config(&config) {
+        return Err(ServeError::UnsupportedConfig(e));
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1593,6 +1618,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let dormancy_cfg = config.dormancy;
     let timing_window = config.timing_window;
     let wake_audit_on = config.wake_audit;
+    let terrain_brick_colliders_on = config.terrain_brick_colliders;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
@@ -1627,6 +1653,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         }
         if wake_audit_on {
             sim.world_mut().enable_wake_audit();
+        }
+        if terrain_brick_colliders_on
+            && let Err(e) = sim.world_mut().enable_terrain_brick_colliders()
+        {
+            return SimResult::error(format!("terrain brick colliders: {e}"), 0);
         }
         let mut journal_records_written: u64 = 0;
 
@@ -2271,6 +2302,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         }
 
         SimResult {
+            terrain_brick_colliders: sim.world().terrain_brick_collider_count() as u64,
             stage_timings: stage_agg.finish(),
             wake_reasons: sim
                 .world()
@@ -2612,6 +2644,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         admission_refused_at_capacity: admission.refused.load(std::sync::atomic::Ordering::Relaxed),
         stage_timings: sim_result.stage_timings.clone(),
         wake_reasons: sim_result.wake_reasons.clone(),
+        terrain_brick_colliders: sim_result.terrain_brick_colliders,
         out_of_world_bodies: sim_result.out_of_world.clone(),
         containment_coverage: sim_result.containment_coverage.clone(),
         backlog_series: sim_result.backlog_series.clone(),
@@ -3205,6 +3238,7 @@ struct SimResult {
     containment_coverage: ContainmentCoverage,
     backlog_series: Vec<(u64, u64, u64)>,
     wake_reasons: Vec<WakeReasonRow>,
+    terrain_brick_colliders: u64,
     stage_timings: Vec<StageTimingRow>,
     samples: Vec<TelemetrySample>,
     blast_commit_ticks: Vec<u64>,
@@ -3274,6 +3308,7 @@ impl SimResult {
             backlog_series: Vec::new(),
             stage_timings: Vec::new(),
             wake_reasons: Vec::new(),
+            terrain_brick_colliders: 0,
             samples: Vec::new(),
             blast_commit_ticks: Vec::new(),
             blast_commit_elapsed_ms: Vec::new(),

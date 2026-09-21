@@ -79,6 +79,7 @@ fn base_config(
         motion_interest: Some(motion_interest),
         residency: None,
         residency_disk_path: None,
+        terrain_brick_colliders: false,
         contact_damage: None,
         dormancy: None,
         timing_window: None,

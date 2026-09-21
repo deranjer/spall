@@ -58,6 +58,10 @@ pub enum WorldError {
     ReplayPrecondition(String),
     #[error("journal replay result hash mismatch: {0}")]
     ReplayResultHash(String),
+    /// An option was requested in a combination the world cannot support (rejected explicitly,
+    /// never silently degraded).
+    #[error("unsupported: {0}")]
+    Unsupported(&'static str),
 }
 
 /// A detached body being reinstated from a persisted checkpoint record.
@@ -318,6 +322,13 @@ impl SimWorld {
         volume: VolumeId,
         coord: BrickCoord,
     ) -> Result<bool, spall_voxel::DigestError> {
+        // Per-brick terrain colliders have no residency lifecycle: an evicted brick would leave a
+        // stale collider (or none). Refuse explicitly rather than silently diverge.
+        if self.terrain_bricks.is_some() && volume == self.terrain().volume_id {
+            return Err(spall_voxel::DigestError::Unsupported(
+                "per-brick terrain colliders do not support terrain eviction",
+            ));
+        }
         let Some(vol) = self.volume_ref(volume) else {
             return Ok(false);
         };

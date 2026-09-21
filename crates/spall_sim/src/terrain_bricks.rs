@@ -105,6 +105,13 @@ impl SimWorld {
         self.terrain_bricks.is_some()
     }
 
+    /// Number of per-brick terrain colliders currently holding geometry (0 when off).
+    pub fn terrain_brick_collider_count(&self) -> usize {
+        self.terrain_bricks
+            .as_ref()
+            .map_or(0, |t| t.bricks.values().filter(|b| b.has_collider).count())
+    }
+
     /// Every physics body that carries terrain collision (the single terrain body when the
     /// prototype is off).
     pub fn terrain_physics_bodies(&self) -> Vec<spall_physics::BodyId> {
@@ -112,6 +119,16 @@ impl SimWorld {
             Some(t) => t.bricks.values().map(|b| b.phys).collect(),
             None => vec![self.terrain().phys],
         }
+    }
+
+    /// Whether the terrain brick at `coord` currently has a physical collider (`None` when the
+    /// prototype is off or the brick was never solid).
+    pub fn terrain_brick_has_collider(&self, coord: BrickCoord) -> Option<bool> {
+        self.terrain_bricks
+            .as_ref()?
+            .bricks
+            .get(&key(coord))
+            .map(|b| b.has_collider)
     }
 
     /// Whether `id` is (one of) the terrain's physics bodies.
@@ -128,6 +145,18 @@ impl SimWorld {
     pub fn enable_terrain_brick_colliders(&mut self) -> Result<(), WorldError> {
         if self.terrain_bricks.is_some() {
             return Ok(());
+        }
+        // Residency is unsupported with per-brick colliders (no eviction/reload lifecycle for
+        // them): refuse instead of leaving stale or missing colliders under evicted bricks.
+        if self.has_backing() {
+            return Err(WorldError::Unsupported(
+                "per-brick terrain colliders cannot be combined with a residency backing",
+            ));
+        }
+        if !self.evicted(self.terrain().volume_id).is_empty() {
+            return Err(WorldError::Unsupported(
+                "per-brick terrain colliders require every terrain brick to be resident",
+            ));
         }
         let coords = self.terrain().volume.resident_brick_coords();
         let plans = plan_terrain_bricks(&self.terrain().volume, &coords)?;

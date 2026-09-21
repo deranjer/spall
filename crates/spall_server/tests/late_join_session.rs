@@ -85,6 +85,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         motion_interest: None,
         residency: None,
         residency_disk_path: None,
+        terrain_brick_colliders: false,
         contact_damage: None,
         dormancy: None,
         timing_window: None,

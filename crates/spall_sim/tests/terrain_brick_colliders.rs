@@ -111,12 +111,15 @@ fn brick_colliders_cover_exactly_the_terrain_and_track_its_revisions() {
     );
     // Publication is at the tick boundary: right after a tick that commits digs, every
     // collider matches the authoritative revision it was built from.
-    for (i, cell) in [[100, 1, 100], [230, 1, 120], [232, 1, 118]]
+    // A brush must satisfy `centre y >= radius` on this bounded volume (its floor is y = 0), else
+    // the edit is rejected; assert each dig really commits so the check is not vacuous.
+    for (i, cell) in [[100, 2, 100], [230, 2, 120], [232, 2, 118]]
         .into_iter()
         .enumerate()
     {
         dig(&mut sim, i as u64 + 1, cell, 2);
-        sim.tick().unwrap();
+        let report = sim.tick().unwrap();
+        assert_eq!(report.committed.len(), 1, "dig {i}: {:?}", report.rejected);
         sim.world()
             .validate_terrain_brick_colliders()
             .unwrap_or_else(|e| panic!("after dig {i}: {e}"));
@@ -316,4 +319,302 @@ fn probe_support_removal_trace() {
             println!("  cell ({},{y},{}): {s:?}", 200 + dx, 120 + dz);
         }
     }
+}
+
+// --- empty / refill, multi-brick edits, collapse, character and contact seams, residency ---------
+
+use spall_core::BrickCoord;
+use spall_sim::EditKind;
+
+fn place(sim: &mut Simulation, req: u64, cell: [i64; 3], radius: i64) {
+    let mut intent = EditIntent::cut(
+        RequestId(req),
+        EntityId::new(1).unwrap(),
+        EditTarget::Terrain,
+        brush_cell(cell, radius),
+    );
+    intent.kind = EditKind::Place(fixtures::STONE);
+    sim.submit(intent).unwrap();
+}
+
+fn cube_rest_y(sim: &mut Simulation, at: [f64; 3]) -> (f64, bool) {
+    let id = cube(sim, at);
+    settle(sim, 240);
+    let b = sim.world().body(id).unwrap();
+    (b.pose.translation_m[1], b.sleeping)
+}
+
+/// A flat slab plus a separate 8 x 8 x 2 cell island in brick (1, 0, 0), on an unbounded volume so
+/// a brush may dip below y = 0 and clear the island completely.
+fn island_setup() -> spall_sim::WorldSetup {
+    let mut setup = fixtures::flat_terrain_setup();
+    let id = setup.terrain.id();
+    setup
+        .terrain
+        .apply_edit(&spall_voxel::EditPlan::filled_box(
+            id,
+            spall_core::GlobalCell::new(32, 0, 0),
+            spall_core::GlobalCell::new(39, 1, 7),
+            fixtures::STONE,
+        ))
+        .unwrap();
+    setup.terrain_collider_region.1 = spall_core::GlobalCell::new(39, 9, 23);
+    setup
+}
+
+#[test]
+fn a_brick_emptied_then_refilled_tracks_the_volume_and_supports_a_body_like_the_single_collider() {
+    let brick = BrickCoord::new(1, 0, 0);
+    let mut rests = Vec::new();
+    for bricks in [false, true] {
+        let mut sim = Simulation::new(SimulationConfig::new(island_setup())).unwrap();
+        if bricks {
+            sim.world_mut().enable_terrain_brick_colliders().unwrap();
+            assert_eq!(sim.world().terrain_brick_has_collider(brick), Some(true));
+        }
+        // Clear the whole island: the brick becomes empty.
+        dig(&mut sim, 1, [35, 1, 3], 8);
+        let report = sim.tick().unwrap();
+        assert_eq!(report.committed.len(), 1, "{:?}", report.rejected);
+        if bricks {
+            sim.world().validate_terrain_brick_colliders().unwrap();
+            assert_eq!(
+                sim.world().terrain_brick_has_collider(brick),
+                Some(false),
+                "an emptied brick keeps no collider"
+            );
+            // The neighbouring slab brick is untouched.
+            assert_eq!(
+                sim.world()
+                    .terrain_brick_has_collider(BrickCoord::new(0, 0, 0)),
+                Some(true)
+            );
+        }
+        // Refill it; the same brick must get a collider again from the refilled geometry.
+        place(&mut sim, 2, [35, 1, 3], 8);
+        let report = sim.tick().unwrap();
+        assert_eq!(report.committed.len(), 1, "{:?}", report.rejected);
+        if bricks {
+            sim.world().validate_terrain_brick_colliders().unwrap();
+            assert_eq!(sim.world().terrain_brick_has_collider(brick), Some(true));
+        }
+        // The refill is a stone dome up to ~2.25 m high; drop a cube on its apex from above.
+        rests.push(cube_rest_y(&mut sim, [8.75, 4.0, 0.75]));
+    }
+    assert_eq!(rests[0].1, rests[1].1, "same sleep state: {rests:?}");
+    assert!(
+        (rests[0].0 - rests[1].0).abs() < 0.02,
+        "rest height matches the single collider: {rests:?}"
+    );
+    assert!(
+        rests[1].0 > 0.4,
+        "it rests on the refilled geometry, not through it: {rests:?}"
+    );
+}
+
+#[test]
+fn a_dig_spanning_four_bricks_rebuilds_only_those_and_matches_the_single_collider() {
+    let far = [BrickCoord::new(0, 0, 0), BrickCoord::new(6, 0, 4)];
+    let mut hashes = Vec::new();
+    let mut before = None;
+    for bricks in [false, true] {
+        let mut sim = scene(bricks);
+        if bricks {
+            before = Some(far.map(|c| {
+                sim.world()
+                    .terrain()
+                    .volume
+                    .brick_revision(c)
+                    .ok()
+                    .flatten()
+            }));
+        }
+        // Centre on the four-brick corner (cell 96, 96).
+        dig(&mut sim, 1, [96, 10, 96], 10);
+        let report = sim.tick().unwrap();
+        assert_eq!(report.committed.len(), 1, "{:?}", report.rejected);
+        if bricks {
+            sim.world().validate_terrain_brick_colliders().unwrap();
+            let after = far.map(|c| {
+                sim.world()
+                    .terrain()
+                    .volume
+                    .brick_revision(c)
+                    .ok()
+                    .flatten()
+            });
+            assert_eq!(
+                before.unwrap(),
+                after,
+                "untouched bricks keep their revisions"
+            );
+        }
+        hashes.push(sim.world().world_hash());
+    }
+    assert_eq!(hashes[0], hashes[1], "authoritative topology is identical");
+}
+
+#[test]
+fn a_cross_brick_collapse_detaches_the_same_beam_and_rests_like_the_single_collider() {
+    let script: [(u64, [i64; 3], i64); 4] = [
+        (4, [31, 4, 1], 3),
+        (8, [32, 4, 2], 3),
+        (16, [21, 1, 1], 1),
+        (24, [43, 1, 1], 1),
+    ];
+    let mut out = Vec::new();
+    for bricks in [false, true] {
+        let mut sim =
+            Simulation::new(SimulationConfig::new(fixtures::cross_brick_bridged_setup())).unwrap();
+        if bricks {
+            sim.world_mut().enable_terrain_brick_colliders().unwrap();
+        }
+        let mut next = 0;
+        for tick in 1..=400u64 {
+            if next < script.len() && script[next].0 == tick {
+                let (_, cell, radius) = script[next];
+                let _ = sim.submit(EditIntent::cut(
+                    RequestId(next as u64 + 1),
+                    EntityId::new(1).unwrap(),
+                    EditTarget::Terrain,
+                    brush_cell(cell, radius),
+                ));
+                next += 1;
+            }
+            sim.tick().unwrap();
+            if bricks {
+                sim.world()
+                    .validate_terrain_brick_colliders()
+                    .unwrap_or_else(|e| panic!("tick {tick}: {e}"));
+            }
+        }
+        let beam = sim.world().bodies().next().expect("beam detached");
+        out.push((
+            sim.world().body_count(),
+            beam.pose.translation_m,
+            beam.sleeping,
+            sim.world().world_hash(),
+        ));
+    }
+    assert_eq!(out[0].0, 1);
+    assert_eq!(
+        out[0].0, out[1].0,
+        "same number of detached bodies: {out:?}"
+    );
+    assert!(
+        out[1].2,
+        "the beam settles asleep on the remaining floor: {out:?}"
+    );
+    for a in 0..3 {
+        assert!(
+            (out[0].1[a] - out[1].1[a]).abs() < 0.05,
+            "resting pose axis {a}: {out:?}"
+        );
+    }
+    assert_eq!(out[0].3, out[1].3, "authoritative topology identical");
+}
+
+#[test]
+fn a_walking_player_crosses_brick_seams_like_on_the_single_collider() {
+    use spall_core::{PlayerInput, player_entity_for};
+    use spall_protocol::InputSeq;
+    use spall_sim::fixtures::{WALK_ARENA_SPAWNS, walk_arena_setup};
+    let mut ends = Vec::new();
+    for bricks in [false, true] {
+        let mut sim = Simulation::new(SimulationConfig::new(walk_arena_setup())).unwrap();
+        if bricks {
+            sim.world_mut().enable_terrain_brick_colliders().unwrap();
+        }
+        let player = player_entity_for(0);
+        // Spawn at x = 7 m, past the row-15 near-origin defect (see G3.md).
+        let _ = WALK_ARENA_SPAWNS;
+        sim.add_player(player, [7.0, 1.0, 1.5]);
+        let mut min_y = f64::MAX;
+        let mut crossed = [false; 2];
+        for seq in 1..=300u64 {
+            sim.set_player_input(
+                player,
+                PlayerInput {
+                    movement: [0.0, 0.0, 1.0],
+                    view_dir: [1.0, 0.0, 0.0],
+                    buttons: 0,
+                },
+                InputSeq(seq),
+            );
+            sim.tick().unwrap();
+            let s = sim.player_state(player).unwrap();
+            if seq > 5 {
+                min_y = min_y.min(s.position_m[1]);
+            }
+            crossed[0] |= s.position_m[0] > 8.5;
+            crossed[1] |= s.position_m[0] > 16.5;
+            // Stay on the 30 m lane: 300 ticks ends near x = 28 m, before its far edge.
+        }
+        let s = sim.player_state(player).unwrap();
+        ends.push((s.position_m, s.grounded, min_y, crossed));
+    }
+    assert!(ends[1].3 == [true, true], "crossed two seams: {ends:?}");
+    assert!(ends[1].1, "grounded at the end: {ends:?}");
+    assert!(ends[1].2 > 0.9, "never dropped through a seam: {ends:?}");
+    // Same path within 0.2 m along the lane and 0.05 m in height (the two colliders are built
+    // from the same cells but the player's terrain window differs in float noise).
+    assert!((ends[0].0[0] - ends[1].0[0]).abs() < 0.2, "{ends:?}");
+    assert!((ends[0].0[1] - ends[1].0[1]).abs() < 0.05, "{ends:?}");
+    assert!((ends[0].0[2] - ends[1].0[2]).abs() < 0.05, "{ends:?}");
+}
+
+#[test]
+fn contacts_against_brick_colliders_are_recognised_as_terrain_contacts() {
+    let mut sim = scene(true);
+    let id = cube_moving(&mut sim, [55.75, 3.0, 45.0], [0.0, -4.0, 0.0]);
+    let phys = sim.world().body(id).unwrap().phys;
+    let mut saw_terrain_contact = false;
+    for _ in 0..120 {
+        sim.tick().unwrap();
+        for c in sim.world().physics().contact_impulses() {
+            if c.bodies[0] != phys && c.bodies[1] != phys {
+                continue;
+            }
+            let other = if c.bodies[0] == phys {
+                c.bodies[1]
+            } else {
+                c.bodies[0]
+            };
+            if sim.world().is_terrain_physics_body(other) {
+                saw_terrain_contact = true;
+            }
+        }
+    }
+    assert!(
+        saw_terrain_contact,
+        "the falling cube touching a brick collider is a terrain contact"
+    );
+}
+
+#[test]
+fn residency_combinations_are_rejected_explicitly() {
+    // Enabling with a residency backing installed is refused.
+    let mut sim = scene(false);
+    sim.world_mut().set_backing(std::sync::Arc::new(
+        spall_sim::backing::MemoryBacking::default(),
+    ));
+    let err = sim
+        .world_mut()
+        .enable_terrain_brick_colliders()
+        .unwrap_err();
+    assert!(err.to_string().contains("residency"), "{err}");
+    assert!(!sim.world().terrain_brick_colliders_enabled());
+
+    // With brick colliders on, evicting a terrain brick is refused and nothing changes.
+    let mut sim = scene(true);
+    let terrain = sim.world().terrain().volume_id;
+    let err = sim
+        .world_mut()
+        .evict_brick(terrain, BrickCoord::new(2, 0, 2))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("do not support terrain eviction"),
+        "{err}"
+    );
+    sim.world().validate_terrain_brick_colliders().unwrap();
 }

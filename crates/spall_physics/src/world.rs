@@ -1018,8 +1018,11 @@ impl PhysicsWorld {
             // expressed relative to that body's centre of mass, in its local
             // frame; lift both to world space (world COM + body rotation · point)
             // and average — a stable brush centre for the hit.
-            let rb1 = &self.bodies[rb1];
-            let rb2 = &self.bodies[rb2];
+            // A pair can outlive a body removed since the last step (a retired debris body):
+            // skip it instead of indexing a stale handle.
+            let (Some(rb1), Some(rb2)) = (self.bodies.get(rb1), self.bodies.get(rb2)) else {
+                continue;
+            };
             let (com1, rot1) = (rb1.center_of_mass(), *rb1.rotation());
             let (com2, rot2) = (rb2.center_of_mass(), *rb2.rotation());
             let mut point_sum = [0.0_f64; 3];

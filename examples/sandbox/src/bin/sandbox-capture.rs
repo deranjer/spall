@@ -894,6 +894,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         motion_interest: None,
         residency: None,
         residency_disk_path: None,
+        terrain_brick_colliders: false,
         contact_damage: None,
         dormancy: None,
         timing_window: None,

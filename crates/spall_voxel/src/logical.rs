@@ -102,6 +102,10 @@ pub enum DigestError {
     NotResident(BrickCoord),
     #[error("logical conflict: brick {0:?} is both resident and evicted")]
     ResidentEvictedConflict(BrickCoord),
+    /// The caller's configuration cannot support eviction of this volume (for example terrain
+    /// with per-brick physics colliders, which have no residency lifecycle).
+    #[error("eviction unsupported: {0}")]
+    Unsupported(&'static str),
     #[error(
         "brick {coord:?} digest conflict: retained rev {retained:?} / {retained_hash}, \
          offered rev {offered:?} / {offered_hash}"

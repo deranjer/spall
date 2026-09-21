@@ -87,7 +87,7 @@ fn retained_save_baseline_breakdown() {
         seed: 0,
         generator_version: 1,
     };
-    let (restored, (sim, _seq)) = {
+    let (sim, _seq) = {
         let (r, peak) = peak_of(|| {
             persist::restore(
                 &recovery,
@@ -100,9 +100,8 @@ fn retained_save_baseline_breakdown() {
             .expect("restore")
         });
         println!("restore peak additional heap: {}", mib(peak));
-        ((), r)
+        r
     };
-    let _ = restored;
 
     let (world, peak_snapshot) = peak_of(|| logical_world_baseline(&sim, None));
     println!(

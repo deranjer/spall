@@ -1375,3 +1375,200 @@ fn terrain_collider_cost() {
     println!("  physics     : {}", stat(&physics));
     println!("  sim.commit  : {}", stat(&commit));
 }
+
+/// Body-time and contact evidence for the awake-body population, per terrain collider mode
+/// (`TERRAIN_BRICKS` unset / set). Counts, over the measured window and for every non-agitated
+/// body, the awake body-ticks by what the body is touching, the awake *episodes* (wake to next
+/// sleep) and how long they last, so the difference between modes can be attributed.
+#[test]
+#[ignore = "measurement: awake body-time and contact attribution"]
+fn awake_body_time() {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    let ticks: u64 = std::env::var("TRACE_TICKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    let (mut sim, bodies) = scene();
+    let agitated: BTreeSet<u64> = bodies.active.iter().map(|b| b.entity.get()).collect();
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let mut counters = (1u64, 0u64, 0u64, 0u64, 0u64);
+    // entity -> ticks awake in the current episode
+    let mut episode: HashMap<u64, u64> = HashMap::new();
+    let mut episodes: Vec<u64> = Vec::new();
+    // Per episode: did the body sit within 0.6 m of a brick-seam line (x or z a multiple of 8 m)
+    // at any point, and did it ever press on two terrain colliders at once?
+    let mut near_seam_ep: HashMap<u64, (bool, bool)> = HashMap::new();
+    let mut ep_groups: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    let mut rapier_active_sum = 0u64;
+    // (fixed terrain bodies, dynamic awake, dynamic rapier-asleep, dormant) summed over the window
+    let mut comp = (0u64, 0u64, 0u64, 0u64);
+    let mut flag_awake_sum = 0u64;
+    let (mut awake_ticks, mut by_contact) = (0u64, BTreeMap::<&str, u64>::new());
+    let mut window = 0u64;
+    let mut born_awake = 0u64;
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    for t in 0..ticks {
+        workload_step(&mut sim, t, &mut counters);
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+        if t < 600 {
+            continue;
+        }
+        window += 1;
+        rapier_active_sum += sim.world().physics().active_body_count() as u64;
+        // What `active_body_count` is made of: fixed terrain bodies + every non-dormant dynamic
+        // body (including rapier-asleep ones).
+        comp.0 += sim.world().terrain_physics_bodies().len() as u64;
+        for b in sim.world().bodies() {
+            if b.dormant {
+                comp.3 += 1;
+            } else if b.sleeping {
+                comp.2 += 1;
+            } else {
+                comp.1 += 1;
+            }
+        }
+        // Contacts of this tick: per body, how many distinct terrain bodies and dynamic bodies
+        // it presses on.
+        let mut terrain_of: HashMap<
+            spall_physics::BodyId,
+            std::collections::HashSet<spall_physics::BodyId>,
+        > = HashMap::new();
+        let mut dynamic_of: HashMap<spall_physics::BodyId, u32> = HashMap::new();
+        for c in sim.world().physics().contact_impulses() {
+            for side in 0..2 {
+                let me = c.bodies[side];
+                let other = c.bodies[1 - side];
+                if !c.dynamic[side] {
+                    continue;
+                }
+                if sim.world().is_terrain_physics_body(other) {
+                    terrain_of.entry(me).or_default().insert(other);
+                } else {
+                    *dynamic_of.entry(me).or_default() += 1;
+                }
+            }
+        }
+        let mut live: BTreeSet<u64> = BTreeSet::new();
+        for b in sim.world().bodies() {
+            let Some(e) = b.entity else { continue };
+            let id = e.get();
+            if agitated.contains(&id) {
+                continue;
+            }
+            let is_awake = !b.sleeping && !b.dormant;
+            if !seen.contains(&id) {
+                seen.insert(id);
+                if is_awake {
+                    born_awake += 1;
+                }
+            }
+            if is_awake {
+                live.insert(id);
+                *episode.entry(id).or_default() += 1;
+                flag_awake_sum += 1;
+                let p = b.pose.translation_m;
+                let near = |v: f64| {
+                    let m = v.rem_euclid(8.0);
+                    m < 0.6 || m > 7.4
+                };
+                let e = near_seam_ep.entry(id).or_default();
+                e.0 |= near(p[0]) || near(p[2]);
+                e.1 |= terrain_of.get(&b.phys).is_some_and(|s| s.len() >= 2);
+                awake_ticks += 1;
+                let terr = terrain_of.get(&b.phys).map_or(0, |s| s.len());
+                let dynn = dynamic_of.get(&b.phys).copied().unwrap_or(0);
+                let key = match (terr, dynn) {
+                    (0, 0) => "no contact (moving/airborne)",
+                    (0, _) => "bodies only",
+                    (1, 0) => "one terrain collider",
+                    (1, _) => "one terrain collider + bodies",
+                    (_, 0) => "two+ terrain colliders (seam)",
+                    (_, _) => "two+ terrain colliders (seam) + bodies",
+                };
+                *by_contact.entry(key).or_default() += 1;
+            }
+        }
+        let ended: Vec<u64> = episode
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id))
+            .collect();
+        for id in ended {
+            let len = episode.remove(&id).unwrap();
+            let (near, two) = near_seam_ep.remove(&id).unwrap_or_default();
+            episodes.push(len);
+            ep_groups
+                .entry(if near {
+                    "episodes near a seam line"
+                } else {
+                    "episodes away from seam lines"
+                })
+                .or_default()
+                .push(len);
+            if two {
+                ep_groups
+                    .entry("episodes that pressed two terrain colliders")
+                    .or_default()
+                    .push(len);
+            }
+        }
+    }
+    episodes.extend(episode.values().copied());
+    episodes.sort_unstable();
+    let q = |p: usize| {
+        episodes
+            .get((episodes.len() * p / 100).min(episodes.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(0)
+    };
+    let mean = episodes.iter().sum::<u64>() as f64 / episodes.len().max(1) as f64;
+    println!(
+        "MODE terrain_bricks={} window {window} ticks, {} non-agitated bodies observed ({} first seen awake)",
+        std::env::var("TERRAIN_BRICKS").is_ok(),
+        seen.len(),
+        born_awake
+    );
+    println!(
+        "  awake body-ticks (non-agitated): {awake_ticks} = {:.1} per tick",
+        awake_ticks as f64 / window as f64
+    );
+    for (k, v) in &by_contact {
+        println!(
+            "    {k}: {v} ({:.1}%)",
+            100.0 * *v as f64 / awake_ticks.max(1) as f64
+        );
+    }
+    println!(
+        "  rapier active bodies avg {:.1}/tick (incl. agitated); flag-awake non-agitated {:.1}/tick",
+        rapier_active_sum as f64 / window as f64,
+        flag_awake_sum as f64 / window as f64
+    );
+    let w = window as f64;
+    println!(
+        "  active_body_count = fixed terrain {:.1} + dynamic awake {:.1} (incl. 256 agitated) + dynamic asleep-not-dormant {:.1}; dormant (excluded) {:.1}",
+        comp.0 as f64 / w,
+        comp.1 as f64 / w,
+        comp.2 as f64 / w,
+        comp.3 as f64 / w
+    );
+    for (k, v) in ep_groups.iter_mut() {
+        v.sort_unstable();
+        let m = v.iter().sum::<u64>() as f64 / v.len() as f64;
+        println!(
+            "  {k}: {} (mean {m:.0} p50 {} p95 {} max {})",
+            v.len(),
+            v[v.len() / 2],
+            v[(v.len() * 95 / 100).min(v.len() - 1)],
+            v[v.len() - 1]
+        );
+    }
+    println!(
+        "  awake episodes: {} (mean {mean:.0} ticks, p50 {} p95 {} max {})",
+        episodes.len(),
+        q(50),
+        q(95),
+        q(100)
+    );
+}

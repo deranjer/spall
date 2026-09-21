@@ -338,6 +338,9 @@ struct Scenario {
     /// Pass `--wake-audit` (per-reason wake accounting in the server summary).
     #[serde(default)]
     wake_audit: bool,
+    /// Pass `--terrain-brick-colliders` (experimental per-brick terrain physics colliders).
+    #[serde(default)]
+    terrain_brick_colliders: bool,
     /// Diagnostic: raise the clients' QUIC handshake timeout (ms). Unset = the
     /// production 5 s.
     #[serde(default)]
@@ -2449,6 +2452,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     ]);
     if scenario.wake_audit {
         server_cmd.arg("--wake-audit");
+    }
+    if scenario.terrain_brick_colliders {
+        server_cmd.arg("--terrain-brick-colliders");
     }
     if let Some(rate) = scenario.baseline_rate_limit_bytes_per_sec {
         server_cmd.args(["--baseline-rate-limit-bytes-per-sec", &rate.to_string()]);

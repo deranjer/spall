@@ -61,6 +61,10 @@ struct Args {
     /// Account which operations wake asleep bodies (`wake_reasons` in the summary).
     #[arg(long)]
     wake_audit: bool,
+    /// EXPERIMENTAL (default off): one physics collider per terrain brick so a far terrain edit
+    /// does not wake unrelated resting bodies. Refused with `--residency-budget-bricks`.
+    #[arg(long)]
+    terrain_brick_colliders: bool,
     /// Cap each client's motion by its measured QUIC congestion window (with
     /// `--motion-interest`).
     #[arg(long)]
@@ -356,6 +360,7 @@ fn run_serve(args: Args) -> ExitCode {
         timing_window,
         baseline_rate_limit_bytes_per_sec: args.baseline_rate_limit_bytes_per_sec,
         wake_audit: args.wake_audit,
+        terrain_brick_colliders: args.terrain_brick_colliders,
     };
     match spall_server::serve(config) {
         Ok(summary) => {

@@ -1,0 +1,54 @@
+{
+  "name": "t23-g4-integrated-2min-separated-bricks",
+  "description": "EXPERIMENTAL A/B variant of t23-g4-integrated-2min-separated: identical workload with --terrain-brick-colliders (docs/reports/terrain-collider-locality.md). Not a gate lane.",
+  "scene": "g4-integrated-separated",
+  "release_profile": true,
+  "server_ticks": 9420,
+  "quiescence_ticks": 1200,
+  "clients": 8,
+  "late_join_clients": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "late_join_connect_delay_ms": 200,
+  "minimum_transactions": 1213,
+  "replay_check": true,
+  "restart_check": true,
+  "dormancy": true,
+  "cuts": [],
+  "sustained_edits": {
+    "start_tick": 1800,
+    "small_rate_per_sec": 10.0,
+    "blast_interval_sec": 10.0,
+    "trailing_buffer_ticks": 300,
+    "mode": "g4_bodies",
+    "ordinary_offset_ticks": 120,
+    "giant_at_offset_ticks": 60,
+    "terrain_edit_every": 10
+  },
+  "motion_interest": {
+    "near_m": 12.0,
+    "far_m": 24.0,
+    "far_interval": 4,
+    "client_budget_bytes": 6000
+  },
+  "baseline_rate_limit_bytes_per_sec": 1048576,
+  "server_timing": {
+    "warmup_ticks": 1800,
+    "measured_ticks": 7200,
+    "max_samples": 7200
+  },
+  "g4_telemetry": {
+    "min_rubble_fraction": 0.8,
+    "warmup_ticks": 1800,
+    "measured_ticks": 7200,
+    "baseline_rate_cap_bytes_per_sec": 1048576
+  },
+  "terrain_brick_colliders": true
+}
