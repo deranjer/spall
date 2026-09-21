@@ -53,3 +53,10 @@ A commit rebuilds only the bricks it changed, so only bodies touching those bric
 Whether to adopt per-brick colliders as the server default after residency support and a longer
 soak; whether to also address wakes from body-edit rebuilds and ordinary contact propagation
 (~30% of wakes remain).
+
+## Update 2026-09-21
+
+- Coverage added: empty/refill, four-brick dig, cross-brick collapse, character seam walk, contact recognition, residency refusals (`terrain_brick_colliders.rs`). Experimental server wiring (`--terrain-brick-colliders`), refused with residency.
+- The earlier higher `active_body_count` (693 vs 655) was a metric artefact: it counts 84 fixed brick bodies plus asleep bodies. Truly awake dynamic bodies fell 22% (507 to 394 per tick). With digs removed the modes are nearly identical, so seams do not prolong awake time.
+- Networked A/B (2 alternating runs each, unchanged workload): tick p95 18.8/16.0 vs 14.7/15.8 ms, p99 63.8/68.8 vs 49.0/55.1 ms, physics p95 6.95/6.41 vs 6.15/6.08 ms; all hashes agree. n = 2, p95 overlaps: **no adoption claim**.
+- Still open: residency support, longer soak, more repeats. See G3.md increment 42 item 3.
