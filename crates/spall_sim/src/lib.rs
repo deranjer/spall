@@ -41,6 +41,7 @@ pub mod collider;
 pub mod commit;
 pub mod contact_damage;
 pub mod containment;
+pub mod debris;
 pub mod dormancy;
 pub mod fixtures;
 pub mod intent;
@@ -68,6 +69,7 @@ pub use commit::{CommitError, CommitOutcome, Committed};
 pub use contact_damage::{
     ContactDamageConfig, ContactDamagePlan, ContactDamagePolicy, ContactEvent, PlannedDamage,
 };
+pub use debris::{DebrisLifetimeConfig, DebrisLifetimePolicy, DebrisRetirement};
 pub use dormancy::{ActiveRegion, BodyDormancyInput, DormancyConfig, DormancyPlan, DormancyPolicy};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
 pub use journal::{JournalEntry, JournalSink};

@@ -161,6 +161,16 @@ struct Args {
     /// combine with this.
     #[arg(long)]
     dormancy: bool,
+    /// Optional expiry after this many continuously dormant simulation seconds.
+    /// Only ids explicitly listed by --expendable-debris-entity can disappear.
+    #[arg(long, requires = "dormancy", value_parser = clap::value_parser!(u64).range(1..=u64::MAX / 60))]
+    debris_dormant_seconds: Option<u64>,
+    /// Game-authorized expendable entity id in this world (repeatable). No inheritance.
+    #[arg(long, requires = "debris_dormant_seconds", value_parser = clap::value_parser!(u64).range(1..))]
+    expendable_debris_entity: Vec<u64>,
+    /// Maximum occupied volume for optional fragment expiry, in cubic metres.
+    #[arg(long, default_value_t = 0.125)]
+    debris_max_volume_m3: f64,
 
     // --- T20 interest + bandwidth scheduling ---
     /// Enable per-client interest relevance + motion bandwidth budget. Without
@@ -361,6 +371,21 @@ fn run_serve(args: Args) -> ExitCode {
             .contact_damage
             .then_some(spall_sim::ContactDamageConfig::DEFAULT),
         dormancy: args.dormancy.then_some(spall_sim::DormancyConfig::DEFAULT),
+        debris_lifetime: args.debris_dormant_seconds.map(|seconds| {
+            spall_sim::DebrisLifetimeConfig {
+                max_solid_volume_m3: args.debris_max_volume_m3,
+                dormant_ticks: seconds * 60,
+                player_clearance_m: 16.0,
+                body_clearance_m: 0.5,
+                max_candidates_per_tick: 4,
+                max_removals_per_tick: 1,
+            }
+        }),
+        expendable_debris: args
+            .expendable_debris_entity
+            .iter()
+            .map(|&id| spall_core::EntityId::new(id).expect("nonzero CLI id"))
+            .collect(),
         timing_window,
         baseline_rate_limit_bytes_per_sec: args.baseline_rate_limit_bytes_per_sec,
         wake_audit: args.wake_audit,

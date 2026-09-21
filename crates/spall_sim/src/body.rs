@@ -103,6 +103,9 @@ pub struct Body {
     /// reads `sleeping = true`. Reactivated before any edit or nearby
     /// interaction (`docs/architecture.md`). Never terrain.
     pub dormant: bool,
+    /// Runtime-only dormancy incarnation. Optional debris timers cannot bridge
+    /// a reactivation/deactivation pair between two policy observations.
+    pub dormant_generation: u64,
     /// Bumped on every collider rebuild; replication and persistence compare it.
     pub collider_revision: u64,
     /// Integer downsample factor the current collider was built at (`1` = exact,

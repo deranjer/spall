@@ -95,6 +95,13 @@ complete body, never a partition-owned fragment.
 
 ## Persistence
 
+Optional game-authorized [debris expiry](debris-lifetime.md) uses ordinary
+`CellRun` writes to air with the existing revision/hash validation and empty-body
+retirement. These committed deletions are replicated and journalled normally;
+they are explicit destroyed matter. No new wire/save schema is introduced.
+Pending expiry approvals/timers are session-local and reset conservatively on
+restart; the game must reauthorize expendable bodies and wait the full interval.
+
 Use SQLite transactions through one I/O writer. Store metadata, versioned compressed brick payloads, volume/body records, spatial references, checkpoints, and an ordered authoritative journal. Configure and verify `journal_mode=WAL` and `synchronous=FULL` on the writer in T16. Group pending journal records into a database transaction, and acknowledge durability only after its successful commit. Keep the database on local storage. SQLite permits one WAL writer at a time and distinguishes commit durability from checkpointing. [SQLite WAL documentation](https://sqlite.org/wal.html).
 
 An engine checkpoint is a coherent saved simulation snapshot. A SQLite WAL checkpoint transfers database WAL pages; these are different operations. Bound reader transaction lifetimes and schedule database checkpoint work off the simulation thread. Include WAL size and flush/checkpoint latency in persistence metrics. T00 must select a released SQLite build with applicable upstream WAL fixes, including when using rusqlite's bundled library.

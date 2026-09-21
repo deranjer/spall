@@ -167,6 +167,92 @@ impl Simulation {
         self.tick
     }
 
+    /// Optional game policy, called once after `tick` and `apply_dormancy`, before
+    /// publishing this tick's report or journal. No body is eligible without an
+    /// explicit policy approval. Retirement uses normal topology replication and
+    /// durable recovery; approval/timer state deliberately resets after restart.
+    pub fn apply_debris_lifetime(
+        &mut self,
+        policy: &mut crate::DebrisLifetimePolicy,
+        report: &mut TickReport,
+    ) -> Result<(), CommitError> {
+        // Honour support edits even if the host did not run the optional
+        // dormancy pass. A just-edited support never expires beneath a body.
+        let terrain = self.world.terrain_volume_id();
+        let cell_m = self.world.terrain().cell_size().metres();
+        let boxes: Vec<_> = report
+            .committed
+            .iter()
+            .filter_map(|(_, c)| transaction_world_box(&c.topology, terrain, cell_m))
+            .collect();
+        if !boxes.is_empty() {
+            let wake: Vec<_> = self
+                .world
+                .bodies()
+                .filter(|b| b.dormant && b.entity.is_some_and(|id| policy.is_approved(id)))
+                .filter_map(|b| {
+                    let (centre, radius) = b.world_bounding_sphere();
+                    boxes
+                        .iter()
+                        .any(|bounds| box_sphere_gap(*bounds, centre, radius) <= 1.0)
+                        .then_some(b.entity)
+                        .flatten()
+                })
+                .collect();
+            for id in wake {
+                self.world.reactivate_body_for(id, "debris.support_edit");
+            }
+        }
+        let candidates = policy.candidates(
+            &self.world,
+            self.tick.get(),
+            &self.pipeline.targeted_bodies(),
+        );
+        let mut removed = 0;
+        for entity in candidates {
+            if removed >= policy.max_removals() {
+                break;
+            }
+            let Some(plan) = policy.removal_plan(&self.world, entity) else {
+                continue;
+            };
+            let body = self.world.body(entity).expect("approved body exists");
+            let cells = plan.writes.len() as u64;
+            let volume_m3 = cells as f64 * body.cell_size().metres().powi(3);
+            let next_seq = self
+                .next_control_seq
+                .checked_add(1)
+                .ok_or(spall_core::IdError::Exhausted)?;
+            let next_damage = self
+                .next_damage_seq
+                .checked_add(1)
+                .filter(|n| *n < SERVER_REQUEST_ID_BAND)
+                .ok_or(spall_core::IdError::Exhausted)?;
+            let committed = crate::debris::retire(
+                &mut self.world,
+                &mut self.journal,
+                entity,
+                &plan,
+                self.tick,
+                spall_protocol::ControlSeq(self.next_control_seq),
+            )?;
+            self.next_control_seq = next_seq;
+            let request = RequestId(SERVER_REQUEST_ID_BAND | self.next_damage_seq);
+            self.next_damage_seq = next_damage;
+            let transaction = committed.transaction;
+            report.committed.push((request, committed));
+            report.debris_retired.push(crate::DebrisRetirement {
+                entity,
+                transaction,
+                destroyed_cells: cells,
+                solid_volume_m3: volume_m3,
+            });
+            policy.protect(entity);
+            removed += 1;
+        }
+        Ok(())
+    }
+
     /// `true` when every accepted intent has committed or been rejected.
     pub fn is_idle(&self) -> bool {
         self.pipeline.is_idle()

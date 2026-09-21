@@ -123,6 +123,8 @@ fn run(tag: &str, staging_budget: Option<u64>, rate: Option<u64>) -> Outcome {
         baseline_segment_bytes: Some(SEGMENT_CAP),
         contact_damage: None,
         dormancy: None,
+        debris_lifetime: None,
+        expendable_debris: Vec::new(),
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: rate,
         wake_audit: false,

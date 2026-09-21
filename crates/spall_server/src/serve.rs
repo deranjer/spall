@@ -510,6 +510,11 @@ pub struct ServeConfig {
     /// [`Self::await_body_settle`]'s `max_penetration_m`) must keep this off,
     /// which is why it defaults to `None` for every existing gate fixture.
     pub dormancy: Option<spall_sim::DormancyConfig>,
+    /// Optional game-authorized material destruction. Never enabled by gate fixtures.
+    pub debris_lifetime: Option<spall_sim::DebrisLifetimeConfig>,
+    /// Explicit stable entity ids the game declares expendable in this world.
+    /// Size alone never selects debris. Reapplied on restart with a fresh grace period.
+    pub expendable_debris: Vec<spall_core::EntityId>,
     /// Optional bounded timing window for the owning server tick. Warmup ticks
     /// are excluded; measured ticks include ingress through replication and
     /// residency, ending immediately before pacing sleep.
@@ -657,6 +662,17 @@ pub struct IntentStats {
 
 /// Refuses configurations the server cannot honour, explicitly and before any state is built.
 pub fn validate_config(config: &ServeConfig) -> Result<(), String> {
+    if let Some(lifetime) = config.debris_lifetime {
+        lifetime.validate().map_err(str::to_owned)?;
+        if config.dormancy.is_none() {
+            return Err("debris lifetime requires the dormancy pass".into());
+        }
+        if config.expendable_debris.len() > spall_sim::debris::MAX_TRACKED_DEBRIS {
+            return Err("too many explicitly expendable debris ids".into());
+        }
+    } else if !config.expendable_debris.is_empty() {
+        return Err("expendable debris ids require an explicit lifetime policy".into());
+    }
     if config.terrain_brick_colliders && config.residency.is_some() {
         return Err(
             "terrain_brick_colliders is unsupported with residency (per-brick terrain colliders              have no eviction/reload lifecycle); disable one of them"
@@ -756,6 +772,8 @@ impl ServeConfig {
             residency_disk_path: None,
             contact_damage: None,
             dormancy: None,
+            debris_lifetime: None,
+            expendable_debris: Vec::new(),
             timing_window: None,
             baseline_rate_limit_bytes_per_sec: None,
             wake_audit: false,
@@ -920,6 +938,8 @@ pub struct ServeSummary {
     /// run (proximity or a hard-wake edit). `0` when `ServeConfig.dormancy` is
     /// `None`.
     pub dormancy_reactivations_total: u64,
+    pub debris_retired_total: u64,
+    pub debris_destroyed_cells_total: u64,
     /// ENG-30 row 7 increment 13: largest pin-set size the residency pass
     /// observed in one tick (pending-edit dependencies, swept-collision
     /// footprints, and pipeline reload grace, unioned). `0` when residency is
@@ -1764,6 +1784,14 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let residency_disk_path = config.residency_disk_path.clone();
     let contact_damage_cfg = config.contact_damage;
     let dormancy_cfg = config.dormancy;
+    let mut debris_policy = config
+        .debris_lifetime
+        .map(|c| spall_sim::DebrisLifetimePolicy::new(c).expect("validated lifetime config"));
+    if let Some(policy) = &mut debris_policy {
+        for &id in &config.expendable_debris {
+            policy.approve(id).expect("validated approval budget");
+        }
+    }
     let timing_window = config.timing_window;
     let wake_audit_on = config.wake_audit;
     let terrain_brick_colliders_on = config.terrain_brick_colliders;
@@ -1881,6 +1909,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut contact_damage_cuts_rejected = 0u64;
         let mut dormancy_deactivations_total = 0u64;
         let mut dormancy_reactivations_total = 0u64;
+        let mut debris_retired_total = 0u64;
+        let mut debris_destroyed_cells_total = 0u64;
         let mut timing = timing_window.map(TimingCollector::new);
         let mut stage_agg = StageAgg::new(timing_window);
 
@@ -2106,7 +2136,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             if !agitated.is_empty() {
                 spall_sim::fixtures::agitate_g4_bodies(sim.world_mut(), &agitated, ticks_run);
             }
-            let report = match sim.tick() {
+            let mut report = match sim.tick() {
                 Ok(r) => r,
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
             };
@@ -2172,6 +2202,17 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 dormancy_deactivations_total += dp.deactivate.len() as u64;
                 dormancy_reactivations_total += dp.reactivate.len() as u64;
             }
+            if let Some(policy) = debris_policy.as_mut() {
+                if let Err(e) = sim.apply_debris_lifetime(policy, &mut report) {
+                    return SimResult::error(format!("debris retirement failed: {e}"), ticks_run);
+                }
+                debris_retired_total += report.debris_retired.len() as u64;
+                debris_destroyed_cells_total += report
+                    .debris_retired
+                    .iter()
+                    .map(|r| r.destroyed_cells)
+                    .sum::<u64>();
+            }
 
             // ENG-61: fold this tick into the "bodies holding still" window.
             // Only when the scenario asked for it — an ordinary run does no
@@ -2233,7 +2274,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 // T11a / ENG-62: bucket each commit's server-side latency
                 // (admission → commit) by whether it split and how much
                 // geometry detached.
-                if let Some(started_at) = ledger.committed(*rid) {
+                let lifetime_removal = report
+                    .debris_retired
+                    .iter()
+                    .any(|d| d.transaction == committed.transaction);
+                if !lifetime_removal && let Some(started_at) = ledger.committed(*rid) {
                     let class =
                         commit_latency::classify(committed.bumped_epoch, &committed.topology);
                     commit_latency.record(class, started_at.elapsed());
@@ -2255,6 +2300,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             }
             drop(sp_fan);
             for status in action_statuses(&report) {
+                if matches!(&status.outcome, ActionOutcome::Committed { transaction }
+                    if report.debris_retired.iter().any(|d| d.transaction == *transaction))
+                {
+                    continue; // Authoritative retirement has no client request/status.
+                }
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
                     rejected_total += 1;
                 }
@@ -2669,6 +2719,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             contact_damage_cuts_rejected,
             dormancy_deactivations_total,
             dormancy_reactivations_total,
+            debris_retired_total,
+            debris_destroyed_cells_total,
             timing: timing
                 .map(|stats| stats.finish(ticks_run))
                 .unwrap_or_default(),
@@ -2835,6 +2887,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         contact_damage_cuts_rejected: sim_result.contact_damage_cuts_rejected,
         dormancy_deactivations_total: sim_result.dormancy_deactivations_total,
         dormancy_reactivations_total: sim_result.dormancy_reactivations_total,
+        debris_retired_total: sim_result.debris_retired_total,
+        debris_destroyed_cells_total: sim_result.debris_destroyed_cells_total,
         residency_pinned_bricks_max: sim_result
             .residency
             .map(|r| r.pinned_bricks_max as u64)
@@ -3791,6 +3845,8 @@ struct SimResult {
     contact_damage_cuts_rejected: u64,
     dormancy_deactivations_total: u64,
     dormancy_reactivations_total: u64,
+    debris_retired_total: u64,
+    debris_destroyed_cells_total: u64,
     timing: TimingReport,
 }
 
@@ -3858,6 +3914,8 @@ impl SimResult {
             contact_damage_cuts_rejected: 0,
             dormancy_deactivations_total: 0,
             dormancy_reactivations_total: 0,
+            debris_retired_total: 0,
+            debris_destroyed_cells_total: 0,
             timing: TimingReport::default(),
         }
     }
