@@ -554,7 +554,14 @@ pub fn commit(
     }
 
     drop(sp7);
-    world.wake_probe_end("edit.commit.parent_collider_publish", wake_probe);
+    world.wake_probe_end(
+        if parent_is_terrain {
+            "edit.commit.parent_collider_publish.terrain"
+        } else {
+            "edit.commit.parent_collider_publish.body"
+        },
+        wake_probe,
+    );
     let wake_probe = world.wake_probe();
     let sp8 = crate::prof::Span::start("commit.install_children");
     // 8. Install every child body and its collider. Mass / COM / inertia come

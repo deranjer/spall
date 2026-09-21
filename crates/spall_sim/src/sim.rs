@@ -205,7 +205,8 @@ impl Simulation {
         if let EditTarget::Body(entity) = intent.target
             && self.world.body_is_dormant(entity)
         {
-            self.world.reactivate_body(entity);
+            self.world
+                .reactivate_body_for(entity, "dormancy.reactivate.edit_target");
         }
         self.pipeline.submit_intent(intent, &self.world)
     }
@@ -510,7 +511,12 @@ impl Simulation {
             self.world.deactivate_body(entity);
         }
         for &entity in &plan.reactivate {
-            self.world.reactivate_body(entity);
+            let reason = if plan.reactivate_hard.contains(&entity) {
+                "dormancy.reactivate.terrain_edit"
+            } else {
+                "dormancy.reactivate.proximity"
+            };
+            self.world.reactivate_body_for(entity, reason);
         }
         plan
     }

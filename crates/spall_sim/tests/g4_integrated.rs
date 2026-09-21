@@ -1794,3 +1794,367 @@ fn awake_growth() {
         }
     }
 }
+
+/// Bounded per-body transition tracking for rubble: how long each body is awake, its longest
+/// uninterrupted awake interval, how long it sleeps before it is woken again, how long it stays
+/// dormant, and -- for representative cohorts followed from creation -- what actually woke it.
+/// One terrain-collider mode per invocation (`TERRAIN_BRICKS` unset / set); instrumented, so it is
+/// a diagnostic and never a timing measurement.
+#[test]
+#[ignore = "diagnostic: per-body rubble transitions and wake triggers"]
+fn rubble_transitions() {
+    use std::collections::{BTreeMap, HashMap};
+
+    #[derive(Default, Clone)]
+    struct Track {
+        born: u64,
+        cohort: Option<usize>,
+        state: u8, // 0 awake, 1 asleep (solver), 2 dormant
+        since: u64,
+        awake: u64,
+        asleep: u64,
+        dormant: u64,
+        longest_awake: u64,
+        sleeps: u32,
+        wakes: u32,
+        dormant_entries: u32,
+        reactivations: u32,
+        first_sleep_after: Option<u64>,
+        asleep_intervals: Vec<u64>,
+        speed_ticks: u64,
+        moving_ticks: u64,
+    }
+    fn close(t: &mut Track, now: u64) {
+        let len = now - t.since;
+        match t.state {
+            0 => {
+                t.awake += len;
+                t.longest_awake = t.longest_awake.max(len);
+            }
+            1 => t.asleep += len,
+            _ => t.dormant += len,
+        }
+    }
+
+    let ticks: u64 = std::env::var("TRACE_TICKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(21_600);
+    const COHORT_WINDOWS: [(u64, u64); 3] = [(2_000, 2_600), (9_000, 9_600), (16_000, 16_600)];
+    const COHORT_SIZE: usize = 150;
+    let (mut sim, bodies) = scene();
+    sim.world_mut().enable_wake_audit();
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let mut counters = (1u64, 0u64, 0u64, 0u64, 0u64);
+    let initial: std::collections::BTreeSet<u64> = sim
+        .world()
+        .bodies()
+        .filter_map(|b| b.entity.map(|e| e.get()))
+        .collect();
+    let mut tracks: HashMap<u64, Track> = HashMap::new();
+    let mut cohort_counts = [0usize; 3];
+    let (mut react_hard, mut react_prox, mut deact) = (0u64, 0u64, 0u64);
+    let mut awake_by_tick_bucket: Vec<(u64, u64, u64)> = Vec::new(); // (tick, awake rubble, total rubble)
+    // What each tick committed: 0 nothing, 1 a terrain dig, 2 a body edit (cut / blast), 3 both.
+    let mut tick_class: Vec<u8> = Vec::with_capacity(ticks as usize);
+    // asleep -> awake transitions of all rubble, by what that tick committed.
+    let mut wakes_by_class = [0u64; 4];
+
+    for t in 0..ticks {
+        workload_step(&mut sim, t, &mut counters);
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        sim.world_mut().wake_audit_set_clock(t);
+        let report = sim.tick().unwrap();
+        let plan = sim.apply_dormancy(&mut policy, &report);
+        let terrain_id = sim.world().terrain_volume_id();
+        let (mut dug, mut cut) = (false, false);
+        for (_, c) in &report.committed {
+            let on_terrain = c.topology.ops.iter().any(|op| {
+                matches!(op, spall_protocol::TopologyOp::IntegerBrush { volume, .. } if *volume == terrain_id)
+            });
+            if on_terrain {
+                dug = true;
+            } else {
+                cut = true;
+            }
+        }
+        let class = u8::from(dug) | (u8::from(cut) << 1);
+        tick_class.push(class);
+        react_hard += plan.reactivate_hard.len() as u64;
+        react_prox += (plan.reactivate.len() - plan.reactivate_hard.len()) as u64;
+        deact += plan.deactivate.len() as u64;
+        let now = t + 1;
+        let mut awake_rubble = 0u64;
+        let mut total_rubble = 0u64;
+        let mut new_ids = Vec::new();
+        for b in sim.world().bodies() {
+            let Some(e) = b.entity else { continue };
+            let id = e.get();
+            if initial.contains(&id) {
+                continue;
+            }
+            total_rubble += 1;
+            let state = if b.dormant {
+                2
+            } else if b.sleeping {
+                1
+            } else {
+                0
+            };
+            if state == 0 {
+                awake_rubble += 1;
+            }
+            let speed =
+                (b.linvel_m_s[0].powi(2) + b.linvel_m_s[1].powi(2) + b.linvel_m_s[2].powi(2))
+                    .sqrt();
+            let tr = tracks.entry(id).or_insert_with(|| {
+                new_ids.push(id);
+                Track {
+                    born: now,
+                    state,
+                    since: now,
+                    ..Track::default()
+                }
+            });
+            if tr.state != state {
+                let old = tr.state;
+                let len = now - tr.since;
+                close(tr, now);
+                if old == 1 && state == 0 {
+                    wakes_by_class[class as usize] += 1;
+                    tr.wakes += 1;
+                    tr.asleep_intervals.push(len);
+                }
+                if old == 2 && state == 0 {
+                    tr.reactivations += 1;
+                }
+                if state == 1 {
+                    tr.sleeps += 1;
+                    if tr.first_sleep_after.is_none() {
+                        tr.first_sleep_after = Some(now - tr.born);
+                    }
+                }
+                if state == 2 {
+                    tr.dormant_entries += 1;
+                    if tr.first_sleep_after.is_none() {
+                        tr.first_sleep_after = Some(now - tr.born);
+                    }
+                }
+                tr.state = state;
+                tr.since = now;
+            }
+            if state == 0 {
+                tr.speed_ticks += 1;
+                if speed > 0.05 {
+                    tr.moving_ticks += 1;
+                }
+            }
+        }
+        for id in new_ids {
+            for (c, (lo, hi)) in COHORT_WINDOWS.iter().enumerate() {
+                if now >= *lo && now < *hi && cohort_counts[c] < COHORT_SIZE {
+                    cohort_counts[c] += 1;
+                    tracks.get_mut(&id).unwrap().cohort = Some(c);
+                    sim.world_mut()
+                        .wake_audit_track(spall_core::EntityId::new(id).unwrap());
+                    break;
+                }
+            }
+        }
+        if now % 1_800 == 0 {
+            awake_by_tick_bucket.push((now, awake_rubble, total_rubble));
+        }
+    }
+    let end = ticks;
+    for tr in tracks.values_mut() {
+        close(tr, end);
+        tr.since = end;
+    }
+
+    println!(
+        "MODE terrain_bricks={} ticks {ticks}: rubble bodies {} (initial population excluded)",
+        std::env::var("TERRAIN_BRICKS").is_ok(),
+        tracks.len()
+    );
+    println!(
+        "dormancy over the run: deactivations {deact}, reactivations by terrain edit {react_hard}, by proximity {react_prox}"
+    );
+    println!("awake rubble / rubble bodies every 1,800 ticks: {awake_by_tick_bucket:?}");
+    let n_class = |k: u8| tick_class.iter().filter(|c| **c == k).count() as u64;
+    println!(
+        "asleep->awake transitions of all rubble by what the tick committed: nothing {} over {} ticks, terrain dig {} over {} ticks ({:.0} per dig tick), body edit {} over {} ticks, both {}",
+        wakes_by_class[0],
+        n_class(0),
+        wakes_by_class[1],
+        n_class(1),
+        wakes_by_class[1] as f64 / n_class(1).max(1) as f64,
+        wakes_by_class[2],
+        n_class(2),
+        wakes_by_class[3]
+    );
+
+    // Population classes for rubble alive at least 1,800 ticks.
+    let mature: Vec<&Track> = tracks.values().filter(|t| end - t.born >= 1_800).collect();
+    let never: Vec<&&Track> = mature
+        .iter()
+        .filter(|t| t.first_sleep_after.is_none())
+        .collect();
+    let once: Vec<&&Track> = mature
+        .iter()
+        .filter(|t| t.first_sleep_after.is_some() && t.wakes + t.reactivations == 0)
+        .collect();
+    let repeat: Vec<&&Track> = mature
+        .iter()
+        .filter(|t| t.wakes + t.reactivations >= 1)
+        .collect();
+    let tot_awake: u64 = mature.iter().map(|t| t.awake).sum();
+    let share = |v: &[&&Track]| {
+        100.0 * v.iter().map(|t| t.awake).sum::<u64>() as f64 / tot_awake.max(1) as f64
+    };
+    let med = |mut v: Vec<u64>| {
+        v.sort_unstable();
+        v.get(v.len() / 2).copied().unwrap_or(0)
+    };
+    println!("rubble alive >= 1,800 ticks: {}", mature.len());
+    for (name, v) in [
+        ("never settled (never asleep, never dormant)", &never),
+        ("settled and stayed (no later wake)", &once),
+        (
+            "settled then woke again (>= 1 wake or reactivation)",
+            &repeat,
+        ),
+    ] {
+        let mv: f64 = v
+            .iter()
+            .map(|t| t.moving_ticks as f64 / t.speed_ticks.max(1) as f64)
+            .sum::<f64>()
+            / v.len().max(1) as f64;
+        println!(
+            "  {name}: {} bodies, {:.1}% of awake body-ticks, median awake {} ticks, median longest awake interval {} ticks, mean moving fraction while awake {:.2}",
+            v.len(),
+            share(v),
+            med(v.iter().map(|t| t.awake).collect()),
+            med(v.iter().map(|t| t.longest_awake).collect()),
+            mv
+        );
+    }
+    let cycles = |t: &Track| t.wakes + t.reactivations;
+    println!(
+        "  settle-and-wake cycles per body (mature): 0: {}, 1: {}, 2-3: {}, 4+: {}",
+        mature.iter().filter(|t| cycles(t) == 0).count(),
+        mature.iter().filter(|t| cycles(t) == 1).count(),
+        mature
+            .iter()
+            .filter(|t| (2..=3).contains(&cycles(t)))
+            .count(),
+        mature.iter().filter(|t| cycles(t) >= 4).count()
+    );
+    let ai: Vec<u64> = mature
+        .iter()
+        .flat_map(|t| t.asleep_intervals.clone())
+        .collect();
+    println!(
+        "  sleep durations before a re-wake: {} intervals, median {} ticks, p90 {} ticks",
+        ai.len(),
+        med(ai.clone()),
+        {
+            let mut v = ai.clone();
+            v.sort_unstable();
+            v.get(v.len() * 9 / 10).copied().unwrap_or(0)
+        }
+    );
+    println!(
+        "  dormancy residence: {} bodies dormant at the end, total dormant body-ticks {}, entries {}, reactivations {}",
+        mature.iter().filter(|t| t.state == 2).count(),
+        mature.iter().map(|t| t.dormant).sum::<u64>(),
+        mature
+            .iter()
+            .map(|t| u64::from(t.dormant_entries))
+            .sum::<u64>(),
+        mature
+            .iter()
+            .map(|t| u64::from(t.reactivations))
+            .sum::<u64>()
+    );
+
+    // Cohorts followed from creation, with the actual triggers of their wakes.
+    let audit = sim.world().wake_audit().unwrap();
+    let mut by_cohort: [BTreeMap<&'static str, u64>; 3] = Default::default();
+    let mut bodies_with: [BTreeMap<&'static str, std::collections::BTreeSet<u64>>; 3] =
+        Default::default();
+    for ev in &audit.events {
+        if let Some(c) = tracks.get(&ev.entity).and_then(|t| t.cohort) {
+            // A physics-step wake is split by what the same tick committed: a terrain dig, a body
+            // edit, or nothing (a contact / island wake with no edit).
+            let label: &'static str = if ev.reason.starts_with("physics.step") {
+                match tick_class.get(ev.tick as usize).copied().unwrap_or(0) {
+                    0 => "physics.step, no edit committed that tick (contact/island)",
+                    1 => "physics.step, terrain dig committed that tick",
+                    2 => "physics.step, body edit committed that tick",
+                    _ => "physics.step, dig and body edit that tick",
+                }
+            } else {
+                ev.reason
+            };
+            *by_cohort[c].entry(label).or_default() += 1;
+            bodies_with[c].entry(label).or_default().insert(ev.entity);
+        }
+    }
+    for (c, (lo, hi)) in COHORT_WINDOWS.iter().enumerate() {
+        let members: Vec<&Track> = tracks.values().filter(|t| t.cohort == Some(c)).collect();
+        if members.is_empty() {
+            continue;
+        }
+        let n = members.len();
+        let life: Vec<u64> = members.iter().map(|t| end - t.born).collect();
+        let fs: Vec<u64> = members.iter().filter_map(|t| t.first_sleep_after).collect();
+        println!(
+            "COHORT {c} (created ticks {lo}-{hi}): {n} bodies, lifetime to end {} ticks (median)",
+            med(life)
+        );
+        println!(
+            "  ever asleep or dormant: {}/{n}; never settled: {}; time to first settle: median {} ticks (n={})",
+            fs.len(),
+            n - fs.len(),
+            med(fs.clone()),
+            fs.len()
+        );
+        println!(
+            "  awake fraction of life: median {:.2}; longest awake interval: median {} ticks, max {}",
+            {
+                let mut v: Vec<f64> = members
+                    .iter()
+                    .map(|t| t.awake as f64 / (end - t.born).max(1) as f64)
+                    .collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            },
+            med(members.iter().map(|t| t.longest_awake).collect()),
+            members.iter().map(|t| t.longest_awake).max().unwrap_or(0)
+        );
+        println!(
+            "  cycles (asleep->awake + reactivations) per body: 0: {}, 1: {}, 2-3: {}, 4+: {}; dormant entries {}; final state awake/asleep/dormant: {}/{}/{}",
+            members.iter().filter(|t| cycles(t) == 0).count(),
+            members.iter().filter(|t| cycles(t) == 1).count(),
+            members
+                .iter()
+                .filter(|t| (2..=3).contains(&cycles(t)))
+                .count(),
+            members.iter().filter(|t| cycles(t) >= 4).count(),
+            members
+                .iter()
+                .map(|t| u64::from(t.dormant_entries))
+                .sum::<u64>(),
+            members.iter().filter(|t| t.state == 0).count(),
+            members.iter().filter(|t| t.state == 1).count(),
+            members.iter().filter(|t| t.state == 2).count()
+        );
+        println!("  wake triggers (events / distinct bodies):");
+        for (reason, n_ev) in &by_cohort[c] {
+            println!(
+                "    {reason:<48} {n_ev:>6} events, {:>4} bodies",
+                bodies_with[c][reason].len()
+            );
+        }
+    }
+}

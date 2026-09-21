@@ -105,6 +105,9 @@ pub struct DormancyPlan {
     pub deactivate: Vec<EntityId>,
     /// Bodies to reactivate, in ascending entity-id order.
     pub reactivate: Vec<EntityId>,
+    /// The subset of [`Self::reactivate`] woken by a hard trigger (a terrain edit next to the body);
+    /// the rest were woken by proximity to an active region.
+    pub reactivate_hard: Vec<EntityId>,
     /// Awake bodies held awake this tick by a nearby active region.
     pub kept_awake_nearby: usize,
     /// Awake bodies partway through their settle countdown.
@@ -185,6 +188,7 @@ impl DormancyPolicy {
                 let since = *self.dormant_since.entry(key).or_insert(tick);
                 if body.hard_wake {
                     plan.reactivate.push(body.entity);
+                    plan.reactivate_hard.push(body.entity);
                     self.dormant_since.remove(&key);
                 } else if near {
                     let held_long_enough =

@@ -123,7 +123,27 @@ pub struct WakeAudit {
     pub reasons: BTreeMap<&'static str, WakeStat>,
     /// Attributed physics-step wake bursts (capped at 8,192).
     pub bursts: Vec<WakeBurst>,
+    /// Bodies whose individual wake / reactivation events are recorded (see
+    /// [`SimWorld::wake_audit_track`]); empty by default, so nothing per-body is kept.
+    pub tracked: std::collections::BTreeSet<u64>,
+    /// Per-body events of the tracked bodies, in order (capped at [`MAX_WAKE_EVENTS`]).
+    pub events: Vec<WakeEvent>,
+    /// The tick the harness last announced (see [`SimWorld::wake_audit_set_clock`]).
+    pub clock: u64,
 }
+
+/// One recorded transition of a tracked body: the operation that woke it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakeEvent {
+    pub tick: u64,
+    pub entity: u64,
+    /// The operation under whose probe the body went from solver-asleep to awake, or the
+    /// `dormancy.reactivate.*` trigger that restored a dormant body.
+    pub reason: &'static str,
+}
+
+/// Recorded per-body events are bounded so a long run cannot grow this without limit.
+pub const MAX_WAKE_EVENTS: usize = 400_000;
 
 /// One reason's totals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -974,6 +994,20 @@ impl SimWorld {
     // --- wake-reason telemetry ------------------------------------------------
 
     /// Turns on wake-reason accounting (an O(bodies) scan per probed operation).
+    /// Records the individual wake and reactivation events of `entity` (a bounded cohort).
+    pub fn wake_audit_track(&mut self, entity: EntityId) {
+        if let Some(a) = &mut self.wake_audit {
+            a.tracked.insert(entity.get());
+        }
+    }
+
+    /// Announces the current tick so recorded events carry it.
+    pub fn wake_audit_set_clock(&mut self, tick: u64) {
+        if let Some(a) = &mut self.wake_audit {
+            a.clock = tick;
+        }
+    }
+
     pub fn enable_wake_audit(&mut self) {
         self.wake_audit.get_or_insert_with(WakeAudit::default);
     }
@@ -1081,6 +1115,32 @@ impl SimWorld {
                     .is_some_and(|b| !b.dormant && !now.contains(id))
             })
             .count() as u64;
+        // Per-body attribution for the tracked cohort only.
+        let tracked_woken: Vec<u64> = match &self.wake_audit {
+            Some(a) if !a.tracked.is_empty() => before
+                .iter()
+                .filter(|id| {
+                    a.tracked.contains(id)
+                        && self
+                            .bodies
+                            .get(id)
+                            .is_some_and(|b| !b.dormant && !now.contains(id))
+                })
+                .copied()
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let Some(audit) = &mut self.wake_audit {
+            for entity in tracked_woken {
+                if audit.events.len() < MAX_WAKE_EVENTS {
+                    audit.events.push(WakeEvent {
+                        tick: audit.clock,
+                        entity,
+                        reason,
+                    });
+                }
+            }
+        }
         if woken >= WAKE_BURST_MIN
             && reason.starts_with("physics.step")
             && self
@@ -1108,6 +1168,13 @@ impl SimWorld {
     /// the solver re-sleeps it on the next quiet step). Returns `false` for an
     /// unknown or non-dormant body, or if its volume could not be gridded.
     pub fn reactivate_body(&mut self, entity: EntityId) -> bool {
+        self.reactivate_body_for(entity, "dormancy.reactivate.other")
+    }
+
+    /// [`Self::reactivate_body`] naming what triggered it (recorded for tracked bodies):
+    /// `dormancy.reactivate.edit_target`, `.terrain_edit` (a terrain edit near the body) or
+    /// `.proximity` (an active region approached).
+    pub fn reactivate_body_for(&mut self, entity: EntityId, reason: &'static str) -> bool {
         let Some(body) = self.bodies.get(&entity.get()) else {
             return false;
         };
@@ -1130,6 +1197,17 @@ impl SimWorld {
             body.dormant = false;
         }
         self.wake_probe_end("dormancy.reactivate", probe);
+        if let Some(a) = &mut self.wake_audit
+            && a.tracked.contains(&entity.get())
+            && a.events.len() < MAX_WAKE_EVENTS
+        {
+            let tick = a.clock;
+            a.events.push(WakeEvent {
+                tick,
+                entity: entity.get(),
+                reason,
+            });
+        }
         true
     }
 
