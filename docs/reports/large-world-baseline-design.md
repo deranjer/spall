@@ -1,6 +1,6 @@
 # Large retained-world baselines — measurement and design (ENG-30 / T23) — 2026-09-21
 
-Status: **measurement done; design revised 2026-09-21; implementation in progress** (see G3.md increment 43). ENG-30 stays open and T23
+Status: **measurement done; design revised 2026-09-21; implemented and measured** (see G3.md increment 43). ENG-30 stays open and T23
 unaccepted. The cap is **not** raised and the workload is **not** reduced.
 
 ## 1. The failure, precisely
@@ -195,12 +195,9 @@ oversized volumes, ranges and budget exhaustion are exercised in milliseconds:
    restart check).
 5. Full `cargo xtask check` on the final integration revision.
 
-## 7. Measurements still owed (nothing below is claimed yet)
+## 7. Measurements (2026-09-21; see G3.md increment 43 for the table)
 
-- Server capture peak additional heap and duration for the retained save at `S = 4 MiB`, `16 MiB`.
-- Client receive peak (temporary) vs staged world (retained) vs the replica after install.
-- Retained heap with 1, 4 and 8 concurrent joiners and with one slow recipient.
-- Whether the 64 MiB transient target holds; if not, the smallest `S` that meets it and its cost.
+Retained save, release, counting allocator. Server encode peak additional heap 1.6 / 6.1 / 24.1 MiB and client receive temporary ~0.9 / 3.1 / 12.1 MiB at segment budgets 1 / 4 / 16 MiB (about 1.5 S and 0.75 S, better than the 3.5-4 S model above); retained after capture 0.2-0.3 MiB; 8 concurrent joiners add 1.5 KB; client staged world 769 MiB (class D). The 64 MiB transient target is met for budgets up to 16 MiB; the default is 4 MiB. Real reconnect: 192 segments, 244 KB, hash match, ready 13.8 s, server 987 MiB / client 799 MiB peak working set. Still unmeasured: a real slow QUIC recipient under the allocator.
 
 ## 8. Risks / open questions
 

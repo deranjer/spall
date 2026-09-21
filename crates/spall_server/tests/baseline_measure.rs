@@ -279,3 +279,146 @@ fn retained_save_yields_a_bounded_baseline_transfer() {
     println!("capture peak additional heap: {}", mib(peak));
     assert!(result.is_ok(), "{:?}", result.err());
 }
+
+/// Peak additional heap and retained heap of a segmented transfer of the retained save: server
+/// capture (snapshot, encode), client receive (temporary vs staged world), install, and the memory
+/// held with 1, 4 and 8 concurrent joiners plus a slow recipient. Measurements only report; the
+/// acceptance asserts are the last few lines.
+#[test]
+#[ignore = "needs SPALL_RETAINED_SAVE (a copy of a retained world.db)"]
+fn retained_save_segmented_transfer_memory() {
+    use spall_client::segmented::SegmentedReceiver;
+    use spall_client::{ReplicaConfig, ReplicaWorld};
+    use spall_protocol::{InterestEpoch, TransferId};
+    use spall_server::baseline::{snapshot_world, transfer_from_snapshot_segmented};
+
+    let path = PathBuf::from(
+        std::env::var("SPALL_RETAINED_SAVE").expect("SPALL_RETAINED_SAVE=path/to/world.db"),
+    );
+    let writer = Writer::open(&path).expect("open save");
+    let recovery = writer.recover().expect("recover");
+    let cfg = PersistConfig {
+        world_id: spall_server::serve::T10_WORLD_ID,
+        seed: 0,
+        generator_version: 1,
+    };
+    let (sim, _) = persist::restore(
+        &recovery,
+        &cfg,
+        persist::RecoveryChoice::RequireClean,
+        spall_sim::fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .expect("restore");
+    drop(recovery);
+    let authoritative_hash = sim.world().world_hash();
+    println!(
+        "world: {} bodies, hash {}",
+        sim.world().body_count(),
+        authoritative_hash
+    );
+
+    let caps: Vec<usize> = std::env::var("SEGMENT_CAPS_MIB")
+        .unwrap_or_else(|_| "1,4,16".to_string())
+        .split(',')
+        .map(|c| c.trim().parse::<usize>().unwrap() << 20)
+        .collect();
+    for cap in caps {
+        println!("=== segment budget {} ===", mib(cap));
+        // Server: the snapshot (COW handles), then the streamed encode.
+        let (snapshot, peak_snapshot) = peak_of(|| snapshot_world(&sim, None));
+        println!(
+            "server snapshot_world: peak additional {}",
+            mib(peak_snapshot)
+        );
+        let est = snapshot.estimated_decoded_bytes();
+        let heap_before = CUR.load(Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let (transfer, peak_encode) = peak_of(|| {
+            transfer_from_snapshot_segmented(snapshot, TransferId(1), InterestEpoch(1), cap)
+                .expect("segmented capture")
+        });
+        let encode_ms = started.elapsed().as_millis();
+        let retained = CUR.load(Ordering::Relaxed).saturating_sub(heap_before);
+        let stats = transfer.segments.unwrap();
+        println!(
+            "server encode: peak additional {} (estimate of decoded world {}), {} ms; retained after {} (parts, {} on the wire); {} segments, max segment decoded {}",
+            mib(peak_encode),
+            mib(est as usize),
+            encode_ms,
+            mib(retained),
+            mib(transfer.payload_bytes()),
+            stats.segments,
+            mib(stats.max_segment_decoded as usize)
+        );
+
+        // Joiners share the compressed parts: heap held with 1, 4 and 8 reissued transfers.
+        for n in [1u64, 4, 8] {
+            let base = CUR.load(Ordering::Relaxed);
+            let joiners: Vec<_> = (0..n)
+                .map(|i| transfer.reissue(TransferId(10 + i)))
+                .collect();
+            let extra = CUR.load(Ordering::Relaxed).saturating_sub(base);
+            println!(
+                "  {n} concurrent joiners share the parts: extra retained heap {} bytes",
+                extra
+            );
+            // A slow recipient holds one transient stamped part at a time per joiner.
+            let (_, peak_slow) = peak_of(|| {
+                let mut held = Vec::new();
+                for j in &joiners {
+                    let mut part = j.parts[0].clone();
+                    part.transfer_id = j.begin.transfer_id;
+                    held.push(part);
+                }
+                held.len()
+            });
+            println!(
+                "  {n} slow recipients each mid-part: peak additional {} bytes",
+                peak_slow
+            );
+            drop(joiners);
+        }
+
+        // Client: feed the payload the way the bulk stream delivers it, one part at a time.
+        let parts = std::sync::Arc::clone(&transfer.parts);
+        let heap_before = CUR.load(Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let (receipt, peak_recv) = peak_of(|| {
+            let mut rx = SegmentedReceiver::new(transfer.begin.checkpoint_tick.get(), None);
+            for p in parts.iter() {
+                rx.push(&p.payload).expect("segment validates");
+            }
+            rx.finish().expect("transfer complete")
+        });
+        let recv_ms = started.elapsed().as_millis();
+        let staged_bytes = CUR.load(Ordering::Relaxed).saturating_sub(heap_before);
+        assert_eq!(receipt.chain_hash, transfer.end.assembled_hash);
+        println!(
+            "client receive: peak additional {} = staged world {} (retained) + temporary ~{}; {} ms; max segment decoded {}, max frame buffered {}",
+            mib(peak_recv),
+            mib(staged_bytes),
+            mib(peak_recv.saturating_sub(staged_bytes)),
+            recv_ms,
+            mib(receipt.max_segment_decoded as usize),
+            mib(receipt.max_buffered_bytes)
+        );
+        let mut replica = ReplicaWorld::empty(ReplicaConfig::default());
+        let (_, peak_install) =
+            peak_of(|| replica.install_staged(receipt.staged).expect("install"));
+        println!(
+            "client install_staged (swap): peak additional {}",
+            mib(peak_install)
+        );
+        assert_eq!(
+            replica.world_hash(),
+            authoritative_hash,
+            "exact authoritative topology"
+        );
+        assert_eq!(replica.body_ids().count(), sim.world().body_count());
+        drop(replica);
+        drop(transfer);
+        drop(parts);
+    }
+}
