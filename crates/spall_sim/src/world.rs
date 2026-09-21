@@ -276,6 +276,7 @@ impl SimWorld {
             angvel_rad_s: [0.0; 3],
             sleeping: true,
             dormant: false,
+            dormant_generation: 0,
             collider_revision: 1,
             coarsen_k: plan.coarsen_k,
             phys,
@@ -901,6 +902,7 @@ impl SimWorld {
             angvel_rad_s,
             sleeping: false,
             dormant: false,
+            dormant_generation: 0,
             collider_revision: 1,
             coarsen_k: plan.coarsen_k,
             phys,
@@ -1195,6 +1197,10 @@ impl SimWorld {
             .reactivate_body(phys, &grid, trans, rot, [0.0; 3], [0.0; 3]);
         if let Some(body) = self.bodies.get_mut(&entity.get()) {
             body.dormant = false;
+            body.dormant_generation = body
+                .dormant_generation
+                .checked_add(1)
+                .expect("dormancy generation exhausted");
         }
         self.wake_probe_end("dormancy.reactivate", probe);
         if let Some(a) = &mut self.wake_audit
@@ -1286,6 +1292,7 @@ impl SimWorld {
             angvel_rad_s: spec.angvel_rad_s,
             sleeping: spec.sleeping,
             dormant: false,
+            dormant_generation: 0,
             collider_revision: spec.collider_revision,
             coarsen_k: plan.coarsen_k,
             phys,

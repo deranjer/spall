@@ -45,6 +45,90 @@ fn cfg() -> PersistConfig {
     }
 }
 
+#[test]
+fn debris_expiry_replicates_and_survives_journal_recovery_and_late_join() {
+    use spall_client::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
+    use spall_sim::{DebrisLifetimeConfig, DebrisLifetimePolicy};
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    let entity = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(2),
+            BodyPose::new(DQuat::IDENTITY, [4.0, 2.0, 4.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    sim.world_mut().deactivate_body(entity);
+    let scratch = Scratch::new("debris_expiry");
+    publish(&scratch.db(), &persist::capture(&sim, &cfg(), 0).unwrap());
+    let before_cells = sim.world().total_solid_cells();
+    let mut replica = ReplicaWorld::from_baseline(
+        fixtures::flat_terrain_setup().terrain,
+        ReplicaConfig::default(),
+    );
+    replica
+        .install_baseline_world(&spall_server::baseline::world_baseline(&sim))
+        .unwrap();
+    let mut policy = DebrisLifetimePolicy::new(DebrisLifetimeConfig {
+        max_solid_volume_m3: 0.125,
+        dormant_ticks: 2,
+        player_clearance_m: 5.0,
+        body_clearance_m: 0.5,
+        max_candidates_per_tick: 2,
+        max_removals_per_tick: 1,
+    })
+    .unwrap();
+    policy.approve(entity).unwrap();
+    for _ in 0..3 {
+        let mut report = sim.tick().unwrap();
+        sim.apply_debris_lifetime(&mut policy, &mut report).unwrap();
+    }
+    let entry = &sim.journal().entries()[0];
+    assert!(matches!(
+        replica.apply_transaction(&entry.transaction),
+        ApplyOutcome::Published { .. }
+    ));
+    let after = replica.world_hash();
+    replica.apply_transaction(&entry.transaction); // duplicate delivery never resurrects or repeats
+    assert_eq!(replica.world_hash(), after);
+    assert_eq!(after, sim.world().world_hash());
+    assert_eq!(sim.world().total_solid_cells(), before_cells - 8);
+    {
+        let mut writer = Writer::open(scratch.db()).unwrap();
+        writer
+            .append_journal(&persist::journal_records(sim.journal().entries()).unwrap())
+            .unwrap();
+    }
+    let (recovered, durable_cursor) = recover_restore(&scratch.db());
+    assert!(
+        recovered.world().body(entity).is_none(),
+        "journal suffix must retire saved body"
+    );
+    assert_eq!(recovered.world().world_hash(), after);
+    replica
+        .install_baseline_world(&spall_server::baseline::world_baseline(&recovered))
+        .unwrap();
+    assert_eq!(
+        replica.world_hash(),
+        after,
+        "fresh baseline omits retired matter"
+    );
+    publish(
+        &scratch.db(),
+        &persist::capture(&recovered, &cfg(), durable_cursor).unwrap(),
+    );
+    let (again, _) = recover_restore(&scratch.db());
+    assert_eq!(
+        again.world().world_hash(),
+        after,
+        "checkpoint also preserves removal"
+    );
+    assert!(again.world().body(entity).is_none());
+}
+
 fn brush_cell(x: i64, y: i64, z: i64, radius_cells: i64) -> SphereBrush {
     let h = BRUSH_UNIT / 2;
     SphereBrush::new(

@@ -600,6 +600,7 @@ pub fn commit(
             angvel_rad_s: child.angvel_rad_s,
             sleeping: false,
             dormant: false,
+            dormant_generation: 0,
             collider_revision: 1,
             coarsen_k: child.collider_plan.coarsen_k,
             phys,

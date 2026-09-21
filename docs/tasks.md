@@ -289,6 +289,11 @@ Accept: long weak cantilevers fail, comparable strong supports hold within decla
 
 ### T23 — G3/G4 integrated engine acceptance
 
+2026-09-21 user-authorized follow-up: [optional expendable-debris lifetime](debris-lifetime.md)
+is implemented separately on `codex/optional-debris-lifetime`. It defaults off,
+requires explicit game approval of each body and changes no acceptance fixture or
+threshold. It does not close T23 or replace the ongoing dormancy investigation.
+
 Current disposition: **not accepted**, per the
 [2026-09-18 acceptance audit](reports/T23-acceptance-audit-2026-09-18.md).
 Of the audit's five findings, increment 37 (`docs/reports/G3.md`) fixes

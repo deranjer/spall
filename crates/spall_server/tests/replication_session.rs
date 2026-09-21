@@ -28,6 +28,109 @@ fn unique_dir(tag: &str) -> PathBuf {
     base
 }
 
+#[test]
+fn optional_debris_expiry_reaches_a_live_client_without_counting_a_player_edit() {
+    use spall_server::persist::{self, PersistConfig};
+    use spall_sim::{BodyPose, DebrisLifetimeConfig, Simulation, SimulationConfig, fixtures};
+    let dir = unique_dir("debris-expiry");
+    let save = dir.join("world.db");
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    let entity = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(2),
+            BodyPose::new(glam::DQuat::IDENTITY, [4.0, 0.5, 4.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    sim.world_mut().deactivate_body(entity);
+    let persist_cfg = PersistConfig {
+        world_id: spall_server::serve::T10_WORLD_ID,
+        seed: 0,
+        generator_version: 1,
+    };
+    {
+        let mut writer = spall_store::Writer::open(&save).unwrap();
+        writer
+            .publish_checkpoint(&persist::capture(&sim, &persist_cfg, 0).unwrap())
+            .unwrap();
+    }
+    let token = JoinToken::generate().unwrap();
+    let fp_path = dir.join("fp");
+    let addr_path = dir.join("addr");
+    let mut cfg = ServeConfig::headless("127.0.0.1:0".parse().unwrap(), Scene::BridgeCut, token);
+    cfg.max_ticks = 240;
+    cfg.paced = true;
+    cfg.save = Some(save.clone());
+    cfg.log_json = dir.join("server.jsonl");
+    cfg.fingerprint_out = Some(fp_path.clone());
+    cfg.addr_out = Some(addr_path.clone());
+    cfg.dormancy = Some(spall_sim::DormancyConfig {
+        settle_ticks: 10,
+        ..spall_sim::DormancyConfig::DEFAULT
+    });
+    cfg.debris_lifetime = Some(DebrisLifetimeConfig {
+        max_solid_volume_m3: 0.125,
+        dormant_ticks: 60,
+        player_clearance_m: 5.0,
+        body_clearance_m: 0.5,
+        max_candidates_per_tick: 2,
+        max_removals_per_tick: 1,
+    });
+    cfg.expendable_debris = vec![entity];
+    let server_thread = std::thread::spawn(move || serve(cfg));
+    let fp = wait_for_file(&fp_path, Duration::from_secs(15));
+    let addr = wait_for_file(&addr_path, Duration::from_secs(15));
+    let client = run_replication_client(ClientNetConfig {
+        connect_addr: addr.parse().unwrap(),
+        server_fingerprint: Fingerprint::from_hex(&fp).unwrap(),
+        join_token: token,
+        script: Vec::new(),
+        movement_script: Vec::new(),
+        late_join: true,
+        baseline_scene: BaselineScene::BridgeCut,
+        run_ticks: 400,
+        idle_grace: Duration::from_millis(500),
+        overall_timeout: Duration::from_secs(20),
+        log_json: dir.join("client.jsonl"),
+        summary_json: None,
+        transport: TransportConfig::for_tests(),
+        client_residency: None,
+        baseline_staging_budget_bytes: None,
+        on_replica_ready: None,
+        interactive: None,
+    })
+    .unwrap();
+    let server = server_thread.join().unwrap().unwrap();
+    assert_eq!(server.debris_retired_total, 1);
+    assert_eq!(server.debris_destroyed_cells_total, 8);
+    assert_eq!(
+        server.admission.logical_committed, 0,
+        "expiry is not a player edit"
+    );
+    assert_eq!(client.transactions_rejected, 0);
+    assert_eq!(
+        client.transactions_applied, 1,
+        "live client must receive the expiry transaction"
+    );
+    assert_eq!(client.final_world_hash, server.final_world_hash);
+    assert_eq!(server.body_count, 0);
+    let recovery = spall_store::recover(&save).unwrap();
+    let (restored, _) = persist::restore(
+        &recovery,
+        &persist_cfg,
+        persist::RecoveryChoice::RequireClean,
+        fixtures::stone_manifest(),
+        spall_structure::AnchorPlane::at(0),
+        spall_physics::PhysicsConfig::default(),
+    )
+    .unwrap();
+    assert!(restored.world().body(entity).is_none());
+}
+
 fn wait_for_file(path: &PathBuf, deadline: Duration) -> String {
     let start = Instant::now();
     loop {
@@ -101,6 +204,8 @@ fn bridge_cut_session(brick_colliders: bool) {
         baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
+        debris_lifetime: None,
+        expendable_debris: Vec::new(),
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: None,
         wake_audit: false,
@@ -224,6 +329,8 @@ fn server_persists_and_recovers_across_a_restart() {
         baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
+        debris_lifetime: None,
+        expendable_debris: Vec::new(),
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: None,
         wake_audit: false,
@@ -351,6 +458,8 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
+        debris_lifetime: None,
+        expendable_debris: Vec::new(),
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: None,
         wake_audit: false,

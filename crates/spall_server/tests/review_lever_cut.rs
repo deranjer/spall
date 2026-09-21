@@ -68,6 +68,8 @@ fn the_review_cut_key_is_accepted_and_the_beam_tips() {
         baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
+        debris_lifetime: None,
+        expendable_debris: Vec::new(),
         timing_window: None,
         baseline_rate_limit_bytes_per_sec: None,
         wake_audit: false,

@@ -61,6 +61,8 @@ struct QueuedIntent {
 /// What one [`EditPipeline::run_tick`] did.
 #[derive(Debug, Default)]
 pub struct TickReport {
+    /// Explicit material destroyed by the optional game-authorized lifetime pass.
+    pub debris_retired: Vec<crate::DebrisRetirement>,
     /// Time spent in the owning world's physics step, including extraction of
     /// updated body poses. This is populated by `Simulation::tick` so server
     /// telemetry can report the physics portion without timing a replica.
