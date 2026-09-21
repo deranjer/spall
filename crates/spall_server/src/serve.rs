@@ -526,6 +526,12 @@ pub struct ServeConfig {
     /// (`docs/reports/terrain-collider-locality.md`). Unsupported combinations are refused by
     /// [`validate_config`]: it cannot be combined with residency.
     pub terrain_brick_colliders: bool,
+    /// Segmented late-join baselines. `Some(n)` forces the segmented format (per-segment decoded
+    /// budget `n` bytes) for every client that advertises support; `None` uses the single blob
+    /// unless the world would not fit it, then segments at
+    /// [`spall_protocol::segment::DEFAULT_SEGMENT_DECODED_BYTES`]. A client that does not
+    /// advertise support and needs a segmented transfer is refused explicitly.
+    pub baseline_segment_bytes: Option<usize>,
 }
 
 /// How the edit pipeline behaved under the offered load. `queue_full_rejections` are the explicit
@@ -652,6 +658,7 @@ impl ServeConfig {
             baseline_rate_limit_bytes_per_sec: None,
             wake_audit: false,
             terrain_brick_colliders: false,
+            baseline_segment_bytes: None,
         }
     }
 }
@@ -1641,6 +1648,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let timing_window = config.timing_window;
     let wake_audit_on = config.wake_audit;
     let terrain_brick_colliders_on = config.terrain_brick_colliders;
+    let baseline_segment_bytes = config.baseline_segment_bytes;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
@@ -1782,6 +1790,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let agitated = scene.agitated_bodies();
         let observer: [f64; 3] = scene.player_spawns().first().copied().unwrap_or([0.0; 3]);
         let mut lj = LateJoin::new(catch_up_cap, max_join_retries, capture_workers);
+        lj.segment_cap = baseline_segment_bytes;
         // T23 / G3 row 7, slice D: a late-join baseline or repair patch over a
         // brick the residency pass has evicted is filled from its durable
         // backing.
@@ -3438,6 +3447,8 @@ struct PendingCapture {
     /// only while the world's cursor still equals it (no commit since).
     cursor: JournalSeq,
     rx: std::sync::mpsc::Receiver<Result<BaselineTransfer, baseline::BaselineError>>,
+    /// The capture is a segmented transfer (only clients that advertised support may wait on it).
+    segmented: bool,
     /// `(session.raw(), that session's transfer id)`.
     waiters: Vec<(u64, TransferId)>,
 }
@@ -3445,6 +3456,8 @@ struct PendingCapture {
 struct ClientLink {
     session: SessionId,
     phase: Phase,
+    /// The client advertised segmented-baseline support in its baseline request.
+    segmented_ok: bool,
 }
 
 /// All the per-run late-join / reconnect bookkeeping the sim loop needs, kept
@@ -3571,6 +3584,10 @@ struct LateJoin {
     /// ENG-30 / T23 row 11, increment 30: bounds concurrent background
     /// baseline captures. See [`CapturePool`].
     capture_pool: CapturePool,
+    /// Forced per-segment decoded budget (see [`ServeConfig::baseline_segment_bytes`]).
+    segment_cap: Option<usize>,
+    /// Test hook: treat every world as too large for the single blob.
+    assume_oversized: bool,
     /// T23 / G4 session timelines (`None` in unit tests).
     telemetry: Option<Arc<ServerTelemetry>>,
 }
@@ -3592,6 +3609,8 @@ impl LateJoin {
             cached_baseline: None,
             pending_captures: Vec::new(),
             capture_pool: CapturePool::new(capture_workers),
+            segment_cap: None,
+            assume_oversized: false,
             telemetry: None,
         }
     }
@@ -3617,6 +3636,7 @@ impl LateJoin {
             ClientLink {
                 session,
                 phase: Phase::Live,
+                segmented_ok: false,
             },
         );
     }
@@ -3686,9 +3706,16 @@ impl LateJoin {
             return;
         }
         let want_baseline = ack.transfer_id == BASELINE_REQUEST_SENTINEL;
+        if want_baseline
+            && ack.verified_manifest_hash == spall_protocol::segment::baseline_cap_segmented()
+            && let Some(l) = self.links.get_mut(&session.raw())
+        {
+            l.segmented_ok = true;
+        }
         let Some(link) = self.links.get(&session.raw()) else {
             return;
         };
+        let capable = link.segmented_ok;
 
         if want_baseline {
             let id = self.next_id();
@@ -3698,6 +3725,9 @@ impl LateJoin {
                 .as_ref()
                 .filter(|b| b.begin.journal_cursor == JournalSeq(sim.journal_cursor()))
             {
+                Some(transfer) if transfer.segments.is_some() && !capable => {
+                    self.refuse_unsupported_baseline(session, clients);
+                }
                 Some(transfer) => {
                     let transfer = transfer.reissue(id);
                     self.ev(session, "baseline_reused_cached");
@@ -3726,6 +3756,10 @@ impl LateJoin {
                     {
                         // A capture at this very cursor is already running:
                         // wait on it rather than snapshotting the world again.
+                        if existing.segmented && !capable {
+                            self.refuse_unsupported_baseline(session, clients);
+                            return;
+                        }
                         existing.waiters.push((raw, id));
                         if let Some(link) = self.links.get_mut(&raw) {
                             link.phase = joining;
@@ -3736,13 +3770,27 @@ impl LateJoin {
                     let sp_snap = spall_sim::prof::Span::start("srv.baseline_snapshot_world");
                     let snapshot = baseline::snapshot_world(sim, self.backing_ref());
                     drop(sp_snap);
+                    let segmented_cap = self.segmented_cap_for(&snapshot, capable);
+                    if segmented_cap.is_some() && !capable {
+                        self.refuse_unsupported_baseline(session, clients);
+                        return;
+                    }
                     self.ev(session, "capture_submitted");
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
                     let telemetry = self.telemetry.clone();
                     self.capture_pool.spawn(move || {
                         let started = std::time::Instant::now();
-                        let result =
-                            baseline::transfer_from_snapshot(snapshot, id, InterestEpoch(1));
+                        let result = match segmented_cap {
+                            Some(cap) => baseline::transfer_from_snapshot_segmented(
+                                snapshot,
+                                id,
+                                InterestEpoch(1),
+                                cap,
+                            ),
+                            None => {
+                                baseline::transfer_from_snapshot(snapshot, id, InterestEpoch(1))
+                            }
+                        };
                         if let Some(t) = telemetry {
                             t.capture_encode_ms
                                 .lock()
@@ -3756,6 +3804,7 @@ impl LateJoin {
                         self.pending_captures.push(PendingCapture {
                             cursor,
                             rx,
+                            segmented: segmented_cap.is_some(),
                             waiters: vec![(raw, id)],
                         });
                     }
@@ -3884,6 +3933,7 @@ impl LateJoin {
                 Some(ClientLink {
                     session,
                     phase: Phase::Joining { retries, .. },
+                    ..
                 }) => {
                     *retries += 1;
                     if let Some(t) = &self.telemetry {
@@ -3907,7 +3957,8 @@ impl LateJoin {
             }
             self.retries += 1;
             let id = self.next_id();
-            match self.capture_for(sim, id) {
+            let capable = self.links.get(&raw).is_some_and(|l| l.segmented_ok);
+            match self.capture_for(sim, id, capable) {
                 Some(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&raw) {
@@ -3955,24 +4006,65 @@ impl LateJoin {
     /// Captures a baseline transfer at the current tick / journal cursor, over
     /// the logical brick set (evicted bricks filled from the residency
     /// backing when one is installed).
-    fn capture_for(&mut self, sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
+    fn capture_for(
+        &mut self,
+        sim: &Simulation,
+        id: TransferId,
+        capable: bool,
+    ) -> Option<BaselineTransfer> {
         let cursor = JournalSeq(sim.journal_cursor());
         if let Some(cached) = &self.cached_baseline
             && cached.begin.journal_cursor == cursor
+            && (capable || cached.segments.is_none())
         {
             return Some(cached.reissue(id));
         }
-        let transfer = baseline::logical_capture_transfer(
-            sim,
-            self.backing_ref(),
-            id,
-            InterestEpoch(1),
-            cursor,
-        )
+        let snapshot = baseline::snapshot_world(sim, self.backing_ref());
+        let segmented_cap = self.segmented_cap_for(&snapshot, capable);
+        if segmented_cap.is_some() && !capable {
+            tracing::warn!(
+                "baseline recapture needs segmented support the client did not advertise"
+            );
+            return None;
+        }
+        let transfer = match segmented_cap {
+            Some(cap) => {
+                baseline::transfer_from_snapshot_segmented(snapshot, id, InterestEpoch(1), cap)
+            }
+            None => baseline::transfer_from_snapshot(snapshot, id, InterestEpoch(1)),
+        }
         .map_err(|e| tracing::warn!("baseline capture failed: {e:?}"))
         .ok()?;
         self.cached_baseline = Some(std::sync::Arc::new(transfer.reissue(id)));
         Some(transfer)
+    }
+
+    /// The per-segment decoded budget to capture `snapshot` with, or `None` for the single blob.
+    /// Forced segmentation applies only to clients that advertised support; a world too large for
+    /// the single blob is segmented regardless (and refused later if the client cannot take it).
+    fn segmented_cap_for(
+        &self,
+        snapshot: &baseline::BaselineSnapshot,
+        capable: bool,
+    ) -> Option<usize> {
+        match (self.segment_cap, capable) {
+            (Some(n), true) => Some(n),
+            _ => (self.assume_oversized || snapshot.needs_segmentation())
+                .then_some(spall_protocol::segment::DEFAULT_SEGMENT_DECODED_BYTES),
+        }
+    }
+
+    /// Ends a join whose world needs a segmented baseline the client did not advertise.
+    fn refuse_unsupported_baseline(&mut self, session: SessionId, clients: &ClientMap) {
+        tracing::warn!(session = %session, "refusing join: baseline requires segmented transfer support");
+        self.ev(session, "baseline_refused_unsupported");
+        self.failed += 1;
+        self.links.remove(&session.raw());
+        send_to(
+            clients,
+            session,
+            Outbound::Shutdown(Connection::BYE_REASON_BASELINE_UNSUPPORTED),
+        );
     }
 
     fn publish_ready_captures(&mut self, clients: &ClientMap) {
@@ -4663,8 +4755,11 @@ async fn send_baseline_paced(
     };
     let started = tokio::time::Instant::now();
     let mut sent = 0u64;
-    for part in transfer.parts.iter() {
-        if let Err(e) = bulk.send_part(part).await {
+    for shared in transfer.parts.iter() {
+        // The parts are shared between joiners; stamp this joiner's transfer id on a transient copy.
+        let mut part = shared.clone();
+        part.transfer_id = transfer.begin.transfer_id;
+        if let Err(e) = bulk.send_part(&part).await {
             return fail("bulk part", &e);
         }
         if let Some(rate) = rate_limit.filter(|r| *r > 0) {
@@ -5237,18 +5332,20 @@ mod tests {
             DEFAULT_MAX_JOIN_RETRIES,
             default_capture_workers(),
         );
-        let first = lj.capture_for(&sim, TransferId(1)).unwrap();
-        let second = lj.capture_for(&sim, TransferId(2)).unwrap();
+        let first = lj.capture_for(&sim, TransferId(1), false).unwrap();
+        let second = lj.capture_for(&sim, TransferId(2), false).unwrap();
 
         assert_eq!(first.begin.journal_cursor, second.begin.journal_cursor);
         assert_eq!(first.begin.transfer_id, TransferId(1));
         assert_eq!(second.begin.transfer_id, TransferId(2));
-        assert!(std::sync::Arc::ptr_eq(&first.world, &second.world));
+        assert!(std::sync::Arc::ptr_eq(&first.parts, &second.parts));
+        // The parts are shared and keep the capture's id; the sender stamps each joiner's transfer
+        // id on a transient copy, so the second joiner costs no second copy of the payload.
         assert!(
             second
                 .parts
                 .iter()
-                .all(|part| part.transfer_id == TransferId(2))
+                .all(|part| part.transfer_id == TransferId(1))
         );
 
         let tx = Arc::new(TopologyTransaction {
@@ -5458,6 +5555,97 @@ mod tests {
             !lj.links.contains_key(&joiner.raw()),
             "the joiner was dropped after exhausting its retry budget; other clients are untouched"
         );
+    }
+
+    fn baseline_request(hash: Hash32) -> BaselineAck {
+        BaselineAck {
+            transfer_id: BASELINE_REQUEST_SENTINEL,
+            verified_manifest_hash: hash,
+            installed_cursor: spall_core::JournalSeq(0),
+        }
+    }
+
+    /// Runs one baseline request and returns what the joiner was sent (`Baseline` transfers and
+    /// `Shutdown` reasons) after the background capture, if any, completed.
+    fn negotiate(
+        lj: &mut LateJoin,
+        hash: Hash32,
+    ) -> (Vec<Arc<BaselineTransfer>>, Vec<&'static str>) {
+        let sim = Scene::BridgeCut.simulation();
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        let joiner = sess(0, 1);
+        let handle = OutboundHandle::new();
+        clients.lock().unwrap().insert(joiner.raw(), handle.clone());
+        lj.on_joined(joiner);
+        lj.on_baseline_ack(
+            joiner,
+            baseline_request(hash),
+            &sim,
+            &clients,
+            &mut MotionPublisher::new(60, 20),
+        );
+        // Wait (bounded) for the background capture and publish it.
+        for _ in 0..200 {
+            lj.publish_ready_captures(&clients);
+            if lj.pending_captures.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut transfers = Vec::new();
+        let mut shutdowns = Vec::new();
+        for msg in handle.take().reliable {
+            match msg {
+                Outbound::Baseline(t) => transfers.push(t),
+                Outbound::Shutdown(r) => shutdowns.push(r),
+                _ => {}
+            }
+        }
+        (transfers, shutdowns)
+    }
+
+    #[test]
+    fn a_capable_client_gets_a_segmented_baseline_when_the_world_needs_it_and_others_are_refused() {
+        // Capability advertised + oversized world -> segmented (world_version 2).
+        let mut lj = LateJoin::new(64, 1, 2);
+        lj.assume_oversized = true;
+        let (transfers, shutdowns) =
+            negotiate(&mut lj, spall_protocol::segment::baseline_cap_segmented());
+        assert!(shutdowns.is_empty(), "{shutdowns:?}");
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(
+            transfers[0].begin.world_version,
+            spall_protocol::segment::BASELINE_SEGMENTED_WORLD_VERSION
+        );
+        assert!(transfers[0].segments.is_some());
+
+        // No capability + oversized world -> explicit refusal, never a partial world.
+        let mut lj = LateJoin::new(64, 1, 2);
+        lj.assume_oversized = true;
+        let (transfers, shutdowns) = negotiate(&mut lj, Hash32::ZERO);
+        assert!(transfers.is_empty());
+        assert_eq!(shutdowns, vec![Connection::BYE_REASON_BASELINE_UNSUPPORTED]);
+        assert_eq!(lj.failed, 1);
+
+        // No capability + a world that fits -> the ordinary single blob (byte-identical to before).
+        let mut lj = LateJoin::new(64, 1, 2);
+        let (transfers, shutdowns) = negotiate(&mut lj, Hash32::ZERO);
+        assert!(shutdowns.is_empty());
+        assert_eq!(transfers[0].begin.world_version, 1);
+        assert!(transfers[0].segments.is_none());
+
+        // Forced segmentation applies only to clients that advertised support.
+        let mut lj = LateJoin::new(64, 1, 2);
+        lj.segment_cap = Some(spall_protocol::segment::DENSE_BRICK_DECODED_COST);
+        let (transfers, _) = negotiate(&mut lj, Hash32::ZERO);
+        assert_eq!(
+            transfers[0].begin.world_version, 1,
+            "an old client still gets v1"
+        );
+        let mut lj = LateJoin::new(64, 1, 2);
+        lj.segment_cap = Some(spall_protocol::segment::DENSE_BRICK_DECODED_COST);
+        let (transfers, _) = negotiate(&mut lj, spall_protocol::segment::baseline_cap_segmented());
+        assert_eq!(transfers[0].begin.world_version, 2);
     }
 
     /// T23 / G3 row 10: the joiner dropped after its retry budget is exhausted

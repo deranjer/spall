@@ -15,6 +15,9 @@
 //! step 4).
 
 use spall_core::{BrickCoord, CELLS_PER_BRICK, JournalSeq, LocalCell, Revision, Tick, VolumeId};
+use spall_protocol::segment::{
+    self, BaselineSegment, SegmentManifest, SegmentVolume, VolumeHeader,
+};
 use spall_protocol::{
     BaselineBegin, BaselineBrick, BaselineCells, BaselineEnd, BaselineOwner, BaselinePart,
     BaselineRegion, BaselineVolume, BaselineWorld, Hash32, InterestEpoch, RepairKey, RepairRequest,
@@ -36,8 +39,24 @@ pub struct BaselineTransfer {
     pub begin: BaselineBegin,
     pub parts: Arc<[BaselinePart]>,
     pub end: BaselineEnd,
-    /// The decoded payload, retained for server-side assertions / metrics.
-    pub world: Arc<BaselineWorld>,
+    /// What a segmented (`world_version == 2`) transfer is made of; `None` for a single blob.
+    /// The decoded world is deliberately **not** retained: only the compressed, framed parts are
+    /// shared (`docs/reports/large-world-baseline-design.md`, class B).
+    pub segments: Option<SegmentedStats>,
+}
+
+/// Shape of a segmented transfer, for telemetry and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentedStats {
+    pub segments: u32,
+    pub volumes: u32,
+    pub bricks: u64,
+    /// Sum of the decoded cost of every brick (what a receiver's staging must hold).
+    pub decoded_bytes: u64,
+    /// The per-segment decoded budget the sender used.
+    pub segment_cap: u32,
+    /// The largest decoded cost any one segment reached.
+    pub max_segment_decoded: u32,
 }
 
 /// Immutable, copy-on-write geometry handed from the authoritative tick to a
@@ -65,6 +84,11 @@ impl BaselineTransfer {
         self.parts.iter().map(|p| p.payload.len()).sum()
     }
 
+    /// Decodes a **single-blob** (v1) transfer's world from its parts (tests and diagnostics).
+    pub fn decode_v1_world(&self) -> Result<BaselineWorld, spall_protocol::BaselineDecodeError> {
+        assemble(&self.parts)
+    }
+
     /// Reissues immutable baseline geometry under a fresh transfer id. The
     /// snapshot's cursor remains its honest capture cursor; the receiver drains
     /// all later topology records before it is promoted to live replication.
@@ -75,20 +99,13 @@ impl BaselineTransfer {
         begin.transfer_id = transfer_id;
         let mut end = self.end;
         end.transfer_id = transfer_id;
-        let parts = self
-            .parts
-            .iter()
-            .cloned()
-            .map(|mut part| {
-                part.transfer_id = transfer_id;
-                part
-            })
-            .collect();
+        // The compressed parts are shared, not copied: a joiner's transfer id lives in `begin` /
+        // `end` and is stamped on each part transiently when it is sent (`send_baseline_paced`).
         Self {
             begin,
-            parts,
+            parts: Arc::clone(&self.parts),
             end,
-            world: Arc::clone(&self.world),
+            segments: self.segments,
         }
     }
 }
@@ -103,6 +120,8 @@ pub enum BaselineError {
     TooLarge { bytes: usize, cap: usize },
     #[error("baseline needs {parts} parts; the ceiling is {cap}")]
     TooManyParts { parts: usize, cap: usize },
+    #[error("segmented baseline: {0}")]
+    Segmented(String),
 }
 
 /// Snapshots `sim`'s live world into an immutable [`BaselineWorld`] coherent
@@ -341,7 +360,230 @@ pub fn transfer_from_world(
         begin,
         parts,
         end,
-        world: Arc::new(world),
+        segments: None,
+    })
+}
+
+impl BaselineSnapshot {
+    /// Conservative decoded cost of the whole snapshot (a dense-stored brick counts as dense even
+    /// if its cells turn out uniform), computed without expanding any cells.
+    pub fn estimated_decoded_bytes(&self) -> u64 {
+        self.volumes
+            .iter()
+            .flat_map(|v| &v.bricks)
+            .map(|(_, snap)| {
+                if snap.is_dense() {
+                    segment::DENSE_BRICK_DECODED_COST as u64
+                } else {
+                    segment::UNIFORM_BRICK_DECODED_COST as u64
+                }
+            })
+            .sum()
+    }
+
+    /// Whether a single-blob (v1) transfer of this snapshot could exceed the whole-blob
+    /// decompression bound: postcard is at most 1.5x the decoded size, so anything whose decoded
+    /// estimate times 1.5 passes the bound is sent segmented.
+    pub fn needs_segmentation(&self) -> bool {
+        self.estimated_decoded_bytes() * 3 / 2 > limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED as u64
+    }
+}
+
+/// Packages `snapshot` as a **segmented** transfer (`world_version == 2`) with per-segment decoded
+/// budget `decoded_cap`.
+///
+/// One segment is expanded, hashed, compressed and framed at a time; every temporary is dropped
+/// before the next, so the peak is `O(decoded_cap)` regardless of world size. The snapshot's brick
+/// handles are released as they are consumed. Only the compressed frames are retained (class B).
+pub fn transfer_from_snapshot_segmented(
+    snapshot: BaselineSnapshot,
+    transfer_id: TransferId,
+    interest_epoch: InterestEpoch,
+    decoded_cap: usize,
+) -> Result<BaselineTransfer, BaselineError> {
+    if !(segment::DENSE_BRICK_DECODED_COST..=segment::MAX_SEGMENT_DECODED_BYTES)
+        .contains(&decoded_cap)
+    {
+        return Err(BaselineError::Segmented(format!(
+            "segment budget {decoded_cap} is outside {}..={}",
+            segment::DENSE_BRICK_DECODED_COST,
+            segment::MAX_SEGMENT_DECODED_BYTES
+        )));
+    }
+    let checkpoint_tick = snapshot.checkpoint_tick;
+    let journal_cursor = snapshot.journal_cursor;
+    let seg_err = |e: segment::SegmentError| BaselineError::Segmented(e.to_string());
+
+    let mut payload: Vec<u8> = Vec::new();
+    let mut raw_hashes: Vec<Hash32> = Vec::new();
+    let mut segments = 0u32;
+    let mut volumes_n = 0u32;
+    let mut bricks_n = 0u64;
+    let mut decoded_total = 0u64;
+    let mut max_segment_decoded = 0usize;
+
+    let mut cur = BaselineSegment {
+        index: 0,
+        volumes: Vec::new(),
+    };
+    let mut cur_cost = 0usize;
+
+    // Encodes and clears the current segment.
+    let flush = |cur: &mut BaselineSegment,
+                 cur_cost: &mut usize,
+                 payload: &mut Vec<u8>,
+                 raw_hashes: &mut Vec<Hash32>,
+                 segments: &mut u32|
+     -> Result<(), BaselineError> {
+        if cur.volumes.is_empty() {
+            return Ok(());
+        }
+        let frame = segment::encode_segment_frame(cur, decoded_cap).map_err(seg_err)?;
+        if frame.bytes.len() > 5 + segment::segment_frame_cap(decoded_cap) {
+            return Err(BaselineError::Segmented(format!(
+                "segment {} frame is {} bytes, over its {} byte cap",
+                cur.index,
+                frame.bytes.len(),
+                segment::segment_frame_cap(decoded_cap)
+            )));
+        }
+        payload.extend_from_slice(&frame.bytes);
+        raw_hashes.push(frame.raw_hash);
+        *segments += 1;
+        let next = cur.index + 1;
+        *cur = BaselineSegment {
+            index: next,
+            volumes: Vec::new(),
+        };
+        *cur_cost = 0;
+        Ok(())
+    };
+
+    for volume in snapshot.volumes {
+        volumes_n += 1;
+        let header = VolumeHeader {
+            cell_size_code: volume.cell_size_code,
+            owner: volume.owner,
+            bounds: volume.bounds,
+        };
+        let mut header = Some(header);
+        let mut run: Option<SegmentVolume> = None;
+        for (ordinal, (coord, snap)) in (0u32..).zip(volume.bricks) {
+            let brick = BaselineBrick {
+                coord: [coord.x, coord.y, coord.z],
+                revision: snap.revision().get(),
+                edited: snap.is_edited(),
+                cells: cells_of(&snap),
+            };
+            drop(snap);
+            let cost = segment::brick_decoded_cost(&brick.cells);
+            if cost > decoded_cap {
+                return Err(BaselineError::Segmented(format!(
+                    "one brick costs {cost} decoded bytes, over the {decoded_cap} budget"
+                )));
+            }
+            if cur_cost + cost > decoded_cap {
+                if let Some(mut r) = run.take() {
+                    r.last = false;
+                    cur.volumes.push(r);
+                }
+                flush(
+                    &mut cur,
+                    &mut cur_cost,
+                    &mut payload,
+                    &mut raw_hashes,
+                    &mut segments,
+                )?;
+            }
+            let r = run.get_or_insert_with(|| SegmentVolume {
+                volume_id: volume.volume_id,
+                header: header.take(),
+                first_ordinal: ordinal,
+                bricks: Vec::new(),
+                last: false,
+            });
+            r.bricks.push(brick);
+            cur_cost += cost;
+            decoded_total += cost as u64;
+            max_segment_decoded = max_segment_decoded.max(cur_cost);
+            bricks_n += 1;
+        }
+        let Some(mut r) = run.take() else {
+            return Err(BaselineError::Segmented(format!(
+                "volume {} has no bricks",
+                volume.volume_id
+            )));
+        };
+        r.last = true;
+        cur.volumes.push(r);
+    }
+    flush(
+        &mut cur,
+        &mut cur_cost,
+        &mut payload,
+        &mut raw_hashes,
+        &mut segments,
+    )?;
+
+    let manifest = SegmentManifest {
+        schema: segment::SEGMENT_SCHEMA,
+        segment_count: segments,
+        volume_count: volumes_n,
+        total_bricks: bricks_n,
+        total_decoded_bytes: decoded_total,
+        segment_decoded_cap: decoded_cap as u32,
+    };
+    manifest.validate().map_err(seg_err)?;
+    let manifest_frame = segment::encode_manifest_frame(&manifest);
+    let assembled_hash = segment::chain_hash(&manifest_frame.bytes[5..], &raw_hashes);
+    let mut framed = manifest_frame.bytes;
+    framed.extend_from_slice(&payload);
+    drop(payload);
+
+    if framed.len() > limits::MAX_ASSEMBLED_TRANSFER {
+        return Err(BaselineError::TooLarge {
+            bytes: framed.len(),
+            cap: limits::MAX_ASSEMBLED_TRANSFER,
+        });
+    }
+    let parts: Arc<[BaselinePart]> = chunk_payload(&framed, transfer_id).into();
+    if parts.len() > limits::MAX_BASELINE_PARTS {
+        return Err(BaselineError::TooManyParts {
+            parts: parts.len(),
+            cap: limits::MAX_BASELINE_PARTS,
+        });
+    }
+    let begin = BaselineBegin {
+        transfer_id,
+        interest_epoch,
+        checkpoint_tick: Tick(checkpoint_tick),
+        journal_cursor,
+        world_version: segment::BASELINE_SEGMENTED_WORLD_VERSION,
+        content_version: BASELINE_CONTENT_VERSION,
+        total_bytes: framed.len() as u64,
+        part_count: parts.len() as u32,
+        // The per-volume region list does not scale (a world can hold more volumes than the
+        // 8,192-region / 64 KiB control-record limits allow); the manifest frame carries the
+        // volume and brick counts instead and nothing reads `regions` on the client.
+        regions: Vec::new(),
+    };
+    let end = BaselineEnd {
+        transfer_id,
+        assembled_hash,
+        journal_cursor,
+    };
+    Ok(BaselineTransfer {
+        begin,
+        parts,
+        end,
+        segments: Some(SegmentedStats {
+            segments,
+            volumes: volumes_n,
+            bricks: bricks_n,
+            decoded_bytes: decoded_total,
+            segment_cap: decoded_cap as u32,
+            max_segment_decoded: max_segment_decoded as u32,
+        }),
     })
 }
 
@@ -612,7 +854,6 @@ mod tests {
 
         // Reassembly reproduces the captured world exactly.
         let rebuilt = assemble(&transfer.parts).unwrap();
-        assert_eq!(rebuilt, *transfer.world);
         assert_eq!(rebuilt.volumes.len(), sim.world().body_count() + 1);
         assert_eq!(Hash32::of(&rebuilt.encode()), transfer.end.assembled_hash);
     }
@@ -627,7 +868,10 @@ mod tests {
         let detached =
             transfer_from_snapshot(snapshot_world(&sim, None), TransferId(12), InterestEpoch(1))
                 .unwrap();
-        assert_eq!(*live.world, *detached.world);
+        assert_eq!(
+            live.decode_v1_world().unwrap(),
+            detached.decode_v1_world().unwrap()
+        );
         assert_eq!(live.begin.journal_cursor, detached.begin.journal_cursor);
     }
 

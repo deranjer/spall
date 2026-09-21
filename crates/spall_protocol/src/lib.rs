@@ -26,6 +26,7 @@ pub mod handshake;
 pub mod input;
 pub mod limits;
 pub mod records;
+pub mod segment;
 pub mod session;
 
 pub use input::{frame_input, player_entity, recent_input, session_player_entity};

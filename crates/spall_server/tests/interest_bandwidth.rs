@@ -80,6 +80,7 @@ fn base_config(
         residency: None,
         residency_disk_path: None,
         terrain_brick_colliders: false,
+        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
@@ -113,6 +114,7 @@ fn column_cut_client(
         summary_json: Some(dir.join("client.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None,
     }

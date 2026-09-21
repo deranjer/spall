@@ -86,6 +86,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         residency: None,
         residency_disk_path: None,
         terrain_brick_colliders: false,
+        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
@@ -142,6 +143,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         summary_json: Some(dir.join("early.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None,
     };
@@ -171,6 +173,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         summary_json: Some(dir.join("late.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None,
     };

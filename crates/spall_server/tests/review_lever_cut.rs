@@ -65,6 +65,7 @@ fn the_review_cut_key_is_accepted_and_the_beam_tips() {
         residency: None,
         residency_disk_path: None,
         terrain_brick_colliders: false,
+        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
@@ -94,6 +95,7 @@ fn the_review_cut_key_is_accepted_and_the_beam_tips() {
         summary_json: None,
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: Some(session.clone()),
     };

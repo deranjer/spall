@@ -226,6 +226,178 @@ pub struct ReplicaWorld {
     evicted: BTreeMap<u64, spall_voxel::EvictedBricks>,
 }
 
+/// A baseline being built off to the side while its segments arrive (`docs/protocol.md` late-join
+/// step 3). Nothing here is visible to prediction or rendering; [`ReplicaWorld::install_staged`]
+/// swaps it in atomically once the transfer is verified complete. Its memory is the world itself
+/// (class D in `docs/reports/large-world-baseline-design.md`): the caller budgets it before the
+/// first brick is staged.
+pub struct StagedBaseline {
+    checkpoint_tick: u64,
+    volumes: BTreeMap<u64, Volume>,
+    owner: BTreeMap<u64, CanonicalOwner>,
+    bodies: BTreeMap<u64, ReplicaBody>,
+    volume_of_entity: BTreeMap<u64, u64>,
+    terrain_id: Option<VolumeId>,
+    /// The volume currently open (header seen, `last` not yet).
+    open: Option<u64>,
+    bricks: u64,
+}
+
+impl StagedBaseline {
+    pub fn new(checkpoint_tick: u64) -> Self {
+        Self {
+            checkpoint_tick,
+            volumes: BTreeMap::new(),
+            owner: BTreeMap::new(),
+            bodies: BTreeMap::new(),
+            volume_of_entity: BTreeMap::new(),
+            terrain_id: None,
+            open: None,
+            bricks: 0,
+        }
+    }
+
+    /// Bricks staged so far.
+    pub fn brick_count(&self) -> u64 {
+        self.bricks
+    }
+
+    /// Volumes staged so far.
+    pub fn volume_count(&self) -> usize {
+        self.volumes.len()
+    }
+
+    /// Bodies staged so far (every non-terrain volume).
+    pub fn body_count(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Opens a volume from its header. It must not already exist and no other volume may be open.
+    pub fn open_volume(
+        &mut self,
+        vid: VolumeId,
+        header: &spall_protocol::segment::VolumeHeader,
+    ) -> Result<(), String> {
+        use spall_protocol::BaselineOwner;
+        if let Some(open) = self.open {
+            return Err(format!("volume {open} still open when {vid} began"));
+        }
+        if self.volumes.contains_key(&vid.get()) {
+            return Err(format!("baseline volume {vid} appears twice"));
+        }
+        let cs = CellSizeCode::from_u8(header.cell_size_code).ok_or_else(|| {
+            format!(
+                "baseline volume {vid} has unknown cell-size code {}",
+                header.cell_size_code
+            )
+        })?;
+        let volume = match header.bounds {
+            Some([mn, mx]) => {
+                let bb = spall_voxel::BrickBounds::new(
+                    BrickCoord::new(mn[0], mn[1], mn[2]),
+                    BrickCoord::new(mx[0], mx[1], mx[2]),
+                )
+                .ok_or_else(|| format!("baseline volume {vid} has inverted bounds"))?;
+                Volume::bounded(vid, cs, bb)
+            }
+            None => Volume::new(vid, cs),
+        };
+        match header.owner {
+            BaselineOwner::Terrain => {
+                if self.terrain_id.is_some() {
+                    return Err("baseline has a second terrain volume".to_string());
+                }
+                self.owner.insert(vid.get(), CanonicalOwner::Terrain);
+                self.terrain_id = Some(vid);
+            }
+            BaselineOwner::Body(entity) => {
+                if self.volume_of_entity.contains_key(&entity.get()) {
+                    return Err(format!("baseline entity {entity} owns two volumes"));
+                }
+                self.owner.insert(vid.get(), CanonicalOwner::Body(entity));
+                self.volume_of_entity.insert(entity.get(), vid.get());
+                self.bodies.insert(
+                    entity.get(),
+                    ReplicaBody {
+                        entity,
+                        volume_id: vid,
+                        track: MotionTrack::default(),
+                    },
+                );
+            }
+        }
+        self.volumes.insert(vid.get(), volume);
+        self.open = Some(vid.get());
+        Ok(())
+    }
+
+    /// Stages one brick into the open volume `vid`.
+    pub fn insert_brick(
+        &mut self,
+        vid: VolumeId,
+        bb: &spall_protocol::BaselineBrick,
+    ) -> Result<(), String> {
+        use spall_protocol::BaselineCells;
+        if self.open != Some(vid.get()) {
+            return Err(format!(
+                "brick for volume {vid}, which is not the open volume"
+            ));
+        }
+        let cells: Vec<MaterialId> = match &bb.cells {
+            BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
+            BaselineCells::Dense(raw) => {
+                if raw.len() != spall_core::CELLS_PER_BRICK {
+                    return Err(format!(
+                        "baseline brick in {vid} has {} cells, expected {}",
+                        raw.len(),
+                        spall_core::CELLS_PER_BRICK
+                    ));
+                }
+                raw.iter().copied().map(MaterialId).collect()
+            }
+        };
+        let brick = Brick::restored(&cells, Revision(bb.revision), bb.edited);
+        self.volumes
+            .get_mut(&vid.get())
+            .expect("open volume is staged")
+            .insert_brick(
+                BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                brick,
+            )
+            .map_err(|e| format!("baseline brick insert into {vid} failed: {e}"))?;
+        self.bricks += 1;
+        Ok(())
+    }
+
+    /// Closes the open volume `vid`.
+    pub fn close_volume(&mut self, vid: VolumeId) {
+        if self.open == Some(vid.get()) {
+            self.open = None;
+        }
+    }
+
+    /// Stages one segment. Structural validation (order, contiguity, completeness) belongs to the
+    /// `SequenceValidator`; this builds the volumes and fails on anything the voxel layer refuses
+    /// (bounds, cell-size, duplicate coordinates).
+    pub fn add_segment(
+        &mut self,
+        seg: &spall_protocol::segment::BaselineSegment,
+    ) -> Result<(), String> {
+        for v in &seg.volumes {
+            if let Some(h) = &v.header {
+                self.open_volume(v.volume_id, h)?;
+            }
+            for b in &v.bricks {
+                self.insert_brick(v.volume_id, b)?;
+            }
+            if v.last {
+                self.close_volume(v.volume_id);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ReplicaWorld {
     /// Installs a fixed-scene baseline: `terrain` is the world grid. Bodies
     /// present before play are added with [`Self::install_body`].
@@ -304,86 +476,36 @@ impl ReplicaWorld {
         &mut self,
         world: &spall_protocol::BaselineWorld,
     ) -> Result<(), String> {
-        use spall_protocol::{BaselineCells, BaselineOwner};
-
         world.validate().map_err(|e| e.to_string())?;
-
-        let mut volumes = BTreeMap::new();
-        let mut owner = BTreeMap::new();
-        let mut bodies = BTreeMap::new();
-        let mut volume_of_entity = BTreeMap::new();
-        let mut terrain_id = None;
-
+        let mut staged = StagedBaseline::new(world.checkpoint_tick);
         for bv in &world.volumes {
-            let vid = bv.volume_id;
-            let cs = CellSizeCode::from_u8(bv.cell_size_code).ok_or_else(|| {
-                format!(
-                    "baseline volume {vid} has unknown cell-size code {}",
-                    bv.cell_size_code
-                )
-            })?;
-            let mut volume = match bv.bounds {
-                Some([mn, mx]) => {
-                    let bb = spall_voxel::BrickBounds::new(
-                        BrickCoord::new(mn[0], mn[1], mn[2]),
-                        BrickCoord::new(mx[0], mx[1], mx[2]),
-                    )
-                    .ok_or_else(|| format!("baseline volume {vid} has inverted bounds"))?;
-                    Volume::bounded(vid, cs, bb)
-                }
-                None => Volume::new(vid, cs),
+            let header = spall_protocol::segment::VolumeHeader {
+                cell_size_code: bv.cell_size_code,
+                owner: bv.owner,
+                bounds: bv.bounds,
             };
+            staged.open_volume(bv.volume_id, &header)?;
             for bb in &bv.bricks {
-                let cells: Vec<MaterialId> = match &bb.cells {
-                    BaselineCells::Uniform(id) => {
-                        vec![MaterialId(*id); spall_core::CELLS_PER_BRICK]
-                    }
-                    BaselineCells::Dense(raw) => {
-                        if raw.len() != spall_core::CELLS_PER_BRICK {
-                            return Err(format!(
-                                "baseline brick in {vid} has {} cells, expected {}",
-                                raw.len(),
-                                spall_core::CELLS_PER_BRICK
-                            ));
-                        }
-                        raw.iter().copied().map(MaterialId).collect()
-                    }
-                };
-                let brick = Brick::restored(&cells, Revision(bb.revision), bb.edited);
-                volume
-                    .insert_brick(
-                        BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
-                        brick,
-                    )
-                    .map_err(|e| format!("baseline brick insert into {vid} failed: {e}"))?;
+                staged.insert_brick(bv.volume_id, bb)?;
             }
-            match bv.owner {
-                BaselineOwner::Terrain => {
-                    owner.insert(vid.get(), CanonicalOwner::Terrain);
-                    terrain_id = Some(vid);
-                }
-                BaselineOwner::Body(entity) => {
-                    owner.insert(vid.get(), CanonicalOwner::Body(entity));
-                    volume_of_entity.insert(entity.get(), vid.get());
-                    bodies.insert(
-                        entity.get(),
-                        ReplicaBody {
-                            entity,
-                            volume_id: vid,
-                            track: MotionTrack::default(),
-                        },
-                    );
-                }
-            }
-            volumes.insert(vid.get(), volume);
+            staged.close_volume(bv.volume_id);
         }
-        let terrain_id = terrain_id.ok_or("baseline has no terrain volume")?;
+        self.install_staged(staged)
+    }
 
+    /// Installs a fully staged baseline atomically: the same swap `install_baseline_world`
+    /// performs, for a world built segment by segment. The previous state is untouched until this
+    /// call, and a staged world with no terrain or an open volume is refused.
+    pub fn install_staged(&mut self, staged: StagedBaseline) -> Result<(), String> {
+        let terrain_id = staged.terrain_id.ok_or("baseline has no terrain volume")?;
+        if let Some(open) = staged.open {
+            return Err(format!("baseline volume {open} was left open"));
+        }
         self.terrain_id = terrain_id;
-        self.volumes = volumes;
-        self.owner = owner;
-        self.bodies = bodies;
-        self.volume_of_entity = volume_of_entity;
+        self.volumes = staged.volumes;
+        self.owner = staged.owner;
+        self.bodies = staged.bodies;
+        self.volume_of_entity = staged.volume_of_entity;
         self.tombstoned = BTreeSet::new();
         self.applied_tx = BTreeSet::new();
         self.control_gate = SequenceGate::new();
@@ -397,7 +519,7 @@ impl ReplicaWorld {
         // A full baseline replaces the whole logical state, digest namespace
         // included (G3-residency-hash.md lifecycle).
         self.evicted = BTreeMap::new();
-        self.now_tick = world.checkpoint_tick;
+        self.now_tick = staged.checkpoint_tick;
         Ok(())
     }
 

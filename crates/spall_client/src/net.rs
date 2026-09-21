@@ -43,6 +43,7 @@ use crate::interactive::{InteractiveSession, InteractiveView};
 use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer, WindowStats};
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
 use crate::residency::ClientResidencyPass;
+use crate::segmented::{SegmentedReceipt, SegmentedReceiver};
 use crate::tick_accumulator::TickAccumulator;
 
 /// One leg of a scripted movement path: hold `input` from tick `from` up to (not
@@ -264,6 +265,9 @@ pub struct ClientNetConfig {
     /// capsule and pulls bricks back with `RepairRequest`s as the player
     /// returns. Needs a `movement_script` (no mover, no pass).
     pub client_residency: Option<ClientResidencyLimits>,
+    /// Ceiling on the decoded bytes a segmented baseline may declare (its manifest), checked
+    /// before any segment is decoded. `None` = no client-side ceiling beyond the protocol's.
+    pub baseline_staging_budget_bytes: Option<u64>,
     /// T11a / ENG-62 increment 3: called once, right after the replica's
     /// initial baseline is installed (late-join) or the fixed scene is set
     /// (a live client), with a shared handle to the live
@@ -395,6 +399,20 @@ pub struct ClientSummary {
     /// `client_residency_reloads_completed`) despite it.
     #[serde(default)]
     pub baseline_transfer_failures: u64,
+    /// Late-join baselines received in the segmented format, and what they were made of.
+    #[serde(default)]
+    pub segmented_transfers: u64,
+    #[serde(default)]
+    pub segments_received: u64,
+    /// Decoded bytes staged for the segmented baseline (world-sized, not a temporary buffer).
+    #[serde(default)]
+    pub staged_decoded_bytes: u64,
+    /// Largest decoded segment held at once (the bounded temporary).
+    #[serde(default)]
+    pub max_segment_decoded_bytes: u64,
+    /// Most bytes the frame reassembler ever buffered.
+    #[serde(default)]
+    pub max_frame_buffered_bytes: u64,
     /// T23 / G4 join/convergence timeline: `(ms since the client started, event)`.
     #[serde(default)]
     pub timeline: Vec<(u64, String)>,
@@ -559,6 +577,11 @@ struct Counters {
     /// retry) already re-requests on its own schedule, so this is dropped and
     /// counted rather than treated as fatal.
     baseline_transfer_failures: AtomicU64,
+    segmented_transfers: AtomicU64,
+    segments_received: AtomicU64,
+    staged_decoded_bytes: AtomicU64,
+    max_segment_decoded_bytes: AtomicU64,
+    max_frame_buffered_bytes: AtomicU64,
     /// T23 / G3 row 10: the `Bye` reason the control reader saw when its
     /// record loop ended, if the peer said goodbye rather than the stream
     /// just closing. Set at most once (the control reader breaks right
@@ -713,6 +736,42 @@ async fn forward_outcome(conn: &Connection, counters: &Counters, outcome: ApplyO
     }
 }
 
+/// Receives a segmented (`world_version == 2`) baseline over the bulk stream and the closing
+/// `BaselineEnd`, driving [`SegmentedReceiver`]. Returns a reason naming the segment on any
+/// failure; the caller's replica is untouched until it installs the returned receipt.
+async fn receive_segmented_baseline(
+    conn: &Connection,
+    begin: &spall_protocol::BaselineBegin,
+    staging_budget: Option<u64>,
+) -> Result<SegmentedReceipt, String> {
+    let mut bulk = conn
+        .accept_bulk()
+        .await
+        .map_err(|e| format!("baseline bulk stream: {e}"))?;
+    let mut receiver = SegmentedReceiver::new(begin.checkpoint_tick.get(), staging_budget);
+    while let Some(part) = bulk
+        .next_part()
+        .await
+        .map_err(|e| format!("baseline part: {e}"))?
+    {
+        receiver.push(&part.payload)?;
+    }
+    let receipt = receiver.finish()?;
+    // Drain until BaselineEnd, exactly as the single-blob path does.
+    loop {
+        match conn.recv_record().await {
+            Ok(Some(WireRecord::BaselineEnd(end))) => {
+                if end.assembled_hash != receipt.chain_hash {
+                    return Err("BaselineEnd hash does not match the received segments".to_string());
+                }
+                return Ok(receipt);
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return Err("connection closed before BaselineEnd".to_string()),
+        }
+    }
+}
+
 /// The initial late-join handshake: ask for a baseline, install it, confirm it.
 /// `connect_at` is the wall-clock reference point ("late-join connect") the
 /// T23 / G3 row 11 join-budget timings are measured from.
@@ -721,11 +780,13 @@ async fn perform_late_join(
     replica: &Mutex<ReplicaWorld>,
     counters: &Counters,
     connect_at: std::time::Instant,
+    staging_budget: Option<u64>,
 ) -> Result<(), ClientNetError> {
     counters.mark("baseline_requested");
     conn.send_record(WireRecord::BaselineAck(BaselineAck {
         transfer_id: BASELINE_REQUEST_SENTINEL,
-        verified_manifest_hash: Hash32::ZERO,
+        // Advertises segmented-baseline support; an older server ignores the field.
+        verified_manifest_hash: spall_protocol::segment::baseline_cap_segmented(),
         installed_cursor: spall_core::JournalSeq(0),
     }))
     .await
@@ -756,6 +817,63 @@ async fn perform_late_join(
         "baseline_begin id={} bytes={}",
         begin.transfer_id.0, begin.total_bytes
     ));
+    if begin.world_version == spall_protocol::segment::BASELINE_SEGMENTED_WORLD_VERSION {
+        let receipt = receive_segmented_baseline(conn, &begin, staging_budget)
+            .await
+            .map_err(|e| ClientNetError::Baseline(format!("segmented baseline: {e}")))?;
+        counters
+            .late_join_baseline_compressed_bytes
+            .store(begin.total_bytes, Ordering::Relaxed);
+        counters
+            .late_join_baseline_install_ms
+            .store(connect_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+        counters.mark("baseline_received");
+        counters.segmented_transfers.fetch_add(1, Ordering::Relaxed);
+        counters
+            .segments_received
+            .fetch_add(u64::from(receipt.segments), Ordering::Relaxed);
+        counters
+            .staged_decoded_bytes
+            .store(receipt.decoded_bytes, Ordering::Relaxed);
+        counters
+            .max_segment_decoded_bytes
+            .store(receipt.max_segment_decoded, Ordering::Relaxed);
+        counters
+            .max_frame_buffered_bytes
+            .store(receipt.max_buffered_bytes as u64, Ordering::Relaxed);
+        counters.late_join_has_bodies.store(
+            u64::from(receipt.staged.body_count() > 0),
+            Ordering::Relaxed,
+        );
+        counters
+            .baseline_bricks
+            .store(receipt.staged.brick_count(), Ordering::Relaxed);
+        {
+            let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .install_staged(receipt.staged)
+                .map_err(ClientNetError::Baseline)?;
+        }
+        counters.mark("baseline_installed");
+        counters
+            .last_tick
+            .fetch_max(begin.checkpoint_tick.get(), Ordering::Relaxed);
+        conn.send_record(WireRecord::BaselineAck(BaselineAck {
+            transfer_id: begin.transfer_id,
+            verified_manifest_hash: receipt.chain_hash,
+            installed_cursor: begin.journal_cursor,
+        }))
+        .await
+        .map_err(ClientNetError::Transport)?;
+        counters.mark("promotion_ack_sent");
+        return Ok(());
+    }
+    if begin.world_version != 1 {
+        return Err(ClientNetError::Baseline(format!(
+            "unsupported baseline version {} (this client understands 1 and 2)",
+            begin.world_version
+        )));
+    }
     let Some(world) = receive_baseline_body(conn).await else {
         return Err(ClientNetError::Baseline(
             "transfer failed to assemble / verify".into(),
@@ -901,7 +1019,15 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     // replication stream, so the replica starts at the server's current
     // topology with no edit replay from world creation.
     if want_baseline {
-        if let Err(e) = perform_late_join(&conn, &replica, &counters, session_start).await {
+        if let Err(e) = perform_late_join(
+            &conn,
+            &replica,
+            &counters,
+            session_start,
+            config.baseline_staging_budget_bytes,
+        )
+        .await
+        {
             log.write(&ProcessRecord::new(
                 ProcessEvent::Failed,
                 ProcessRole::Client,
@@ -950,6 +1076,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let (throttle_tx, mut throttle_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
 
     // Control reader: apply transactions, answer repair gaps.
+    let staging_budget = config.baseline_staging_budget_bytes;
     let control = {
         let conn = conn.clone();
         let replica = replica.clone();
@@ -1073,6 +1200,37 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         // — including ones for a request sent well after
                         // this failure — turning one dropped patch into a
                         // permanently stuck reload.
+                        // A segmented (v2) baseline mid-session is a full re-baseline: stage it
+                        // off to the side and swap it in atomically once verified.
+                        if begin.world_version
+                            == spall_protocol::segment::BASELINE_SEGMENTED_WORLD_VERSION
+                            && !is_split
+                        {
+                            match receive_segmented_baseline(&conn, &begin, staging_budget).await {
+                                Ok(receipt) => {
+                                    let installed = {
+                                        let mut guard =
+                                            replica.lock().unwrap_or_else(|e| e.into_inner());
+                                        guard.install_staged(receipt.staged)
+                                    };
+                                    if let Err(e) = installed {
+                                        counters.mark(format!("segmented_install_failed: {e}"));
+                                        counters
+                                            .baseline_transfer_failures
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        counters.patches.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(e) => {
+                                    counters.mark(format!("segmented_baseline_failed: {e}"));
+                                    counters
+                                        .baseline_transfer_failures
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            continue;
+                        }
                         match receive_baseline_body(&conn).await {
                             Some(world) if is_split => {
                                 let retried = {
@@ -1808,12 +1966,15 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     // hash. Only `late_join` clients get this override: a live client that
     // was never joining has nothing to be exhausted.
     let catch_up_exhausted = config.late_join
-        && counters
-            .disconnect_reason
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_deref()
-            == Some(Connection::BYE_REASON_CATCH_UP_EXHAUSTED);
+        && matches!(
+            counters
+                .disconnect_reason
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+            Some(Connection::BYE_REASON_CATCH_UP_EXHAUSTED)
+                | Some(Connection::BYE_REASON_BASELINE_UNSUPPORTED)
+        );
     let max_body_displacement_m = guard.max_body_displacement_m();
     let body_cut_committed = match counters.body_cut_entity_plus1.load(Ordering::Relaxed) {
         0 => false,
@@ -1884,6 +2045,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         late_join_ready_ms: counters.late_join_ready_ms.load(Ordering::Relaxed),
         late_join_ready_confirmed: counters.late_join_ready_confirmed.load(Ordering::Relaxed) != 0,
         baseline_transfer_failures: counters.baseline_transfer_failures.load(Ordering::Relaxed),
+        segmented_transfers: counters.segmented_transfers.load(Ordering::Relaxed),
+        segments_received: counters.segments_received.load(Ordering::Relaxed),
+        staged_decoded_bytes: counters.staged_decoded_bytes.load(Ordering::Relaxed),
+        max_segment_decoded_bytes: counters.max_segment_decoded_bytes.load(Ordering::Relaxed),
+        max_frame_buffered_bytes: counters.max_frame_buffered_bytes.load(Ordering::Relaxed),
         timeline: counters
             .timeline
             .lock()

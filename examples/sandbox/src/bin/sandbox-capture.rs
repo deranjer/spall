@@ -895,6 +895,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         residency: None,
         residency_disk_path: None,
         terrain_brick_colliders: false,
+        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
@@ -954,6 +955,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         summary_json: Some(dir.join("cutter.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None,
     };
@@ -981,6 +983,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         summary_json: Some(dir.join("observer.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: Some(Arc::new(move |r| {
             *replica_slot_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         })),

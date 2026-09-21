@@ -90,6 +90,10 @@ struct Args {
     /// as the player returns. The committed world / agreed hash is unchanged.
     #[arg(long, default_value_t = 0)]
     residency_budget_bricks: usize,
+    /// Refuse a segmented late-join baseline whose manifest declares more decoded bytes than this
+    /// (checked before any segment is decoded).
+    #[arg(long)]
+    baseline_staging_budget_bytes: Option<u64>,
     /// Chebyshev brick radius kept resident around the predicted player.
     #[arg(long, default_value_t = 2)]
     residency_radius_bricks: i64,
@@ -353,6 +357,7 @@ fn run_replication(args: Args) -> ExitCode {
                 max_dense_bytes: args.residency_budget_dense_bytes.unwrap_or(u64::MAX),
             },
         ),
+        baseline_staging_budget_bytes: args.baseline_staging_budget_bytes,
         on_replica_ready: None,
         interactive: None,
     };
@@ -488,6 +493,7 @@ fn run_interactive(args: Args) -> ExitCode {
         summary_json: None,
         transport: TransportConfig::default(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None, // set by `run_interactive_window` itself
     };

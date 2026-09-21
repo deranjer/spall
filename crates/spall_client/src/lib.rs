@@ -6,6 +6,7 @@ pub mod net;
 pub mod predict;
 pub mod replica;
 pub mod residency;
+pub mod segmented;
 pub mod tick_accumulator;
 pub mod window;
 
@@ -16,7 +17,7 @@ pub use net::{
     run_replication_client,
 };
 pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
-pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
+pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld, StagedBaseline};
 pub use residency::{ClientResidency, ClientResidencyPass, MAX_RELOAD_REQUESTS_PER_STEP};
 pub use window::run_interactive_window;
 

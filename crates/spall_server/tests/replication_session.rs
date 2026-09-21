@@ -98,6 +98,7 @@ fn bridge_cut_session(brick_colliders: bool) {
         residency: None,
         residency_disk_path: None,
         terrain_brick_colliders: brick_colliders,
+        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
@@ -132,6 +133,7 @@ fn bridge_cut_session(brick_colliders: bool) {
         summary_json: Some(dir.join("client.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None,
     };
@@ -219,6 +221,7 @@ fn server_persists_and_recovers_across_a_restart() {
         residency: None,
         residency_disk_path: None,
         terrain_brick_colliders: false,
+        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
@@ -250,6 +253,7 @@ fn server_persists_and_recovers_across_a_restart() {
             summary_json: None,
             transport: TransportConfig::for_tests(),
             client_residency: None,
+            baseline_staging_budget_bytes: None,
             on_replica_ready: None,
             interactive: None,
         };
@@ -344,6 +348,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         residency: None,
         residency_disk_path: None,
         terrain_brick_colliders: false,
+        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
@@ -374,6 +379,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         summary_json: None,
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None,
     };

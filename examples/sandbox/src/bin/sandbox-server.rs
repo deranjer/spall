@@ -65,6 +65,10 @@ struct Args {
     /// does not wake unrelated resting bodies. Refused with `--residency-budget-bricks`.
     #[arg(long)]
     terrain_brick_colliders: bool,
+    /// Force segmented late-join baselines for clients that support them, with this per-segment
+    /// decoded budget in bytes (default: single blob unless the world does not fit it).
+    #[arg(long)]
+    baseline_segment_bytes: Option<usize>,
     /// Cap each client's motion by its measured QUIC congestion window (with
     /// `--motion-interest`).
     #[arg(long)]
@@ -361,6 +365,7 @@ fn run_serve(args: Args) -> ExitCode {
         baseline_rate_limit_bytes_per_sec: args.baseline_rate_limit_bytes_per_sec,
         wake_audit: args.wake_audit,
         terrain_brick_colliders: args.terrain_brick_colliders,
+        baseline_segment_bytes: args.baseline_segment_bytes,
     };
     match spall_server::serve(config) {
         Ok(summary) => {

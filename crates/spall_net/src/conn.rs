@@ -287,6 +287,10 @@ impl Connection {
     /// ordinary shutdown so the disconnected client can report a bounded
     /// failure instead of silently keeping its stale pre-catch-up state.
     pub const BYE_REASON_CATCH_UP_EXHAUSTED: &'static str = "catch-up exhausted";
+    /// `say_bye` reason for refusing a joining client whose world needs a segmented baseline
+    /// the client did not advertise support for: an explicit, bounded failure, never a partial world.
+    pub const BYE_REASON_BASELINE_UNSUPPORTED: &'static str =
+        "baseline requires segmented transfer support";
 
     /// Sends a `Bye` then finishes the control send stream. Waits briefly
     /// (bounded) for the peer to acknowledge receipt before returning.
@@ -476,6 +480,9 @@ impl Connection {
             cap: self.cfg.limits.max_bulk_part,
             assembled_cap: self.cfg.limits.max_assembled_transfer,
             _open: guard,
+            assembled: 0,
+            transfer: None,
+            next_part_index: 0,
         })
     }
 
@@ -745,82 +752,92 @@ pub struct BulkRecv {
     cap: usize,
     assembled_cap: usize,
     _open: BulkGuard,
+    /// Streaming state shared by [`Self::next_part`] and [`Self::collect_parts`].
+    assembled: usize,
+    transfer: Option<spall_protocol::TransferId>,
+    next_part_index: u32,
 }
 
 impl BulkRecv {
-    /// Reads framed parts until the stream ends, enforcing both the per-part
-    /// and the assembled-transfer limits. A transfer that would exceed
-    /// `max_assembled_transfer` is refused without buffering the overflow.
-    pub async fn collect_parts(mut self) -> Result<Vec<spall_protocol::BaselinePart>> {
-        let mut parts = Vec::new();
-        let mut assembled = 0usize;
-        let mut transfer = None;
-        let mut next_part_index = 0u32;
-        while let Some(bytes) = read_framed(
+    /// Reads the next framed part, enforcing the per-part and assembled-transfer limits, part
+    /// order, transfer id and part hash. `Ok(None)` when the stream ended cleanly. A transfer that
+    /// would exceed `max_assembled_transfer` is refused without buffering the overflow. Lets a
+    /// receiver process a transfer piece by piece without holding every part.
+    pub async fn next_part(&mut self) -> Result<Option<spall_protocol::BaselinePart>> {
+        let Some(bytes) = read_framed(
             &mut self.stream,
             self.cap + spall_protocol::codec::BULK_FRAME_OVERHEAD,
         )
         .await?
-        {
-            self.stats
-                .app_bytes_recv
-                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            if parts.len() >= spall_protocol::limits::MAX_BASELINE_PARTS {
-                return Err(TransportError::Frame(
-                    crate::framing::FrameError::BulkPartCount {
-                        limit: spall_protocol::limits::MAX_BASELINE_PARTS,
-                    },
-                ));
-            }
-            let part = spall_protocol::decode_bulk(&bytes).map_err(|e| {
-                TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
-            })?;
-            if part.payload.len() > self.cap {
-                return Err(TransportError::Frame(
-                    crate::framing::FrameError::Oversize {
-                        declared: part.payload.len(),
-                        limit: self.cap,
-                    },
-                ));
-            }
-            assembled = assembled.saturating_add(part.payload.len());
-            if assembled > self.assembled_cap {
-                return Err(TransportError::Frame(
-                    crate::framing::FrameError::Oversize {
-                        declared: assembled,
-                        limit: self.assembled_cap,
-                    },
-                ));
-            }
-            if let Some(expected) = transfer {
-                if part.transfer_id != expected {
-                    return Err(TransportError::Frame(
-                        crate::framing::FrameError::TransferMismatch,
-                    ));
-                }
-            } else {
-                transfer = Some(part.transfer_id);
-            }
-            if part.part_index != next_part_index {
-                return Err(TransportError::Frame(
-                    crate::framing::FrameError::PartOrder {
-                        expected: next_part_index,
-                        found: part.part_index,
-                    },
-                ));
-            }
-            if part.part_hash != spall_protocol::Hash32::of(&part.payload) {
-                return Err(TransportError::Frame(
-                    crate::framing::FrameError::PartHashMismatch {
-                        index: part.part_index,
-                    },
-                ));
-            }
-            next_part_index = next_part_index.checked_add(1).ok_or({
-                TransportError::Frame(crate::framing::FrameError::BulkPartCount {
+        else {
+            return Ok(None);
+        };
+        self.stats
+            .app_bytes_recv
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if self.next_part_index as usize >= spall_protocol::limits::MAX_BASELINE_PARTS {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::BulkPartCount {
                     limit: spall_protocol::limits::MAX_BASELINE_PARTS,
-                })
-            })?;
+                },
+            ));
+        }
+        let part = spall_protocol::decode_bulk(&bytes).map_err(|e| {
+            TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
+        })?;
+        if part.payload.len() > self.cap {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::Oversize {
+                    declared: part.payload.len(),
+                    limit: self.cap,
+                },
+            ));
+        }
+        self.assembled = self.assembled.saturating_add(part.payload.len());
+        if self.assembled > self.assembled_cap {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::Oversize {
+                    declared: self.assembled,
+                    limit: self.assembled_cap,
+                },
+            ));
+        }
+        if let Some(expected) = self.transfer {
+            if part.transfer_id != expected {
+                return Err(TransportError::Frame(
+                    crate::framing::FrameError::TransferMismatch,
+                ));
+            }
+        } else {
+            self.transfer = Some(part.transfer_id);
+        }
+        if part.part_index != self.next_part_index {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::PartOrder {
+                    expected: self.next_part_index,
+                    found: part.part_index,
+                },
+            ));
+        }
+        if part.part_hash != spall_protocol::Hash32::of(&part.payload) {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::PartHashMismatch {
+                    index: part.part_index,
+                },
+            ));
+        }
+        self.next_part_index = self.next_part_index.checked_add(1).ok_or({
+            TransportError::Frame(crate::framing::FrameError::BulkPartCount {
+                limit: spall_protocol::limits::MAX_BASELINE_PARTS,
+            })
+        })?;
+        Ok(Some(part))
+    }
+
+    /// Reads framed parts until the stream ends (see [`Self::next_part`] for the checks).
+    pub async fn collect_parts(mut self) -> Result<Vec<spall_protocol::BaselinePart>> {
+        let mut parts = Vec::new();
+        while let Some(part) = self.next_part().await? {
             parts.push(part);
         }
         Ok(parts)
