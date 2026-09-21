@@ -534,6 +534,56 @@ pub struct ServeConfig {
     pub baseline_segment_bytes: Option<usize>,
 }
 
+/// One committed edit on a traced tick: what it was and how much geometry it touched.
+#[derive(Debug, Clone, Serialize)]
+pub struct TickEditRow {
+    pub request: u64,
+    /// `terrain_dig`, `body_cut` or `blast` (a body edit of at least the named-blast radius).
+    pub kind: &'static str,
+    /// The volume the brush hit (the terrain volume for a dig).
+    pub volume: u64,
+    /// Brush radius in cells, when the transaction carries an integer brush.
+    pub radius_cells: Option<i64>,
+    /// Bricks the commit revised (`before` / `after` revision lists).
+    pub bricks_before: usize,
+    pub bricks_after: usize,
+    /// Topology ops in the transaction, and bodies it created.
+    pub ops: usize,
+    pub children: usize,
+    /// It moved the topology epoch (a split) / shipped a bulk baseline.
+    pub split: bool,
+    pub bulk_baseline: bool,
+}
+
+/// One of the slowest measured ticks with the stage spans recorded **on that same tick**.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlowTickRow {
+    pub tick: u64,
+    pub busy_ms: f64,
+    /// Every span recorded that tick (`name`, ms), in completion order; nested spans overlap
+    /// their parents, so these are not additive.
+    pub spans: Vec<(String, f64)>,
+    pub edits: Vec<TickEditRow>,
+    pub bodies_total: usize,
+    pub intents_pending: usize,
+}
+
+/// Tick busy time and mean stage time for one class of tick, from the same ticks.
+#[derive(Debug, Clone, Serialize)]
+pub struct TickClassRow {
+    /// `no_edit`, `terrain_dig`, `body_cut`, `blast`, `giant` or `mixed`.
+    pub class: &'static str,
+    pub ticks: u64,
+    pub busy_p50_ms: f64,
+    pub busy_p95_ms: f64,
+    pub busy_p99_ms: f64,
+    pub busy_max_ms: f64,
+    /// Ticks over the 16.7 ms p99 target.
+    pub over_16_7_ms: u64,
+    /// Mean per-tick span sums over this class's ticks (`stage`, mean ms).
+    pub mean_stage_ms: Vec<(String, f64)>,
+}
+
 /// How the edit pipeline behaved under the offered load. `queue_full_rejections` are the explicit
 /// overload rejections; `pending_max` is the deepest the intent queue got (cap 256 by default);
 /// `retried_conflicts` / `stale_discards` count staged work redone because the world moved;
@@ -937,6 +987,12 @@ pub struct ServeSummary {
     /// Edit-intent admission and pipeline pressure (see [`IntentStats`]).
     #[serde(default)]
     pub intent_stats: IntentStats,
+    /// The slowest measured ticks with their same-tick stage spans and edits (bounded).
+    #[serde(default)]
+    pub slow_ticks: Vec<SlowTickRow>,
+    /// Tick busy time by what the tick committed, with per-class mean stage times.
+    #[serde(default)]
+    pub tick_classes: Vec<TickClassRow>,
     /// Bodies observed below the world floor (see [`OutOfWorldRow`]); empty when none.
     #[serde(default)]
     pub out_of_world_bodies: Vec<OutOfWorldRow>,
@@ -2251,7 +2307,45 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             }
 
             drop(sp_resid);
-            stage_agg.ingest(ticks_run, started.elapsed());
+            let tick_edits: Vec<TickEditRow> = report
+                .committed
+                .iter()
+                .map(|(rid, c)| {
+                    let brush = c.topology.ops.iter().find_map(|op| match op {
+                        spall_protocol::TopologyOp::IntegerBrush { volume, brush, .. } => {
+                            Some((volume.get(), brush.radius_units() / spall_core::BRUSH_UNIT))
+                        }
+                        _ => None,
+                    });
+                    let volume = brush.map_or(0, |b| b.0);
+                    let kind = if volume == terrain_vid.get() {
+                        "terrain_dig"
+                    } else if blast_requests.contains(rid) {
+                        "blast"
+                    } else {
+                        "body_cut"
+                    };
+                    TickEditRow {
+                        request: rid.0,
+                        kind,
+                        volume,
+                        radius_cells: brush.map(|b| b.1),
+                        bricks_before: c.topology.before.len(),
+                        bricks_after: c.topology.after.len(),
+                        ops: c.topology.ops.len(),
+                        children: c.children.len(),
+                        split: c.bumped_epoch,
+                        bulk_baseline: c.bulk_baseline.is_some(),
+                    }
+                })
+                .collect();
+            stage_agg.ingest(
+                ticks_run,
+                started.elapsed(),
+                tick_edits,
+                sim.world().body_count(),
+                report.pending_after,
+            );
             // G4 timing ends after all owning-thread work for this tick,
             // including replication, persistence submission, and residency,
             // but before the optional pacing sleep below. Warmup is explicit;
@@ -2351,9 +2445,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             );
         }
 
+        let (slow_ticks, tick_classes) = stage_agg.traces();
         SimResult {
             terrain_brick_colliders: sim.world().terrain_brick_collider_count() as u64,
             intent_stats: intent_stats.clone(),
+            slow_ticks: slow_ticks.clone(),
+            tick_classes: tick_classes.clone(),
             stage_timings: stage_agg.finish(),
             wake_reasons: sim
                 .world()
@@ -2697,6 +2794,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         wake_reasons: sim_result.wake_reasons.clone(),
         terrain_brick_colliders: sim_result.terrain_brick_colliders,
         intent_stats: sim_result.intent_stats.clone(),
+        slow_ticks: sim_result.slow_ticks.clone(),
+        tick_classes: sim_result.tick_classes.clone(),
         out_of_world_bodies: sim_result.out_of_world.clone(),
         containment_coverage: sim_result.containment_coverage.clone(),
         backlog_series: sim_result.backlog_series.clone(),
@@ -3115,6 +3214,55 @@ pub struct StageTimingRow {
 struct StageAgg {
     window: Option<(u64, u64)>,
     stages: HashMap<&'static str, StageSamples>,
+    /// The slowest measured ticks (bounded), and one compact row per measured tick.
+    slow: Vec<SlowTickRow>,
+    ticks: Vec<TickRow>,
+}
+
+/// Stages summed per tick for the per-class table.
+const CLASS_STAGES: [&str; 14] = [
+    "physics.rapier_step",
+    "physics.pose_extract",
+    "sim.commit",
+    "commit.hash_and_assemble",
+    "commit.clone_apply_edit",
+    "commit.occupancy_extract",
+    "commit.plan_collider",
+    "commit.publish_parent_collider",
+    "commit.build_children",
+    "commit.install_children",
+    "commit.remove_detached",
+    "stage.structure_index_build",
+    "stage.dry_run_and_reclassify",
+    "srv.persistence_submit",
+];
+
+/// Most slow ticks retained, and most spans kept per slow tick.
+const MAX_SLOW_TICKS: usize = 48;
+const MAX_SLOW_TICK_SPANS: usize = 96;
+
+struct TickRow {
+    busy_ms: f32,
+    class: &'static str,
+    stages: [f32; CLASS_STAGES.len()],
+}
+
+/// The class of a tick from the edits it committed.
+fn tick_class(edits: &[TickEditRow]) -> &'static str {
+    let has = |k: &str| edits.iter().any(|e| e.kind == k);
+    let giant = edits.iter().any(|e| e.bulk_baseline);
+    let kinds = [has("terrain_dig"), has("body_cut"), has("blast"), giant]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    match (edits.is_empty(), kinds) {
+        (true, _) => "no_edit",
+        (false, 1) if giant => "giant",
+        (false, 1) if has("terrain_dig") => "terrain_dig",
+        (false, 1) if has("blast") => "blast",
+        (false, 1) => "body_cut",
+        _ => "mixed",
+    }
 }
 
 #[derive(Default)]
@@ -3131,17 +3279,63 @@ impl StageAgg {
         Self {
             window: window.map(|w| (w.warmup_ticks, w.warmup_ticks + w.measured_ticks)),
             stages: HashMap::new(),
+            slow: Vec::new(),
+            ticks: Vec::new(),
         }
     }
 
     /// Drains this thread's spans for `tick` and folds them in, plus the tick's
     /// total owning-thread busy time under `srv.tick_busy`.
-    fn ingest(&mut self, tick: u64, busy: Duration) {
+    fn ingest(
+        &mut self,
+        tick: u64,
+        busy: Duration,
+        edits: Vec<TickEditRow>,
+        bodies_total: usize,
+        intents_pending: usize,
+    ) {
         let spans = spall_sim::prof::drain();
         if let Some((lo, hi)) = self.window
             && (tick <= lo || tick > hi)
         {
             return;
+        }
+        // Same-tick attribution: keep this tick's raw spans and edits together.
+        let busy_ms = busy.as_secs_f64() * 1000.0;
+        let mut row = TickRow {
+            busy_ms: busy_ms as f32,
+            class: tick_class(&edits),
+            stages: [0.0; CLASS_STAGES.len()],
+        };
+        for (name, d) in &spans {
+            if let Some(i) = CLASS_STAGES.iter().position(|s| s == name) {
+                row.stages[i] += (d.as_secs_f64() * 1000.0) as f32;
+            }
+        }
+        self.ticks.push(row);
+        let admit = self.slow.len() < MAX_SLOW_TICKS
+            || self.slow.last().is_some_and(|w| busy_ms > w.busy_ms);
+        if admit {
+            let mut kept: Vec<(String, f64)> = spans
+                .iter()
+                .take(MAX_SLOW_TICK_SPANS)
+                .map(|(n, d)| ((*n).to_string(), d.as_secs_f64() * 1000.0))
+                .collect();
+            kept.shrink_to_fit();
+            self.slow.push(SlowTickRow {
+                tick,
+                busy_ms,
+                spans: kept,
+                edits,
+                bodies_total,
+                intents_pending,
+            });
+            self.slow.sort_by(|a, b| {
+                b.busy_ms
+                    .partial_cmp(&a.busy_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            self.slow.truncate(MAX_SLOW_TICKS);
         }
         let mut per_tick: HashMap<&'static str, f32> = HashMap::new();
         for (name, d) in spans
@@ -3161,6 +3355,49 @@ impl StageAgg {
                 s.per_tick.push((tick, ms));
             }
         }
+    }
+
+    /// The retained slow ticks and the per-class breakdown (call before [`Self::finish`]).
+    fn traces(&self) -> (Vec<SlowTickRow>, Vec<TickClassRow>) {
+        let mut classes: Vec<TickClassRow> = Vec::new();
+        for class in [
+            "no_edit",
+            "terrain_dig",
+            "body_cut",
+            "blast",
+            "giant",
+            "mixed",
+        ] {
+            let rows: Vec<&TickRow> = self.ticks.iter().filter(|t| t.class == class).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let mut busy: Vec<f64> = rows.iter().map(|t| f64::from(t.busy_ms)).collect();
+            busy.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let q = |p: f64| {
+                let rank = ((p * busy.len() as f64).ceil() as usize).clamp(1, busy.len());
+                busy[rank - 1]
+            };
+            let mean_stage_ms = CLASS_STAGES
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let sum: f64 = rows.iter().map(|t| f64::from(t.stages[i])).sum();
+                    ((*name).to_string(), sum / rows.len() as f64)
+                })
+                .collect();
+            classes.push(TickClassRow {
+                class,
+                ticks: rows.len() as u64,
+                busy_p50_ms: q(0.50),
+                busy_p95_ms: q(0.95),
+                busy_p99_ms: q(0.99),
+                busy_max_ms: *busy.last().unwrap_or(&0.0),
+                over_16_7_ms: busy.iter().filter(|b| **b > 16.7).count() as u64,
+                mean_stage_ms,
+            });
+        }
+        (self.slow.clone(), classes)
     }
 
     fn finish(self) -> Vec<StageTimingRow> {
@@ -3292,6 +3529,8 @@ struct SimResult {
     wake_reasons: Vec<WakeReasonRow>,
     terrain_brick_colliders: u64,
     intent_stats: IntentStats,
+    slow_ticks: Vec<SlowTickRow>,
+    tick_classes: Vec<TickClassRow>,
     stage_timings: Vec<StageTimingRow>,
     samples: Vec<TelemetrySample>,
     blast_commit_ticks: Vec<u64>,
@@ -3363,6 +3602,8 @@ impl SimResult {
             wake_reasons: Vec::new(),
             terrain_brick_colliders: 0,
             intent_stats: IntentStats::default(),
+            slow_ticks: Vec::new(),
+            tick_classes: Vec::new(),
             samples: Vec::new(),
             blast_commit_ticks: Vec::new(),
             blast_commit_elapsed_ms: Vec::new(),
