@@ -357,7 +357,11 @@ fn run_replication(args: Args) -> ExitCode {
                 max_dense_bytes: args.residency_budget_dense_bytes.unwrap_or(u64::MAX),
             },
         ),
-        baseline_staging_budget_bytes: args.baseline_staging_budget_bytes,
+        // Production clients always carry an explicit admission budget.
+        baseline_staging_budget_bytes: Some(
+            args.baseline_staging_budget_bytes
+                .unwrap_or(spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES),
+        ),
         on_replica_ready: None,
         interactive: None,
     };

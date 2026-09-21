@@ -13,6 +13,52 @@ use spall_protocol::segment::{
 
 use crate::replica::StagedBaseline;
 
+/// What the client will let a baseline cost: the existing replica plus the staged world, its
+/// installation overhead and the temporary segment buffers, against one explicit budget.
+///
+/// The existing replica counts because a client that already holds a world keeps it until the
+/// atomic swap (old + staged coexist); the overhead factor covers the staged bricks being a little
+/// larger than the sum of their decoded costs (measured 769 MiB staged against 754 MiB declared,
+/// 1.02x; 1.10x is budgeted); the temporary term is four segment budgets (measured peak is about
+/// 0.75 of one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagingAdmission {
+    /// Total bytes the client permits itself for holding + building the baseline.
+    pub budget_bytes: u64,
+    /// Decoded bytes the current replica already holds ([`crate::ReplicaWorld::decoded_bytes_estimate`]).
+    pub existing_replica_bytes: u64,
+}
+
+/// The default production budget: the client memory target in `docs/validation.md` (4 GiB,
+/// excluding driver allocations).
+pub const DEFAULT_CLIENT_BASELINE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+impl StagingAdmission {
+    /// Bytes admitting `manifest` would need: existing replica + staged world x 1.10 + four
+    /// segment budgets of temporary buffers.
+    pub fn required_bytes(&self, manifest: &SegmentManifest) -> u64 {
+        self.existing_replica_bytes
+            + manifest.total_decoded_bytes / 10 * 11
+            + 4 * u64::from(manifest.segment_decoded_cap)
+    }
+
+    /// Admits or refuses `manifest` before any segment is decoded.
+    pub fn check(&self, manifest: &SegmentManifest) -> Result<(), String> {
+        let need = self.required_bytes(manifest);
+        if need > self.budget_bytes {
+            return Err(format!(
+                "baseline needs {need} bytes ({} staged x1.10 + {} existing replica + 4 x {} segment buffers) \
+                 but the client budget is {} bytes",
+                manifest.total_decoded_bytes,
+                self.existing_replica_bytes,
+                manifest.segment_decoded_cap,
+                self.budget_bytes
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A verified, fully staged segmented baseline.
 pub struct SegmentedReceipt {
     pub staged: StagedBaseline,
@@ -34,22 +80,44 @@ pub struct SegmentedReceiver {
     validator: Option<SequenceValidator>,
     staged: StagedBaseline,
     raw_hashes: Vec<Hash32>,
-    staging_budget: Option<u64>,
+    admission: Option<StagingAdmission>,
+    /// Compressed bytes accepted so far, and the ceilings they are held to.
+    received: u64,
+    max_compressed: u64,
     max_segment_decoded: u64,
     max_buffered: usize,
 }
 
 impl SegmentedReceiver {
-    /// `checkpoint_tick` comes from `BaselineBegin`; `staging_budget` caps the manifest's declared
-    /// decoded bytes (checked before any segment is decoded).
-    pub fn new(checkpoint_tick: u64, staging_budget: Option<u64>) -> Self {
+    /// `checkpoint_tick` comes from `BaselineBegin`; `admission` is checked against the manifest
+    /// before any segment is decoded. The cumulative compressed bytes are held to the protocol's
+    /// [`spall_protocol::limits::MAX_ASSEMBLED_TRANSFER`].
+    pub fn new(checkpoint_tick: u64, admission: Option<StagingAdmission>) -> Self {
+        Self::with_limits(
+            checkpoint_tick,
+            admission,
+            spall_protocol::limits::MAX_ASSEMBLED_TRANSFER as u64,
+        )
+    }
+
+    /// Like [`Self::new`] with an explicit ceiling on the cumulative **compressed** bytes (the
+    /// smaller of the protocol cap and the `BaselineBegin.total_bytes` the server declared).
+    /// Enforced before a payload is buffered, so an over-long or poorly compressible transfer is
+    /// refused without growing any buffer past it.
+    pub fn with_limits(
+        checkpoint_tick: u64,
+        admission: Option<StagingAdmission>,
+        max_compressed: u64,
+    ) -> Self {
         Self {
             reader: FrameReader::new(),
             manifest_body: None,
             validator: None,
             staged: StagedBaseline::new(checkpoint_tick),
             raw_hashes: Vec::new(),
-            staging_budget,
+            admission,
+            received: 0,
+            max_compressed,
             max_segment_decoded: 0,
             max_buffered: 0,
         }
@@ -63,19 +131,22 @@ impl SegmentedReceiver {
     /// Feeds the next part's payload. Returns a reason naming the segment on any failure; the
     /// receiver must then be dropped (the replica has not been touched).
     pub fn push(&mut self, payload: &[u8]) -> Result<(), String> {
+        // The cumulative compressed cap is checked *before* the bytes are buffered.
+        self.received = self.received.saturating_add(payload.len() as u64);
+        if self.received > self.max_compressed {
+            return Err(format!(
+                "the transfer exceeds its {} byte compressed cap ({} bytes received)",
+                self.max_compressed, self.received
+            ));
+        }
         self.reader.push(payload);
         self.max_buffered = self.max_buffered.max(self.reader.buffered());
         while let Some(frame) = self.reader.next_frame().map_err(|e| e.to_string())? {
             match (frame, self.validator.as_mut()) {
                 (Frame::Manifest(body), None) => {
                     let m = segment::decode_manifest(&body).map_err(|e| e.to_string())?;
-                    if let Some(budget) = self.staging_budget
-                        && m.total_decoded_bytes > budget
-                    {
-                        return Err(format!(
-                            "baseline needs {} decoded bytes of staging, the client budget is {budget}",
-                            m.total_decoded_bytes
-                        ));
+                    if let Some(adm) = &self.admission {
+                        adm.check(&m)?;
                     }
                     self.reader
                         .set_max_body(segment::segment_frame_cap(m.segment_decoded_cap as usize));

@@ -955,7 +955,9 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         summary_json: Some(dir.join("cutter.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
-        baseline_staging_budget_bytes: None,
+        baseline_staging_budget_bytes: Some(
+            spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
+        ),
         on_replica_ready: None,
         interactive: None,
     };
@@ -983,7 +985,9 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         summary_json: Some(dir.join("observer.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
-        baseline_staging_budget_bytes: None,
+        baseline_staging_budget_bytes: Some(
+            spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
+        ),
         on_replica_ready: Some(Arc::new(move |r| {
             *replica_slot_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         })),

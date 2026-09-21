@@ -493,6 +493,17 @@ impl ReplicaWorld {
         self.install_staged(staged)
     }
 
+    /// Decoded bytes the replica's terrain and bodies hold, counting every resident brick as a
+    /// dense one (conservative). Used to admit a replacement baseline, which coexists with the
+    /// current world until the atomic swap.
+    pub fn decoded_bytes_estimate(&self) -> u64 {
+        self.volumes
+            .values()
+            .map(|v| v.resident_brick_count() as u64)
+            .sum::<u64>()
+            * spall_protocol::segment::DENSE_BRICK_DECODED_COST as u64
+    }
+
     /// Installs a fully staged baseline atomically: the same swap `install_baseline_world`
     /// performs, for a world built segment by segment. The previous state is untouched until this
     /// call, and a staged world with no terrain or an open volume is refused.

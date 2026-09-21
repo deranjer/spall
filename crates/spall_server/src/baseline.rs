@@ -401,6 +401,26 @@ pub fn transfer_from_snapshot_segmented(
     interest_epoch: InterestEpoch,
     decoded_cap: usize,
 ) -> Result<BaselineTransfer, BaselineError> {
+    transfer_from_snapshot_segmented_limited(
+        snapshot,
+        transfer_id,
+        interest_epoch,
+        decoded_cap,
+        limits::MAX_ASSEMBLED_TRANSFER,
+    )
+}
+
+/// [`transfer_from_snapshot_segmented`] with an explicit ceiling on the cumulative **compressed**
+/// transfer. The ceiling is enforced as each frame is produced, **before** it is appended to the
+/// retained payload, so a poorly compressible world fails at the first frame that would cross it
+/// instead of growing the buffer to the end and checking afterwards.
+pub fn transfer_from_snapshot_segmented_limited(
+    snapshot: BaselineSnapshot,
+    transfer_id: TransferId,
+    interest_epoch: InterestEpoch,
+    decoded_cap: usize,
+    max_compressed: usize,
+) -> Result<BaselineTransfer, BaselineError> {
     if !(segment::DENSE_BRICK_DECODED_COST..=segment::MAX_SEGMENT_DECODED_BYTES)
         .contains(&decoded_cap)
     {
@@ -446,6 +466,13 @@ pub fn transfer_from_snapshot_segmented(
                 frame.bytes.len(),
                 segment::segment_frame_cap(decoded_cap)
             )));
+        }
+        // The manifest frame (a few dozen bytes) is prepended later; reserve its ceiling.
+        if payload.len() + frame.bytes.len() + 5 + segment::MAX_MANIFEST_BODY > max_compressed {
+            return Err(BaselineError::TooLarge {
+                bytes: payload.len() + frame.bytes.len(),
+                cap: max_compressed,
+            });
         }
         payload.extend_from_slice(&frame.bytes);
         raw_hashes.push(frame.raw_hash);
@@ -540,10 +567,10 @@ pub fn transfer_from_snapshot_segmented(
     framed.extend_from_slice(&payload);
     drop(payload);
 
-    if framed.len() > limits::MAX_ASSEMBLED_TRANSFER {
+    if framed.len() > max_compressed {
         return Err(BaselineError::TooLarge {
             bytes: framed.len(),
-            cap: limits::MAX_ASSEMBLED_TRANSFER,
+            cap: max_compressed,
         });
     }
     let parts: Arc<[BaselinePart]> = chunk_payload(&framed, transfer_id).into();

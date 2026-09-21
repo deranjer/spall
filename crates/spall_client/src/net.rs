@@ -43,7 +43,7 @@ use crate::interactive::{InteractiveSession, InteractiveView};
 use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer, WindowStats};
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
 use crate::residency::ClientResidencyPass;
-use crate::segmented::{SegmentedReceipt, SegmentedReceiver};
+use crate::segmented::{SegmentedReceipt, SegmentedReceiver, StagingAdmission};
 use crate::tick_accumulator::TickAccumulator;
 
 /// One leg of a scripted movement path: hold `input` from tick `from` up to (not
@@ -743,12 +743,27 @@ async fn receive_segmented_baseline(
     conn: &Connection,
     begin: &spall_protocol::BaselineBegin,
     staging_budget: Option<u64>,
+    replica: &Mutex<ReplicaWorld>,
 ) -> Result<SegmentedReceipt, String> {
+    // The current replica coexists with the staged world until the atomic swap, so it counts.
+    let admission = staging_budget.map(|budget_bytes| StagingAdmission {
+        budget_bytes,
+        existing_replica_bytes: replica
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .decoded_bytes_estimate(),
+    });
     let mut bulk = conn
         .accept_bulk()
         .await
         .map_err(|e| format!("baseline bulk stream: {e}"))?;
-    let mut receiver = SegmentedReceiver::new(begin.checkpoint_tick.get(), staging_budget);
+    let mut receiver = SegmentedReceiver::with_limits(
+        begin.checkpoint_tick.get(),
+        admission,
+        begin
+            .total_bytes
+            .min(spall_protocol::limits::MAX_ASSEMBLED_TRANSFER as u64),
+    );
     while let Some(part) = bulk
         .next_part()
         .await
@@ -818,7 +833,7 @@ async fn perform_late_join(
         begin.transfer_id.0, begin.total_bytes
     ));
     if begin.world_version == spall_protocol::segment::BASELINE_SEGMENTED_WORLD_VERSION {
-        let receipt = receive_segmented_baseline(conn, &begin, staging_budget)
+        let receipt = receive_segmented_baseline(conn, &begin, staging_budget, replica)
             .await
             .map_err(|e| ClientNetError::Baseline(format!("segmented baseline: {e}")))?;
         counters
@@ -1206,7 +1221,14 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             == spall_protocol::segment::BASELINE_SEGMENTED_WORLD_VERSION
                             && !is_split
                         {
-                            match receive_segmented_baseline(&conn, &begin, staging_budget).await {
+                            match receive_segmented_baseline(
+                                &conn,
+                                &begin,
+                                staging_budget,
+                                &replica,
+                            )
+                            .await
+                            {
                                 Ok(receipt) => {
                                     let installed = {
                                         let mut guard =

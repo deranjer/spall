@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use glam::DQuat;
-use spall_client::segmented::SegmentedReceiver;
+use spall_client::segmented::{SegmentedReceiver, StagingAdmission};
 use spall_client::{ReplicaConfig, ReplicaWorld};
 use spall_protocol::segment::{
     DENSE_BRICK_DECODED_COST, Frame, FrameReader, MAX_SEGMENT_DECODED_BYTES, segment_frame_cap,
@@ -64,7 +64,13 @@ fn receive(
     frames: &[Vec<u8>],
     budget: Option<u64>,
 ) -> Result<spall_client::segmented::SegmentedReceipt, String> {
-    let mut rx = SegmentedReceiver::new(0, budget);
+    let mut rx = SegmentedReceiver::new(
+        0,
+        budget.map(|budget_bytes| StagingAdmission {
+            budget_bytes,
+            existing_replica_bytes: 0,
+        }),
+    );
     let wire: Vec<u8> = frames.concat();
     for piece in wire.chunks(700) {
         rx.push(piece)?;
@@ -206,18 +212,149 @@ fn a_missing_manifest_a_corrupt_hash_and_a_lying_length_are_refused() {
 }
 
 #[test]
-fn a_manifest_over_the_client_budget_is_refused_before_any_segment_is_decoded() {
+fn admission_counts_the_staged_world_the_existing_replica_and_the_segment_buffers() {
     let sim = world(2);
     let t = segmented(&sim);
     let all = frames(&t.parts);
     let stats = t.segments.unwrap();
+    let mut rx = SegmentedReceiver::new(0, None);
+    rx.push(&all[0]).unwrap();
+    let m = rx.manifest().unwrap().clone();
+    let adm = |budget_bytes, existing_replica_bytes| StagingAdmission {
+        budget_bytes,
+        existing_replica_bytes,
+    };
+    let need = adm(0, 0).required_bytes(&m);
+    // staged x1.10 + four segment buffers, and nothing less.
+    assert_eq!(
+        need,
+        stats.decoded_bytes / 10 * 11 + 4 * u64::from(m.segment_decoded_cap)
+    );
+    assert!(
+        need > stats.decoded_bytes,
+        "installation overhead is budgeted"
+    );
+
     // Only the manifest frame is fed: the refusal must not need a single segment.
-    let mut rx = SegmentedReceiver::new(0, Some(stats.decoded_bytes - 1));
+    let mut rx = SegmentedReceiver::new(0, Some(adm(need - 1, 0)));
     let e = rx.push(&all[0]).unwrap_err();
     assert!(e.contains("budget"), "{e}");
     assert!(rx.manifest().is_none());
-    // The exact budget is accepted.
-    receive(&all, Some(stats.decoded_bytes)).expect("a sufficient budget passes");
+    // The exact requirement is admitted...
+    receive(&all, Some(need)).expect("a sufficient budget passes");
+    // ...but the same budget no longer admits it once the client already holds a world: the old
+    // replica stays until the atomic swap.
+    let mut rx = SegmentedReceiver::new(0, Some(adm(need, 1)));
+    let e = rx.push(&all[0]).unwrap_err();
+    assert!(e.contains("existing replica"), "{e}");
+}
+
+#[test]
+fn the_replicas_own_footprint_is_what_admission_charges() {
+    let sim = world(3);
+    let mut replica = ReplicaWorld::empty(ReplicaConfig::default());
+    assert_eq!(replica.decoded_bytes_estimate(), 0);
+    replica
+        .install_baseline_world(
+            &transfer_from_snapshot(snapshot_world(&sim, None), TransferId(1), InterestEpoch(1))
+                .unwrap()
+                .decode_v1_world()
+                .unwrap(),
+        )
+        .unwrap();
+    let est = replica.decoded_bytes_estimate();
+    let bricks: usize = 84 + 3;
+    assert!(est >= bricks as u64 * DENSE_BRICK_DECODED_COST as u64);
+}
+
+/// A world whose cells look random: zstd cannot shrink one bit of entropy per cell below an eighth
+/// of the decoded size, so the compressed transfer is a large fraction of the decoded one.
+fn incompressible_world() -> Simulation {
+    let mut setup = fixtures::flat_terrain_setup();
+    let id = setup.terrain.id();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut edit = spall_voxel::EditPlan::new(id);
+    for cz in 0..128 {
+        for cy in 0..32 {
+            for cx in 0..128 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let m = if x & 1 == 0 {
+                    fixtures::STONE
+                } else {
+                    spall_core::MaterialId(2)
+                };
+                edit.set(spall_core::GlobalCell::new(cx, cy, cz), m);
+            }
+        }
+    }
+    setup.terrain.apply_edit(&edit).unwrap();
+    setup.terrain_collider_region = (
+        spall_core::GlobalCell::new(0, 0, 0),
+        spall_core::GlobalCell::new(127, 31, 127),
+    );
+    Simulation::new(SimulationConfig::new(setup)).unwrap()
+}
+
+#[test]
+fn a_poorly_compressible_world_is_refused_at_the_cumulative_cap_before_the_buffer_grows() {
+    let sim = incompressible_world();
+    let unlimited = transfer_from_snapshot_segmented(
+        snapshot_world(&sim, None),
+        TransferId(1),
+        InterestEpoch(1),
+        CAP,
+    )
+    .unwrap();
+    let full = unlimited.payload_bytes();
+    let stats = unlimited.segments.unwrap();
+    assert!(
+        full > 50_000 && (full as u64) * 16 > stats.decoded_bytes,
+        "random cells barely compress: {full} wire bytes for {} decoded",
+        stats.decoded_bytes
+    );
+
+    // Server: a small cumulative cap fails at the first frame that would cross it, and the error
+    // reports a size no larger than that frame's end -- not the whole transfer.
+    let cap = full / 3;
+    let err = spall_server::baseline::transfer_from_snapshot_segmented_limited(
+        snapshot_world(&sim, None),
+        TransferId(2),
+        InterestEpoch(1),
+        CAP,
+        cap,
+    )
+    .expect_err("over the cumulative cap");
+    match err {
+        BaselineError::TooLarge { bytes, cap: c } => {
+            assert_eq!(c, cap);
+            assert!(
+                bytes < full,
+                "stopped before the whole transfer was buffered ({bytes} of {full})"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Client: the same payload fed to a receiver with the smaller cap is refused before the
+    // over-cap bytes are buffered.
+    let parts = &unlimited.parts;
+    let mut rx = SegmentedReceiver::with_limits(0, None, cap as u64);
+    let mut refused_at = None;
+    for (i, p) in parts.iter().enumerate() {
+        if let Err(e) = rx.push(&p.payload) {
+            assert!(e.contains("compressed cap"), "{e}");
+            refused_at = Some(i);
+            break;
+        }
+    }
+    let i = refused_at.expect("the receiver refuses once the cap is crossed");
+    let accepted: usize = parts[..i].iter().map(|p| p.payload.len()).sum();
+    assert!(
+        accepted <= cap,
+        "only bytes within the cap were ever accepted"
+    );
 }
 
 #[test]
