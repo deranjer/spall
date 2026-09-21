@@ -1859,6 +1859,9 @@ fn rubble_transitions() {
     let mut tick_class: Vec<u8> = Vec::with_capacity(ticks as usize);
     // asleep -> awake transitions of all rubble, by what that tick committed.
     let mut wakes_by_class = [0u64; 4];
+    // Time-averaged awake rubble per 1,800-tick window (every tick counted, so no phase bias).
+    let (mut win_awake, mut win_total) = (0u64, 0u64);
+    let mut avg_by_window: Vec<(u64, f64, f64)> = Vec::new();
 
     for t in 0..ticks {
         workload_step(&mut sim, t, &mut counters);
@@ -1961,8 +1964,13 @@ fn rubble_transitions() {
                 }
             }
         }
+        win_awake += awake_rubble;
+        win_total += total_rubble;
         if now % 1_800 == 0 {
             awake_by_tick_bucket.push((now, awake_rubble, total_rubble));
+            avg_by_window.push((now, win_awake as f64 / 1_800.0, win_total as f64 / 1_800.0));
+            win_awake = 0;
+            win_total = 0;
         }
     }
     let end = ticks;
@@ -1979,7 +1987,16 @@ fn rubble_transitions() {
     println!(
         "dormancy over the run: deactivations {deact}, reactivations by terrain edit {react_hard}, by proximity {react_prox}"
     );
-    println!("awake rubble / rubble bodies every 1,800 ticks: {awake_by_tick_bucket:?}");
+    println!(
+        "awake rubble / rubble bodies sampled at tick multiples of 1,800 (phase-aligned with the dig cycle; do not read as awake time): {awake_by_tick_bucket:?}"
+    );
+    println!("time-averaged awake rubble / total rubble per 1,800-tick window (every tick):");
+    for (t, a, n) in &avg_by_window {
+        println!(
+            "  to tick {t:5}: awake {a:7.1} of {n:7.1} ({:.0}%)",
+            100.0 * a / n.max(1.0)
+        );
+    }
     let n_class = |k: u8| tick_class.iter().filter(|c| **c == k).count() as u64;
     println!(
         "asleep->awake transitions of all rubble by what the tick committed: nothing {} over {} ticks, terrain dig {} over {} ticks ({:.0} per dig tick), body edit {} over {} ticks, both {}",

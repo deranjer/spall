@@ -534,6 +534,23 @@ pub struct ServeConfig {
     pub baseline_segment_bytes: Option<usize>,
 }
 
+/// Body-state census at a **phase-jittered** tick. The workload digs terrain every 60 ticks and a
+/// dig wakes what rests on it, so a census that always lands on the same tick of that cycle (the
+/// per-60-tick telemetry does) reads a fixed phase of the wake / re-sleep cycle. These samples fall
+/// at `30k + (11k mod 30)`, sweeping every phase, so their mean is an unbiased awake-body time.
+#[derive(Debug, Clone, Serialize)]
+pub struct AwakeSampleRow {
+    pub tick: u64,
+    /// Dynamic bodies not asleep and not dormant.
+    pub awake: u32,
+    /// Asleep in the solver but still stepped (not dormant).
+    pub asleep: u32,
+    pub dormant: u32,
+}
+
+/// Most awake samples kept (one per ~30 ticks; 4,096 covers over 34 simulated minutes).
+const MAX_AWAKE_SAMPLES: usize = 4_096;
+
 /// One committed edit on a traced tick: what it was and how much geometry it touched.
 #[derive(Debug, Clone, Serialize)]
 pub struct TickEditRow {
@@ -1036,6 +1053,9 @@ pub struct ServeSummary {
     /// Per-minute tick cost windows (bounded: one row per 3,600 measured ticks).
     #[serde(default)]
     pub tick_windows: Vec<TickWindowRow>,
+    /// Phase-jittered body-state census (about every 30 ticks).
+    #[serde(default)]
+    pub awake_series: Vec<AwakeSampleRow>,
     /// Bodies observed below the world floor (see [`OutOfWorldRow`]); empty when none.
     #[serde(default)]
     pub out_of_world_bodies: Vec<OutOfWorldRow>,
@@ -1837,6 +1857,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut actions_requested = 0u64;
         let mut actions_staged = 0u64;
         let mut ledger = crate::admission::AdmissionLedger::new();
+        let mut awake_series: Vec<AwakeSampleRow> = Vec::new();
+        let (mut awake_k, mut next_awake_sample) = (0u64, 0u64);
         // The session that staged each still-pending request, so the tick-report
         // outcome (`action_statuses`) can be routed back to only that client
         // instead of every connected client.
@@ -2089,6 +2111,29 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
             };
             ticks_run += 1;
+            if ticks_run >= next_awake_sample {
+                // One O(bodies) scan per ~30 ticks (about 50 us at 17k bodies).
+                let (mut awake, mut asleep, mut dormant) = (0u32, 0u32, 0u32);
+                for b in sim.world().bodies() {
+                    if b.dormant {
+                        dormant += 1;
+                    } else if b.sleeping {
+                        asleep += 1;
+                    } else {
+                        awake += 1;
+                    }
+                }
+                if awake_series.len() < MAX_AWAKE_SAMPLES {
+                    awake_series.push(AwakeSampleRow {
+                        tick: ticks_run,
+                        awake,
+                        asleep,
+                        dormant,
+                    });
+                }
+                awake_k += 1;
+                next_awake_sample = 30 * awake_k + (11 * awake_k) % 30;
+            }
             intent_stats.ticks += 1;
             intent_stats.pending_max = intent_stats.pending_max.max(report.pending_after as u64);
             intent_stats.pending_depth_sum += report.pending_after as u64;
@@ -2519,6 +2564,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             slow_ticks: slow_ticks.clone(),
             tick_classes: tick_classes.clone(),
             tick_windows: tick_windows.clone(),
+            awake_series: awake_series.clone(),
             stage_timings: stage_agg.finish(),
             wake_reasons: sim
                 .world()
@@ -2867,6 +2913,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         slow_ticks: sim_result.slow_ticks.clone(),
         tick_classes: sim_result.tick_classes.clone(),
         tick_windows: sim_result.tick_windows.clone(),
+        awake_series: sim_result.awake_series.clone(),
         out_of_world_bodies: sim_result.out_of_world.clone(),
         containment_coverage: sim_result.containment_coverage.clone(),
         backlog_series: sim_result.backlog_series.clone(),
@@ -3684,6 +3731,7 @@ struct SimResult {
     slow_ticks: Vec<SlowTickRow>,
     tick_classes: Vec<TickClassRow>,
     tick_windows: Vec<TickWindowRow>,
+    awake_series: Vec<AwakeSampleRow>,
     stage_timings: Vec<StageTimingRow>,
     samples: Vec<TelemetrySample>,
     blast_commit_ticks: Vec<u64>,
@@ -3759,6 +3807,7 @@ impl SimResult {
             slow_ticks: Vec::new(),
             tick_classes: Vec::new(),
             tick_windows: Vec::new(),
+            awake_series: Vec::new(),
             samples: Vec::new(),
             blast_commit_ticks: Vec::new(),
             blast_commit_elapsed_ms: Vec::new(),
