@@ -6,6 +6,7 @@
 //! accepts clients, and broadcasts committed topology transactions plus 20 Hz
 //! motion snapshots.
 
+pub mod admission;
 pub mod baseline;
 pub mod commit_latency;
 pub mod disk_backing;

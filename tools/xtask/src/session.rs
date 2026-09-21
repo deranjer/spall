@@ -1051,6 +1051,8 @@ struct ServerSummary {
     #[serde(default)]
     actions_queued_unresolved: u64,
     #[serde(default)]
+    admission: Option<g4::AdmissionFacts>,
+    #[serde(default)]
     single_brick_commit_p95_ms: f64,
     #[serde(default)]
     single_brick_commit_samples: u64,
@@ -1339,7 +1341,11 @@ struct AdmissionRow {
     actions_requested: u64,
     actions_rejected: u64,
     actions_staged: u64,
+    /// Admitted requests still awaiting an outcome at the end (a terminally rejected request is
+    /// not counted here).
     actions_queued_unresolved: u64,
+    /// Attempts vs unique logical edits vs terminal outcomes (from the server's ledger).
+    ledger: Option<g4::AdmissionFacts>,
     transactions_committed: u64,
     single_brick_commit_p95_ms: f64,
     single_brick_commit_samples: u64,
@@ -1398,6 +1404,7 @@ impl AdmissionRow {
     /// All-zero row for a run that produced no server summary.
     fn empty() -> Self {
         Self {
+            ledger: None,
             actions_requested: 0,
             actions_rejected: 0,
             actions_staged: 0,
@@ -3075,6 +3082,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             facts.actions_staged = server.actions_staged;
             facts.actions_rejected = server.actions_rejected;
             facts.actions_queued_unresolved = server.actions_queued_unresolved;
+            facts.admission = server.admission.clone();
             facts.transactions_committed = server.transactions_committed;
             g4::evaluate(
                 &cfg,
@@ -3089,6 +3097,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         requirements_met = false;
     }
     let admission = AdmissionRow {
+        ledger: server.admission.clone(),
         actions_requested: server.actions_requested,
         actions_rejected: server.actions_rejected,
         actions_staged: server.actions_staged,

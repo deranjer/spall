@@ -50,6 +50,41 @@ pub struct BaselineSend {
     pub duration_ms: u64,
 }
 
+/// The server's admission ledger (`spall_server::admission::AdmissionSummary`), as serialised.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdmissionFacts {
+    #[serde(default)]
+    pub attempts: u64,
+    #[serde(default)]
+    pub unique_requests: u64,
+    #[serde(default)]
+    pub duplicates_replayed: u64,
+    #[serde(default)]
+    pub admitted: u64,
+    #[serde(default)]
+    pub committed: u64,
+    #[serde(default)]
+    pub rejected_after_admission: u64,
+    #[serde(default)]
+    pub pending_at_end: u64,
+    #[serde(default)]
+    pub refused_throttled: u64,
+    #[serde(default)]
+    pub refused_queue_full: u64,
+    #[serde(default)]
+    pub refused_invalid: u64,
+    #[serde(default)]
+    pub logical_committed: u64,
+    #[serde(default)]
+    pub logical_pending: u64,
+    #[serde(default)]
+    pub logical_rejected_after_admission: u64,
+    #[serde(default)]
+    pub logical_never_admitted: u64,
+    #[serde(default)]
+    pub ledger_saturated: bool,
+}
+
 /// The G4 fields of the server summary, flattened into `ServerSummary`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct G4ServerFacts {
@@ -73,6 +108,10 @@ pub struct G4ServerFacts {
     pub actions_rejected: u64,
     #[serde(default)]
     pub actions_queued_unresolved: u64,
+    /// The server's admission ledger (attempts vs unique logical edits vs terminal outcomes); when
+    /// present the workload-completion check is judged on unique logical edits.
+    #[serde(default)]
+    pub admission: Option<AdmissionFacts>,
     #[serde(default)]
     pub transactions_committed: u64,
     #[serde(default)]
@@ -899,22 +938,48 @@ pub fn evaluate(
             cfg.min_rubble_fraction, cfg.expected_ordinary_edits
         ),
     );
-    add(
-        "workload completed: every requested edit committed, none rejected or left unresolved",
-        facts.actions_requested > 0
-            && facts.actions_rejected == 0
-            && facts.actions_queued_unresolved == 0
-            && facts.transactions_committed == facts.actions_requested,
-        format!(
-            "{} requested, {} staged, {} committed, {} rejected, {} unresolved (convergence of the committed work is checked separately)",
-            facts.actions_requested,
-            facts.actions_staged,
-            facts.transactions_committed,
-            facts.actions_rejected,
-            facts.actions_queued_unresolved
+    match facts
+        .admission
+        .as_ref()
+        .filter(|a| !a.ledger_saturated && a.unique_requests > 0)
+    {
+        // Judged on unique logical edits: a retried attempt is not a second edit, and an edit that
+        // was refused once but committed on a retry is complete.
+        Some(a) => add(
+            "workload completed: every requested edit committed, none rejected or left unresolved",
+            a.logical_committed == a.unique_requests,
+            format!(
+                "{} unique edits requested in {} attempts (retries and duplicates {}): {} committed, {} rejected after admission, {} never admitted (refused: {} throttled, {} queue-full, {} invalid attempts), {} pending at end (convergence of the committed work is checked separately)",
+                a.unique_requests,
+                a.attempts,
+                a.attempts.saturating_sub(a.unique_requests),
+                a.logical_committed,
+                a.logical_rejected_after_admission,
+                a.logical_never_admitted,
+                a.refused_throttled,
+                a.refused_queue_full,
+                a.refused_invalid,
+                a.logical_pending
+            ),
+            "every unique edit committed".to_string(),
         ),
-        "committed == requested, 0 rejected, 0 unresolved".to_string(),
-    );
+        None => add(
+            "workload completed: every requested edit committed, none rejected or left unresolved",
+            facts.actions_requested > 0
+                && facts.actions_rejected == 0
+                && facts.actions_queued_unresolved == 0
+                && facts.transactions_committed == facts.actions_requested,
+            format!(
+                "{} requested, {} staged, {} committed, {} rejected, {} unresolved (convergence of the committed work is checked separately)",
+                facts.actions_requested,
+                facts.actions_staged,
+                facts.transactions_committed,
+                facts.actions_rejected,
+                facts.actions_queued_unresolved
+            ),
+            "committed == requested, 0 rejected, 0 unresolved".to_string(),
+        ),
+    }
     if cfg.require_giant_collapse {
         let ys: Vec<f64> = all.iter().filter_map(|s| s.giant_origin_y_m).collect();
         let standing = ys.first().copied();
@@ -1403,5 +1468,75 @@ mod tests {
                 .unwrap()
                 .passed
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_ledger_tests {
+    use super::*;
+
+    fn cfg() -> G4Telemetry {
+        serde_json::from_str(
+            r#"{"warmup_ticks":1800,"measured_ticks":7200,"blast_recovery_sec":5}"#,
+        )
+        .unwrap()
+    }
+
+    fn check(a: AdmissionFacts) -> Check {
+        let facts = G4ServerFacts {
+            admission: Some(a),
+            ..G4ServerFacts::default()
+        };
+        let row = evaluate(&cfg(), &facts, Some(1), 2, 1, &[]);
+        row.checks
+            .into_iter()
+            .find(|c| c.name.starts_with("workload completed"))
+            .expect("the workload check is always present")
+    }
+
+    #[test]
+    fn retried_attempts_do_not_fail_a_workload_whose_every_unique_edit_committed() {
+        // 100 unique edits, 260 attempts (retries after queue-full), every edit committed.
+        let c = check(AdmissionFacts {
+            attempts: 260,
+            unique_requests: 100,
+            admitted: 100,
+            committed: 100,
+            logical_committed: 100,
+            refused_queue_full: 160,
+            ..AdmissionFacts::default()
+        });
+        assert!(c.passed, "{c:?}");
+        assert!(
+            c.measured.contains("100 unique edits") && c.measured.contains("260 attempts"),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_rejections_never_admitted_and_pending_are_each_reported_and_fail() {
+        let c = check(AdmissionFacts {
+            attempts: 500,
+            unique_requests: 200,
+            admitted: 150,
+            committed: 120,
+            logical_committed: 120,
+            logical_rejected_after_admission: 20,
+            logical_pending: 10,
+            logical_never_admitted: 50,
+            refused_queue_full: 300,
+            ..AdmissionFacts::default()
+        });
+        assert!(!c.passed, "{c:?}");
+        for needle in [
+            "200 unique edits",
+            "500 attempts",
+            "120 committed",
+            "20 rejected after admission",
+            "50 never admitted",
+            "10 pending at end",
+        ] {
+            assert!(c.measured.contains(needle), "{needle}: {c:?}");
+        }
     }
 }

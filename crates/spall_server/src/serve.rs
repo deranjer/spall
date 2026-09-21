@@ -840,7 +840,12 @@ pub struct ServeSummary {
     pub actions_staged: u64,
     /// T11a / ENG-62: staged requests that had not committed when the run ended
     /// ("queued" in the gate breakdown).
+    /// Admitted requests still awaiting an outcome at the end (genuinely pending; a request the
+    /// pipeline rejected after admitting it is terminal and is **not** counted here).
     pub actions_queued_unresolved: u64,
+    /// Attempts, unique logical edits, terminal rejections and pending work, kept apart.
+    #[serde(default)]
+    pub admission: crate::admission::AdmissionSummary,
     /// T11a / ENG-62: server commit latency — admission to commit — as a
     /// nearest-rank p95 (ms) per commit shape, with the sample count behind each
     /// figure. Gate targets (`docs/validation.md` "G1"): single-brick commit
@@ -1831,7 +1836,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // run was staged but never committed — the "queued" bucket.
         let mut actions_requested = 0u64;
         let mut actions_staged = 0u64;
-        let mut submitted_at: HashMap<RequestId, std::time::Instant> = HashMap::new();
+        let mut ledger = crate::admission::AdmissionLedger::new();
         // The session that staged each still-pending request, so the tick-report
         // outcome (`action_statuses`) can be routed back to only that client
         // instead of every connected client.
@@ -1945,7 +1950,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     Inbound::Action(session, req) => {
                         saw_client_work = true;
                         actions_requested += 1;
+                        ledger.attempt();
                         if lj.session_expired(session) {
+                            ledger.refused(
+                                req.request_id,
+                                crate::admission::AdmissionRefusal::Invalid,
+                            );
                             reject(&clients_for_sim, session, req.request_id, "expired session");
                             rejected_total += 1;
                             lj.expired_actions += 1;
@@ -1958,6 +1968,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         // request on its replacement session. Replaying this
                         // status must not restage or re-apply the edit.
                         if let Some(status) = replay_admitted_status(&sim, req.request_id) {
+                            ledger.duplicate_replayed();
                             send_to(
                                 &clients_for_sim,
                                 session,
@@ -1970,6 +1981,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             session.raw(),
                             MAX_ACTIONS_PER_CLIENT_PER_TICK,
                         ) {
+                            ledger.refused(
+                                req.request_id,
+                                crate::admission::AdmissionRefusal::Throttled,
+                            );
                             reject(
                                 &clients_for_sim,
                                 session,
@@ -1989,9 +2004,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         match resolved {
                             Ok(intent) => match sim.submit(intent) {
                                 Ok(status) => {
-                                    submitted_at
-                                        .entry(req.request_id)
-                                        .or_insert_with(std::time::Instant::now);
+                                    ledger.admitted(req.request_id, std::time::Instant::now());
                                     submitted_by.entry(req.request_id).or_insert(session);
                                     if req.claimed_brush.radius_units()
                                         >= BLAST_MIN_RADIUS_CELLS * spall_core::BRUSH_UNIT
@@ -2006,9 +2019,19 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                     );
                                 }
                                 Err(e) => {
-                                    if matches!(e, spall_sim::IntentError::QueueFull { .. }) {
+                                    let queue_full =
+                                        matches!(e, spall_sim::IntentError::QueueFull { .. });
+                                    if queue_full {
                                         intent_stats.queue_full_rejections += 1;
                                     }
+                                    ledger.refused(
+                                        req.request_id,
+                                        if queue_full {
+                                            crate::admission::AdmissionRefusal::QueueFull
+                                        } else {
+                                            crate::admission::AdmissionRefusal::Invalid
+                                        },
+                                    );
                                     // Overload is an explicit, *retryable* answer: clients back off
                                     // and resend a bounded number of times. The request id was never
                                     // admitted, so a resend is a fresh admission attempt (a request
@@ -2024,6 +2047,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                 }
                             },
                             Err(rej) => {
+                                ledger.refused(
+                                    req.request_id,
+                                    crate::admission::AdmissionRefusal::Invalid,
+                                );
                                 reject(&clients_for_sim, session, req.request_id, &rej.reason());
                                 rejected_total += 1;
                             }
@@ -2161,7 +2188,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 // T11a / ENG-62: bucket each commit's server-side latency
                 // (admission → commit) by whether it split and how much
                 // geometry detached.
-                if let Some(started_at) = submitted_at.remove(rid) {
+                if let Some(started_at) = ledger.committed(*rid) {
                     let class =
                         commit_latency::classify(committed.bumped_epoch, &committed.topology);
                     commit_latency.record(class, started_at.elapsed());
@@ -2186,6 +2213,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
                     rejected_total += 1;
                 }
+                // An admitted request the pipeline rejected is terminal, not pending.
+                ledger.on_status(&status);
                 // A tick-resolved outcome (commit or deterministic staging
                 // rejection) belongs to whichever session staged it — route it
                 // there only. `submitted_by` is best-effort bookkeeping (cleared
@@ -2584,7 +2613,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             max_client_motion_batch_bytes: motion_egress.max_client_batch_bytes,
             actions_requested,
             actions_staged,
-            actions_queued_unresolved: submitted_at.len() as u64,
+            actions_queued_unresolved: ledger.pending_len() as u64,
+            admission: ledger.summary(),
             latency: commit_latency.report(),
             residency: residency.as_ref().map(|p| p.stats_with_world(sim.world())),
             residency_backing_disk_bytes: residency.as_ref().and_then(|p| p.backing_disk_bytes()),
@@ -2716,6 +2746,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         actions_requested: sim_result.actions_requested,
         actions_staged: sim_result.actions_staged,
         actions_queued_unresolved: sim_result.actions_queued_unresolved,
+        admission: sim_result.admission.clone(),
         single_brick_commit_p95_ms: sim_result.latency.single_brick_commit_p95_ms,
         single_brick_commit_samples: sim_result.latency.single_brick_commit_samples,
         structure_split_p95_ms: sim_result.latency.structure_split_p95_ms,
@@ -3696,6 +3727,7 @@ struct SimResult {
     actions_requested: u64,
     actions_staged: u64,
     actions_queued_unresolved: u64,
+    admission: crate::admission::AdmissionSummary,
     latency: commit_latency::LatencyReport,
     residency: Option<crate::ResidencyStats>,
     /// T23 / G3 row 7 item 3: the residency backing's on-disk footprint, when
@@ -3768,6 +3800,7 @@ impl SimResult {
             actions_requested: 0,
             actions_staged: 0,
             actions_queued_unresolved: 0,
+            admission: crate::admission::AdmissionSummary::default(),
             latency: commit_latency::LatencyReport::default(),
             residency: None,
             residency_backing_disk_bytes: None,
