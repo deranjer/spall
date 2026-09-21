@@ -2722,6 +2722,7 @@ name = "spall_server"
 version = "0.1.0"
 dependencies = [
  "glam 0.33.6",
+ "postcard",
  "rusqlite",
  "serde",
  "serde_json",
