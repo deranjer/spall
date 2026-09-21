@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::Args;
 
 use crate::session::{ChildGuard, random_hex_32, wait_for_addr, write_file};
-use crate::{XtaskError, run_cargo, sandbox_binary_profile, workspace_root};
+use crate::{XtaskError, run_cargo, workspace_root};
 
 /// `cargo xtask play` — launches a server and an interactive window against
 /// it, for a hands-on local play session.
@@ -42,6 +42,12 @@ pub struct PlayArgs {
     /// Build and run optimized (release) binaries instead of debug ones.
     #[arg(long)]
     release: bool,
+    /// Cargo target directory for the play binaries. Defaults to `target/play`, separate from the
+    /// workspace `target` that `cargo xtask scenario` / `session` build into, so an open play window
+    /// (which keeps its `.exe` locked on Windows) can never block a scenario run rebuilding, and a
+    /// scenario measurement never shares binaries with an interactive viewer.
+    #[arg(long)]
+    target_dir: Option<PathBuf>,
     /// How long to wait for the server to bind before giving up.
     #[arg(long, default_value_t = 20_000)]
     startup_timeout_ms: u64,
@@ -74,8 +80,19 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         server_build.push("--release");
         client_build.push("--release");
     }
+    let target_dir = args
+        .target_dir
+        .map(|p| workspace_root().join(p))
+        .unwrap_or_else(|| workspace_root().join("target").join("play"));
+    let target_arg = target_dir.display().to_string();
+    server_build.extend(["--target-dir", target_arg.as_str()]);
+    client_build.extend(["--target-dir", target_arg.as_str()]);
     run_cargo(&server_build)?;
     run_cargo(&client_build)?;
+    let play_binary = |name: &str| {
+        let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_owned() };
+        target_dir.join(profile).join(exe)
+    };
 
     // A fresh token per session (unlike `session`/`scenario`'s seeded one —
     // there is nothing here that needs to reproduce deterministically).
@@ -91,7 +108,7 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     let _ = fs::remove_file(&fp_file);
     let _ = fs::remove_file(&addr_file);
 
-    let mut server_cmd = Command::new(sandbox_binary_profile("sandbox-server", profile));
+    let mut server_cmd = Command::new(play_binary("sandbox-server"));
     server_cmd.current_dir(workspace_root()).args([
         "--serve",
         "--listen",
@@ -137,7 +154,7 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         args.scene, args.ticks
     );
 
-    let mut client_cmd = Command::new(sandbox_binary_profile("sandbox-client", profile));
+    let mut client_cmd = Command::new(play_binary("sandbox-client"));
     client_cmd.current_dir(workspace_root()).args([
         "--connect",
         &bound.to_string(),
