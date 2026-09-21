@@ -50,6 +50,16 @@ pub struct ContainmentCensus {
     pub cell_checked: u64,
     /// Candidates skipped because they have more solid cells than the cap.
     pub skipped_large: u64,
+    /// Bodies whose collider bounds contain a solid terrain cell (prefilter hits).
+    pub prefilter_passed: u64,
+    /// Bodies not examined because their bounds were too large to scan.
+    pub skipped_aabb_too_large: u64,
+    /// Bodies not examined because this scan's sample budget ran out.
+    pub skipped_budget: u64,
+    /// Terrain samples the prefilter spent this scan.
+    pub prefilter_samples: u64,
+    /// Where the next scan should start so a budgeted census rotates through every body.
+    pub next_offset: usize,
     /// Bodies whose cells are embedded in terrain by at least `min_depth_m`.
     pub deep_penetrations: Vec<ContainmentRow>,
     /// Bodies whose geometry lies entirely outside the world box.
@@ -103,10 +113,40 @@ fn terrain_solid_at(world: &SimWorld, p: DVec3) -> bool {
     matches!(world.terrain().volume.sample(cell), Ok(Sample::Filled(_)))
 }
 
-/// Scans every non-terrain body. `max_cells` caps the per-body cell walk (bodies with
-/// more solid cells that touch terrain are counted in `skipped_large`, not checked);
-/// `min_depth_m` is the embedding depth that counts as a deep penetration.
+/// Limits for one census scan.
+#[derive(Debug, Clone, Copy)]
+pub struct CensusOptions {
+    /// Per-body cap on the cell walk (bodies with more solid cells that touch terrain are counted
+    /// in `skipped_large`, not checked).
+    pub max_cells: u64,
+    /// Embedding depth (m) that counts as a deep penetration.
+    pub min_depth_m: f64,
+    /// Per-body cap on prefilter terrain samples (bigger bounds are `skipped_aabb_too_large`).
+    pub max_aabb_samples: u64,
+    /// Total prefilter samples per scan; bodies past the budget are `skipped_budget`.
+    pub sample_budget: u64,
+    /// Body index to start from (use the previous scan's `next_offset`).
+    pub start_offset: usize,
+}
+
+/// Unbudgeted scan (tests and one-off diagnostics).
 pub fn containment_census(world: &SimWorld, max_cells: u64, min_depth_m: f64) -> ContainmentCensus {
+    containment_census_with(
+        world,
+        CensusOptions {
+            max_cells,
+            min_depth_m,
+            max_aabb_samples: 1_000_000,
+            sample_budget: u64::MAX,
+            start_offset: 0,
+        },
+    )
+}
+
+/// Scans every non-terrain body, examining as many as the budget allows and reporting exactly how
+/// many were not, so a clean result is never mistaken for full coverage.
+pub fn containment_census_with(world: &SimWorld, opts: CensusOptions) -> ContainmentCensus {
+    let (max_cells, min_depth_m) = (opts.max_cells, opts.min_depth_m);
     let terrain = world.terrain();
     let tm = terrain.cell_size().metres();
     let mut census = ContainmentCensus::default();
@@ -126,10 +166,12 @@ pub fn containment_census(world: &SimWorld, max_cells: u64, min_depth_m: f64) ->
         census.world_min_m = [f64::MIN; 3];
         census.world_max_m = [f64::MAX; 3];
     }
-    for body in world.bodies() {
-        if body.entity.is_none() {
-            continue;
-        }
+    let bodies: Vec<&Body> = world.bodies().filter(|b| b.entity.is_some()).collect();
+    let n = bodies.len();
+    census.next_offset = opts.start_offset % n.max(1);
+    for step in 0..n {
+        let idx = (opts.start_offset + step) % n;
+        let body = bodies[idx];
         census.bodies += 1;
         let (min, max) = collider_bounds(body);
         let row = |depth: f64, overlapped: u32, cells: u64| ContainmentRow {
@@ -149,19 +191,43 @@ pub fn containment_census(world: &SimWorld, max_cells: u64, min_depth_m: f64) ->
             census.external.push(row(0.0, 0, 0));
             continue;
         }
-        // Cheap pre-filter: a body resting on or above the surface has every corner of
-        // its bounds outside solid terrain; only an embedded body has one inside.
-        let touches_terrain = (0..8).any(|corner| {
-            let p = DVec3::new(
-                if corner & 1 == 0 { min[0] } else { max[0] },
-                if corner & 2 == 0 { min[1] } else { max[1] },
-                if corner & 4 == 0 { min[2] } else { max[2] },
-            );
-            terrain_solid_at(world, p)
-        });
+        // Pre-filter: does the body's world-space collider bounds contain any solid terrain? The
+        // bounds are scanned at terrain-cell spacing, not just at their corners: a long or thin body
+        // that straddles a wall or the ground with both ends in air has no corner in solid
+        // terrain. Bounds too large to scan, and bodies beyond this scan's budget, are counted in
+        // the census -- never silently treated as clear.
+        let dims: [u64; 3] = std::array::from_fn(|a| ((max[a] - min[a]) / tm).ceil() as u64 + 1);
+        let samples = dims[0].saturating_mul(dims[1]).saturating_mul(dims[2]);
+        if samples > opts.max_aabb_samples {
+            census.skipped_aabb_too_large += 1;
+            continue;
+        }
+        if census.prefilter_samples.saturating_add(samples) > opts.sample_budget {
+            census.skipped_budget += 1;
+            if census.skipped_budget == 1 {
+                census.next_offset = idx;
+            }
+            continue;
+        }
+        census.prefilter_samples += samples;
+        let mut touches_terrain = false;
+        'aabb: for i in 0..dims[0] {
+            let x = (min[0] + i as f64 * tm).min(max[0]);
+            for j in 0..dims[1] {
+                let y = (min[1] + j as f64 * tm).min(max[1]);
+                for k in 0..dims[2] {
+                    let z = (min[2] + k as f64 * tm).min(max[2]);
+                    if terrain_solid_at(world, DVec3::new(x, y, z)) {
+                        touches_terrain = true;
+                        break 'aabb;
+                    }
+                }
+            }
+        }
         if !touches_terrain {
             continue;
         }
+        census.prefilter_passed += 1;
         census.cell_checked += 1;
         let cm = body.cell_size().metres();
         let mut cells = 0u64;

@@ -891,6 +891,9 @@ pub struct ServeSummary {
     /// Bodies observed below the world floor (see [`OutOfWorldRow`]); empty when none.
     #[serde(default)]
     pub out_of_world_bodies: Vec<OutOfWorldRow>,
+    /// Coverage of the containment census that produced `out_of_world_bodies`.
+    #[serde(default)]
+    pub containment_coverage: ContainmentCoverage,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -2286,6 +2289,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 sampler.scan_escapes(ticks_run, sim.world());
                 sampler.escapes.clone()
             },
+            containment_coverage: sampler.coverage.clone(),
             samples: sampler.samples,
             blast_commit_ticks,
             blast_commit_elapsed_ms,
@@ -2605,6 +2609,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         stage_timings: sim_result.stage_timings.clone(),
         wake_reasons: sim_result.wake_reasons.clone(),
         out_of_world_bodies: sim_result.out_of_world.clone(),
+        containment_coverage: sim_result.containment_coverage.clone(),
         baseline_capture_encode_ms: telemetry
             .capture_encode_ms
             .lock()
@@ -2734,6 +2739,8 @@ struct TelemetrySampler {
     known_max_entity: u64,
     first_seen_scan: HashMap<u64, u64>,
     escapes: Vec<OutOfWorldRow>,
+    census_offset: usize,
+    coverage: ContainmentCoverage,
     start: std::time::Instant,
     conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
     samples: Vec<TelemetrySample>,
@@ -2756,6 +2763,8 @@ impl TelemetrySampler {
             known_max_entity: 0,
             first_seen_scan: HashMap::new(),
             escapes: Vec::new(),
+            census_offset: 0,
+            coverage: ContainmentCoverage::default(),
         }
     }
 
@@ -2844,6 +2853,50 @@ pub struct OutOfWorldRow {
 }
 
 const ESCAPE_MAX_ROWS: usize = 64;
+/// Per-body prefilter cap (terrain samples over the collider bounds) and per-scan budget: bodies
+/// beyond either are *counted* in [`ContainmentCoverage`], never treated as clear.
+const CENSUS_MAX_AABB_SAMPLES: u64 = 65_536;
+const CENSUS_SAMPLE_BUDGET: u64 = 400_000;
+
+/// How much of the world the containment census actually examined. A result of "no deep
+/// penetration" only means something alongside this.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ContainmentCoverage {
+    pub scans: u64,
+    /// Scans in which no body was skipped (every body's bounds were fully examined).
+    pub full_coverage_scans: u64,
+    /// The most recent scan.
+    pub last_bodies: u64,
+    pub last_prefilter_passed: u64,
+    pub last_cell_checked: u64,
+    pub last_skipped_large_cells: u64,
+    pub last_skipped_aabb_too_large: u64,
+    pub last_skipped_budget: u64,
+    /// Worst single scan.
+    pub max_skipped_aabb_too_large: u64,
+    pub max_skipped_budget: u64,
+    pub max_skipped_large_cells: u64,
+}
+
+impl ContainmentCoverage {
+    fn record(&mut self, c: &spall_sim::containment::ContainmentCensus) {
+        self.scans += 1;
+        if c.skipped_large + c.skipped_aabb_too_large + c.skipped_budget == 0 {
+            self.full_coverage_scans += 1;
+        }
+        self.last_bodies = c.bodies;
+        self.last_prefilter_passed = c.prefilter_passed;
+        self.last_cell_checked = c.cell_checked;
+        self.last_skipped_large_cells = c.skipped_large;
+        self.last_skipped_aabb_too_large = c.skipped_aabb_too_large;
+        self.last_skipped_budget = c.skipped_budget;
+        self.max_skipped_aabb_too_large = self
+            .max_skipped_aabb_too_large
+            .max(c.skipped_aabb_too_large);
+        self.max_skipped_budget = self.max_skipped_budget.max(c.skipped_budget);
+        self.max_skipped_large_cells = self.max_skipped_large_cells.max(c.skipped_large);
+    }
+}
 /// Deepest embedding of a body cell in terrain that counts as a penetration (m).
 const PENETRATION_MIN_DEPTH_M: f64 = 0.25;
 /// Bodies with more solid cells than this are not checked cell by cell.
@@ -2869,11 +2922,18 @@ impl TelemetrySampler {
                 ));
             }
         }
-        let census = spall_sim::containment::containment_census(
+        let census = spall_sim::containment::containment_census_with(
             world,
-            PENETRATION_MAX_CELLS,
-            PENETRATION_MIN_DEPTH_M,
+            spall_sim::containment::CensusOptions {
+                max_cells: PENETRATION_MAX_CELLS,
+                min_depth_m: PENETRATION_MIN_DEPTH_M,
+                max_aabb_samples: CENSUS_MAX_AABB_SAMPLES,
+                sample_budget: CENSUS_SAMPLE_BUDGET,
+                start_offset: self.census_offset,
+            },
         );
+        self.census_offset = census.next_offset;
+        self.coverage.record(&census);
         for (kind, rows) in [
             ("deep_penetration", &census.deep_penetrations),
             ("external", &census.external),
@@ -3124,6 +3184,7 @@ fn percentile(samples: &[f64], fraction: f64) -> f64 {
 
 struct SimResult {
     out_of_world: Vec<OutOfWorldRow>,
+    containment_coverage: ContainmentCoverage,
     wake_reasons: Vec<WakeReasonRow>,
     stage_timings: Vec<StageTimingRow>,
     samples: Vec<TelemetrySample>,
@@ -3190,6 +3251,7 @@ impl SimResult {
     fn error(msg: String, ticks_run: u64) -> Self {
         Self {
             out_of_world: Vec::new(),
+            containment_coverage: ContainmentCoverage::default(),
             stage_timings: Vec::new(),
             wake_reasons: Vec::new(),
             samples: Vec::new(),

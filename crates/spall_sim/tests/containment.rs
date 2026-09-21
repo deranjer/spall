@@ -128,3 +128,91 @@ fn an_external_body_becomes_dormant_and_persists() {
     let b = sim.world().body(e).unwrap();
     assert!(b.dormant, "an external body must leave the solver");
 }
+
+/// A 3 m rod lying across the 1 m perimeter wall with **both ends in air**: no corner of its
+/// bounds is in solid terrain, so a corner-only prefilter never looked at it.
+fn rod(id: spall_core::VolumeId) -> spall_voxel::Volume {
+    use spall_core::{CellSizeCode, GlobalCell};
+    let mut v = spall_voxel::Volume::new(id, CellSizeCode::Quarter);
+    v.apply_edit(&spall_voxel::EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(11, 0, 0),
+        fixtures::STONE,
+    ))
+    .unwrap();
+    v
+}
+
+#[test]
+fn a_body_straddling_a_thin_wall_with_both_ends_in_air_is_still_found() {
+    let mut sim = scene();
+    // West wall: x 0..1 m, y 1..7 m. The rod spans x -1..2 m at y 3 m.
+    let e = sim
+        .world_mut()
+        .spawn_body(
+            rod,
+            BodyPose::new(glam::DQuat::IDENTITY, [-1.0, 3.0, 20.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    let c = containment_census(sim.world(), 4096, 0.25);
+    let row = c
+        .deep_penetrations
+        .iter()
+        .find(|r| r.entity == e.get())
+        .expect("straddling body flagged");
+    assert!(row.overlapped_cells > 0);
+    assert!(
+        c.prefilter_passed >= 1 && c.skipped_aabb_too_large == 0 && c.skipped_budget == 0,
+        "full coverage: {c:?}"
+    );
+}
+
+#[test]
+fn skipped_bodies_are_reported_never_silently_clear() {
+    use spall_sim::containment::{CensusOptions, containment_census_with};
+    let mut sim = scene();
+    for i in 0..6 {
+        spawn(&mut sim, [40.0 + 3.0 * f64::from(i), 5.0, 30.0], [0.0; 3]);
+    }
+    let base = CensusOptions {
+        max_cells: 4096,
+        min_depth_m: 0.25,
+        max_aabb_samples: 1_000_000,
+        sample_budget: u64::MAX,
+        start_offset: 0,
+    };
+    let full = containment_census_with(sim.world(), base);
+    assert_eq!(full.skipped_budget + full.skipped_aabb_too_large, 0);
+    // A tiny per-body cap: every body is reported as skipped, not as clear.
+    let tiny = containment_census_with(
+        sim.world(),
+        CensusOptions {
+            max_aabb_samples: 2,
+            ..base
+        },
+    );
+    assert_eq!(tiny.skipped_aabb_too_large, tiny.bodies, "{tiny:?}");
+    assert_eq!(tiny.prefilter_passed, 0);
+    // A budget that fits about half: the rest are `skipped_budget`, and the next scan rotates on.
+    let per_body = full.prefilter_samples / full.bodies.max(1);
+    let half = containment_census_with(
+        sim.world(),
+        CensusOptions {
+            sample_budget: per_body * full.bodies / 2,
+            ..base
+        },
+    );
+    assert!(
+        half.skipped_budget > 0 && half.skipped_budget < half.bodies,
+        "{half:?}"
+    );
+    assert!(
+        half.next_offset > 0,
+        "the next scan resumes at the first skipped body"
+    );
+}
