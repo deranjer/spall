@@ -1696,3 +1696,101 @@ fn overload_drain() {
         );
     }
 }
+
+/// Long-horizon growth of awake dynamic bodies and ordinary-tick cost on the nominal workload
+/// (in-process, tick-paced: no wall-clock pile-up), one terrain-collider mode per invocation
+/// (`TERRAIN_BRICKS` unset / set). Prints one row per `WINDOW` ticks so a rising ordinary-tick cost
+/// can be told from occasional expensive digs, and whether new rubble ever goes to sleep.
+#[test]
+#[ignore = "measurement: long-horizon awake-body growth and ordinary tick cost"]
+fn awake_growth() {
+    use std::time::Instant;
+    let ticks: u64 = std::env::var("TRACE_TICKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(21_600);
+    const WINDOW: u64 = 1_800;
+    let (mut sim, bodies) = scene();
+    if std::env::var("WAKE_AUDIT").is_ok() {
+        sim.world_mut().enable_wake_audit();
+    }
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let mut counters = (1u64, 0u64, 0u64, 0u64, 0u64);
+    let _ = spall_sim::prof::drain();
+    let (mut ord, mut dig, mut phys) = (Vec::new(), Vec::new(), 0.0f64);
+    println!(
+        "MODE terrain_bricks={} (tick-paced nominal workload)",
+        std::env::var("TERRAIN_BRICKS").is_ok()
+    );
+    println!(
+        "  tick  bodies  awake asleep dormant | ordinary p50/p95 ms | dig mean ms (n) | physics mean ms"
+    );
+    for t in 0..ticks {
+        workload_step(&mut sim, t, &mut counters);
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        let s = Instant::now();
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+        let ms = s.elapsed().as_secs_f64() * 1e3;
+        for (name, d) in spall_sim::prof::drain() {
+            if name == "physics.rapier_step" || name == "physics.pose_extract" {
+                phys += d.as_secs_f64() * 1e3;
+            }
+        }
+        let terrain = sim.world().terrain_volume_id();
+        let dug = report.committed.iter().any(|(_, c)| {
+            c.topology.ops.iter().any(|op| {
+                matches!(op, spall_protocol::TopologyOp::IntegerBrush { volume, .. } if *volume == terrain)
+            })
+        });
+        if dug {
+            dig.push(ms);
+        } else if report.committed.is_empty() {
+            ord.push(ms);
+        }
+        if (t + 1) % WINDOW == 0 {
+            let (mut awake, mut asleep, mut dormant) = (0, 0, 0);
+            for b in sim.world().bodies() {
+                if b.dormant {
+                    dormant += 1;
+                } else if b.sleeping {
+                    asleep += 1;
+                } else {
+                    awake += 1;
+                }
+            }
+            ord.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let q = |p: usize| {
+                ord.get((ord.len() * p / 100).min(ord.len().saturating_sub(1)))
+                    .copied()
+                    .unwrap_or(0.0)
+            };
+            let dm = dig.iter().sum::<f64>() / dig.len().max(1) as f64;
+            println!(
+                "  {:5}  {:6} {:6} {:6} {:6} | {:6.1} / {:6.1} | {:6.1} ({:3}) | {:6.2}",
+                t + 1,
+                sim.world().body_count(),
+                awake,
+                asleep,
+                dormant,
+                q(50),
+                q(95),
+                dm,
+                dig.len(),
+                phys / WINDOW as f64
+            );
+            ord.clear();
+            dig.clear();
+            phys = 0.0;
+        }
+    }
+    if let Some(audit) = sim.world().wake_audit() {
+        println!("wake reasons over the run (asleep bodies woken):");
+        for (reason, st) in &audit.reasons {
+            println!(
+                "  {reason:<52} ops {:>6}, waking ops {:>5}, bodies woken {:>8}, max by one {:>5}",
+                st.operations, st.waking_operations, st.bodies_woken, st.max_woken_by_one
+            );
+        }
+    }
+}
