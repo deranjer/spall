@@ -755,3 +755,53 @@ fn a_repeatedly_contested_region_is_serialized_and_still_makes_progress() {
         "five distinct transactions, none applied twice"
     );
 }
+
+/// ENG-77: a global topology epoch is still authoritative, but a burst of
+/// independently-targeted structural edits must not be reduced to one commit
+/// per server tick.  The second staged result is stale after the first split;
+/// the pipeline rebases it in a bounded same-tick round and commits it in
+/// request order.
+#[test]
+fn independent_topology_edits_rebase_within_one_tick() {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    let east = spall_voxel::fixtures::SEPARATED_REGIONS_EAST_OFFSET;
+    let west = RequestId(1);
+    let east_request = RequestId(2);
+
+    sim.submit(EditIntent::cut(
+        west,
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10, 6, 3, 2),
+    ))
+    .unwrap();
+    sim.submit(EditIntent::cut(
+        east_request,
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10 + east.x, 6 + east.y, 3 + east.z, 2),
+    ))
+    .unwrap();
+
+    let report = sim.tick().unwrap();
+    assert_eq!(report.committed.len(), 2, "both edits commit in one tick");
+    assert_eq!(report.committed[0].0, west, "request order is preserved");
+    assert_eq!(
+        report.committed[1].0, east_request,
+        "request order is preserved"
+    );
+    assert!(
+        report.retried.contains(&east_request),
+        "the second edit was explicitly rebased after the global epoch advanced"
+    );
+    assert_eq!(
+        report.pending_after, 0,
+        "the bounded rebase drained the burst"
+    );
+    assert_eq!(
+        sim.world().body_count(),
+        2,
+        "both beams detached exactly once"
+    );
+}
