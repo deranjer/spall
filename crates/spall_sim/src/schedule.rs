@@ -202,6 +202,12 @@ impl EditPipeline {
         const MAX_REBASE_ROUNDS: usize = 4;
         let mut rebase_round = 0usize;
         let mut serialized_regions_this_tick = HashSet::new();
+        // Geometry reloads are an external residency transition, not a stale
+        // topology rebase. Keep their intents out of `pending` until this
+        // tick has fully drained: otherwise an unrelated stale result can
+        // enter another same-tick round and execute a reload retry despite
+        // the retry contract promising the next tick.
+        let mut reload_retries_next_tick = VecDeque::new();
 
         loop {
             self.active_regions.clear();
@@ -298,7 +304,7 @@ impl EditPipeline {
                                 report
                                     .reloaded_bricks
                                     .extend(bricks.iter().map(|&b| (queued.volume_id, b)));
-                                self.pending.push_back(QueuedIntent {
+                                reload_retries_next_tick.push_back(QueuedIntent {
                                     attempts: queued.attempts + 1,
                                     ..queued
                                 });
@@ -345,7 +351,7 @@ impl EditPipeline {
                                 report
                                     .reloaded_bricks
                                     .extend(bricks.iter().map(|&b| (volume, b)));
-                                self.pending.push_back(QueuedIntent {
+                                reload_retries_next_tick.push_back(QueuedIntent {
                                     attempts: queued.attempts + 1,
                                     ..queued
                                 });
@@ -396,6 +402,7 @@ impl EditPipeline {
             rebase_round += 1;
         }
 
+        self.pending.append(&mut reload_retries_next_tick);
         report.pending_after = self.pending.len();
         Ok(report)
     }
