@@ -27,7 +27,7 @@ use spall_structure::AnchorPlane;
 use spall_voxel::{Brick, BrickBounds, BrickState, EditPlan, EvictedBricks, Volume};
 
 use crate::body::{Body, BodyKind, BodyPose};
-use crate::collider::plan_collider;
+use crate::collider::{ColliderPlan, plan_collider};
 use crate::player::Player;
 use crate::registry::IdRegistry;
 use spall_protocol::InputSeq;
@@ -108,6 +108,17 @@ pub struct WorldSetup {
     pub physics: PhysicsConfig,
 }
 
+/// Derived terrain collision for one resident brick. The authoritative volume
+/// and its logical digests remain the source of truth; this record only keeps
+/// the stable physics body needed to retire/reload collision without touching
+/// unrelated bricks.
+#[derive(Debug, Clone, Copy)]
+struct TerrainBrickCollider {
+    phys: PhysBodyId,
+    built_revision: Revision,
+    has_collider: bool,
+}
+
 /// The authoritative simulation world.
 pub struct SimWorld {
     registry: IdRegistry,
@@ -124,6 +135,10 @@ pub struct SimWorld {
     /// (T19). Not bodies: no volume, never split, never in the dynamic set.
     players: BTreeMap<u64, Player>,
     physics: PhysicsWorld,
+    /// Lazily installed when residency first evicts terrain. `None` keeps the
+    /// validated whole-terrain collider path byte-for-byte unchanged for the
+    /// default-off configuration.
+    terrain_brick_colliders: Option<BTreeMap<BrickCoord, TerrainBrickCollider>>,
     /// ENG-69 round 18: each live player's own bounded terrain-query window
     /// (`spall_physics::query_cache`'s own doc has the full design) — keyed
     /// the same as `players`, kept in sync with it by `advance_players`
@@ -210,6 +225,7 @@ impl SimWorld {
             volume_owner: BTreeMap::new(),
             players: BTreeMap::new(),
             physics,
+            terrain_brick_colliders: None,
             query_caches: BTreeMap::new(),
             window_stats: spall_physics::WindowStats::default(),
             evicted: BTreeMap::new(),
@@ -247,6 +263,221 @@ impl SimWorld {
         self.evicted.values().any(|e| !e.is_empty())
     }
 
+    /// Exact occupancy for one resident brick. The fixed-size region means an
+    /// evicted neighbour cannot turn this build into an accidental whole-world
+    /// extraction or be treated as air.
+    fn plan_terrain_brick(
+        volume: &Volume,
+        coord: BrickCoord,
+    ) -> Result<Option<ColliderPlan>, WorldError> {
+        let min = GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32);
+        let max = GlobalCell::new(min.x + 31, min.y + 31, min.z + 31);
+        let grid = OccupancyGrid::from_region(volume, min, max)?;
+        if grid.solid_count() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(plan_collider(&grid)?))
+    }
+
+    /// Installs the per-brick terrain representation from the fully resident
+    /// snapshot. This is called only when eviction is first requested, so the
+    /// ordinary default-off path continues using the existing whole collider.
+    fn ensure_terrain_brick_colliders(&mut self) -> Result<(), WorldError> {
+        if self.terrain_brick_colliders.is_some() {
+            return Ok(());
+        }
+        let terrain = self.terrain.volume.clone();
+        let mut planned = Vec::new();
+        for coord in terrain.resident_brick_coords() {
+            planned.push((coord, Self::plan_terrain_brick(&terrain, coord)?));
+        }
+
+        self.physics.remove_collider(self.terrain.phys);
+        let mut colliders = BTreeMap::new();
+        let cell_m = terrain.cell_size().metres() as f32;
+        for (coord, plan) in planned {
+            let Some(plan) = plan else { continue };
+            let phys = self.physics.add_body(BodySpec {
+                kind: PhysBodyKind::Fixed,
+                representation: plan.representation,
+                grid: plan.grid,
+                cell_m,
+                density_kg_m3: 1.0,
+                mass_properties: None,
+                translation_m: [0.0; 3],
+                linvel_m_s: [0.0; 3],
+            });
+            let revision = terrain
+                .brick_revision(coord)
+                .ok()
+                .flatten()
+                .unwrap_or(Revision::ZERO);
+            colliders.insert(
+                coord,
+                TerrainBrickCollider {
+                    phys,
+                    built_revision: revision,
+                    has_collider: true,
+                },
+            );
+        }
+        self.terrain_brick_colliders = Some(colliders);
+        self.terrain.collider_revision += 1;
+        Ok(())
+    }
+
+    /// Publishes one brick's derived collider. A missing entry gets a fresh
+    /// fixed body; an empty/reloaded brick reuses its stable body slot.
+    fn publish_terrain_brick(&mut self, coord: BrickCoord, plan: Option<&ColliderPlan>) {
+        let existing = self
+            .terrain_brick_colliders
+            .as_ref()
+            .and_then(|m| m.get(&coord))
+            .copied();
+        let cell_m = self.terrain.volume.cell_size().metres() as f32;
+        let revision = self
+            .terrain
+            .volume
+            .brick_revision(coord)
+            .ok()
+            .flatten()
+            .unwrap_or(Revision::ZERO);
+        let next = match (existing, plan) {
+            (Some(entry), Some(plan)) => {
+                self.physics
+                    .rebuild_collider(entry.phys, &plan.grid, plan.representation);
+                TerrainBrickCollider {
+                    phys: entry.phys,
+                    built_revision: revision,
+                    has_collider: true,
+                }
+            }
+            (Some(entry), None) => {
+                if entry.has_collider {
+                    self.physics.remove_collider(entry.phys);
+                }
+                TerrainBrickCollider {
+                    phys: entry.phys,
+                    built_revision: revision,
+                    has_collider: false,
+                }
+            }
+            (None, Some(plan)) => {
+                let phys = self.physics.add_body(BodySpec {
+                    kind: PhysBodyKind::Fixed,
+                    representation: plan.representation,
+                    grid: plan.grid.clone(),
+                    cell_m,
+                    density_kg_m3: 1.0,
+                    mass_properties: None,
+                    translation_m: [0.0; 3],
+                    linvel_m_s: [0.0; 3],
+                });
+                TerrainBrickCollider {
+                    phys,
+                    built_revision: revision,
+                    has_collider: true,
+                }
+            }
+            (None, None) => return,
+        };
+        self.terrain_brick_colliders
+            .as_mut()
+            .expect("terrain brick state initialized")
+            .insert(coord, next);
+        self.terrain.collider_revision += 1;
+    }
+
+    fn rebuild_terrain_brick_colliders(&mut self) -> Result<(), WorldError> {
+        self.ensure_terrain_brick_colliders()?;
+        let terrain = self.terrain.volume.clone();
+        let resident = terrain.resident_brick_coords();
+        let known: Vec<BrickCoord> = self
+            .terrain_brick_colliders
+            .as_ref()
+            .expect("terrain brick state initialized")
+            .keys()
+            .copied()
+            .collect();
+        for coord in known {
+            if !resident.contains(&coord) {
+                self.publish_terrain_brick(coord, None);
+            }
+        }
+        for coord in resident {
+            let plan = Self::plan_terrain_brick(&terrain, coord)?;
+            self.publish_terrain_brick(coord, plan.as_ref());
+        }
+        Ok(())
+    }
+
+    fn terrain_physics_bodies(&self) -> Vec<PhysBodyId> {
+        self.terrain_brick_colliders
+            .as_ref()
+            .map(|m| m.values().map(|b| b.phys).collect())
+            .unwrap_or_else(|| vec![self.terrain.phys])
+    }
+
+    /// Whether residency has installed the per-brick terrain representation.
+    /// It stays false for the default-off, fully resident path.
+    pub fn terrain_brick_colliders_enabled(&self) -> bool {
+        self.terrain_brick_colliders.is_some()
+    }
+
+    /// Number of resident terrain bricks currently carrying collision.
+    pub fn terrain_brick_collider_count(&self) -> usize {
+        self.terrain_brick_colliders
+            .as_ref()
+            .map_or(0, |m| m.values().filter(|b| b.has_collider).count())
+    }
+
+    /// Checks that every resident solid terrain brick has exactly one collider
+    /// built from its current revision and that evicted/empty bricks have no
+    /// active derived shape.
+    pub fn validate_terrain_brick_colliders(&self) -> Result<(), String> {
+        let Some(colliders) = &self.terrain_brick_colliders else {
+            return Ok(());
+        };
+        let volume = &self.terrain.volume;
+        for coord in volume.resident_brick_coords() {
+            let plan = Self::plan_terrain_brick(volume, coord).map_err(|e| e.to_string())?;
+            let Some(entry) = colliders.get(&coord) else {
+                if plan.is_some() {
+                    return Err(format!("resident solid brick {coord:?} has no collider"));
+                }
+                continue;
+            };
+            match plan {
+                Some(_) if !entry.has_collider => {
+                    return Err(format!("resident solid brick {coord:?} has no collider"));
+                }
+                Some(_) => {
+                    let revision = volume
+                        .brick_revision(coord)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(Revision::ZERO);
+                    if entry.built_revision != revision {
+                        return Err(format!(
+                            "brick {coord:?} collider revision {:?} != volume revision {:?}",
+                            entry.built_revision, revision
+                        ));
+                    }
+                }
+                None if entry.has_collider => {
+                    return Err(format!("empty brick {coord:?} retains a collider"));
+                }
+                None => {}
+            }
+        }
+        for (coord, entry) in colliders {
+            if !volume.resident_brick_coords().contains(coord) && entry.has_collider {
+                return Err(format!("evicted brick {coord:?} retains a collider"));
+            }
+        }
+        Ok(())
+    }
+
     /// Evicts one brick of `volume` from the live cache, retaining its exact
     /// `(revision, content_hash, solid_cells)` digest so `world_hash`,
     /// conservation, and `result_hashes` still see it (the digest-lifecycle
@@ -257,6 +488,10 @@ impl SimWorld {
         volume: VolumeId,
         coord: BrickCoord,
     ) -> Result<bool, spall_voxel::DigestError> {
+        if volume == self.terrain.volume_id {
+            self.ensure_terrain_brick_colliders()
+                .map_err(|e| spall_voxel::DigestError::ColliderBuild(e.to_string()))?;
+        }
         let Some(vol) = self.volume_ref(volume) else {
             return Ok(false);
         };
@@ -265,11 +500,15 @@ impl SimWorld {
             Err(spall_voxel::DigestError::NotResident(_)) => return Ok(false),
             Err(e) => return Err(e),
         };
+
         self.evicted_mut(volume).record(coord, digest)?;
         self.volume_body_mut(volume)
             .expect("volume_ref matched")
             .volume
             .evict_brick(coord);
+        if volume == self.terrain.volume_id {
+            self.publish_terrain_brick(coord, None);
+        }
         Ok(true)
     }
 
@@ -285,6 +524,13 @@ impl SimWorld {
             .volume_ref(volume)
             .ok_or(spall_voxel::DigestError::NoRetained(coord))?;
         self.evicted(volume).verify_reload(vol, coord)?;
+        if volume == self.terrain.volume_id {
+            self.ensure_terrain_brick_colliders()
+                .map_err(|e| spall_voxel::DigestError::ColliderBuild(e.to_string()))?;
+            let plan = Self::plan_terrain_brick(&self.terrain.volume, coord)
+                .map_err(|e| spall_voxel::DigestError::ColliderBuild(e.to_string()))?;
+            self.publish_terrain_brick(coord, plan.as_ref());
+        }
         self.evicted_mut(volume).clear(coord)?;
         Ok(())
     }
@@ -331,10 +577,25 @@ impl SimWorld {
             crate::backing::BackingBrick::Unavailable => return Ok(false),
         };
         self.evicted(volume).verify_candidate(coord, &brick)?;
+
+        let plan = if volume == self.terrain.volume_id {
+            self.ensure_terrain_brick_colliders()
+                .map_err(|e| spall_voxel::DigestError::ColliderBuild(e.to_string()))?;
+            let mut candidate = self.terrain.volume.clone();
+            candidate.insert_brick(coord, brick.clone())?;
+            Self::plan_terrain_brick(&candidate, coord)
+                .map_err(|e| spall_voxel::DigestError::ColliderBuild(e.to_string()))?
+        } else {
+            None
+        };
+
         self.volume_body_mut(volume)
             .ok_or(spall_voxel::DigestError::NoRetained(coord))?
             .volume
             .insert_brick(coord, brick)?;
+        if volume == self.terrain.volume_id {
+            self.publish_terrain_brick(coord, plan.as_ref());
+        }
         self.evicted_mut(volume).clear(coord)?;
         Ok(true)
     }
@@ -668,7 +929,7 @@ impl SimWorld {
         // else's sweep. Ordinary dynamic bodies (debris, detached
         // structures) are *never* excluded either way: they stay fully
         // visible, exactly as before this round.
-        let terrain_id = self.terrain.phys;
+        let terrain_ids = self.terrain_physics_bodies();
         for (key, player) in &mut self.players {
             let my = windows.iter().find(|w| w.key == *key);
             let my_fresh = my.is_some_and(|w| w.fresh);
@@ -683,7 +944,7 @@ impl SimWorld {
             }
             let mut exclude: Vec<PhysBodyId> = Vec::with_capacity(windows.len());
             if my_fresh {
-                exclude.push(terrain_id);
+                exclude.extend(terrain_ids.iter().copied());
             } else if let Some(id) = my_window_id {
                 exclude.push(id);
             }
@@ -838,7 +1099,9 @@ impl SimWorld {
     /// Idempotent; a no-op for an unknown volume.
     pub fn retire_empty_volume(&mut self, volume: VolumeId) {
         if volume == self.terrain.volume_id {
-            self.physics.remove_collider(self.terrain.phys);
+            for id in self.terrain_physics_bodies() {
+                self.physics.remove_collider(id);
+            }
             self.terrain.collider_revision += 1;
             return;
         }
@@ -1501,6 +1764,9 @@ impl SimWorld {
     /// volume is retired by [`Self::retire_empty_volume`] once the replay's
     /// result checks have run (`ENG-56`).
     pub fn rebuild_volume_collider(&mut self, volume: VolumeId) -> Result<(), WorldError> {
+        if volume == self.terrain.volume_id && self.terrain_brick_colliders.is_some() {
+            return self.rebuild_terrain_brick_colliders();
+        }
         let Some(body) = self.volume_body(volume) else {
             return Err(WorldError::UnknownVolume(volume));
         };

@@ -4,10 +4,13 @@
 
 use std::sync::Arc;
 
+use glam::DQuat;
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
-use spall_core::{BrickCoord, EntityId, SphereBrush};
+use spall_core::{BrickCoord, CELLS_PER_BRICK, EntityId, LocalCell, SphereBrush};
 use spall_protocol::RequestId;
-use spall_sim::{EditIntent, EditTarget, MemoryBacking, Simulation, SimulationConfig, fixtures};
+use spall_sim::{
+    BodyPose, EditIntent, EditTarget, MemoryBacking, Simulation, SimulationConfig, fixtures,
+};
 
 /// Sever the seam column of `cross_brick_bridged_setup` — the brush writes cells
 /// in **both** brick `x = 0` and brick `x = 1`.
@@ -66,6 +69,134 @@ fn an_edit_that_needs_evicted_geometry_reloads_it_and_commits() {
         sim.world().world_hash(),
         full_post_seam_cut_hash(),
         "reload-and-retry reached a different world than a fully resident run"
+    );
+}
+
+#[test]
+fn terrain_collider_residency_tracks_eviction_and_reload_without_stale_shapes() {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
+    sim.world_mut().set_backing(Arc::new(backing));
+
+    let (victim, active) = sim
+        .world()
+        .terrain()
+        .volume
+        .resident_brick_coords()
+        .into_iter()
+        .filter_map(|coord| {
+            let snapshot = sim
+                .world()
+                .terrain()
+                .volume
+                .snapshot_brick(coord)
+                .ok()
+                .flatten()?;
+            let solid = (0..CELLS_PER_BRICK as u16).any(|index| {
+                !snapshot
+                    .get(LocalCell::from_linear_index(index).unwrap())
+                    .is_air()
+            });
+            solid.then_some(coord)
+        })
+        .map(|coord| {
+            let active = sim
+                .world()
+                .terrain()
+                .volume
+                .resident_brick_coords()
+                .into_iter()
+                .filter(|&candidate| {
+                    sim.world()
+                        .terrain()
+                        .volume
+                        .snapshot_brick(candidate)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|snapshot| {
+                            (0..CELLS_PER_BRICK as u16).any(|index| {
+                                !snapshot
+                                    .get(LocalCell::from_linear_index(index).unwrap())
+                                    .is_air()
+                            })
+                        })
+                })
+                .count();
+            (coord, active)
+        })
+        .next()
+        .expect("fixture has a resident solid terrain brick");
+    assert!(!sim.world().terrain_brick_colliders_enabled());
+    assert!(sim.world_mut().evict_brick(terrain, victim).unwrap());
+    assert!(sim.world().terrain_brick_colliders_enabled());
+    assert_eq!(
+        sim.world().terrain_brick_collider_count(),
+        active - 1,
+        "the evicted brick's derived collider was retired"
+    );
+    sim.world()
+        .validate_terrain_brick_colliders()
+        .expect("resident colliders match resident revisions");
+
+    assert!(sim.world_mut().reload_brick(terrain, victim).unwrap());
+    assert_eq!(
+        sim.world().terrain_brick_collider_count(),
+        active,
+        "reload reinstalls exactly the evicted brick collider"
+    );
+    sim.world()
+        .validate_terrain_brick_colliders()
+        .expect("reloaded collider matches the durable brick");
+}
+
+#[test]
+fn evicted_terrain_has_no_collision_until_its_durable_brick_reloads() {
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
+    sim.world_mut().set_backing(Arc::new(backing));
+    let victim = BrickCoord::new(0, 0, 0);
+    assert!(sim.world_mut().evict_brick(terrain, victim).unwrap());
+
+    let falling = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(1),
+            BodyPose::new(DQuat::IDENTITY, [1.0, 3.0, 1.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    for _ in 0..240 {
+        sim.step_physics_only();
+    }
+    assert!(
+        sim.world().body(falling).unwrap().pose.translation_m[1] < -2.0,
+        "evicted terrain retained a stale collision shape"
+    );
+
+    assert!(sim.world_mut().reload_brick(terrain, victim).unwrap());
+    let landed = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(1),
+            BodyPose::new(DQuat::IDENTITY, [1.0, 3.0, 1.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    for _ in 0..240 {
+        sim.step_physics_only();
+    }
+    assert!(
+        sim.world().body(landed).unwrap().pose.translation_m[1] > 0.0,
+        "reloaded terrain did not restore collision"
     );
 }
 
