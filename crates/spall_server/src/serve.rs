@@ -1387,6 +1387,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
         let mut pacer = crate::pacing::TickPacer::new(tick_dt, std::time::Instant::now());
         for _ in 0..max_ticks {
+            let started = std::time::Instant::now();
             // ENG-48: drain a bounded slice of what the clients have sent since
             // the last tick, with a per-session admission quota so one flooding
             // client can neither stall this loop nor starve the others. The

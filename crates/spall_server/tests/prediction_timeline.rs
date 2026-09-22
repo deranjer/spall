@@ -113,6 +113,7 @@ fn run_session(
         residency_disk_path: None,
         contact_damage: None,
         dormancy: None,
+        timing_window: None,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
     let fp_hex = wait_for_file(&fp_path, Duration::from_secs(20));
