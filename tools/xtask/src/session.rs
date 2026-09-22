@@ -314,6 +314,11 @@ struct Scenario {
     /// world that reads from.
     #[serde(default)]
     dormancy: bool,
+    /// Optional settle-window override for an explicit dormancy evaluation.
+    /// Requires `dormancy: true`; absent preserves the server's 120-tick
+    /// default and keeps existing fixtures byte-for-byte equivalent.
+    #[serde(default)]
+    dormancy_settle_ticks: Option<u64>,
     /// T21 / ENG-28 increment 4: require the server's end-of-run report to
     /// show at least this many dormancy deactivations / reactivations —
     /// real end-to-end proof the pass ran, not just that `dormancy` was set.
@@ -1398,6 +1403,24 @@ mod requirement_tests {
     }
 
     #[test]
+    fn dormancy_settle_override_is_optional_and_preserves_default_path() {
+        let default_scenario: Scenario =
+            serde_json::from_str(r#"{ "server_ticks": 10, "dormancy": true }"#).unwrap();
+        assert!(default_scenario.dormancy);
+        assert_eq!(default_scenario.dormancy_settle_ticks, None);
+
+        let tuned_scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 112,
+                "dormancy": true,
+                "dormancy_settle_ticks": 20
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(tuned_scenario.dormancy_settle_ticks, Some(20));
+    }
+
+    #[test]
     fn residency_assertions_fail_when_a_pass_is_disabled_or_return_is_missing() {
         let scenario: Scenario = serde_json::from_str(
             r#"{
@@ -2081,6 +2104,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     }
     if scenario.dormancy {
         server_cmd.arg("--dormancy");
+    }
+    if let Some(settle_ticks) = scenario.dormancy_settle_ticks {
+        server_cmd.args(["--dormancy-settle-ticks", &settle_ticks.to_string()]);
     }
     // T11 exact-replay check (and the T23 cold-restart check) both journal every
     // committed transaction to a world DB. Replay rebuilds from the tick-0

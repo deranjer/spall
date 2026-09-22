@@ -321,6 +321,38 @@ mod tests {
     }
 
     #[test]
+    fn a_short_settle_window_handles_28_tick_hard_wake_cadence() {
+        fn run(settle_ticks: u64) -> (usize, usize, bool) {
+            let mut config = cfg();
+            config.settle_ticks = settle_ticks;
+            // The edit is a hard wake, so this deliberately large hysteresis
+            // value proves the result does not depend on proximity re-waking.
+            config.min_dormant_ticks = 10_000;
+            let mut policy = DormancyPolicy::new(config);
+            let mut body = still_body(1, [10.0, 0.0, 0.0]);
+            let mut deactivations = 0;
+            let mut reactivations = 0;
+
+            for tick in 1..=112 {
+                body.hard_wake = body.dormant && tick % 28 == 0;
+                let plan = policy.plan(tick, &[body], &[]);
+                if plan.deactivate.contains(&body.entity) {
+                    body.dormant = true;
+                    deactivations += 1;
+                }
+                if plan.reactivate.contains(&body.entity) {
+                    body.dormant = false;
+                    reactivations += 1;
+                }
+            }
+            (deactivations, reactivations, body.dormant)
+        }
+
+        assert_eq!(run(120), (0, 0, false));
+        assert_eq!(run(20), (4, 4, false));
+    }
+
+    #[test]
     fn a_dormant_body_wakes_on_proximity_after_the_hysteresis_window() {
         let mut p = DormancyPolicy::new(cfg());
         let dormant = BodyDormancyInput {

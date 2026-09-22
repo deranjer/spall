@@ -133,6 +133,12 @@ struct Args {
     /// combine with this.
     #[arg(long)]
     dormancy: bool,
+    /// Override the dormancy settle window for a deliberate networked policy
+    /// evaluation. Requires `--dormancy`; omitted preserves the 120-tick
+    /// default. This does not force a sleeping body or alter moving-body
+    /// admission.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
+    dormancy_settle_ticks: Option<u64>,
 
     // --- T20 interest + bandwidth scheduling ---
     /// Enable per-client interest relevance + motion bandwidth budget. Without
@@ -268,6 +274,19 @@ fn run_serve(args: Args) -> ExitCode {
         None
     };
 
+    let dormancy = match (args.dormancy, args.dormancy_settle_ticks) {
+        (false, None) => None,
+        (false, Some(_)) => {
+            eprintln!("sandbox-server: --dormancy-settle-ticks requires --dormancy");
+            return ExitCode::from(2);
+        }
+        (true, None) => Some(spall_sim::DormancyConfig::DEFAULT),
+        (true, Some(settle_ticks)) => Some(spall_sim::DormancyConfig {
+            settle_ticks,
+            ..spall_sim::DormancyConfig::DEFAULT
+        }),
+    };
+
     let config = ServeConfig {
         listen: args.listen,
         scene,
@@ -308,7 +327,7 @@ fn run_serve(args: Args) -> ExitCode {
         contact_damage: args
             .contact_damage
             .then_some(spall_sim::ContactDamageConfig::DEFAULT),
-        dormancy: args.dormancy.then_some(spall_sim::DormancyConfig::DEFAULT),
+        dormancy,
     };
     match spall_server::serve(config) {
         Ok(summary) => {
