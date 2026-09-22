@@ -316,6 +316,7 @@ fn run_serve(args: Args) -> ExitCode {
                 "sandbox-server: --timing-warmup-ticks, --timing-measured-ticks (>0), and --timing-max-samples (>0) must be supplied together"
             );
             return ExitCode::from(2);
+        }
     };
 
     let config = ServeConfig {
