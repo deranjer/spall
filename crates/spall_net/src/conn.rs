@@ -191,6 +191,12 @@ impl Connection {
         self.quic.stats()
     }
 
+    /// Quinn's current transport round-trip estimate, independent of
+    /// application work such as a server-scheduled input boundary.
+    pub fn rtt(&self) -> Duration {
+        self.quic.rtt()
+    }
+
     /// Shared counter handle, for a spawned pump that wants to record bytes.
     pub fn stats_handle(&self) -> Arc<ConnStats> {
         self.stats.clone()

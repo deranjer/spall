@@ -672,8 +672,6 @@ struct Predictor {
     /// Steers the prediction timeline's rate so its lead over the server stays
     /// bounded (see [`crate::tick_accumulator::LeadController`]).
     lead: crate::tick_accumulator::LeadController,
-    /// When each recent input frame was sent, to time its acknowledgement.
-    sent_at: std::collections::VecDeque<(u64, std::time::Instant)>,
     /// Every replicated body's newest motion (geometry stripped), as of the
     /// mover's last pass; what a reconcile replays against.
     bodies_motion: Vec<ClientBodyCollision>,
@@ -699,7 +697,6 @@ impl Predictor {
             script_origin_tick: None,
             local_terrain: None,
             lead: crate::tick_accumulator::LeadController::default(),
-            sent_at: std::collections::VecDeque::new(),
             bodies_motion: Vec::new(),
             trace: None,
             trace_started: std::time::Instant::now(),
@@ -767,26 +764,12 @@ impl Predictor {
         });
     }
 
-    /// Feeds a reconcile's outcome to the lead controller: the lead it saw, and
-    /// a round-trip sample if `acked` names a frame we timed.
-    fn observe_reconcile(&mut self, lead_ticks: usize, acked: InputSeq, now: std::time::Instant) {
-        // Round trip first, then the lead: both describe the same snapshot, so a
-        // snapshot that was delayed in transit raises the target it is judged
-        // against as well as the lead it reports.
-        if let Some(&(_, sent)) = self.sent_at.iter().find(|(seq, _)| *seq == acked.0) {
-            self.lead.observe_rtt(now.saturating_duration_since(sent));
-        }
+    /// Feeds a reconcile's lead and the transport's RTT estimate to the lead
+    /// controller. Application acknowledgement time is unsuitable here because
+    /// input may intentionally wait for its scheduled server tick.
+    fn observe_reconcile(&mut self, lead_ticks: usize, transport_rtt: Duration) {
+        self.lead.observe_rtt(transport_rtt);
         self.lead.observe_lead(lead_ticks);
-        while self.sent_at.front().is_some_and(|(seq, _)| *seq < acked.0) {
-            self.sent_at.pop_front();
-        }
-    }
-
-    fn note_input_sent(&mut self, seq: u64, now: std::time::Instant) {
-        self.sent_at.push_back((seq, now));
-        while self.sent_at.len() > 256 {
-            self.sent_at.pop_front();
-        }
     }
 }
 
@@ -1321,8 +1304,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                             let now = std::time::Instant::now();
                                             p.observe_reconcile(
                                                 outcome.records_replayed,
-                                                snap.acked_input,
-                                                now,
+                                                conn.rtt(),
                                             );
                                             p.trace_reconcile(&outcome, st, snap.acked_input, now);
                                             if let Some(session) = &interactive
@@ -1712,12 +1694,15 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         };
                         p.input_seq += 1;
                         let seq = InputSeq(p.input_seq);
-                        p.note_input_sent(seq.0, now);
                         let predicted_pos = p
                             .player
                             .as_ref()
                             .map_or([0.0; 3], |pl| pl.predicted().position_m);
                         p.trace_input(seq.0, input.movement, tick, predicted_pos);
+                        let intended_tick = p
+                            .player
+                            .as_ref()
+                            .map_or(Tick(tick + 1), PredictedPlayer::next_tick);
                         // Client authority: the physics thread ticks the
                         // player in lockstep with body stepping instead.
                         if !client_authoritative
@@ -1731,7 +1716,13 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             // long. The same sampled `input`/`seq` covers
                             // every tick in the burst, exactly like ordinary
                             // held-input reuse already does.
-                            for _ in 0..ticks_to_run {
+                            let allowed_ticks = crate::tick_accumulator::cap_prediction_ticks(
+                                ticks_to_run,
+                                pl.next_tick().0,
+                                tick,
+                                p.lead.max_lead_ticks(),
+                            );
+                            for _ in 0..allowed_ticks {
                                 p.phys.sync_bodies_at(
                                     &p.bodies_motion,
                                     Some(pl.next_tick().0 as f64),
@@ -1782,7 +1773,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                 }
                             }
                         }
-                        // Preserve the script's server-tick cadence.  The
+                        // Preserve the script's server-tick cadence. The
                         // mover itself samples more often than snapshots can
                         // advance, so incrementing once per loop makes an
                         // impaired client cover several scripted ticks per
@@ -1809,7 +1800,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             session,
                             player: p.entity,
                             input_seq: seq,
-                            intended_tick: Tick(tick + 1),
+                            // Tag the first local prediction step this frame
+                            // will drive (captured before catch-up). The latest
+                            // motion snapshot can be several ticks behind this
+                            // independently paced predictor.
+                            intended_tick,
                             movement: input.movement,
                             view_dir: input.view_dir,
                             buttons: input.buttons,

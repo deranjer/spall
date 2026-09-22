@@ -52,6 +52,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::baseline::{self, BaselineTransfer};
 use crate::commit_latency::{self, CommitLatency};
+use crate::input_schedule::{PlayerInputSchedule, ScheduleResult};
 use crate::persist::{self, PersistConfig};
 use crate::persist_pipeline::{PersistPipeline, PipelineConfig};
 
@@ -1352,6 +1353,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         lj.backing = residency.as_ref().map(|p| p.backing());
 
         let mut pacer = crate::pacing::TickPacer::new(tick_dt, std::time::Instant::now());
+        let mut pending_player_inputs = PlayerInputSchedule::default();
         for _ in 0..max_ticks {
             // ENG-48: drain a bounded slice of what the clients have sent since
             // the last tick, with a per-session admission quota so one flooding
@@ -1370,6 +1372,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 match msg {
                     Inbound::Joined(session) => {
                         lj.on_joined(session);
+                        // Player identity is slot-stable across reconnects;
+                        // no input scheduled by the old generation may leak
+                        // into the replacement session.
+                        pending_player_inputs.remove_slot(session.slot().0);
                         // T19: give this connection an authoritative player
                         // capsule on a player scene (respawn on reconnect).
                         let spawns = scene.player_spawns();
@@ -1391,14 +1397,40 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             continue;
                         }
                         let entity = session_player_entity(session);
-                        // Apply the redundant recent copies oldest-first, then
-                        // the current frame. `set_player_input` drops any that
-                        // are not newer than what the server already has, so a
-                        // single surviving datagram recovers a dropped frame.
+                        // Recover unseen redundant copies immediately. A copy
+                        // already queued for its intended future tick must not
+                        // be applied early simply because the next datagram
+                        // carries it again.
                         for r in frame.recent.iter().rev() {
-                            sim.set_player_input(entity, recent_input(r), r.input_seq);
+                            if !pending_player_inputs.contains(session, r.input_seq) {
+                                sim.set_player_input(entity, recent_input(r), r.input_seq);
+                            }
                         }
-                        sim.set_player_input(entity, frame_input(&frame), frame.input_seq);
+                        if sim
+                            .player_acked_input(entity)
+                            .is_none_or(|acked| frame.input_seq.0 > acked.0)
+                        {
+                            let (result, _) = pending_player_inputs.schedule(
+                                session,
+                                entity,
+                                frame_input(&frame),
+                                frame.input_seq,
+                                frame.intended_tick,
+                                sim.current_tick(),
+                            );
+                            match result {
+                                ScheduleResult::Immediate => {
+                                    sim.set_player_input(
+                                        entity,
+                                        frame_input(&frame),
+                                        frame.input_seq,
+                                    );
+                                }
+                                ScheduleResult::Queued
+                                | ScheduleResult::Duplicate
+                                | ScheduleResult::Rejected => {}
+                            }
+                        }
                     }
                     Inbound::Action(session, req) => {
                         saw_client_work = true;
@@ -1493,11 +1525,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         saw_client_work = true;
                         lj.on_baseline_ack(session, ack, &sim, &clients_for_sim, &mut motion);
                     }
-                    Inbound::Gone(session) => lj.on_gone(session),
+                    Inbound::Gone(session) => {
+                        pending_player_inputs.remove_session(session);
+                        lj.on_gone(session);
+                    }
                 }
             }
 
             lj.publish_ready_captures(&clients_for_sim);
+            let next_tick = spall_core::Tick(sim.current_tick().0.saturating_add(1));
+            for input in pending_player_inputs.take_due(next_tick) {
+                if !lj.session_expired(input.session) {
+                    sim.set_player_input(input.entity, input.input, input.seq);
+                }
+            }
             let report = match sim.tick() {
                 Ok(r) => r,
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
