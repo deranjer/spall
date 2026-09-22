@@ -40,6 +40,25 @@ transactions, `dormancy_deactivations_total: 1`,
 A sustained alternating G4 run with physics timing telemetry is still needed
 before changing the default; the default remains 120.
 
+## Bounded eight-client comparison after integration
+
+Two matched 60-second measured windows used eight clients, 10 ordinary edits/s,
+the same two structural cuts, 30 seconds of warmup, and 3,600 retained timing
+samples each. They are exploratory runs, not the 30-minute G4 soak.
+
+| Settle window | Committed / requested | Deactivations / reactivations | Tick p95 / p99 | Physics p95 |
+| ---: | ---: | ---: | ---: | ---: |
+| 120 ticks | 608 / 608 | 0 / 0 | 14.077 / 16.809 ms | 0.507 ms |
+| 20 ticks | 608 / 608 | 0 / 0 | 15.293 / 23.539 ms | 0.574 ms |
+
+Both timing windows completed, and replay, restart recovery, and client hashes
+agreed within each run. The configured timing verdict failed: tick p95 exceeded
+the 12 ms target in both runs, and tick p99 exceeded 16.7 ms. The shorter
+settle window did not improve cost in this lane. Detached bodies were not
+asleep at the end (maximum reported speed was 400 m/s), so neither run
+exercised the dormancy transition whose effect ENG-76 needs to measure. A
+representative sustained run with genuinely settled rubble remains required.
+
 ## Checks
 
 - `cargo test -p spall_sim dormancy --lib` — expected to cover the new cadence
