@@ -52,6 +52,8 @@ pub enum WorldError {
     Occupancy(#[from] spall_physics::ExtractError),
     #[error("no exact active collider for the body: {0}")]
     Collider(#[from] crate::collider::ColliderInfeasible),
+    #[error("brick coordinate {0:?} cannot be represented as a cell range")]
+    BrickCoordinateOverflow(BrickCoord),
     #[error("edit during replay failed: {0}")]
     Edit(#[from] spall_voxel::EditError),
     #[error("journal replay precondition failed: {0}")]
@@ -266,12 +268,30 @@ impl SimWorld {
     /// Exact occupancy for one resident brick. The fixed-size region means an
     /// evicted neighbour cannot turn this build into an accidental whole-world
     /// extraction or be treated as air.
-    fn plan_terrain_brick(
+    pub(crate) fn plan_terrain_brick(
         volume: &Volume,
         coord: BrickCoord,
     ) -> Result<Option<ColliderPlan>, WorldError> {
-        let min = GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32);
-        let max = GlobalCell::new(min.x + 31, min.y + 31, min.z + 31);
+        let Some(min_x) = coord.x.checked_mul(32) else {
+            return Err(WorldError::BrickCoordinateOverflow(coord));
+        };
+        let Some(min_y) = coord.y.checked_mul(32) else {
+            return Err(WorldError::BrickCoordinateOverflow(coord));
+        };
+        let Some(min_z) = coord.z.checked_mul(32) else {
+            return Err(WorldError::BrickCoordinateOverflow(coord));
+        };
+        let min = GlobalCell::new(min_x, min_y, min_z);
+        let Some(max_x) = min_x.checked_add(31) else {
+            return Err(WorldError::BrickCoordinateOverflow(coord));
+        };
+        let Some(max_y) = min_y.checked_add(31) else {
+            return Err(WorldError::BrickCoordinateOverflow(coord));
+        };
+        let Some(max_z) = min_z.checked_add(31) else {
+            return Err(WorldError::BrickCoordinateOverflow(coord));
+        };
+        let max = GlobalCell::new(max_x, max_y, max_z);
         let grid = OccupancyGrid::from_region(volume, min, max)?;
         if grid.solid_count() == 0 {
             return Ok(None);
@@ -328,7 +348,7 @@ impl SimWorld {
 
     /// Publishes one brick's derived collider. A missing entry gets a fresh
     /// fixed body; an empty/reloaded brick reuses its stable body slot.
-    fn publish_terrain_brick(&mut self, coord: BrickCoord, plan: Option<&ColliderPlan>) {
+    pub(crate) fn publish_terrain_brick(&mut self, coord: BrickCoord, plan: Option<&ColliderPlan>) {
         let existing = self
             .terrain_brick_colliders
             .as_ref()
@@ -438,6 +458,9 @@ impl SimWorld {
         let Some(colliders) = &self.terrain_brick_colliders else {
             return Ok(());
         };
+        if self.physics.has_collider(self.terrain.phys) {
+            return Err("per-brick terrain mode retained the whole-terrain collider".into());
+        }
         let volume = &self.terrain.volume;
         for coord in volume.resident_brick_coords() {
             let plan = Self::plan_terrain_brick(volume, coord).map_err(|e| e.to_string())?;
