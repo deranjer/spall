@@ -391,4 +391,117 @@ mod tests {
         // call for tick 5 is empty.
         assert_eq!(p.plan(5, &bodies, &[]), DormancyPlan::default());
     }
+
+    /// A compact in-process transition tracker used to sweep the existing
+    /// settle window against the measured terrain-edit cadence.  This models
+    /// the observable contract at the policy boundary: physics has put a body
+    /// to sleep between edits, and a terrain edit hard-wakes it only if it had
+    /// already become dormant.  It intentionally does not force a sleep or
+    /// bypass the policy's sleeping/speed guard.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct TransitionTracker {
+        dormant: bool,
+        deactivations: u32,
+        hard_reactivations: u32,
+        proximity_reactivations: u32,
+    }
+
+    impl TransitionTracker {
+        fn observe(&mut self, plan: &DormancyPlan, hard_wake: bool) {
+            for entity in &plan.deactivate {
+                assert_eq!(*entity, ent(1));
+                assert!(!self.dormant, "a body cannot be deactivated twice");
+                self.dormant = true;
+                self.deactivations += 1;
+            }
+            for entity in &plan.reactivate {
+                assert_eq!(*entity, ent(1));
+                assert!(self.dormant, "reactivation must follow dormancy");
+                self.dormant = false;
+                if hard_wake {
+                    self.hard_reactivations += 1;
+                } else {
+                    self.proximity_reactivations += 1;
+                }
+            }
+        }
+    }
+
+    /// The single-terrain-collider trace measured a median 28-tick sleep
+    /// interval between terrain edits.  A settle window above that interval
+    /// cannot reach dormancy; a smaller existing `settle_ticks` value can.
+    /// This is deliberately a policy-only sweep so it remains deterministic
+    /// and cheap enough for every CPU test run.
+    #[test]
+    fn settle_window_sweep_tolerates_periodic_terrain_wakes_without_forcing_sleep() {
+        const EDIT_PERIOD: u64 = 28;
+        const TICKS: u64 = EDIT_PERIOD * 4;
+        let run = |settle_ticks: u64| {
+            let mut config = cfg();
+            config.settle_ticks = settle_ticks;
+            // Ensure this sweep exercises the hard-wake path rather than the
+            // proximity path, even when the dormant minimum is large.
+            config.min_dormant_ticks = 10_000;
+            let mut policy = DormancyPolicy::new(config);
+            let mut tracker = TransitionTracker::default();
+
+            for tick in 1..=TICKS {
+                let edit = tick % EDIT_PERIOD == 0;
+                let body = BodyDormancyInput {
+                    entity: ent(1),
+                    centre_m: [50.0, 1.0, 50.0],
+                    radius_m: 0.5,
+                    // An edit wakes a live sleeping body in the solver; an
+                    // edit against dormant rubble is represented by hard_wake.
+                    sleeping: !edit,
+                    speed_m_s: 0.0,
+                    dormant: tracker.dormant,
+                    hard_wake: edit && tracker.dormant,
+                };
+                let plan = policy.plan(tick, &[body], &[]);
+                tracker.observe(&plan, edit);
+            }
+            tracker
+        };
+
+        let long = run(120);
+        assert_eq!(
+            long.deactivations, 0,
+            "120 ticks exceeds the 28-tick quiet interval"
+        );
+        assert_eq!(long.hard_reactivations, 0);
+        assert!(!long.dormant);
+
+        let short = run(20);
+        assert_eq!(
+            short.deactivations, 4,
+            "each complete quiet interval reaches dormancy"
+        );
+        assert_eq!(
+            short.hard_reactivations, 4,
+            "every terrain edit hard-wakes dormant rubble"
+        );
+        assert_eq!(
+            short.proximity_reactivations, 0,
+            "hysteresis must not bypass hard-wake accounting"
+        );
+        assert!(!short.dormant, "the final edit leaves the body live");
+    }
+
+    #[test]
+    fn settle_window_never_deactivates_a_moving_body_in_the_sweep() {
+        let mut config = cfg();
+        config.settle_ticks = 1;
+        let mut policy = DormancyPolicy::new(config);
+        let mut body = still_body(1, [50.0, 1.0, 50.0]);
+        body.sleeping = false;
+        body.speed_m_s = config.still_speed_m_s * 2.0;
+        for tick in 1..=100 {
+            let plan = policy.plan(tick, &[body], &[]);
+            assert!(
+                plan.deactivate.is_empty(),
+                "moving body deactivated at tick {tick}"
+            );
+        }
+    }
 }
