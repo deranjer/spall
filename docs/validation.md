@@ -211,8 +211,10 @@ mass, and renders local body poses while ignoring server pose corrections.
 Topology and voxel shapes still arrive from the server baseline/transactions;
 the flag is a single-client testing mode, not an alternate multiplayer
 authority model. Automated coverage in `spall_client::predict::body_collision_tests`
-checks local falling without server correction, both local emitter releases,
-and a player sweep moving a light body. Hands-on window feel/bounce remains a
+checks local falling without server pose correction, mass refresh after a
+server topology revision, both local emitter releases, and a player sweep
+moving a light body. `spall_client::window::input_tests` verifies that a local
+body pose reaches the render instances. Hands-on window feel/bounce remains a
 desktop UAT check.
 T20 (increment 1) adds opt-in per-client interest + motion bandwidth
 scheduling to the host: `sandbox-server --serve --motion-interest`

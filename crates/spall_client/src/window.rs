@@ -2227,6 +2227,44 @@ mod input_tests {
             assert_eq!(thin_axes, 2, "line dimensions were {dimensions:?}");
         }
     }
+
+    #[test]
+    fn locally_simulated_pose_reaches_body_render_instances() {
+        let now = Instant::now();
+        let draws = [BodyDraw {
+            entity: 7,
+            template: Arc::new(vec![Instance {
+                offset: [0.0, 0.0, 0.0],
+                color: [1.0, 0.0, 0.0],
+                scale: [1.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            }]),
+            translation_m: [2.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            net: None,
+        }];
+        let local_pose = crate::interactive::LocalPose {
+            translation_m: [8.0, 1.0, 3.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        };
+        let local = crate::interactive::LocalBodyPoses {
+            prev: Default::default(),
+            curr: [(7, local_pose)].into_iter().collect(),
+            curr_at: now,
+            step: Duration::from_millis(16),
+        };
+        let mut instances = Vec::new();
+        pose_body_instances(
+            &draws,
+            Some(&local),
+            now,
+            &mut PoseStats::default(),
+            &mut instances,
+        );
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].offset, [8.0, 1.0, 3.0]);
+    }
 }
 
 #[cfg(test)]

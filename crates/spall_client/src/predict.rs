@@ -344,6 +344,16 @@ impl ClientPhysics {
                     let representation = self.world.representation(existing.physics);
                     self.world
                         .rebuild_collider(existing.physics, &grid, representation);
+                    if self.client_authoritative {
+                        let mass_properties =
+                            analytic_mass_properties(&grid, volume.cell_size().metres(), |_| {
+                                2_000.0
+                            });
+                        self.world.set_mass_properties(
+                            existing.physics,
+                            mass_properties.to_body_properties(),
+                        );
+                    }
                     existing.grid = grid;
                     existing.topology_version = snapshot.topology_version;
                 }
@@ -1357,6 +1367,54 @@ mod body_collision_tests {
             (after_server_update[0] - locally_fallen[0]).abs() < 1.0e-5
                 && (after_server_update[1] - locally_fallen[1]).abs() < 1.0e-5,
             "server pose replaced local authority: before={locally_fallen:?} after={after_server_update:?}"
+        );
+    }
+
+    #[test]
+    fn client_authority_refreshes_mass_after_server_topology_update() {
+        let body = one_voxel_body(2);
+        let entity = EntityId::new(2).unwrap();
+        let initial_version = body.next_revision().get();
+        let mut physics = ClientPhysics::new();
+        physics.set_client_authoritative(true);
+        physics.sync_bodies(&[ClientBodyCollision {
+            entity,
+            topology_version: initial_version,
+            volume: Some(body.clone()),
+            pose: pose_at([0.0, 5.0, 0.0]),
+            motion: BodyMotion::STATIC,
+        }]);
+        let initial_mass = physics.local_body_poses();
+        let body_physics = physics.bodies[&entity.get()].physics;
+        let initial_mass_kg = physics.world.body_state(body_physics).mass_kg;
+
+        let mut expanded = body;
+        expanded
+            .apply_edit(&EditPlan::filled_box(
+                expanded.id(),
+                GlobalCell::new(1, 0, 0),
+                GlobalCell::new(1, 0, 0),
+                MaterialId(1),
+            ))
+            .unwrap();
+        let next_version = expanded.next_revision().get();
+        physics.sync_bodies(&[ClientBodyCollision {
+            entity,
+            topology_version: next_version,
+            volume: Some(expanded),
+            pose: pose_at([50.0, 50.0, 50.0]),
+            motion: BodyMotion::STATIC,
+        }]);
+
+        let updated_mass_kg = physics.world.body_state(body_physics).mass_kg;
+        assert!(
+            updated_mass_kg > initial_mass_kg,
+            "mass did not follow new server topology: {initial_mass_kg} -> {updated_mass_kg}"
+        );
+        let pose_after_topology_update = physics.local_body_poses()[&entity.get()].translation_m;
+        assert_eq!(
+            pose_after_topology_update,
+            initial_mass[&entity.get()].translation_m
         );
     }
 

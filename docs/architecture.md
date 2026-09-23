@@ -169,9 +169,10 @@ density), applies the 80 kg player push impulses locally, owns playground
 emitter timing, and supplies body poses directly to rendering. Server player
 and body motion continues as a shadow simulation but cannot correct the local
 runtime poses. Replicated topology remains the source of terrain and body voxel
-shapes; this mode does not transfer topology/edit authority and is never a
-multiplayer protocol mode. With the flag absent, the normal server-authoritative
-path above is unchanged.
+shapes; on a server topology revision, local mass/COM/inertia are recomputed
+from the new voxel grid as well. This mode does not transfer topology/edit
+authority and is never a multiplayer protocol mode. With the flag absent, the
+normal server-authoritative path above is unchanged.
 
 For a larger world, multiple independently rebased physics regions are necessary when players are far apart. Region merge/split and body transfer must be atomic and tested. A single origin following one player is not an acceptable multiplayer large-world solution. This is a G5 gate, not hidden work in the initial sandbox.
 
