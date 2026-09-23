@@ -4,10 +4,13 @@
 
 use std::sync::Arc;
 
+use glam::DQuat;
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
-use spall_core::{BrickCoord, EntityId, SphereBrush};
+use spall_core::{BrickCoord, CELLS_PER_BRICK, EntityId, LocalCell, SphereBrush};
 use spall_protocol::RequestId;
-use spall_sim::{EditIntent, EditTarget, MemoryBacking, Simulation, SimulationConfig, fixtures};
+use spall_sim::{
+    BodyPose, EditIntent, EditTarget, MemoryBacking, Simulation, SimulationConfig, fixtures,
+};
 
 /// Sever the seam column of `cross_brick_bridged_setup` — the brush writes cells
 /// in **both** brick `x = 0` and brick `x = 1`.
@@ -62,10 +65,275 @@ fn an_edit_that_needs_evicted_geometry_reloads_it_and_commits() {
         !sim.world().evicted(terrain).contains(victim),
         "the reloaded brick's digest was cleared"
     );
+    sim.world()
+        .validate_terrain_brick_colliders()
+        .expect("post-commit resident collision must be current");
     assert_eq!(
         sim.world().world_hash(),
         full_post_seam_cut_hash(),
         "reload-and-retry reached a different world than a fully resident run"
+    );
+
+    // The newly committed revision must survive a second residency cycle.
+    // Refresh the backing to that committed revision before evicting it again.
+    let backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
+    sim.world_mut().set_backing(Arc::new(backing));
+    let before_re_evict = sim.world().terrain_brick_collider_count();
+    assert!(sim.world_mut().evict_brick(terrain, victim).unwrap());
+    assert_eq!(
+        sim.world().terrain_brick_collider_count(),
+        before_re_evict - 1,
+        "re-eviction retires the current brick collider"
+    );
+    sim.world()
+        .validate_terrain_brick_colliders()
+        .expect("re-eviction leaves no old whole-terrain shape");
+    assert!(sim.world_mut().reload_brick(terrain, victim).unwrap());
+    sim.world()
+        .validate_terrain_brick_colliders()
+        .expect("second reload restores a collider for the committed revision");
+}
+
+#[test]
+fn emptying_terrain_retires_every_per_brick_collider() {
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
+    sim.world_mut().set_backing(Arc::new(backing));
+    let victim = BrickCoord::new(0, 0, 0);
+    assert!(sim.world_mut().evict_brick(terrain, victim).unwrap());
+    assert!(sim.world_mut().reload_brick(terrain, victim).unwrap());
+    assert!(sim.world().terrain_brick_colliders_enabled());
+    assert_eq!(sim.world().terrain_brick_collider_count(), 1);
+
+    let h = BRUSH_UNIT / 2;
+    let brush = SphereBrush::new(
+        BrushPoint::from_units(12 * BRUSH_UNIT + h, h, 12 * BRUSH_UNIT + h),
+        17 * BRUSH_UNIT,
+    )
+    .unwrap();
+    sim.submit(EditIntent::cut(
+        RequestId(2),
+        EntityId::new(1).unwrap(),
+        EditTarget::Terrain,
+        brush,
+    ))
+    .unwrap();
+    sim.run_until_idle(24).unwrap();
+
+    assert!(sim.committed(RequestId(2)).is_some());
+    assert_eq!(sim.world().total_solid_cells(), 0);
+    assert_eq!(sim.world().terrain_brick_collider_count(), 0);
+    sim.world()
+        .validate_terrain_brick_colliders()
+        .expect("empty terrain has neither brick shapes nor its old whole-terrain collider");
+}
+
+#[test]
+fn live_and_replayed_edits_install_equivalent_terrain_collision() {
+    let mut live =
+        Simulation::new(SimulationConfig::new(fixtures::cross_brick_bridged_setup())).unwrap();
+    let terrain = live.world().terrain_volume_id();
+    let backing = MemoryBacking::from_volume(&live.world().terrain().volume);
+    live.world_mut().set_backing(Arc::new(backing));
+    let victim = BrickCoord::new(1, 0, 0);
+    assert!(live.world_mut().evict_brick(terrain, victim).unwrap());
+    assert!(live.world_mut().reload_brick(terrain, victim).unwrap());
+    live.submit(seam_cut()).unwrap();
+    live.run_until_idle(48).unwrap();
+    live.world()
+        .validate_terrain_brick_colliders()
+        .expect("live edit collision is current");
+    let entry = live.journal().entries()[0].clone();
+
+    let mut replay =
+        Simulation::new(SimulationConfig::new(fixtures::cross_brick_bridged_setup())).unwrap();
+    let replay_terrain = replay.world().terrain_volume_id();
+    let backing = MemoryBacking::from_volume(&replay.world().terrain().volume);
+    replay.world_mut().set_backing(Arc::new(backing));
+    assert!(
+        replay
+            .world_mut()
+            .evict_brick(replay_terrain, victim)
+            .unwrap()
+    );
+    assert!(
+        replay
+            .world_mut()
+            .reload_brick(replay_terrain, victim)
+            .unwrap()
+    );
+    replay
+        .world_mut()
+        .replay_transaction(
+            &entry.transaction,
+            &entry.participants,
+            entry.bulk_baseline.as_ref(),
+        )
+        .expect("journalled edit replays into the brick collider representation");
+    replay
+        .world()
+        .validate_terrain_brick_colliders()
+        .expect("replayed edit collision is current");
+    assert_eq!(live.world().world_hash(), replay.world().world_hash());
+
+    // A body dropped onto the same surviving floor must observe equivalent
+    // collision in the live and replayed worlds, beyond matching metadata.
+    let drop_body = |sim: &mut Simulation| {
+        sim.world_mut()
+            .spawn_body(
+                fixtures::solid_block(1),
+                BodyPose::new(DQuat::IDENTITY, [6.0, 3.0, 0.5]),
+                [0.0; 3],
+                [0.0; 3],
+                2600.0,
+                0,
+            )
+            .unwrap()
+    };
+    let live_body = drop_body(&mut live);
+    let replay_body = drop_body(&mut replay);
+    for _ in 0..240 {
+        live.step_physics_only();
+        replay.step_physics_only();
+    }
+    let live_y = live.world().body(live_body).unwrap().pose.translation_m[1];
+    let replay_y = replay.world().body(replay_body).unwrap().pose.translation_m[1];
+    assert!(
+        live_y > 0.0,
+        "live collision did not support the dropped body: {live_y}"
+    );
+    assert!(
+        (live_y - replay_y).abs() < 1.0e-4,
+        "live {live_y} != replay {replay_y}"
+    );
+}
+
+#[test]
+fn terrain_collider_residency_tracks_eviction_and_reload_without_stale_shapes() {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
+    sim.world_mut().set_backing(Arc::new(backing));
+
+    let (victim, active) = sim
+        .world()
+        .terrain()
+        .volume
+        .resident_brick_coords()
+        .into_iter()
+        .filter_map(|coord| {
+            let snapshot = sim
+                .world()
+                .terrain()
+                .volume
+                .snapshot_brick(coord)
+                .ok()
+                .flatten()?;
+            let solid = (0..CELLS_PER_BRICK as u16).any(|index| {
+                !snapshot
+                    .get(LocalCell::from_linear_index(index).unwrap())
+                    .is_air()
+            });
+            solid.then_some(coord)
+        })
+        .map(|coord| {
+            let active = sim
+                .world()
+                .terrain()
+                .volume
+                .resident_brick_coords()
+                .into_iter()
+                .filter(|&candidate| {
+                    sim.world()
+                        .terrain()
+                        .volume
+                        .snapshot_brick(candidate)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|snapshot| {
+                            (0..CELLS_PER_BRICK as u16).any(|index| {
+                                !snapshot
+                                    .get(LocalCell::from_linear_index(index).unwrap())
+                                    .is_air()
+                            })
+                        })
+                })
+                .count();
+            (coord, active)
+        })
+        .next()
+        .expect("fixture has a resident solid terrain brick");
+    assert!(!sim.world().terrain_brick_colliders_enabled());
+    assert!(sim.world_mut().evict_brick(terrain, victim).unwrap());
+    assert!(sim.world().terrain_brick_colliders_enabled());
+    assert_eq!(
+        sim.world().terrain_brick_collider_count(),
+        active - 1,
+        "the evicted brick's derived collider was retired"
+    );
+    sim.world()
+        .validate_terrain_brick_colliders()
+        .expect("resident colliders match resident revisions");
+
+    assert!(sim.world_mut().reload_brick(terrain, victim).unwrap());
+    assert_eq!(
+        sim.world().terrain_brick_collider_count(),
+        active,
+        "reload reinstalls exactly the evicted brick collider"
+    );
+    sim.world()
+        .validate_terrain_brick_colliders()
+        .expect("reloaded collider matches the durable brick");
+}
+
+#[test]
+fn evicted_terrain_has_no_collision_until_its_durable_brick_reloads() {
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
+    sim.world_mut().set_backing(Arc::new(backing));
+    let victim = BrickCoord::new(0, 0, 0);
+    assert!(sim.world_mut().evict_brick(terrain, victim).unwrap());
+
+    let falling = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(1),
+            BodyPose::new(DQuat::IDENTITY, [1.0, 3.0, 1.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    for _ in 0..240 {
+        sim.step_physics_only();
+    }
+    assert!(
+        sim.world().body(falling).unwrap().pose.translation_m[1] < -2.0,
+        "evicted terrain retained a stale collision shape"
+    );
+
+    assert!(sim.world_mut().reload_brick(terrain, victim).unwrap());
+    let landed = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(1),
+            BodyPose::new(DQuat::IDENTITY, [1.0, 3.0, 1.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    for _ in 0..240 {
+        sim.step_physics_only();
+    }
+    assert!(
+        sim.world().body(landed).unwrap().pose.translation_m[1] > 0.0,
+        "reloaded terrain did not restore collision"
     );
 }
 

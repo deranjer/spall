@@ -124,6 +124,11 @@ pub enum DigestError {
         reloaded: Revision,
         reloaded_hash: BrickHash,
     },
+    /// The logical transition was valid, but derived physics could not be
+    /// rebuilt for the new resident geometry. The caller must keep the
+    /// digest / geometry transition unpublished.
+    #[error("resident collider rebuild failed: {0}")]
+    ColliderBuild(String),
     #[error("no retained digest for brick {0:?}")]
     NoRetained(BrickCoord),
 }

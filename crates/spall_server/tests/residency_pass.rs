@@ -20,6 +20,14 @@ const SCRIPT: &[(u64, [i64; 3], i64)] = &[
     (90, [90, 1, 75], 1),
 ];
 
+// A static supported floor patch used only by the checkpoint and dense-cap
+// fault-injection cases. The east-collapse beam is intentionally still active
+// and correctly pins its own terrain brick after the collision lifecycle fix;
+// targeting this quiet brick keeps the backing/admission assertions independent
+// of that active-body swept-collision policy.
+const CHECKPOINT_CELL: [i64; 3] = [44, 1, 70];
+const CHECKPOINT_BRICK: BrickCoord = BrickCoord::new(1, 0, 2);
+
 fn cut(req: u64, cell: [i64; 3], radius: i64) -> EditIntent {
     let h = BRUSH_UNIT / 2;
     let brush = SphereBrush::new(
@@ -43,6 +51,55 @@ fn sim() -> Simulation {
     let mut setup = fixtures::separated_regions_setup();
     setup.physics.disable_ccd = true;
     Simulation::new(SimulationConfig::new(setup)).unwrap()
+}
+
+fn checkpoint_sim() -> Simulation {
+    let mut setup = fixtures::separated_regions_setup();
+    let terrain = setup.terrain.id();
+    setup
+        .terrain
+        .apply_edit(&spall_voxel::EditPlan::filled_box(
+            terrain,
+            GlobalCell::new(32, 0, 64),
+            GlobalCell::new(55, 3, 79),
+            spall_core::MaterialId(1),
+        ))
+        .unwrap();
+    Simulation::new(SimulationConfig::new(setup)).unwrap()
+}
+
+fn run_checkpoint_script(
+    sim: &mut Simulation,
+    mut pass: Option<&mut ResidencyPass>,
+    player_feet: &[(u64, [f64; 3])],
+) {
+    let terrain = sim.world().terrain_volume_id();
+    for tick in 1..=20 {
+        if tick == 2 {
+            sim.submit(cut(1, CHECKPOINT_CELL, 1)).unwrap();
+        }
+        let report = sim.tick().unwrap();
+        if let Some(pass) = pass.as_deref_mut() {
+            for (_, done) in &report.committed {
+                let touched: Vec<BrickCoord> = done
+                    .topology
+                    .after
+                    .iter()
+                    .filter(|br| br.volume == terrain)
+                    .map(|br| br.coord)
+                    .collect();
+                pass.on_commit(sim.world(), touched);
+            }
+            pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+            pass.run(sim.world_mut(), player_feet, &Default::default());
+        }
+    }
+}
+
+fn run_checkpoint_without_residency() -> (Hash32, u64) {
+    let mut sim = checkpoint_sim();
+    run_checkpoint_script(&mut sim, None, &[]);
+    (sim.world().world_hash(), sim.world().total_solid_cells())
 }
 
 /// Committed `result_hashes`, in commit order, as `(volume raw, hash)` rows.
@@ -334,7 +391,7 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
         generator_version: 1,
     };
 
-    let mut sim = sim();
+    let mut sim = checkpoint_sim();
     let terrain = sim.world().terrain_volume_id();
     let backing = Arc::new(MemoryBacking::default());
     let mut pass = ResidencyPass::install_with_backing(
@@ -342,38 +399,20 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
         ResidencyLimits {
             budget_bricks: 4,
             max_dense_bytes: u64::MAX,
-            interest_radius_bricks: 1,
+            interest_radius_bricks: 0,
         },
         backing.clone(),
     );
-    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+    // Keep the interest centre between the structures with radius zero. The
+    // edited quiet patch is outside interest; active-body sweeps in the east
+    // collapse remain free to pin the beam's own brick.
+    let player_feet = [(1u64, [12.0_f64, 1.0, 12.0])];
+    run_checkpoint_script(&mut sim, Some(&mut pass), &player_feet);
 
-    let mut next = 0usize;
-    for tick in 1..=180u64 {
-        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
-            let (_, cell, r) = SCRIPT[next];
-            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
-            next += 1;
-        }
-        let report = sim.tick().unwrap();
-        for (_, done) in &report.committed {
-            let touched: Vec<BrickCoord> = done
-                .topology
-                .after
-                .iter()
-                .filter(|br| br.volume == terrain)
-                .map(|br| br.coord)
-                .collect();
-            pass.on_commit(sim.world(), touched);
-        }
-        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
-        pass.run(sim.world_mut(), &player_feet, &Default::default());
-    }
-
-    let evicted_coord = GlobalCell::new(82, 6, 75).split().0;
+    let evicted_coord = CHECKPOINT_BRICK;
     assert!(
         sim.world().evicted(terrain).contains(evicted_coord),
-        "the edited east brick must be evicted by end of run, or this test proves nothing"
+        "the edited quiet brick must be evicted by end of run, or this test proves nothing"
     );
     backing.mark_unavailable(terrain, evicted_coord);
 
@@ -396,19 +435,13 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
 /// other side of a merge) reintroduced the unverified read on the
 /// cache-**miss** path without this test noticing: it originally picked
 /// `evicted(...).iter().next()` — the lexicographically-first evicted coord —
-/// which, for this fixture's script, happens to be a brick nothing ever
-/// edited. Its digest revision therefore still equals the revision
-/// `ResidencyPass::install_with_backing` cached for it at install time
-/// (before anything was evicted), so `capture_checkpoint` took the cache
-/// **hit** branch and never read the forged backing record at all — the test
-/// passed for the wrong reason and the missing verification went
-/// unnoticed. Fixed by deliberately picking the evicted coord with the
-/// *highest* retained revision: the script's far-away cuts (`SCRIPT`, cells
-/// `[82, 6, 75]` and `[90, 1, 75]`) touch bricks well outside the player's
-/// residency interest box, so the highest-revision evicted brick is
-/// guaranteed to be one of those edited bricks — its revision changed after
-/// install, so its cache entry is stale and this checkpoint call must
-/// actually read (and now verify) the backing.
+/// which, for this fixture's script, happened to be a brick nothing ever
+/// edited. Its digest revision therefore still equalled the revision cached
+/// at install. The east collapse also creates an awake detached body whose
+/// swept collision footprint correctly pins the east brick with the fixed
+/// collider path. This test uses a small edited floor patch in quiet brick
+/// `(1, 0, 2)`, outside both player interest and the east body's sweep, so the
+/// actual cache-miss backing read remains under test.
 ///
 /// The audit's second half — proving reuse of an *unchanged* cached record
 /// stays safe — is the companion test immediately below,
@@ -423,7 +456,7 @@ fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_r
         generator_version: 1,
     };
 
-    let mut sim = sim();
+    let mut sim = checkpoint_sim();
     let terrain = sim.world().terrain_volume_id();
     let backing = Arc::new(MemoryBacking::default());
     let mut pass = ResidencyPass::install_with_backing(
@@ -431,40 +464,21 @@ fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_r
         ResidencyLimits {
             budget_bricks: 4,
             max_dense_bytes: u64::MAX,
-            interest_radius_bricks: 1,
+            interest_radius_bricks: 0,
         },
         backing.clone(),
     );
     let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+    run_checkpoint_script(&mut sim, Some(&mut pass), &player_feet);
 
-    let mut next = 0usize;
-    for tick in 1..=180u64 {
-        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
-            let (_, cell, r) = SCRIPT[next];
-            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
-            next += 1;
-        }
-        let report = sim.tick().unwrap();
-        for (_, done) in &report.committed {
-            let touched: Vec<BrickCoord> = done
-                .topology
-                .after
-                .iter()
-                .filter(|br| br.volume == terrain)
-                .map(|br| br.coord)
-                .collect();
-            pass.on_commit(sim.world(), touched);
-        }
-        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
-        pass.run(sim.world_mut(), &player_feet, &Default::default());
-    }
-
-    let (evicted_coord, retained_digest) = sim
+    let evicted_coord = CHECKPOINT_BRICK;
+    let retained_digest = sim
         .world()
         .evicted(terrain)
         .iter()
-        .max_by_key(|(_, digest)| digest.revision.get())
-        .expect("the run must still have evicted terrain, or this test proves nothing");
+        .find(|(coord, _)| *coord == evicted_coord)
+        .map(|(_, digest)| digest)
+        .expect("the edited quiet brick must still be evicted");
     assert!(
         retained_digest.revision.get() > 1,
         "the picked coord must actually have been edited (and therefore differ from its \
@@ -1008,53 +1022,30 @@ fn a_players_swept_path_pins_a_brick_it_crosses_even_past_the_settle_window() {
 /// completely unaffected by whether that brick happens to be resident.
 #[test]
 fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budget() {
-    let (off_hash, off_solid, _) = run_without_residency();
+    let (off_hash, off_solid) = run_checkpoint_without_residency();
 
-    let mut sim = sim();
+    let mut sim = checkpoint_sim();
     let terrain = sim.world().terrain_volume_id();
     let mut pass = ResidencyPass::install(
         sim.world_mut(),
         ResidencyLimits {
             budget_bricks: 100,
             max_dense_bytes: u64::MAX,
-            interest_radius_bricks: 1,
+            interest_radius_bricks: 0,
         },
     );
     let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])]; // stationary west
-    let east = GlobalCell::new(82, 6, 75).split().0;
-
-    // Run the full script so the east cut actually materialises east's brick
-    // as `Dense`, then let ordinary west-only-interest hysteresis evict it.
-    let mut next = 0usize;
-    for tick in 1..=180u64 {
-        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
-            let (_, cell, r) = SCRIPT[next];
-            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
-            next += 1;
-        }
-        let report = sim.tick().unwrap();
-        for (_, done) in &report.committed {
-            let touched: Vec<BrickCoord> = done
-                .topology
-                .after
-                .iter()
-                .filter(|br| br.volume == terrain)
-                .map(|br| br.coord)
-                .collect();
-            pass.on_commit(sim.world(), touched);
-        }
-        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
-        pass.run(sim.world_mut(), &player_feet, &Default::default());
-    }
+    let target = CHECKPOINT_BRICK;
+    run_checkpoint_script(&mut sim, Some(&mut pass), &player_feet);
     assert!(
-        sim.world().evicted(terrain).contains(east),
-        "east must be evicted by the end of the run, or this test proves nothing"
+        sim.world().evicted(terrain).contains(target),
+        "the edited quiet brick must be evicted by the end of the run, or this test proves nothing"
     );
     assert_eq!(sim.world().world_hash(), off_hash);
     assert_eq!(sim.world().total_solid_cells(), off_solid);
 
     // Tighten the dense-byte cap to exactly the current resident total --
-    // zero headroom for east's dense brick to come back -- and give a small
+    // zero headroom for the quiet dense brick to come back -- and give a small
     // interest radius, matching an ordinary walking approach rather than a
     // teleport (a single large jump would swept-pin the whole path as
     // *required*, which must never be admission-limited -- see
@@ -1065,10 +1056,10 @@ fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budg
     limits.interest_radius_bricks = 1;
     pass.set_limits(limits);
 
-    // Walk a second player toward (but not physically into) east's own brick
+    // Walk a second player toward (but not physically into) the quiet brick
     // in small steps, stopping one brick short -- close enough for ordinary
-    // proximity `interest` (radius 1) to *want* east back, but never crossing
-    // into it, so the swept-collision path never itself needs to treat east
+    // proximity `interest` (radius 1) to *want* it back, but never crossing
+    // into it, so the swept-collision path never itself needs to treat it
     // as *required* (that is
     // `a_players_swept_path_pins_a_brick_it_crosses_even_past_the_settle_window`'s
     // job; this test isolates the plain interest-driven admission path). A
@@ -1078,7 +1069,7 @@ fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budg
     let west_player = 1u64;
     let walker = 2u64;
     let west = [1.0_f64, 1.0, 1.0];
-    let goal = [12.5_f64, 1.5, 18.75]; // one brick short of east, in range
+    let goal = [12.5_f64, 1.5, 12.5]; // one brick short of the target, in range
     let steps = 40;
     let mut deferred = 0u64;
     for i in 1..=steps {
@@ -1100,7 +1091,7 @@ fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budg
         "the tight dense-byte cap must have deferred at least one admission"
     );
     assert!(
-        sim.world().evicted(terrain).contains(east),
+        sim.world().evicted(terrain).contains(target),
         "a deferred reload must leave the brick evicted, not admit it over budget"
     );
     // Logical topology is completely unaffected by residency placement.
@@ -1116,7 +1107,7 @@ fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budg
         &Default::default(),
     );
     assert!(
-        !sim.world().evicted(terrain).contains(east),
+        !sim.world().evicted(terrain).contains(target),
         "once the cap has headroom, the previously deferred reload must succeed"
     );
 }

@@ -626,6 +626,13 @@ impl PhysicsWorld {
         self.pending_removed.push(collider);
     }
 
+    /// Whether `id` currently has an attached collider in Rapier.
+    pub fn has_collider(&self, id: BodyId) -> bool {
+        self.entries
+            .get(id.0 as usize)
+            .is_some_and(|entry| !entry.retired && self.colliders.contains(entry.collider))
+    }
+
     /// Excludes `id`'s collider from ever producing a rigid-body **solver**
     /// response — no dynamic body colliding with it is pushed, slowed, or
     /// stopped by it, ever, regardless of either side's own collision groups
