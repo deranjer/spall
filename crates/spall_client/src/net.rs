@@ -1789,6 +1789,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             p.recent.iter().rev().take(3).copied().collect();
                         p.recent.push_back(RecentInput {
                             input_seq: seq,
+                            intended_tick,
                             movement: input.movement,
                             view_dir: input.view_dir,
                             buttons: input.buttons,

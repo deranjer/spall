@@ -206,8 +206,9 @@ mod tests {
             journal_seq: JournalSeq(300),
         };
         let bytes = encode_control(&record).unwrap();
-        // header: schema=1, tag=11 (DurableThrough); body: postcard varint of 300 = 0xAC 0x02
-        assert_eq!(bytes, [0x01, 0x00, 0x0B, 0x00, 0xAC, 0x02]);
+        // header: schema=2 (bumped for RecentInput.intended_tick, ENG-86),
+        // tag=11 (DurableThrough); body: postcard varint of 300 = 0xAC 0x02
+        assert_eq!(bytes, [0x02, 0x00, 0x0B, 0x00, 0xAC, 0x02]);
         let back: DurableThrough = decode_control(&bytes).unwrap();
         assert_eq!(back, record);
     }

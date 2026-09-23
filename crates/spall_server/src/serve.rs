@@ -52,7 +52,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::baseline::{self, BaselineTransfer};
 use crate::commit_latency::{self, CommitLatency};
-use crate::input_schedule::{PlayerInputSchedule, ScheduleResult};
+use crate::input_schedule::PlayerInputSchedule;
 use crate::persist::{self, PersistConfig};
 use crate::persist_pipeline::{PersistPipeline, PipelineConfig};
 
@@ -1397,39 +1397,38 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             continue;
                         }
                         let entity = session_player_entity(session);
-                        // Recover unseen redundant copies immediately. A copy
-                        // already queued for its intended future tick must not
-                        // be applied early simply because the next datagram
-                        // carries it again.
+                        // Recover unseen redundant copies through the same
+                        // admission rule as the primary input below. A copy
+                        // carries its own intended_tick, so recovering one
+                        // that was dropped as a primary datagram still lands
+                        // on the tick it was tagged for -- applying it
+                        // immediately here would reproduce the whole-tick
+                        // edge snap this scheduling exists to remove, in
+                        // exactly the case (a dropped datagram) the
+                        // redundancy is for.
                         for r in frame.recent.iter().rev() {
-                            if !pending_player_inputs.contains(session, r.input_seq) {
-                                sim.set_player_input(entity, recent_input(r), r.input_seq);
-                            }
-                        }
-                        if sim
-                            .player_acked_input(entity)
-                            .is_none_or(|acked| frame.input_seq.0 > acked.0)
-                        {
-                            let (result, _) = pending_player_inputs.schedule(
+                            if let Some(input) = pending_player_inputs.admit(
                                 session,
                                 entity,
-                                frame_input(&frame),
-                                frame.input_seq,
-                                frame.intended_tick,
+                                recent_input(r),
+                                r.input_seq,
+                                r.intended_tick,
                                 sim.current_tick(),
-                            );
-                            match result {
-                                ScheduleResult::Immediate => {
-                                    sim.set_player_input(
-                                        entity,
-                                        frame_input(&frame),
-                                        frame.input_seq,
-                                    );
-                                }
-                                ScheduleResult::Queued
-                                | ScheduleResult::Duplicate
-                                | ScheduleResult::Rejected => {}
+                                sim.player_acked_input(entity),
+                            ) {
+                                sim.set_player_input(entity, input, r.input_seq);
                             }
+                        }
+                        if let Some(input) = pending_player_inputs.admit(
+                            session,
+                            entity,
+                            frame_input(&frame),
+                            frame.input_seq,
+                            frame.intended_tick,
+                            sim.current_tick(),
+                            sim.player_acked_input(entity),
+                        ) {
+                            sim.set_player_input(entity, input, frame.input_seq);
                         }
                     }
                     Inbound::Action(session, req) => {

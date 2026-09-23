@@ -46,6 +46,37 @@ impl PlayerInputSchedule {
             || self.superseded.contains(&(session.raw(), seq.0))
     }
 
+    /// The single admission rule shared by a frame's primary input and each
+    /// of its redundant "recent" copies: skip anything this queue already
+    /// tracks (`contains`) or that is not newer than what the sim has
+    /// already accepted (`acked`), then hand everything else to
+    /// [`Self::schedule`]. Returns `Some(input)` only when it is due this
+    /// tick and the caller must apply it to the sim itself; every other
+    /// outcome (queued, duplicate, rejected, already tracked, stale) is
+    /// `None` and needs no further action from the caller.
+    ///
+    /// Recovering a redundant copy through this same path (instead of
+    /// applying it immediately) is what keeps a dropped primary datagram's
+    /// input pinned to its own `intended_tick` rather than snapping onto
+    /// whichever tick happens to be next when the copy is finally seen.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit(
+        &mut self,
+        session: SessionId,
+        entity: EntityId,
+        input: PlayerInput,
+        seq: InputSeq,
+        intended_tick: Tick,
+        current_tick: Tick,
+        acked: Option<InputSeq>,
+    ) -> Option<PlayerInput> {
+        if self.contains(session, seq) || acked.is_some_and(|acked| seq.0 <= acked.0) {
+            return None;
+        }
+        let (result, _) = self.schedule(session, entity, input, seq, intended_tick, current_tick);
+        (result == ScheduleResult::Immediate).then_some(input)
+    }
+
     pub fn schedule(
         &mut self,
         session: SessionId,
@@ -178,6 +209,113 @@ mod tests {
         assert_eq!(applied[0].seq, InputSeq(11));
         assert_eq!(applied[0].input.movement[2], -1.0);
         assert!(!queue.contains(session, InputSeq(11)));
+    }
+
+    #[test]
+    fn a_recovered_redundant_copy_of_a_lost_primary_lands_on_its_own_intended_tick() {
+        let session = session(1);
+        let player = player_entity_for(2);
+        let mut queue = PlayerInputSchedule::default();
+        // Seq 11's own primary datagram never arrived; it is only recovered
+        // from a later datagram's "recent" copies, carrying the same
+        // intended_tick the primary would have. Admitting it must schedule
+        // it against that tick, not apply it on whatever tick is next --
+        // that immediate-apply is exactly the whole-tick edge snap this
+        // scheduling exists to remove, and it is precisely the packet-loss
+        // case the redundant-copy mechanism exists for.
+        let admitted = queue.admit(
+            session,
+            player,
+            player_input(-1.0),
+            InputSeq(11),
+            Tick(104),
+            Tick(100),
+            None,
+        );
+        assert_eq!(
+            admitted, None,
+            "a future-tick recovery must not be applied immediately"
+        );
+        assert!(queue.take_due(Tick(103)).is_empty());
+        let due = queue.take_due(Tick(104));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].seq, InputSeq(11));
+        assert_eq!(due[0].tick, Tick(104));
+        assert_eq!(due[0].input.movement[2], -1.0);
+    }
+
+    #[test]
+    fn admit_applies_a_next_tick_recovery_immediately_like_a_primary_frame() {
+        let session = session(1);
+        let player = player_entity_for(2);
+        let mut queue = PlayerInputSchedule::default();
+        // A recovered copy whose intended_tick has already arrived (a
+        // stale/late redundant copy) behaves exactly like an ordinary
+        // next-tick primary frame: the caller applies it right away.
+        let admitted = queue.admit(
+            session,
+            player,
+            player_input(1.0),
+            InputSeq(5),
+            Tick(50),
+            Tick(100),
+            None,
+        );
+        assert_eq!(admitted, Some(player_input(1.0)));
+    }
+
+    #[test]
+    fn admit_skips_a_copy_already_tracked_or_already_applied() {
+        let session = session(1);
+        let player = player_entity_for(2);
+        let mut queue = PlayerInputSchedule::default();
+        assert!(
+            queue
+                .admit(
+                    session,
+                    player,
+                    player_input(1.0),
+                    InputSeq(11),
+                    Tick(104),
+                    Tick(100),
+                    None,
+                )
+                .is_none()
+        );
+        // Already tracked by this queue: a second recovery of the same seq
+        // (e.g. it rides along in more than one later datagram) does not
+        // re-admit it.
+        assert!(
+            queue
+                .admit(
+                    session,
+                    player,
+                    player_input(1.0),
+                    InputSeq(11),
+                    Tick(104),
+                    Tick(100),
+                    None,
+                )
+                .is_none()
+        );
+        assert_eq!(queue.take_due(Tick(104)).len(), 1);
+        // Already applied: the sim's acked seq has moved past it, so
+        // recovering the same seq again is a no-op rather than re-injecting
+        // stale input after it has already run.
+        assert!(
+            queue
+                .admit(
+                    session,
+                    player,
+                    player_input(1.0),
+                    InputSeq(11),
+                    Tick(104),
+                    Tick(105),
+                    Some(InputSeq(11)),
+                )
+                .is_none()
+        );
+        assert!(queue.take_due(Tick(105)).is_empty());
     }
 
     #[test]
