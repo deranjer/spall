@@ -1,0 +1,27 @@
+{
+  "name": "g4-dormancy-settle-120",
+  "description": "ENG-75/76/79 representative rubble-lane measurement: t23-g4-soak-2min's real g4-workload scene/rates (8 late-join clients, 256 active + 4096 sleeping debris, 10 edits/s + one 4m blast/10s) with dormancy enabled at the unchanged 120-tick default settle window and a server_timing window covering the same 30s-warmup / 2-minute-measured split, so tick p95/p99 and physics p95 are measured under a workload where the debris population genuinely lands (g4_workload_setup's debris floors) instead of the non-representative short exploratory runs (0/0 dormancy transitions, debris never landed).",
+  "scene": "g4-workload",
+  "release_profile": true,
+  "server_ticks": 9300,
+  "quiescence_ticks": 250,
+  "clients": 8,
+  "late_join_clients": [0, 1, 2, 3, 4, 5, 6, 7],
+  "late_join_connect_delay_ms": 200,
+  "minimum_transactions": 1212,
+  "replay_check": true,
+  "restart_check": true,
+  "cuts": [],
+  "sustained_edits": {
+    "start_tick": 1800,
+    "small_rate_per_sec": 10.0,
+    "blast_interval_sec": 10.0,
+    "trailing_buffer_ticks": 300
+  },
+  "dormancy": true,
+  "server_timing": {
+    "warmup_ticks": 1800,
+    "measured_ticks": 7200,
+    "max_samples": 7200
+  }
+}
