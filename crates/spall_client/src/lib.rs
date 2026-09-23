@@ -215,7 +215,9 @@ struct Renderer {
 
 impl Renderer {
     fn new(window: Arc<Window>) -> Result<Self, ClientError> {
-        let instance = wgpu::Instance::default();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
+            Box::new(window.clone()),
+        ));
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| ClientError::Gpu(error.to_string()))?;
@@ -223,17 +225,16 @@ impl Renderer {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
+            ..Default::default()
         }))
-        .ok_or_else(|| ClientError::Gpu("no compatible GPU adapter".into()))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("spall-client-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        .map_err(|error| ClientError::Gpu(error.to_string()))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("spall-client-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            ..Default::default()
+        }))
         .map_err(|error| ClientError::Gpu(error.to_string()))?;
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
@@ -251,6 +252,7 @@ impl Renderer {
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: capabilities.alpha_modes[0],
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -275,13 +277,24 @@ impl Renderer {
 
     fn render(&mut self) -> Result<bool, ClientError> {
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                self.surface.configure(&self.device, &self.surface_config);
+                drop(frame);
+                return Ok(false);
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
                 return Ok(false);
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(false),
-            Err(error) => return Err(ClientError::Render(error.to_string())),
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(false);
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(ClientError::Render(
+                    "surface acquisition validation error".into(),
+                ));
+            }
         };
         let view = frame
             .texture
@@ -306,14 +319,16 @@ impl Renderer {
                         }),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None,
             });
         }
         self.queue.submit([encoder.finish()]);
-        frame.present();
+        self.queue.present(frame);
         Ok(true)
     }
 }

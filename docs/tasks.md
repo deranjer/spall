@@ -375,6 +375,14 @@ Implement an AssetDatabase and an EditorCommand-based undo/redo layer before UI 
 
 Accept: commands are the sole mutation route and undo/redo restores entity and voxel edits; saving/reloading preserves stable references; a created voxel asset can be assigned to an entity and persisted with a scene; the editor opens as a native window and can launch the real sandbox runtime. CPU tests cover document round-trips and command invariants; graphical interaction is a separate hands-on check.
 
+### ENG-89 — wgpu 30 and Yakui HUD migration (user-authorized follow-up)
+
+Dependencies: current renderer and ENG-74 editor. Own: workspace GPU/UI dependency pins, `spall_render`, `spall_client`, `tools/spall_editor`, the local rendering proof of concept, and dependency/validation documentation. Keep Yakui crates on one exact upstream revision and keep editor egui crates compatible with the workspace wgpu types.
+
+Port instance/device/surface setup, pipelines, passes, polling, shader tooling, editor integration, and local proof of concept to wgpu 30. Integrate Yakui into the existing live client device and frame, including input/DPI/resize handling and CPU/GPU HUD timing where the adapter supports timestamps. Preserve rendering across surface loss and resize. Do not use Yakui's standalone application window as the client integration.
+
+Accept: `cargo tree -d` shows one wgpu/Naga line for application rendering and matching egui-wgpu; `cargo xtask check`, `cargo xtask smoke --graphical`, the G2 captures, the release G1 bounded run, and `cargo run -p spall_editor` complete. Inspect captures and the live HUD on D3D12 and Vulkan hardware; record frame/HUD CPU/GPU measurements against the pre-migration baseline. Hardware checks unavailable in the current environment must be recorded as unrun rather than inferred from compilation.
+
 ## Assignment template
 
 ```text

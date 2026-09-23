@@ -457,8 +457,8 @@ impl IndirectPipeline {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("spall-t13-indirect-pipeline-layout"),
-            bind_group_layouts: &[&compute_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&compute_layout)],
+            immediate_size: 0,
         });
         let make = |label, entry| {
             crate::probe::mark(&format!(

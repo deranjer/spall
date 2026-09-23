@@ -153,11 +153,12 @@ impl GpuTimer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        ctx.wait();
+        ctx.wait().ok()?;
         rx.recv().ok()?.ok()?;
         let ticks: Vec<u64> = {
             let mapped = slice.get_mapped_range();
-            bytemuck::cast_slice::<u8, u64>(&mapped).to_vec()
+            bytemuck::cast_slice::<u8, u64>(&mapped.map_err(|_| RenderError::Readback).ok()?)
+                .to_vec()
         };
         self.readback.unmap();
         Some(
@@ -241,6 +242,7 @@ pub fn capture_scene(
             }),
             timestamp_writes,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(pipeline.shadow());
         pass.set_bind_group(0, &bind, &[]);
@@ -289,6 +291,7 @@ pub fn capture_scene(
                         }),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: target.depth_view(),
@@ -300,6 +303,7 @@ pub fn capture_scene(
                 }),
                 timestamp_writes,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(pipeline.opaque());
             pass.set_bind_group(0, &scene_bind, &[]);
@@ -317,10 +321,12 @@ pub fn capture_scene(
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(pipeline.tone_map());
             pass.set_bind_group(0, &tone_bind, &[]);
@@ -345,7 +351,7 @@ pub fn capture_scene(
         encode_millis += encode_start.elapsed().as_secs_f64() * 1000.0;
         images.push(CaptureImage { view, path });
     }
-    ctx.wait();
+    ctx.wait()?;
     let cpu_total_millis = loop_start.elapsed().as_secs_f64() * 1000.0;
 
     let gpu_passes = gpu_timer
@@ -587,6 +593,7 @@ pub fn capture_lighting_sequence(
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(pipeline.shadow());
         pass.set_bind_group(0, &bind, &[]);
@@ -648,6 +655,7 @@ pub fn capture_lighting_sequence(
                         }),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: target.depth_view(),
@@ -659,6 +667,7 @@ pub fn capture_lighting_sequence(
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(pipeline.opaque());
             pass.set_bind_group(0, &scene_bind, &[]);
@@ -675,10 +684,12 @@ pub fn capture_lighting_sequence(
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(pipeline.tone_map());
             pass.set_bind_group(0, &tone_bind, &[]);
@@ -686,7 +697,7 @@ pub fn capture_lighting_sequence(
         }
         target.copy_to_readback(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
-        ctx.wait();
+        ctx.wait()?;
 
         let rgba = target.read_rgba(ctx)?;
         let luminance = band_luminance(&rgba, target.width, target.height, band);
@@ -1206,6 +1217,7 @@ pub fn capture_frame_loop(
             }),
             timestamp_writes,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(pipeline.shadow());
         pass.set_bind_group(0, &bind, &[]);
@@ -1303,6 +1315,7 @@ pub fn capture_frame_loop(
                         }),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: target.depth_view(),
@@ -1314,6 +1327,7 @@ pub fn capture_frame_loop(
                 }),
                 timestamp_writes,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(pipeline.opaque());
             pass.set_bind_group(0, &scene_bind, &[]);
@@ -1331,10 +1345,12 @@ pub fn capture_frame_loop(
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(pipeline.tone_map());
             pass.set_bind_group(0, &tone_bind, &[]);
@@ -1618,6 +1634,7 @@ pub fn capture_motion_sequence(
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(pipeline.shadow());
         pass.set_bind_group(0, &bind, &[]);
@@ -1804,6 +1821,7 @@ fn render_motion_frame(
                     }),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: target.depth_view(),
@@ -1815,6 +1833,7 @@ fn render_motion_frame(
             }),
             timestamp_writes,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(pipeline.opaque());
         pass.set_bind_group(0, &scene_bind, &[]);
@@ -1832,10 +1851,12 @@ fn render_motion_frame(
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(pipeline.tone_map());
         pass.set_bind_group(0, tone_bind, &[]);
@@ -2030,6 +2051,7 @@ pub fn capture_collapse_sequence(
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(pipeline.shadow());
         pass.set_bind_group(0, &bind, &[]);

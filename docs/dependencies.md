@@ -18,7 +18,8 @@ manifests. Cargo may select compatible patch releases only by updating
 | thiserror | 2.0.20 | default features | `MIT OR Apache-2.0` | typed host/harness errors |
 | tracing | 0.1.44 | default features | `MIT` | sandbox process diagnostics |
 | tracing-subscriber | 0.3.23 | `env-filter`; default features | `MIT` | `RUST_LOG` subscriber |
-| wgpu | 24.0.5 | default features | `MIT OR Apache-2.0` | clear-only native surface render |
+| wgpu | 30.0.1 | default features | `MIT OR Apache-2.0` | renderer, native surface and GPU captures |
+| naga | 30.0.1 | WGSL input, SPIR-V output | `MIT OR Apache-2.0` | direct shader validation and SPIR-V probe |
 | winit | 0.30.13 | default features | `Apache-2.0` | native window, resize, close event loop |
 
 Only the client package imports wgpu/winit. `sandbox-client` requires the
@@ -33,10 +34,20 @@ The editor is a leaf workspace package (`tools/spall_editor`). Its egui integrat
 
 | Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by ENG-74 |
 | --- | ---: | --- | --- | --- |
-| egui | 0.31.1 | default features | `MIT OR Apache-2.0` | panels, menus, inspectors and voxel controls |
-| egui-wgpu | 0.31.1 | default features | `MIT OR Apache-2.0` | compositing the editor UI on the native surface |
-| egui-winit | 0.31.1 | default features | `MIT OR Apache-2.0` | native input/window event translation |
+| egui | 0.36.2 | default features | `MIT OR Apache-2.0` | panels, menus, inspectors and voxel controls |
+| egui-wgpu | 0.36.2 | default features | `MIT OR Apache-2.0` | compositing the editor UI on the native surface |
+| egui-winit | 0.36.2 | default features | `MIT OR Apache-2.0` | native input/window event translation |
+| yakui, yakui-wgpu, yakui-winit | 0.3.0 (Git `d4cba2dabc2a201162ed105cf547ca95a26c44f3`) | workspace Git revision | `MIT OR Apache-2.0` | in-frame interactive client HUD |
 | ron | 0.10.1 | default features | `MIT OR Apache-2.0` | versioned human-readable project, scene and voxel documents |
+
+## ENG-89 — renderer and HUD migration (verified 2026-09-23)
+
+The workspace now resolves wgpu and Naga to 30.0.1, the editor's egui crates
+to 0.36.2, and all three Yakui crates to 0.3.0 from one Git revision
+(`d4cba2dabc2a201162ed105cf547ca95a26c44f3`). `cargo tree -d` shows the
+matching renderer versions. Yakui uses the existing interactive client's
+device, queue, surface, and frame; it does not create a second application
+window.
 
 ## T01 — IDs, schemas, canonical encoding (verified 2026-09-06)
 

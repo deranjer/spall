@@ -58,11 +58,14 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 bytemuck = { version = "1.23", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "0.4.0"
-wgpu = "24.0.5"
+wgpu = "=30.0.1"
 winit = "0.30.12"
-egui = "0.31.1"
-egui-wgpu = "0.31.1"
-egui-winit = "0.31.1"
+egui = "=0.36.2"
+egui-wgpu = "=0.36.2"
+egui-winit = "=0.36.2"
+yakui = { git = "https://github.com/SecondHalfGames/yakui", rev = "d4cba2dabc2a201162ed105cf547ca95a26c44f3" }
+yakui-wgpu = { git = "https://github.com/SecondHalfGames/yakui", rev = "d4cba2dabc2a201162ed105cf547ca95a26c44f3" }
+yakui-winit = { git = "https://github.com/SecondHalfGames/yakui", rev = "d4cba2dabc2a201162ed105cf547ca95a26c44f3" }
 ron = "0.10.1"
 
 [profile.dev]

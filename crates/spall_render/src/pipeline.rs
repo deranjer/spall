@@ -511,8 +511,8 @@ fn create_opaque_pipeline(
 ) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("spall-t12-opaque-layout"),
-        bind_group_layouts: &[layout, indirect_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(layout), Some(indirect_layout)],
+        immediate_size: 0,
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("spall-t12-opaque-pipeline"),
@@ -520,14 +520,14 @@ fn create_opaque_pipeline(
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_main"),
-            buffers: &[GpuVertex::LAYOUT],
+            buffers: &[Some(GpuVertex::LAYOUT)],
             compilation_options: Default::default(),
         },
         primitive: opaque_primitive(),
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: Default::default(),
             bias: Default::default(),
         }),
@@ -542,7 +542,7 @@ fn create_opaque_pipeline(
             })],
             compilation_options: Default::default(),
         }),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -554,8 +554,8 @@ fn create_shadow_pipeline(
 ) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("spall-shadow-layout"),
-        bind_group_layouts: &[layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("spall-shadow-pipeline"),
@@ -563,14 +563,14 @@ fn create_shadow_pipeline(
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_main"),
-            buffers: &[GpuVertex::LAYOUT],
+            buffers: &[Some(GpuVertex::LAYOUT)],
             compilation_options: Default::default(),
         },
         primitive: opaque_primitive(),
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: Default::default(),
             bias: wgpu::DepthBiasState {
                 constant: 2,
@@ -580,7 +580,7 @@ fn create_shadow_pipeline(
         }),
         multisample: Default::default(),
         fragment: None,
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -592,8 +592,8 @@ fn create_tone_pipeline(
 ) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("spall-tone-layout"),
-        bind_group_layouts: &[layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("spall-tone-pipeline"),
@@ -620,7 +620,7 @@ fn create_tone_pipeline(
             })],
             compilation_options: Default::default(),
         }),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }

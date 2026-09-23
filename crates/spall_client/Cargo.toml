@@ -20,6 +20,9 @@ winit.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
 pollster = "0.4.0"
+yakui.workspace = true
+yakui-wgpu.workspace = true
+yakui-winit.workspace = true
 
 [dev-dependencies]
 spall_sim = { path = "../spall_sim" }

@@ -31,6 +31,8 @@ use winit::event::{DeviceEvent, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
+use yakui_wgpu::{SurfaceInfo as YakuiSurfaceInfo, YakuiWgpu};
+use yakui_winit::YakuiWinit;
 
 use crate::ClientError;
 use crate::interactive::{InteractiveSession, InteractiveView, LiveInput};
@@ -377,6 +379,11 @@ struct Hud {
     /// `FrameTiming::buffer_upload_ms`). Reset to `0.0` each time `report`
     /// runs.
     max_buffer_upload_ms: f32,
+    max_hud_cpu_ms: f32,
+    hud_cpu_sum_ms: f64,
+    max_hud_gpu_ms: f32,
+    hud_gpu_sum_ms: f64,
+    hud_gpu_samples: u32,
     /// `InteractiveView::corrections` as of the last report — a *lifetime*
     /// counter, so the report shows how many are new since then rather than
     /// a running total that only ever grows and stops being useful for
@@ -431,6 +438,13 @@ impl Hud {
     /// showed a "hold, then jump" pattern the average alone didn't explain).
     fn record_frame(&mut self, timing: &FrameTiming) {
         self.max_frame_ms = self.max_frame_ms.max(timing.total_ms);
+        self.max_hud_cpu_ms = self.max_hud_cpu_ms.max(timing.hud_cpu_ms);
+        self.hud_cpu_sum_ms += f64::from(timing.hud_cpu_ms);
+        if let Some(ms) = timing.hud_gpu_ms {
+            self.max_hud_gpu_ms = self.max_hud_gpu_ms.max(ms);
+            self.hud_gpu_sum_ms += f64::from(ms);
+            self.hud_gpu_samples += 1;
+        }
         if let Some(ms) = timing.buffer_upload_ms {
             self.max_buffer_upload_ms = self.max_buffer_upload_ms.max(ms);
         }
@@ -468,6 +482,16 @@ impl Hud {
             .last_report_at
             .map_or(Self::REPORT_INTERVAL, |t| now - t);
         let fps = self.frames_since_report as f32 / elapsed.as_secs_f32();
+        let avg_hud_cpu_ms = self.hud_cpu_sum_ms / f64::from(self.frames_since_report.max(1));
+        let hud_gpu_report = if self.hud_gpu_samples == 0 {
+            "unavailable".to_owned()
+        } else {
+            format!(
+                "{:.3} ms (avg) / {:.3} ms (max)",
+                self.hud_gpu_sum_ms / f64::from(self.hud_gpu_samples),
+                self.max_hud_gpu_ms
+            )
+        };
         self.last_report_at = Some(now);
         self.frames_since_report = 0;
         let new_corrections = corrections_total.saturating_sub(self.last_corrections_total);
@@ -478,8 +502,14 @@ impl Hud {
         self.last_unmatched_total = unmatched_total;
         let max_frame_ms = self.max_frame_ms;
         let max_buffer_upload_ms = self.max_buffer_upload_ms;
+        let max_hud_cpu_ms = self.max_hud_cpu_ms;
         self.max_frame_ms = 0.0;
         self.max_buffer_upload_ms = 0.0;
+        self.max_hud_cpu_ms = 0.0;
+        self.hud_cpu_sum_ms = 0.0;
+        self.max_hud_gpu_ms = 0.0;
+        self.hud_gpu_sum_ms = 0.0;
+        self.hud_gpu_samples = 0;
         // ENG-69 round 18: `window_sweeps` vs `terrain_fallbacks` shows
         // whether the character-query-window cache is actually the thing
         // resolving movement this session, or silently falling back to the
@@ -498,7 +528,7 @@ impl Hud {
             .saturating_sub(self.last_window_stats.terrain_fallbacks);
         self.last_window_stats = window_stats_total;
         format!(
-            "{fps:.0} fps | frame {:.1} ms (avg) / {max_frame_ms:.1} ms (max) | buffer upload {max_buffer_upload_ms:.1} ms (max) | \
+            "{fps:.0} fps | frame {:.1} ms (avg) / {max_frame_ms:.1} ms (max) | HUD CPU {avg_hud_cpu_ms:.3} ms (avg) / {max_hud_cpu_ms:.3} ms (max), GPU {hud_gpu_report} | buffer upload {max_buffer_upload_ms:.1} ms (max) | \
              rebuild {:.1} ms ({} instances) | server tick {server_tick} | \
              +{new_corrections} corrections ({new_idle} idle) (lifetime max {max_correction_m:.3} m idle {max_idle_correction_m:.3} m vert {max_vertical_correction_m:.3} m horiz {max_horizontal_correction_m:.3} m) | \
              +{new_unmatched} unmatched (lifetime max displacement {max_unmatched_displacement_m:.3} m) | \
@@ -604,6 +634,12 @@ impl ApplicationHandler for InteractiveApp {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        // Forward every native window event to Yakui first. Its return value
+        // tells gameplay input whether the UI consumed this event.
+        let ui_consumed = self
+            .renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.handle_window_event(&event));
         match event {
             WindowEvent::CloseRequested => {
                 self.session.request_stop();
@@ -622,10 +658,13 @@ impl ApplicationHandler for InteractiveApp {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if !self.cursor_locked => {
+            } if !self.cursor_locked && !ui_consumed => {
                 self.set_cursor_locked(true);
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if ui_consumed {
+                    return;
+                }
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
@@ -1626,6 +1665,115 @@ struct WorldRenderer {
     /// position / look direction; this struct only knows the surface aspect
     /// ratio needed to finish the projection).
     aspect: f32,
+    yakui: yakui::Yakui,
+    yakui_winit: YakuiWinit,
+    yakui_wgpu: YakuiWgpu,
+    yakui_buffers: yakui_wgpu::Buffers,
+    yakui_clicks: u64,
+    hud_gpu_timer: Option<HudGpuTimer>,
+}
+
+struct HudGpuReadback {
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    receiver: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+}
+
+/// Optional GPU timestamp around the Yakui pass. Readbacks are asynchronous
+/// and rotate through three buffers so measurement never stalls presentation.
+struct HudGpuTimer {
+    queries: wgpu::QuerySet,
+    slots: [HudGpuReadback; 3],
+    period_ns: f32,
+    latest_ms: Option<f32>,
+}
+
+impl HudGpuTimer {
+    fn new(device: &wgpu::Device, period_ns: f32) -> Self {
+        let slots = std::array::from_fn(|_| HudGpuReadback {
+            resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spall-hud-query-resolve"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            readback: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spall-hud-query-readback"),
+                size: 16,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            receiver: None,
+        });
+        Self {
+            queries: device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("spall-hud-timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            }),
+            slots,
+            period_ns,
+            latest_ms: None,
+        }
+    }
+
+    fn acquire(&mut self) -> (Option<usize>, Option<f32>) {
+        let mut completed_ms = None;
+        for slot in &mut self.slots {
+            let Some(receiver) = slot.receiver.take() else {
+                continue;
+            };
+            match receiver.try_recv() {
+                Ok(Ok(())) => {
+                    if let Ok(mapped) = slot.readback.slice(..).get_mapped_range() {
+                        let ticks = bytemuck::cast_slice::<u8, u64>(&mapped);
+                        if ticks.len() >= 2 {
+                            let measured = (ticks[1].saturating_sub(ticks[0]) as f32
+                                * self.period_ns
+                                / 1_000_000.0,);
+                            self.latest_ms = Some(measured.0);
+                            completed_ms = Some(measured.0);
+                        }
+                    }
+                    slot.readback.unmap();
+                }
+                Ok(Err(_)) => {}
+                Err(mpsc::TryRecvError::Empty) => {
+                    slot.receiver = Some(receiver);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        let index = self.slots.iter().position(|slot| slot.receiver.is_none());
+        (index, completed_ms)
+    }
+
+    fn write_start(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.write_timestamp(&self.queries, 0);
+    }
+
+    fn resolve(&self, encoder: &mut wgpu::CommandEncoder, slot: usize) {
+        encoder.write_timestamp(&self.queries, 1);
+        encoder.resolve_query_set(&self.queries, 0..2, &self.slots[slot].resolve, 0);
+        encoder.copy_buffer_to_buffer(
+            &self.slots[slot].resolve,
+            0,
+            &self.slots[slot].readback,
+            0,
+            16,
+        );
+    }
+
+    fn map_after_submit(&mut self, slot: usize) {
+        let (sender, receiver) = mpsc::channel();
+        self.slots[slot]
+            .readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        self.slots[slot].receiver = Some(receiver);
+    }
 }
 
 /// One render frame's timing breakdown — see [`WorldRenderer::begin_frame`]/
@@ -1661,6 +1809,8 @@ struct FrameTiming {
     /// Time in `surface_texture.present()` — on some backends this, not
     /// `acquire`, is where `PresentMode::Fifo` actually blocks for vsync.
     present_ms: f32,
+    hud_cpu_ms: f32,
+    hud_gpu_ms: Option<f32>,
 }
 
 impl FrameTiming {
@@ -1680,6 +1830,8 @@ impl FrameTiming {
             acquire_ms,
             submit_ms: 0.0,
             present_ms: 0.0,
+            hud_cpu_ms: 0.0,
+            hud_gpu_ms: None,
         }
     }
 }
@@ -1709,7 +1861,9 @@ impl WorldRenderer {
     fn new(window: Arc<Window>) -> Result<Self, ClientError> {
         use wgpu::util::DeviceExt;
 
-        let instance = wgpu::Instance::default();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
+            Box::new(window.clone()),
+        ));
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| ClientError::Gpu(error.to_string()))?;
@@ -1717,17 +1871,23 @@ impl WorldRenderer {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
+            ..Default::default()
         }))
-        .ok_or_else(|| ClientError::Gpu("no compatible GPU adapter".into()))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("spall-interactive-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        .map_err(|error| ClientError::Gpu(error.to_string()))?;
+        let timestamp_features =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let required_features = if adapter.features().contains(timestamp_features) {
+            timestamp_features
+        } else {
+            wgpu::Features::empty()
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("spall-interactive-device"),
+            required_features,
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            ..Default::default()
+        }))
         .map_err(|error| ClientError::Gpu(error.to_string()))?;
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
@@ -1745,6 +1905,7 @@ impl WorldRenderer {
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: capabilities.alpha_modes[0],
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             // ENG-69 round 12: `.local/runs/interactive-frames.jsonl` from a
             // live hands-on run showed a perfectly regular 4-frame cycle —
@@ -1765,6 +1926,13 @@ impl WorldRenderer {
         surface.configure(&device, &surface_config);
         let depth_view = create_depth_view(&device, surface_config.width, surface_config.height);
         let aspect = surface_config.width as f32 / surface_config.height.max(1) as f32;
+        let yakui = yakui::Yakui::new();
+        let yakui_winit = YakuiWinit::new(&window);
+        let yakui_wgpu = YakuiWgpu::new(device.clone(), queue.clone());
+        let yakui_buffers = yakui_wgpu.buffers();
+        let hud_gpu_timer = required_features
+            .contains(timestamp_features)
+            .then(|| HudGpuTimer::new(&device, queue.get_timestamp_period()));
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("spall-interactive-shader"),
@@ -1799,8 +1967,8 @@ impl WorldRenderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("spall-interactive-pipeline-layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
@@ -1850,7 +2018,7 @@ impl WorldRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[vertex_layout, instance_layout],
+                buffers: &[Some(vertex_layout), Some(instance_layout)],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1871,13 +2039,13 @@ impl WorldRenderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -1908,7 +2076,17 @@ impl WorldRenderer {
             instance_buffer: None,
             body_buffer: None,
             aspect,
+            yakui,
+            yakui_winit,
+            yakui_wgpu,
+            yakui_buffers,
+            yakui_clicks: 0,
+            hud_gpu_timer,
         })
+    }
+
+    fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
+        self.yakui_winit.handle_window_event(&mut self.yakui, event)
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -1956,8 +2134,18 @@ impl WorldRenderer {
 
         let acquire_start = Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                self.surface.configure(&self.device, &self.surface_config);
+                drop(t);
+                return Ok(AcquireOutcome::Skipped(FrameTiming::early_return(
+                    frame_start.elapsed().as_secs_f32() * 1000.0,
+                    buffer_upload_ms,
+                    instance_count,
+                    acquire_start.elapsed().as_secs_f32() * 1000.0,
+                )));
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
                 return Ok(AcquireOutcome::Skipped(FrameTiming::early_return(
                     frame_start.elapsed().as_secs_f32() * 1000.0,
@@ -1966,7 +2154,7 @@ impl WorldRenderer {
                     acquire_start.elapsed().as_secs_f32() * 1000.0,
                 )));
             }
-            Err(wgpu::SurfaceError::Timeout) => {
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 return Ok(AcquireOutcome::Skipped(FrameTiming::early_return(
                     frame_start.elapsed().as_secs_f32() * 1000.0,
                     buffer_upload_ms,
@@ -1974,7 +2162,11 @@ impl WorldRenderer {
                     acquire_start.elapsed().as_secs_f32() * 1000.0,
                 )));
             }
-            Err(error) => return Err(ClientError::Render(error.to_string())),
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(ClientError::Render(
+                    "surface acquisition validation error".into(),
+                ));
+            }
         };
         let acquire_ms = acquire_start.elapsed().as_secs_f32() * 1000.0;
         let view = surface_texture
@@ -2064,6 +2256,7 @@ impl WorldRenderer {
                         load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
@@ -2075,6 +2268,7 @@ impl WorldRenderer {
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None,
             });
             if cam.is_some() {
                 pass.set_pipeline(&self.pipeline);
@@ -2092,8 +2286,59 @@ impl WorldRenderer {
                 }
             }
         }
+        let hud_start = Instant::now();
+        let (hud_gpu_slot, hud_gpu_ms) = self
+            .hud_gpu_timer
+            .as_mut()
+            .map(HudGpuTimer::acquire)
+            .unwrap_or((None, None));
+        if hud_gpu_slot.is_some()
+            && let Some(timer) = self.hud_gpu_timer.as_ref()
+        {
+            timer.write_start(&mut encoder);
+        }
+        self.yakui.start();
+        let mut clicked = false;
+        {
+            let clicks = self.yakui_clicks;
+            yakui::align(yakui::Alignment::TOP_LEFT, || {
+                yakui::column(|| {
+                    yakui::text(20.0, "SPALL");
+                    yakui::text(14.0, "WASD move  |  Space jump  |  Esc release cursor");
+                    yakui::text(12.0, "Authoritative multiplayer voxel sandbox");
+                    yakui::text(12.0, format!("HUD input test clicks: {clicks}"));
+                    clicked = yakui::button("Click to verify UI input").clicked;
+                });
+            });
+        }
+        self.yakui.finish();
+        if clicked {
+            self.yakui_clicks = self.yakui_clicks.saturating_add(1);
+        }
+        self.yakui_wgpu.paint_with_encoder(
+            &mut self.yakui,
+            &mut self.yakui_buffers,
+            &mut encoder,
+            YakuiSurfaceInfo {
+                format: self.surface_config.format,
+                sample_count: 1,
+                color_attachment: &view,
+                resolve_target: None,
+            },
+        );
+        if let Some(slot) = hud_gpu_slot
+            && let Some(timer) = self.hud_gpu_timer.as_ref()
+        {
+            timer.resolve(&mut encoder, slot);
+        }
+        let hud_cpu_ms = hud_start.elapsed().as_secs_f32() * 1000.0;
         let submit_start = Instant::now();
         self.queue.submit([encoder.finish()]);
+        if let Some(slot) = hud_gpu_slot
+            && let Some(timer) = self.hud_gpu_timer.as_mut()
+        {
+            timer.map_after_submit(slot);
+        }
         // A minimal isolated reproduction (`examples/poc_local`, ENG-69)
         // found that on this app's Vulkan backend, `desired_maximum_frame_latency: 1`
         // above did not actually stop the CPU from racing ~2 frames ahead of
@@ -2104,10 +2349,12 @@ impl WorldRenderer {
         // here until the GPU has actually finished this frame's work caps
         // one submission in flight at a time and restored a rock-steady
         // ~16.6ms cadence in that reproduction.
-        let _ = self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| ClientError::Render(error.to_string()))?;
         let submit_ms = submit_start.elapsed().as_secs_f32() * 1000.0;
         let present_start = Instant::now();
-        surface_texture.present();
+        self.queue.present(surface_texture);
         let present_ms = present_start.elapsed().as_secs_f32() * 1000.0;
         Ok(FrameTiming {
             total_ms: frame_start.elapsed().as_secs_f32() * 1000.0,
@@ -2116,6 +2363,8 @@ impl WorldRenderer {
             acquire_ms,
             submit_ms,
             present_ms,
+            hud_cpu_ms,
+            hud_gpu_ms,
         })
     }
 }

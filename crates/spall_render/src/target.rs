@@ -127,7 +127,7 @@ impl OffscreenTarget {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        ctx.wait();
+        ctx.wait()?;
         rx.recv()
             .map_err(|_| RenderError::Readback)?
             .map_err(|_| RenderError::Readback)?;
@@ -136,7 +136,9 @@ impl OffscreenTarget {
         let unpadded = (self.width * 4) as usize;
         let mut out = Vec::with_capacity(unpadded * self.height as usize);
         {
-            let mapped = slice.get_mapped_range();
+            let mapped = slice
+                .get_mapped_range()
+                .map_err(|_| RenderError::Readback)?;
             for row in mapped.chunks_exact(padded) {
                 out.extend_from_slice(&row[..unpadded]);
             }
