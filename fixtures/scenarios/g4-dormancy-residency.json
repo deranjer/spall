@@ -1,0 +1,29 @@
+{
+  "name": "g4-dormancy-residency",
+  "description": "ENG-80 representative rubble-lane measurement with per-brick terrain colliders: identical to g4-dormancy-settle-120.json (real g4-workload scene/gate rate, 30s warmup + 2-minute measured window, dormancy at the 120-tick default) but with --residency-budget-bricks enabled (tuned via exploratory smoke tests: radius=0 keeps dormancy churn low -- 1/0 in a short smoke run vs 57-117/18 at radius=2-3 -- budget=16 comfortably covers the pinned+interest set, residency_required_over_budget_ticks ~0). Compares tick/physics timing and dormancy churn against the whole-terrain baseline (settle-120: 261/30 deactivations/reactivations, tick p95/p99 9.0-9.5/13.2-20.2 ms across 4 runs) to see what per-brick colliders cost on top of that baseline.",
+  "scene": "g4-workload",
+  "release_profile": true,
+  "server_ticks": 9300,
+  "quiescence_ticks": 250,
+  "clients": 8,
+  "late_join_clients": [0, 1, 2, 3, 4, 5, 6, 7],
+  "late_join_connect_delay_ms": 200,
+  "minimum_transactions": 1212,
+  "replay_check": true,
+  "restart_check": true,
+  "cuts": [],
+  "sustained_edits": {
+    "start_tick": 1800,
+    "small_rate_per_sec": 10.0,
+    "blast_interval_sec": 10.0,
+    "trailing_buffer_ticks": 300
+  },
+  "dormancy": true,
+  "residency_budget_bricks": 16,
+  "residency_radius_bricks": 0,
+  "server_timing": {
+    "warmup_ticks": 1800,
+    "measured_ticks": 7200,
+    "max_samples": 7200
+  }
+}
