@@ -397,55 +397,23 @@ mod tests {
         );
     }
 
-    /// **Known upstream defect (T23 / G3 row 15, `docs/reports/G3.md`).** A
-    /// freshly created authoritative player capsule spawned close to a
-    /// bounded volume's `x = 0` origin, near a floor **and** a second,
-    /// elevated slab-like solid structure a few metres above it (this scene's
-    /// "beam"), does not respond to horizontal input — `move_shape`'s
-    /// returned translation is `[0, 0, 0]` every tick indefinitely, though
-    /// `grounded` stays `true` and the desired wish-velocity is computed
-    /// correctly every tick (verified: the bug is in the swept-collision
-    /// resolution, not upstream of it).
-    ///
-    /// Root-caused down to `rapier3d::control::KinematicCharacterController`
-    /// itself, not anything in this crate or `spall_sim`/`spall_voxel`:
-    /// reproduces with this crate's `PhysicsWorld` alone, no `spall_sim`
-    /// commit/structural pipeline involved. Ruled out by direct experiment
-    /// (see the PR that added this test for the full parameter sweep):
-    /// - **Not a broad-phase "warm-up"**: extra `world.step()`s before the
-    ///   character is added make no difference.
-    /// - **Not representation-specific**: reproduces identically with
-    ///   [`Representation::NativeVoxels`], not just `MergedCuboids` —
-    ///   `spall_physics::merge::greedy_boxes`'s box decomposition is not the
-    ///   cause.
-    /// - **Not about one combined collider**: still reproduces with the
-    ///   floor and the elevated structure as two separate physics bodies.
-    /// - **Position-dependent, not proximity-to-column**: a floor + a narrow
-    ///   *column* (no beam) does **not** reproduce it; a floor + the wide,
-    ///   thin *beam* alone does, at its original position. Moving the beam
-    ///   either much higher (`y`) or much further away (`x`) — while leaving
-    ///   the spawn where it was — also stops it reproducing, so the exact
-    ///   trigger is some position/geometry relationship this investigation
-    ///   did not fully isolate inside `rapier3d`.
-    ///
-    /// The shipped mitigation ([`fixtures::SEPARATED_REGION_FAR_SPAWNS`]'s
-    /// `x = 7 m` slot-0 spawn, `docs/reports/G3.md` row 2) is empirically
-    /// justified: `x >= ~6.5 m` on this exact scene does not reproduce it.
-    ///
-    /// This test pins the **current broken behaviour** so a `rapier3d`
-    /// upgrade (or a future fix) is caught: if it ever starts failing, the
-    /// defect is gone — delete this test, drop the `#[ignore]`, and reconsider
-    /// whether the spawn-distance mitigation is still needed.
+    /// T23 / G3 row 15 follow-up: a valid near-origin spawn outside the raised
+    /// beam's footprint walks normally. The old `[1, 1, 1]` repro was invalid:
+    /// the floor top is at `y = 1.0 m`, the beam underside is at `y = 2.5 m`,
+    /// and the standing capsule is `1.8 m` tall, so it began overlapping the
+    /// beam by `0.3 m`. Rapier's sweep is not a spawn-depenetration operation;
+    /// its zero-time contacts from that overlapping state cannot establish an
+    /// unobstructed horizontal path. Moving only `z` outside the beam footprint
+    /// preserves `x = 1 m` and clears the overlap.
     #[test]
-    #[ignore = "documents a known upstream rapier3d defect, not a bug in this crate; see the doc comment"]
-    fn row15_elevated_beam_near_origin_freezes_horizontal_movement() {
+    fn row15_near_origin_spawn_clear_of_beam_moves_horizontally() {
         let mut world = PhysicsWorld::new(PhysicsConfig::default());
         let v = vox::separated_regions_scene(VolumeId::new(1).unwrap());
         add_fixed(&mut world, &v);
         world.step();
 
         let params = CharacterParams::DEFAULT;
-        let mut state = CharacterState::at([1.0, 1.0, 1.0]);
+        let mut state = CharacterState::at([1.0, 1.0, 1.6]);
         let input = PlayerInput {
             movement: [0.0, 0.0, 1.0],
             view_dir: [1.0, 0.0, 0.0],
@@ -458,8 +426,7 @@ mod tests {
         }
         assert!(
             state.position_m[0] - 1.0 > 1.0,
-            "expected this to fail today (row 15): capsule should have moved \
-             but stayed frozen at x={} after 200 ticks of forward input",
+            "a capsule outside the beam footprint should move; ended at x={}",
             state.position_m[0]
         );
     }

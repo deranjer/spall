@@ -453,13 +453,14 @@ pub fn separated_regions_setup() -> WorldSetup {
 /// Feet spawn positions (metres) for [`separated_regions_setup`]; index is the
 /// player / connection slot. Even slots stand in the west region, odd slots in
 /// the east region (offset `+18 m` on `x` and `z`), so connected players start
-/// geographically separated. Floor top is `y = 1.0 m`; all positions clear the
-/// column footprint.
+/// geographically separated. Floor top is `y = 1.0 m`; the local `z = 1.6 m`
+/// offsets keep the standing capsules clear of the low beam (whose underside
+/// is at `y = 2.5 m`) while remaining on the floor.
 pub const SEPARATED_REGION_SPAWNS: [[f64; 3]; 4] = [
-    [1.0, 1.0, 1.0],
-    [18.5, 1.0, 18.5],
-    [2.0, 1.0, 1.5],
-    [19.25, 1.0, 18.0],
+    [1.0, 1.0, 1.6],
+    [18.5, 1.0, 19.6],
+    [2.0, 1.0, 1.6],
+    [19.25, 1.0, 19.6],
 ];
 
 /// The T23 / G3 **full-envelope** integrated-acceptance world
@@ -488,26 +489,22 @@ pub fn separated_regions_full_envelope_setup() -> WorldSetup {
 /// Feet spawn positions (metres) for [`separated_regions_full_envelope_setup`];
 /// index is the player / connection slot. Even slots stand in the west region;
 /// odd slots stand in the east region, `110 m` away on `x` alone (the region's
-/// own local layout is otherwise identical). Floor top is `y = 1.0 m`; all
-/// positions clear the column footprint.
+/// own local layout is otherwise identical). Floor top is `y = 1.0 m`; the
+/// local `z = 1.6 m` offsets keep standing capsules clear of the beam.
 ///
 /// Slot 0 (the scripted mover, [`fixtures/scenarios/t23-g3-full-envelope.json`])
-/// spawns at `x = 7.0 m` rather than the `x = 1.0 m` [`SEPARATED_REGION_SPAWNS`]
-/// uses — **not** the same local offset. A fresh authoritative player capsule
-/// spawned within roughly the first few metres of `x = 0` on *any* of this
-/// crate's bounded-volume fixtures (reproduced on the already-merged, unrelated
-/// [`separated_regions_setup`] too, with no terrain edit involved) does not
-/// respond to horizontal input for several hundred ticks after creation — a
-/// pre-existing defect in the shared T19 kinematic-character / collider-query
-/// path, not something this scene introduces, and out of scope to fix here.
-/// Spawning past that band (empirically, `x >= ~6.5 m`) sidesteps it cleanly;
-/// slot 2 (stationary, no script) is left at its original offset since a
-/// player that never receives non-neutral input is unaffected either way.
+/// spawns at `x = 7.0 m` because the full-envelope scenario drives it along a
+/// continuous causeway from west to east. All slots use a local `z = 1.6 m`
+/// offset so capsules spawned near the raised beam remain outside its
+/// footprint. The previous `z = 1.0 m` positions started capsules intersecting
+/// the beam; that overlap, rather than proximity to the world origin or a
+/// Rapier controller defect, caused the frozen movement in ENG-66's original
+/// repro.
 pub const SEPARATED_REGION_FAR_SPAWNS: [[f64; 3]; 4] = [
-    [7.0, 1.0, 1.0],
-    [111.0, 1.0, 1.0],
-    [2.0, 1.0, 1.5],
-    [112.0, 1.0, 1.5],
+    [7.0, 1.0, 1.6],
+    [111.0, 1.0, 1.6],
+    [2.0, 1.0, 1.6],
+    [112.0, 1.0, 1.6],
 ];
 
 /// Like [`bridged_terrain_setup`], but the whole scene is translated so its
