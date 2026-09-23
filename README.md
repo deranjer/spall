@@ -58,6 +58,14 @@ Quinn exposes both streams and unreliable unordered datagrams, matching the prop
 
 All numbers, including voxel sizes, player count, and world size, become frozen compatibility choices only after the feasibility gates. Changing cell size later needs a new world format or explicit conversion.
 
+Current provisional collision choice (ENG-80, 2026-09-23): resident terrain
+uses one derived fixed collider per solid brick by default; the authoritative
+voxel volume and server ownership are unchanged. The user accepted this for
+the main engine loop with good-enough performance for now. A whole-terrain
+comparison mode remains available, and timing/churn follow-up is low priority
+and non-blocking (ENG-87); this decision does not claim the G4 timing targets
+passed.
+
 ## What full-world destruction means
 
 The initial structural model uses six-face connectivity to explicit world-boundary support. Severing the last supporting connection releases a connected component as a voxel rigid body. Detached pieces can be hit, cut again, sleep, wake, and survive save/load and late join. Support crosses brick and storage-region boundaries. Merely reaching an unloaded brick never proves support.

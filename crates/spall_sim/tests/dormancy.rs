@@ -126,8 +126,8 @@ fn settled_debris_deactivates_without_changing_the_world() {
     assert_eq!(sim.world().dormant_body_count(), 1);
     assert_eq!(
         sim.world().physics().active_body_count(),
-        1,
-        "only the fixed terrain is still stepped"
+        sim.world().terrain_brick_collider_count(),
+        "only resident fixed terrain bricks remain in physics"
     );
     // The body is still a full authoritative entity: enumerable, owns its
     // volume, all its mass still present.
@@ -194,7 +194,11 @@ fn a_player_approaching_wakes_dormant_rubble() {
         "the dormant cube reactivated once the player was within the wake margin"
     );
     assert_eq!(sim.world().dormant_body_count(), 0);
-    assert_eq!(sim.world().physics().active_body_count(), 2);
+    assert_eq!(
+        sim.world().physics().active_body_count(),
+        sim.world().terrain_brick_collider_count() + 1,
+        "the player woke the one detached body alongside fixed terrain"
+    );
 }
 
 #[test]

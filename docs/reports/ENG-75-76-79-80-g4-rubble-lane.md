@@ -1,9 +1,10 @@
 # ENG-75/76/79/80 — G4 representative rubble-lane measurement
 
-Status: evidence-gathering only. No default changed (`DormancyConfig::DEFAULT`
-stays at `settle_ticks = 120`; per-brick terrain colliders stay
-experimental/default-off). Adds three reusable scenario fixtures and reports
-what they measured; does not close any of the four tickets.
+Status at measurement time: evidence-gathering only. No default changed then
+(`DormancyConfig::DEFAULT` stayed at `settle_ticks = 120`; per-brick terrain
+colliders were experimental/default-off). The later user-directed provisional
+adoption is recorded at the end of this report. The measurements below remain
+historical evidence, not a claim that the tick targets passed.
 
 ## Why the prior short comparisons weren't representative
 
@@ -246,6 +247,41 @@ only three tuned repeats on one desktop host, timing varies materially, and
 the matched radius control is only one run. Per-brick colliders remain
 experimental/default-off pending stronger repeated evidence and resolution
 of the original high-churn configuration.
+
+## User-directed provisional adoption — 2026-09-23
+
+The user explicitly chose to adopt per-brick terrain collision **for now**
+despite the limited performance evidence above. This decision supersedes the
+report's earlier default-off recommendation, not its measurements: one of the
+three tuned runs missed both tick targets. `SimWorld` now installs a fixed
+collider for each resident solid terrain brick at startup, even with the
+residency cache disabled. Residency eviction remains opt-in and still retires
+the affected brick's collider before its cells leave memory. A server or
+scenario can select `--whole-terrain-collider` / `whole_terrain_collider: true`
+for a legacy comparison; the settle=120/20 baseline fixtures use that explicit
+mode so their historical comparison remains reproducible. The collision mode
+is derived at startup or recovery and is not persisted into world DTOs.
+
+The contact-damage integration had assumed every terrain contact used the old
+single physics body. Default per-brick startup exposed that mismatch; contact
+ownership now recognizes active terrain-brick physics bodies. Functional
+collision, edit, reload, contact-damage, replay, and recovery checks are the
+acceptance focus for this provisional default. Timing variance, the historical
+20–30x churn configuration, and longer controlled measurements remain
+low-priority, non-blocking follow-up (ENG-87); no G4 performance gate is
+reported as passed by this decision.
+
+The default-on G3 network scenarios retained the agreed world hash, seven
+commits, replay, and cold restart/reconnect checks, but both `t23-g3` and
+`t23-g3-residency` still failed their strict body-sleep gate after 900 ticks.
+One detached body was stable for 706 ticks with final linear speed below
+`0.000002 m/s`, angular components below `0.000004 rad/s`, and contact
+penetration below `0.00007 m`, yet Rapier reported it awake. An explicit
+whole-terrain run without residency passed that gate at tick 543; residency
+switches even the legacy comparison mode to per-brick on first eviction.
+The gate and its fixture remain unchanged. ENG-87 tracks the per-brick contact
+and sleep investigation as a non-blocking dormancy/performance follow-up under
+the user's provisional integration decision.
 
 ## Checks
 

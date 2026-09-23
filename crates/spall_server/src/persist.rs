@@ -408,6 +408,28 @@ pub fn restore(
     anchor: AnchorPlane,
     physics: PhysicsConfig,
 ) -> Result<(Simulation, u64), PersistError> {
+    restore_with_terrain_collider_mode(
+        recovery,
+        cfg,
+        choice,
+        materials,
+        anchor,
+        physics,
+        spall_sim::world::TerrainColliderMode::PerBrick,
+    )
+}
+
+/// Recovery with an explicit derived collision mode. The mode is not stored:
+/// collision is rebuilt from the durable voxel volume on every restart.
+pub fn restore_with_terrain_collider_mode(
+    recovery: &Recovery,
+    cfg: &PersistConfig,
+    choice: RecoveryChoice,
+    materials: MaterialManifest,
+    anchor: AnchorPlane,
+    physics: PhysicsConfig,
+    terrain_collider_mode: spall_sim::world::TerrainColliderMode,
+) -> Result<(Simulation, u64), PersistError> {
     let cp = &recovery.checkpoint;
 
     // Fail closed on a reported-corrupt recovery before anything is rebuilt.
@@ -453,13 +475,16 @@ pub fn restore(
         &cp.bricks,
     )?;
 
-    let mut world = SimWorld::new(WorldSetup {
-        terrain: terrain_vol,
-        terrain_collider_region: region_from(terrain_sb.collider_region),
-        materials,
-        anchor,
-        physics,
-    })?;
+    let mut world = SimWorld::new_with_terrain_collider_mode(
+        WorldSetup {
+            terrain: terrain_vol,
+            terrain_collider_region: region_from(terrain_sb.collider_region),
+            materials,
+            anchor,
+            physics,
+        },
+        terrain_collider_mode,
+    )?;
 
     for sb in cp
         .bodies

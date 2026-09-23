@@ -41,6 +41,7 @@ use spall_protocol::{
 use spall_sim::fixtures::{
     G4_WORKLOAD_SPAWNS, SEPARATED_REGION_FAR_SPAWNS, SEPARATED_REGION_SPAWNS, WALK_ARENA_SPAWNS,
 };
+use spall_sim::world::TerrainColliderMode;
 use spall_sim::{
     Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
     SimulationConfig, action_statuses, fixtures,
@@ -314,7 +315,12 @@ impl Scene {
         }
     }
 
+    #[cfg(test)]
     fn simulation(self) -> Simulation {
+        self.simulation_with_terrain_collider_mode(TerrainColliderMode::PerBrick)
+    }
+
+    fn simulation_with_terrain_collider_mode(self, mode: TerrainColliderMode) -> Simulation {
         let mut setup = match self {
             Scene::BridgeCut => spall_sim::fixtures::bridged_terrain_setup(),
             Scene::CrossBridgeCut => spall_sim::fixtures::cross_brick_bridged_setup(),
@@ -338,8 +344,9 @@ impl Scene {
         // is still settling (repro: `cargo xtask scenario --name
         // g1-networked-destruction`). Skip the CCD pass — a no-op here.
         setup.physics.disable_ccd = true;
-        let mut sim =
-            Simulation::new(SimulationConfig::new(setup)).expect("built-in scene is valid");
+        let mut sim_config = SimulationConfig::new(setup);
+        sim_config.terrain_collider_mode = mode;
+        let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
         if matches!(self, Scene::G4Workload) {
             // Row 12: 256 active (64 near the west cluster's first spawn) +
             // 4096 sleeping debris bodies, built once at scene-construction
@@ -376,6 +383,9 @@ impl Scene {
 pub struct ServeConfig {
     pub listen: SocketAddr,
     pub scene: Scene,
+    /// Derived terrain collision mode. Per-brick is the adopted default;
+    /// whole-terrain is available for controlled legacy comparisons.
+    pub terrain_collider_mode: TerrainColliderMode,
     pub join_token: JoinToken,
     /// Hard cap on server ticks for this run.
     pub max_ticks: u64,
@@ -532,6 +542,7 @@ impl ServeConfig {
         Self {
             listen,
             scene,
+            terrain_collider_mode: TerrainColliderMode::PerBrick,
             join_token: token,
             max_ticks: 1_200,
             quiescence_ticks: 45,
@@ -1235,6 +1246,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let await_body_settle = config.await_body_settle;
     let motion_interest = config.motion_interest;
     let scene = config.scene;
+    let terrain_collider_mode = config.terrain_collider_mode;
     let clients_for_sim = clients.clone();
     let save = config.save.clone();
     let save_faults = config.save_faults.clone();
@@ -1267,7 +1279,13 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             mut pipeline,
             mut journalled_through,
             mut checkpoints_published,
-        } = match setup_persistence(save.as_deref(), scene, &persist_cfg, save_faults) {
+        } = match setup_persistence_with_terrain_collider_mode(
+            save.as_deref(),
+            scene,
+            &persist_cfg,
+            save_faults,
+            terrain_collider_mode,
+        ) {
             Ok(parts) => parts,
             Err(e) => {
                 return SimResult::error(format!("persistence setup failed: {e}"), 0);
@@ -2893,15 +2911,32 @@ struct Persistence {
 /// exist but do not decode, aborts startup without touching the file — losing
 /// durable records requires an explicit operator choice
 /// ([`persist::RecoveryChoice`]), not an automatic resume or reinitialisation.
+#[cfg(test)]
 fn setup_persistence(
     save: Option<&std::path::Path>,
     scene: Scene,
     cfg: &PersistConfig,
     save_faults: Option<spall_store::FaultPlan>,
 ) -> Result<Persistence, String> {
+    setup_persistence_with_terrain_collider_mode(
+        save,
+        scene,
+        cfg,
+        save_faults,
+        TerrainColliderMode::PerBrick,
+    )
+}
+
+fn setup_persistence_with_terrain_collider_mode(
+    save: Option<&std::path::Path>,
+    scene: Scene,
+    cfg: &PersistConfig,
+    save_faults: Option<spall_store::FaultPlan>,
+    terrain_collider_mode: TerrainColliderMode,
+) -> Result<Persistence, String> {
     let Some(path) = save else {
         return Ok(Persistence {
-            sim: scene.simulation(),
+            sim: scene.simulation_with_terrain_collider_mode(terrain_collider_mode),
             pipeline: None,
             journalled_through: 0,
             checkpoints_published: 0,
@@ -2910,20 +2945,21 @@ fn setup_persistence(
     let mut writer = Writer::open(path).map_err(|e| e.to_string())?;
     let (sim, journalled_through, checkpoints_published) = match writer.recover() {
         Ok(recovery) => {
-            let (sim, seq) = persist::restore(
+            let (sim, seq) = persist::restore_with_terrain_collider_mode(
                 &recovery,
                 cfg,
                 persist::RecoveryChoice::RequireClean,
                 fixtures::stone_manifest(),
                 AnchorPlane::at(0),
                 PhysicsConfig::default(),
+                terrain_collider_mode,
             )
             .map_err(|e| e.to_string())?;
             (sim, seq, 0)
         }
         // A genuinely new/empty database: seed it with the built-in scene.
         Err(spall_store::StoreError::NoCheckpoint) => {
-            let sim = scene.simulation();
+            let sim = scene.simulation_with_terrain_collider_mode(terrain_collider_mode);
             let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
             writer
                 .publish_checkpoint(&checkpoint)
@@ -4553,6 +4589,40 @@ mod tests {
         );
         drop(pipeline);
         assert_eq!(checkpoint_row_count(&db), 1);
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn recovery_rebuilds_the_selected_terrain_collision_without_changing_world_hash() {
+        let db = scratch_db("terrain_collider_mode");
+        let original = setup_persistence_with_terrain_collider_mode(
+            Some(&db),
+            Scene::BridgeCut,
+            &persist_cfg(),
+            None,
+            TerrainColliderMode::WholeTerrain,
+        )
+        .unwrap();
+        assert!(!original.sim.world().terrain_brick_colliders_enabled());
+        let hash = original.sim.world().world_hash();
+        drop(original);
+
+        let restored = setup_persistence_with_terrain_collider_mode(
+            Some(&db),
+            Scene::BridgeCut,
+            &persist_cfg(),
+            None,
+            TerrainColliderMode::PerBrick,
+        )
+        .unwrap();
+        assert!(restored.sim.world().terrain_brick_colliders_enabled());
+        restored
+            .sim
+            .world()
+            .validate_terrain_brick_colliders()
+            .unwrap();
+        assert_eq!(restored.sim.world().world_hash(), hash);
+        drop(restored);
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 

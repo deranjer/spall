@@ -110,6 +110,17 @@ pub struct WorldSetup {
     pub physics: PhysicsConfig,
 }
 
+/// Derived terrain collision representation. This does not change voxel
+/// ownership, transaction records, or the durable world format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerrainColliderMode {
+    /// One fixed collider per resident solid terrain brick.
+    #[default]
+    PerBrick,
+    /// Legacy whole-terrain collider for controlled comparisons.
+    WholeTerrain,
+}
+
 /// Derived terrain collision for one resident brick. The authoritative volume
 /// and its logical digests remain the source of truth; this record only keeps
 /// the stable physics body needed to retire/reload collision without touching
@@ -137,9 +148,9 @@ pub struct SimWorld {
     /// (T19). Not bodies: no volume, never split, never in the dynamic set.
     players: BTreeMap<u64, Player>,
     physics: PhysicsWorld,
-    /// Lazily installed when residency first evicts terrain. `None` keeps the
-    /// validated whole-terrain collider path byte-for-byte unchanged for the
-    /// default-off configuration.
+    /// Installed at startup by default. `None` denotes an explicit legacy
+    /// whole-terrain comparison run; residency still switches it to bricks
+    /// before eviction so an evicted brick never retains collision.
     terrain_brick_colliders: Option<BTreeMap<BrickCoord, TerrainBrickCollider>>,
     /// ENG-69 round 18: each live player's own bounded terrain-query window
     /// (`spall_physics::query_cache`'s own doc has the full design) — keyed
@@ -175,8 +186,16 @@ fn empty_evicted() -> &'static EvictedBricks {
 }
 
 impl SimWorld {
-    /// Builds a world from `setup`, installing the terrain collider.
+    /// Builds a world from `setup` with per-brick terrain collision.
     pub fn new(setup: WorldSetup) -> Result<Self, WorldError> {
+        Self::new_with_terrain_collider_mode(setup, TerrainColliderMode::PerBrick)
+    }
+
+    /// Builds a world with an explicit derived terrain collision mode.
+    pub fn new_with_terrain_collider_mode(
+        setup: WorldSetup,
+        mode: TerrainColliderMode,
+    ) -> Result<Self, WorldError> {
         let mut registry = IdRegistry::new();
         let terrain_volume_id = registry.allocate_volume()?; // volume 1 == terrain
 
@@ -216,7 +235,7 @@ impl SimWorld {
             collider_region: setup.terrain_collider_region,
         };
 
-        Ok(Self {
+        let mut world = Self {
             registry,
             materials: setup.materials,
             anchor: setup.anchor,
@@ -232,7 +251,11 @@ impl SimWorld {
             window_stats: spall_physics::WindowStats::default(),
             evicted: BTreeMap::new(),
             backing: None,
-        })
+        };
+        if mode == TerrainColliderMode::PerBrick {
+            world.ensure_terrain_brick_colliders()?;
+        }
+        Ok(world)
     }
 
     /// The retained evicted-brick digests for `volume` (empty by default —
@@ -300,8 +323,7 @@ impl SimWorld {
     }
 
     /// Installs the per-brick terrain representation from the fully resident
-    /// snapshot. This is called only when eviction is first requested, so the
-    /// ordinary default-off path continues using the existing whole collider.
+    /// snapshot, at startup by default or before the first legacy-mode eviction.
     fn ensure_terrain_brick_colliders(&mut self) -> Result<(), WorldError> {
         if self.terrain_brick_colliders.is_some() {
             return Ok(());
@@ -312,7 +334,10 @@ impl SimWorld {
             planned.push((coord, Self::plan_terrain_brick(&terrain, coord)?));
         }
 
-        self.physics.remove_collider(self.terrain.phys);
+        // The legacy fixed body is no longer used after this one-way switch.
+        // Retire it rather than leaving a collider-less body in the solver's
+        // active set (which also skews dormancy/physics-body accounting).
+        self.physics.retire_body(self.terrain.phys);
         let mut colliders = BTreeMap::new();
         let cell_m = terrain.cell_size().metres() as f32;
         for (coord, plan) in planned {
@@ -438,8 +463,18 @@ impl SimWorld {
             .unwrap_or_else(|| vec![self.terrain.phys])
     }
 
-    /// Whether residency has installed the per-brick terrain representation.
-    /// It stays false for the default-off, fully resident path.
+    /// Resolve a solved contact to the authoritative terrain owner, whether
+    /// collision is represented by one legacy shape or resident brick shapes.
+    pub(crate) fn is_terrain_physics_body(&self, id: PhysBodyId) -> bool {
+        match &self.terrain_brick_colliders {
+            Some(bricks) => bricks
+                .values()
+                .any(|entry| entry.has_collider && entry.phys == id),
+            None => self.terrain.phys == id,
+        }
+    }
+
+    /// Whether the per-brick terrain representation is active.
     pub fn terrain_brick_colliders_enabled(&self) -> bool {
         self.terrain_brick_colliders.is_some()
     }

@@ -136,8 +136,11 @@ impl Harness {
     /// reconciliation path, whether matching representations eliminates the
     /// divergence this file's traces otherwise reproduce.
     fn new_with(ack_delay: usize, force_server_native_voxels: bool) -> Self {
-        let mut sim = Simulation::new(SimulationConfig::new(g1_full_envelope_setup()))
-            .expect("g1 world valid");
+        // This historical representation comparison explicitly needs the
+        // legacy single terrain collider. The production default is per-brick.
+        let mut config = SimulationConfig::new(g1_full_envelope_setup());
+        config.terrain_collider_mode = spall_sim::world::TerrainColliderMode::WholeTerrain;
+        let mut sim = Simulation::new(config).expect("g1 world valid");
         let player = player_entity_for(0);
         sim.add_player(player, TOWER_APPROACH_M);
         if force_server_native_voxels {

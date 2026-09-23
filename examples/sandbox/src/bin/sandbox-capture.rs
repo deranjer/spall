@@ -866,6 +866,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
     let server_cfg = ServeConfig {
         listen: "127.0.0.1:0".parse().expect("valid loopback addr"),
         scene: ServerScene::CrossBridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: DESTRUCTION_TICKS,
         quiescence_ticks: 0,

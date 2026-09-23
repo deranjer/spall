@@ -8,6 +8,7 @@ use glam::DQuat;
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
 use spall_core::{BrickCoord, CELLS_PER_BRICK, EntityId, LocalCell, SphereBrush};
 use spall_protocol::RequestId;
+use spall_sim::world::TerrainColliderMode;
 use spall_sim::{
     BodyPose, EditIntent, EditTarget, MemoryBacking, Simulation, SimulationConfig, fixtures,
 };
@@ -211,8 +212,9 @@ fn live_and_replayed_edits_install_equivalent_terrain_collision() {
 
 #[test]
 fn terrain_collider_residency_tracks_eviction_and_reload_without_stale_shapes() {
-    let mut sim =
-        Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    let mut config = SimulationConfig::new(fixtures::separated_regions_setup());
+    config.terrain_collider_mode = TerrainColliderMode::WholeTerrain;
+    let mut sim = Simulation::new(config).unwrap();
     let terrain = sim.world().terrain_volume_id();
     let backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
     sim.world_mut().set_backing(Arc::new(backing));
@@ -286,6 +288,16 @@ fn terrain_collider_residency_tracks_eviction_and_reload_without_stale_shapes() 
     sim.world()
         .validate_terrain_brick_colliders()
         .expect("reloaded collider matches the durable brick");
+}
+
+#[test]
+fn fully_resident_world_starts_with_current_per_brick_collision() {
+    let sim = Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    assert!(sim.world().terrain_brick_colliders_enabled());
+    assert!(sim.world().terrain_brick_collider_count() > 1);
+    sim.world()
+        .validate_terrain_brick_colliders()
+        .expect("every resident solid brick has one current collider and no whole-terrain shape");
 }
 
 #[test]
