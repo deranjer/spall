@@ -155,11 +155,97 @@ as a promising single data point, not adoption evidence.
   residency radius in this report's testing — investigate whether radius was
   the actual variable in the original finding before treating churn as a
   fixed cost of the representation.
-- Next unblocked work: repeat `g4-dormancy-residency.json` a few times for
-  the same statistical footing as the settle-window comparison; reproduce a
-  loose-radius *full-length* run (not just the short smoke test) to confirm
-  radius — not something else — is the lever; investigate why settle=120's
-  tick p99 is bimodal.
+- Next unblocked work: recover the original ENG-80 high-churn run's exact
+  residency radius/budget and workload, then reproduce those values at full
+  horizon. The current report's tuned configuration now has three repeats,
+  and its controlled radius=2 full-horizon run is recorded below. Separately,
+  investigate why settle=120's tick p99 is bimodal.
+
+## ENG-80: sequential full-horizon repeat (2026-09-23)
+
+The exact three fixtures above were run sequentially in a dedicated worktree
+at `38d426f` plus this report/fixture commit `5acfaea` (the fixture commit was
+cherry-picked into the worktree as `c2afb45`). No engine source or default was
+changed. The report's `g4-dormancy-residency.json` remained byte-identical;
+the lockfile SHA-256 was
+`DCC3E3D3F15288A651F8C5548743E1BBFFB5BDAEEEF1DC3EF99F520485188883`.
+The sessions were run one at a time after the other worker's targeted checks
+finished; the release binaries were built on the baseline invocation and
+reused thereafter. Host was Windows NT 10.0.26200, 16 logical processors as
+reported by the runtime. Windows denied access to the processor model, so the
+CPU model could not be recorded. No competing agent builds or timed runs
+overlapped this sequence; other interactive desktop processes were not
+controlled, so this is sequential evidence, not an isolated benchmark host.
+
+Commands used (every command exited successfully except tuned run 01, which
+returned exit 1 for its configured server-timing target miss):
+
+```text
+cargo xtask scenario --name g4-dormancy-settle-120 --timeout-ms 400000 --output .local/runs/eng80-luna/baseline-run-01
+cargo xtask scenario --name g4-dormancy-residency --timeout-ms 400000 --output .local/runs/eng80-luna/tuned-run-01
+cargo xtask scenario --name g4-dormancy-residency --timeout-ms 400000 --output .local/runs/eng80-luna/tuned-run-02
+cargo xtask scenario --name g4-dormancy-residency --timeout-ms 400000 --output .local/runs/eng80-luna/tuned-run-03
+cargo xtask scenario --name g4-dormancy-residency-radius2 --timeout-ms 400000 --output .local/runs/eng80-luna/loose-radius2-run-01
+```
+
+The baseline is a fresh one-run comparison against the report's earlier
+whole-terrain n=4 set. The radius=2 run is a controlled full-horizon fixture
+that keeps the tuned fixture's budget=16, settle=120, workload and timing
+window unchanged, changing only the residency radius from 0 to 2.
+`fixtures/scenarios/g4-dormancy-residency-radius2.json` records that exact
+configuration for reproduction.
+
+| Run / configuration | session result | Tick p95 / p99 (ms) | Physics p95 / p99 (ms) | Dormancy deact / react | Residency evictions / reloads | Required-over-budget ticks / budget misses | Topology, replay, restart |
+| --- | :---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| Fresh whole-terrain baseline, settle=120 | pass | 9.7478 / 15.3598 | 0.4117 / 0.6338 | 261 / 30 | 0 / 0 | 0 / 0 | all match |
+| Per-brick, radius=0 budget=16, run 01 | **timing miss** | 12.6228 / 18.3999 | 0.8923 / 1.5258 | 115 / 76 | 3,805 / 2,189 | 530 / 27 | all match |
+| Per-brick, radius=0 budget=16, run 02 | pass | 9.9968 / 12.7466 | 0.7906 / 1.2802 | 115 / 76 | 3,961 / 2,228 | 569 / 27 | all match |
+| Per-brick, radius=0 budget=16, run 03 | pass | 10.7632 / 15.4773 | 0.9522 / 1.4615 | 115 / 76 | 3,805 / 2,189 | 530 / 27 | all match |
+| Per-brick, radius=2 budget=16, run 01 | pass | 10.7887 / 15.8373 | 0.8216 / 1.3901 | 144 / 105 | 1,557 / 1,554 | 9,139 / 8,880 | all match |
+
+Each run completed the configured 7,200-sample measured timing window and
+committed 1,212 transactions. The three tuned-radius runs had the same
+115/76 dormancy counts despite differing timing: mean tick p95/p99 was
+11.1276/15.5413 ms (ranges 9.9968–12.6228 / 12.7466–18.3999 ms); mean
+physics p95/p99 was 0.8784/1.4225 ms. Two of three met all configured timing
+thresholds; run 01 missed tick p95 <=12 ms and p99 <=16.7 ms. That session's
+eight clients each matched the server hash, and replay, cold-restart hash,
+and reconnect hash all matched. Its top-level session result was `failed`
+solely because `server_timing.requirements_met` was false; the harness's
+`all_hashes_match` summary field is also false on that aggregate failure even
+though the per-client, replay, and recovery hashes match. Do not count this as
+a topology or recovery failure, and do count it as a timing target miss.
+
+The radius=2 control passed hash agreement, replay, cold restart and reconnect,
+and its timing targets. It measured 249 total dormancy transitions versus
+191 at radius=0 (+30%), while the default whole-terrain baseline measured
+291. Meanwhile the radius=2 required set exceeded budget on all 9,139 server
+ticks, with 8,880 budget-miss ticks; the tuned radius=0 runs recorded 530–569
+required-over-budget ticks and 27 budget misses. This controlled run supports
+radius as a contributor to residency admission pressure and a moderate change
+in churn. It does **not** reproduce the historical 20–30x churn claim, nor
+prove radius alone caused that claim: the original comparison's radius and
+matched settings remain unknown, and the short earlier runs used differing
+budgets. The old claim needs its original config/logs or a better-matched
+reproduction before it can be retired.
+
+All output folders are under `.local/runs/eng80-luna/` in the measurement
+worktree and contain `summary.json`, `server.summary.json`, process JSONL
+logs, and run databases. The per-run server summary SHA-256 values are:
+
+| Output | SHA-256 of `server.summary.json` |
+| --- | --- |
+| `baseline-run-01` | `B44AB46B2B3FE454E3AA8789011D4F7873286E2317D5BEF280F63688AFA98722` |
+| `tuned-run-01` | `6F2462EB54B641698702442F131B8B368D5A052F635370DDB5452FB95988CC28` |
+| `tuned-run-02` | `A9555F93438113D6758FDD57D900EF9C69205825F47F3147283C6A0FB2B5C499` |
+| `tuned-run-03` | `AB2F41E07F71ECB660AD5D6FD7734EA331A92A97F78E31973E391FB5E43EABBC` |
+| `loose-radius2-run-01` | `D04FF4F45B8E23611A8F7CFCC0B3BD44DCE0738C830B3D477DCC8BDDF6819CBF` |
+
+These results improve the evidence but do not qualify adoption: there are
+only three tuned repeats on one desktop host, timing varies materially, and
+the matched radius control is only one run. Per-brick colliders remain
+experimental/default-off pending stronger repeated evidence and resolution
+of the original high-churn configuration.
 
 ## Checks
 
