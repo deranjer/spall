@@ -680,6 +680,18 @@ refinements (`ResidencyController` unification, durable-store backing,
 incremental capture, logical-terrain predicted collider) are follow-up tickets;
 the join-duration budget and the G4 eight-client workload + soak stay open.
 
+ENG-80 provisional adoption (2026-09-23): per-brick **terrain collision** now
+starts enabled even with the residency **cache** disabled. The two switches are
+independent. `sandbox-server --whole-terrain-collider` (or scenario JSON
+`"whole_terrain_collider": true`) selects the legacy comparison path; the
+`g4-dormancy-settle-120` and `g4-dormancy-settle-20` fixtures use it to retain
+their historical whole-terrain baseline. The tuned residency fixtures run
+per-brick by default. The user accepted this provisional default despite one
+of three tuned full-horizon runs missing tick p95/p99; see the G4 rubble-lane
+report. Good-enough performance is the current scheduling decision, while
+collision/edit/recovery correctness remains required. ENG-87 tracks later
+non-blocking performance and churn investigation.
+
 T23 increment 12 qualifies that residency evidence after the post-merge review.
 `SimWorld::reload_brick` now validates revision/content before publishing a
 backing candidate; wrong-revision and wrong-content tests require unchanged

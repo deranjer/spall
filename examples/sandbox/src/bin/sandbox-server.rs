@@ -1,6 +1,7 @@
 use clap::Parser;
 use spall_net::{JoinToken, TransportConfig};
 use spall_server::{Scene, ServeConfig, ServerConfig, TimingWindow};
+use spall_sim::world::TerrainColliderMode;
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 
 #[derive(Debug, Parser)]
@@ -63,6 +64,10 @@ struct Args {
     /// `walk` (T19 player-movement arena — every client gets a predicted capsule).
     #[arg(long, default_value = "bridge-cut")]
     scene: String,
+    /// Use the legacy whole-terrain collider for a controlled comparison.
+    /// Per-brick terrain collision is the normal mode.
+    #[arg(long)]
+    whole_terrain_collider: bool,
     /// T16: persist to `<world>/world.db` — recover from it on start, journal
     /// committed transactions, checkpoint on the interval and on shutdown.
     #[arg(long)]
@@ -322,6 +327,11 @@ fn run_serve(args: Args) -> ExitCode {
     let config = ServeConfig {
         listen: args.listen,
         scene,
+        terrain_collider_mode: if args.whole_terrain_collider {
+            TerrainColliderMode::WholeTerrain
+        } else {
+            TerrainColliderMode::PerBrick
+        },
         join_token: token,
         max_ticks: args.ticks,
         quiescence_ticks: args.quiescence_ticks,

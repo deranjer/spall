@@ -1,7 +1,9 @@
 # ENG-80 residency-safe terrain collider lifecycle
 
-Status: experimental and default-off. This report is an adoption prerequisite
-only; it does not claim that per-brick terrain colliders are adopted.
+Status when written: experimental and default-off. The user directed
+provisional default adoption on 2026-09-23 after this lifecycle port; see
+`ENG-75-76-79-80-g4-rubble-lane.md` for the decision and later evidence.
+The design and checks below describe the original residency-safe port.
 
 The validated ENG-75/76/77/79 integration head does not contain the earlier
 `terrain_bricks` prototype or its server option. The safe port therefore keeps

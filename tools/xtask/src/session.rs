@@ -147,6 +147,10 @@ struct Scenario {
     /// Build and run optimized binaries for CPU-heavy performance gates.
     #[serde(default)]
     release_profile: bool,
+    /// Compare against the legacy whole-terrain collider. Normal runs use
+    /// per-brick terrain colliders even when residency is disabled.
+    #[serde(default)]
+    whole_terrain_collider: bool,
     server_ticks: u64,
     /// Consecutive idle ticks before the server stops early. A gate fixture with
     /// widely-spaced scripted cuts under an impaired transport needs a larger
@@ -2234,6 +2238,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         // so the run can actually show it come to rest.
         server_cmd.arg("--await-body-settle");
     }
+    if scenario.whole_terrain_collider {
+        server_cmd.arg("--whole-terrain-collider");
+    }
     if let Some(budget) = scenario.residency_budget_bricks {
         server_cmd.args(["--residency-budget-bricks", &budget.to_string()]);
         if let Some(r) = scenario.residency_radius_bricks {
@@ -2753,7 +2760,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             &agreed,
             run.timeout,
             profile,
-            restart_residency,
+            RestartOptions {
+                residency: restart_residency,
+                whole_terrain_collider: scenario.whole_terrain_collider,
+            },
         );
         if !(r.ran && r.recovered_matches && r.reconnect_matches) {
             requirements_met = false;
@@ -2940,6 +2950,11 @@ struct RestartResidency {
     radius_bricks: Option<i64>,
 }
 
+struct RestartOptions {
+    residency: Option<RestartResidency>,
+    whole_terrain_collider: bool,
+}
+
 /// T23 / G3 cold restart. Launches a **fresh** `sandbox-server --serve --save`
 /// over the world DB the run just journalled — a cold recovery from the
 /// shutdown checkpoint plus the durable journal, no client edit replay — and
@@ -2953,7 +2968,7 @@ fn run_restart_check(
     expected: &str,
     deadline: Duration,
     profile: &str,
-    residency: Option<RestartResidency>,
+    options: RestartOptions,
 ) -> RestartCheck {
     let miss = RestartCheck {
         ran: false,
@@ -3009,11 +3024,14 @@ fn run_restart_check(
         "0",
         "--dev-unvalidated-actions",
     ]);
+    if options.whole_terrain_collider {
+        srv.arg("--whole-terrain-collider");
+    }
     // T23 / G3 row 7 item 2 (increment 31): re-open the same
     // `<world>/residency.db` a disk-backed live run wrote, proving a cold
     // restart's fresh `DiskBrickBacking` reads it back correctly. Absent for
     // every scenario that didn't request disk backing (unchanged behavior).
-    if let Some(r) = &residency {
+    if let Some(r) = &options.residency {
         srv.args(["--residency-budget-bricks", &r.budget_bricks.to_string()]);
         if let Some(radius) = r.radius_bricks {
             srv.args(["--residency-radius-bricks", &radius.to_string()]);

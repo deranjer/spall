@@ -59,6 +59,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
     let server_cfg = ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 1_500,
         quiescence_ticks: 60,

@@ -55,6 +55,7 @@ fn base_config(
     ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 300,
         quiescence_ticks: 30,

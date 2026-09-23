@@ -87,6 +87,7 @@ fn run_session(
     let server_cfg = ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: total_ticks + 600,
         quiescence_ticks: 0,

@@ -203,6 +203,18 @@ Storage partitions index data; they do not own indivisible physical objects. A b
 
 Begin G1/G2 with all scene geometry resident. G3 introduces eviction against the same invariants. Distant render LOD never changes authoritative voxels, collision, support, or replicated destruction outcomes.
 
+Per-brick terrain collision is the current provisional default: each resident
+solid terrain brick owns one derived fixed physics collider from its exact
+voxel revision, even when residency eviction is disabled. The authoritative
+terrain remains one volume; this creates no per-voxel entities or bodies.
+Eviction retires only the evicted brick's collider, and validated reload or a
+committed edit republishes current collision at the owning tick boundary.
+The legacy whole-terrain collider remains an explicit server comparison mode
+(`--whole-terrain-collider`), and it switches to per-brick before any terrain
+eviction. Collision mode is rebuilt from voxel state on recovery, not stored
+as a runtime handle. See ENG-80 and the G4 rubble-lane report for the
+user-directed decision and measured timing limits.
+
 T18 implements the shared policy in `spall_voxel::residency`: server and client
 hosts account resident brick count and dense material bytes against explicit
 ceilings, apply an enter/retain hysteresis band, and choose only clean,

@@ -22,7 +22,7 @@ use crate::intent::{EditIntent, EditTarget, IntentError};
 use crate::journal::JournalSink;
 use crate::player::transaction_world_box;
 use crate::schedule::{EditPipeline, TickReport};
-use crate::world::{SimWorld, WorldSetup};
+use crate::world::{SimWorld, TerrainColliderMode, WorldSetup};
 
 /// Reserved high bit for a server-authored [`RequestId`]. Contact-damage cuts
 /// (T21) are minted by the server, not a client, so their request ids sit in a
@@ -41,6 +41,9 @@ pub const TICK_DT_S: f32 = 1.0 / 60.0;
 /// Tunables for a [`Simulation`].
 pub struct SimulationConfig {
     pub world: WorldSetup,
+    /// Per-brick collision is the adopted default. Whole-terrain is retained
+    /// only for explicit comparison runs.
+    pub terrain_collider_mode: TerrainColliderMode,
     /// Maximum accepted-but-unstaged intents held before backpressure.
     pub max_pending_intents: usize,
     /// Consecutive commit conflicts on one region before it is routed through
@@ -57,6 +60,7 @@ impl SimulationConfig {
     pub fn new(world: WorldSetup) -> Self {
         Self {
             world,
+            terrain_collider_mode: TerrainColliderMode::PerBrick,
             max_pending_intents: Self::DEFAULT_MAX_PENDING_INTENTS,
             serialize_threshold: Self::DEFAULT_SERIALIZE_THRESHOLD,
         }
@@ -97,7 +101,8 @@ pub struct Simulation {
 
 impl Simulation {
     pub fn new(config: SimulationConfig) -> Result<Self, crate::world::WorldError> {
-        let world = SimWorld::new(config.world)?;
+        let world =
+            SimWorld::new_with_terrain_collider_mode(config.world, config.terrain_collider_mode)?;
         Ok(Self {
             world,
             pipeline: EditPipeline::new(config.max_pending_intents, config.serialize_threshold),
@@ -262,7 +267,6 @@ impl Simulation {
         }
 
         let terrain_volume = self.world.terrain_volume_id();
-        let terrain_phys = self.world.terrain().phys;
         let cell_m = self.world.terrain().cell_size().metres();
         let g = {
             let a = self.world.physics().gravity_m_s2();
@@ -292,7 +296,10 @@ impl Simulation {
                 // the world grid (increment 1).
                 (true, false) | (false, true) => {
                     let striker_idx = if contact.dynamic[0] { 0 } else { 1 };
-                    if contact.bodies[1 - striker_idx] != terrain_phys {
+                    if !self
+                        .world
+                        .is_terrain_physics_body(contact.bodies[1 - striker_idx])
+                    {
                         continue;
                     }
                     let striker_phys = contact.bodies[striker_idx];
