@@ -307,6 +307,11 @@ struct Scenario {
     /// exercise (0 samples) is not asserted.
     #[serde(default)]
     latency_targets: Option<LatencyTargets>,
+    /// T23 / G4: opt-in bounded owning-server timing window. Warmup ticks are
+    /// excluded; all requested measured ticks must complete and retain samples
+    /// before any configured target can pass.
+    #[serde(default)]
+    server_timing: Option<ServerTiming>,
     /// T21 / ENG-28 increment 4 (3c): run the server with `--dormancy` — a
     /// settled body with nothing active nearby deactivates, and a dormant body
     /// a player or edit approaches reactivates. Never combine with
@@ -314,6 +319,11 @@ struct Scenario {
     /// world that reads from.
     #[serde(default)]
     dormancy: bool,
+    /// Optional settle-window override for an explicit dormancy evaluation.
+    /// Requires `dormancy: true`; absent preserves the server's 120-tick
+    /// default and keeps existing fixtures byte-for-byte equivalent.
+    #[serde(default)]
+    dormancy_settle_ticks: Option<u64>,
     /// T21 / ENG-28 increment 4: require the server's end-of-run report to
     /// show at least this many dormancy deactivations / reactivations —
     /// real end-to-end proof the pass ran, not just that `dormancy` was set.
@@ -433,6 +443,43 @@ struct LatencyTargets {
     large_collapse_p95_ms: f64,
 }
 
+/// G4 owning-server timing assertions. Defaults are the validation contract:
+/// tick p95 <= 12 ms, p99 <= 16.7 ms, physics p95 <= 6 ms, and peak process
+/// memory <= 8 GiB. A scenario opts in by supplying the bounded window.
+#[derive(Debug, Clone, Deserialize)]
+struct ServerTiming {
+    #[serde(default)]
+    warmup_ticks: u64,
+    #[serde(default)]
+    measured_ticks: u64,
+    #[serde(default)]
+    max_samples: usize,
+    #[serde(default = "default_tick_p95_ms")]
+    tick_p95_ms: f64,
+    #[serde(default = "default_tick_p99_ms")]
+    tick_p99_ms: f64,
+    #[serde(default = "default_physics_p95_ms")]
+    physics_p95_ms: f64,
+    #[serde(default = "default_server_peak_memory_bytes")]
+    server_peak_memory_bytes: u64,
+}
+
+fn default_tick_p95_ms() -> f64 {
+    12.0
+}
+
+fn default_tick_p99_ms() -> f64 {
+    16.7
+}
+
+fn default_physics_p95_ms() -> f64 {
+    6.0
+}
+
+fn default_server_peak_memory_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
 fn default_single_brick_ms() -> f64 {
     100.0
 }
@@ -464,6 +511,26 @@ fn latency_targets_met(scenario: &Scenario, server: &ServerSummary) -> bool {
         server.large_collapse_p95_ms,
         t.large_collapse_p95_ms,
     )
+}
+
+/// T23 / G4: timing is fail-closed. A configured window that did not finish,
+/// retained no samples, or lacks the real process memory reading cannot pass.
+fn server_timing_requirements_met(scenario: &Scenario, server: &ServerSummary) -> bool {
+    let Some(t) = &scenario.server_timing else {
+        return true;
+    };
+    t.measured_ticks > 0
+        && t.max_samples >= t.measured_ticks as usize
+        && server.tick_busy_window_complete
+        && server.physics_window_complete
+        && server.tick_busy_samples >= t.measured_ticks
+        && server.physics_samples >= t.measured_ticks
+        && server.tick_busy_p95_ms <= t.tick_p95_ms
+        && server.tick_busy_p99_ms <= t.tick_p99_ms
+        && server.physics_p95_ms <= t.physics_p95_ms
+        && server
+            .process_peak_memory_bytes
+            .is_some_and(|bytes| bytes <= t.server_peak_memory_bytes)
 }
 
 fn one() -> u64 {
@@ -880,6 +947,27 @@ struct ServerSummary {
     residency_checkpoint_bricks_captured_total: u64,
     #[serde(default)]
     residency_checkpoint_bricks_logical_total: u64,
+    // T23 / G4 bounded owning-server timing telemetry (ServeSummary v9).
+    #[serde(default)]
+    tick_busy_p95_ms: f64,
+    #[serde(default)]
+    tick_busy_p99_ms: f64,
+    #[serde(default)]
+    tick_busy_max_ms: f64,
+    #[serde(default)]
+    tick_busy_samples: u64,
+    #[serde(default)]
+    tick_busy_window_complete: bool,
+    #[serde(default)]
+    physics_p95_ms: f64,
+    #[serde(default)]
+    physics_p99_ms: f64,
+    #[serde(default)]
+    physics_max_ms: f64,
+    #[serde(default)]
+    physics_samples: u64,
+    #[serde(default)]
+    physics_window_complete: bool,
 }
 
 /// Mirrors `spall_server::PerClientEgress`.
@@ -1043,6 +1131,8 @@ struct SessionSummary {
     /// T11a / ENG-62: the gate's requested / rejected / queued / committed
     /// breakdown (server-authoritative) and the measured commit-latency p95s.
     admission: AdmissionRow,
+    /// T23 / G4 bounded owning-server timing evidence and acceptance result.
+    server_timing: ServerTimingRow,
     /// T23 / G3 row 11: the configured join-budget network profile / ceilings
     /// alongside the measured compressed baseline size and time-to-ready.
     /// `configured: false` (all other fields zeroed) when no `join_budget`
@@ -1078,6 +1168,49 @@ struct AdmissionRow {
     large_collapse_samples: u64,
     latency_targets_configured: bool,
     latency_targets_met: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerTimingRow {
+    configured: bool,
+    warmup_ticks: u64,
+    measured_ticks: u64,
+    max_samples: usize,
+    tick_busy_p95_ms: f64,
+    tick_busy_p99_ms: f64,
+    tick_busy_max_ms: f64,
+    tick_busy_samples: u64,
+    tick_busy_window_complete: bool,
+    physics_p95_ms: f64,
+    physics_p99_ms: f64,
+    physics_max_ms: f64,
+    physics_samples: u64,
+    physics_window_complete: bool,
+    process_peak_memory_bytes: Option<u64>,
+    requirements_met: bool,
+}
+
+impl ServerTimingRow {
+    fn unconfigured() -> Self {
+        Self {
+            configured: false,
+            warmup_ticks: 0,
+            measured_ticks: 0,
+            max_samples: 0,
+            tick_busy_p95_ms: 0.0,
+            tick_busy_p99_ms: 0.0,
+            tick_busy_max_ms: 0.0,
+            tick_busy_samples: 0,
+            tick_busy_window_complete: false,
+            physics_p95_ms: 0.0,
+            physics_p99_ms: 0.0,
+            physics_max_ms: 0.0,
+            physics_samples: 0,
+            physics_window_complete: false,
+            process_peak_memory_bytes: None,
+            requirements_met: true,
+        }
+    }
 }
 
 impl AdmissionRow {
@@ -1395,6 +1528,57 @@ mod requirement_tests {
             &scenario,
             &ServerSummary::default()
         ));
+    }
+
+    #[test]
+    fn dormancy_settle_override_is_optional_and_preserves_default_path() {
+        let default_scenario: Scenario =
+            serde_json::from_str(r#"{ "server_ticks": 10, "dormancy": true }"#).unwrap();
+        assert!(default_scenario.dormancy);
+        assert_eq!(default_scenario.dormancy_settle_ticks, None);
+
+        let tuned_scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 112,
+                "dormancy": true,
+                "dormancy_settle_ticks": 20
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(tuned_scenario.dormancy_settle_ticks, Some(20));
+    }
+
+    #[test]
+    fn server_timing_requirements_fail_closed_until_the_full_window_is_measured() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "server_timing": {
+                    "warmup_ticks": 2,
+                    "measured_ticks": 4,
+                    "max_samples": 4
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut server = ServerSummary::default();
+        assert!(!server_timing_requirements_met(&scenario, &server));
+
+        server.tick_busy_window_complete = true;
+        server.physics_window_complete = true;
+        server.tick_busy_samples = 4;
+        server.physics_samples = 4;
+        server.tick_busy_p95_ms = 12.0;
+        server.tick_busy_p99_ms = 16.7;
+        server.physics_p95_ms = 6.0;
+        server.process_peak_memory_bytes = Some(8 * 1024 * 1024 * 1024);
+        assert!(server_timing_requirements_met(&scenario, &server));
+
+        server.tick_busy_p99_ms = 16.71;
+        assert!(!server_timing_requirements_met(&scenario, &server));
+        server.tick_busy_p99_ms = 16.7;
+        server.process_peak_memory_bytes = None;
+        assert!(!server_timing_requirements_met(&scenario, &server));
     }
 
     #[test]
@@ -2035,6 +2219,16 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         // produce; the harness is the authenticated dev-scenario path (ENG-47).
         "--dev-unvalidated-actions",
     ]);
+    if let Some(timing) = &scenario.server_timing {
+        server_cmd.args([
+            "--timing-warmup-ticks",
+            &timing.warmup_ticks.to_string(),
+            "--timing-measured-ticks",
+            &timing.measured_ticks.to_string(),
+            "--timing-max-samples",
+            &timing.max_samples.to_string(),
+        ]);
+    }
     if scenario.require_body_settled {
         // ENG-61: run physics past edit-quiescence until the detached body sleeps
         // so the run can actually show it come to rest.
@@ -2081,6 +2275,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     }
     if scenario.dormancy {
         server_cmd.arg("--dormancy");
+    }
+    if let Some(settle_ticks) = scenario.dormancy_settle_ticks {
+        server_cmd.args(["--dormancy-settle-ticks", &settle_ticks.to_string()]);
     }
     // T11 exact-replay check (and the T23 cold-restart check) both journal every
     // committed transaction to a world DB. Replay rebuilds from the tick-0
@@ -2361,6 +2558,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     all_hashes_match: false,
                     requirements_met: false,
                     admission: AdmissionRow::empty(),
+                    server_timing: ServerTimingRow::unconfigured(),
                     join_budget: JoinBudgetRow::unconfigured(),
                     per_client: Vec::new(),
                     app_egress_bytes: 0,
@@ -2571,6 +2769,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     if scenario.latency_targets.is_some() && !latency_ok {
         requirements_met = false;
     }
+    let server_timing_ok = server_timing_requirements_met(&scenario, &server);
+    if scenario.server_timing.is_some() && !server_timing_ok {
+        requirements_met = false;
+    }
     let admission = AdmissionRow {
         actions_requested: server.actions_requested,
         actions_rejected: server.actions_rejected,
@@ -2586,6 +2788,28 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         latency_targets_configured: scenario.latency_targets.is_some(),
         latency_targets_met: latency_ok,
     };
+    let server_timing =
+        scenario
+            .server_timing
+            .as_ref()
+            .map_or_else(ServerTimingRow::unconfigured, |t| ServerTimingRow {
+                configured: true,
+                warmup_ticks: t.warmup_ticks,
+                measured_ticks: t.measured_ticks,
+                max_samples: t.max_samples,
+                tick_busy_p95_ms: server.tick_busy_p95_ms,
+                tick_busy_p99_ms: server.tick_busy_p99_ms,
+                tick_busy_max_ms: server.tick_busy_max_ms,
+                tick_busy_samples: server.tick_busy_samples,
+                tick_busy_window_complete: server.tick_busy_window_complete,
+                physics_p95_ms: server.physics_p95_ms,
+                physics_p99_ms: server.physics_p99_ms,
+                physics_max_ms: server.physics_max_ms,
+                physics_samples: server.physics_samples,
+                physics_window_complete: server.physics_window_complete,
+                process_peak_memory_bytes: server.process_peak_memory_bytes,
+                requirements_met: server_timing_ok,
+            });
 
     all_match &= requirements_met;
     finish(
@@ -2635,6 +2859,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             all_hashes_match: all_match,
             requirements_met,
             admission,
+            server_timing,
             join_budget,
             per_client: rows,
             app_egress_bytes: server.app_egress_bytes,
