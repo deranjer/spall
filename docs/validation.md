@@ -796,3 +796,27 @@ G1/G2 are architecture decision points. Strong review is needed for structural g
 `cargo test -p spall_net` includes `separate_process_transport`: one OS server process, two OS client processes, and two OS UDP proxy processes, with packet loss and forwarding delay. Each client checks reliable replies, bulk parts and motion datagrams. Every child is supervised under a 30-second whole-run deadline and killed/reaped on failure. The ignored `process_role` test is its child entry point, invoked by the parent; it is not an omitted scenario. `cargo xtask net-check` remains the faster in-process measurement command and is labelled accordingly.
 
 The transport regressions also exercise constructor validation through postcard, 1 MiB bulk payloads, negotiated limits, QUIC establishment timeouts, decoded-message loss/reorder, duplicate/overflow sequences, bounded bulk part metadata, liveness-owner shutdown, and delayed-proxy cancellation. Application-byte metrics use connection counters (control/datagram/bulk frame bytes observed at the sampling point, excluding QUIC overhead and authentication), not message counts. Wire-byte metrics come from Quinn. Neither harness is a destruction/replication/G1 feasibility result.
+
+## ENG-89 — wgpu 30 renderer and Yakui HUD migration
+
+The migration acceptance sequence is:
+
+```powershell
+cargo tree -d
+cargo xtask check
+cargo xtask smoke --graphical
+cargo xtask capture --scene g2-frames --output .local/runs/eng89-g2-frames
+cargo xtask capture --scene g2-loop --output .local/runs/eng89-g2-loop
+cargo xtask capture --scene g2-motion --output .local/runs/eng89-g2-motion
+cargo xtask capture --scene g2-terrain --output .local/runs/eng89-g2-terrain
+cargo xtask capture --scene g2-collapse --output .local/runs/eng89-g2-collapse
+cargo xtask play --release --scene g1 --ticks 18000
+cargo run -p spall_editor
+```
+
+On each intended D3D12 and Vulkan adapter, inspect the captures and verify the
+live Yakui HUD draws over the scene, accepts input without leaking consumed
+clicks to gameplay, scales with DPI, survives resize, and recovers after surface
+loss. Record before/after frame-time percentiles plus HUD CPU time and, where the
+adapter supports timestamp queries, GPU time. Compilation and CPU-side checks
+do not substitute for those hardware observations.

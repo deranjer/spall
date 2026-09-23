@@ -39,14 +39,14 @@ impl EngineGpu {
         // renderer. `InstanceDescriptor::default()` can select a compatible
         // software/downlevel adapter first on Windows; those often expose a
         // tiny 2048-pixel texture limit despite a much stronger D3D12 GPU.
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: if cfg!(target_os = "windows") {
-                wgpu::Backends::DX12
-            } else {
-                wgpu::Backends::all()
-            },
-            ..Default::default()
-        });
+        let mut instance_descriptor =
+            wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()));
+        instance_descriptor.backends = if cfg!(target_os = "windows") {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::all()
+        };
+        let instance = wgpu::Instance::new(instance_descriptor);
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| error.to_string())?;
@@ -70,11 +70,21 @@ impl EngineGpu {
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: capabilities.alpha_modes[0],
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&context.device, &config);
-        let renderer = Renderer::new(&context.device, format, None, 1, false);
+        let renderer = Renderer::new(
+            &context.device,
+            format,
+            egui_wgpu::RendererOptions {
+                msaa_samples: 1,
+                depth_stencil_format: None,
+                dithering: false,
+                ..Default::default()
+            },
+        );
         Ok(Self {
             _instance: instance,
             surface,
@@ -444,8 +454,8 @@ impl EditorApp {
         };
     }
 
-    fn draw(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+    fn draw(&mut self, ctx: &mut egui::Ui) {
+        egui::Panel::top("menu").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
                     self.save();
@@ -485,7 +495,7 @@ impl EditorApp {
         }
     }
 
-    fn draw_launcher(&mut self, ctx: &egui::Context) {
+    fn draw_launcher(&mut self, ctx: &mut egui::Ui) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(60.0);
@@ -518,18 +528,18 @@ impl EditorApp {
         });
     }
 
-    fn draw_editor(&mut self, ctx: &egui::Context) {
+    fn draw_editor(&mut self, ctx: &mut egui::Ui) {
         match self.workspace {
             Workspace::Scene => self.draw_scene_workspace(ctx),
             Workspace::Asset => self.draw_asset_workspace(ctx),
         }
     }
 
-    fn draw_scene_workspace(&mut self, ctx: &egui::Context) {
+    fn draw_scene_workspace(&mut self, ctx: &mut egui::Ui) {
         if self.show_toolbox {
-            egui::TopBottomPanel::bottom("asset-toolbox")
+            egui::Panel::bottom("asset-toolbox")
                 .resizable(true)
-                .default_height(180.0)
+                .default_size(180.0)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.strong("Asset toolbox");
@@ -541,12 +551,12 @@ impl EditorApp {
                 });
         }
         if self.show_hierarchy {
-            egui::SidePanel::left("hierarchy")
+            egui::Panel::left("hierarchy")
                 .resizable(true)
                 .show(ctx, |ui| self.draw_hierarchy(ui));
         }
         if self.show_inspector {
-            egui::SidePanel::right("inspector")
+            egui::Panel::right("inspector")
                 .resizable(true)
                 .show(ctx, |ui| self.draw_inspector(ui));
         }
@@ -632,14 +642,14 @@ impl EditorApp {
         });
     }
 
-    fn draw_asset_workspace(&mut self, ctx: &egui::Context) {
+    fn draw_asset_workspace(&mut self, ctx: &mut egui::Ui) {
         if self.show_hierarchy {
-            egui::SidePanel::left("asset-library")
+            egui::Panel::left("asset-library")
                 .resizable(true)
                 .show(ctx, |ui| self.draw_asset_library(ui));
         }
         if self.show_inspector {
-            egui::SidePanel::right("asset-brush")
+            egui::Panel::right("asset-brush")
                 .resizable(true)
                 .show(ctx, |ui| self.draw_brush_controls(ui));
         }
@@ -802,7 +812,7 @@ impl EditorApp {
         let available = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(available, egui::Sense::hover());
         if response.hovered() {
-            let scroll = ui.input(|input| input.raw_scroll_delta.y);
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 self.viewport_zoom = (self.viewport_zoom * (scroll * 0.002).exp()).clamp(0.2, 5.0);
             }
@@ -1065,7 +1075,7 @@ impl EditorApp {
     ) {
         let viewport_active = viewport.response.hovered() || viewport.response.has_focus();
         if viewport.response.hovered() {
-            let scroll = ui.input(|input| input.raw_scroll_delta.y);
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 self.asset_camera.zoom =
                     (self.asset_camera.zoom * (scroll * 0.002).exp()).clamp(0.2, 8.0);
@@ -1325,13 +1335,14 @@ impl EditorApp {
         };
         let raw = egui_state.take_egui_input(&window);
         let egui_context = self.egui_context.clone();
-        let output = egui_context.run(raw, |ctx| self.draw(ctx));
+        let mut output = egui_context.run_ui(raw, |ui| self.draw(ui));
         self.egui_state
             .as_mut()
             .expect("state above")
             .handle_platform_output(&window, output.platform_output);
         let native_pixels_per_point = egui_winit::pixels_per_point(&self.egui_context, &window);
         let Some(gpu) = self.gpu.as_mut() else {
+            output.textures_delta.clear();
             return;
         };
         let window_size = window.inner_size();
@@ -1341,18 +1352,44 @@ impl EditorApp {
         let primitives = self
             .egui_context
             .tessellate(output.shapes, pixels_per_point);
-        for (id, delta) in &output.textures_delta.set {
-            gpu.renderer
-                .update_texture(&gpu.context.device, &gpu.context.queue, *id, delta);
+        for (id, deltas) in &output.textures_delta.set {
+            for delta in deltas {
+                gpu.renderer
+                    .update_texture(&gpu.context.device, &gpu.context.queue, *id, delta);
+            }
         }
         let frame = match gpu.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                drop(frame);
                 gpu.surface.configure(&gpu.context.device, &gpu.config);
+                for id in &output.textures_delta.free {
+                    gpu.renderer.free_texture(id);
+                }
+                output.textures_delta.clear();
                 return;
             }
-            Err(error) => {
-                self.status = format!("surface: {error}");
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                gpu.surface.configure(&gpu.context.device, &gpu.config);
+                for id in &output.textures_delta.free {
+                    gpu.renderer.free_texture(id);
+                }
+                output.textures_delta.clear();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                for id in &output.textures_delta.free {
+                    gpu.renderer.free_texture(id);
+                }
+                output.textures_delta.clear();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.status = "surface acquisition validation error".into();
+                for id in &output.textures_delta.free {
+                    gpu.renderer.free_texture(id);
+                }
+                output.textures_delta.clear();
                 return;
             }
         };
@@ -1391,10 +1428,12 @@ impl EditorApp {
                         }),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             gpu.renderer
                 .render(&mut pass.forget_lifetime(), &primitives, &screen);
@@ -1404,10 +1443,11 @@ impl EditorApp {
                 .into_iter()
                 .chain(std::iter::once(encoder.finish())),
         );
-        frame.present();
+        gpu.context.queue.present(frame);
         for id in &output.textures_delta.free {
             gpu.renderer.free_texture(id);
         }
+        output.textures_delta.clear();
     }
 }
 
