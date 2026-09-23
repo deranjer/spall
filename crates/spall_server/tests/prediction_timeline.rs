@@ -188,10 +188,10 @@ fn prediction_lead_stays_bounded_and_release_does_not_reverse() {
 
     // --- release behaviour ------------------------------------------------
     // Two separate questions. (1) Edge snap: how far the reconcile moves the
-    // predicted position horizontally at a key edge (the server applies an
-    // arriving input on whichever of its ticks comes next, the client applied
-    // it on its own tick, so an edge is off by whole ticks: 7.5 cm each at walk
-    // speed). (2) Sustained drift: once the player has been stationary for
+    // predicted position horizontally at a key edge. The client tags input
+    // with the first prediction tick it drives, and the server applies it on
+    // that tick when it is within the bounded future-input window. (2)
+    // Sustained drift: once the player has been stationary for
     // `SETTLE_MS`, horizontal corrections must be ~zero and must never pull the
     // player back along the direction it walked.
     const SETTLE_MS: u64 = 400;

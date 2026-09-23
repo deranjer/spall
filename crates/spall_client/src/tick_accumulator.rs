@@ -131,8 +131,12 @@ impl LeadController {
     /// Weight of each new round-trip sample in the running average.
     const RTT_EMA: f64 = 0.5;
 
-    /// Folds in one round-trip sample (input sent -> snapshot acknowledging it).
+    /// Folds in one measured transport round-trip sample. Zero is treated as
+    /// unavailable (e.g. before Quinn has a useful estimate), not as zero RTT.
     pub fn observe_rtt(&mut self, sample: Duration) {
+        if sample.is_zero() {
+            return;
+        }
         let s = sample.as_secs_f64();
         self.rtt_s = Some(match self.rtt_s {
             Some(prev) => prev + (s - prev) * Self::RTT_EMA,
@@ -150,6 +154,14 @@ impl LeadController {
     pub fn target_lead_ticks(&self) -> f64 {
         let rtt_ticks = self.rtt_s.unwrap_or(0.0) * Self::TICK_HZ;
         (rtt_ticks + Self::MARGIN_TICKS).clamp(Self::MIN_TARGET_TICKS, Self::MAX_TARGET_TICKS)
+    }
+
+    /// Hard prediction-history ceiling for one sampled timeline. A catch-up
+    /// burst may not jump past the same excess bound the rate controller uses;
+    /// this keeps a delayed snapshot from turning one scheduler stall into a
+    /// large batch of unacknowledged movement records.
+    pub fn max_lead_ticks(&self) -> u32 {
+        self.target_lead_ticks().ceil() as u32 + Self::HOLD_EXCESS_TICKS as u32
     }
 
     /// The most recently observed lead, if any reconcile has reported one.
@@ -170,6 +182,20 @@ impl LeadController {
             1.0 - (error * 0.02).clamp(-Self::MAX_SLEW, Self::MAX_SLEW)
         }
     }
+}
+
+/// Caps one local catch-up batch so the predicted timeline does not cross its
+/// lead ceiling relative to the newest server tick observed by the client.
+pub(crate) fn cap_prediction_ticks(
+    requested: u32,
+    next_predicted_tick: u64,
+    latest_server_tick: u64,
+    max_lead_ticks: u32,
+) -> u32 {
+    let current_lead = next_predicted_tick
+        .saturating_sub(latest_server_tick.saturating_add(1))
+        .min(u64::from(u32::MAX)) as u32;
+    requested.min(max_lead_ticks.saturating_sub(current_lead))
 }
 
 #[cfg(test)]
@@ -278,5 +304,47 @@ mod tests {
         assert_eq!(ctl.rate(), 1.0);
         ctl.observe_lead(ctl.target_lead_ticks() as usize + 6);
         assert!((0.94..1.0).contains(&ctl.rate()), "slews down, bounded");
+    }
+
+    #[test]
+    fn catch_up_bursts_stop_at_the_rtt_relative_lead_ceiling() {
+        let mut ctl = LeadController::default();
+        ctl.observe_rtt(Duration::from_millis(50));
+        ctl.observe_lead(4);
+        let server_tick = 100;
+        let mut next_tick = server_tick + 1 + 4;
+        let mut predicted = 0;
+        for _ in 0..8 {
+            let count = cap_prediction_ticks(8, next_tick, server_tick, ctl.max_lead_ticks());
+            predicted += count;
+            next_tick += u64::from(count);
+            assert!(next_tick - server_tick - 1 <= u64::from(ctl.max_lead_ticks()));
+        }
+        assert_eq!(ctl.max_lead_ticks(), 16);
+        assert_eq!(
+            predicted, 12,
+            "the burst stops at the existing excess bound"
+        );
+
+        // High-RTT play keeps the controller's documented larger lead range.
+        let mut high_rtt = LeadController::default();
+        high_rtt.observe_rtt(Duration::from_millis(400));
+        assert_eq!(high_rtt.max_lead_ticks(), 36);
+    }
+
+    #[test]
+    fn unavailable_zero_transport_rtt_does_not_replace_a_valid_sample() {
+        let mut ctl = LeadController::default();
+        ctl.observe_rtt(Duration::from_millis(80));
+        let target = ctl.target_lead_ticks();
+        ctl.observe_rtt(Duration::ZERO);
+        assert_eq!(ctl.target_lead_ticks(), target);
+
+        let mut unavailable = LeadController::default();
+        unavailable.observe_rtt(Duration::ZERO);
+        assert_eq!(
+            unavailable.target_lead_ticks(),
+            LeadController::MIN_TARGET_TICKS
+        );
     }
 }

@@ -21,7 +21,7 @@ use crate::limits::{
 };
 
 /// Schema version stamped into every encoded record header.
-pub const WIRE_SCHEMA_VERSION: u16 = 1;
+pub const WIRE_SCHEMA_VERSION: u16 = 2;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -162,9 +162,16 @@ fn unit_axis(v: &[f32; 3], field: &'static str) -> Result<(), RecordError> {
 // --- InputFrame -------------------------------------------------------------
 
 /// One redundant copy of a recent input, carried inside [`InputFrame`].
+///
+/// Carries its own `intended_tick` (not just the enclosing frame's) so that
+/// recovering it from a later datagram -- the case this redundancy exists
+/// for, a dropped primary frame -- can still schedule it against the tick it
+/// was tagged for instead of applying it immediately on whatever tick is
+/// next.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RecentInput {
     pub input_seq: InputSeq,
+    pub intended_tick: Tick,
     pub movement: [f32; 3],
     pub view_dir: [f32; 3],
     pub buttons: u32,
@@ -711,6 +718,7 @@ mod tests {
     fn input_frame_rejects_too_many_redundant_and_bad_axes() {
         let base = RecentInput {
             input_seq: InputSeq(1),
+            intended_tick: Tick(100),
             movement: [0.0; 3],
             view_dir: [0.0, 0.0, 1.0],
             buttons: 0,
