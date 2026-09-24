@@ -14,6 +14,57 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Stable server-assigned player principal. Unlike [`SessionId`] and [`SlotId`],
+/// this identity survives reconnects and transport slot reuse. It is sent only
+/// in the server's authenticated response, never trusted from a client claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlayerId(pub [u8; 16]);
+
+impl PlayerId {
+    /// Reject the reserved all-zero principal.
+    pub const fn is_valid(self) -> bool {
+        let bytes = self.0;
+        !(bytes[0] == 0
+            && bytes[1] == 0
+            && bytes[2] == 0
+            && bytes[3] == 0
+            && bytes[4] == 0
+            && bytes[5] == 0
+            && bytes[6] == 0
+            && bytes[7] == 0
+            && bytes[8] == 0
+            && bytes[9] == 0
+            && bytes[10] == 0
+            && bytes[11] == 0
+            && bytes[12] == 0
+            && bytes[13] == 0
+            && bytes[14] == 0
+            && bytes[15] == 0)
+    }
+
+    pub fn to_hex(self) -> String {
+        let mut text = String::with_capacity(32);
+        for byte in self.0 {
+            text.push_str(&format!("{byte:02x}"));
+        }
+        text
+    }
+
+    /// Parses exactly 32 hexadecimal characters.
+    pub fn from_hex(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0; 16];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        let id = Self(bytes);
+        id.is_valid().then_some(id)
+    }
+}
+
 /// Connection slot: which player seat on the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SlotId(pub u32);

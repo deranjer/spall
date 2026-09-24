@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use spall_protocol::{
-    InputFrame, MotionSnapshot, Record, SessionId, WireTag, decode_datagram, encode_datagram,
+    InputFrame, MotionSnapshot, PlayerId, Record, SessionId, WireTag, decode_datagram,
+    encode_datagram,
 };
 
 use crate::config::TransportConfig;
@@ -85,6 +86,7 @@ pub struct Connection {
     cfg: TransportConfig,
     role: Role,
     session: SessionId,
+    player_id: Option<PlayerId>,
 
     ctrl_send: Mutex<quinn::SendStream>,
     ctrl_recv: Mutex<CtrlRecv>,
@@ -133,6 +135,7 @@ impl Connection {
         ctrl_recv: quinn::RecvStream,
         cfg: TransportConfig,
         session: SessionId,
+        player_id: Option<PlayerId>,
         role: Role,
     ) -> Result<Self> {
         if quic.max_datagram_size().is_none() {
@@ -146,6 +149,7 @@ impl Connection {
             cfg,
             role,
             session,
+            player_id,
             ctrl_send: Mutex::new(ctrl_send),
             ctrl_recv: Mutex::new(CtrlRecv {
                 stream: ctrl_recv,
@@ -165,6 +169,13 @@ impl Connection {
     /// The session id assigned by the server during authentication.
     pub fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// Server-authenticated stable player principal, if this connection used
+    /// a per-player credential. Legacy shared-token connections have no
+    /// principal and must not be used for durable player-owned state.
+    pub fn player_id(&self) -> Option<PlayerId> {
+        self.player_id
     }
 
     /// Server or client end.

@@ -15,8 +15,8 @@
 use serde::{Deserialize, Serialize};
 use spall_protocol::{
     ActionRequest, ActionStatus, BaselineAck, BaselineBegin, BaselineEnd, BaselinePart, CodecError,
-    DurableThrough, Handshake, RepairRequest, TopologyTransaction, WireTag, decode_control,
-    encode_control,
+    DurableThrough, Handshake, ProgressionRequest, ProgressionResponse, RepairRequest,
+    TopologyTransaction, WireTag, decode_control, encode_control,
 };
 
 use crate::message::private::Sealed;
@@ -36,6 +36,8 @@ pub enum WireRecord {
     RepairRequest(RepairRequest),
     DurableThrough(DurableThrough),
     Handshake(Handshake),
+    ProgressionRequest(ProgressionRequest),
+    ProgressionResponse(ProgressionResponse),
 }
 
 impl WireRecord {
@@ -52,6 +54,8 @@ impl WireRecord {
             Self::RepairRequest(_) => WireTag::RepairRequest,
             Self::DurableThrough(_) => WireTag::DurableThrough,
             Self::Handshake(_) => WireTag::Handshake,
+            Self::ProgressionRequest(_) => WireTag::ProgressionRequest,
+            Self::ProgressionResponse(_) => WireTag::ProgressionResponse,
         }
     }
 
@@ -69,6 +73,8 @@ impl WireRecord {
             Self::RepairRequest(r) => encode_control(r),
             Self::DurableThrough(r) => encode_control(r),
             Self::Handshake(r) => encode_control(r),
+            Self::ProgressionRequest(r) => encode_control(r),
+            Self::ProgressionResponse(r) => encode_control(r),
         }
     }
 
@@ -95,6 +101,8 @@ impl WireRecord {
             WireTag::RepairRequest => Self::RepairRequest(decode_control(bytes)?),
             WireTag::DurableThrough => Self::DurableThrough(decode_control(bytes)?),
             WireTag::Handshake => Self::Handshake(decode_control(bytes)?),
+            WireTag::ProgressionRequest => Self::ProgressionRequest(decode_control(bytes)?),
+            WireTag::ProgressionResponse => Self::ProgressionResponse(decode_control(bytes)?),
             WireTag::InputFrame | WireTag::MotionSnapshot => {
                 return Err(CodecError::TagMismatch {
                     expected: WireTag::Handshake,
@@ -275,6 +283,10 @@ pub enum ServerAuthReply {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerAccept {
     pub session: spall_protocol::SessionId,
+    /// Authenticated stable identity assigned by a player credential, if the
+    /// server is using per-player credentials. Legacy shared-token servers
+    /// intentionally return `None`.
+    pub player_id: Option<spall_protocol::PlayerId>,
     pub server_handshake: Handshake,
 }
 

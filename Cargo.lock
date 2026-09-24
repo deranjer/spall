@@ -3033,8 +3033,12 @@ dependencies = [
 name = "sandbox"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "glam 0.33.6",
+ "postcard",
+ "ron",
+ "rusqlite",
  "serde",
  "serde_json",
  "spall_client",
@@ -3042,12 +3046,15 @@ dependencies = [
  "spall_jobs",
  "spall_mesh",
  "spall_net",
+ "spall_protocol",
  "spall_render",
  "spall_server",
  "spall_sim",
  "spall_voxel",
+ "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]
@@ -3461,6 +3468,7 @@ dependencies = [
  "serde_json",
  "spall_client",
  "spall_core",
+ "spall_jobs",
  "spall_net",
  "spall_physics",
  "spall_protocol",

@@ -27,8 +27,13 @@ use std::path::Path;
 
 use spall_core::{BrickCoord, CELLS_PER_BRICK, LocalCell, MaterialId, Revision, VolumeId};
 use spall_sim::{BackingBrick, BrickBacking, BrickBackingWriter};
-use spall_store::{ResidencyRecord, ResidencyStore, StoreError, decode_cells, encode_cells};
+use spall_store::{
+    BrickPayload, ResidencyRecord, ResidencyStore, StoreError, StoredBrick, decode_cells,
+    encode_cells,
+};
 use spall_voxel::{Brick, Volume};
+
+use crate::{BackingLoad, ResidencyBacking};
 
 /// Anything that can go wrong opening or using the disk-backed residency
 /// cache.
@@ -112,6 +117,67 @@ impl BrickBackingWriter for DiskBrickBacking {
     }
 }
 
+/// The same SQLite store can back the server residency controller as well as
+/// the SimWorld reload interface. Both surfaces share the exact StoredBrick
+/// bytes and revision key; writes are durable before success is returned.
+impl ResidencyBacking for DiskBrickBacking {
+    type Error = DiskBackingError;
+
+    fn load(&self, key: spall_voxel::BrickCacheKey) -> Result<BackingLoad, Self::Error> {
+        let Some(record) = self
+            .store
+            .get(key.volume.get(), [key.coord.x, key.coord.y, key.coord.z])?
+        else {
+            return Ok(BackingLoad::Unavailable);
+        };
+        Ok(match record {
+            ResidencyRecord::KnownEmpty { revision, edited } => BackingLoad::Brick(StoredBrick {
+                volume_id: key.volume.get(),
+                coord: [key.coord.x, key.coord.y, key.coord.z],
+                revision,
+                edited,
+                payload: BrickPayload::Uniform(MaterialId::AIR.raw()),
+            }),
+            ResidencyRecord::Brick {
+                revision,
+                edited,
+                payload,
+            } => BackingLoad::Brick(StoredBrick {
+                volume_id: key.volume.get(),
+                coord: [key.coord.x, key.coord.y, key.coord.z],
+                revision,
+                edited,
+                payload,
+            }),
+        })
+    }
+
+    fn persist(&mut self, brick: StoredBrick) -> Result<(), Self::Error> {
+        if matches!(brick.payload, BrickPayload::Uniform(material) if material == MaterialId::AIR.raw())
+        {
+            self.store.put_known_empty(
+                brick.volume_id,
+                brick.coord,
+                brick.revision,
+                brick.edited,
+            )?;
+        } else {
+            self.store.put_brick(
+                brick.volume_id,
+                brick.coord,
+                brick.revision,
+                brick.edited,
+                &brick.payload,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn records(&self) -> Result<Vec<StoredBrick>, Self::Error> {
+        Ok(self.store.records()?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,7 +210,9 @@ mod tests {
         assert!(backing.capture(&volume, coord));
 
         let expected = volume.snapshot_brick(coord).unwrap().unwrap();
-        let BackingBrick::Loaded(loaded) = backing.load(volume.id(), coord) else {
+        let BackingBrick::Loaded(loaded) =
+            spall_sim::BrickBacking::load(&backing, volume.id(), coord)
+        else {
             panic!("expected a loaded brick");
         };
         for i in 0..CELLS_PER_BRICK as u16 {
@@ -161,7 +229,7 @@ mod tests {
         let backing = DiskBrickBacking::open(&path).unwrap();
         let coord = GlobalCell::new(5, 5, 5).split().0;
         assert!(matches!(
-            backing.load(VolumeId::new(1).unwrap(), coord),
+            spall_sim::BrickBacking::load(&backing, VolumeId::new(1).unwrap(), coord),
             BackingBrick::Unavailable
         ));
     }
@@ -182,7 +250,9 @@ mod tests {
         // Fresh instance, same file: nothing carried over except what is on
         // disk.
         let reopened = DiskBrickBacking::open(&path).unwrap();
-        let BackingBrick::Loaded(loaded) = reopened.load(volume.id(), coord) else {
+        let BackingBrick::Loaded(loaded) =
+            spall_sim::BrickBacking::load(&reopened, volume.id(), coord)
+        else {
             panic!("expected the reload to survive reopening the store");
         };
         for i in 0..CELLS_PER_BRICK as u16 {

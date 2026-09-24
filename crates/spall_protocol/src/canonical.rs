@@ -196,6 +196,20 @@ pub fn content_manifest_hash(manifest: &MaterialManifest) -> Hash32 {
     w.hash()
 }
 
+/// Combines the material registry with the game-owned asset manifest for
+/// sandbox handshake compatibility. Engine-only callers retain the original
+/// material-only hash through [`content_manifest_hash`].
+pub fn content_manifest_hash_with_assets(
+    materials: &MaterialManifest,
+    asset_manifest_hash: Hash32,
+) -> Hash32 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"spall.content-with-assets.v1");
+    hasher.update(&content_manifest_hash(materials).0);
+    hasher.update(&asset_manifest_hash.0);
+    Hash32(*hasher.finalize().as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

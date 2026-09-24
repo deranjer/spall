@@ -38,3 +38,11 @@ spall_voxel = { workspace = true, features = ["oracle"] }
 name = "sim-scenario"
 path = "src/bin/sim_scenario.rs"
 required-features = ["scenario"]
+
+[[bin]]
+name = "region-origin-bench"
+path = "src/bin/region_origin_bench.rs"
+
+[[bin]]
+name = "region-coordination-bench"
+path = "src/bin/region_coordination_bench.rs"

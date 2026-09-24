@@ -11,7 +11,8 @@
 use std::collections::HashSet;
 
 use glam::DVec3;
-use spall_core::{EntityId, IdError, PlayerInput, Tick};
+use spall_core::{EntityId, GlobalCell, IdError, PlayerInput, Tick};
+use spall_physics::PhysicsOrigin;
 use spall_physics::{CharacterParams, CharacterState};
 use spall_protocol::{ActionStatus, InputSeq, RequestId};
 
@@ -23,6 +24,7 @@ use crate::journal::JournalSink;
 use crate::player::transaction_world_box;
 use crate::schedule::{EditPipeline, TickReport};
 use crate::world::{SimWorld, TerrainColliderMode, WorldSetup};
+use spall_voxel::Sample;
 
 /// Reserved high bit for a server-authored [`RequestId`]. Contact-damage cuts
 /// (T21) are minted by the server, not a client, so their request ids sit in a
@@ -101,8 +103,20 @@ pub struct Simulation {
 
 impl Simulation {
     pub fn new(config: SimulationConfig) -> Result<Self, crate::world::WorldError> {
-        let world =
-            SimWorld::new_with_terrain_collider_mode(config.world, config.terrain_collider_mode)?;
+        Self::new_with_physics_origin(config, PhysicsOrigin::ZERO)
+    }
+
+    /// Creates a simulation with an explicit local physics frame. Authoritative
+    /// world positions and protocol snapshots remain in global coordinates.
+    pub fn new_with_physics_origin(
+        config: SimulationConfig,
+        physics_origin: PhysicsOrigin,
+    ) -> Result<Self, crate::world::WorldError> {
+        let world = SimWorld::new_with_terrain_collider_mode_and_origin(
+            config.world,
+            config.terrain_collider_mode,
+            physics_origin,
+        )?;
         Ok(Self {
             world,
             pipeline: EditPipeline::new(config.max_pending_intents, config.serialize_threshold),
@@ -286,11 +300,8 @@ impl Simulation {
             if !contact.point_m.iter().all(|v| v.is_finite()) {
                 continue;
             }
-            let world_point = DVec3::new(
-                f64::from(contact.point_m[0]),
-                f64::from(contact.point_m[1]),
-                f64::from(contact.point_m[2]),
-            );
+            let world_point =
+                DVec3::from_array(self.world.physics_origin().to_world_f64(contact.point_m));
             match (contact.dynamic[0], contact.dynamic[1]) {
                 // Exactly one side dynamic, the other terrain: a body striking
                 // the world grid (increment 1).
@@ -309,11 +320,19 @@ impl Simulation {
                         continue;
                     };
                     let mass = self.world.physics().body_state(striker_phys).mass_kg;
+                    let point_cell = (world_point / cell_m).to_array();
+                    let normal = contact.normal.map(f64::from);
+                    let Some(target_material) =
+                        sample_contact_material(&self.world, terrain_volume, point_cell, normal)
+                    else {
+                        continue;
+                    };
                     events.push(ContactEvent {
                         target: EditTarget::Terrain,
                         target_volume: terrain_volume,
-                        point_cell: (world_point / cell_m).to_array(),
-                        normal: contact.normal.map(f64::from),
+                        target_material,
+                        point_cell,
+                        normal,
                         impulse_n_s: contact.normal_impulse_n_s,
                         resting_impulse_n_s: mass * g * dt,
                         striker_born_this_tick: born_this_tick.contains(&striker.get()),
@@ -361,9 +380,20 @@ impl Simulation {
                         .xform(struck_body.cell_size())
                         .world_to_local_cell(world_point)
                         .to_array();
+                    let normal_world = DVec3::from_array(contact.normal.map(f64::from));
+                    let normal_local = struck_body.pose.rotation.inverse() * normal_world;
+                    let Some(target_material) = sample_contact_material(
+                        &self.world,
+                        struck_body.volume_id,
+                        point_cell,
+                        normal_local.to_array(),
+                    ) else {
+                        continue;
+                    };
                     events.push(ContactEvent {
                         target: EditTarget::Body(struck_entity),
                         target_volume: struck_body.volume_id,
+                        target_material,
                         point_cell,
                         normal: contact.normal.map(f64::from),
                         impulse_n_s: contact.normal_impulse_n_s,
@@ -601,6 +631,29 @@ impl Simulation {
     pub fn step_physics_only(&mut self) {
         self.world.step_physics();
     }
+}
+
+/// Resolves the solid material just inside a contact surface. Solver points can
+/// lie on cell boundaries, so step half a cell against the target-to-striker
+/// normal and fail closed when the backing data is not resident.
+fn sample_contact_material(
+    world: &SimWorld,
+    volume_id: spall_core::VolumeId,
+    point_cell: [f64; 3],
+    normal: [f64; 3],
+) -> Option<spall_core::MaterialId> {
+    let volume = world.volume_ref(volume_id)?;
+    for offset in [0.51, 1.01, 1.51] {
+        let cell = GlobalCell::new(
+            (point_cell[0] - normal[0] * offset).floor() as i64,
+            (point_cell[1] - normal[1] * offset).floor() as i64,
+            (point_cell[2] - normal[2] * offset).floor() as i64,
+        );
+        if let Ok(Sample::Filled(material)) = volume.sample(cell) {
+            return Some(material);
+        }
+    }
+    None
 }
 
 /// Nearest-surface gap, metres, between a world-space AABB `(min, max)` and a

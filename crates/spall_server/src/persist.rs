@@ -650,10 +650,19 @@ pub fn replay_from_base_builtin(
     db_path: &std::path::Path,
     cfg: &PersistConfig,
 ) -> Result<(Simulation, u64), PersistError> {
+    replay_from_base_with_manifest(db_path, cfg, spall_sim::fixtures::stone_manifest())
+}
+
+/// Replays a save against the selected game's validated content manifest.
+pub fn replay_from_base_with_manifest(
+    db_path: &std::path::Path,
+    cfg: &PersistConfig,
+    materials: MaterialManifest,
+) -> Result<(Simulation, u64), PersistError> {
     replay_from_base(
         db_path,
         cfg,
-        spall_sim::fixtures::stone_manifest(),
+        materials,
         AnchorPlane::at(0),
         PhysicsConfig::default(),
     )

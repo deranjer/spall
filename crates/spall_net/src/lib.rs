@@ -48,12 +48,12 @@ pub use framing::{FrameError, read_framed, write_framed};
 pub use harness::{ClientOutcome, TransportCheckParams, TransportCheckReport, run_transport_check};
 pub use message::{AuthReject, ClientHello, NetMessage, ServerAccept, ServerAuthReply, WireRecord};
 pub use proxy::{PacketFaultPlan, PacketStats, UdpProxy};
-pub use tls::{DevIdentity, Fingerprint, JoinToken};
+pub use tls::{DevIdentity, Fingerprint, JoinToken, PlayerCredential};
 
 pub use spall_protocol;
 
 /// The ALPN protocol identifier negotiated on every Spall QUIC connection.
-pub const ALPN: &[u8] = b"spall/1";
+pub const ALPN: &[u8] = b"spall/2";
 
 /// Anything that can go wrong establishing or running a transport session.
 ///

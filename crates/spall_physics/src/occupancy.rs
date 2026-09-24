@@ -23,6 +23,9 @@ pub enum ExtractError {
     /// build works on fully resident fixtures; streamed residency is T18.
     #[error("cell {0:?} is not resident")]
     Unresident([i64; 3]),
+    /// The requested physics origin cannot be represented as a local cell frame.
+    #[error("physics origin cannot be represented in this occupancy grid's cell frame")]
+    OriginOutOfRange,
 }
 
 /// Largest dense occupancy grid a single build will allocate: 8 M cells (one
@@ -301,6 +304,17 @@ impl OccupancyGrid {
     /// Global cell that maps to grid cell `(0, 0, 0)`.
     pub fn origin(&self) -> GlobalCell {
         self.origin
+    }
+
+    /// Returns the same occupancy with its grid origin shifted by the
+    /// supplied cell count. Cell contents and ordering remain unchanged.
+    pub fn rebase_origin_by_cells(mut self, subtract_cells: [i64; 3]) -> Option<Self> {
+        self.origin = GlobalCell::new(
+            self.origin.x.checked_sub(subtract_cells[0])?,
+            self.origin.y.checked_sub(subtract_cells[1])?,
+            self.origin.z.checked_sub(subtract_cells[2])?,
+        );
+        Some(self)
     }
 
     /// Grid extent in cells on each axis.
