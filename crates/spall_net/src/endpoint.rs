@@ -25,17 +25,22 @@ use crate::message::{
     AuthReject, ClientHello, MAX_AUTH_MESSAGE, ServerAccept, ServerAuthReply, decode_auth,
     encode_auth,
 };
-use crate::tls::{DevIdentity, Fingerprint, JoinToken, client_config};
+use crate::tls::{DevIdentity, Fingerprint, JoinToken, PlayerCredential, client_config};
 use crate::{Result, TransportError};
 
 /// A listening Spall server endpoint.
 pub struct NetServer {
     endpoint: quinn::Endpoint,
-    token: JoinToken,
+    auth: ServerAuth,
     server_handshake: Handshake,
     cfg: TransportConfig,
     sessions: Arc<Mutex<Vec<(u32, bool)>>>,
     preauth: Arc<Semaphore>,
+}
+
+enum ServerAuth {
+    Shared(JoinToken),
+    Players(Vec<PlayerCredential>),
 }
 
 impl NetServer {
@@ -54,7 +59,56 @@ impl NetServer {
         let endpoint = quinn::Endpoint::server(server_config, addr)?;
         Ok(Self {
             endpoint,
-            token,
+            auth: ServerAuth::Shared(token),
+            server_handshake,
+            cfg,
+            sessions: Arc::new(Mutex::new(vec![(0, false); cfg.max_connections as usize])),
+            preauth: Arc::new(Semaphore::new(cfg.max_pending_authentications as usize)),
+        })
+    }
+
+    /// Binds an endpoint that authenticates each player with a server-issued
+    /// credential. Every token maps to a stable player principal; duplicate
+    /// credentials, duplicate tokens, invalid IDs, and an empty registry are
+    /// rejected before listening.
+    pub async fn bind_with_player_credentials(
+        addr: SocketAddr,
+        identity: &DevIdentity,
+        credentials: Vec<PlayerCredential>,
+        server_handshake: Handshake,
+        cfg: TransportConfig,
+    ) -> Result<Self> {
+        if credentials.is_empty() {
+            return Err(TransportError::Auth(AuthReject::Malformed(
+                "player credential registry is empty".into(),
+            )));
+        }
+        if credentials.len() > 4096 {
+            return Err(TransportError::Auth(AuthReject::Malformed(
+                "player credential registry exceeds the 4096-entry limit".into(),
+            )));
+        }
+        for (index, credential) in credentials.iter().enumerate() {
+            if !credential.player_id.is_valid() {
+                return Err(TransportError::Auth(AuthReject::Malformed(
+                    "player credential contains a reserved all-zero player ID".into(),
+                )));
+            }
+            if credentials[..index]
+                .iter()
+                .any(|earlier| earlier.token.verify(&credential.token))
+            {
+                return Err(TransportError::Auth(AuthReject::Malformed(
+                    "player credential registry contains a duplicate token".into(),
+                )));
+            }
+        }
+        let server_handshake = handshake_with_local_limits(server_handshake, cfg)?;
+        let server_config = identity.server_config(&cfg)?;
+        let endpoint = quinn::Endpoint::server(server_config, addr)?;
+        Ok(Self {
+            endpoint,
+            auth: ServerAuth::Players(credentials),
             server_handshake,
             cfg,
             sessions: Arc::new(Mutex::new(vec![(0, false); cfg.max_connections as usize])),
@@ -117,7 +171,14 @@ impl NetServer {
             Err(reject) => return Err(reject_client(&mut send, reject).await),
         };
 
-        if !self.token.verify(&hello.token) {
+        let player_id = match &self.auth {
+            ServerAuth::Shared(token) if token.verify(&hello.token) => None,
+            ServerAuth::Players(credentials) => player_for_token(credentials, &hello.token),
+            _ => None,
+        };
+        if player_id.is_none()
+            && !matches!(&self.auth, ServerAuth::Shared(token) if token.verify(&hello.token))
+        {
             return Err(reject_client(&mut send, AuthReject::BadToken).await);
         }
 
@@ -137,6 +198,7 @@ impl NetServer {
             &mut send,
             &ServerAuthReply::Accepted(ServerAccept {
                 session,
+                player_id,
                 server_handshake,
             }),
         )
@@ -148,6 +210,7 @@ impl NetServer {
             recv,
             effective_config(self.cfg, hello.handshake.limits)?,
             session,
+            player_id,
             Role::Server,
         )?;
         conn.session_lease = Some(lease);
@@ -163,6 +226,23 @@ impl NetServer {
     pub async fn wait_idle(&self) {
         self.endpoint.wait_idle().await;
     }
+}
+
+fn player_for_token(
+    credentials: &[PlayerCredential],
+    presented: &JoinToken,
+) -> Option<spall_protocol::PlayerId> {
+    let mut selected = [0_u8; 16];
+    let mut matched = 0_u8;
+    for credential in credentials {
+        let is_match = presented.verify(&credential.token) as u8;
+        let mask = 0_u8.wrapping_sub(is_match);
+        for (out, candidate) in selected.iter_mut().zip(credential.player_id.0) {
+            *out = (*out & !mask) | (candidate & mask);
+        }
+        matched |= is_match;
+    }
+    (matched != 0).then_some(spall_protocol::PlayerId(selected))
 }
 
 /// Connects to a Spall server (or a [`crate::proxy::UdpProxy`] in front of it).
@@ -234,6 +314,7 @@ pub async fn connect(
                     recv,
                     effective_config(cfg, accept.server_handshake.limits)?,
                     accept.session,
+                    accept.player_id,
                     Role::Client,
                 )
             }

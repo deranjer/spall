@@ -39,6 +39,8 @@ pub enum WireTag {
     RepairRequest = 10,
     DurableThrough = 11,
     Handshake = 12,
+    ProgressionRequest = 13,
+    ProgressionResponse = 14,
 }
 
 impl WireTag {
@@ -56,12 +58,118 @@ impl WireTag {
             10 => Self::RepairRequest,
             11 => Self::DurableThrough,
             12 => Self::Handshake,
+            13 => Self::ProgressionRequest,
+            14 => Self::ProgressionResponse,
             _ => return None,
         })
     }
 
     pub const fn to_u16(self) -> u16 {
         self as u16
+    }
+}
+
+/// Game progression operation requested over the authenticated control stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProgressionOperation {
+    InspectInventory,
+    Craft { recipe_id: u16, batch_count: u32 },
+}
+
+/// A player's request against a versioned game recipe catalog and inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressionRequest {
+    pub request_id: u64,
+    pub catalog_version: u32,
+    pub expected_inventory_revision: u64,
+    pub operation: ProgressionOperation,
+}
+
+impl Record for ProgressionRequest {
+    const TAG: WireTag = WireTag::ProgressionRequest;
+    fn validate(&self) -> Result<(), RecordError> {
+        if self.request_id == 0 {
+            return Err(RecordError::Inconsistent(
+                "progression request ID must be nonzero",
+            ));
+        }
+        match self.operation {
+            ProgressionOperation::InspectInventory => {}
+            ProgressionOperation::Craft {
+                recipe_id,
+                batch_count,
+            } if recipe_id != 0 && batch_count != 0 => {}
+            ProgressionOperation::Craft { .. } => {
+                return Err(RecordError::Inconsistent(
+                    "craft recipe and batch must be nonzero",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stable rejection categories; detailed game-specific prose stays server-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProgressionRejectCode {
+    CatalogVersion,
+    InventoryRevision,
+    UnknownRecipe,
+    ZeroBatch,
+    InsufficientItems,
+    Overflow,
+    Unavailable,
+}
+
+/// Compact, explicit inventory entry; numeric IDs are game-owned stable IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryEntry {
+    pub item_id: u16,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProgressionOutcome {
+    Inventory,
+    Crafted,
+    Rejected(ProgressionRejectCode),
+}
+
+/// Authoritative result always includes the complete current inventory, even
+/// for a rejected optimistic request, so clients can repair stale views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressionResponse {
+    pub request_id: u64,
+    pub catalog_version: u32,
+    pub inventory_revision: u64,
+    pub outcome: ProgressionOutcome,
+    pub inventory: Vec<InventoryEntry>,
+}
+
+impl Record for ProgressionResponse {
+    const TAG: WireTag = WireTag::ProgressionResponse;
+    fn validate(&self) -> Result<(), RecordError> {
+        if self.request_id == 0 || self.catalog_version == 0 {
+            return Err(RecordError::Inconsistent(
+                "progression response identity must be nonzero",
+            ));
+        }
+        if self.inventory.len() > 256 {
+            return Err(RecordError::OutOfRange {
+                field: "ProgressionResponse.inventory",
+                detail: "more than 256 stacks",
+            });
+        }
+        let mut previous = 0;
+        for entry in &self.inventory {
+            if entry.item_id == 0 || entry.count == 0 || entry.item_id <= previous {
+                return Err(RecordError::Inconsistent(
+                    "inventory entries must have positive counts and sorted unique IDs",
+                ));
+            }
+            previous = entry.item_id;
+        }
+        Ok(())
     }
 }
 

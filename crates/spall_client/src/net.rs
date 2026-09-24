@@ -36,7 +36,8 @@ use spall_physics::{CharacterParams, CharacterState};
 use spall_protocol::{
     ActionKind, ActionOutcome, ActionRequest, AlgorithmVersions, BaselineAck, BaselineWorld,
     ClaimedTarget, Handshake, Hash32, InputFrame, InputSeq, MotionSnapshot, NegotiatedLimits,
-    PROTOCOL_VERSION, RecentInput, RepairKey, RequestId, TransferId, session_player_entity,
+    PROTOCOL_VERSION, ProgressionRequest, ProgressionResponse, RecentInput, RepairKey, RequestId,
+    TransferId, session_player_entity,
 };
 
 use crate::interactive::{InteractiveSession, InteractiveView};
@@ -129,6 +130,26 @@ pub fn cut_request(
     cell: [i64; 3],
     radius_cells: i64,
 ) -> ActionRequest {
+    tool_request(
+        0,
+        ActionKind::Cut,
+        request_id,
+        input_seq,
+        cell,
+        radius_cells,
+    )
+}
+
+/// A request for a game-selected, server-approved tool. The server resolves
+/// the tool ID to its own operation and validates the aim and brush claims.
+pub fn tool_request(
+    tool: u16,
+    action: ActionKind,
+    request_id: u64,
+    input_seq: u64,
+    cell: [i64; 3],
+    radius_cells: i64,
+) -> ActionRequest {
     let h = BRUSH_UNIT / 2;
     let brush = SphereBrush::new(
         BrushPoint::from_units(
@@ -142,8 +163,8 @@ pub fn cut_request(
     ActionRequest {
         request_id: RequestId(request_id),
         input_seq: InputSeq(input_seq),
-        action: ActionKind::Cut,
-        tool: 0,
+        action,
+        tool,
         aim_origin_m: [0.0, 1.0, 0.0],
         aim_dir: [0.0, 0.0, 1.0],
         claimed_target: ClaimedTarget::Terrain,
@@ -311,9 +332,7 @@ pub struct ClientResidencyLimits {
 
 /// Machine-readable result of a client run.
 ///
-/// v4 (T23 / G3 row 7 increment 14) adds
-/// `client_residency_admission_deferred_total`, mirroring `ServeSummary`'s
-/// v6->v7 pattern from increment 13.
+/// v5 adds authoritative progression request responses.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientSummary {
     pub version: u32,
@@ -327,6 +346,8 @@ pub struct ClientSummary {
     /// when the transport (a lossy/jittered proxy) actually reordered them.
     pub motion_snapshots_out_of_order: u64,
     pub actions_sent: u64,
+    /// Authoritative progression replies received on the control stream.
+    pub progression_responses: Vec<ProgressionResponse>,
     pub last_server_tick: u64,
     pub final_world_hash: String,
     pub total_solid_cells: u64,
@@ -433,17 +454,62 @@ pub enum ClientNetError {
 
 /// Connects, replicates, scripts, and reports. Builds its own Tokio runtime.
 pub fn run_replication_client(config: ClientNetConfig) -> Result<ClientSummary, ClientNetError> {
+    run_replication_client_with_manifest(config, spall_sim::fixtures::stone_manifest())
+}
+
+/// Connects using the provided game's material manifest for handshake
+/// compatibility. The client never grants authority by supplying this data.
+pub fn run_replication_client_with_manifest(
+    config: ClientNetConfig,
+    materials: spall_core::MaterialManifest,
+) -> Result<ClientSummary, ClientNetError> {
+    run_replication_client_with_game_content(config, materials, None)
+}
+
+/// Connects using material and optional game-asset manifests for handshake compatibility.
+pub fn run_replication_client_with_game_content(
+    config: ClientNetConfig,
+    materials: spall_core::MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+) -> Result<ClientSummary, ClientNetError> {
+    run_replication_client_with_progression(config, materials, asset_manifest_hash, Vec::new())
+}
+
+/// Connects with optional asset compatibility and sends authenticated game
+/// progression requests over the reliable control stream.
+pub fn run_replication_client_with_progression(
+    config: ClientNetConfig,
+    materials: spall_core::MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+    progression_requests: Vec<ProgressionRequest>,
+) -> Result<ClientSummary, ClientNetError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| ClientNetError::Runtime(e.to_string()))?;
-    runtime.block_on(run_async(config))
+    runtime.block_on(run_async(
+        config,
+        materials,
+        asset_manifest_hash,
+        progression_requests,
+    ))
 }
 
-fn client_handshake() -> Handshake {
+fn client_handshake(
+    materials: &spall_core::MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+) -> Handshake {
     Handshake {
         protocol_version: PROTOCOL_VERSION,
-        content_manifest_hash: Hash32::of(T10_CONTENT_TAG),
+        content_manifest_hash: asset_manifest_hash.map_or_else(
+            || spall_protocol::content_manifest_hash(materials),
+            |hash| {
+                spall_protocol::content_manifest_hash_with_assets(
+                    materials,
+                    spall_protocol::Hash32(hash),
+                )
+            },
+        ),
         world_id: spall_core::WorldId::from_u128(T10_WORLD_ID),
         generator_version: 1,
         algorithms: AlgorithmVersions {
@@ -925,7 +991,12 @@ async fn perform_late_join(
     Ok(())
 }
 
-async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetError> {
+async fn run_async(
+    config: ClientNetConfig,
+    materials: spall_core::MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+    progression_requests: Vec<ProgressionRequest>,
+) -> Result<ClientSummary, ClientNetError> {
     // T23 / G3 row 11: the join-budget wall-clock reference point ("late-join
     // connect"). Deliberately taken before the QUIC handshake — under the
     // imposed network profile that handshake is itself part of the cost a
@@ -942,7 +1013,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         config.connect_addr,
         config.server_fingerprint,
         config.join_token,
-        client_handshake(),
+        client_handshake(&materials, asset_manifest_hash),
         config.transport,
     )
     .await
@@ -962,6 +1033,11 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         ProcessRole::Client,
         Some(format!("session={}", conn.session())),
     ))?;
+    for request in progression_requests {
+        conn.send_record(WireRecord::ProgressionRequest(request))
+            .await
+            .map_err(ClientNetError::Transport)?;
+    }
 
     // T23 / G3 row 11: start the heartbeat/idle-watchdog task now, before any
     // late-join wait -- not after one. `perform_late_join` below can
@@ -994,6 +1070,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         )
     }));
     let counters = Arc::new(Counters::default());
+    let progression_responses = Arc::new(Mutex::new(Vec::new()));
 
     // The window reads live terrain straight off the replica for its debug
     // draw; publish the handle once, up front, rather than threading it
@@ -1063,6 +1140,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let replica = replica.clone();
         let counters = counters.clone();
         let throttle_tx = throttle_tx.clone();
+        let progression_responses = progression_responses.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_record().await {
@@ -1180,6 +1258,12 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                                 reasons.push(reason.clone());
                             }
                         }
+                    }
+                    Ok(Some(WireRecord::ProgressionResponse(response))) => {
+                        progression_responses
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(response);
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => {
@@ -2093,7 +2177,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         }
     };
     let summary = ClientSummary {
-        version: 4,
+        version: 5,
         result: if catch_up_exhausted {
             "join-failed"
         } else if progressed && movement_ok {
@@ -2109,6 +2193,10 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         motion_snapshots: counters.motion.load(Ordering::Relaxed),
         motion_snapshots_out_of_order: counters.motion_reordered.load(Ordering::Relaxed),
         actions_sent: counters.actions.load(Ordering::Relaxed),
+        progression_responses: progression_responses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
         last_server_tick: last_tick,
         final_world_hash: guard.world_hash().to_string(),
         total_solid_cells: guard.total_solid_cells(),

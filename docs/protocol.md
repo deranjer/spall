@@ -10,7 +10,7 @@ Use Quinn reliable streams and datagrams. One reliable ordered control/topology 
 
 Datagrams carry player inputs and body/player motion. Each payload fits `min(1100, connection.max_datagram_size())` bytes after our envelope; recalculate when path limits change. Fail the connection setup clearly if required datagrams are unavailable. Larger records are split into independently useful snapshots, not IP-fragmented giant packets. Reliable application records use explicit length framing and checked decoding.
 
-Handshake includes protocol version, exact content manifest hash, world ID, generator version, supported algorithms, server tick rate, cell-size codes, session identity, and negotiated limits. Reject incompatibility before creating a player. For development use server certificate fingerprint pinning and a session join token; do not disable TLS verification globally. Dedicated Internet hosting is direct-address initially; QUIC does not provide NAT traversal, a relay, matchmaking, or account identity. Those need an explicit later platform choice.
+Handshake includes protocol version, exact content manifest hash, world ID, generator version, supported algorithms, server tick rate, cell-size codes, session identity, and negotiated limits. The sandbox combines its canonical material manifest hash with the optional versioned asset-manifest hash; clients serving custom content must provide the same asset manifest before connecting. Reject incompatibility before creating a player. For development use server certificate fingerprint pinning and a session join token; do not disable TLS verification globally. Dedicated Internet hosting is direct-address initially; QUIC does not provide NAT traversal, a relay, matchmaking, or account identity. Those need an explicit later platform choice.
 
 ## Minimal record families
 
@@ -25,8 +25,35 @@ Handshake includes protocol version, exact content manifest hash, world ID, gene
 | BaselineAck | transfer ID, verified manifest hash and installed cursor |
 | RepairRequest | object/brick key, expected/current revision and hash; rate-limited |
 | DurableThrough | highest contiguous journal sequence flushed to durable storage; distinct from simulation commit |
+| ProgressionRequest | nonzero request ID, recipe catalog version, expected inventory revision, and inspect/craft operation; authenticated control stream only |
+| ProgressionResponse | request ID, current catalog/inventory revisions, outcome/rejection code, and complete sorted inventory snapshot |
 
 Never serialize Rapier handles, ECS entities, pointers, platform-sized integers, or raw Rust structs. DTOs use explicit numeric sizes, tags, units, and bounds. Version the wire schema independently of the world save schema. Protocol mismatch is initially a clear rejection, not speculative compatibility code.
+
+Progression requests are game-facing control records, not world edits. In
+per-player credential mode, the server passes the authenticated `PlayerId` to
+the game-owned catalog/inventory handler; legacy shared-token mode passes no
+principal and remains suitable only for ephemeral per-slot progression. Crafting
+uses optimistic catalog and inventory revisions; every reply contains the
+authoritative full inventory, including rejection replies, so clients can
+refresh stale state. The sandbox deduplicates by authenticated player ID when
+available and falls back to the temporary connection slot only in legacy mode.
+Durable inventory storage is a separate game-owned layer and remains open.
+
+The sandbox per-player credential mode stores progression in its own
+versioned SQLite database, separate from the authoritative world database.
+Inventory revisions and item stacks use explicit stable fields. A craft
+request, its complete response receipt, and the per-player request high-water
+mark commit atomically in WAL mode with `synchronous=FULL`; recent receipts
+are retained for replay and older unseen IDs are rejected. One bounded writer
+thread owns this file. Harvest rewards in a saved world are first recorded in
+the world's durable outbox in the same transaction as the world journal row.
+The outbox delivery calls the progression writer, which deduplicates by
+authenticated player ID and originating action request ID, then the world
+writer acknowledges the event. Recovery replays unacknowledged events after a
+crash. Delivery can still wait for the game-owned writer on the simulation
+thread after the world row becomes durable; eliminating that tick delay is
+separate follow-up work. Without world persistence, harvest remains ephemeral.
 
 Limits start at 64 KiB per control record, 1 MiB per bulk part, 64 MiB per assembled transfer, and 256 KiB maximum decompressed data per material-only brick record (actual material payload is 64 KiB). Validate counts before allocation and decompress with output bounds. A multi-volume transaction can span staged bulk parts; its visible commit marker is small. Larger regions are split into multiple dependency-complete transfers. Each connection has bounded staging memory and a timeout.
 
@@ -107,6 +134,17 @@ Group disk flushes with a target interval <=100 ms, then emit DurableThrough. A 
 
 Checkpoint publication records all brick/body data and its journal cursor in one DB transaction. Recovery loads the latest complete checkpoint and replays the durable ordered journal suffix. Ignore no interior corrupt record: report corruption and offer the previous valid checkpoint as an explicit recovery choice. A crash must not leave the terrain removed without the corresponding child body.
 
+Game progression that grants rewards for a committed world edit uses the
+world database's durable outbox. The world journal row and opaque, explicitly
+versioned game event are inserted in one SQLite transaction. The game applies
+the event idempotently in its own database using a stable event/request ID, then
+the world writer acknowledges (deletes) the outbox row. A crash before the
+world transaction leaves neither; a crash after it leaves a replayable event;
+a crash after the game transaction but before acknowledgement safely replays
+the same ID. Events remain pending until the game database reports success.
+This guarantee applies when world persistence is enabled; an ephemeral run has
+no crash-recovery promise.
+
 Retire journal records only after a newer durable checkpoint covers them and no snapshot transfer needs them. Cap retention; lagging joins get a fresh baseline. Persist modified-air bricks explicitly so procedural regeneration cannot restore mined blocks. Initial baselines transfer authoritative terrain rather than trusting client-side generation to be bit-identical.
 
 Use versioned DTO migrations with fixture worlds before changing save formats. Unknown newer schemas are rejected without modifying the database. Back up/migrate into a separate database and validate before replacement.
@@ -167,8 +205,9 @@ baselines for an interest-crossing split.
 
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
-`spall_protocol` version-0 headers use `WIRE_SCHEMA_VERSION = 1` and
-`PROTOCOL_VERSION = 1`.
+`spall_protocol` record headers use `WIRE_SCHEMA_VERSION = 1`. The connection
+protocol is `PROTOCOL_VERSION = 2` after adding server-authenticated player
+principals to the pre-stream authentication exchange.
 
 **Endianness.** Every canonical hash pre-image and every frame header field is
 little-endian, fixed width. Canonical sequences carry a `u32` LE length prefix;
@@ -223,17 +262,20 @@ baseline regions, 4096 baseline parts.
 ## T09 transport adapter (implemented)
 
 `crates/spall_net` layers Quinn/QUIC on the T01 records. It owns transport only:
-no simulation, storage, or rendering. ALPN is `spall/1`; TLS is 1.3-only.
+no simulation, storage, or rendering. ALPN is `spall/2`; TLS is 1.3-only.
 
-**Sessions.** Development uses server-certificate **fingerprint pinning**
-(BLAKE3 of the certificate DER, carried out of band) plus a per-run 32-byte
-**join token** (constant-time compared). A wrong certificate fails the QUIC/TLS
-handshake (`TransportError::Connect`); a wrong token or an incompatible
-`Handshake` fails after TLS with a distinct `AuthReject::{BadToken,
-Incompatible(field)}` sent back to the client before the connection is torn
-down. Authentication is a `spall_net`-local `ClientHello { token, handshake }` /
-`ServerAuthReply` exchange at the head of the control stream — not a frozen wire
-record — after which the same stream carries `NetMessage`s.
+**Sessions.** Clients pin the server certificate fingerprint (BLAKE3 of the
+certificate DER, carried out of band). Legacy development mode accepts one
+per-run 32-byte shared join token and assigns no stable player principal.
+Player-owned state uses per-player credential mode: the server provisions
+unique 32-byte bearer tokens bound to stable 128-bit `PlayerId`s. `ClientHello`
+contains only the token and compatibility handshake; the server checks the
+token and returns the assigned optional `PlayerId` in `ServerAccept`. The ID is
+never client-asserted. Credential files must be access-controlled and tokens
+provisioned to the corresponding client through a protected channel. A wrong
+certificate fails the QUIC/TLS handshake; an unknown token or incompatible
+`Handshake` gets a distinct `AuthReject` before teardown. This local
+`ClientHello` / `ServerAuthReply` exchange precedes the normal control stream.
 
 **Channels.** One reliable ordered **control stream** per connection carries
 `NetMessage` envelopes: `Heartbeat { seq }`, `Record { seq, <T01 frame> }`, or

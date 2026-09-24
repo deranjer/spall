@@ -36,9 +36,13 @@ use yakui_winit::YakuiWinit;
 
 use crate::ClientError;
 use crate::interactive::{InteractiveSession, InteractiveView, LiveInput};
-use crate::net::{ClientNetConfig, run_replication_client};
+use crate::net::{
+    ClientNetConfig, run_replication_client_with_game_content,
+    run_replication_client_with_manifest, run_replication_client_with_progression,
+};
 use crate::predict::CELL_M;
 use crate::replica::ReplicaWorld;
+use spall_core::MaterialManifest;
 
 /// Debug-view visible radius (metres) around the player's feet. This
 /// renderer walks the raw volume every rebuild (no meshing/culling beyond a
@@ -69,7 +73,34 @@ const MAX_PITCH: f32 = 1.5;
 /// until the window closes or the network session ends on its own (the
 /// server closing, a fatal transport error). `net_config.interactive` is set
 /// by this function; any value the caller passed there is overwritten.
-pub fn run_interactive_window(mut net_config: ClientNetConfig) -> Result<(), ClientError> {
+pub fn run_interactive_window(net_config: ClientNetConfig) -> Result<(), ClientError> {
+    run_interactive_window_with_manifest(net_config, spall_sim::fixtures::stone_manifest())
+}
+
+/// Runs the interactive client using the game's material manifest for handshake compatibility.
+pub fn run_interactive_window_with_manifest(
+    net_config: ClientNetConfig,
+    materials: MaterialManifest,
+) -> Result<(), ClientError> {
+    run_interactive_window_with_game_content(net_config, materials, None)
+}
+
+/// Interactive client using material and optional game-asset manifests.
+pub fn run_interactive_window_with_game_content(
+    net_config: ClientNetConfig,
+    materials: MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+) -> Result<(), ClientError> {
+    run_interactive_window_with_progression(net_config, materials, asset_manifest_hash, Vec::new())
+}
+
+/// Interactive client with optional authenticated progression requests.
+pub fn run_interactive_window_with_progression(
+    mut net_config: ClientNetConfig,
+    materials: MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+    progression_requests: Vec<spall_protocol::ProgressionRequest>,
+) -> Result<(), ClientError> {
     let session = InteractiveSession::new();
     net_config.interactive = Some(session.clone());
 
@@ -89,7 +120,18 @@ pub fn run_interactive_window(mut net_config: ClientNetConfig) -> Result<(), Cli
     let net_thread = std::thread::Builder::new()
         .name("spall-client-net".into())
         .spawn(move || {
-            let result = run_replication_client(net_config);
+            let result = if !progression_requests.is_empty() {
+                run_replication_client_with_progression(
+                    net_config,
+                    materials,
+                    asset_manifest_hash,
+                    progression_requests,
+                )
+            } else if asset_manifest_hash.is_some() {
+                run_replication_client_with_game_content(net_config, materials, asset_manifest_hash)
+            } else {
+                run_replication_client_with_manifest(net_config, materials)
+            };
             let _ = net_done.send_event(());
             result
         })

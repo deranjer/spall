@@ -289,8 +289,10 @@ Accept: long weak cantilevers fail, comparable strong supports hold within decla
 
 ### T23 — G3/G4 integrated engine acceptance
 
-Current disposition: **not accepted**, per the
-[2026-09-18 acceptance audit](reports/T23-acceptance-audit-2026-09-18.md).
+Current disposition: **ENG-30 is Done in Loopira (2026-09-23, user-directed); gate evidence remains qualified below.**
+This status does not claim every G3/G4 validation target passed. The
+[2026-09-18 acceptance audit](reports/T23-acceptance-audit-2026-09-18.md)
+records the then-current findings.
 Of the audit's five findings, increment 37 (`docs/reports/G3.md`) fixes
 finding 1 (a real checkpoint-integrity regression — evicted-brick backing
 reads on the incremental-capture cache-miss path had lost their digest
@@ -299,12 +301,14 @@ integrity) was already closed by a same-day commit the audit's own stated
 verification numbers predate. Findings 3-5 — partial G4 soak evidence, a
 workload narrower than the required integrated gate, and incomplete
 network/visual evidence — are measurement and workload-coverage gaps, not
-correctness defects, and remain open. Full G4 measurement / workload
-coverage still requires follow-up. Historical increment completion does not
-unblock T24.
+correctness defects, and remain recorded as evidence limitations. Full G4
+measurement / workload coverage is not claimed. T24 may proceed under the
+user-directed ENG-30 status update; this does not waive or rewrite those
+remaining measurement findings.
 
 Post-merge follow-ups and evidence limits are recorded in the
-[ENG-30 review](reviews/2026-09-10-eng-30-post-merge.md). T23 stays open.
+[ENG-30 review](reviews/2026-09-10-eng-30-post-merge.md). Historical review
+text saying T23 stays open predates the 2026-09-23 Loopira status update.
 Those initial atomic-reload and traversal-assertion fixes have landed, as have
 bounded checkpoint capture and disk-backed residency with restart evidence.
 The current [G3 report](reports/G3.md) records increments through 37: the
@@ -329,6 +333,19 @@ Dependencies: T15, T17, T18, T20, T21, T22. Own: complete gate report and target
 Run all correctness, crash, impairment, visual, and eight-client workload scenarios. Include geographically separated players inside the bounded world, a multi-region collapse, prolonged rubble accumulation, and late join after heavy edits.
 
 Accept: validation.md gates pass or remaining failures are clearly recorded as open. Produce reproducible commands and raw evidence. This is the first game-ready engine slice, still without menus/editor/survival content.
+
+ENG-31 / T24 increment 19 (2026-09-23): the feasibility report contains a
+criterion-by-criterion acceptance audit, measured fixture bounds, reproducible
+commands, and explicit open failures. The eight-origin debris and separated
+player fixtures, adapter split/merge/body-transfer checks, SQLite distant-edit
+reload, and render-only seam invariant are demonstrated. Procedural generation
+and version coexistence, far/large structural-graph growth, long-session
+storage growth, continuous approach-triggered production merge, full server
+region routing, and a product-scale envelope remain open; no larger-world gate
+pass or maximum-scale claim is made. The audit fulfills T24's reporting
+acceptance, which allows unresolved gate failures when they are clearly
+recorded. Follow-up work should be assigned before making a G5 feasibility
+claim.
 
 Lands in increments against `docs/reports/G3.md`.
 
@@ -363,7 +380,294 @@ Dependencies: T23; T24 only if the game needs the larger-world envelope immediat
 
 Produce a game-facing API/examples for authoritative tools, placement, material definitions, recipes, damage, entity spawn, and asset loading. Recommend an ordered survival-content backlog separately. Keep game rules in sandbox_game, and preserve the engine's launch/scenario interface.
 
-Accept: one example game tool is added without editing renderer, transport, or storage internals; agents can reproduce all engine gate scenes from a clean checkout. UI/editor work remains unassigned.
+Acceptance amendment for the requested multiplayer progression increments:
+keep rendering and engine world-storage internals unchanged; allow explicit,
+versioned protocol records and thin client/server adapters for authenticated
+game progression, persisted by the sandbox-owned store. Provide the requested
+game-facing content APIs and examples, plus an ordered follow-on content
+backlog. Engine gate scenarios remain reproducible from a clean checkout as
+documented in Increment 5 below. UI/editor work remains unassigned.
+
+Delivered in increments. **Increment 1 (game-owned wood placement):**
+`sandbox_game::game::Tool::PLACE_WOOD` now creates the same validated
+`EditIntent` shape as the existing dig and stone-placement examples, targeting
+the stable game material ID `materials::WOOD`. The engine receives only the
+normal placement intent; the material catalog and tool choice remain in the
+example package. This is an API/content slice, not yet wired to a separate
+server-approved network tool ID: `spall_server` still owns its built-in tool
+whitelist. Renderer, transport, and storage internals were not changed.
+
+Recommended survival-content backlog, in dependency order: (1) define the
+versioned game rules/tool catalog and connect server-authorized tool IDs to
+game-owned rules; (2) finish placement and material interaction examples with
+server-side range/permission validation; (3) extend the versioned impact rule
+with material-specific damage profiles; (4) add versioned recipe definitions
+and crafting transactions; (5) add asset IDs/loading and
+persisted content manifests; (6) build survival inventory, gathering,
+crafting, and progression scenarios. Keep these as separate content work; do
+not fold UI/editor work into T25.
+
+**Increment 2 (versioned server action catalog):** `spall_server::ToolCatalog`
+stores validated unique tool IDs, an explicit catalog version, allowed edit
+kind/material, maximum brush radius, and aim reach. The ordinary `serve`
+entry point retains its legacy catalog; `serve_with_catalog` accepts the
+game-owned catalog. `sandbox-server` now supplies `sandbox_game::tool_catalog`
+with stable IDs for dig, stone, wood, and dirt placement. The server continues
+to derive hits and edit centers from authoritative geometry and rejects a
+place rule whose material is not registered in that world's manifest. Dirt
+is available in the current built-in manifest and is the immediately usable
+placement example; wood requires the later game-manifest/world-recovery wiring.
+The rules version is logged at startup, but is not yet negotiated in the client
+  handshake; clients with unknown/mismatched IDs receive normal action rejection.
+  No renderer, transport, or storage internals changed.
+
+  **Increment 3 (sandbox content identity and recovery):** The sandbox server
+  now creates fresh worlds and restores saved worlds with the sandbox material
+  manifest, including the established playground palette, and replay uses that
+  same manifest. Headless and interactive sandbox clients pass the matching
+  manifest into handshake validation; the advertised content hash now comes
+  from the canonical material manifest instead of a fixed engine tag. Existing
+  engine-only entry points retain the built-in stone manifest. This makes the
+  wood placement rule valid in sandbox worlds and prevents clients with a
+    different material catalog from joining. The action catalog version is still
+    logged but is not separately negotiated by the handshake.
+
+  **Increment 4 (sandbox client tool selection):** `spall_client::tool_request`
+  builds an action request with an explicit tool ID and operation; the existing
+  `cut_request` remains a compatibility wrapper for tool 0. `sandbox-client`
+  accepts `--tool dig|place-stone|place-wood|place-dirt` and writes the matching
+  stable game tool ID and action into scripted action schedules. The server
+  still resolves each ID through its catalog and checks action type, reach,
+  radius, target, and material availability before creating an edit intent.
+  This adds request selection, not a UI hotbar or live mouse aiming.
+
+  **Increment 5 (clean-checkout gate reproducibility audit):** Ran the
+  documented scenarios from an isolated clean worktree at commit
+  `e87ceac7fd3e089328c22b21765321d7275d1764`, with raw evidence retained under
+  `.local/runs/t25-gates/`. G1 passed for `g1-networked-destruction`, its 2%
+  loss variant (31 out-of-order motion snapshots), `g1-full-envelope`, and
+  `body-rest-on-structure`. G3 `t23-g3-traversal` passed with replay, recovery,
+  and reconnect hashes matching. The eight-client release-profile
+  `t23-g4-workload` passed with 4,352 bodies, 20 committed edits, replay, cold
+  restart, and reconnect at the same hash. G2 `g2-motion`, `g2-frames`,
+  `g2-loop`, `g2-terrain`, and `g2-collapse` all ran on RTX 4080 SUPER / DX12;
+  motion/terrain/collapse quality flags were empty, the persistent loop met its
+  client-frame target in all four scenes, and the cold full-cache frame-cost
+  capture remained above its explicitly provisional GPU target (as documented).
+  The `t23-g3` collapse scenario reproduced but did not pass its
+  `require_body_settled` gate: server/client/replay/recovery/reconnect hashes
+  all matched, but one detached body was still marked awake, so
+  `all_hashes_match` was false for the overall requirement summary. This is an
+  existing T23 evidence gap, not hidden as a T25 pass. The full-duration G4
+  soak, remaining impaired-join variants, and cross-GPU visual review were not
+  run; T23's docs already keep those measurements open.
+
+  **Increment 6 (game-owned impact-damage policy):** Added a versioned
+  sandbox-owned `IMPACT_DAMAGE_RULES` configuration and passed it to the
+  existing authoritative `Simulation::apply_contact_damage` path when
+  `sandbox-server --contact-damage` is enabled. The server logs the game damage
+  rules version. The engine still resolves collisions, caps work, creates
+  normal cut intents, and commits the resulting transactions. No material-
+  specific resistance table or client authority was introduced; entity spawn
+  rules remain open.
+
+  **Increment 7 (game-owned spawn rule):** Added
+  `sandbox::game::spawn_demo_wood_crate`, which constructs a stable game-owned
+  wood volume and delegates entity/physics allocation to
+  `SimWorld::spawn_body`. `sandbox-server --spawn-wood-crate` invokes the new
+  server setup hook only for a fresh world, before publishing its first
+  checkpoint. Existing saves restore without adding a duplicate crate. The
+  hook is game-provided but executes on the authoritative simulation thread;
+  clients cannot request arbitrary body spawns.
+
+  **Increment 8 (material-specific impact profiles):** Contact events now carry
+  the material sampled just inside the struck voxel surface. The authoritative
+  simulation resolves terrain and body-local contacts against their respective
+  volumes and drops events whose material cannot be read. `ContactDamagePolicy`
+  accepts game-provided per-material threshold, brush-radius, and detachment
+  profiles while retaining shared cooldown and per-tick safety caps. The
+  sandbox supplies distinct stone, dirt, and wood values, increments its damage
+  rules version, and passes profiles through the server's game policy setup.
+  **Checks:** `cargo fmt --all`; `cargo check -p spall_sim --all-targets
+  --all-features`; `cargo check -p spall_server --all-targets --all-features`;
+  `cargo check -p sandbox --bins --all-features`; `git diff --check` passed.
+  No tests were run. Values are initial sandbox tuning, not measured balance.
+  Next T25 item: versioned recipe definitions and authoritative crafting
+  transactions; then asset IDs/loading and progression examples.
+
+  **Increment 9 (versioned recipes and crafting transactions):** The sandbox
+  now defines stable item and recipe IDs plus an immutable recipe catalog with
+  an explicit catalog version. `RecipeCatalog::stage` validates catalog and
+  inventory revisions, scales ingredient/output quantities with checked
+  arithmetic, and builds a replacement inventory without mutating the source.
+  `Inventory::commit` applies that transaction only against its original
+  revision, so stale requests cannot double-spend; `game::craft` provides the
+  stage-and-commit path for the authoritative owner. Starter recipes convert
+  wood logs to planks and stone chunks to stone blocks, and the server logs the
+  catalog version. This is an in-memory game API: no client craft message,
+  player inventory ownership/persistence, or UI was added because those
+  systems do not yet exist in the assigned sandbox path. **Checks:** `cargo
+  fmt --all`; `cargo check -p sandbox --all-targets --all-features`;
+  `git diff --check` passed. No tests were run. This increment is followed by
+  the asset-loading slice below.
+
+  **Increment 10 (stable content asset manifest and loader):** Added
+  `sandbox::content` with stable game-owned `AssetId`s, versioned RON manifests,
+  and a canonical BLAKE3 manifest hash over explicit ID/version/path/hash
+  fields. Versioned manifests are immutable on write; `AssetStore` loads by ID,
+  confines relative paths to the manifest root, bounds file sizes, checks each
+  asset's recorded content digest, and verifies the SPVX major version, chunk bounds, required
+  chunk structure, decompression lengths, and embedded logical HASH before
+  returning file bytes. The editor's project-local asset IDs stay separate;
+  the sandbox runtime does not depend on the editor/UI package. The next
+  increment connects decoded static voxels to authoritative body spawn and
+  negotiates the manifest hash during client connection. **Checks:** `cargo fmt --all`; `cargo check -p
+  sandbox --all-targets --all-features`; `git diff --check` passed. No tests
+  were run.
+
+  **Increment 11 (asset/network integration and progression scenario):** The
+  loader now imports supported static single-root SPVX voxel runs into stable
+  material IDs and the sandbox maps those cells into a game-owned rigid body.
+  `sandbox-server --content-manifest` verifies all listed assets before
+  serving and incorporates the canonical asset manifest hash into the
+  handshake; clients pass the same manifest with `--content-manifest`, so a
+  different or missing asset catalog fails the existing compatibility check.
+  `--spawn-content-asset ID` places an imported asset in a new world. The
+  optional `--progression-demo` scenario grants one wood harvest drop to a
+  fresh authoritative inventory, crafts four planks using the versioned
+  recipe transaction, then places the selected imported asset. Example
+  sequence: start the server with `--content-manifest content-v1.ron
+  --spawn-content-asset 1 --progression-demo`, then connect either client mode
+  with the same `--content-manifest content-v1.ron`. The scenario is a
+  deterministic fresh-world integration fixture. At this stage harvest drops
+  are scenario-seeded rather than connected to normal committed world edits.
+  Animated/assembled/tinted SPVX
+  assets remain rejected by the static importer. **Checks:** `cargo fmt
+  --all`; `cargo check -p spall_client --all-targets --all-features`; `cargo
+  check -p spall_server --all-targets --all-features`; `cargo check -p sandbox
+  --bins --all-features`; `git diff --check` passed. No tests were run.
+
+  **Increment 12 (committed harvest drops and player-slot inventories):** The
+  staged cut now records per-material cell counts from its immutable input
+  snapshot, and the successful `Committed` result carries those counts. The
+  server invokes a game-owned callback only after commit, with the initiating
+  session and request ID; the sandbox awards wood logs and stone chunks to the
+  inventory keyed by that player's stable connection slot. Sixteen removed
+  cells yield one item. Crafting remains an in-memory API and is not yet
+  exposed as a client protocol request; connection slots are run-local, not
+  account identities, and inventories are not persisted. **Checks:**
+  `cargo fmt --all`; `cargo check -p spall_sim --all-targets --all-features`;
+  `cargo check -p spall_server --all-targets --all-features`; `cargo check -p
+  sandbox --bins --all-features` passed. No tests were run. Next: decide the
+  durable player identity and inventory storage boundary.
+
+  **Increment 13 (versioned crafting control protocol):** Added progression
+  request/response records on new reliable control tags. Requests carry a
+  nonzero request ID, recipe catalog version, expected inventory revision, and
+  inspect/craft operation; bounded responses carry current revisions, result
+  code, and a complete sorted inventory snapshot. The sandbox server routes
+  requests through its game-owned catalog and slot-owned inventory handler,
+  checks catalog and inventory revisions, and caches recent outcomes per
+  player slot to prevent duplicate craft application. Server admission is
+  capped at eight requests per slot per tick. Headless and interactive clients
+  can send progression records and surface responses; sandbox-client exposes
+  `--inspect-inventory` and `--craft RECIPE_ID:BATCH_COUNT` with an explicit
+  `--inventory-revision`. **Checks:** `cargo fmt --all`; `cargo check -p
+  spall_protocol --all-targets --all-features`; `cargo check -p spall_net
+  --all-targets --all-features`; `cargo check -p spall_client --all-targets
+  --all-features`; `cargo check -p spall_server --all-targets --all-features`;
+  `cargo check -p sandbox --bins --all-features`; `git diff --check` passed.
+  No tests were run. Limitation: player slots and inventories are server-run
+  local and in-memory; stable account identity and durable storage remain open.
+
+  **Increment 14 (identity/storage boundary review):** Do not persist
+  progression under `SlotId` or `SessionId`. `SessionId` changes on reconnect,
+  and connection slots are allocated by the live transport and can be reused
+  after restart. The current `JoinToken` authenticates membership in a server
+  run but is shared by clients; it does not identify an individual player.
+  The existing `spall_store` schema belongs to authoritative world saves and
+  does not define game-owned player records. Therefore durable inventory work
+  is blocked on an explicit authenticated player-principal contract and a
+  game-owned identity-to-inventory storage schema. Add that prerequisite
+  before associating a reconnecting client with a persisted inventory; do not
+  introduce client-asserted IDs or treat a connection slot as ownership.
+
+  **Increment 15 (server-authenticated player principals):** Added a stable
+  128-bit `PlayerId` and server-provisioned per-player bearer credentials.
+  `ClientHello` sends only the credential; `ServerAccept` returns the
+  server-assigned principal, which `Connection` and the authoritative game
+  callbacks expose. The sandbox accepts a bounded credential file with one
+  `<player-id-hex> <token-hex>` pair per line and keys in-memory inventories
+  and duplicate-request ledgers by `PlayerId` in this mode. The legacy shared
+  join token remains available for ephemeral sessions and has no stable
+  principal. The protocol/ALPN version was bumped to 2 because the auth reply
+  changed. This does not add durable inventory storage, account recovery,
+  credential revocation, or an external identity provider. **Checks:**
+  `cargo fmt --all`; `cargo check -p spall_protocol --all-targets
+  --all-features`; `cargo check -p spall_net --all-targets --all-features`;
+  `cargo check -p spall_server --all-targets --all-features`; `cargo check -p
+  sandbox --bins --all-features`; `git diff --check` passed. No tests were run.
+
+  **Increment 16 (durable per-player progression):** Added a game-owned,
+  versioned SQLite store under the sandbox world directory (or
+  `--progression-db`) for per-player inventory revisions/stacks and craft
+  request receipts, keyed only by authenticated `PlayerId`. It uses WAL plus
+  `synchronous=FULL`, a single bounded writer thread, and one transaction for
+  each craft's updated inventory, exact replay response, and request cursor.
+  The server restores progression on startup; harvest awards are persisted
+  idempotently by action request ID. At this increment's baseline, the
+  player's database was separate from the authoritative world database; see
+  Increment 18 for the durable outbox follow-up. The progression callback
+  waits for the writer result, so slow storage can delay a simulation tick.
+  **Checks:** `cargo fmt --all`; `cargo check -p sandbox --bins
+  --all-features`; `git diff --check` passed. No tests were run.
+
+  **Increment 17 (durable progression invariants):** Added focused SQLite
+  behavior tests for player isolation, committed-harvest idempotency, inventory
+  recovery after reopening the database, atomic craft/retry replay after
+  reopening, and rejection of an old request after its cached response has
+  aged out. **Checks:** `cargo fmt --all`; `cargo test -p sandbox --lib
+  progression_store::tests -- --nocapture` passed (3 tests);
+  `cargo xtask scenario --name t23-g3 --output .local/runs/t25-final-g3`
+  passed (7 committed edits, replay, cold restart, and reconnect converged to
+  `cac2893c…d18e6de`); `cargo xtask scenario --name
+  g1-networked-destruction --loss-percent 0 --output
+  .local/runs/t25-final-g1` passed (10 committed edits and replay converged to
+  `62164eee…d7a4b`); `cargo xtask scenario --name t23-g4-workload
+  --timeout-ms 240000 --output .local/runs/t25-final-g4` passed with all eight
+  clients, all 20 edits, replay, cold restart, and late reconnect converging to
+  `dafe0e5e…9547afa`; checks for spall_protocol, spall_net, spall_client,
+  spall_server and sandbox across all targets/features; `cargo fmt --all
+  --check`; and `git diff --check` passed. These scenario runs used the current
+  working tree, not a clean checkout. They do not establish atomicity with the
+  separate world journal or measure writer latency under server load. The
+  checks used the current working tree; the separate clean-checkout audit
+  remains documented in Increment 5.
+
+  **Increment 18 (review follow-up: contact normals and harvest durability):**
+  Contact material sampling now orients the physics pair normal from the
+  selected target toward its striker for both terrain/body and body/body
+  contacts; a pair-order regression test covers either target slot. For
+  authenticated harvests with world persistence enabled, sandbox emits a
+  versioned reward event into the world's durable outbox. The journal row and
+  outbox row share one SQLite transaction; startup and live delivery apply the
+  event to the progression database using its existing player/request
+  idempotency key and acknowledge it only after success. A crash before commit
+  leaves neither record, while a crash after commit or before acknowledgement
+  replays without losing or duplicating inventory. Ephemeral runs retain their
+  in-memory behavior and have no crash recovery promise. Exact checks and any
+  remaining integration limitations are recorded in the session work log.
+
+  Recommended follow-on survival-content work, in order: (1) connect committed
+  world edits and progression awards through a durable idempotent outbox or a
+  shared transaction boundary, and return persistence completions without
+  blocking the simulation tick; (2) define credential rotation/revocation and
+  operator-safe secret provisioning; (3) extend static asset import for
+  multi-root assemblies, animation, and tint only when gameplay needs them;
+  (4) add live tool selection/aiming controls and a hands-on multiplayer
+  progression scenario; (5) add end-to-end network tests for authenticated
+  craft requests across disconnect and restart. These follow-on items are not
+  T25 acceptance claims.
 
 ### ENG-74 — Editor MVP (user-authorized follow-up)
 

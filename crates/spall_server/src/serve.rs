@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::action_catalog::ToolCatalog;
 use crate::replication::{BodyDigest, ClientReplication, InterestSet, MotionBudget};
 use glam::DVec3;
 use serde::Serialize;
@@ -34,7 +35,7 @@ use spall_net::{
 use spall_physics::PhysicsConfig;
 use spall_protocol::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, AlgorithmVersions, BaselineAck,
-    ClaimedTarget, Handshake, Hash32, InputFrame, InterestEpoch, MotionSnapshot, NegotiatedLimits,
+    ClaimedTarget, Handshake, InputFrame, InterestEpoch, MotionSnapshot, NegotiatedLimits,
     PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
     frame_input, recent_input, session_player_entity,
 };
@@ -44,7 +45,7 @@ use spall_sim::fixtures::{
 use spall_sim::world::TerrainColliderMode;
 use spall_sim::{
     Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
-    SimulationConfig, action_statuses, fixtures,
+    SimulationConfig, action_statuses,
 };
 use spall_store::Writer;
 use spall_structure::AnchorPlane;
@@ -153,6 +154,7 @@ pub const MAX_ACTIONS_PER_CLIENT_PER_TICK: u32 = 4;
 /// (`docs/protocol.md`: `RepairRequest` is "rate-limited"). Surplus is dropped;
 /// the replica re-requests, itself rate-limited (ENG-49).
 pub const MAX_REPAIRS_PER_CLIENT_PER_TICK: u32 = 8;
+pub const MAX_PROGRESSION_PER_CLIENT_PER_TICK: u32 = 8;
 
 /// Most reliable messages (committed topology, `ActionStatus`, baseline
 /// transfers) that may sit unsent in one client's outbound queue before that
@@ -320,7 +322,16 @@ impl Scene {
         self.simulation_with_terrain_collider_mode(TerrainColliderMode::PerBrick)
     }
 
+    #[cfg(test)]
     fn simulation_with_terrain_collider_mode(self, mode: TerrainColliderMode) -> Simulation {
+        self.simulation_with_materials(mode, spall_sim::fixtures::stone_manifest())
+    }
+
+    fn simulation_with_materials(
+        self,
+        mode: TerrainColliderMode,
+        materials: spall_core::MaterialManifest,
+    ) -> Simulation {
         let mut setup = match self {
             Scene::BridgeCut => spall_sim::fixtures::bridged_terrain_setup(),
             Scene::CrossBridgeCut => spall_sim::fixtures::cross_brick_bridged_setup(),
@@ -337,6 +348,7 @@ impl Scene {
             Scene::Playground => spall_sim::fixtures::playground_setup(),
             Scene::PushTest => spall_sim::fixtures::walk_arena_setup(),
         };
+        setup.materials = materials;
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
         // CCD broad-phase BVH can keep a stale proxy for the just-removed
@@ -818,17 +830,337 @@ pub enum ServeError {
 /// Runs the networked host to completion and returns its summary. Builds its own
 /// current-thread-free multi-thread Tokio runtime.
 pub fn serve(config: ServeConfig) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content(
+        config,
+        ToolCatalog::default(),
+        spall_sim::fixtures::stone_manifest(),
+    )
+}
+
+/// Runs the networked host with a game-owned, versioned action catalog.
+/// Engine callers can continue using [`serve`] for the legacy built-in rules.
+pub fn serve_with_catalog(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content(config, tool_catalog, spall_sim::fixtures::stone_manifest())
+}
+
+/// Runs the networked host with game-owned authoritative tools and material
+/// definitions. The manifest is used for world creation, save recovery, and
+/// handshake compatibility checks.
+pub fn serve_with_game_content(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        None,
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// A callback for game-owned entities that belong in a newly-created world.
+/// It runs on the authoritative simulation thread before the initial
+/// checkpoint is published; it is not run when an existing save is restored.
+pub type InitialGameWorldSetup =
+    Box<dyn FnOnce(&mut Simulation) -> Result<(), String> + Send + 'static>;
+
+/// Game-owned observer invoked on the authoritative thread only after a
+/// client edit commits. Material counts describe cells actually removed by
+/// that committed cut, sampled from the validated pre-edit snapshot.
+pub type CommittedEditHandler = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            RequestId,
+            &std::collections::BTreeMap<spall_core::MaterialId, u64>,
+        ) + Send
+        + 'static,
+>;
+/// Converts a committed harvest to opaque, versioned game bytes. The stable
+/// identity and journal cursor are supplied by the server for durable replay.
+pub type CommittedEditOutboxEncoder = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            RequestId,
+            spall_core::JournalSeq,
+            &std::collections::BTreeMap<spall_core::MaterialId, u64>,
+        ) -> Option<spall_store::OutboxRecord>
+        + Send
+        + 'static,
+>;
+/// Applies one durable game event idempotently to the game's progression store.
+pub type OutboxProcessor =
+    Box<dyn FnMut(&spall_store::OutboxRecord) -> Result<(), String> + Send + 'static>;
+pub type ProgressionHandler = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            spall_protocol::ProgressionRequest,
+        ) -> spall_protocol::ProgressionResponse
+        + Send
+        + 'static,
+>;
+
+/// Runs the host with game content and an optional initial-world setup hook.
+/// The hook runs only when creating a new world, before its initial durable
+/// checkpoint, so restored saves never receive duplicate starter entities.
+pub fn serve_with_game_content_and_setup(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    setup: impl FnOnce(&mut Simulation) -> Result<(), String> + Send + 'static,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        Some(Box::new(setup)),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Runs the host with game content, optional new-world setup, and material
+/// profiles for the opt-in authoritative contact-damage pass.
+pub fn serve_with_game_content_and_policies(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Same as `serve_with_game_content_and_policies`, with a game asset manifest
+/// included in the exact client/server handshake content hash.
+pub fn serve_with_game_content_and_asset_manifest(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: spall_protocol::Hash32,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        Some(asset_manifest_hash),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Game-owned callback for post-commit material rewards, with the optional
+/// asset manifest included in handshake compatibility.
+pub fn serve_with_game_content_and_commit_handler(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Host with both post-commit harvest and authenticated progression handlers.
+pub fn serve_with_game_content_and_handlers(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        None,
+        None,
+        None,
+    )
+}
+
+/// Same as [`serve_with_game_content_and_handlers`], but authenticates clients
+/// using server-provisioned credentials, each bound to a stable `PlayerId`.
+/// The shared development join token in `ServeConfig` is ignored on this path.
+pub fn serve_with_game_content_and_player_credentials(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+    credentials: Vec<spall_net::PlayerCredential>,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        Some(credentials),
+        None,
+        None,
+    )
+}
+
+/// Credential-authenticated host whose harvest events are transactionally
+/// coupled to the world journal and replayed through the game's idempotent
+/// outbox processor after restart.
+pub fn serve_with_game_content_and_player_credentials_and_outbox(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+    credentials: Vec<spall_net::PlayerCredential>,
+    encoder: CommittedEditOutboxEncoder,
+    processor: OutboxProcessor,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        Some(credentials),
+        Some(encoder),
+        Some(processor),
+    )
+}
+
+fn serve_with_game_content_and_optional_setup(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    game_setup: Option<InitialGameWorldSetup>,
+    damage_profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: Option<CommittedEditHandler>,
+    progression_handler: Option<ProgressionHandler>,
+    player_credentials: Option<Vec<spall_net::PlayerCredential>>,
+    outbox_encoder: Option<CommittedEditOutboxEncoder>,
+    outbox_processor: Option<OutboxProcessor>,
+) -> Result<ServeSummary, ServeError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| ServeError::Runtime(e.to_string()))?;
-    runtime.block_on(serve_async(config))
+    runtime.block_on(serve_async(
+        config,
+        tool_catalog,
+        materials,
+        game_setup,
+        damage_profiles,
+        asset_manifest_hash,
+        commit_handler,
+        progression_handler,
+        player_credentials,
+        outbox_encoder,
+        outbox_processor,
+    ))
 }
 
-fn server_handshake() -> Handshake {
+fn server_handshake(
+    materials: &spall_core::MaterialManifest,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+) -> Handshake {
     Handshake {
         protocol_version: PROTOCOL_VERSION,
-        content_manifest_hash: Hash32::of(T10_CONTENT_TAG),
+        content_manifest_hash: asset_manifest_hash.map_or_else(
+            || spall_protocol::content_manifest_hash(materials),
+            |asset_hash| spall_protocol::content_manifest_hash_with_assets(materials, asset_hash),
+        ),
         world_id: spall_core::WorldId::from_u128(T10_WORLD_ID),
         generator_version: 1,
         algorithms: AlgorithmVersions {
@@ -847,10 +1179,11 @@ fn server_handshake() -> Handshake {
 /// One reliable/repair message from a client to the sim bridge.
 #[derive(Debug)]
 enum Inbound {
-    /// A connection was accepted; the sim loop learns its session (and, from the
-    /// generation, whether it supersedes an earlier one on the same slot).
-    Joined(SessionId),
+    /// A connection was accepted; the sim loop learns its session and any
+    /// server-authenticated stable player principal.
+    Joined(SessionId, Option<spall_protocol::PlayerId>),
     Action(SessionId, ActionRequest),
+    Progression(SessionId, spall_protocol::ProgressionRequest),
     Repair(SessionId, RepairRequest),
     /// T19: a player movement input frame (datagram). At most one is applied per
     /// player per tick; redundant `recent` copies recover a dropped frame.
@@ -868,6 +1201,7 @@ enum Inbound {
 enum Outbound {
     Transaction(Arc<TopologyTransaction>),
     Status(Arc<ActionStatus>),
+    Progression(Arc<spall_protocol::ProgressionResponse>),
     Motion(Arc<Vec<MotionSnapshot>>),
     /// A baseline transfer: `BaselineBegin` on control, parts on a bulk stream,
     /// `BaselineEnd` on control. Carries the whole world for a first late join,
@@ -1009,6 +1343,7 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
                 + tx.result_hashes.len() * 40
         }
         Outbound::Status(_) => 96,
+        Outbound::Progression(reply) => 64 + reply.inventory.len() * 8,
         Outbound::Baseline(t) => 64 + t.payload_bytes(),
         Outbound::Motion(_) | Outbound::Shutdown(_) => 0,
     }
@@ -1090,7 +1425,22 @@ impl OutboundHandle {
     }
 }
 
-async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
+async fn serve_async(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    game_setup: Option<InitialGameWorldSetup>,
+    damage_profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    mut commit_handler: Option<CommittedEditHandler>,
+    mut progression_handler: Option<ProgressionHandler>,
+    player_credentials: Option<Vec<spall_net::PlayerCredential>>,
+    mut outbox_encoder: Option<CommittedEditOutboxEncoder>,
+    outbox_processor: Option<OutboxProcessor>,
+) -> Result<ServeSummary, ServeError> {
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -1111,16 +1461,26 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         std::fs::rename(&tmp, path)?;
     }
 
-    let server = Arc::new(
+    let handshake = server_handshake(&materials, asset_manifest_hash);
+    let server = Arc::new(if let Some(credentials) = player_credentials {
+        NetServer::bind_with_player_credentials(
+            config.listen,
+            &identity,
+            credentials,
+            handshake,
+            config.transport,
+        )
+        .await?
+    } else {
         NetServer::bind(
             config.listen,
             &identity,
             config.join_token,
-            server_handshake(),
+            handshake,
             config.transport,
         )
-        .await?,
-    );
+        .await?
+    });
     let bound = server.local_addr()?;
     if let Some(path) = &config.addr_out {
         if let Some(parent) = path.parent() {
@@ -1137,6 +1497,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         ProcessRole::Server,
         Some(format!("bound={bound}")),
     ))?;
+    tracing::info!(
+        action_catalog_version = tool_catalog.version(),
+        "loaded authoritative action catalog"
+    );
 
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
     // T20 egress accounting: live connection handles (for a final stats read at
@@ -1255,9 +1619,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let max_join_retries = config.max_join_retries;
     let capture_workers = config.capture_workers.max(1);
     let dev_unvalidated_actions = config.dev_unvalidated_actions;
+    let action_catalog = tool_catalog;
+    let world_materials = materials;
     let residency_limits = config.residency;
     let residency_disk_path = config.residency_disk_path.clone();
     let contact_damage_cfg = config.contact_damage;
+    let contact_damage_profiles = damage_profiles;
     let dormancy_cfg = config.dormancy;
     let timing_window = config.timing_window;
     let persist_cfg = PersistConfig {
@@ -1279,12 +1646,16 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             mut pipeline,
             mut journalled_through,
             mut checkpoints_published,
-        } = match setup_persistence_with_terrain_collider_mode(
+            mut outbox_processor,
+        } = match setup_persistence_with_game_content(
             save.as_deref(),
             scene,
             &persist_cfg,
             save_faults,
             terrain_collider_mode,
+            world_materials,
+            game_setup,
+            outbox_processor,
         ) {
             Ok(parts) => parts,
             Err(e) => {
@@ -1292,6 +1663,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             }
         };
         let mut journal_records_written: u64 = 0;
+        let mut pending_outbox = Vec::<spall_store::OutboxRecord>::new();
+        let mut waiting_outbox = std::collections::VecDeque::<spall_store::OutboxRecord>::new();
 
         // T23 / G3 row 7, slice D: default-off residency pass. `None` -> the
         // world stays fully resident and every counter below is `0`.
@@ -1342,13 +1715,17 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // The session that staged each still-pending request, so the tick-report
         // outcome (`action_statuses`) can be routed back to only that client
         // instead of every connected client.
-        let mut submitted_by: HashMap<RequestId, SessionId> = HashMap::new();
+        let mut submitted_by: HashMap<RequestId, (SessionId, Option<spall_protocol::PlayerId>)> =
+            HashMap::new();
+        let mut player_principals: HashMap<u64, spall_protocol::PlayerId> = HashMap::new();
         let mut commit_latency = CommitLatency::default();
 
         // T21 / ENG-28 increment 4 (3c): default-off passes. `None` -> every
         // counter below stays `0` and neither pass is ever called, so an
         // ordinary run is byte-identical to before this increment.
-        let mut contact_damage_policy = contact_damage_cfg.map(spall_sim::ContactDamagePolicy::new);
+        let mut contact_damage_policy = contact_damage_cfg.map(|cfg| {
+            spall_sim::ContactDamagePolicy::with_material_profiles(cfg, contact_damage_profiles)
+        });
         let mut dormancy_policy = dormancy_cfg.map(spall_sim::DormancyPolicy::new);
         let mut contact_damage_cuts_submitted = 0u64;
         let mut contact_damage_cuts_rejected = 0u64;
@@ -1416,6 +1793,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             let mut saw_client_work = false;
             let mut actions_admitted: HashMap<u64, u32> = HashMap::new();
             let mut repairs_admitted: HashMap<u64, u32> = HashMap::new();
+            let mut progression_admitted: HashMap<u64, u32> = HashMap::new();
             let mut drained = 0usize;
             while drained < MAX_INBOUND_PER_TICK {
                 let Ok(msg) = inbound_rx.try_recv() else {
@@ -1423,8 +1801,13 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 };
                 drained += 1;
                 match msg {
-                    Inbound::Joined(session) => {
+                    Inbound::Joined(session, player_id) => {
                         lj.on_joined(session);
+                        if let Some(player_id) = player_id {
+                            player_principals.insert(session.raw(), player_id);
+                        } else {
+                            player_principals.remove(&session.raw());
+                        }
                         // Player identity is slot-stable across reconnects;
                         // no input scheduled by the old generation may leak
                         // into the replacement session.
@@ -1526,7 +1909,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             dev_intent_from_request(session, &req)
                                 .ok_or(ActionReject::Unsupported("unsupported target"))
                         } else {
-                            resolve_intent(sim.world(), session, &req)
+                            resolve_intent_with_catalog(sim.world(), session, &req, &action_catalog)
                         };
                         match resolved {
                             Ok(intent) => match sim.submit(intent) {
@@ -1534,7 +1917,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                     submitted_at
                                         .entry(req.request_id)
                                         .or_insert_with(std::time::Instant::now);
-                                    submitted_by.entry(req.request_id).or_insert(session);
+                                    submitted_by.entry(req.request_id).or_insert((
+                                        session,
+                                        player_principals.get(&session.raw()).copied(),
+                                    ));
                                     actions_staged += 1;
                                     send_to(
                                         &clients_for_sim,
@@ -1558,6 +1944,49 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             }
                         }
                     }
+                    Inbound::Progression(session, req) => {
+                        saw_client_work = true;
+                        if lj.session_expired(session) {
+                            continue;
+                        }
+                        let admitted = admit(
+                            &mut progression_admitted,
+                            session.raw(),
+                            MAX_PROGRESSION_PER_CLIENT_PER_TICK,
+                        );
+                        let response = if admitted
+                            && let Some(handler) = progression_handler.as_mut()
+                        {
+                            handler(session, player_principals.get(&session.raw()).copied(), req)
+                        } else if let Some(handler) = progression_handler.as_mut() {
+                            let mut snapshot_request = req;
+                            snapshot_request.operation =
+                                spall_protocol::ProgressionOperation::InspectInventory;
+                            // Use a reserved ID so the game handler can return a snapshot
+                            // without consuming or caching the rejected request's ID.
+                            snapshot_request.request_id = 0;
+                            let mut response = handler(
+                                session,
+                                player_principals.get(&session.raw()).copied(),
+                                snapshot_request,
+                            );
+                            response.request_id = req.request_id;
+                            response.outcome = spall_protocol::ProgressionOutcome::Rejected(
+                                spall_protocol::ProgressionRejectCode::Unavailable,
+                            );
+                            response
+                        } else {
+                            progression_rejected(
+                                &req,
+                                spall_protocol::ProgressionRejectCode::Unavailable,
+                            )
+                        };
+                        send_to(
+                            &clients_for_sim,
+                            session,
+                            Outbound::Progression(Arc::new(response)),
+                        );
+                    }
                     Inbound::Repair(session, req) => {
                         saw_client_work = true;
                         if lj.session_expired(session) {
@@ -1580,6 +2009,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     Inbound::Gone(session) => {
                         pending_player_inputs.remove_session(session);
                         lj.on_gone(session);
+                        player_principals.remove(&session.raw());
                     }
                 }
             }
@@ -1648,6 +2078,24 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
             for (rid, committed) in &report.committed {
                 committed_total += 1;
+                if !committed.removed_materials.is_empty()
+                    && let Some((session, player_id)) = submitted_by.get(rid).copied()
+                {
+                    let encoded = outbox_encoder.as_mut().and_then(|encoder| {
+                        encoder(
+                            session,
+                            player_id,
+                            *rid,
+                            committed.journal_seq,
+                            &committed.removed_materials,
+                        )
+                    });
+                    if let Some(event) = encoded.filter(|_| pipeline.is_some()) {
+                        pending_outbox.push(event);
+                    } else if let Some(handler) = commit_handler.as_mut() {
+                        handler(session, player_id, *rid, &committed.removed_materials);
+                    }
+                }
                 // T17 increment 2: a giant split ships its geometry out of band
                 // as a `BaselineTransfer`, keyed to the transaction by
                 // `transfer_id` (= the split's `TransactionId` | high bit).
@@ -1704,7 +2152,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 // shouldn't be one) falls back to the old broadcast so a status
                 // is never silently dropped.
                 match submitted_by.remove(&status.request_id) {
-                    Some(session) => send_to(
+                    Some((session, _player_id)) => send_to(
                         &clients_for_sim,
                         session,
                         Outbound::Status(Arc::new(status)),
@@ -1778,8 +2226,30 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         return SimResult::error(format!("journal encode failed: {e}"), ticks_run);
                     }
                 };
-                if let Err(e) = pipe.submit_journal(batch) {
+                let records = std::mem::take(&mut pending_outbox);
+                if let Err(e) = pipe.submit_journal_with_outbox(batch, records.clone()) {
                     return SimResult::error(format!("persistence: {e}"), ticks_run);
+                }
+                waiting_outbox.extend(records);
+                let durable = pipe.durable_seq();
+                let mut acknowledged = Vec::new();
+                while waiting_outbox
+                    .front()
+                    .is_some_and(|event| event.journal_seq <= durable)
+                {
+                    let event = waiting_outbox.pop_front().expect("front checked");
+                    if let Some(processor) = outbox_processor.as_mut() {
+                        if let Err(error) = processor(&event) {
+                            return SimResult::error(
+                                format!("harvest outbox delivery failed: {error}"),
+                                ticks_run,
+                            );
+                        }
+                        acknowledged.push(event.event_id);
+                    }
+                }
+                if let Err(e) = pipe.submit_acknowledge_outbox(acknowledged) {
+                    return SimResult::error(format!("outbox acknowledgement: {e}"), ticks_run);
                 }
 
                 // A checkpoint's journal cursor is `journalled_through`: the FIFO
@@ -1925,7 +2395,37 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             let final_tick = sim.current_tick().get();
             let tail = tick_journal_batch(&mut sim, &mut journalled_through, None, final_tick)
                 .unwrap_or_default();
-            let _ = pipe.submit_journal(tail);
+            let tail_events = std::mem::take(&mut pending_outbox);
+            if let Err(error) = pipe.submit_journal_with_outbox(tail, tail_events.clone()) {
+                shutdown_error = Some(format!("final journal/outbox submission failed: {error}"));
+            }
+            waiting_outbox.extend(tail_events);
+            if shutdown_error.is_none() {
+                if let Err(error) = pipe.wait_durable_through(journalled_through) {
+                    shutdown_error = Some(format!("final journal durability wait failed: {error}"));
+                } else {
+                    let mut acknowledged = Vec::new();
+                    while let Some(event) = waiting_outbox.pop_front() {
+                        if let Some(processor) = outbox_processor.as_mut() {
+                            match processor(&event) {
+                                Ok(()) => acknowledged.push(event.event_id),
+                                Err(error) => {
+                                    shutdown_error = Some(format!(
+                                        "final harvest outbox delivery failed: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if shutdown_error.is_none() {
+                        if let Err(error) = pipe.submit_acknowledge_outbox(acknowledged) {
+                            shutdown_error =
+                                Some(format!("final outbox acknowledgement failed: {error}"));
+                        }
+                    }
+                }
+            }
             // T23 / G3 row 7 follow-up: the shutdown snapshot folds evicted
             // terrain in from the durable backing the same way the periodic
             // checkpoints above do now, instead of reloading it into the live
@@ -1947,10 +2447,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             // The final drain covers the journal tail, the final checkpoint, and
             // the retain pass; attribute any failure to that shutdown flush so a
             // stranded save is never reported as a pass.
-            shutdown_error = outcome
-                .status
-                .error
-                .map(|e| format!("final checkpoint/flush failed: {e}"));
+            shutdown_error = shutdown_error.or_else(|| {
+                outcome
+                    .status
+                    .error
+                    .map(|e| format!("final checkpoint/flush failed: {e}"))
+            });
             tracing::info!(
                 durable_seq = outcome.status.durable_seq,
                 journal_records = outcome.status.journal_records,
@@ -2896,6 +3398,7 @@ struct Persistence {
     pipeline: Option<PersistPipeline>,
     journalled_through: u64,
     checkpoints_published: u64,
+    outbox_processor: Option<OutboxProcessor>,
 }
 
 /// Opens the world database, recovering from it when it already holds a
@@ -2927,6 +3430,7 @@ fn setup_persistence(
     )
 }
 
+#[cfg(test)]
 fn setup_persistence_with_terrain_collider_mode(
     save: Option<&std::path::Path>,
     scene: Scene,
@@ -2934,12 +3438,39 @@ fn setup_persistence_with_terrain_collider_mode(
     save_faults: Option<spall_store::FaultPlan>,
     terrain_collider_mode: TerrainColliderMode,
 ) -> Result<Persistence, String> {
+    setup_persistence_with_game_content(
+        save,
+        scene,
+        cfg,
+        save_faults,
+        terrain_collider_mode,
+        spall_sim::fixtures::stone_manifest(),
+        None,
+        None,
+    )
+}
+
+fn setup_persistence_with_game_content(
+    save: Option<&std::path::Path>,
+    scene: Scene,
+    cfg: &PersistConfig,
+    save_faults: Option<spall_store::FaultPlan>,
+    terrain_collider_mode: TerrainColliderMode,
+    materials: spall_core::MaterialManifest,
+    mut game_setup: Option<InitialGameWorldSetup>,
+    mut outbox_processor: Option<OutboxProcessor>,
+) -> Result<Persistence, String> {
     let Some(path) = save else {
+        let mut sim = scene.simulation_with_materials(terrain_collider_mode, materials);
+        if let Some(setup) = game_setup.take() {
+            setup(&mut sim)?;
+        }
         return Ok(Persistence {
-            sim: scene.simulation_with_terrain_collider_mode(terrain_collider_mode),
+            sim,
             pipeline: None,
             journalled_through: 0,
             checkpoints_published: 0,
+            outbox_processor,
         });
     };
     let mut writer = Writer::open(path).map_err(|e| e.to_string())?;
@@ -2949,7 +3480,7 @@ fn setup_persistence_with_terrain_collider_mode(
                 &recovery,
                 cfg,
                 persist::RecoveryChoice::RequireClean,
-                fixtures::stone_manifest(),
+                materials.clone(),
                 AnchorPlane::at(0),
                 PhysicsConfig::default(),
                 terrain_collider_mode,
@@ -2959,7 +3490,10 @@ fn setup_persistence_with_terrain_collider_mode(
         }
         // A genuinely new/empty database: seed it with the built-in scene.
         Err(spall_store::StoreError::NoCheckpoint) => {
-            let sim = scene.simulation_with_terrain_collider_mode(terrain_collider_mode);
+            let mut sim = scene.simulation_with_materials(terrain_collider_mode, materials);
+            if let Some(setup) = game_setup.take() {
+                setup(&mut sim)?;
+            }
             let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
             writer
                 .publish_checkpoint(&checkpoint)
@@ -2982,12 +3516,26 @@ fn setup_persistence_with_terrain_collider_mode(
     if let Some(faults) = save_faults {
         writer.set_faults(faults);
     }
+    if let Some(processor) = outbox_processor.as_mut() {
+        loop {
+            let events = writer.pending_outbox(256).map_err(|e| e.to_string())?;
+            if events.is_empty() {
+                break;
+            }
+            for event in &events {
+                processor(event)?;
+            }
+            let ids: Vec<_> = events.iter().map(|event| event.event_id).collect();
+            writer.acknowledge_outbox(&ids).map_err(|e| e.to_string())?;
+        }
+    }
     let pipeline = PersistPipeline::spawn(writer, PipelineConfig::default());
     Ok(Persistence {
         sim,
         pipeline: Some(pipeline),
         journalled_through,
         checkpoints_published,
+        outbox_processor,
     })
 }
 
@@ -3045,40 +3593,6 @@ fn dev_intent_from_request(session: SessionId, req: &ActionRequest) -> Option<Ed
 }
 
 // --- ENG-47: server-side action-claim validation -------------------------------
-
-/// A server-approved tool. On the wire `ActionRequest::tool` is an opaque `u16`;
-/// the server — not the client — decides what each id may do, how big a brush it
-/// may request, and how far its aim reaches. Unknown ids are refused. Real
-/// per-role tool grants are a later task; this is the minimum "action limits are
-/// resolved on the server" (`docs/architecture.md` Editing).
-#[derive(Debug, Clone, Copy)]
-struct ToolSpec {
-    /// The edit this tool performs on a validated hit.
-    kind: EditKind,
-    /// Largest brush radius this tool may request, in whole cells.
-    max_radius_cells: i64,
-    /// Farthest the aim ray may travel to a solid authoritative hit, in metres.
-    reach_m: f64,
-}
-
-/// The built-in T10 tool catalog.
-fn tool_spec(tool: u16) -> Option<ToolSpec> {
-    match tool {
-        // 0 — short-range cutter.
-        0 => Some(ToolSpec {
-            kind: EditKind::Cut,
-            max_radius_cells: 8,
-            reach_m: 12.0,
-        }),
-        // 1 — short-range stone placer.
-        1 => Some(ToolSpec {
-            kind: EditKind::Place(spall_voxel::fixtures::STONE),
-            max_radius_cells: 4,
-            reach_m: 8.0,
-        }),
-        _ => None,
-    }
-}
 
 /// Why an [`ActionRequest`] was refused before it could become an [`EditIntent`].
 /// The `&'static str` variants keep the `ActionStatus` reason strings stable.
@@ -3181,12 +3695,24 @@ fn target_matches(claimed: ClaimedTarget, struck: EditTarget) -> bool {
 /// exists; the aim ray hits solid authoritative geometry within reach; and the
 /// struck volume matches `claimed_target`. The `session` is already known-live
 /// (the caller rejects a superseded generation first).
+#[cfg(test)]
 fn resolve_intent(
     world: &SimWorld,
     session: SessionId,
     req: &ActionRequest,
 ) -> Result<EditIntent, ActionReject> {
-    let spec = tool_spec(req.tool).ok_or(ActionReject::UnknownTool(req.tool))?;
+    resolve_intent_with_catalog(world, session, req, &ToolCatalog::default())
+}
+
+fn resolve_intent_with_catalog(
+    world: &SimWorld,
+    session: SessionId,
+    req: &ActionRequest,
+    catalog: &ToolCatalog,
+) -> Result<EditIntent, ActionReject> {
+    let spec = catalog
+        .get(req.tool)
+        .ok_or(ActionReject::UnknownTool(req.tool))?;
 
     let action_fits = matches!(
         (req.action, spec.kind),
@@ -3194,6 +3720,13 @@ fn resolve_intent(
     );
     if !action_fits {
         return Err(ActionReject::ToolActionMismatch);
+    }
+    if let EditKind::Place(material) = spec.kind
+        && world.materials().get(material).is_none()
+    {
+        return Err(ActionReject::Unsupported(
+            "tool material is absent from the authoritative world manifest",
+        ));
     }
 
     let max_units = spec.max_radius_cells.saturating_mul(BRUSH_UNIT);
@@ -3432,6 +3965,19 @@ fn reject(clients: &ClientMap, session: SessionId, request: RequestId, reason: &
     );
 }
 
+fn progression_rejected(
+    request: &spall_protocol::ProgressionRequest,
+    code: spall_protocol::ProgressionRejectCode,
+) -> spall_protocol::ProgressionResponse {
+    spall_protocol::ProgressionResponse {
+        request_id: request.request_id,
+        catalog_version: request.catalog_version.max(1),
+        inventory_revision: request.expected_inventory_revision,
+        outcome: spall_protocol::ProgressionOutcome::Rejected(code),
+        inventory: Vec::new(),
+    }
+}
+
 /// Returns a replayable status only for an action that passed authoritative
 /// validation and was admitted to the simulation. Pre-admission validation and
 /// rate-limit refusals intentionally are not held here: no edit was staged, so
@@ -3498,7 +4044,9 @@ async fn serve_conn(
 
     // Announce the join in order so the sim loop can supersede an earlier
     // session on the same slot (reconnect) and drive a late-join baseline.
-    let _ = inbound.send(Inbound::Joined(session)).await;
+    let _ = inbound
+        .send(Inbound::Joined(session, conn.player_id()))
+        .await;
 
     let liveness = tokio::spawn(conn.clone().run_liveness(stop.clone()));
 
@@ -3515,6 +4063,12 @@ async fn serve_conn(
                     // stays far under the cap.
                     Ok(Some(WireRecord::ActionRequest(req))) => {
                         match inbound.try_send(Inbound::Action(session, req)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                    Ok(Some(WireRecord::ProgressionRequest(req))) => {
+                        match inbound.try_send(Inbound::Progression(session, req)) {
                             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                             Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
@@ -3576,6 +4130,10 @@ async fn serve_conn(
                         .is_ok(),
                     Outbound::Status(s) => conn
                         .send_record(WireRecord::ActionStatus((*s).clone()))
+                        .await
+                        .is_ok(),
+                    Outbound::Progression(reply) => conn
+                        .send_record(WireRecord::ProgressionResponse((*reply).clone()))
                         .await
                         .is_ok(),
                     Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
@@ -4126,7 +4684,7 @@ mod tests {
             joiner,
             BaselineAck {
                 transfer_id: BASELINE_REQUEST_SENTINEL,
-                verified_manifest_hash: Hash32::ZERO,
+                verified_manifest_hash: spall_protocol::Hash32::ZERO,
                 installed_cursor: spall_core::JournalSeq(0),
             },
             &sim,
@@ -4189,7 +4747,7 @@ mod tests {
             joiner,
             BaselineAck {
                 transfer_id: BASELINE_REQUEST_SENTINEL,
-                verified_manifest_hash: Hash32::ZERO,
+                verified_manifest_hash: spall_protocol::Hash32::ZERO,
                 installed_cursor: spall_core::JournalSeq(0),
             },
             &sim,

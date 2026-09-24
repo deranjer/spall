@@ -46,6 +46,7 @@ pub mod intent;
 pub mod journal;
 pub mod player;
 pub mod playground;
+pub mod region_coordinator;
 pub mod registry;
 pub mod replication;
 pub mod schedule;
@@ -64,7 +65,8 @@ pub use collider::{
 };
 pub use commit::{CommitError, CommitOutcome, Committed};
 pub use contact_damage::{
-    ContactDamageConfig, ContactDamagePlan, ContactDamagePolicy, ContactEvent, PlannedDamage,
+    ContactDamageConfig, ContactDamageMaterialProfile, ContactDamagePlan, ContactDamagePolicy,
+    ContactEvent, PlannedDamage,
 };
 pub use dormancy::{ActiveRegion, BodyDormancyInput, DormancyConfig, DormancyPlan, DormancyPolicy};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
@@ -75,6 +77,9 @@ pub use playground::{
     PLAYGROUND_SHOWCASE_COUNT, PLINKO_RESTITUTION, PlaygroundDropPools, SHOWCASE_RESTITUTION,
     pending_drop_pools, playground_drop_zones, populate as populate_playground_debris,
     spawn_push_test_box,
+};
+pub use region_coordinator::{
+    PhysicsRegionId, RegionCoordinator, RegionCoordinatorError, RegionMergePlan,
 };
 pub use registry::IdRegistry;
 pub use replication::{

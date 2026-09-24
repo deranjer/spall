@@ -66,6 +66,9 @@ pub struct Committed {
     /// bricks) the host must deliver on a bulk stream and journal alongside the
     /// transaction. `None` for every ordinary commit.
     pub bulk_baseline: Option<spall_protocol::baseline::BaselineWorld>,
+    /// Exact pre-edit material counts removed by this committed cut. This is
+    /// game-facing outcome metadata; it does not grant items by itself.
+    pub removed_materials: std::collections::BTreeMap<MaterialId, u64>,
 }
 
 impl Committed {
@@ -179,11 +182,7 @@ pub fn commit(
                 f64::from(st.rotation[2]),
                 f64::from(st.rotation[3]),
             ),
-            [
-                f64::from(st.translation_m[0]),
-                f64::from(st.translation_m[1]),
-                f64::from(st.translation_m[2]),
-            ],
+            world.physics_origin().to_world_f64(st.translation_m),
         );
         ParentState {
             pose,
@@ -340,7 +339,14 @@ pub fn commit(
         };
         match occupancy {
             Some(grid) => {
-                let plan = plan_collider(&grid)?;
+                let mut plan = plan_collider(&grid)?;
+                if parent_is_terrain {
+                    let (localized, _) = world
+                        .physics_origin()
+                        .localize_terrain_grid(plan.grid, cell_size.metres())
+                        .ok_or(crate::world::WorldError::PhysicsFrameOutOfRange)?;
+                    plan.grid = localized;
+                }
                 let mass_properties = (!parent_is_terrain).then(|| {
                     analytic_mass_properties(&grid, cell_size.metres(), |m| world.density(m))
                         .to_body_properties()
@@ -500,6 +506,24 @@ pub fn commit(
         journal_seq,
     );
 
+    // Validate every narrowed/localized coordinate before any authoritative
+    // state or collider is published. The publication section below is then
+    // infallible with respect to physics-frame conversion.
+    for child in &children {
+        world.physics_translation(child.pose.translation_m)?;
+    }
+    if let Some(plans) = &terrain_brick_rebuild {
+        let cell_m = world.terrain().cell_size().metres();
+        for (_, plan) in plans {
+            if let Some(plan) = plan {
+                world
+                    .physics_origin()
+                    .localize_terrain_grid(plan.grid.clone(), cell_m)
+                    .ok_or(crate::world::WorldError::PhysicsFrameOutOfRange)?;
+            }
+        }
+    }
+
     // ---- Publish. Every step below is infallible: the candidate is committed
     // ---- to the live world in one shot at the tick boundary.
     *world.registry_mut() = reg;
@@ -510,7 +534,7 @@ pub fn commit(
 
     if let Some(plans) = terrain_brick_rebuild {
         for (coord, plan) in plans {
-            world.publish_terrain_brick(coord, plan.as_ref());
+            world.publish_terrain_brick(coord, plan.as_ref())?;
         }
     } else {
         match parent_rebuild {
@@ -549,7 +573,9 @@ pub fn commit(
         let child_cell_m = child.volume.cell_size().metres() as f32;
         let rot = child.pose.rotation;
         let rot_xyzw = [rot.x as f32, rot.y as f32, rot.z as f32, rot.w as f32];
-        let trans = child.pose.translation_m.map(|v| v as f32);
+        let trans = world
+            .physics_translation(child.pose.translation_m)
+            .expect("child physics translation was validated before publication");
         let linvel = child.linvel_m_s.map(|v| v as f32);
         let angvel = child.angvel_rad_s.map(|v| v as f32);
 
@@ -603,6 +629,7 @@ pub fn commit(
         children: child_entities,
         bumped_epoch,
         bulk_baseline,
+        removed_materials: staged.removed_materials.clone(),
     }))
 }
 

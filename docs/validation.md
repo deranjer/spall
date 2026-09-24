@@ -102,6 +102,29 @@ T06 adds one offline measurement binary,
 `cargo run --release -p spall_physics --bin collision-bench`, which runs the
 voxel-collision feasibility scenarios and writes `collision-feasibility.json`;
 it is not wired into `cargo xtask bench`.
+ENG-31 adds a fixed-origin precision mode to that binary:
+`cargo run --release -p spall_physics --bin collision-bench -- --precision`
+runs merged-cuboid floor/contact, capsule walking, and two-body impact cases at
+11 offsets from 0 through 100 km from world origin; it also repeats character
+and body cases with an explicit local origin at each offset. A paired probe
+also steps two independent local `PhysicsWorld`s together for 60 ticks with
+players 100 km apart. It writes
+`collision-precision.json` when `--out DIR` is given. The report compares
+placement rounding, travel, contact, penetration, velocity transfer, and finite
+state. The local-origin case is a physics-adapter experiment, not an integrated
+multi-region host or world-scale acceptance test.
+ENG-31 also adds
+`cargo run --release -p spall_sim --bin region-origin-bench`, which compares
+one `Simulation` at zero origin against an otherwise identical terrain/body
+scene at a 100 km world offset with a matching local physics origin. This
+exercises terrain-grid cell-origin localization and body pose synchronization
+through `SimWorld`; it does not exercise simultaneous regions, routing, or
+cross-region body transfer.
+ENG-31's render-LOD seam spike is the CPU-only command
+`cargo run --release -p spall_mesh --bin lod_seam_bench`. It exercises one
+synthetic 2:1 heightfield boundary and emits transition quads for mismatched
+edge heights. It is a narrow geometry probe, not an integrated LOD renderer,
+general 3D seam solution, or authoritative-world acceptance test.
 T08 adds one offline authoritative-edit binary,
 `cargo run -p spall_sim --features scenario --bin sim-scenario`, which drives the
 in-process `Simulation` through the terrain-split, rotated-moving-body cut,
@@ -820,3 +843,26 @@ clicks to gameplay, scales with DPI, survives resize, and recovers after surface
 loss. Record before/after frame-time percentiles plus HUD CPU time and, where the
 adapter supports timestamp queries, GPU time. Compilation and CPU-side checks
 do not substitute for those hardware observations.
+`cargo run --release -p spall_sim --bin region-coordination-bench` exercises
+the stable-ID merge preflight and a live voxel-body transfer between separate
+region physics worlds. It checks transfer rollback conditions, one active body
+owner, local-to-world pose conversion, and removal of the emptied physics
+region after merge. `cargo run --release -p spall_physics --bin
+region-physics-bench` steps three rebased physics worlds together and measures
+the transfer against an uninterrupted control for position, linear/angular
+velocity, and rotation. These are physics/coordinator prototypes; they do not
+route the production `SimWorld` player, terrain, contact-damage, or topology
+paths yet.
+`cargo run --release -p spall_physics --bin region-player-bench` builds two
+small resident terrain patches 100 km apart, gives each player an independent
+region-local query window, and compares 60 grounded capsule sweeps.
+`cargo run --release -p spall_physics --bin region-scale-bench` steps a
+bounded eight-region/64-debris contact workload and reports its measured
+simulation time; it is a demonstrated fixture size, not a maximum.
+`cargo run --release -p spall_server --bin region-support-reload-bench`
+persists a remote support edit in SQLite, evicts and reopens the backing, and
+checks streamed support is unknown until the edited brick reloads, then
+resolves to unsupported geometry.
+`cargo run --release -p spall_mesh --bin lod_seam_bench` also hashes a seeded
+authoritative voxel brick before and after render-only seam generation and
+checks its hash and sampled solid remain unchanged.

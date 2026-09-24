@@ -11,16 +11,38 @@ use crate::collider::{Representation, build_collider};
 use crate::mass::BodyMassProperties;
 use crate::occupancy::OccupancyGrid;
 
-/// Opaque, stable identifier for a body in a [`PhysicsWorld`]. Never a Rapier
-/// handle; safe to store outside the adapter for the life of the world.
+/// Opaque, stable identifier for a body in a [`PhysicsWorld`]. The high 32 bits
+/// namespace bodies across coordinated physics regions; the low 32 bits are the
+/// body's stable slot within its region. Never a Rapier handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BodyId(u32);
+pub struct BodyId(u64);
 
 impl BodyId {
-    /// The raw index, for report keys only.
+    /// The region-local slot, for report keys only.
     pub fn index(self) -> u32 {
-        self.0
+        self.0 as u32
     }
+
+    /// The physics-region namespace used to route this id to its owner.
+    pub fn namespace(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+}
+
+impl From<&BodyId> for BodyId {
+    fn from(value: &BodyId) -> Self {
+        *value
+    }
+}
+
+fn entry_index<I: Into<BodyId>>(id: I, namespace: u32) -> usize {
+    let id = id.into();
+    assert_eq!(
+        id.namespace(),
+        namespace,
+        "body id belongs to another physics region"
+    );
+    id.index() as usize
 }
 
 /// Fixed simulation configuration.
@@ -250,6 +272,7 @@ fn principal_inertia(inertia_com_kg_m2: [[f32; 3]; 3]) -> [f32; 3] {
 
 /// A fixed-step rigid-body world over voxel colliders.
 pub struct PhysicsWorld {
+    id_namespace: u32,
     gravity: Vector,
     params: IntegrationParameters,
     pipeline: PhysicsPipeline,
@@ -279,6 +302,12 @@ const CARRY_MIN_SPEED_M_S: f32 = 0.1;
 impl PhysicsWorld {
     /// Creates an empty world.
     pub fn new(cfg: PhysicsConfig) -> Self {
+        Self::new_in_namespace(cfg, 0)
+    }
+
+    /// Creates an empty region-local world whose body IDs are disjoint from
+    /// worlds using another namespace. Namespace zero preserves `new` IDs.
+    pub fn new_in_namespace(cfg: PhysicsConfig, id_namespace: u32) -> Self {
         let mut params = IntegrationParameters {
             dt: cfg.dt_s,
             ..Default::default()
@@ -288,6 +317,7 @@ impl PhysicsWorld {
             params.max_ccd_substeps = 0;
         }
         Self {
+            id_namespace,
             gravity: Vector::new(
                 cfg.gravity_m_s2[0],
                 cfg.gravity_m_s2[1],
@@ -365,7 +395,7 @@ impl PhysicsWorld {
     pub fn add_body(&mut self, spec: BodySpec) -> BodyId {
         let (body, collider, offset) = self.insert_rapier_body(&spec);
 
-        let id = BodyId(self.entries.len() as u32);
+        let id = BodyId((u64::from(self.id_namespace) << 32) | self.entries.len() as u64);
         self.entries.push(Entry {
             body,
             collider,
@@ -393,7 +423,7 @@ impl PhysicsWorld {
         grid: &OccupancyGrid,
         rep: Representation,
     ) -> Duration {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         debug_assert!(!entry.retired, "rebuild_collider on a retired body");
         if entry.retired {
             return Duration::ZERO;
@@ -439,9 +469,9 @@ impl PhysicsWorld {
         }
         let total = start.elapsed();
 
-        self.entries[id.0 as usize].collider = handle;
-        self.entries[id.0 as usize].representation = rep;
-        self.entries[id.0 as usize].collider_offset_m = offset;
+        self.entries[entry_index(id, self.id_namespace)].collider = handle;
+        self.entries[entry_index(id, self.id_namespace)].representation = rep;
+        self.entries[entry_index(id, self.id_namespace)].collider_offset_m = offset;
         self.pending_removed.push(old_collider);
         self.pending_modified.push(handle);
         total
@@ -457,7 +487,7 @@ impl PhysicsWorld {
     /// its collider is already massless); otherwise the shape's own mass would
     /// be added on top of `props`.
     pub fn set_mass_properties(&mut self, id: BodyId, props: BodyMassProperties) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         debug_assert!(!entry.retired, "set_mass_properties on a retired body");
         if entry.retired {
             return;
@@ -478,7 +508,7 @@ impl PhysicsWorld {
     /// dormancy. `Max` combination lets a deliberately bouncy body rebound
     /// from ordinary zero-restitution terrain.
     pub fn set_restitution(&mut self, id: BodyId, restitution: f32) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired {
             return;
         }
@@ -497,7 +527,7 @@ impl PhysicsWorld {
     /// are indices — removing one would shift every later id) and marked
     /// retired; callers must drop the handle. Idempotent.
     pub fn retire_body(&mut self, id: BodyId) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired {
             return;
         }
@@ -521,7 +551,7 @@ impl PhysicsWorld {
 
     /// Whether `id` has been retired by [`Self::retire_body`].
     pub fn is_retired(&self, id: BodyId) -> bool {
-        self.entries[id.0 as usize].retired
+        self.entries[entry_index(id, self.id_namespace)].retired
     }
 
     /// Deactivates a **dormant** body (T21): removes its Rapier rigid body and
@@ -532,7 +562,7 @@ impl PhysicsWorld {
     /// pose / velocity and passes them back on reactivation. Idempotent; a no-op
     /// on a retired body.
     pub fn deactivate_body(&mut self, id: BodyId) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired || entry.dormant {
             return;
         }
@@ -567,7 +597,7 @@ impl PhysicsWorld {
         linvel_m_s: [f32; 3],
         angvel_rad_s: [f32; 3],
     ) {
-        let entry = &self.entries[id.0 as usize];
+        let entry = &self.entries[entry_index(id, self.id_namespace)];
         if entry.retired || !entry.dormant {
             return;
         }
@@ -583,7 +613,7 @@ impl PhysicsWorld {
             linvel_m_s,
         };
         let (body, collider, offset) = self.insert_rapier_body(&spec);
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         entry.body = body;
         entry.collider = collider;
         entry.collider_offset_m = offset;
@@ -595,7 +625,7 @@ impl PhysicsWorld {
 
     /// Whether `id` is currently dormant (deactivated by [`Self::deactivate_body`]).
     pub fn is_dormant(&self, id: BodyId) -> bool {
-        self.entries[id.0 as usize].dormant
+        self.entries[entry_index(id, self.id_namespace)].dormant
     }
 
     /// Bodies that are neither retired nor dormant — the set the solver actually
@@ -613,7 +643,7 @@ impl PhysicsWorld {
     /// nothing collides with the obsolete solid shape in the meantime. A no-op
     /// on a retired body.
     pub fn remove_collider(&mut self, id: BodyId) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired {
             return;
         }
@@ -629,7 +659,7 @@ impl PhysicsWorld {
     /// Whether `id` currently has an attached collider in Rapier.
     pub fn has_collider(&self, id: BodyId) -> bool {
         self.entries
-            .get(id.0 as usize)
+            .get(entry_index(id, self.id_namespace))
             .is_some_and(|entry| !entry.retired && self.colliders.contains(entry.collider))
     }
 
@@ -653,7 +683,7 @@ impl PhysicsWorld {
     /// `id` reapplies it to the fresh collider automatically. A no-op on a
     /// retired body.
     pub fn set_query_only(&mut self, id: BodyId) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired {
             return;
         }
@@ -825,8 +855,8 @@ impl PhysicsWorld {
     ) -> crate::character::CharacterMove {
         let handles: Vec<ColliderHandle> = exclude
             .iter()
-            .filter(|id| !self.entries[id.0 as usize].retired)
-            .map(|id| self.entries[id.0 as usize].collider)
+            .filter(|id| !self.entries[entry_index(*id, self.id_namespace)].retired)
+            .map(|id| self.entries[entry_index(id, self.id_namespace)].collider)
             .collect();
         self.sweep_character_impl(
             params,
@@ -857,8 +887,8 @@ impl PhysicsWorld {
     ) -> crate::character::CharacterMove {
         let handles: Vec<ColliderHandle> = exclude
             .iter()
-            .filter(|id| !self.entries[id.0 as usize].retired)
-            .map(|id| self.entries[id.0 as usize].collider)
+            .filter(|id| !self.entries[entry_index(*id, self.id_namespace)].retired)
+            .map(|id| self.entries[entry_index(id, self.id_namespace)].collider)
             .collect();
         let controller = crate::character::controller();
         let shape = crate::character::capsule(params);
@@ -1081,7 +1111,7 @@ impl PhysicsWorld {
 
     /// Current representation of a body.
     pub fn representation(&self, id: BodyId) -> Representation {
-        self.entries[id.0 as usize].representation
+        self.entries[entry_index(id, self.id_namespace)].representation
     }
 
     /// Kinematic snapshot of a body. A retired body (its volume became empty) or
@@ -1089,7 +1119,7 @@ impl PhysicsWorld {
     /// left; it reports an all-zero, non-sleeping state and the caller is
     /// expected to hold the authoritative pose itself.
     pub fn body_state(&self, id: BodyId) -> BodyState {
-        let entry = &self.entries[id.0 as usize];
+        let entry = &self.entries[entry_index(id, self.id_namespace)];
         debug_assert!(!entry.retired, "body_state on a retired body");
         debug_assert!(!entry.dormant, "body_state on a dormant body");
         if entry.retired || entry.dormant {
@@ -1153,7 +1183,7 @@ impl PhysicsWorld {
         self.entries
             .iter()
             .position(|e| !e.retired && e.body == handle)
-            .map(|i| BodyId(i as u32))
+            .map(|i| BodyId((u64::from(self.id_namespace) << 32) | i as u64))
     }
 
     /// Every contact pair with a non-zero solved normal impulse this step, as
@@ -1249,7 +1279,7 @@ impl PhysicsWorld {
     /// split child at its parent's transform so world geometry is unchanged at
     /// the split instant.
     pub fn set_body_pose(&mut self, id: BodyId, translation_m: [f32; 3], rotation: [f32; 4]) {
-        let entry = &self.entries[id.0 as usize];
+        let entry = &self.entries[entry_index(id, self.id_namespace)];
         let rb = &mut self.bodies[entry.body];
         rb.set_translation(
             Vector::new(translation_m[0], translation_m[1], translation_m[2]),
@@ -1270,7 +1300,7 @@ impl PhysicsWorld {
     /// impulse or an impact from an adjacent edit — for the sleep/wake
     /// feasibility scenario. No-op for `Fixed` bodies.
     pub fn apply_impulse(&mut self, id: BodyId, impulse_n_s: [f32; 3]) {
-        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_impulse(
             Vector::new(impulse_n_s[0], impulse_n_s[1], impulse_n_s[2]),
             true,
@@ -1282,7 +1312,7 @@ impl PhysicsWorld {
     /// body's installed inertia tensor — the direct motion check for
     /// mixed-material inertia. No-op for `Fixed` bodies.
     pub fn apply_torque_impulse(&mut self, id: BodyId, torque_impulse_n_m_s: [f32; 3]) {
-        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_torque_impulse(
             Vector::new(
                 torque_impulse_n_m_s[0],
@@ -1304,7 +1334,7 @@ impl PhysicsWorld {
         impulse_n_s: [f32; 3],
         point_world_m: [f32; 3],
     ) {
-        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_impulse_at_point(
             Vector::new(impulse_n_s[0], impulse_n_s[1], impulse_n_s[2]),
             Vector::new(point_world_m[0], point_world_m[1], point_world_m[2]),
@@ -1315,7 +1345,7 @@ impl PhysicsWorld {
     /// Sets a body's linear and angular velocity, m/s and rad/s. Used to hand a
     /// split child its inherited velocity.
     pub fn set_body_velocity(&mut self, id: BodyId, linvel_m_s: [f32; 3], angvel_rad_s: [f32; 3]) {
-        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.set_linvel(
             Vector::new(linvel_m_s[0], linvel_m_s[1], linvel_m_s[2]),
             true,
@@ -1331,7 +1361,7 @@ impl PhysicsWorld {
     /// [`Self::derived_mass_properties`]'s grid-local centre of mass to get the
     /// body-local centre of mass (`ENG-55`).
     pub fn collider_offset_m(&self, id: BodyId) -> [f32; 3] {
-        self.entries[id.0 as usize].collider_offset_m
+        self.entries[entry_index(id, self.id_namespace)].collider_offset_m
     }
 
     /// A body's authoritative mass properties: `(mass_kg, local centre of mass in
@@ -1343,7 +1373,7 @@ impl PhysicsWorld {
     /// `(0, 0, 0)` corner at the origin); [`Self::collider_offset_m`] shifts it
     /// to the body frame.
     pub fn derived_mass_properties(&self, id: BodyId) -> (f32, [f32; 3], [f32; 3]) {
-        let entry = &self.entries[id.0 as usize];
+        let entry = &self.entries[entry_index(id, self.id_namespace)];
         if let Some(p) = entry.mass_properties {
             return (
                 p.mass_kg,
@@ -1368,7 +1398,7 @@ impl PhysicsWorld {
     /// installed override are folded together — so tests can prove the fine-grid
     /// properties reached the solver, not just this adapter's record of them.
     pub fn live_body_mass_properties(&self, id: BodyId) -> (f32, [f32; 3], [f32; 3]) {
-        let rb = &self.bodies[self.entries[id.0 as usize].body];
+        let rb = &self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         let mp = &rb.mass_properties().local_mprops;
         let com = mp.local_com;
         let pi = mp.principal_inertia();

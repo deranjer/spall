@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::TransportConfig;
 use crate::{ALPN, Result, TransportError};
+use spall_protocol::PlayerId;
 
 /// BLAKE3 digest of a certificate's DER encoding. The value pinned by the
 /// client and compared against the server's presented certificate.
@@ -108,6 +109,43 @@ impl JoinToken {
     }
 }
 
+/// A server-provisioned credential bound to a durable player principal.
+/// Clients present only `token`; the server returns `player_id` after verifying
+/// the credential, so clients cannot choose another player's identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PlayerCredential {
+    pub player_id: PlayerId,
+    pub token: JoinToken,
+}
+
+impl std::fmt::Debug for PlayerCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlayerCredential")
+            .field("player_id", &self.player_id)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
+impl PlayerCredential {
+    /// Creates a fresh player principal and a fresh bearer credential using
+    /// the operating-system CSPRNG. Provision the token to exactly one client
+    /// through a protected channel; the server stores the credential registry.
+    pub fn generate() -> Result<Self> {
+        let mut player_id = [0_u8; 16];
+        SystemRandom::new()
+            .fill(&mut player_id)
+            .map_err(|_| TransportError::Tls("operating-system CSPRNG unavailable".into()))?;
+        if player_id.iter().all(|byte| *byte == 0) {
+            player_id[15] = 1;
+        }
+        Ok(Self {
+            player_id: PlayerId(player_id),
+            token: JoinToken::generate()?,
+        })
+    }
+}
+
 impl std::fmt::Debug for JoinToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print the token itself.
@@ -151,7 +189,7 @@ impl DevIdentity {
         self.cert_der.as_ref()
     }
 
-    /// Builds the QUIC server configuration: this identity, ALPN `spall/1`,
+    /// Builds the QUIC server configuration: this identity, ALPN `spall/2`,
     /// TLS 1.3 only, and the transport timers from `cfg`.
     pub fn server_config(&self, cfg: &TransportConfig) -> Result<quinn::ServerConfig> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());

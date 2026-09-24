@@ -10,6 +10,7 @@ spall_protocol = { path = "../spall_protocol" }
 spall_net = { path = "../spall_net" }
 spall_physics = { path = "../spall_physics" }
 spall_sim = { path = "../spall_sim" }
+spall_jobs = { path = "../spall_jobs" }
 spall_store = { path = "../spall_store" }
 spall_structure = { path = "../spall_structure" }
 spall_voxel = { path = "../spall_voxel" }
@@ -28,6 +29,10 @@ rusqlite = { workspace = true }
 name = "crash-bench"
 path = "src/bin/crash_bench.rs"
 required-features = ["persist-bench"]
+
+[[bin]]
+name = "region-support-reload-bench"
+path = "src/bin/region_support_reload_bench.rs"
 
 [features]
 # Pulls in the offline persistence crash-suite binary (`cargo xtask crash-test`).

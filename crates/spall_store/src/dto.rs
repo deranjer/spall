@@ -171,6 +171,15 @@ pub struct JournalRecord {
     pub payload: JournalPayload,
 }
 
+/// Game-owned durable event committed atomically with its world journal row.
+/// The payload has its own game schema; the engine stores opaque bytes only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxRecord {
+    pub event_id: [u8; 32],
+    pub journal_seq: u64,
+    pub payload: Vec<u8>,
+}
+
 /// The content of a [`JournalRecord`]. Topology and pose bytes are
 /// `spall_protocol` wire records kept verbatim; `spall_store` never interprets
 /// their semantics.

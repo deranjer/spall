@@ -13,12 +13,16 @@ pub use interactive::{InteractiveSession, InteractiveView, LiveInput};
 pub use net::{
     BaselineScene, ClientNetConfig, ClientNetError, ClientResidencyLimits, ClientSummary,
     MovementStep, ReplicaReadyHook, ScriptTarget, ScriptedAction, cut_request,
-    run_replication_client,
+    run_replication_client, run_replication_client_with_game_content,
+    run_replication_client_with_manifest, run_replication_client_with_progression, tool_request,
 };
 pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
 pub use residency::{ClientResidency, ClientResidencyPass, MAX_RELOAD_REQUESTS_PER_STEP};
-pub use window::run_interactive_window;
+pub use window::{
+    run_interactive_window, run_interactive_window_with_game_content,
+    run_interactive_window_with_manifest, run_interactive_window_with_progression,
+};
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};
 use std::{path::PathBuf, sync::Arc};

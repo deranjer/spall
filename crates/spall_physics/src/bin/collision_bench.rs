@@ -11,16 +11,20 @@ use std::path::PathBuf;
 
 use spall_physics::report::{FeasibilityParams, run_feasibility};
 
+mod precision;
+
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args().skip(1);
     let mut small = false;
+    let mut precision = false;
     let mut out: Option<PathBuf> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--small" => small = true,
+            "--precision" => precision = true,
             "--out" => out = args.next().map(PathBuf::from),
             "--help" | "-h" => {
-                println!("collision-bench [--small] [--out DIR]");
+                println!("collision-bench [--small] [--precision] [--out DIR]");
                 return std::process::ExitCode::SUCCESS;
             }
             other => {
@@ -28,6 +32,10 @@ fn main() -> std::process::ExitCode {
                 return std::process::ExitCode::from(2);
             }
         }
+    }
+
+    if precision {
+        return precision::run(out);
     }
 
     let params = if small {

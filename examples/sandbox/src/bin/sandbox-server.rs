@@ -1,5 +1,13 @@
 use clap::Parser;
-use spall_net::{JoinToken, TransportConfig};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HarvestOutboxV1 {
+    version: u16,
+    player_id: spall_protocol::PlayerId,
+    request_id: u64,
+    removed: std::collections::BTreeMap<spall_core::MaterialId, u64>,
+}
+use spall_net::{JoinToken, PlayerCredential, TransportConfig};
 use spall_server::{Scene, ServeConfig, ServerConfig, TimingWindow};
 use spall_sim::world::TerrainColliderMode;
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
@@ -27,12 +35,20 @@ struct Args {
 
     // --- T10 networked replication host ---
     /// Run the authoritative replication host instead of the T00 bounded loop.
-    /// Requires --join-token-file.
+    /// Requires --join-token-file or --player-credentials-file.
     #[arg(long)]
     serve: bool,
     /// Per-run join secret (hex), shared with clients out of band.
     #[arg(long)]
     join_token_file: Option<PathBuf>,
+    /// Optional per-player credential file. Each noncomment line is
+    /// `<32-hex-player-id> <64-hex-token>`; when supplied, shared-token auth is disabled.
+    #[arg(long)]
+    player_credentials_file: Option<PathBuf>,
+    /// Game-owned durable progression database. Defaults to
+    /// `<world>/player-progression.db` and requires player credentials.
+    #[arg(long)]
+    progression_db: Option<PathBuf>,
     /// Write the server certificate fingerprint (hex) here for clients.
     #[arg(long)]
     fingerprint_out: Option<PathBuf>,
@@ -72,6 +88,19 @@ struct Args {
     /// committed transactions, checkpoint on the interval and on shutdown.
     #[arg(long)]
     save: bool,
+    /// Spawn one game-owned wood crate into a new world before its first
+    /// checkpoint. Existing saved worlds are restored unchanged.
+    #[arg(long)]
+    spawn_wood_crate: bool,
+    /// Versioned sandbox content manifest; validates assets and joins its hash into the client handshake.
+    #[arg(long)]
+    content_manifest: Option<PathBuf>,
+    /// Stable content asset ID to import and spawn in a new world.
+    #[arg(long)]
+    spawn_content_asset: Option<u64>,
+    /// Run the fresh-world wood harvest -> plank craft -> asset placement progression scenario.
+    #[arg(long)]
+    progression_demo: bool,
     /// Ticks between engine checkpoints (1800 == 30 s at 60 Hz). 0 disables the
     /// periodic checkpoint (a shutdown checkpoint still happens).
     #[arg(long, default_value_t = 1_800)]
@@ -133,9 +162,9 @@ struct Args {
     residency_disk_backing: bool,
 
     // --- T21 / ENG-28 increment 4 (3c): default-off contact damage + dormancy ---
-    /// Enable the contact-damage pass: a hard enough impact carves a cut into
-    /// terrain or the struck body (`spall_sim::ContactDamageConfig::DEFAULT`
-    /// tuning). Off by default — this changes the committed hash.
+    /// Enable the sandbox's versioned impact-damage policy: hard impacts carve
+    /// a cut into terrain or the struck body. Off by default — this changes the
+    /// committed hash.
     #[arg(long)]
     contact_damage: bool,
     /// Enable the region-dormancy pass: a settled body with nothing active
@@ -193,6 +222,12 @@ struct Args {
     expect_hash: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ProgressionOwner {
+    Player(spall_protocol::PlayerId),
+    LegacySlot(u32),
+}
+
 fn main() -> ExitCode {
     sandbox::init_tracing();
     let args = Args::parse();
@@ -223,20 +258,154 @@ fn main() -> ExitCode {
     }
 }
 
+fn read_player_credentials(path: &std::path::Path) -> Result<Vec<PlayerCredential>, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read player credentials {path:?}: {error}"))?;
+    let mut credentials = Vec::new();
+    for (line_index, line) in source.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let player_text = fields.next();
+        let token_text = fields.next();
+        if fields.next().is_some() {
+            return Err(format!(
+                "player credentials {}:{} must contain exactly a player ID and token",
+                path.display(),
+                line_index + 1
+            ));
+        }
+        let (Some(player_text), Some(token_text)) = (player_text, token_text) else {
+            return Err(format!(
+                "player credentials {}:{} must contain a 32-hex player ID and 64-hex token",
+                path.display(),
+                line_index + 1
+            ));
+        };
+        let player_id = spall_protocol::PlayerId::from_hex(player_text).ok_or_else(|| {
+            format!(
+                "player credentials {}:{} has an invalid player ID",
+                path.display(),
+                line_index + 1
+            )
+        })?;
+        let token = JoinToken::from_hex(token_text).ok_or_else(|| {
+            format!(
+                "player credentials {}:{} has an invalid token",
+                path.display(),
+                line_index + 1
+            )
+        })?;
+        credentials.push(PlayerCredential { player_id, token });
+        if credentials.len() > 4096 {
+            return Err("player credential file exceeds the 4096-entry limit".into());
+        }
+    }
+    if credentials.is_empty() {
+        return Err("player credential file contains no entries".into());
+    }
+    Ok(credentials)
+}
+
 fn run_serve(args: Args) -> ExitCode {
-    let Some(token_file) = args.join_token_file else {
-        eprintln!("sandbox-server: --serve requires --join-token-file");
-        return ExitCode::from(2);
+    let credentials = match args.player_credentials_file.as_ref() {
+        Some(path) => match read_player_credentials(path) {
+            Ok(credentials) => Some(credentials),
+            Err(error) => {
+                eprintln!("sandbox-server: {error}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
     };
-    let token = match std::fs::read_to_string(&token_file)
-        .ok()
-        .and_then(|s| JoinToken::from_hex(s.trim()))
+    if credentials.is_some() && args.join_token_file.is_some() {
+        eprintln!("sandbox-server: use either --player-credentials-file or --join-token-file");
+        return ExitCode::from(2);
+    }
+    let token = if credentials.is_some() {
+        match JoinToken::generate() {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("sandbox-server: could not initialize auth token: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        let Some(token_file) = args.join_token_file.as_ref() else {
+            eprintln!(
+                "sandbox-server: --serve requires --join-token-file or --player-credentials-file"
+            );
+            return ExitCode::from(2);
+        };
+        match std::fs::read_to_string(token_file)
+            .ok()
+            .and_then(|s| JoinToken::from_hex(s.trim()))
+        {
+            Some(token) => token,
+            None => {
+                eprintln!("sandbox-server: could not read a 64-hex join token from {token_file:?}");
+                return ExitCode::from(2);
+            }
+        }
+    };
+    if credentials.is_none() && args.progression_db.is_some() {
+        eprintln!("sandbox-server: --progression-db requires --player-credentials-file");
+        return ExitCode::from(2);
+    }
+    let durable_progression = if credentials.is_some() {
+        let path = args
+            .progression_db
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| args.world.join("player-progression.db"));
+        match sandbox::progression_store::ProgressionStore::open(&path) {
+            Ok(store) => Some(std::sync::Arc::new(std::sync::Mutex::new(store))),
+            Err(error) => {
+                eprintln!("sandbox-server: could not open progression database {path:?}: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    let asset_store = match args
+        .content_manifest
+        .as_ref()
+        .map(sandbox::content::AssetStore::open)
+        .transpose()
     {
-        Some(t) => t,
-        None => {
-            eprintln!("sandbox-server: could not read a 64-hex join token from {token_file:?}");
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("sandbox-server: content manifest: {error}");
             return ExitCode::from(2);
         }
+    };
+    if args.progression_demo && (asset_store.is_none() || args.spawn_content_asset.is_none()) {
+        eprintln!(
+            "sandbox-server: --progression-demo requires --content-manifest and --spawn-content-asset"
+        );
+        return ExitCode::from(2);
+    }
+    if args.spawn_content_asset.is_some() && asset_store.is_none() {
+        eprintln!("sandbox-server: --spawn-content-asset requires --content-manifest");
+        return ExitCode::from(2);
+    }
+    let asset_manifest_hash = if let Some(store) = asset_store.as_ref() {
+        if let Err(error) = store.verify_all() {
+            eprintln!("sandbox-server: content asset verification: {error}");
+            return ExitCode::from(2);
+        }
+        match store.manifest().canonical_hash() {
+            Ok(hash) => Some(spall_protocol::Hash32(hash)),
+            Err(error) => {
+                eprintln!("sandbox-server: content manifest hash: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
     };
 
     let scene = match Scene::from_name(&args.scene) {
@@ -368,11 +537,262 @@ fn run_serve(args: Args) -> ExitCode {
         residency_disk_path,
         contact_damage: args
             .contact_damage
-            .then_some(spall_sim::ContactDamageConfig::DEFAULT),
+            .then_some(sandbox::game::contact_damage_config()),
         dormancy,
         timing_window,
     };
-    match spall_server::serve(config) {
+    tracing::info!(
+        damage_rules_version = sandbox::game::DAMAGE_RULES_VERSION,
+        enabled = args.contact_damage,
+        "sandbox impact damage policy"
+    );
+    tracing::info!(
+        game_rules_version = sandbox::game::GAME_RULES_VERSION,
+        recipe_catalog_version = sandbox::game::RECIPE_CATALOG_VERSION,
+        recipe_count = sandbox::game::recipe_catalog().len(),
+        "sandbox game content versions"
+    );
+    let setup: Option<spall_server::InitialGameWorldSetup> = (args.spawn_wood_crate || args.spawn_content_asset.is_some() || args.progression_demo).then(|| {
+        let asset_store = asset_store;
+        let asset_id = args.spawn_content_asset.map(sandbox::content::AssetId);
+        let progression_demo = args.progression_demo;
+        Box::new(move |simulation: &mut spall_sim::Simulation| {
+            if progression_demo {
+                let mut inventory = sandbox::game::Inventory::default();
+                sandbox::game::record_gathered_material_drop(&mut inventory, sandbox::game::materials::WOOD, 1)
+                    .map_err(|error| format!("progression gather failed: {error:?}"))?;
+                let inventory_revision = inventory.revision();
+                let receipt = sandbox::game::craft(&mut inventory, &sandbox::game::recipe_catalog(), sandbox::game::CraftRequest {
+                    recipe: sandbox::game::recipe_ids::SAW_PLANKS,
+                    batch_count: 1,
+                    expected_catalog_version: sandbox::game::RECIPE_CATALOG_VERSION,
+                    expected_inventory_revision: inventory_revision,
+                }).map_err(|error| format!("progression craft failed: {error:?}"))?;
+                tracing::info!(inventory_revision = inventory.revision(), planks = inventory.count(sandbox::game::items::WOOD_PLANK), recipe = ?receipt.recipe, "completed authoritative gathering and crafting progression step");
+            }
+            if let (Some(store), Some(asset_id)) = (asset_store.as_ref(), asset_id) {
+                let loaded = store.load_voxel_asset(asset_id, &sandbox::game::asset_material_mapping())
+                    .map_err(|error| format!("asset import failed: {error}"))?;
+                let entity = sandbox::game::spawn_loaded_voxel_asset(simulation, loaded, [5.0, 12.0, 5.0])
+                    .map_err(|error| format!("asset spawn failed: {error}"))?;
+                tracing::info!(entity_id = entity.get(), asset_id = asset_id.0, "spawned versioned game content asset in new world");
+            }
+            if args.spawn_wood_crate {
+            let entity = sandbox::game::spawn_demo_wood_crate(simulation, [5.0, 12.0, 5.0])?;
+            tracing::info!(
+                entity_id = entity.get(),
+                spawn_m = ?[5.0, 12.0, 5.0],
+                "spawned sandbox wood crate in new world"
+            );
+            }
+            Ok(())
+        }) as spall_server::InitialGameWorldSetup
+    });
+    let player_inventories = std::sync::Arc::new(std::sync::Mutex::new(
+        sandbox::game::PlayerInventories::default(),
+    ));
+    let commit_inventories = player_inventories.clone();
+    let commit_store = durable_progression.clone();
+    let commit_handler: spall_server::CommittedEditHandler =
+        Box::new(move |session, player_id, request_id, removed_materials| {
+            if let (Some(player_id), Some(store)) = (player_id, commit_store.as_ref()) {
+                let result = store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_committed_cut(player_id, request_id.0, removed_materials);
+                match result {
+                    Ok(drops) if !drops.is_empty() => tracing::info!(
+                        player_id = ?player_id,
+                        request_id = request_id.0,
+                        drops = ?drops,
+                        "durably awarded progression drops for committed cut"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::error!(
+                        player_id = ?player_id,
+                        request_id = request_id.0,
+                        error = ?error,
+                        "could not durably award progression drops after committed cut"
+                    ),
+                }
+                return;
+            }
+            let mut inventories = commit_inventories.lock().unwrap_or_else(|e| e.into_inner());
+            let result = match player_id {
+                Some(player_id) => {
+                    inventories.record_committed_cut_for_player(player_id, removed_materials)
+                }
+                None => inventories.record_committed_cut(session.slot().0, removed_materials),
+            };
+            match result {
+                Ok(drops) if !drops.is_empty() => tracing::info!(
+                    player_slot = session.slot().0,
+                    player_id = ?player_id,
+                    request_id = request_id.0,
+                    inventory_revision = player_id
+                        .and_then(|id| inventories.get_player(id))
+                        .or_else(|| inventories.get(session.slot().0))
+                        .map_or(0, |inventory| inventory.revision()),
+                    drops = ?drops,
+                    "awarded progression drops for committed cut"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::error!(
+                    player_slot = session.slot().0,
+                    request_id = request_id.0,
+                    error = ?error,
+                    "could not award progression drops after committed cut"
+                ),
+            }
+        });
+    let progression_ledger =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            ProgressionOwner,
+            (
+                u64,
+                std::collections::BTreeMap<u64, spall_protocol::ProgressionResponse>,
+            ),
+        >::new()));
+    let progression_inventories = player_inventories.clone();
+    let progression_cache = progression_ledger.clone();
+    let progression_store = durable_progression.clone();
+    let progression_handler: spall_server::ProgressionHandler = Box::new(
+        move |session, player_id, request| {
+            if let (Some(player_id), Some(store)) = (player_id, progression_store.as_ref()) {
+                let store = store.lock().unwrap_or_else(|e| e.into_inner());
+                return match store.execute_request(player_id, request, sandbox_progression_response)
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::error!(player_id = ?player_id, request_id = request.request_id, error = ?error, "durable progression request failed");
+                        let mut inventory = store.load_inventory(player_id).unwrap_or_default();
+                        let mut response = sandbox_progression_response(
+                            &mut inventory,
+                            spall_protocol::ProgressionRequest {
+                                operation: spall_protocol::ProgressionOperation::InspectInventory,
+                                ..request
+                            },
+                        );
+                        response.outcome = spall_protocol::ProgressionOutcome::Rejected(
+                            spall_protocol::ProgressionRejectCode::Unavailable,
+                        );
+                        response
+                    }
+                };
+            }
+            let owner = player_id.map_or(
+                ProgressionOwner::LegacySlot(session.slot().0),
+                ProgressionOwner::Player,
+            );
+            let mut cache = progression_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let ledger = cache
+                .entry(owner)
+                .or_insert_with(|| (0, Default::default()));
+            if let Some(response) = ledger.1.get(&request.request_id) {
+                return response.clone();
+            }
+            let mut inventories = progression_inventories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let inventory = match player_id {
+                Some(player_id) => inventories.ensure_player(player_id),
+                None => inventories.ensure(session.slot().0),
+            };
+            if request.request_id <= ledger.0 {
+                let mut rejected = sandbox_progression_response(
+                    inventory,
+                    spall_protocol::ProgressionRequest {
+                        operation: spall_protocol::ProgressionOperation::InspectInventory,
+                        ..request
+                    },
+                );
+                rejected.outcome = spall_protocol::ProgressionOutcome::Rejected(
+                    spall_protocol::ProgressionRejectCode::Unavailable,
+                );
+                return rejected;
+            }
+            ledger.0 = request.request_id;
+            let response = sandbox_progression_response(inventory, request);
+            ledger.1.insert(request.request_id, response.clone());
+            while ledger.1.len() > 128 {
+                ledger.1.pop_first();
+            }
+            response
+        },
+    );
+    let tool_catalog = sandbox::game::tool_catalog();
+    let materials = sandbox::game::manifest();
+    let profiles = sandbox::game::contact_damage_profiles();
+    let serve_result = if let Some(credentials) = credentials {
+        let encoder_store = durable_progression.clone();
+        let encoder: spall_server::CommittedEditOutboxEncoder = Box::new(
+            move |_session, player_id, request_id, journal_seq, removed| {
+                let (Some(player_id), Some(_store)) = (player_id, encoder_store.as_ref()) else {
+                    return None;
+                };
+                let payload = HarvestOutboxV1 {
+                    version: 1,
+                    player_id,
+                    request_id: request_id.0,
+                    removed: removed.clone(),
+                };
+                let payload = postcard::to_stdvec(&payload).ok()?;
+                let mut identity = Vec::with_capacity(24);
+                identity.extend_from_slice(&player_id.0);
+                identity.extend_from_slice(&request_id.0.to_le_bytes());
+                Some(spall_store::OutboxRecord {
+                    event_id: *blake3::hash(&identity).as_bytes(),
+                    journal_seq: journal_seq.0,
+                    payload,
+                })
+            },
+        );
+        let processor_store = durable_progression.clone();
+        let processor: spall_server::OutboxProcessor = Box::new(move |event| {
+            let harvest: HarvestOutboxV1 = postcard::from_bytes(&event.payload)
+                .map_err(|error| format!("invalid harvest outbox payload: {error}"))?;
+            if harvest.version != 1 {
+                return Err(format!(
+                    "unsupported harvest outbox version {}",
+                    harvest.version
+                ));
+            }
+            let store = processor_store
+                .as_ref()
+                .ok_or("progression store unavailable")?;
+            store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_committed_cut(harvest.player_id, harvest.request_id, &harvest.removed)
+                .map(|_| ())
+                .map_err(|error| format!("progression reward transaction failed: {error:?}"))
+        });
+        spall_server::serve_with_game_content_and_player_credentials_and_outbox(
+            config,
+            tool_catalog,
+            materials,
+            profiles,
+            setup,
+            asset_manifest_hash,
+            commit_handler,
+            progression_handler,
+            credentials,
+            encoder,
+            processor,
+        )
+    } else {
+        spall_server::serve_with_game_content_and_handlers(
+            config,
+            tool_catalog,
+            materials,
+            profiles,
+            setup,
+            asset_manifest_hash,
+            commit_handler,
+            progression_handler,
+        )
+    };
+    match serve_result {
         Ok(summary) => {
             println!(
                 "sandbox-server: {} ticks={} clients={} committed={} hash={}",
@@ -395,6 +815,78 @@ fn run_serve(args: Args) -> ExitCode {
     }
 }
 
+fn sandbox_progression_response(
+    inventory: &mut sandbox::game::Inventory,
+    request: spall_protocol::ProgressionRequest,
+) -> spall_protocol::ProgressionResponse {
+    use spall_protocol::{
+        InventoryEntry, ProgressionOperation as Operation, ProgressionOutcome as Outcome,
+        ProgressionRejectCode as Reject, ProgressionResponse,
+    };
+    let catalog = sandbox::game::recipe_catalog();
+    let mut outcome = match request.operation {
+        Operation::InspectInventory => Outcome::Inventory,
+        Operation::Craft {
+            recipe_id,
+            batch_count,
+        } => {
+            if request.catalog_version != sandbox::game::RECIPE_CATALOG_VERSION {
+                Outcome::Rejected(Reject::CatalogVersion)
+            } else if request.expected_inventory_revision != inventory.revision() {
+                Outcome::Rejected(Reject::InventoryRevision)
+            } else {
+                let craft_request = sandbox::game::CraftRequest {
+                    recipe: sandbox::game::RecipeId(recipe_id),
+                    batch_count,
+                    expected_catalog_version: request.catalog_version,
+                    expected_inventory_revision: request.expected_inventory_revision,
+                };
+                match catalog.stage(inventory, craft_request) {
+                    Ok(transaction) => match inventory.commit(transaction) {
+                        Ok(_) => Outcome::Crafted,
+                        Err(error) => Outcome::Rejected(map_craft_error(error)),
+                    },
+                    Err(error) => Outcome::Rejected(map_craft_error(error)),
+                }
+            }
+        }
+    };
+    if request.catalog_version != sandbox::game::RECIPE_CATALOG_VERSION {
+        if matches!(request.operation, Operation::InspectInventory) {
+            outcome = Outcome::Rejected(Reject::CatalogVersion);
+        }
+    }
+    ProgressionResponse {
+        request_id: request.request_id,
+        catalog_version: sandbox::game::RECIPE_CATALOG_VERSION,
+        inventory_revision: inventory.revision(),
+        outcome,
+        inventory: inventory
+            .stacks()
+            .map(|stack| InventoryEntry {
+                item_id: stack.item.0,
+                count: stack.count,
+            })
+            .collect(),
+    }
+}
+
+fn map_craft_error(error: sandbox::game::CraftError) -> spall_protocol::ProgressionRejectCode {
+    use sandbox::game::CraftError as Craft;
+    use spall_protocol::ProgressionRejectCode as Reject;
+    match error {
+        Craft::CatalogVersionMismatch { .. } => Reject::CatalogVersion,
+        Craft::InventoryRevisionMismatch { .. } | Craft::StaleInventory { .. } => {
+            Reject::InventoryRevision
+        }
+        Craft::UnknownRecipe(_) => Reject::UnknownRecipe,
+        Craft::ZeroBatch => Reject::ZeroBatch,
+        Craft::InsufficientItems(_) => Reject::InsufficientItems,
+        Craft::Overflow | Craft::RevisionExhausted => Reject::Overflow,
+        Craft::InvalidStack => Reject::Unavailable,
+    }
+}
+
 /// `--replay <db>`: rebuild the world from the oldest checkpoint + the whole
 /// committed topology journal and compare its canonical hash to `--expect-hash`.
 fn run_replay(args: Args) -> ExitCode {
@@ -404,16 +896,18 @@ fn run_replay(args: Args) -> ExitCode {
         seed: args.seed,
         generator_version: 1,
     };
-    let (sim, events) = match spall_server::replay_from_base_builtin(&db, &cfg) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("sandbox-server: replay failed: {e}");
-            if let Some(path) = &args.summary_json {
-                let _ = write_replay_summary(path, "failed", 0, "", args.expect_hash.as_deref());
+    let (sim, events) =
+        match spall_server::replay_from_base_with_manifest(&db, &cfg, sandbox::game::manifest()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("sandbox-server: replay failed: {e}");
+                if let Some(path) = &args.summary_json {
+                    let _ =
+                        write_replay_summary(path, "failed", 0, "", args.expect_hash.as_deref());
+                }
+                return ExitCode::from(1);
             }
-            return ExitCode::from(1);
-        }
-    };
+        };
     let hash = sim.world().world_hash().to_string();
     let matches = args
         .expect_hash

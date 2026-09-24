@@ -6,6 +6,7 @@
 //! accepts clients, and broadcasts committed topology transactions plus 20 Hz
 //! motion snapshots.
 
+pub mod action_catalog;
 pub mod baseline;
 pub mod commit_latency;
 pub mod disk_backing;
@@ -19,6 +20,7 @@ pub mod residency;
 pub mod residency_pass;
 pub mod serve;
 
+pub use action_catalog::{ToolCatalog, ToolCatalogError, ToolRule};
 pub use baseline::{
     BaselineError, BaselineTransfer, brick_repair_patch, capture_transfer, chunk_payload,
     logical_brick_repair_patch, logical_capture_transfer, logical_world_baseline,
@@ -27,8 +29,8 @@ pub use baseline::{
 pub use disk_backing::{DiskBackingError, DiskBrickBacking};
 pub use persist::{
     CrashSuiteReport, PersistConfig, PersistError, RecoveryChoice, ScenarioResult, capture,
-    journal_records, pose_batch_record, replay_from_base, replay_from_base_builtin, restore,
-    run_crash_suite,
+    journal_records, pose_batch_record, replay_from_base, replay_from_base_builtin,
+    replay_from_base_with_manifest, restore, run_crash_suite,
 };
 pub use persist_pipeline::{
     DEFAULT_QUEUE_CAPACITY, PersistPipeline, PipelineConfig, PipelineError, PipelineOutcome,
@@ -46,8 +48,14 @@ pub use residency_pass::{
     PassTick, ResidencyLimits, ResidencyPass, ResidencyStats, total_resident_dense_bytes,
 };
 pub use serve::{
-    MotionInterest, PerClientEgress, Scene, ServeConfig, ServeError, ServeSummary, TimingWindow,
-    default_capture_workers, serve,
+    CommittedEditHandler, CommittedEditOutboxEncoder, InitialGameWorldSetup, MotionInterest,
+    OutboxProcessor, PerClientEgress, ProgressionHandler, Scene, ServeConfig, ServeError,
+    ServeSummary, TimingWindow, default_capture_workers, serve, serve_with_catalog,
+    serve_with_game_content, serve_with_game_content_and_asset_manifest,
+    serve_with_game_content_and_commit_handler, serve_with_game_content_and_handlers,
+    serve_with_game_content_and_player_credentials,
+    serve_with_game_content_and_player_credentials_and_outbox,
+    serve_with_game_content_and_policies, serve_with_game_content_and_setup,
 };
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};
