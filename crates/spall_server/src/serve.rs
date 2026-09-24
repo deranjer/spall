@@ -864,6 +864,8 @@ pub fn serve_with_game_content(
         None,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -885,6 +887,22 @@ pub type CommittedEditHandler = Box<
         ) + Send
         + 'static,
 >;
+/// Converts a committed harvest to opaque, versioned game bytes. The stable
+/// identity and journal cursor are supplied by the server for durable replay.
+pub type CommittedEditOutboxEncoder = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            RequestId,
+            spall_core::JournalSeq,
+            &std::collections::BTreeMap<spall_core::MaterialId, u64>,
+        ) -> Option<spall_store::OutboxRecord>
+        + Send
+        + 'static,
+>;
+/// Applies one durable game event idempotently to the game's progression store.
+pub type OutboxProcessor =
+    Box<dyn FnMut(&spall_store::OutboxRecord) -> Result<(), String> + Send + 'static>;
 pub type ProgressionHandler = Box<
     dyn FnMut(
             SessionId,
@@ -914,6 +932,8 @@ pub fn serve_with_game_content_and_setup(
         None,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -935,6 +955,8 @@ pub fn serve_with_game_content_and_policies(
         materials,
         setup,
         profiles,
+        None,
+        None,
         None,
         None,
         None,
@@ -965,6 +987,8 @@ pub fn serve_with_game_content_and_asset_manifest(
         None,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -990,6 +1014,8 @@ pub fn serve_with_game_content_and_commit_handler(
         profiles,
         asset_manifest_hash,
         Some(commit_handler),
+        None,
+        None,
         None,
         None,
     )
@@ -1018,6 +1044,8 @@ pub fn serve_with_game_content_and_handlers(
         asset_manifest_hash,
         Some(commit_handler),
         Some(progression_handler),
+        None,
+        None,
         None,
     )
 }
@@ -1049,6 +1077,42 @@ pub fn serve_with_game_content_and_player_credentials(
         Some(commit_handler),
         Some(progression_handler),
         Some(credentials),
+        None,
+        None,
+    )
+}
+
+/// Credential-authenticated host whose harvest events are transactionally
+/// coupled to the world journal and replayed through the game's idempotent
+/// outbox processor after restart.
+pub fn serve_with_game_content_and_player_credentials_and_outbox(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+    credentials: Vec<spall_net::PlayerCredential>,
+    encoder: CommittedEditOutboxEncoder,
+    processor: OutboxProcessor,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        Some(credentials),
+        Some(encoder),
+        Some(processor),
     )
 }
 
@@ -1065,6 +1129,8 @@ fn serve_with_game_content_and_optional_setup(
     commit_handler: Option<CommittedEditHandler>,
     progression_handler: Option<ProgressionHandler>,
     player_credentials: Option<Vec<spall_net::PlayerCredential>>,
+    outbox_encoder: Option<CommittedEditOutboxEncoder>,
+    outbox_processor: Option<OutboxProcessor>,
 ) -> Result<ServeSummary, ServeError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1080,6 +1146,8 @@ fn serve_with_game_content_and_optional_setup(
         commit_handler,
         progression_handler,
         player_credentials,
+        outbox_encoder,
+        outbox_processor,
     ))
 }
 
@@ -1370,6 +1438,8 @@ async fn serve_async(
     mut commit_handler: Option<CommittedEditHandler>,
     mut progression_handler: Option<ProgressionHandler>,
     player_credentials: Option<Vec<spall_net::PlayerCredential>>,
+    mut outbox_encoder: Option<CommittedEditOutboxEncoder>,
+    outbox_processor: Option<OutboxProcessor>,
 ) -> Result<ServeSummary, ServeError> {
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
@@ -1576,6 +1646,7 @@ async fn serve_async(
             mut pipeline,
             mut journalled_through,
             mut checkpoints_published,
+            mut outbox_processor,
         } = match setup_persistence_with_game_content(
             save.as_deref(),
             scene,
@@ -1584,6 +1655,7 @@ async fn serve_async(
             terrain_collider_mode,
             world_materials,
             game_setup,
+            outbox_processor,
         ) {
             Ok(parts) => parts,
             Err(e) => {
@@ -1591,6 +1663,8 @@ async fn serve_async(
             }
         };
         let mut journal_records_written: u64 = 0;
+        let mut pending_outbox = Vec::<spall_store::OutboxRecord>::new();
+        let mut waiting_outbox = std::collections::VecDeque::<spall_store::OutboxRecord>::new();
 
         // T23 / G3 row 7, slice D: default-off residency pass. `None` -> the
         // world stays fully resident and every counter below is `0`.
@@ -2004,11 +2078,23 @@ async fn serve_async(
 
             for (rid, committed) in &report.committed {
                 committed_total += 1;
-                if let (Some(handler), Some((session, player_id))) =
-                    (commit_handler.as_mut(), submitted_by.get(rid).copied())
-                    && !committed.removed_materials.is_empty()
+                if !committed.removed_materials.is_empty()
+                    && let Some((session, player_id)) = submitted_by.get(rid).copied()
                 {
-                    handler(session, player_id, *rid, &committed.removed_materials);
+                    let encoded = outbox_encoder.as_mut().and_then(|encoder| {
+                        encoder(
+                            session,
+                            player_id,
+                            *rid,
+                            committed.journal_seq,
+                            &committed.removed_materials,
+                        )
+                    });
+                    if let Some(event) = encoded.filter(|_| pipeline.is_some()) {
+                        pending_outbox.push(event);
+                    } else if let Some(handler) = commit_handler.as_mut() {
+                        handler(session, player_id, *rid, &committed.removed_materials);
+                    }
                 }
                 // T17 increment 2: a giant split ships its geometry out of band
                 // as a `BaselineTransfer`, keyed to the transaction by
@@ -2140,8 +2226,30 @@ async fn serve_async(
                         return SimResult::error(format!("journal encode failed: {e}"), ticks_run);
                     }
                 };
-                if let Err(e) = pipe.submit_journal(batch) {
+                let records = std::mem::take(&mut pending_outbox);
+                if let Err(e) = pipe.submit_journal_with_outbox(batch, records.clone()) {
                     return SimResult::error(format!("persistence: {e}"), ticks_run);
+                }
+                waiting_outbox.extend(records);
+                let durable = pipe.durable_seq();
+                let mut acknowledged = Vec::new();
+                while waiting_outbox
+                    .front()
+                    .is_some_and(|event| event.journal_seq <= durable)
+                {
+                    let event = waiting_outbox.pop_front().expect("front checked");
+                    if let Some(processor) = outbox_processor.as_mut() {
+                        if let Err(error) = processor(&event) {
+                            return SimResult::error(
+                                format!("harvest outbox delivery failed: {error}"),
+                                ticks_run,
+                            );
+                        }
+                        acknowledged.push(event.event_id);
+                    }
+                }
+                if let Err(e) = pipe.submit_acknowledge_outbox(acknowledged) {
+                    return SimResult::error(format!("outbox acknowledgement: {e}"), ticks_run);
                 }
 
                 // A checkpoint's journal cursor is `journalled_through`: the FIFO
@@ -2287,7 +2395,37 @@ async fn serve_async(
             let final_tick = sim.current_tick().get();
             let tail = tick_journal_batch(&mut sim, &mut journalled_through, None, final_tick)
                 .unwrap_or_default();
-            let _ = pipe.submit_journal(tail);
+            let tail_events = std::mem::take(&mut pending_outbox);
+            if let Err(error) = pipe.submit_journal_with_outbox(tail, tail_events.clone()) {
+                shutdown_error = Some(format!("final journal/outbox submission failed: {error}"));
+            }
+            waiting_outbox.extend(tail_events);
+            if shutdown_error.is_none() {
+                if let Err(error) = pipe.wait_durable_through(journalled_through) {
+                    shutdown_error = Some(format!("final journal durability wait failed: {error}"));
+                } else {
+                    let mut acknowledged = Vec::new();
+                    while let Some(event) = waiting_outbox.pop_front() {
+                        if let Some(processor) = outbox_processor.as_mut() {
+                            match processor(&event) {
+                                Ok(()) => acknowledged.push(event.event_id),
+                                Err(error) => {
+                                    shutdown_error = Some(format!(
+                                        "final harvest outbox delivery failed: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if shutdown_error.is_none() {
+                        if let Err(error) = pipe.submit_acknowledge_outbox(acknowledged) {
+                            shutdown_error =
+                                Some(format!("final outbox acknowledgement failed: {error}"));
+                        }
+                    }
+                }
+            }
             // T23 / G3 row 7 follow-up: the shutdown snapshot folds evicted
             // terrain in from the durable backing the same way the periodic
             // checkpoints above do now, instead of reloading it into the live
@@ -2309,10 +2447,12 @@ async fn serve_async(
             // The final drain covers the journal tail, the final checkpoint, and
             // the retain pass; attribute any failure to that shutdown flush so a
             // stranded save is never reported as a pass.
-            shutdown_error = outcome
-                .status
-                .error
-                .map(|e| format!("final checkpoint/flush failed: {e}"));
+            shutdown_error = shutdown_error.or_else(|| {
+                outcome
+                    .status
+                    .error
+                    .map(|e| format!("final checkpoint/flush failed: {e}"))
+            });
             tracing::info!(
                 durable_seq = outcome.status.durable_seq,
                 journal_records = outcome.status.journal_records,
@@ -3258,6 +3398,7 @@ struct Persistence {
     pipeline: Option<PersistPipeline>,
     journalled_through: u64,
     checkpoints_published: u64,
+    outbox_processor: Option<OutboxProcessor>,
 }
 
 /// Opens the world database, recovering from it when it already holds a
@@ -3305,6 +3446,7 @@ fn setup_persistence_with_terrain_collider_mode(
         terrain_collider_mode,
         spall_sim::fixtures::stone_manifest(),
         None,
+        None,
     )
 }
 
@@ -3316,6 +3458,7 @@ fn setup_persistence_with_game_content(
     terrain_collider_mode: TerrainColliderMode,
     materials: spall_core::MaterialManifest,
     mut game_setup: Option<InitialGameWorldSetup>,
+    mut outbox_processor: Option<OutboxProcessor>,
 ) -> Result<Persistence, String> {
     let Some(path) = save else {
         let mut sim = scene.simulation_with_materials(terrain_collider_mode, materials);
@@ -3327,6 +3470,7 @@ fn setup_persistence_with_game_content(
             pipeline: None,
             journalled_through: 0,
             checkpoints_published: 0,
+            outbox_processor,
         });
     };
     let mut writer = Writer::open(path).map_err(|e| e.to_string())?;
@@ -3372,12 +3516,26 @@ fn setup_persistence_with_game_content(
     if let Some(faults) = save_faults {
         writer.set_faults(faults);
     }
+    if let Some(processor) = outbox_processor.as_mut() {
+        loop {
+            let events = writer.pending_outbox(256).map_err(|e| e.to_string())?;
+            if events.is_empty() {
+                break;
+            }
+            for event in &events {
+                processor(event)?;
+            }
+            let ids: Vec<_> = events.iter().map(|event| event.event_id).collect();
+            writer.acknowledge_outbox(&ids).map_err(|e| e.to_string())?;
+        }
+    }
     let pipeline = PersistPipeline::spawn(writer, PipelineConfig::default());
     Ok(Persistence {
         sim,
         pipeline: Some(pipeline),
         journalled_through,
         checkpoints_published,
+        outbox_processor,
     })
 }
 

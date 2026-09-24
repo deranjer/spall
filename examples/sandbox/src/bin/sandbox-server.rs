@@ -1,4 +1,12 @@
 use clap::Parser;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HarvestOutboxV1 {
+    version: u16,
+    player_id: spall_protocol::PlayerId,
+    request_id: u64,
+    removed: std::collections::BTreeMap<spall_core::MaterialId, u64>,
+}
 use spall_net::{JoinToken, PlayerCredential, TransportConfig};
 use spall_server::{Scene, ServeConfig, ServerConfig, TimingWindow};
 use spall_sim::world::TerrainColliderMode;
@@ -716,7 +724,50 @@ fn run_serve(args: Args) -> ExitCode {
     let materials = sandbox::game::manifest();
     let profiles = sandbox::game::contact_damage_profiles();
     let serve_result = if let Some(credentials) = credentials {
-        spall_server::serve_with_game_content_and_player_credentials(
+        let encoder_store = durable_progression.clone();
+        let encoder: spall_server::CommittedEditOutboxEncoder = Box::new(
+            move |_session, player_id, request_id, journal_seq, removed| {
+                let (Some(player_id), Some(_store)) = (player_id, encoder_store.as_ref()) else {
+                    return None;
+                };
+                let payload = HarvestOutboxV1 {
+                    version: 1,
+                    player_id,
+                    request_id: request_id.0,
+                    removed: removed.clone(),
+                };
+                let payload = postcard::to_stdvec(&payload).ok()?;
+                let mut identity = Vec::with_capacity(24);
+                identity.extend_from_slice(&player_id.0);
+                identity.extend_from_slice(&request_id.0.to_le_bytes());
+                Some(spall_store::OutboxRecord {
+                    event_id: *blake3::hash(&identity).as_bytes(),
+                    journal_seq: journal_seq.0,
+                    payload,
+                })
+            },
+        );
+        let processor_store = durable_progression.clone();
+        let processor: spall_server::OutboxProcessor = Box::new(move |event| {
+            let harvest: HarvestOutboxV1 = postcard::from_bytes(&event.payload)
+                .map_err(|error| format!("invalid harvest outbox payload: {error}"))?;
+            if harvest.version != 1 {
+                return Err(format!(
+                    "unsupported harvest outbox version {}",
+                    harvest.version
+                ));
+            }
+            let store = processor_store
+                .as_ref()
+                .ok_or("progression store unavailable")?;
+            store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_committed_cut(harvest.player_id, harvest.request_id, &harvest.removed)
+                .map(|_| ())
+                .map_err(|error| format!("progression reward transaction failed: {error:?}"))
+        });
+        spall_server::serve_with_game_content_and_player_credentials_and_outbox(
             config,
             tool_catalog,
             materials,
@@ -726,6 +777,8 @@ fn run_serve(args: Args) -> ExitCode {
             commit_handler,
             progression_handler,
             credentials,
+            encoder,
+            processor,
         )
     } else {
         spall_server::serve_with_game_content_and_handlers(

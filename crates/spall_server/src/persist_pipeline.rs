@@ -37,6 +37,9 @@ pub enum PersistJob {
     /// A contiguous journal batch (topology transactions and/or 20 Hz pose
     /// batches), ascending by `seq`, starting one past the stored maximum.
     Journal(Vec<JournalRecord>),
+    /// Journal records and game outbox events committed in the same store txn.
+    JournalWithOutbox(Vec<JournalRecord>, Vec<spall_store::OutboxRecord>),
+    AcknowledgeOutbox(Vec<[u8; 32]>),
     /// A whole immutable engine checkpoint.
     Checkpoint(Box<Checkpoint>),
     /// Keep the newest `keep` complete checkpoints and prune journal rows no
@@ -188,6 +191,31 @@ impl PersistPipeline {
         self.submit(PersistJob::Journal(records))
     }
 
+    /// Queues a journal batch and its associated durable game events atomically.
+    pub fn submit_journal_with_outbox(
+        &self,
+        records: Vec<JournalRecord>,
+        outbox: Vec<spall_store::OutboxRecord>,
+    ) -> Result<(), PipelineError> {
+        if records.is_empty() {
+            return if outbox.is_empty() {
+                Ok(())
+            } else {
+                Err(PipelineError::Failed("outbox without journal rows".into()))
+            };
+        }
+        self.submit(PersistJob::JournalWithOutbox(records, outbox))
+    }
+
+    /// Queues acknowledgement only after the application has durably consumed
+    /// the corresponding events.
+    pub fn submit_acknowledge_outbox(&self, event_ids: Vec<[u8; 32]>) -> Result<(), PipelineError> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+        self.submit(PersistJob::AcknowledgeOutbox(event_ids))
+    }
+
     /// Queues a whole immutable checkpoint.
     pub fn submit_checkpoint(&self, checkpoint: Checkpoint) -> Result<(), PipelineError> {
         self.submit(PersistJob::Checkpoint(Box::new(checkpoint)))
@@ -331,6 +359,17 @@ impl PersistPipeline {
             .durable_seq
     }
 
+    /// Waits at clean shutdown until a specific journal prefix is durable.
+    pub fn wait_durable_through(&self, seq: u64) -> Result<(), PipelineError> {
+        while self.durable_seq() < seq {
+            if let Some(error) = self.error() {
+                return Err(PipelineError::Failed(error));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
     /// Blocks until every queued job has been processed and the writer thread
     /// has exited, then returns the final metrics and progress.
     pub fn shutdown(mut self) -> PipelineOutcome {
@@ -380,6 +419,20 @@ fn run_job(writer: &mut Writer, job: PersistJob) -> Result<Progress, String> {
                 })
                 .map_err(|e| format!("journal flush failed: {e}"))
         }
+        PersistJob::JournalWithOutbox(records, outbox) => {
+            let n = records.len() as u64;
+            writer
+                .append_journal_with_outbox(&records, &outbox)
+                .map(|d| Progress::Journal {
+                    through: d.journal_seq.0,
+                    records: n,
+                })
+                .map_err(|e| format!("journal/outbox flush failed: {e}"))
+        }
+        PersistJob::AcknowledgeOutbox(ids) => writer
+            .acknowledge_outbox(&ids)
+            .map(|()| Progress::Wal)
+            .map_err(|e| format!("outbox acknowledgement failed: {e}")),
         PersistJob::Checkpoint(cp) => writer
             .publish_checkpoint(&cp)
             .map(|()| Progress::Checkpoint)

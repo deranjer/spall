@@ -615,11 +615,11 @@ The rules version is logged at startup, but is not yet negotiated in the client
   `synchronous=FULL`, a single bounded writer thread, and one transaction for
   each craft's updated inventory, exact replay response, and request cursor.
   The server restores progression on startup; harvest awards are persisted
-  idempotently by action request ID. The player's database is separate from
-  the authoritative world database: a crash between a committed world edit
-  and its harvest award can lose or duplicate the reward. The progression
-  callback waits for the writer result, so slow storage can delay a simulation
-  tick. **Checks:** `cargo fmt --all`; `cargo check -p sandbox --bins
+  idempotently by action request ID. At this increment's baseline, the
+  player's database was separate from the authoritative world database; see
+  Increment 18 for the durable outbox follow-up. The progression callback
+  waits for the writer result, so slow storage can delay a simulation tick.
+  **Checks:** `cargo fmt --all`; `cargo check -p sandbox --bins
   --all-features`; `git diff --check` passed. No tests were run.
 
   **Increment 17 (durable progression invariants):** Added focused SQLite
@@ -643,6 +643,20 @@ The rules version is logged at startup, but is not yet negotiated in the client
   separate world journal or measure writer latency under server load. The
   checks used the current working tree; the separate clean-checkout audit
   remains documented in Increment 5.
+
+  **Increment 18 (review follow-up: contact normals and harvest durability):**
+  Contact material sampling now orients the physics pair normal from the
+  selected target toward its striker for both terrain/body and body/body
+  contacts; a pair-order regression test covers either target slot. For
+  authenticated harvests with world persistence enabled, sandbox emits a
+  versioned reward event into the world's durable outbox. The journal row and
+  outbox row share one SQLite transaction; startup and live delivery apply the
+  event to the progression database using its existing player/request
+  idempotency key and acknowledge it only after success. A crash before commit
+  leaves neither record, while a crash after commit or before acknowledgement
+  replays without losing or duplicating inventory. Ephemeral runs retain their
+  in-memory behavior and have no crash recovery promise. Exact checks and any
+  remaining integration limitations are recorded in the session work log.
 
   Recommended follow-on survival-content work, in order: (1) connect committed
   world edits and progression awards through a durable idempotent outbox or a

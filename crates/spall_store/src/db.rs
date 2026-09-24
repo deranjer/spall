@@ -21,7 +21,7 @@ use spall_core::JournalSeq;
 use spall_protocol::DurableThrough;
 
 use crate::StoreError;
-use crate::dto::{self, Checkpoint, JournalRecord, STORE_SCHEMA_VERSION};
+use crate::dto::{self, Checkpoint, JournalRecord, OutboxRecord, STORE_SCHEMA_VERSION};
 use crate::fault::{CrashPoint, FaultPlan};
 use crate::metrics::WriteMetrics;
 use crate::recover::{Recovery, recover_conn};
@@ -187,6 +187,17 @@ impl Writer {
         &mut self,
         records: &[JournalRecord],
     ) -> Result<DurableThrough, StoreError> {
+        self.append_journal_with_outbox(records, &[])
+    }
+
+    /// Commits journal rows and game outbox events in one SQLite transaction.
+    /// Each event must refer to a topology row in this batch. The store treats
+    /// payloads as opaque versioned game data.
+    pub fn append_journal_with_outbox(
+        &mut self,
+        records: &[JournalRecord],
+        outbox: &[OutboxRecord],
+    ) -> Result<DurableThrough, StoreError> {
         self.ensure_live()?;
         if records.is_empty() {
             return Err(StoreError::Empty);
@@ -220,6 +231,18 @@ impl Writer {
                 });
             }
         }
+        for event in outbox {
+            if !records.iter().any(|r| {
+                r.seq == event.journal_seq
+                    && matches!(
+                        r.payload,
+                        dto::JournalPayload::Topology { .. }
+                            | dto::JournalPayload::TopologyBulkSplit { .. }
+                    )
+            }) {
+                return Err(StoreError::OutboxJournalMismatch(event.journal_seq));
+            }
+        }
 
         // Arm a genuine engine write failure (if requested) before the txn opens.
         self.maybe_arm_real_write_failure()?;
@@ -244,6 +267,19 @@ impl Writer {
                     let crc = crc16(&body);
                     stmt.execute(params![r.seq as i64, r.tick as i64, &body, &crc])?;
                     payload_bytes += body.len() as u64;
+                }
+            }
+
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR IGNORE INTO game_outbox (event_id, journal_seq, payload) VALUES (?, ?, ?)",
+                )?;
+                for event in outbox {
+                    stmt.execute(params![
+                        &event.event_id[..],
+                        event.journal_seq as i64,
+                        &event.payload
+                    ])?;
                 }
             }
 
@@ -290,6 +326,41 @@ impl Writer {
                 Err(e)
             }
         }
+    }
+
+    /// Returns pending game events in journal order. Delivery is at least once;
+    /// consumers must apply each event idempotently before acknowledging it.
+    pub fn pending_outbox(&self, limit: usize) -> Result<Vec<OutboxRecord>, StoreError> {
+        self.ensure_live()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, journal_seq, payload FROM game_outbox ORDER BY journal_seq, event_id LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit.min(i64::MAX as usize) as i64], |row| {
+            let id: Vec<u8> = row.get(0)?;
+            let event_id: [u8; 32] = id.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(OutboxRecord {
+                event_id,
+                journal_seq: row.get::<_, i64>(1)? as u64,
+                payload: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Deletes successfully delivered events. Call only after the destination
+    /// store has durably applied them; a crash before this call causes replay.
+    pub fn acknowledge_outbox(&mut self, event_ids: &[[u8; 32]]) -> Result<(), StoreError> {
+        self.ensure_live()?;
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached("DELETE FROM game_outbox WHERE event_id = ?")?;
+            for id in event_ids {
+                stmt.execute(params![&id[..]])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Writes every body/brick row of `checkpoint`, the world metadata, and the

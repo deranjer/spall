@@ -44,6 +44,7 @@ spall_net = { path = "../../crates/spall_net" }
 spall_protocol = { path = "../../crates/spall_protocol" }
 spall_render = { workspace = true, optional = true }
 spall_server = { path = "../../crates/spall_server" }
+spall_store = { path = "../../crates/spall_store" }
 spall_sim = { path = "../../crates/spall_sim" }
 glam.workspace = true
 serde_json = { workspace = true, optional = true }

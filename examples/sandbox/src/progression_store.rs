@@ -217,8 +217,8 @@ impl ProgressionDatabase {
     }
 
     /// Durably awards drops from a committed cut once per player/action ID.
-    /// The world edit and this game-owned database are separate transactions;
-    /// callers must report that crash window rather than claim cross-store atomicity.
+    /// The world journal outbox delivers committed edits at least once. This
+    /// transaction deduplicates the stable player/action ID before granting.
     pub fn record_committed_cut(
         &mut self,
         player_id: PlayerId,

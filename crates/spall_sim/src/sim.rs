@@ -321,7 +321,11 @@ impl Simulation {
                     };
                     let mass = self.world.physics().body_state(striker_phys).mass_kg;
                     let point_cell = (world_point / cell_m).to_array();
-                    let normal = contact.normal.map(f64::from);
+                    // Contact normals point from body 0 to body 1. Sampling
+                    // steps against target-to-striker, so orient from target
+                    // (terrain) toward the selected striker.
+                    let normal =
+                        target_to_striker_normal(contact.normal.map(f64::from), 1 - striker_idx);
                     let Some(target_material) =
                         sample_contact_material(&self.world, terrain_volume, point_cell, normal)
                     else {
@@ -380,7 +384,11 @@ impl Simulation {
                         .xform(struck_body.cell_size())
                         .world_to_local_cell(world_point)
                         .to_array();
-                    let normal_world = DVec3::from_array(contact.normal.map(f64::from));
+                    let normal_target_to_striker = target_to_striker_normal(
+                        contact.normal.map(f64::from),
+                        if strike_a { 0 } else { 1 },
+                    );
+                    let normal_world = DVec3::from_array(normal_target_to_striker);
                     let normal_local = struck_body.pose.rotation.inverse() * normal_world;
                     let Some(target_material) = sample_contact_material(
                         &self.world,
@@ -395,7 +403,7 @@ impl Simulation {
                         target_volume: struck_body.volume_id,
                         target_material,
                         point_cell,
-                        normal: contact.normal.map(f64::from),
+                        normal: normal_target_to_striker,
                         impulse_n_s: contact.normal_impulse_n_s,
                         resting_impulse_n_s: mass_struck * g * dt,
                         // A body split out this tick is at its split instant, not
@@ -633,6 +641,16 @@ impl Simulation {
     }
 }
 
+/// Converts Rapier's body-0-to-body-1 contact normal to a target-to-striker
+/// normal. `target_index` is the target's position in the contact pair.
+fn target_to_striker_normal(pair_normal: [f64; 3], target_index: usize) -> [f64; 3] {
+    if target_index == 0 {
+        pair_normal
+    } else {
+        pair_normal.map(|component| -component)
+    }
+}
+
 /// Resolves the solid material just inside a contact surface. Solver points can
 /// lie on cell boundaries, so step half a cell against the target-to-striker
 /// normal and fail closed when the backing data is not resident.
@@ -654,6 +672,26 @@ fn sample_contact_material(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod contact_normal_tests {
+    use super::target_to_striker_normal;
+
+    #[test]
+    fn contact_pair_order_orients_sampling_into_either_target() {
+        let body_zero_to_one = [1.0, 0.0, 0.0];
+        // Target in slot 0: the struck material lies in +X, toward striker 1.
+        assert_eq!(
+            target_to_striker_normal(body_zero_to_one, 0),
+            body_zero_to_one
+        );
+        // Target in slot 1: the struck material lies in -X, toward striker 0.
+        assert_eq!(
+            target_to_striker_normal(body_zero_to_one, 1),
+            [-1.0, 0.0, 0.0]
+        );
+    }
 }
 
 /// Nearest-surface gap, metres, between a world-space AABB `(min, max)` and a

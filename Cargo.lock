@@ -3050,6 +3050,7 @@ dependencies = [
  "spall_render",
  "spall_server",
  "spall_sim",
+ "spall_store",
  "spall_voxel",
  "thiserror 2.0.20",
  "tracing",

@@ -39,7 +39,8 @@ pub use brick::{BrickCodecError, DENSE_CELL_BYTES, decode_cells, encode_cells};
 pub use db::{DEFAULT_MAX_BATCH_RECORDS, WalCheckpoint, Writer};
 pub use dto::{
     BrickPayload, Checkpoint, DtoError, JournalPayload, JournalRecord, MAX_STORED_BRICK_BYTES,
-    STORE_SCHEMA_VERSION, StoredBody, StoredBodyKind, StoredBrick, StoredPose, StoredWorldMeta,
+    OutboxRecord, STORE_SCHEMA_VERSION, StoredBody, StoredBodyKind, StoredBrick, StoredPose,
+    StoredWorldMeta,
 };
 pub use fault::{CrashPoint, FaultPlan};
 pub use metrics::WriteMetrics;
@@ -80,6 +81,8 @@ pub enum StoreError {
     JournalGap { expected: u64, got: u64 },
     #[error("journal batch of {pending} records exceeds the {cap} cap")]
     QueueFull { pending: usize, cap: usize },
+    #[error("outbox event refers to journal sequence {0} absent from this topology batch")]
+    OutboxJournalMismatch(u64),
 
     #[error("writer stopped after an earlier failure: {0}")]
     Poisoned(String),
