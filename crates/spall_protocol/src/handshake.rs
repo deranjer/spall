@@ -16,7 +16,7 @@ use crate::records::{Record, RecordError, WireTag};
 use crate::session::SessionId;
 
 /// Current wire protocol version. Bumped on any breaking record-layout change.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Fixed simulation and snapshot rates (Hz).
 pub const SERVER_TICK_HZ: u16 = 60;

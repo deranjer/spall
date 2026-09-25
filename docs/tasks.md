@@ -658,16 +658,67 @@ The rules version is logged at startup, but is not yet negotiated in the client
   in-memory behavior and have no crash recovery promise. Exact checks and any
   remaining integration limitations are recorded in the session work log.
 
-  Recommended follow-on survival-content work, in order: (1) connect committed
-  world edits and progression awards through a durable idempotent outbox or a
-  shared transaction boundary, and return persistence completions without
-  blocking the simulation tick; (2) define credential rotation/revocation and
-  operator-safe secret provisioning; (3) extend static asset import for
-  multi-root assemblies, animation, and tint only when gameplay needs them;
-  (4) add live tool selection/aiming controls and a hands-on multiplayer
-  progression scenario; (5) add end-to-end network tests for authenticated
-  craft requests across disconnect and restart. These follow-on items are not
-  T25 acceptance claims.
+  **Increment 19 (bounded asynchronous progression and outbox delivery):**
+  progression requests, committed-cut callbacks, and live harvest outbox
+  delivery now execute on dedicated bounded worker queues. The request worker
+  is a single FIFO, so operations for each player stay serialized; the sim
+  thread enqueues with `try_send`, drains a bounded completion slice, and emits
+  craft replies only after the handler's durable transaction completes. A full
+  request queue returns the new explicit `RetryableCapacity` rejection and
+  clients must retry the same request ID. The world outbox remains unacknowledged
+  until the award worker reports success; only then does the sim submit the
+  world-database acknowledgement. Recovery and clean shutdown may wait outside
+  the active simulation tick. Wire schema, handshake protocol, and ALPN advance
+  to version 3 for the new rejection code. **Checks:** queue saturation/order
+  test with an injected 75 ms slow handler (enqueue stays below 50 ms; 64 queued
+  plus one active accepted, next rejected); `cargo test -p spall_protocol --lib`
+  (33 passed); eight-client `t23-g4-workload` (3,000 ticks, 20 committed edits,
+  replay/restart/reconnect hashes converged to `dafe0e5e…9547afa`). Measured
+  server tick busy p95 0.9893 ms / p99 2.7976 ms against 12 / 16.7 ms targets;
+  physics p95 0.2251 ms; process peak 2,732,171,264 bytes. The slow handler is
+  a deterministic queue-level injected delay, not an instrumented SQLite stall
+  inside the eight-client scenario. No claim is made for full G4 soak.
+
+  **Increment 20 (credential lifecycle):** Added
+  [credential operations](credential-operations.md) for protected server/client
+  secret files, provisioning, rotation with the same PlayerId, and revocation.
+  The server polls the registry every 500 ms; an atomic valid update replaces
+  the accepted credentials and closes active sessions, while malformed or
+  unreadable content fails closed by revoking all credentials. The stable
+  PlayerId remains independent from the bearer token, so progression ownership
+  survives rotation and revocation. Tests verify rotated-token acceptance,
+  old-token rejection, revocation, stable identity, redacted Debug output, and
+  parser errors that do not echo token bytes. **Checks:** `cargo check -p
+  spall_net --all-targets --all-features`; `cargo check -p spall_server --lib
+  --all-features`; `cargo check -p sandbox --bins --all-features`; focused
+  `spall_net` rotation/replacement tests and `spall_server` parser-redaction
+  test passed. Windows ACL commands are documented but were not exercised on
+  this run.
+
+  **Increment 21 (authenticated network crafting recovery):** Added a real
+  QUIC integration test with two credential-authenticated players and the
+  sandbox's durable progression database. It sends duplicate craft IDs and
+  verifies identical recorded replies, rejects a stale inventory revision,
+  isolates a player without ingredients, disconnects after admission but
+  before an injected slow durable reply, reconnects with the same request ID,
+  restarts the server and reopens the progression database, then verifies
+  exact inventory contents/revisions. The same test rotates one token while
+  retaining its PlayerId and revokes another, proving old tokens cannot
+  reconnect and that token strings do not appear in JSONL logs. **Check:**
+  `cargo test -p sandbox --all-features --test progression_network` passed
+  (1 integration scenario; ~20 s).
+
+  Remaining ordered completion checks and audit:
+  (1) the supplied acceptance key is `(WorldId, TransactionId)`, while the
+  current harvest store deduplicates `(PlayerId, RequestId)`; see
+  [T25 remaining checks](reports/T25-remaining-checks.md). (5) no authored
+  sandbox asset/manifest fixture is checked in, so assembly/animation/tint
+  runtime expansion cannot yet be validated against game-authored meaning;
+  SPVX v1.1 already specifies those format semantics and unsupported runtime
+  forms fail explicitly. (6) D3D12 and Vulkan G2 still/motion captures have
+  been run on the RTX 4080 SUPER, with Vulkan output recorded, but a distinct
+  physical adapter remains unavailable/unrun. See the report for exact
+  measurements and limits.
 
 ### ENG-74 — Editor MVP (user-authorized follow-up)
 
