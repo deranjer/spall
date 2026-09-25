@@ -40,7 +40,7 @@ pub struct NetServer {
 
 enum ServerAuth {
     Shared(JoinToken),
-    Players(Vec<PlayerCredential>),
+    Players(Arc<std::sync::RwLock<Vec<PlayerCredential>>>),
 }
 
 impl NetServer {
@@ -88,27 +88,13 @@ impl NetServer {
                 "player credential registry exceeds the 4096-entry limit".into(),
             )));
         }
-        for (index, credential) in credentials.iter().enumerate() {
-            if !credential.player_id.is_valid() {
-                return Err(TransportError::Auth(AuthReject::Malformed(
-                    "player credential contains a reserved all-zero player ID".into(),
-                )));
-            }
-            if credentials[..index]
-                .iter()
-                .any(|earlier| earlier.token.verify(&credential.token))
-            {
-                return Err(TransportError::Auth(AuthReject::Malformed(
-                    "player credential registry contains a duplicate token".into(),
-                )));
-            }
-        }
+        validate_player_credentials(&credentials)?;
         let server_handshake = handshake_with_local_limits(server_handshake, cfg)?;
         let server_config = identity.server_config(&cfg)?;
         let endpoint = quinn::Endpoint::server(server_config, addr)?;
         Ok(Self {
             endpoint,
-            auth: ServerAuth::Players(credentials),
+            auth: ServerAuth::Players(Arc::new(std::sync::RwLock::new(credentials))),
             server_handshake,
             cfg,
             sessions: Arc::new(Mutex::new(vec![(0, false); cfg.max_connections as usize])),
@@ -119,6 +105,20 @@ impl NetServer {
     /// The bound address (with the OS-assigned port resolved).
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.endpoint.local_addr()?)
+    }
+
+    /// Atomically replaces the accepted player-token registry. An empty
+    /// registry revokes every credential while leaving durable PlayerIds and
+    /// their game-owned progression records untouched.
+    pub fn replace_player_credentials(&self, credentials: Vec<PlayerCredential>) -> Result<()> {
+        validate_player_credentials(&credentials)?;
+        let ServerAuth::Players(registry) = &self.auth else {
+            return Err(TransportError::Auth(AuthReject::Malformed(
+                "this server does not use player credentials".into(),
+            )));
+        };
+        *registry.write().unwrap_or_else(|error| error.into_inner()) = credentials;
+        Ok(())
     }
 
     /// Accepts one QUIC connection and runs server-side authentication. On an
@@ -173,7 +173,12 @@ impl NetServer {
 
         let player_id = match &self.auth {
             ServerAuth::Shared(token) if token.verify(&hello.token) => None,
-            ServerAuth::Players(credentials) => player_for_token(credentials, &hello.token),
+            ServerAuth::Players(credentials) => player_for_token(
+                &credentials
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner()),
+                &hello.token,
+            ),
             _ => None,
         };
         if player_id.is_none()
@@ -226,6 +231,30 @@ impl NetServer {
     pub async fn wait_idle(&self) {
         self.endpoint.wait_idle().await;
     }
+}
+
+fn validate_player_credentials(credentials: &[PlayerCredential]) -> Result<()> {
+    if credentials.len() > 4096 {
+        return Err(TransportError::Auth(AuthReject::Malformed(
+            "player credential registry exceeds the 4096-entry limit".into(),
+        )));
+    }
+    for (index, credential) in credentials.iter().enumerate() {
+        if !credential.player_id.is_valid() {
+            return Err(TransportError::Auth(AuthReject::Malformed(
+                "player credential contains a reserved all-zero player ID".into(),
+            )));
+        }
+        if credentials[..index]
+            .iter()
+            .any(|earlier| earlier.token.verify(&credential.token))
+        {
+            return Err(TransportError::Auth(AuthReject::Malformed(
+                "player credential registry contains a duplicate token".into(),
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn player_for_token(
@@ -471,6 +500,67 @@ impl std::fmt::Debug for NetServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_rotation_preserves_player_id_and_revocation_rejects_old_token() {
+        let current = PlayerCredential::generate().unwrap();
+        let rotated = PlayerCredential {
+            player_id: current.player_id,
+            token: JoinToken::generate().unwrap(),
+        };
+        let old_text = format!("{:?}", current);
+        assert!(!old_text.contains(&current.token.to_hex()));
+        assert_eq!(
+            player_for_token(&[current], &current.token),
+            Some(current.player_id)
+        );
+        assert_eq!(
+            player_for_token(&[rotated], &rotated.token),
+            Some(current.player_id)
+        );
+        assert_eq!(player_for_token(&[rotated], &current.token), None);
+        assert_eq!(player_for_token(&[], &rotated.token), None);
+    }
+
+    #[tokio::test]
+    async fn live_credential_registry_replacement_rotates_and_revokes_without_changing_identity() {
+        let current = PlayerCredential::generate().unwrap();
+        let rotated = PlayerCredential {
+            player_id: current.player_id,
+            token: JoinToken::generate().unwrap(),
+        };
+        let identity = DevIdentity::generate().unwrap();
+        let server = NetServer::bind_with_player_credentials(
+            "127.0.0.1:0".parse().unwrap(),
+            &identity,
+            vec![current],
+            crate::harness::demo_handshake(crate::harness::HARNESS_MANIFEST_TAG),
+            TransportConfig::for_tests(),
+        )
+        .await
+        .unwrap();
+        let ServerAuth::Players(registry) = &server.auth else {
+            panic!("player registry expected");
+        };
+        assert_eq!(
+            player_for_token(&registry.read().unwrap(), &current.token),
+            Some(current.player_id)
+        );
+        server.replace_player_credentials(vec![rotated]).unwrap();
+        assert_eq!(
+            player_for_token(&registry.read().unwrap(), &rotated.token),
+            Some(current.player_id)
+        );
+        assert_eq!(
+            player_for_token(&registry.read().unwrap(), &current.token),
+            None
+        );
+        server.replace_player_credentials(Vec::new()).unwrap();
+        assert_eq!(
+            player_for_token(&registry.read().unwrap(), &rotated.token),
+            None
+        );
+    }
 
     #[test]
     fn client_bind_uses_unspecified_address_in_target_family() {

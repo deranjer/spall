@@ -35,8 +35,13 @@ per-player credential mode, the server passes the authenticated `PlayerId` to
 the game-owned catalog/inventory handler; legacy shared-token mode passes no
 principal and remains suitable only for ephemeral per-slot progression. Crafting
 uses optimistic catalog and inventory revisions; every reply contains the
-authoritative full inventory, including rejection replies, so clients can
-refresh stale state. The sandbox deduplicates by authenticated player ID when
+authoritative full inventory for processed requests, including semantic
+rejections, so clients can refresh stale state. A `RetryableCapacity`
+admission reply has no authoritative inventory snapshot; clients retain their
+current view and retry the identical request ID after backoff. The server
+processes accepted requests on one bounded FIFO worker, preserving operation
+order per player. Queue saturation never waits on the simulation tick. The
+sandbox deduplicates by authenticated player ID when
 available and falls back to the temporary connection slot only in legacy mode.
 Durable inventory storage is a separate game-owned layer and remains open.
 
@@ -46,14 +51,17 @@ Inventory revisions and item stacks use explicit stable fields. A craft
 request, its complete response receipt, and the per-player request high-water
 mark commit atomically in WAL mode with `synchronous=FULL`; recent receipts
 are retained for replay and older unseen IDs are rejected. One bounded writer
-thread owns this file. Harvest rewards in a saved world are first recorded in
+thread owns this file. Craft requests are submitted through a bounded server
+queue and their responses are sent only after the complete inventory and replay
+receipt transaction commits. Harvest rewards in a saved world are first recorded in
 the world's durable outbox in the same transaction as the world journal row.
 The outbox delivery calls the progression writer, which deduplicates by
 authenticated player ID and originating action request ID, then the world
 writer acknowledges the event. Recovery replays unacknowledged events after a
-crash. Delivery can still wait for the game-owned writer on the simulation
-thread after the world row becomes durable; eliminating that tick delay is
-separate follow-up work. Without world persistence, harvest remains ephemeral.
+crash. Live delivery runs on a separate bounded worker; the simulation thread
+submits the world acknowledgement only after it receives the durable award
+completion. Startup recovery and clean shutdown may wait for award completion.
+Without world persistence, harvest remains ephemeral.
 
 Limits start at 64 KiB per control record, 1 MiB per bulk part, 64 MiB per assembled transfer, and 256 KiB maximum decompressed data per material-only brick record (actual material payload is 64 KiB). Validate counts before allocation and decompress with output bounds. A multi-volume transaction can span staged bulk parts; its visible commit marker is small. Larger regions are split into multiple dependency-complete transfers. Each connection has bounded staging memory and a timeout.
 
@@ -262,7 +270,7 @@ baseline regions, 4096 baseline parts.
 ## T09 transport adapter (implemented)
 
 `crates/spall_net` layers Quinn/QUIC on the T01 records. It owns transport only:
-no simulation, storage, or rendering. ALPN is `spall/2`; TLS is 1.3-only.
+no simulation, storage, or rendering. ALPN is `spall/3`; TLS is 1.3-only.
 
 **Sessions.** Clients pin the server certificate fingerprint (BLAKE3 of the
 certificate DER, carried out of band). Legacy development mode accepts one
@@ -276,6 +284,13 @@ provisioned to the corresponding client through a protected channel. A wrong
 certificate fails the QUIC/TLS handshake; an unknown token or incompatible
 `Handshake` gets a distinct `AuthReject` before teardown. This local
 `ClientHello` / `ServerAuthReply` exchange precedes the normal control stream.
+When `--player-credentials-file` is set, the server checks that file every
+500 ms. A valid atomic replacement rotates or revokes tokens while preserving
+the stable PlayerId. Registry changes close active sessions, so reconnects
+must use a currently registered token; malformed or unreadable updates revoke
+all credentials until a valid file is installed. Follow
+[`credential-operations.md`](credential-operations.md) for protected
+provisioning, rotation, and revocation steps.
 
 **Channels.** One reliable ordered **control stream** per connection carries
 `NetMessage` envelopes: `Heartbeat { seq }`, `Record { seq, <T01 frame> }`, or
