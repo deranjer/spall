@@ -754,3 +754,130 @@ Return changed files, commands/results, evidence paths, and remaining risks.
 ```
 
 Work that can proceed independently after prerequisites: T09 alongside CPU geometry work; T12/T13 alongside replication integration; T16 alongside the graphics gate. This is a dependency observation, not a request to launch agents automatically. One integrator owns shared schemas and final gates.
+
+### ENG-103 — Water feasibility prototype: dam, canal, and flooded tunnel
+
+User-authorized follow-up scoped by `docs/water-agent-handoff.md`. This is the
+first bounded water assignment, not the complete water feature roadmap.
+
+**Dependencies:** Existing voxel and simulation foundations. First audit
+`spall_voxel`, simulation tick ownership, physics, jobs, and validation seams;
+do not assume a water API exists. **Owns:** a CPU-only `spall_*` fluid
+subsystem and its bounded fixture, meaningful invariant/scenario tests,
+reproducible metrics, solver decision, and evidence report. Compare custom
+sparse 3D grid and Salva capabilities/compatibility/licensing without changing
+shared dependency versions. Use actual voxel boundary data, a finite pair of
+reservoirs, editable dam, excavatable canal/tunnel, and one water type.
+
+Keep water state separate from solid occupancy and ECS entities. Preserve
+Rapier as the only rigid-body solver; no GPU/window/network dependency enters
+the fluid algorithm. Account for initial water, explicit sources/sinks and
+boundary outflow across flow and geometry edits. Unknown residency must never
+be silently treated as air, a drain, or a wall. Specify committed-edit and
+fluid tick ordering, fixed-tick substeps/stability limits, bounded overload
+behavior, and pressure-region consistency before integrated use.
+
+**Required evidence:** stable water and no leakage through intact walls,
+including a brick seam; canal transfer toward equilibrium and closure without
+water loss; a moving dam-break surge with downstream accumulation; a flooded
+tunnel under a second pool; absolute/relative accounting error and explicit
+outflow; fluid/total step timings, active cells, memory, pressure convergence,
+larger workload response, and a resolution or timestep sensitivity comparison.
+Record dimensions, water resolution, timestep/substeps, initial volume,
+boundaries, hardware, and numerical/performance targets before measuring.
+Targets remain targets until measured. Deliver exact commands and limitations;
+do not shrink the named workload or substitute visuals when a feasibility
+target fails. Current prototype measurements and failed gates:
+`docs/reports/ENG-103.md`.
+
+**Grid comparison increment (user-directed, 2026-09-27):** Preserve the Salva
+backend and its raw evidence. Add a separate fully resident, dense CPU 3D MAC
+grid with one water cell per terrain cell and fractional VOF state. The
+pre-coding numerical method, equations, units, boundary conditions, step order,
+and deliberate simplifications are recorded in
+`docs/reports/ENG-103-grid-method.md`. The acceptance extension is the full
+grid-prototype brief recorded in Loopira ENG-103: bounded conservative
+fraction transport, staggered velocity/pressure projection, explicit
+disconnected-region/nullspace handling, staged voxel boundaries, fixed outer
+tick with bounded stability substeps, analytical projection/hydrostatic check,
+and the listed physical fixtures, sensitivity runs, and base/scale-2 evidence.
+This static aligned-grid experiment does not establish support for coarse
+fluid cells, moving/rotating hulls, or production integration.
+
+  **Bounded correctness/profile follow-up (user-directed, 2026-09-27):** Correct
+the speed and face-weighted kinetic/potential energy diagnostics; reconcile the
+upper-pool region from the actually applied FCT face fluxes; and keep the scale-2
+pressure solve profile. Pressure matrix and Krylov work now iterate wet cells
+only. Equal-duration basin runs compare 0.25 m/60 Hz, 0.25 m/120 Hz, and
+0.125 m/60 Hz; equal-duration tunnel runs compare both spatial resolutions.
+The scale-2 pool discrepancy was caused by a region mask omitting the first
+cavity row and now balances to 1.8e-15 m³. Base sealed/canal/breach fit the
+  proposed 2 ms allocation after the bounded optimization. **Pressure-cost and
+  residual-motion follow-up (user-directed, 2026-09-27):** Correct the harness's
+  per-1/60-second normalization (half-dt work is nearly 2x, not cheaper), add
+  detailed PCG residual/component/timing traces, and remove redundant
+  enclosed-nullspace projection passes. Repeated scale-2 tunnel pressure cost
+  falls from 52.05 to 36.80 ms/tick with the same iterations; the complete
+  workload remains about 24x above the 2 ms proposal. The basin maximum is
+  retained at 0.854 m/s but occurs in a fraction 3.16e-18 interface cell; the
+  volume-weighted p95 is 0.075 m/s. Neither finding clears the failed
+  unfiltered speed gate. Keep ENG-103 in progress and production integration
+  blocked; the next bounded comparison is IC(0) preconditioning, including
+  setup cost and enclosed-component nullspaces. See
+  `docs/reports/ENG-103.md`, `docs/reports/ENG-103-grid-method.md`, and the
+  uniquely named evidence captures.
+
+**IC(0) comparison and corrected basin diagnostic (2026-09-27):** Add a
+selectable deterministic zero-fill incomplete-Cholesky PCG preconditioner while
+preserving Jacobi as the default baseline. Rebuild and measure the factor at
+every pressure projection; use a factor-only pinned gauge for enclosed
+components; reject bad pivots explicitly. The matched base basin/canal/breach
+and scale-2 tunnel fixtures preserve pressure convergence and flow results.
+Three release timing repeats show normalized mean-cost medians of Jacobi→IC(0):
+basin 1.941→1.870 ms, canal 1.854→1.748 ms, breach 1.820→1.742 ms, scale-2
+tunnel 49.002→37.598 ms. IC(0) cuts scale-2 pressure iterations from 229.6 to
+86.2 mean while adding factor storage and ~3 MiB peak process memory. Revise the
+basin gate to occupancy-weighted p95/high-speed share at C>=1e-3, retain the
+raw maximum, and publish 0 through 1e-2 threshold sensitivity. This clears the
+speed-only interpretation but finds that upper-bound basin kinetic-energy rise
+still misses by 0.101 J. Tiny fractions also cause 7 extra diagnostic-estimated
+CFL substeps in the basin and remain pressure rows; solver filtering was not
+applied. Recommendation: keep IC(0) for further isolated candidate work and
+Jacobi as the reproducible baseline. Scale 2 remains 18.8x over the proposed
+2 ms allocation; the Salva tunnel roof crossing remains. Production promotion,
+moving-body force coupling, boats, and networking stay blocked. See
+`docs/reports/ENG-103.md`, `docs/reports/ENG-103-grid-method.md`,
+`docs/validation.md`, and the `ic0-final-*`/`ic0-plain-*` JSONL captures.
+
+**Two-phase candidate, reference comparison, cost, and sealed air
+(2026-09-27):** The opt-in two-phase variable-density MAC/PLIC model
+(`--ambient-density 1.2`) passes the 30-second physical acceptance. The
+acceptance output is now v2. The level `equilibrium` basin keeps the at-rest
+KE gate. The historical `basin` is a small dam break, so it gates on total
+mechanical energy never exceeding its initial value. The legacy single-phase
+closure fails because it genuinely gains 15–20 kJ.
+
+An independent Basilisk C reference (the `reference-*.c` sources and
+`basilisk-*.jsonl` output in `docs/reports/ENG-103-evidence/`) agrees on
+conservation, energy released, dissipation, and final level. A new
+standing-wave benchmark shows resolved waves are not over-damped: 0.991
+amplitude ratio per period against Basilisk's 0.959. The remaining basin KE
+gap is under-resolved collapse. MacCormack advection was rejected because it
+grows waves 4.6–11% per period.
+
+Cost: a Galerkin-aggregation multigrid PCG (`--preconditioner mg`), exact
+transport savings, and rayon data-parallel loops that stay bit-identical for
+any thread count. Every scale-1 fixture now costs 1.1–1.3 ms per 1/60 s; the
+closed scale-2 tunnel costs 19 ms.
+
+Sealed air is an isothermal compressible gas by default. A diving-bell test
+lands within 7% of the analytic equilibrium.
+
+Recommendation: adopt the two-phase MAC grid as the water solver. Production
+integration (tick ordering with committed edits, overlap/displacement policy,
+replication, persistence, dormancy) is the next scoped assignment. See the
+dated sections of `docs/reports/ENG-103.md`.
+
+Swimming, boats, rigid-body coupling, multiplayer water DTOs, persistence,
+streaming-scale behavior, and replaceable water appearance are later scoped
+assignments. See Loopira ENG-103 for the matching tracked issue.

@@ -3,6 +3,7 @@ members = [
     "crates/spall_core",
     "crates/spall_protocol",
     "crates/spall_voxel",
+    "crates/spall_fluid",
     "crates/spall_jobs",
     "crates/spall_structure",
     "crates/spall_net",
@@ -18,6 +19,10 @@ members = [
     "tools/spall_editor",
     "tools/xtask",
 ]
+# Vendored third-party crates are path dependencies, never members: not
+# linted as Spall code, and `--all-features` does not toggle their features.
+# (Cargo ignores `exclude` for paths inside a member directory.)
+exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
