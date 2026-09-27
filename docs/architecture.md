@@ -13,6 +13,7 @@ spall_jobs    -> spall_core                     bounded scheduling, result token
 spall_mesh    -> spall_voxel, spall_jobs        surface generation, no GPU
 spall_structure -> spall_voxel, spall_jobs      connectivity, support, split plans
 spall_physics -> spall_voxel                    Rapier adapter, collision builds
+spall_fluid  -> spall_core, spall_voxel          CPU fluid state and solid-boundary snapshots
 spall_sim     -> spall_structure, spall_physics, spall_jobs, spall_protocol   authoritative state and tick order
 spall_protocol -> spall_core                   explicit DTOs and codecs only
 spall_net     -> spall_protocol                 Quinn transport adapter (Tokio; T09)
@@ -25,6 +26,21 @@ xtask                                    process/scenario/build orchestration
 ```
 
 spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The graph edge is refined from `spall_sim -> spall_structure, spall_physics` to add `-> spall_jobs, spall_protocol` (T08): staging is submitted to a `spall_jobs::Scheduler` and re-validated through a `JobToken` like any other off-tick result, and every commit emits a `spall_protocol::TopologyTransaction`. Both new targets are foundation crates (`-> spall_core`); no cycle is introduced. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
+
+ENG-103 introduces `spall_fluid -> spall_core, spall_voxel` as a CPU-only
+boundary and water-state prototype. It captures only fully resident voxel
+geometry and rejects unknown cells. It is not yet connected to `spall_sim`,
+Rapier, jobs, replication, or persistence; solver, tick ordering, and water
+recovery remain open feasibility work. Rapier remains the sole rigid-body
+solver.
+
+ENG-103's comparison increment adds a separate dense CPU MAC/VOF grid backend
+inside `spall_fluid`, alongside Salva. It uses staggered face velocities,
+fractional water volume, conservative shared-face transport, and an explicit
+pressure projection. The harness, measurements, and remaining failed gates
+are recorded in [`docs/reports/ENG-103.md`](reports/ENG-103.md). Neither water
+backend is advanced by the authoritative `spall_sim` tick or coupled to Rapier;
+the measured comparison does not establish production readiness.
 
 Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
 in-process `cargo xtask net-check` transport harness. Add `games/survival` only
