@@ -718,3 +718,349 @@ fn wake_reasons_over_the_workload() {
         );
     }
 }
+
+/// Trace every body that ends up below the ground slab: who it is, when and by which
+/// commit it was created, where it crossed, and whether it crossed over the footprint
+/// of a terrain dig (an actual opening), outside the slab (escape), or elsewhere on
+/// intact slab (tunnelling / missing collision geometry).
+#[test]
+#[ignore = "diagnostic: trace bodies that end far below the slab"]
+fn escaped_body_trace() {
+    use std::collections::HashMap;
+    let ticks: u64 = std::env::var("TRACE_TICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(9500);
+    let (mut sim, bodies) = scene();
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let (mut req, mut ordinary, mut blast, mut digs, mut comb_edits) = (1u64, 0u64, 0u64, 0u64, 0u64);
+    let mut dig_cells: Vec<[i64; 3]> = Vec::new();
+    let mut born: HashMap<u64, (u64, Vec<u64>)> = HashMap::new();
+    type Sample = (u64, [f64; 3], [f64; 3]);
+    let mut hist: HashMap<u64, Vec<Sample>> = HashMap::new();
+    let mut crossed: HashMap<u64, u64> = HashMap::new();
+    let mut report_lines = Vec::new();
+    for t in 0..ticks {
+        if t == 60 {
+            sim.submit(body_cut(req, vfix::g4_giant_cut())).unwrap();
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 6 == 0 {
+            if ordinary % 10 == 9 {
+                let (cell, radius) = vfix::g4_terrain_dig(digs).unwrap();
+                digs += 1;
+                dig_cells.push(cell);
+                sim.submit(EditIntent::cut(
+                    RequestId(req),
+                    actor(),
+                    spall_sim::EditTarget::Terrain,
+                    brush_cell(cell, radius),
+                ))
+                .unwrap();
+            } else {
+                let e = vfix::g4_ordinary_edit(comb_edits).unwrap();
+                comb_edits += 1;
+                sim.submit(body_cut(req, e)).unwrap();
+            }
+            ordinary += 1;
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 600 == 300 {
+            sim.submit(body_cut(req, vfix::g4_blast(blast).unwrap())).unwrap();
+            blast += 1;
+            req += 1;
+        }
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+        let commits: Vec<u64> = report.committed.iter().map(|c| c.0 .0).collect();
+        for b in sim.world().bodies() {
+            let Some(e) = b.entity else { continue };
+            let id = e.get();
+            born.entry(id).or_insert_with(|| (t, commits.clone()));
+            let h = hist.entry(id).or_default();
+            h.push((t, b.pose.translation_m, b.linvel_m_s));
+            if h.len() > 60 {
+                h.remove(0);
+            }
+            if b.pose.translation_m[1] < -0.3 && !crossed.contains_key(&id) {
+                crossed.insert(id, t);
+                let p = b.pose.translation_m;
+                let inside = p[0] > 1.0 && p[0] < 95.0 && p[2] > 1.0 && p[2] < 55.0;
+                let near_dig = dig_cells
+                    .iter()
+                    .map(|c| {
+                        let (cx, cz) = (c[0] as f64 * 0.25 + 0.125, c[2] as f64 * 0.25 + 0.125);
+                        ((p[0] - cx).powi(2) + (p[2] - cz).powi(2)).sqrt()
+                    })
+                    .fold(f64::MAX, f64::min);
+                let path: Vec<String> = h
+                    .iter()
+                    .step_by(6)
+                    .map(|(tt, pp, vv)| format!("t{tt}:({:.2},{:.2},{:.2})v({:.1},{:.1},{:.1})", pp[0], pp[1], pp[2], vv[0], vv[1], vv[2]))
+                    .collect();
+                let (bt, bc) = &born[&id];
+                report_lines.push(format!(
+                    "entity {id}: created t={bt} in commit request(s) {bc:?}; crossed y<-0.3 at t={t} at ({:.2},{:.2},{:.2}); inside slab footprint {inside}; nearest dig centre {near_dig:.2} m (digs so far {}); dormant {} sleeping {} coarsen_k {} collider_rev {} cells {}\n    path {}",
+                    p[0], p[1], p[2], dig_cells.len(), b.dormant, b.sleeping, b.coarsen_k, b.collider_revision,
+                    spall_sim::world::solid_cells(&b.volume), path.join(" ")
+                ));
+            }
+        }
+    }
+    let mut min_y = (f64::MAX, 0u64);
+    for b in sim.world().bodies() {
+        if let Some(e) = b.entity
+            && b.pose.translation_m[1] < min_y.0
+        {
+            min_y = (b.pose.translation_m[1], e.get());
+        }
+    }
+    println!("=== {} bodies crossed below the slab; final min y {:.1} (entity {}), bodies {}, digs {}", crossed.len(), min_y.0, min_y.1, sim.world().body_count(), dig_cells.len());
+    println!("--- final state of the bodies that crossed below the slab");
+    for id in crossed.keys().copied().collect::<Vec<_>>().into_iter().take(20) {
+        let b = sim.world().body(EntityId::new(id).unwrap()).unwrap();
+        let (lo, hi) = b.collider_region;
+        println!(
+            "entity {id}: final pose ({:.2},{:.2},{:.2}) v({:.2},{:.2},{:.2}) sleeping {} dormant {} collider_region cells [{},{},{}]..[{},{},{}] kind {:?}",
+            b.pose.translation_m[0], b.pose.translation_m[1], b.pose.translation_m[2],
+            b.linvel_m_s[0], b.linvel_m_s[1], b.linvel_m_s[2], b.sleeping, b.dormant,
+            lo.x, lo.y, lo.z, hi.x, hi.y, hi.z, b.kind
+        );
+    }
+    let deep: std::collections::HashSet<u64> = sim.world().bodies().filter(|b| b.pose.translation_m[1] < -20.0).filter_map(|b| b.entity.map(|e| e.get())).collect();
+    println!("--- bodies still below y = -20 at the end: {}", deep.len());
+    for l in report_lines.iter().filter(|l| l.strip_prefix("entity ").and_then(|r| r.split(':').next()).and_then(|s| s.parse::<u64>().ok()).is_some_and(|i| deep.contains(&i))).take(12) {
+        println!("{l}");
+    }
+}
+
+/// Full-workload wake audit (in-process, deterministic schedule mirroring the
+/// networked lane's declared mix): wake counts by reason, awake spell lengths and
+/// repeated wakes per cohort. `AUDIT=0` skips the reason probes and `SCAN=0` skips the
+/// per-tick census so their overhead can be timed separately (`ns per tick` printed).
+#[test]
+#[ignore = "diagnostic: full-workload wake audit"]
+fn full_workload_wake_audit() {
+    use std::collections::HashMap;
+    let ticks: u64 = std::env::var("TRACE_TICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(9500);
+    let audit = std::env::var("AUDIT").map(|v| v != "0").unwrap_or(true);
+    let scan = std::env::var("SCAN").map(|v| v != "0").unwrap_or(true);
+    let (mut sim, bodies) = scene();
+    if audit {
+        sim.world_mut().enable_wake_audit();
+    }
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let first_sleeper = vfix::G4_ENTITY_FIRST
+        + 1
+        + vfix::G4_COMB_COUNT as u64
+        + vfix::G4_TOWER_COUNT as u64
+        + G4_ACTIVE_BODY_COUNT as u64;
+    let combs = (vfix::G4_ENTITY_FIRST + 1)..(vfix::G4_ENTITY_FIRST + 1 + vfix::G4_COMB_COUNT as u64);
+    let towers_end = combs.end + vfix::G4_TOWER_COUNT as u64;
+    let cohort = |id: u64| -> &'static str {
+        if id == vfix::G4_ENTITY_FIRST {
+            "giant"
+        } else if combs.contains(&id) {
+            "comb"
+        } else if id < towers_end {
+            "tower"
+        } else if id < first_sleeper {
+            "active-debris"
+        } else if id < first_sleeper + 4096 {
+            "sleepers"
+        } else {
+            "rubble"
+        }
+    };
+    #[derive(Default, Clone)]
+    struct St {
+        asleep: bool,
+        seen: bool,
+        since: u64,
+        wakes: u32,
+        awake_ticks: u64,
+        spells: Vec<u64>,
+        dormant_cycles: u32,
+    }
+    let mut st: HashMap<u64, St> = HashMap::new();
+    let (mut req, mut ordinary, mut blast, mut digs, mut comb_edits) = (1u64, 0u64, 0u64, 0u64, 0u64);
+    let wall = std::time::Instant::now();
+    for t in 0..ticks {
+        if t == 60 {
+            sim.submit(body_cut(req, vfix::g4_giant_cut())).unwrap();
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 6 == 0 {
+            if ordinary % 10 == 9 {
+                let (cell, radius) = vfix::g4_terrain_dig(digs).unwrap();
+                digs += 1;
+                sim.submit(EditIntent::cut(
+                    RequestId(req),
+                    actor(),
+                    spall_sim::EditTarget::Terrain,
+                    brush_cell(cell, radius),
+                ))
+                .unwrap();
+            } else {
+                let e = vfix::g4_ordinary_edit(comb_edits).unwrap();
+                comb_edits += 1;
+                sim.submit(body_cut(req, e)).unwrap();
+            }
+            ordinary += 1;
+            req += 1;
+        }
+        if t >= 120 && (t - 120) % 600 == 300 {
+            sim.submit(body_cut(req, vfix::g4_blast(blast).unwrap())).unwrap();
+            blast += 1;
+            req += 1;
+        }
+        let probe = sim.world().wake_probe();
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        sim.world_mut().wake_probe_end("fixture.agitator (impulses)", probe);
+        let report = sim.tick().unwrap();
+        let plan = sim.apply_dormancy(&mut policy, &report);
+        if scan {
+            for e in plan.deactivate.iter().chain(plan.reactivate.iter()) {
+                st.entry(e.get()).or_default().dormant_cycles += 1;
+            }
+            for b in sim.world().bodies() {
+                let Some(e) = b.entity else { continue };
+                let s = st.entry(e.get()).or_default();
+                let asleep = b.sleeping || b.dormant;
+                if !s.seen {
+                    s.seen = true;
+                    s.asleep = asleep;
+                    s.since = t;
+                    continue;
+                }
+                if !asleep {
+                    s.awake_ticks += 1;
+                }
+                if s.asleep && !asleep {
+                    s.wakes += 1;
+                    s.since = t;
+                } else if !s.asleep && asleep {
+                    s.spells.push(t - s.since);
+                }
+                s.asleep = asleep;
+            }
+        }
+    }
+    let ns_per_tick = wall.elapsed().as_nanos() as f64 / ticks as f64;
+    println!("=== audit={audit} scan={scan} ticks={ticks}: {:.3} ms/tick wall, digs {digs}, bodies {}", ns_per_tick / 1e6, sim.world().body_count());
+    if let Some(a) = sim.world().wake_audit() {
+        for (reason, s) in &a.reasons {
+            println!(
+                "{reason:<52} ops {:>6}, waking ops {:>5}, sleeping bodies woken {:>7}, max by one {:>4}",
+                s.operations, s.waking_operations, s.bodies_woken, s.max_woken_by_one
+            );
+        }
+    }
+    if scan {
+        let mut by: HashMap<&str, Vec<&St>> = HashMap::new();
+        for (id, s) in &st {
+            by.entry(cohort(*id)).or_default().push(s);
+        }
+        let pct = |v: &mut Vec<u64>, p: f64| -> u64 {
+            if v.is_empty() {
+                return 0;
+            }
+            v.sort_unstable();
+            v[((v.len() as f64 * p).ceil() as usize).clamp(1, v.len()) - 1]
+        };
+        for name in ["giant", "comb", "tower", "active-debris", "sleepers", "rubble"] {
+            let Some(v) = by.get(name) else { continue };
+            let n = v.len();
+            let wakes: u64 = v.iter().map(|s| s.wakes as u64).sum();
+            let rewoken = v.iter().filter(|s| s.wakes >= 2).count();
+            let many = v.iter().filter(|s| s.wakes >= 10).count();
+            let never_slept = v.iter().filter(|s| !s.asleep).count();
+            let awake_ticks: u64 = v.iter().map(|s| s.awake_ticks).sum();
+            let cycles: u64 = v.iter().map(|s| s.dormant_cycles as u64).sum();
+            let mut spells: Vec<u64> = v.iter().flat_map(|s| s.spells.iter().copied()).collect();
+            let (p50, p95, mx) = (pct(&mut spells, 0.5), pct(&mut spells, 0.95), spells.last().copied().unwrap_or(0));
+            println!(
+                "{name:<14} bodies {n:>5} | wakes {wakes:>6} (>=2 wakes: {rewoken}, >=10: {many}) | awake body-ticks {awake_ticks:>9} ({:.1}% of body-ticks) | ended awake {never_slept} | completed spells p50 {p50} p95 {p95} max {mx} ticks | dormancy transitions {cycles}",
+                100.0 * awake_ticks as f64 / (n as f64 * ticks as f64).max(1.0)
+            );
+        }
+    }
+}
+
+/// Schedule shared by the long in-process diagnostics: giant at 1 s, an ordinary edit
+/// every 6 ticks from tick 120 (every 10th a terrain dig), a blast every 600 ticks.
+fn workload_step(
+    sim: &mut Simulation,
+    t: u64,
+    counters: &mut (u64, u64, u64, u64, u64),
+) {
+    let (req, ordinary, blast, digs, comb_edits) = counters;
+    if t == 60 {
+        sim.submit(body_cut(*req, vfix::g4_giant_cut())).unwrap();
+        *req += 1;
+    }
+    if t >= 120 && (t - 120).is_multiple_of(6) {
+        if *ordinary % 10 == 9 {
+            let (cell, radius) = vfix::g4_terrain_dig(*digs).unwrap();
+            *digs += 1;
+            sim.submit(EditIntent::cut(
+                RequestId(*req),
+                actor(),
+                spall_sim::EditTarget::Terrain,
+                brush_cell(cell, radius),
+            ))
+            .unwrap();
+        } else {
+            let e = vfix::g4_ordinary_edit(*comb_edits).unwrap();
+            *comb_edits += 1;
+            sim.submit(body_cut(*req, e)).unwrap();
+        }
+        *ordinary += 1;
+        *req += 1;
+    }
+    if t >= 120 && (t - 120) % 600 == 300 {
+        sim.submit(body_cut(*req, vfix::g4_blast(*blast).unwrap())).unwrap();
+        *blast += 1;
+        *req += 1;
+    }
+}
+
+/// Every 60 ticks, list bodies newly flagged by the containment census (deep
+/// penetration in terrain / wholly outside the world) — first sightings only.
+#[test]
+#[ignore = "diagnostic: containment census over the long workload"]
+fn containment_watch_over_the_workload() {
+    let ticks: u64 = std::env::var("TRACE_TICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(9500);
+    let stride: u64 = std::env::var("WATCH_STRIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+    let (mut sim, bodies) = scene();
+    let mut policy = spall_sim::DormancyPolicy::new(spall_sim::DormancyConfig::DEFAULT);
+    let mut counters = (1u64, 0u64, 0u64, 0u64, 0u64);
+    let mut seen = std::collections::HashSet::new();
+    let (mut deep_total, mut ext_total) = (0, 0);
+    for t in 0..ticks {
+        workload_step(&mut sim, t, &mut counters);
+        fixtures::agitate_g4_bodies(sim.world_mut(), &bodies.active, t);
+        let report = sim.tick().unwrap();
+        sim.apply_dormancy(&mut policy, &report);
+        if t % stride != stride - 1 {
+            continue;
+        }
+        let c = spall_sim::containment::containment_census(sim.world(), 4096, 0.25);
+        for (kind, rows) in [("deep_penetration", &c.deep_penetrations), ("external", &c.external)] {
+            for r in rows {
+                if seen.insert((kind, r.entity)) {
+                    if kind == "external" { ext_total += 1 } else { deep_total += 1 }
+                    if deep_total + ext_total <= 30 {
+                        println!(
+                            "t={t} {kind}: entity {} depth {:.2} m cells {}/{} v({:.1},{:.1},{:.1}) aabb ({:.1},{:.1},{:.1})..({:.1},{:.1},{:.1}) sleeping {} dormant {}",
+                            r.entity, r.penetration_depth_m, r.overlapped_cells, r.solid_cells,
+                            r.velocity_m_s[0], r.velocity_m_s[1], r.velocity_m_s[2],
+                            r.aabb_min_m[0], r.aabb_min_m[1], r.aabb_min_m[2],
+                            r.aabb_max_m[0], r.aabb_max_m[1], r.aabb_max_m[2], r.sleeping, r.dormant
+                        );
+                    }
+                }
+            }
+        }
+    }
+    println!("=== containment over {ticks} ticks: {deep_total} bodies ever deeply penetrating terrain, {ext_total} ever wholly outside the world, bodies {}", sim.world().body_count());
+}
+

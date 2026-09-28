@@ -39,6 +39,7 @@ pub mod backing;
 pub mod body;
 pub mod collider;
 pub mod commit;
+pub mod containment;
 pub mod contact_damage;
 pub mod dormancy;
 pub mod fixtures;
