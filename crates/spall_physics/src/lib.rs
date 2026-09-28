@@ -19,19 +19,32 @@
 //! No GPU, window, or network dependency. This crate does not run the server
 //! tick; body/collider ownership and the authoritative edit path are T08.
 
+pub mod character;
 pub mod collider;
+pub mod coordinates;
 pub mod fixtures;
 pub mod mass;
 pub mod merge;
 pub mod metrics;
 pub mod occupancy;
+pub mod query_cache;
+pub mod region_set;
 pub mod report;
 pub mod world;
 
-pub use collider::{ColliderBuild, Representation, build_collider};
-pub use mass::{MassProperties, analytic_mass_properties};
+pub use character::{CharacterMove, CharacterParams, CharacterState, PlayerInput, step_character};
+pub use collider::{
+    ColliderBuild, MERGED_CUBOID_PRIMITIVE_BUDGET, Representation, build_collider,
+    choose_representation,
+};
+pub use coordinates::PhysicsOrigin;
+pub use mass::{BodyMassProperties, MassProperties, analytic_mass_properties};
 pub use merge::{BoxSpan, greedy_boxes};
 pub use metrics::{DurationSamples, PercentileSummary};
 pub use occupancy::{ExtractError, OccupancyGrid};
+pub use query_cache::{CharacterQueryCache, REBUILD_MARGIN_M, WINDOW_RADIUS_M, WindowStats};
+pub use region_set::{PhysicsRegionSet, PhysicsRegionSetError, RegionalBodyState};
 pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_feasibility};
-pub use world::{BodyId, BodyKind, BodySpec, BodyState, PhysicsConfig, PhysicsWorld, StepTiming};
+pub use world::{
+    BodyId, BodyKind, BodySpec, BodyState, ContactImpulse, PhysicsConfig, PhysicsWorld, StepTiming,
+};

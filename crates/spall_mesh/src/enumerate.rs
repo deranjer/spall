@@ -6,7 +6,7 @@ use spall_core::MaterialId;
 use crate::ao::quad_levels;
 use crate::face::FACE_DIRS;
 use crate::mesh::FaceQuad;
-use crate::sample::{CellBox, Occupancy, VolumeSampler};
+use crate::sample::{Occupancy, ResidentCells, VolumeSampler};
 
 /// One exposed unit face.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,14 +43,20 @@ impl ExposedFace {
     }
 }
 
-/// Visits every exposed face of every solid cell in `cell_box`, in canonical
-/// `(z, y, x)` cell order then [`FACE_DIRS`] order.
+/// Visits every exposed face of every solid cell of every resident brick in
+/// `cells`, in canonical brick order then `(z, y, x)` cell order then
+/// [`FACE_DIRS`] order.
+///
+/// Only resident-brick cells are enumerated, so the cost scales with the
+/// resident data, not with the bounding hull. Seam faces are still fully
+/// resolved: each solid cell samples its six neighbours directly, reaching one
+/// cell past any brick boundary.
 pub fn for_each_exposed_face(
     sampler: &VolumeSampler<'_>,
-    cell_box: CellBox,
+    cells: &ResidentCells,
     mut visit: impl FnMut(ExposedFace),
 ) {
-    for cell in cell_box.cells() {
+    for cell in cells.cells() {
         let Occupancy::Solid(material) = sampler.at(cell) else {
             continue;
         };

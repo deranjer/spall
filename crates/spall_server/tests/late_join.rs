@@ -41,7 +41,7 @@ fn assemble(parts: &[spall_protocol::BaselinePart]) -> BaselineWorld {
     for p in parts {
         bytes.extend_from_slice(&p.payload);
     }
-    BaselineWorld::decode(&bytes).expect("assembled baseline decodes")
+    BaselineWorld::decode_compressed(&bytes).expect("assembled baseline decompresses/decodes")
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn a_reassembled_baseline_reproduces_the_server_hash_with_no_replay() {
     .expect("capture");
 
     // Every part validates and reassembly matches the captured world.
-    for part in &transfer.parts {
+    for part in transfer.parts.iter() {
         assert!(!part.payload.is_empty());
     }
     let world = assemble(&transfer.parts);

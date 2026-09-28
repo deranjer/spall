@@ -1,0 +1,15 @@
+{
+  "name": "oversized-split",
+  "scene": "checkerboard-split",
+  "description": "T17 / ENG-64. An anchored floor holds a 24x24x24 checkerboard STONE/DIRT block through one column. Client 0 cuts the column; the whole block detaches as one component whose ~13,824 single-cell canonical runs overflow the inline CellRun transaction budget, so the commit falls back to the compressed-baseline-blob op path (SplitOffBaseline + SourcePatchBaseline). Passes only if the cut commits (it was rejected before this ticket), the server and both live replicas agree on one canonical topology hash, each live client sees the block move, and the committed topology-event stream replayed from the tick-0 baseline reproduces the same hash.",
+  "server_ticks": 240,
+  "quiescence_ticks": 60,
+  "clients": 2,
+  "minimum_transactions": 1,
+  "minimum_motion_snapshots": 1,
+  "minimum_body_displacement_m": 0.3,
+  "replay_check": true,
+  "cuts": [
+    { "client": 0, "at_tick": 6, "cell": [15, 4, 15], "radius": 2 }
+  ]
+}

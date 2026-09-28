@@ -9,13 +9,147 @@ every channel exercised, bounded teardown) that writes `summary.json`,
 `net.jsonl`, and `metrics.json`.
 T05 implements `cargo xtask capture`: offscreen greedy-meshed renders of the
 acceptance shapes (cube, tunnel, checkerboard, negative coordinates, adjacent
-bricks, rotated hollow volume) to a shaded PNG plus normal and depth debug
-images, with a `summary.json`; it exits 3 when no GPU adapter is available.
-Scene/camera fixture files and the lighting-quality capture stay T12/T13.
+bricks, rotated hollow volume). T12 extends each capture to shaded, albedo,
+normal, linear-depth, shadow-cascade, and roughness PNGs using four sun-shadow
+cascades, a linear-HDR opaque pass, and fixed-exposure tone mapping. T13 adds
+`cargo xtask capture --scene colored-room`: open/closed colored-room captures
+with shaded and indirect-only PNGs, a fixed 128-cubed lighting cache, separate
+upload/trace/denoise timings, and deterministic closed/open and thin-wall
+probes.
+
+ENG-74 adds a separate editor package, outside the engine gate harness:
+`cargo check -p spall_editor`, `cargo test -p spall_editor --lib`, and
+`cargo clippy -p spall_editor --all-targets -- -D warnings` validate its CPU
+documents/commands and leaf dependency boundary. `cargo run -p spall_editor`
+opens the native Yakui shell for a manual project/scene/voxel editing pass,
+including the SPVOX color preview in the Assets workspace. Native
+window interaction and launching an offline sandbox client require an available
+desktop GPU and remain a hands-on check rather than a CPU-CI claim.
+
+Editor command coverage includes stable asset-reference round trips, single-cell
+undo/redo, and mixed-colour box-stroke undo: each prior voxel material/tint must
+be restored exactly rather than replacing the whole selection with one colour.
+SPVX 1.1 layer coverage also checks hidden and overlapping source layers,
+deterministic save/reload, flat v1.0 import, composition against `VOXL`, and
+undoable layer cell/visibility changes. Runtime import reads only `VOXL` after
+validating the optional `LAYR` feature marker and the whole-file hash.
+
+ENG-91 ships immutable engine voxel sources in
+`crates/spall_voxel/assets/builtin/voxel/` and exposes them through
+`spall_voxel::builtin_assets::builtin_voxel_assets()` as canonical SPVX bytes.
+Terrain-generation consumers and the editor use that same catalog. In the
+editor's **Voxel Asset Library** bottom panel, built-ins and project assets are
+searchable and shown in a small-preview grid. Built-ins support read-only preview
+and **Edit Project Copy**; copies enter the project through an undoable editor
+command and save to project asset storage. The starting screen can open this
+catalog directly without opening a scene. The center viewport fills the space
+between side panels, the asset authoring controls are on the right, and the
+bottom panel spans the full workspace width with a searchable grid of small
+asset previews. The asset viewport shows a pointer crosshair and offers Studio,
+Daylight, Overcast, Sunset, and Night lighting presets. Checkpoint the two built-in keys and
+the SPVX reader using `cargo test -p spall_voxel` and editor CPU tests. Inspect
+File/Edit/Help menus, direct startup access to built-ins, panel collapse and
+dragging the left/right/bottom panel splitters, text readability, and viewport
+zoom/pan clipping, cursor tracking, lighting presets, and bottom-grid resizing
+in `cargo run -p spall_editor`; this native interaction is
+not a CPU test claim.
+
+T14 adds incremental cache updates. `LightingUpdate` is a plain
+(non-simulation) description of what changed — world-space AABBs cleared to air
+plus solid regions refilled in order; `LightingVolume::apply_update` applies one
+and records a cell dirty only when its material actually changes, so a moving
+body vacates old cells and fills new ones with no separate clear step erasing
+overlapping geometry. `capture_lighting_sequence` renders a base
+`IndirectOnly` frame, then applies a list of `LightingStep`s (each an update
+and, optionally, a new camera pose), re-uploading only the dirty cells
+(`take_dirty`) and re-tracing only the dirty cell-AABB grown by a halo
+(`set_trace_region`); the denoise still runs full. A `temporal_weight < 1.0`
+enables a temporal accumulation pass: each frame's denoised estimate is blended
+into a persistent history that is clamped to the current neighbourhood
+min/max — so the 12-ray trace noise settles while an edit's re-traced region
+(forced to full weight) and the clamp keep stale shadows and light trails from
+surviving. `SequenceReport` records per step: `dirty_cells`, `retraced_cells`,
+`gpu_trace_millis` / `gpu_denoise_millis` / `gpu_temporal_millis`, and the
+measured `band_luminance`. The
+`rapid_destruction` fixture (colored emitter scene, one represented 0.5 m
+occluder column removed) is exercised by
+`rapid_destruction_reexposes_the_band_with_a_bounded_retrace` in
+`spall_render/tests/capture_gpu.rs`: on the reference adapter the shadowed band
+brightens ~22.8 -> ~26.3 sRGB luminance in the next frame while the re-trace
+touches ~1.3 % of the cache (~1.43 ms -> ~0.11 ms).
+
+`LightingUpdate::moving_box` builds the update for a box body moving between two
+world AABBs: both boxes are dirty, the caller's static regions are re-asserted,
+then the body is filled at its new box — so a moving body never erases geometry
+that overlaps its old bounds. The `moving_body_overlap` fixture puts a
+cache-only occluder in an emitter -> receiver path, then moves it out and back;
+`moving_body_leaves_no_ghost_and_keeps_swept_geometry` checks the shadowed band
+recovers when the body leaves (22.8 -> 28.5), the shadow re-forms when it
+returns (back to 22.8, bit-identical to the base frame), and each move
+re-traces only ~3 % of the cache.
+`temporal_accumulation_keeps_a_moving_occluder_ghost_free` reruns that fixture
+with `temporal_weight = 0.1` and confirms the shadow still clears, re-forms, and
+returns to the base frame with accumulation on. `panning_camera` pans a static
+lit room; `panning_camera_temporal_matches_no_accumulation` confirms a
+`temporal_weight = 0.1` run matches a `1.0` run frame for frame — the
+world-anchored cache means camera motion cannot smear the lighting.
+
+`cargo xtask capture --scene lighting-sequence` runs the `rapid_destruction`
+edit followed by settle frames with accumulation on and reports edit and
+convergence latency in frames and milliseconds (`nominal_frame_millis`, the
+provisional G2 client-frame target, converts the two). On the reference adapter
+the edit shows in the next frame and the band reaches within 5 % of its settled
+value in that same frame; `docs/reports/G2-lighting.md` collects the T14
+numbers.
+
+Known limit: a lighting change is only refreshed inside the dirty AABB plus the
+halo, so a far-reaching light change (a bright emitter moving many metres)
+leaves stale radiance beyond the halo until the next full re-trace. The gate
+fixtures keep light changes local; a periodic full re-trace or a halo sized to
+the trace reach covers the general case and is follow-up work.
+
+A wall-clock latency figure against a live 60 Hz tick loop is deferred with the
+game loop; cross-GPU quality and p95 frame cost remain T15.
+Each run also writes `summary.json`; it exits 3 when no GPU adapter is available.
+The `summary.json` is schema `version: 4`. CPU and GPU costs are reported
+separately and must not be conflated: `gpu_render_millis` is a real device
+measurement from render-pass timestamp queries and is `null` (with
+`gpu_timing_available: false`) on adapters that do not support them — it is
+never a CPU-derived figure. T12 also reports `gpu_shadow_millis`,
+`gpu_opaque_millis`, and `gpu_tone_map_millis`; T13 adds
+`gpu_indirect_trace_millis`, `gpu_indirect_denoise_millis`, and
+`cpu_lighting_upload_millis`. `cpu_capture_millis` (whole render → readback →
+PNG-encode loop), `cpu_readback_millis`, and `cpu_encode_millis` are CPU
+wall-clock and include the synchronous readback map wait and PNG compression.
+The pre-`version: 2` `gpu_millis` field measured that CPU loop, not the GPU, and
+must not be read as a GPU timing.
 T06 adds one offline measurement binary,
 `cargo run --release -p spall_physics --bin collision-bench`, which runs the
 voxel-collision feasibility scenarios and writes `collision-feasibility.json`;
 it is not wired into `cargo xtask bench`.
+ENG-31 adds a fixed-origin precision mode to that binary:
+`cargo run --release -p spall_physics --bin collision-bench -- --precision`
+runs merged-cuboid floor/contact, capsule walking, and two-body impact cases at
+11 offsets from 0 through 100 km from world origin; it also repeats character
+and body cases with an explicit local origin at each offset. A paired probe
+also steps two independent local `PhysicsWorld`s together for 60 ticks with
+players 100 km apart. It writes
+`collision-precision.json` when `--out DIR` is given. The report compares
+placement rounding, travel, contact, penetration, velocity transfer, and finite
+state. The local-origin case is a physics-adapter experiment, not an integrated
+multi-region host or world-scale acceptance test.
+ENG-31 also adds
+`cargo run --release -p spall_sim --bin region-origin-bench`, which compares
+one `Simulation` at zero origin against an otherwise identical terrain/body
+scene at a 100 km world offset with a matching local physics origin. This
+exercises terrain-grid cell-origin localization and body pose synchronization
+through `SimWorld`; it does not exercise simultaneous regions, routing, or
+cross-region body transfer.
+ENG-31's render-LOD seam spike is the CPU-only command
+`cargo run --release -p spall_mesh --bin lod_seam_bench`. It exercises one
+synthetic 2:1 heightfield boundary and emits transition quads for mismatched
+edge heights. It is a narrow geometry probe, not an integrated LOD renderer,
+general 3D seam solution, or authoritative-world acceptance test.
 T08 adds one offline authoritative-edit binary,
 `cargo run -p spall_sim --features scenario --bin sim-scenario`, which drives the
 in-process `Simulation` through the terrain-split, rotated-moving-body cut,
@@ -36,9 +170,32 @@ schema and single WAL writer) and `spall_server::persist` (the `SimWorld` ⇄
 save-record conversion and recovery). `sandbox-server --serve --save` recovers
 from `<world>/world.db` on start, journals every committed transaction, and
 checkpoints on `--checkpoint-interval-ticks` and clean shutdown. `cargo xtask
-crash-test --suite persistence` runs the crash-point / disk-fault matrix
-end-to-end through a real `Simulation` (bridge scene → column cut → beam
-detaches) and writes `summary.json` with the measured bytes/write rate.
+crash-test --suite persistence` runs the in-process crash-point / disk-fault
+matrix through a real `Simulation` (bridge scene → column cut → two floor
+excavations = three committed transactions) and writes `summary.json` with the
+measured bytes/write rate. Its 12 scenarios (T23 increment 3) cover **every**
+`CrashPoint` — before/after the journal commit, mid-checkpoint-rows,
+before/after the checkpoint commit (the after-commit case proves recovery
+resumes from a durable-but-unacked checkpoint) — plus a genuine SQLite engine
+write failure, an injected `SQLITE_FULL` (disk-full) on the checkpoint commit, a
+CRC-broken journal record, and a deleted interior journal record. The two
+corruption cases assert recovery reports it and truncates the durable prefix,
+that `RecoveryChoice::RequireClean` then fails closed, and that
+`AcceptDurablePrefix` resumes from the clean prefix. Recovery after an
+**abrupt, unclean process kill** at the journal / checkpoint publication
+boundaries is a separate child-process harness: `cargo test -p spall_store
+--test abrupt_crash` (it kills real child processes and reopens from a fresh
+process). `summary.json`'s `unrun_here` field names what the in-process suite
+deliberately does not cover.
+Durable writes go through `spall_server::persist_pipeline::PersistPipeline`: a
+single off-thread `Writer` fed a **bounded** queue of immutable
+snapshots/records, so a disk stall never stalls physics; a full backlog or a
+failed write stops the run rather than continuing an unsavable world. The
+integrator journals periodic 20 Hz body pose batches on a sequence contiguous
+with the topology transactions, so a crash rewinds motion only to the latest
+durable pose batch. `cargo test -p spall_server --test persist_pipeline`
+reports retained-snapshot memory (max queue depth) and flush / checkpoint
+latency.
 T17 adds live late join: `sandbox-client --connect --late-join` pulls a
 dependency-complete `BaselineWorld` over a bulk transfer instead of installing
 the fixed scene, drains the server's bounded catch-up queue, and reaches the
@@ -49,6 +206,85 @@ after the tick loop is running and are excluded from `--min-clients`. Built-in
 replica. Mid-session brick `RepairRequest`s are answered with a one-brick
 authoritative baseline patch (exact revision parity), and a reconnected session
 generation invalidates the prior one server-side.
+T19 adds headless player movement: `sandbox-server --serve --scene walk` runs the
+flat `walk_arena` and gives each connecting client an authoritative capsule;
+`sandbox-client --move FROM:TO:MX,MY,MZ:BUTTONS` (repeatable) scripts a movement
+path, predicts the capsule locally with the shared `step_character` kernel, sends
+`InputFrame` datagrams, and reconciles against the server's player snapshots.
+Horizontal input applies while grounded; a jump keeps its takeoff momentum and
+does not accept mid-air steering or braking. The tightened jump acceptance is a
+`0.9..=1.1 m` apex and `0.6..<0.8 s` airtime at 60 Hz. The server gives the
+kinematic capsule an `80 kg` effective contact mass and transfers its contact
+impulse into dynamic bodies; `character_push_uses_fine_voxel_mass` proves an
+identical sweep accelerates a small exact-voxel-mass body more than a heavy one.
+A
+scenario file may set `scene` and list `player_paths` (per-client legs) plus a
+`movement` acceptance block (`max_correction_m`, `min_distance_m`,
+`min_ground_contact_ratio`, `expect_no_hover`). Built-in `player-movement` runs
+one `walk` server + two scripted movers plus one floor cut; each mover's
+`ClientSummary.movement` must show bounded corrections, sustained ground contact,
+the scripted travel distance, no hover after the cut, and a clean held-input
+release. It passes headless and with `--loss-percent 2`. The deep
+prediction/reconciliation acceptance is CPU tests: `cargo test -p spall_physics
+character::`, `-p spall_sim --test player_movement`, and `-p spall_client --test
+prediction` (predictor vs. a live `spall_sim::Simulation` through an injected
+100 ms link — convergence, floor-removal-no-hover, lost-button-release).
+ENG-69 adds the separate live-input path: `sandbox-client --connect
+--interactive` runs the same network prediction/reconciliation session in a
+winit window, reading WASD, Space, and mouse look from the local window. Its
+minimal debug view draws nearby replicated terrain and detached bodies; its
+prediction collision world mirrors both, with detached-body poses remaining
+server-driven. F3 shows the local capsule bounds as 1.25 cm wire-like strokes
+rather than voxel-sized markers. It is not the G2 renderer.
+The window releases the cursor with Escape or focus loss, and focus loss clears
+all held actions so a missing OS key-up cannot continue a walk or jump. The
+historical PR #109 record reports a hands-on run of `cargo xtask play --release
+--scene g1 --ticks 18000` in which the investigated frame-pacing jitter was no
+longer observed. That result is historical evidence, not a measurement made by
+the current validation pass; live input has no automated keyboard/mouse
+acceptance scenario. `cargo xtask play --release --scene playground` adds two
+spawn-side UAT stations: a unique varied block is released every five seconds,
+and a unique 0.5 m block is released every second over a staggered Plinko board
+with high restitution. Pending replicated bodies are staged below the playable
+scene, then moved to their emitter on activation. `spall_sim::playground` tests
+pin both cadences and prove each staged body's mass equals the sum of its
+quarter-metre voxels at the current material density. Full moving-body crush
+outcomes remain follow-up.
+
+For isolated physics UAT, `cargo xtask play --scene playground --late-join
+--client-authoritative` makes the interactive client authoritative for player
+and detached-body runtime motion. It locally releases both emitter populations,
+steps gravity/contact/bounce, transfers player push impulses using voxel-count
+mass, and renders local body poses while ignoring server pose corrections.
+Topology and voxel shapes still arrive from the server baseline/transactions;
+the flag is a single-client testing mode, not an alternate multiplayer
+authority model. Automated coverage in `spall_client::predict::body_collision_tests`
+checks local falling without server pose correction, mass refresh after a
+server topology revision, both local emitter releases, and a player sweep
+moving a light body. `spall_client::window::input_tests` verifies that a local
+body pose reaches the render instances. Hands-on window feel/bounce remains a
+desktop UAT check.
+T20 (increment 1) adds opt-in per-client interest + motion bandwidth
+scheduling to the host: `sandbox-server --serve --motion-interest`
+(with `--motion-near-m` / `--motion-far-m` / `--motion-far-interval` /
+`--motion-client-budget-bytes` / `--motion-static-anchor`) filters each live
+client's 20 Hz `MotionSnapshot` batch to its interest set, tiers `Far` bodies
+onto a reduced cadence, and caps per-client per-batch motion bytes. Without the
+flag the host is byte-for-byte unchanged (`g1-networked-destruction`,
+`body-rest-on-structure`, `player-movement` reproduce their recorded hashes).
+`ServeSummary` is now `version: 2` with `motion_snapshots_sent` /
+`_interest_culled` / `_budget_deferred`, `max_client_motion_batch_bytes`, and
+`app_egress_bytes` + `transport_egress_bytes` (Quinn `udp_tx.bytes`) summed
+over every connection. CPU acceptance: `cargo test -p spall_server
+replication::` (interest tiers, hysteresis, `far_interval` cadence, the byte
+ceiling shedding lowest-priority motion first) and `cargo test -p spall_server
+--test interest_bandwidth` (a scene-covering interest set changes nothing and
+reports real egress; a far static anchor culls the detached body's motion
+entirely while every committed transaction still reaches the client and the
+hashes agree). The full G4 eight-client separated-interest bandwidth scenario
+(<= 256 KiB/s/client steady egress, topology backlog drains after a blast,
+join not starved) and its xtask acceptance assertions remain follow-up — they
+need a world larger than the current 64 x 32 x 64 m / walk-arena fixtures.
 `bench` still returns an explicit unavailable-capability result until its listed
 task is delivered. All numerical limits are provisional acceptance targets. None
 is a measured result.
@@ -91,20 +327,86 @@ cargo xtask scenario --name destruction-network --loss-percent 5 --output .local
 # pulls a baseline over a bulk transfer, and catches up to the server hash.
 cargo xtask scenario --name late-join-collapse --output .local/runs/late-join
 
-# T05: offscreen renders of the acceptance shapes (shaded + normal + depth PNGs
-# and a summary.json). Needs a supported GPU/driver; exit 3 otherwise.
-cargo xtask capture --output .local/runs/t05-capture --width 1280 --height 720 --strategy greedy
-# T12/T13 extend capture with named lighting scenes and camera fixture files:
-cargo xtask capture --scene colored-room --camera fixtures/cameras/colored-room.toml --size 1920x1080 --frames 120 --output .local/runs/lighting
+# T11 CPU-side G1 gate fixture on the cross-brick bridge scene. The full
+# graphical capture portion remains unavailable until T05/T12. Two real OS
+# clients over QUIC: client 0 cuts the seam-straddling column to detach the
+# beam then cuts the falling beam again (a body-targeted cut), both clients
+# excavate opposite floor ends concurrently. Passes only if all ten scripted
+# cuts commit, the server and both clients agree on one hash, the detached body
+# spans >= 2 bricks (cross-brick ownership transfer), each live client sees the
+# beam move >= 0.3 m, the body cut lands, and the committed topology-event
+# stream replayed from the tick-0 baseline reproduces the hash. Add
+# --loss-percent 2 for the impaired-transport run, which additionally requires
+# the clients to have observed motion datagrams delivered out of order. See
+# docs/reports/G1.md.
+cargo xtask scenario --name g1-networked-destruction --loss-percent 0 --output .local/runs/g1
+
+# T17 / ENG-64: a cut that detaches a 24^3 checkerboard block — a component too
+# fragmented to encode as inline CellRuns. The commit falls back to compressed
+# SplitOffBaseline / SourcePatchBaseline op blobs; server + both live replicas
+# converge on one hash and the tick-0 baseline replay reproduces it. Before this
+# ticket the same cut was rejected (ReplicationError::SplitTooLarge).
+cargo xtask scenario --name oversized-split --loss-percent 0 --output .local/runs/oversized-split
+
+# T17 increment 2 / ENG-64: a cut that detaches a 54x46x54 hash-patterned block
+# whose compressed geometry exceeds even the inline op-blob cap. The commit ships
+# marker SplitOffBulkBaseline / SourcePatchBulkBaseline ops plus one out-of-band
+# BaselineWorld on a bulk stream; each replica holds the marker transaction until
+# the blob assembles. Server + both replicas converge; the tick-0 baseline replay
+# (from the journalled TopologyBulkSplit payload) reproduces the hash.
+cargo xtask scenario --name giant-split --loss-percent 0 --output .local/runs/giant-split
+
+# T19: one `walk` server + two scripted player capsules that predict movement,
+# send InputFrame datagrams, and reconcile against the server's player snapshots.
+# Passes on bounded corrections, ground contact, travel distance, and no hover.
+cargo xtask scenario --name player-movement --loss-percent 0 --output .local/runs/player-movement
+
+# ENG-69 manual interactive launcher. Requires a desktop, so it is not an
+# automated acceptance check. PR #109 records one historical hands-on run;
+# see docs/reports/ENG-69-acceptance.md.
+cargo xtask play --release --scene g1 --ticks 18000
+
+# Testing-only playground client authority: local player + rigid-body physics,
+# including emitter timing, bounce, voxel-count mass, and player pushing.
+cargo xtask play --scene playground --late-join --client-authoritative
+
+# T12: stable acceptance cameras with six views and per-pass GPU timing.
+# Needs a supported GPU/driver; exit 3 otherwise.
+cargo xtask capture --output .local/runs/t12-1080p --width 1920 --height 1080 --strategy greedy
+
+# T13: static one-bounce colored-room feasibility capture. See
+# docs/lighting-decision.md.
+cargo xtask capture --scene colored-room --width 1920 --height 1080 --output .local/runs/t13-lighting
+
+# T14: incremental edit + settle frames with temporal accumulation on; reports
+# per-frame band luminance, per-step re-trace counts, and edit/convergence
+# latency (frames and ms). See docs/reports/G2-lighting.md.
+cargo xtask capture --scene lighting-sequence --width 1920 --height 1080 --output .local/runs/t14-sequence
+
+# T11a: offscreen frames of the authoritative g1-networked-destruction cut
+# sequence (terrain + detached bodies meshed from the live world, at ticks
+# 3/20/45/90/190) with measured GPU render-pass timings. Exit 3 without a GPU.
+# See docs/reports/G1.md.
+cargo xtask capture --scene destruction --width 1920 --height 1080 --output .local/runs/g1-destruction
 
 # Release build, named fixture, fixed workload; emits machine-readable metrics.
 cargo xtask bench --suite engine-slice --clients 8 --warmup-seconds 30 --duration-seconds 120 --output .local/runs/bench
 
 # Defined fault points around journal/checkpoint publication.
 cargo xtask crash-test --suite persistence --output .local/runs/crash
+
+# T18 CPU acceptance: shared cache policy plus the bounded 256 x 128 x 256 m
+# streamed fixture (structural reload, save-air, body crossing, collision gate,
+# traversal plateau). The full G3 multi-process gate remains T23.
+cargo test -p spall_voxel -p spall_client -p spall_server --all-features
 ```
 
-Interactive controls: mouse look, WASD, jump, primary tool, alternate placement, debug free-camera toggle, Escape to exit. Controls are configuration data. Scenarios can run every action without synthesizing keyboard/mouse events.
+The shipped ENG-69 interactive controls are mouse look, WASD, and Space to
+jump. F1 toggles terrain, F2 toggles detached bodies, and F3 toggles the thin
+local collision outline. Escape releases the cursor; closing the window exits
+the interactive session. The live-input path is deliberately separate from scenario actions,
+which remain local scripted inputs rather than synthesized keyboard/mouse
+events.
 
 No runtime command shell or arbitrary code execution over the game socket. Agent control uses local scenario files or a loopback authenticated development command channel with a fixed command schema: load scene, move player, use tool, step ticks, capture, inspect hashes, save, quit. Disable the development channel in Internet server builds/configurations.
 
@@ -136,14 +438,32 @@ At a gate, retain raw metrics alongside a concise report in `docs/reports/Gx.md`
 | destruction-network | Two clients agree with server geometry after cuts, duplicates, loss, reorder, and repair |
 | late-join-collapse | A third client obtains a consistent current world while objects split and move |
 | interest-crossing | A multi-region body remains one entity; entering clients receive required dependencies |
+| t23-g3 | Two regions of one bounded world collapse independently with separated players; a late joiner converges after heavy edits; the committed stream replays to the agreed hash and every beam rests |
+| t23-g3-impaired-join | A late joiner that cannot reach the (already shut-down) server ends in a bounded explicit `join-failed` — not a hang — while the live clients and server converge and replay |
 | save-air | Completely mined bricks remain empty after checkpoint, eviction, restart, and regeneration |
 | crash-transfer | Crash before/after source-removal/child-create commit cannot recover partial ownership |
 | malformed-input | Invalid lengths, huge coordinates, compressed bombs, invalid IDs/NaNs, excessive rates reject within bounds |
 | cantilever-strength | Material capacity changes failure outcome; damage/bonds survive restart and replication |
-| sleep-wake | Settled persistent rubble wakes before nearby interaction and remains destructible |
+| contact-damage | A falling body craters the terrain it strikes; a heavier body dropped on a lighter one fractures the body being struck, not the dropper; a body at rest never re-fractures the surface under it; a settling debris stack produces only a bounded cut stream and stops once asleep; per-tick damage-intent count and pipeline depth stay bounded; conversion is deterministic and conserves matter |
+| sleep-wake | Settled persistent rubble wakes before nearby interaction — an edit targeting it, an approaching player, or a terrain cut under it — and remains destructible; a distant edit leaves it dormant |
 | scene-switch | Old asynchronous results never enter a new world/session at reused coordinates |
+| player-movement | A scripted capsule walks and stays grounded; a 100 ms link keeps corrections bounded; removing a floor cannot leave the player hovering; a lost button release stops it within 250 ms |
 
 Use property tests for coordinates, storage/edit conservation, and codec bounds. Use tiny reference algorithms for topology/mesh coverage. Physics tests use position/energy tolerances where appropriate; exact hashes test topology, not floating-point trajectories. A rendered screenshot is not proof of collision or replication correctness.
+
+### ENG-103 grid-fluid basin candidate gate
+
+For the isolated MAC feasibility prototype, report the raw maximum cell speed
+for diagnosis, but evaluate basin stability using volume-weighted speed
+statistics over water cells with fraction `C >= 1e-3`. In the final third of the
+declared 3-second basin run, require weighted p95 <= 0.5 m/s and <=1% of
+eligible water volume above 0.5 m/s, alongside the existing <=1 J kinetic-energy
+rise, <0.15 m surface-p95 drift, and zero intact-solid crossings. Always include
+the same speed metrics at `C >= 0`, `1e-6`, `1e-4`, `1e-3`, and `1e-2` so this
+occupancy choice can be sensitivity-checked. `C=1e-3` is 0.1% of one 0.25 m
+cell (15.625 mL); this gate changes only how basin residual motion is assessed,
+not solver fractions or mass accounting. It is a feasibility-candidate
+criterion and does not establish production readiness.
 
 ## Gate workload and targets
 
@@ -159,7 +479,76 @@ Clean checkout builds with the pinned toolchain. CPU checks need no display adap
 
 Required: exact ownership/conservation, zero unrepaired topology mismatch at quiescence, all accepted work eventually completes within the stated budget, and no permanent hidden support. Normal single-brick edit server commit target: p95 <=100 ms without network delay. Ordinary structure split target: <=500 ms; designated large-collapse stress target <=2 s before consistent activation. These are gates to measure, not guarantees from the chosen algorithms.
 
+The tracked `g1-networked-destruction` fixture is the CPU-side T11 evidence
+surface. It runs on the cross-brick `cross_brick_bridge_scene` (a seam-
+straddling column holds a beam, both spanning the `x = 32` brick boundary) and
+requires: every scripted cut to commit (so an early quiescence fails the run);
+final server/client hash agreement; the detached body's cells to have been
+owned across a brick boundary (`>= 2` distinct bricks — cross-brick structural
+support propagation and brick-boundary ownership transfer); at least
+`minimum_body_displacement_m` of real detached-body motion on every live
+client; the body-targeted cut landing against the detached body; and the
+committed topology-event stream, replayed deterministically from the tick-0
+baseline via the durable journal, reproducing the live canonical hash. The
+### ENG-103 grid-fluid basin candidate gate
+
+For the isolated MAC feasibility prototype, report the raw maximum cell speed
+for diagnosis, but evaluate basin stability using volume-weighted speed
+statistics over water cells with fraction `C >= 1e-3`. In the final third of the
+declared 3-second basin run, require weighted p95 <= 0.5 m/s and <=1% of
+eligible water volume above 0.5 m/s, alongside the existing <=1 J kinetic-energy
+rise, <0.15 m surface-p95 drift, and zero intact-solid crossings. Always include
+the same speed metrics at `C >= 0`, `1e-6`, `1e-4`, `1e-3`, and `1e-2` so this
+occupancy choice can be sensitivity-checked. `C=1e-3` is 0.1% of one 0.25 m
+cell (15.625 mL); this gate changes only how basin residual motion is assessed,
+not solver fractions or mass accounting. It is a feasibility-candidate
+criterion and does not establish production readiness.
+
+`--loss-percent 2` variant additionally asserts the clients observed motion
+datagrams delivered out of `snapshot_seq` order.
+
+The sibling `body-rest-on-structure` fixture covers a **detached body coming to
+rest on remaining structure**: it severs the seam column so the cross-brick beam
+detaches, excavates only the floor ends *outside* the beam's span, then runs the
+server with `--await-body-settle` so physics keeps stepping past edit-quiescence
+until the beam sleeps. It passes only if — on top of the hash-agreement and
+replay checks above — the server reports the detached beam at rest: every
+detached body asleep, final linear speed `<= body_settle_speed_epsilon_m_s`, its
+origin held still (`< 1 mm/tick`) for `>= body_settle_min_stable_ticks` ticks,
+and end-of-run contact penetration `<= body_settle_max_penetration_m` (it settled
+*on* the floor, not through it). CPU-side proof:
+`spall_sim` `body_rest_on_structure` integration test.
+
+Neither fixture yet covers the full 60-second / 10-requests-per-second
+sustained two-client workload or the 64-brick collapse stress case; those
+remain explicit follow-up evidence pending a sustained-request-rate driver
+(the oversized-split path itself is available — T17 / ENG-64). The full
+`64 x 32 x 64 m` envelope itself is built (ENG-62 / T11a increment 3):
+`spall_sim::fixtures::g1_full_envelope_setup` (`--scene g1-full-envelope`) is
+real, resident, walkable terrain across the whole footprint — not just
+isolated structures — plus a hollow tower/bridge spanning brick boundaries, an
+excavatable ramp, and a moving hollow test-volume body, standing up and
+stepping well inside the 60 Hz tick budget. `cargo xtask scenario --name
+g1-full-envelope` runs it networked (two real `--late-join` clients); `cargo
+xtask capture --scene destruction` (below) renders the authoritative cut
+sequence offscreen through the T12 pipeline with real GPU pass timings, and
+`--scene destruction-networked` renders the same sequence from a real
+network-replicated client instead of the authoritative sim. Measured results:
+`docs/reports/G1.md`.
+
 For overload tests, requests beyond admission capacity may return busy. The report must distinguish requested, rejected, queued, and committed counts. Rejecting every expensive action does not satisfy the gate: all named mandatory edits must complete.
+
+**Commit latency + admission counts (ENG-62 / T11a increment 1).** `serve`
+(`ServeSummary` v3) measures server commit latency — admission of an
+`ActionRequest` to commit of its transaction — and reports a nearest-rank p95
+per commit shape (single-brick commit, ordinary structure split, large
+collapse) plus the requested / rejected / queued / committed breakdown. A
+scenario file's optional `latency_targets` block makes `cargo xtask scenario`
+assert each exercised bucket's p95 against the G1 targets (`<= 100 ms` /
+`<= 500 ms` / `<= 2000 ms`); the session summary's `admission` object carries
+the counts, the measured p95s, and `latency_targets_met`. The large-collapse
+bucket stays unexercised until the oversized-split (T17 baseline-blob) path
+lets a big detach commit — see `docs/reports/G1.md`.
 
 ### G2 — graphics quality and cost
 
@@ -169,6 +558,107 @@ Required visual behavior: correct silhouettes/materials, soft/contact shadows, v
 
 Provisional target: client p95 frame <=16.7 ms at 1080p after warmup, with GPU p95 <=12 ms and CPU frame work p95 <=4 ms. CPU/GPU overlap; these are not additive proof of the total. Test lighting-only and combined collapse scenes. If indirect lighting cannot fit, record a revised quality/performance decision instead of quietly removing it.
 
+T15 (ENG-22) is delivered in increments; `docs/reports/G2.md` collects the
+evidence and the open items. Increment 1 adds the GPU frame-cost harness:
+
+```sh
+# T15 / G2 GPU frame-cost percentiles. Renders each still lighting fixture
+# (colored rooms, lit/occluded emitter) for 15 warm-up + 120 measured frames
+# at a fixed 1920x1080, exposure 1.0, Shaded view only, and reports nearest-rank
+# per-pass device-time percentiles plus the provisional GPU p95 <= 12 ms verdict.
+# See docs/reports/G2.md. Cold full-cache re-trace cost, not the amortised
+# client frame; exterior terrain, moving sequences, and the CPU/client frame
+# budget are increment 2.
+cargo xtask capture --scene g2-frames --output .local/runs/g2-frames
+```
+
+Measured (RTX 4080 SUPER / D3D12): frame-total GPU p50 ~12-13 ms, p95 ~32-38 ms
+across the four scenes -- but this is the cold full-cache re-trace with a
+per-frame pipeline rebuild, not a client frame (see increment 2).
+
+Increment 2 adds a persistent-resource settled-frame loop:
+
+```sh
+# T15 / G2 settled-frame cost. Builds every GPU resource once, then renders each
+# still fixture from a fixed camera for 15 warm-up + 120 measured frames at a
+# fixed 1920x1080 in two re-trace modes (settled = nothing re-traced;
+# edit = a 24^3 re-trace box/frame), reporting per-pass GPU device-time and
+# per-frame CPU encode percentiles + the provisional GPU/CPU/client p95 verdicts.
+cargo xtask capture --scene g2-loop --output .local/runs/g2-loop
+```
+
+Measured (RTX 4080 SUPER / D3D12): with resources built once and the T14
+bounded re-trace path, the settled frame is a ~0.3-0.9 ms GPU pass and ~0.6-0.8
+ms CPU encode; pipelined client-frame p95 estimate <= 2.9 ms across all four
+scenes in both modes -- the provisional GPU p95 <= 12 ms, CPU p95 <= 4 ms, and
+client p95 <= 16.7 ms targets are all met with margin. Increment 1's ~3x miss
+was a harness artefact (per-frame pipeline rebuild + full-cache re-trace).
+CPU-only coverage: `spall_render` `capture::tests::frame_stats_*` +
+`*_retrace_box_*`; `sandbox-capture`
+`tests::g2_frame_scenes_are_distinct_lit_and_framed`. The GPU run is manual.
+
+Increment 3 adds moving-frame sequences + quality flags:
+
+```sh
+# T15 / G2 moving-frame quality. Three 120-frame sequences on the emitter/
+# occluder fixture -- static-noise (Shaded, nothing moving), moving-occluder and
+# occluder-jump (IndirectOnly, the occluder leaves the light path and returns
+# smoothly / in two jumps). Samples luminance in probe bands every frame and
+# flags flicker / ghost residual / weak recovery "for review".
+cargo xtask capture --scene g2-motion --output .local/runs/g2-motion
+```
+
+Measured (RTX 4080 SUPER / D3D12): the settled indirect frame is bit-stable
+(band flicker 0.00000 for 120 frames); a moving occluder's shadow recovers ~26%
+when it leaves and returns to within 0.8% of its original level (no ghost / no
+trail); the smooth and discrete moves behave the same; the static region stays
+quiet (far-band flicker < 0.0001). No quality flags. CPU-only coverage:
+`spall_render` `capture::tests::{a_steady_trace_has_zero_flicker,
+flicker_index_is_mean_abs_step_over_mean_level,
+settle_index_finds_the_first_lasting_return_to_target}`. The GPU run is manual.
+
+Increment 4 adds the open daylight-terrain scene (the sixth G2 scene category):
+
+```sh
+# T15 / G2 daylight terrain. An open sun-lit exterior (stepped terraces + tall
+# pillars casting long shadows) run through the persistent settled-frame loop
+# (settled + edit modes) plus a 120-frame static-noise stability pass.
+cargo xtask capture --scene g2-terrain --output .local/runs/g2-terrain
+```
+
+Measured (RTX 4080 SUPER / D3D12): settled frame GPU p95 0.24 ms / CPU p95 0.68
+ms / pipelined client p95 0.68 ms -- the cheapest G2 scene (a single sky/ground
+bounce vs the enclosed rooms' multi-bounce), all provisional targets met with
+the widest margin; 120-frame static-noise flicker 0.000000 (bit-stable); cast
+sun shadows + direct-light falloff read correctly. No quality flags. This
+completes the G2 scene matrix except a GI-lit rapid-destruction sequence
+(increment 5). CPU-only coverage: `spall_render`
+`fixtures::tests::daylight_terrain_is_open_lit_and_shadow_casting`. GPU run
+manual.
+
+Increment 5 adds the GI-lit rapid-destruction scene (the sixth G2 category):
+
+```sh
+# T15 / G2 GI-lit destruction. Drives the authoritative spall_sim world on
+# cross_brick_bridge_scene through the g1-networked-destruction cut script; at
+# 13 ticks across the 200-tick collapse it meshes the live world AND rebuilds a
+# T13/T14 lighting clipmap from it (terrain occupancy + detached body AABBs), so
+# each frame is lit with indirect GI. Reports per-tick cold GPU cost + a
+# settled-frame stability pass + conservation.
+cargo xtask capture --scene g2-collapse --output .local/runs/g2-collapse
+```
+
+Measured (RTX 4080 SUPER / D3D12): 10/10 cut transactions commit; terrain solid
+cells 304 -> 243 monotone non-increasing (no mined-terrain regrowth); the GI-lit
+destruction renders correctly across the collapse; the settled frame is
+bit-stable (60-frame band flicker 0.000000). Per-tick GPU cost is the
+increment-1 cold full-retrace number (~12 ms p50), not a client frame -- the
+bounded per-tick destruction cost (sim -> incremental `LightingUpdate`) is
+increment 6. No quality flags. This completes the G2 scene matrix. CPU-only
+coverage: `sandbox-capture`
+`tests::sim_light_volume_tracks_terrain_occupancy_and_cuts`. GPU run manual. A
+pipelined loop, cross-GPU review, and the freeze decision remain increment 6+.
+
 ### G3 — persistence, late join, and streaming
 
 Use a 256 x 128 x 256 m bounded world with resident cache limits low enough to force eviction. Drive a collapse while a third client joins, then reconnect that client. Traverse away/back, save, and restart. Test crashes at every persistence transaction boundary plus truncated/corrupt data and disk-full injection.
@@ -177,7 +667,132 @@ Required: post-recovery topology equals the declared durable prefix, IDs remain 
 
 Join target: dependency-complete near-player baseline <=16 MiB compressed, ready within 30 seconds on an imposed 1 MiB/s transfer budget with 100 ms RTT and 2% packet loss. The general transfer bound is larger, but exceeding this workload target fails the normal-join gate. Retry/catch-up stress must terminate with either successful join or a bounded explicit failure while connected clients continue.
 
+T18's CPU acceptance uses the bounded world dimensions above with deliberately
+small cache ceilings. `spall_server/tests/residency.rs` verifies that a remote
+anchor dependency is reloaded before its beam is classified and then releases
+after the anchor cut; a modified-air brick is persisted before eviction and
+reloads without regrowth; one rotated/moving body remains one identity across
+partition references; a fast swept entry is blocked until all collision bricks
+are ready; and a 20-brick traversal never exceeds its three-brick fixture
+budget. `spall_client/tests/residency.rs` applies the same policy to replica
+terrain while retaining complete body geometry. These are correctness and
+bounded-accounting results, not the G3 memory, network, or join-duration gate;
+those measurements remain for T23.
+
+T23 lands in increments against `docs/reports/G3.md`. Increment 1 adds the
+`separated-regions` scene (`sandbox-server --serve --scene separated-regions` |
+`t23-g3`): one bounded 256 x 128 x 256 m world holding two independent
+collapsible structures 18 m apart, each connecting client given a capsule that
+spawns in alternating regions. Built-in `t23-g3` runs one server + three live
+clients + one `--late-join` replica; clients sever both regions' columns (a
+multi-region collapse), excavate each floor's ends, and the late client joins
+after those six edits. It passes headless and with `--loss-percent 3`: every
+scripted cut commits, all four clients and the server agree on one canonical
+hash, the committed stream replays from baseline to that hash, and both
+detached beams are reported at rest. A `restart_check` flag then stops the
+server, cold-restarts a fresh `sandbox-server --serve --save` over the same
+`world.db` (recovery from the shutdown checkpoint + journal), and requires both
+the recovered server and a fresh `--late-join` client against it to reach the
+agreed hash. Increment 3 brings `cargo xtask crash-test --suite persistence` to
+12 scenarios covering every `CrashPoint`, CRC / interior-gap journal
+corruption, and an injected `SQLITE_FULL`. Increment 4 covers the
+bounded-failure half of the impaired-late-join requirement: `sandbox-client`
+writes a `{"result":"join-failed"}` summary and exits `4` when a `--late-join`
+replica cannot get a baseline, and a `late_join_may_fail` scenario flag accepts
+a late client that either converged or ended in that bounded explicit failure
+(not a hang) while the live clients keep going — built-in
+`t23-g3-impaired-join` delays the late connect past server shutdown so the
+failure is deterministic. CPU proof: `cargo test -p spall_sim --test
+separated_regions`. Increment 6 (amending increment 5's design per the
+2026-09-10 review) freezes the row-7 contract in
+`docs/reports/G3-residency-hash.md` — one logical topology (resident bricks ∪
+retained evicted digests, each key once) folded by the unchanged
+`canonical_topology_hash` — and lands **slice A**: `spall_voxel::logical`
+(`BrickDigest`, `EvictedBricks` + lifecycle, `logical_bricks`,
+`logical_solid_cells`) and `spall_sim::canonical_logical_volume_for`. Proof:
+`cargo test -p spall_voxel --lib logical`; `cargo test -p spall_sim --test
+logical_hash` (the logical view is byte-identical to `canonical_volume_for` for
+any evicted subset in any order). Increment 7 (slice B) makes the transaction
+`result_hash`, the replica candidate-hash validator, `total_solid_cells`, and
+staging conservation all fold that logical view — a server and a replica with
+**different** bricks evicted still converge — and makes an edit that needs
+unloaded evicted geometry a hard `EvictedGeometryRequired` error rather than a
+silent corruption. Proof: `cargo test -p spall_sim --test logical_commit`;
+`cargo test -p spall_client --test logical_residency`. Increment 8 (slice C)
+adds `spall_sim::BrickBacking` + `SimWorld::reload_brick` so an edit that needs
+an evicted brick's cells reloads it and re-stages (no backing → a bounded
+explicit rejection), and `spall_server::logical_world_baseline` /
+`logical_brick_repair_patch` fill evicted bricks from the backing so a late
+joiner / repair still reaches the exact hash. Proof: `cargo test -p spall_sim
+--test logical_reload`; `cargo test -p spall_server --test logical_baseline`.
+Increment 9 (slice D) wires it into `serve()` behind a **default-off**
+`ServeConfig.residency` knob (`sandbox-server --residency-budget-bricks` /
+`--residency-radius-bricks`): `spall_server::residency_pass::ResidencyPass`
+keeps a brick box around every player capsule resident, evicts out-of-interest
+terrain after a settle hysteresis, refreshes the backing on commit, and reloads
+everything before each checkpoint; late-join and repair capture use the logical
+paths with that backing. Proof: `cargo test -p spall_server --test
+residency_pass` (residency-on reaches the same committed world as off, with real
+evictions); `cargo xtask scenario --name t23-g3-residency` (`t23-g3` under a
+6-brick budget — server + 4 clients + exact replay + cold restart all converge
+to the residency-off agreed hash with 56 evictions). Increment 10 (slice E1)
+adds the client reload digest lifecycle: `EvictedBricks::drop_resident` plus
+`ReplicaWorld` reload paths that supersede a retained digest atomically as the
+brick comes back (same revision on a traversal reload, newer on a repair patch),
+and `ClientResidency::wanted_reloads` to name evicted bricks back in interest.
+Proof: `cargo test -p spall_server --test client_residency` (a replica that
+evicted a region reloads it from server repair patches and converges; a cut into
+a fully-evicted replica region gaps then reloads-and-converges). Increment 11
+(slice E2 / **row 8b**) puts client residency in the live session:
+`spall_client::ClientResidencyPass` runs in the mover loop against the predicted
+player capsule — keep a brick box resident, evict the rest after a hysteresis,
+`RepairRequest` a retained-digest brick back in the box. Proof: `cargo xtask
+scenario --name t23-g3-traversal` — a client walks ~14.6 m out and part-way
+back on the `walk` lane, evicting 6 terrain bricks behind it and reloading 4;
+server residency also on; an edit lands in the region; server + both clients +
+exact replay + cold restart + reconnect all converge to one hash with no
+regrowth. Residency stays default-off for every other scenario. Remaining
+refinements (`ResidencyController` unification, durable-store backing,
+incremental capture, logical-terrain predicted collider) are follow-up tickets;
+the join-duration budget and the G4 eight-client workload + soak stay open.
+
+ENG-80 provisional adoption (2026-09-23): per-brick **terrain collision** now
+starts enabled even with the residency **cache** disabled. The two switches are
+independent. `sandbox-server --whole-terrain-collider` (or scenario JSON
+`"whole_terrain_collider": true`) selects the legacy comparison path; the
+`g4-dormancy-settle-120` and `g4-dormancy-settle-20` fixtures use it to retain
+their historical whole-terrain baseline. The tuned residency fixtures run
+per-brick by default. The user accepted this provisional default despite one
+of three tuned full-horizon runs missing tick p95/p99; see the G4 rubble-lane
+report. Good-enough performance is the current scheduling decision, while
+collision/edit/recovery correctness remains required. ENG-87 tracks later
+non-blocking performance and churn investigation.
+
+T23 increment 12 qualifies that residency evidence after the post-merge review.
+`SimWorld::reload_brick` now validates revision/content before publishing a
+backing candidate; wrong-revision and wrong-content tests require unchanged
+hash, solid count, nonresidency and retained digest, followed by a successful
+correct retry. Client reload work is globally capped at four requests per mover
+step and reports completed loads plus budget misses. Prediction collision uses
+a resident-cache dirty hash, so eviction/reload rebuilds collision even though
+the logical topology hash correctly stays unchanged. `t23-g3-traversal` now
+configures `residency_assertions`: server/client eviction, completed reloads,
+an edit gap caused by evicted client geometry, `>=20 m` outbound travel, and a
+return to `<=12 m` from spawn are all required. The measured clean run reached
+23.38 m out and 10.03 m final, server 5/3 evict/reload, client 6/4/4
+evict/request/complete, grounded ratio 0.993; replay, restart and reconnect all
+matched `2a47eda7…`. This does not satisfy the still-open durable-backing,
+bounded-capture, live-exhaustion, prediction-safe `2%`-loss traversal,
+join-budget or full-envelope requirements.
+
 ### G4 — eight-client engine slice
+
+See the [ENG-30 post-merge review](reviews/2026-09-10-eng-30-post-merge.md) for
+current evidence qualifications: live retry-exhaustion remains untested by the
+after-shutdown join fixture; increment 12 now enforces residency/traversal
+activity, while impaired traversal is still open; and the in-memory
+backing/full-reload checkpoint path does not establish the frozen durable
+residency or total-memory requirements.
 
 Run for two measured minutes after 30 seconds warmup; also run a 30-minute reduced-telemetry soak. Eight players in both clustered and separated arrangements, 256 active nontrivial voxel bodies server-wide, at least 64 nearby to one observer, and an accumulated population of 4,096 sleeping persistent bodies. Drive 10 ordinary edits/s total and one 4 m diameter blast every 10 seconds. Include one 64-brick connected collapse. Geometry fixtures must specify occupied cells and collider complexity, not only body count.
 
@@ -200,6 +815,58 @@ A second burst test exceeds ordinary load to verify explicit admission/backpress
 
 Material strength, contact damage, local player prediction, reliable repairs, full save/recovery, and destructible terrain/body parity are functional requirements of this gate. GPU and server gates may run on separate machines; localhost eight-client runs are correctness evidence, not a substitute for realistic network/performance measurement.
 
+Contact damage CPU-side proof (T21 increments 1 & 3): `spall_physics` unit test
+`contact_impulses_spike_on_impact_then_decay_to_the_resting_load` and the
+`spall_sim` `contact_damage` integration test
+(`falling_body_damages_terrain`, `a_settled_body_stops_damaging_the_floor`,
+`contact_damage_is_bounded_and_deterministic`,
+`a_heavy_body_dropped_on_a_lighter_one_fractures_the_lighter_one`,
+`settling_debris_stack_does_not_cascade`) plus the `contact_damage` pure-module
+unit tests for the body-local brush frame and body-local cooldown key. Increment
+3 targets the struck body (slower of the pair, tie-broken to lower mass) with the
+contact point resolved into its local cell frame; the fracture is a normal
+committed transaction, so conservation holds and the body count stays bounded.
+
+Region dormancy CPU-side proof (T21 increment 2, the `sleep-wake` fixture):
+`spall_physics` unit test
+`a_dormant_body_leaves_the_step_set_and_reactivates_at_its_pose` and the
+`spall_sim` `dormancy` integration test
+(`settled_debris_deactivates_without_changing_the_world`,
+`an_edit_wakes_dormant_rubble_and_it_stays_destructible`,
+`a_player_approaching_wakes_dormant_rubble`,
+`a_terrain_cut_under_dormant_rubble_wakes_it`,
+`a_terrain_cut_far_from_dormant_rubble_leaves_it_dormant`,
+`dormancy_is_invisible_to_the_authoritative_state`). A settled body with a quiet
+interaction region is deactivated (dropped from the physics step, record
+frozen); an edit targeting it, an approaching player, or a terrain cut within
+`wake_margin_m` (increment 3) reactivates it before it is touched, while a
+distant cut leaves it dormant; `world_hash` and conservation are identical to a
+run without the dormancy pass.
+
+Server-wiring networked proof (T21 increment 4 / 3c): `cargo xtask scenario
+--name sleep-wake` runs `sandbox-server --serve --dormancy` on the dedicated
+`Scene::SleepWake` against one real client over QUIC. The client cuts a column
+early, detaching a beam that falls and settles well outside the default wake
+margin; the server-reported `dormancy_deactivations_total` and
+`dormancy_reactivations_total` must both be `>= 1` (`dormancy_assertions` in
+the fixture). The client then walks down the lane into the wake margin — the
+dormant beam reactivates by proximity — and a final body-targeted cut proves it
+is still destructible (`body_cut_committed`). Passes clean, under `--loss-percent
+2`, and with `replay_check` (the committed topology-event stream replayed from
+the tick-0 baseline reproduces the same hash — dormancy is not journalled, only
+the two topology transactions are). See
+`docs/reports/ENG-28-increment-4-sleep-wake.md` for measured evidence.
+
+### Authenticated progression integration
+
+`cargo test -p sandbox --all-features --test progression_network` starts the
+real sandbox server and clients over QUIC. It verifies two-player inventory
+isolation, duplicate craft replay, stale-revision rejection, disconnect before
+a delayed durable reply, reconnect with the same request ID, server restart,
+inventory recovery, token rotation with a stable PlayerId, immediate revocation,
+and token redaction in logs. This is a focused progression acceptance test,
+not a substitute for the eight-client G4 soak.
+
 ### G5 — larger world
 
 Define actual radius, height, concurrent active regions, topology metadata size, and persistent debris envelope from G4 measurements. Demonstrate multiple physics origins with widely separated players and approach/merge tests. Measure generation, streaming/LOD seams, far graph traversal, and long-session storage growth. Do not publish an infinite-world claim or a maximum player count based on extrapolation alone.
@@ -215,3 +882,75 @@ G1/G2 are architecture decision points. Strong review is needed for structural g
 `cargo test -p spall_net` includes `separate_process_transport`: one OS server process, two OS client processes, and two OS UDP proxy processes, with packet loss and forwarding delay. Each client checks reliable replies, bulk parts and motion datagrams. Every child is supervised under a 30-second whole-run deadline and killed/reaped on failure. The ignored `process_role` test is its child entry point, invoked by the parent; it is not an omitted scenario. `cargo xtask net-check` remains the faster in-process measurement command and is labelled accordingly.
 
 The transport regressions also exercise constructor validation through postcard, 1 MiB bulk payloads, negotiated limits, QUIC establishment timeouts, decoded-message loss/reorder, duplicate/overflow sequences, bounded bulk part metadata, liveness-owner shutdown, and delayed-proxy cancellation. Application-byte metrics use connection counters (control/datagram/bulk frame bytes observed at the sampling point, excluding QUIC overhead and authentication), not message counts. Wire-byte metrics come from Quinn. Neither harness is a destruction/replication/G1 feasibility result.
+
+## ENG-89 — wgpu 30 renderer and Yakui HUD migration
+
+The migration acceptance sequence is:
+
+```powershell
+cargo tree -d
+cargo xtask check
+cargo xtask smoke --graphical
+cargo xtask capture --scene g2-frames --output .local/runs/eng89-g2-frames
+cargo xtask capture --scene g2-loop --output .local/runs/eng89-g2-loop
+cargo xtask capture --scene g2-motion --output .local/runs/eng89-g2-motion
+cargo xtask capture --scene g2-terrain --output .local/runs/eng89-g2-terrain
+cargo xtask capture --scene g2-collapse --output .local/runs/eng89-g2-collapse
+cargo xtask play --release --scene g1 --ticks 18000
+cargo run -p spall_editor
+```
+
+On each intended D3D12 and Vulkan adapter, inspect the captures and verify the
+live Yakui HUD draws over the scene, accepts input without leaking consumed
+clicks to gameplay, scales with DPI, survives resize, and recovers after surface
+loss. Record before/after frame-time percentiles plus HUD CPU time and, where the
+adapter supports timestamp queries, GPU time. Compilation and CPU-side checks
+do not substitute for those hardware observations.
+`cargo run --release -p spall_sim --bin region-coordination-bench` exercises
+the stable-ID merge preflight and a live voxel-body transfer between separate
+region physics worlds. It checks transfer rollback conditions, one active body
+owner, local-to-world pose conversion, and removal of the emptied physics
+region after merge. `cargo run --release -p spall_physics --bin
+region-physics-bench` steps three rebased physics worlds together and measures
+the transfer against an uninterrupted control for position, linear/angular
+velocity, and rotation. These are physics/coordinator prototypes; they do not
+route the production `SimWorld` player, terrain, contact-damage, or topology
+paths yet.
+`cargo run --release -p spall_physics --bin region-player-bench` builds two
+small resident terrain patches 100 km apart, gives each player an independent
+region-local query window, and compares 60 grounded capsule sweeps.
+`cargo run --release -p spall_physics --bin region-scale-bench` steps a
+bounded eight-region/64-debris contact workload and reports its measured
+simulation time; it is a demonstrated fixture size, not a maximum.
+`cargo run --release -p spall_server --bin region-support-reload-bench`
+persists a remote support edit in SQLite, evicts and reopens the backing, and
+checks streamed support is unknown until the edited brick reloads, then
+resolves to unsupported geometry.
+`cargo run --release -p spall_mesh --bin lod_seam_bench` also hashes a seeded
+authoritative voxel brick before and after render-only seam generation and
+checks its hash and sampled solid remain unchanged.
+
+## ENG-93 — Editor Run plays the scene
+
+The editor's **Run** button saves the project and launches
+`cargo xtask play --editor-scene <scene.ron>`. `sandbox-server --editor-scene`
+loads the project through `sandbox::editor_scene` (no editor crate dependency),
+flattens placed assets into one 0.25 m terrain volume, and serves it as
+`spall_server::Scene::Custom` with player spawns chosen on the scene surface;
+the interactive client pulls its baseline over the late-join transfer.
+
+```powershell
+cargo test -p sandbox --test editor_scene
+cargo test -p spall_server --test custom_world
+cargo xtask play --editor-scene fixtures/terrain-trees-forest
+```
+
+Measured on the dev machine (debug build, `fixtures/terrain-trees-forest`): 1200
+paced server ticks at 59.999 Hz, client baseline of 147 bricks, 60 fps window,
+0 terrain fallbacks. Not measured: the window was not inspected by eye in this
+session, and no destruction/multi-client run was made on this scene.
+
+Known limit: the engine builds one exact whole-terrain collider and rejects
+terrain over 4096 greedy boxes whose bounding grid exceeds 131,072 cells
+(`ColliderInfeasible::TooLarge`). The forest is sized to fit (16 trees; 33 needed
+6891 boxes). Denser forests need an engine-side change and are not attempted here.

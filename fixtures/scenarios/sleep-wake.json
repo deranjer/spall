@@ -1,0 +1,30 @@
+{
+  "name": "sleep-wake",
+  "scene": "sleep-wake",
+  "description": "T21 / ENG-28 increment 4 (3c) — networked server-wiring evidence for contact damage + region dormancy. One client cuts a column early, detaching a beam that falls and settles on the walk-arena floor, well outside the default dormancy wake margin. The server runs with --dormancy: the settled beam deactivates with nobody nearby. The client then walks down the lane toward it; once within the wake margin the dormancy pass reactivates it (proximity), and a final body-targeted cut proves the reactivated body is still destructible. Passes only if both scripted cuts commit, the server reports at least one deactivation and one reactivation, and the body cut lands.",
+  "server_ticks": 900,
+  "quiescence_ticks": 901,
+  "clients": 1,
+  "dormancy": true,
+  "minimum_transactions": 2,
+  "replay_check": true,
+  "dormancy_assertions": {
+    "min_deactivations": 1,
+    "min_reactivations": 1
+  },
+  "player_paths": [
+    {
+      "client": 0,
+      "legs": [
+        { "from": 400, "to": 550, "movement": [0.0, 0.0, 1.0] }
+      ]
+    }
+  ],
+  "movement": {
+    "min_distance_m": 4.0
+  },
+  "cuts": [
+    { "client": 0, "at_tick": 10, "cell": [60, 6, 6], "radius": 3 },
+    { "client": 0, "at_tick": 650, "cell": [62, 10, 6], "radius": 3, "target": "body" }
+  ]
+}

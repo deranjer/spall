@@ -10,7 +10,7 @@ Use Quinn reliable streams and datagrams. One reliable ordered control/topology 
 
 Datagrams carry player inputs and body/player motion. Each payload fits `min(1100, connection.max_datagram_size())` bytes after our envelope; recalculate when path limits change. Fail the connection setup clearly if required datagrams are unavailable. Larger records are split into independently useful snapshots, not IP-fragmented giant packets. Reliable application records use explicit length framing and checked decoding.
 
-Handshake includes protocol version, exact content manifest hash, world ID, generator version, supported algorithms, server tick rate, cell-size codes, session identity, and negotiated limits. Reject incompatibility before creating a player. For development use server certificate fingerprint pinning and a session join token; do not disable TLS verification globally. Dedicated Internet hosting is direct-address initially; QUIC does not provide NAT traversal, a relay, matchmaking, or account identity. Those need an explicit later platform choice.
+Handshake includes protocol version, exact content manifest hash, world ID, generator version, supported algorithms, server tick rate, cell-size codes, session identity, and negotiated limits. The sandbox combines its canonical material manifest hash with the optional versioned asset-manifest hash; clients serving custom content must provide the same asset manifest before connecting. Reject incompatibility before creating a player. For development use server certificate fingerprint pinning and a session join token; do not disable TLS verification globally. Dedicated Internet hosting is direct-address initially; QUIC does not provide NAT traversal, a relay, matchmaking, or account identity. Those need an explicit later platform choice.
 
 ## Minimal record families
 
@@ -25,8 +25,43 @@ Handshake includes protocol version, exact content manifest hash, world ID, gene
 | BaselineAck | transfer ID, verified manifest hash and installed cursor |
 | RepairRequest | object/brick key, expected/current revision and hash; rate-limited |
 | DurableThrough | highest contiguous journal sequence flushed to durable storage; distinct from simulation commit |
+| ProgressionRequest | nonzero request ID, recipe catalog version, expected inventory revision, and inspect/craft operation; authenticated control stream only |
+| ProgressionResponse | request ID, current catalog/inventory revisions, outcome/rejection code, and complete sorted inventory snapshot |
 
 Never serialize Rapier handles, ECS entities, pointers, platform-sized integers, or raw Rust structs. DTOs use explicit numeric sizes, tags, units, and bounds. Version the wire schema independently of the world save schema. Protocol mismatch is initially a clear rejection, not speculative compatibility code.
+
+Progression requests are game-facing control records, not world edits. In
+per-player credential mode, the server passes the authenticated `PlayerId` to
+the game-owned catalog/inventory handler; legacy shared-token mode passes no
+principal and remains suitable only for ephemeral per-slot progression. Crafting
+uses optimistic catalog and inventory revisions; every reply contains the
+authoritative full inventory for processed requests, including semantic
+rejections, so clients can refresh stale state. A `RetryableCapacity`
+admission reply has no authoritative inventory snapshot; clients retain their
+current view and retry the identical request ID after backoff. The server
+processes accepted requests on one bounded FIFO worker, preserving operation
+order per player. Queue saturation never waits on the simulation tick. The
+sandbox deduplicates by authenticated player ID when
+available and falls back to the temporary connection slot only in legacy mode.
+Durable inventory storage is a separate game-owned layer and remains open.
+
+The sandbox per-player credential mode stores progression in its own
+versioned SQLite database, separate from the authoritative world database.
+Inventory revisions and item stacks use explicit stable fields. A craft
+request, its complete response receipt, and the per-player request high-water
+mark commit atomically in WAL mode with `synchronous=FULL`; recent receipts
+are retained for replay and older unseen IDs are rejected. One bounded writer
+thread owns this file. Craft requests are submitted through a bounded server
+queue and their responses are sent only after the complete inventory and replay
+receipt transaction commits. Harvest rewards in a saved world are first recorded in
+the world's durable outbox in the same transaction as the world journal row.
+The outbox delivery calls the progression writer, which deduplicates by
+authenticated player ID and originating action request ID, then the world
+writer acknowledges the event. Recovery replays unacknowledged events after a
+crash. Live delivery runs on a separate bounded worker; the simulation thread
+submits the world acknowledgement only after it receives the durable award
+completion. Startup recovery and clean shutdown may wait for award completion.
+Without world persistence, harvest remains ephemeral.
 
 Limits start at 64 KiB per control record, 1 MiB per bulk part, 64 MiB per assembled transfer, and 256 KiB maximum decompressed data per material-only brick record (actual material payload is 64 KiB). Validate counts before allocation and decompress with output bounds. A multi-volume transaction can span staged bulk parts; its visible commit marker is small. Larger regions are split into multiple dependency-complete transfers. Each connection has bounded staging memory and a timeout.
 
@@ -39,7 +74,11 @@ Use a hybrid representation for topology changes:
 - The server chooses split membership, child IDs, ownership transfer, and resulting transforms. A split uses canonical source-cell ranges or a baseline blob, not a client rerun of floating-point physics or support heuristics.
 - Use the smaller valid encoding, bounded by staging limits. Do not send full modified chunks every frame as the default.
 
-T10 implements this for the all-resident G1 case: a committed `TopologyTransaction` carries `[IntegerBrush, (SplitOff, child-fill CellRuns)*, source-removal CellRuns]` — the brush op plus, for each detached component, a `SplitOff` marker and the canonical `+X` `CellRun`s that fill the new child volume, then the runs that clear those cells from the source. A replica applies the ops in order into a candidate, checks the `before` revisions and every `result_hash`, and publishes atomically; a `before` gap raises a rate-limited `RepairRequest` and the server answers a brick repair with `CellRun`s for that brick's current state. A split whose runs would exceed `MAX_TRANSACTION_OPS` is refused at commit — the baseline-blob alternative for a giant split is T17.
+T10 implements this for the all-resident G1 case: a committed `TopologyTransaction` carries `[IntegerBrush, (SplitOff, child-fill CellRuns)*, source-removal CellRuns]` — the brush op plus, for each detached component, a `SplitOff` marker and the canonical `+X` `CellRun`s that fill the new child volume, then the runs that clear those cells from the source. A replica applies the ops in order into a candidate, checks the `before` revisions and every `result_hash`, and publishes atomically; a `before` gap raises a rate-limited `RepairRequest` and the server answers a brick repair with `CellRun`s for that brick's current state.
+
+T17 increment 1 (ENG-64) adds the **baseline-blob split**: when the inline `CellRun` list would overflow one reliable control record (`MAX_CONTROL_RECORD`, not just the `MAX_TRANSACTION_OPS` count — ~1300 fragmented runs already blow the 64 KiB frame), the commit re-encodes the ops as `[IntegerBrush, SplitOffBaseline { source, child, child_entity, blob }*, SourcePatchBaseline { source, blob }]`. Each `blob` is a zstd-compressed postcard `spall_protocol::baseline::BaselineVolume` (the same per-brick `{coord, revision, edited, cells}` payload late-join uses) — one carries the whole child volume, one the source's post-cut affected bricks — bounded by `MAX_SPLIT_BASELINE_BLOB` (28 KiB compressed) so the record still fits the wire. `before` / `after` / `result_hashes` are unchanged and remain the replica's acceptance check; the blob rides inside `tx.ops`, so the durable journal and exact-replay reconstruct the split with no schema change.
+
+T17 increment 2 (ENG-64) handles the split whose compressed geometry is *still* over `MAX_SPLIT_BASELINE_BLOB` — the G1 64-brick collapse. The commit emits marker-only ops `[IntegerBrush, SplitOffBulkBaseline { source, child, child_entity, transfer_id }*, SourcePatchBulkBaseline { source, transfer_id }]` plus **one out-of-band `BaselineWorld`** (every child volume + the source's post-cut affected bricks). `transfer_id` is the split's `TransactionId` with a reserved high bit set so it can never collide with a late-join / repair transfer id. That world travels to replicas as a `BaselineTransfer` on a bulk stream (`BaselineBegin` control + `BaselinePart` bulk + `BaselineEnd` control, keyed by `transfer_id`), broadcast to every live client right after the marker transaction; a joining client gets both queued. The control stream is FIFO and single-reader, so a replica always processes the marker `TopologyTransaction` first, **holds** it (`ApplyOutcome::AwaitingBulkSplit`), then assembles the blob from the bulk stream and retries. To disk the pair is a new `spall_store` `JournalPayload::TopologyBulkSplit` variant (an appended postcard variant — old rows stay decodable, `STORE_SCHEMA_VERSION` unchanged); exact-replay and durable recovery feed the sibling `BaselineWorld` into `replay_transaction`. A split whose assembled `BaselineWorld` exceeds `MAX_ASSEMBLED_TRANSFER` (64 MiB) or `MAX_BASELINE_PARTS` is still refused (per-region splitting remains T18).
 
 Physics is not lockstep. Do not promise identical trajectories from running the same inputs on every machine. Rapier's determinism guarantees have conditions, and whole-engine determinism requires more than selecting a physics feature. [Rapier determinism documentation](https://rapier.rs/docs/user_guides/rust/determinism/).
 
@@ -48,7 +87,7 @@ Canonical topology hashes include sorted volume IDs, cell-size codes, brick coor
 ## Transaction application
 
 1. Server constructs a complete transaction against specific input revisions. All source changes, children, mass/pose metadata, and required server collision updates are ready before commit.
-2. Server commits once at a tick boundary and journals the complete authoritative result. Repeated ActionRequest IDs return the existing status and cannot perform another cut.
+2. Server commits once at a tick boundary and journals the complete authoritative result. Once an action has passed authoritative validation and entered admission, repeated ActionRequest IDs return its stored `Queued`, `Committed`, or deterministic staging/commit `Rejected` status and cannot perform another cut. The replay lookup occurs before re-validating the wire claim, so a reconnect can recover a committed result even after that edit changed the ray target. Pre-admission validation and rate-limit refusals are not admitted actions: they do not reserve a request ID, and a corrected retry remains a new request for admission.
 3. Client stages all parts and checks source revisions, IDs, length limits, and hashes. It applies operations in the encoded order into a candidate replica.
 4. Publish the candidate only when the whole transaction validates. Retain the previous consistent replica while dependencies or derived client collision data are pending. Local visual feedback may show a pending action but must not change authoritative replica geometry.
 5. Duplicate transactions are ignored using session/stream sequencing and IDs. Unexpected source revisions trigger bounded repair, not guessed replay. A failed candidate cannot partly replace live state.
@@ -77,6 +116,18 @@ No rewind of destructible world history for competitive lag compensation in v1. 
 
 Interest re-entry follows the same protocol. Unsubscribing evicts only the replica view, not the persistent entity. Reconnect uses a new session generation; old queued inputs and packets are invalid. Cached content may be reused only after matching world/manifest/revision hashes.
 
+T18 makes interest eviction revision-safe. The shared cache treats server and
+client brick count/dense bytes as hard ceilings and retains an outer hysteresis
+band after a brick leaves the enter radius. Server eviction requires an exact
+durable revision acknowledgement first; a dirty brick is never removed merely
+because a write was queued. Modified-air is carried by the existing
+`StoredBrick.edited` field and restored before generation can run. Structural
+queries return pending while any streamed dependency is unavailable. Collision
+entry likewise returns a bounded missing-brick set and defers movement instead
+of sampling unknown space as air. A dynamic body's intersected partitions are
+references to one stable entity/volume pair; dependency baselines include the
+complete body, never a partition-owned fragment.
+
 ## Persistence
 
 Use SQLite transactions through one I/O writer. Store metadata, versioned compressed brick payloads, volume/body records, spatial references, checkpoints, and an ordered authoritative journal. Configure and verify `journal_mode=WAL` and `synchronous=FULL` on the writer in T16. Group pending journal records into a database transaction, and acknowledge durability only after its successful commit. Keep the database on local storage. SQLite permits one WAL writer at a time and distinguishes commit durability from checkpointing. [SQLite WAL documentation](https://sqlite.org/wal.html).
@@ -91,6 +142,17 @@ Group disk flushes with a target interval <=100 ms, then emit DurableThrough. A 
 
 Checkpoint publication records all brick/body data and its journal cursor in one DB transaction. Recovery loads the latest complete checkpoint and replays the durable ordered journal suffix. Ignore no interior corrupt record: report corruption and offer the previous valid checkpoint as an explicit recovery choice. A crash must not leave the terrain removed without the corresponding child body.
 
+Game progression that grants rewards for a committed world edit uses the
+world database's durable outbox. The world journal row and opaque, explicitly
+versioned game event are inserted in one SQLite transaction. The game applies
+the event idempotently in its own database using a stable event/request ID, then
+the world writer acknowledges (deletes) the outbox row. A crash before the
+world transaction leaves neither; a crash after it leaves a replayable event;
+a crash after the game transaction but before acknowledgement safely replays
+the same ID. Events remain pending until the game database reports success.
+This guarantee applies when world persistence is enabled; an ephemeral run has
+no crash-recovery promise.
+
 Retire journal records only after a newer durable checkpoint covers them and no snapshot transfer needs them. Cap retention; lagging joins get a fresh baseline. Persist modified-air bricks explicitly so procedural regeneration cannot restore mined blocks. Initial baselines transfer authoritative terrain rather than trusting client-side generation to be bit-identical.
 
 Use versioned DTO migrations with fixture worlds before changing save formats. Unknown newer schemas are rejected without modifying the database. Back up/migrate into a separate database and validate before replacement.
@@ -103,12 +165,57 @@ Budget example: 200 relevant bodies x 48 encoded bytes x 20 Hz = 192,000 bytes/s
 
 Never discard committed topology to meet the motion budget. Drop superseded unsent motion snapshots; cap cosmetic events; throttle expensive actions; repair or disconnect a client whose reliable backlog exceeds the bounded window. Record backlog bytes and age. The stress gate must show that the queue drains after a blast and a new player can join while the server continues running.
 
+## T20 interest and bandwidth scheduling (partial — increment 1)
+
+`spall_server::serve` gains an opt-in `ServeConfig::motion_interest`
+(`MotionInterest { near_radius_m, far_radius_m, far_interval,
+per_client_budget_bytes, static_anchor_m }`, CLI `--motion-interest` plus
+`--motion-near-m` / `--motion-far-m` / `--motion-far-interval` /
+`--motion-client-budget-bytes` / `--motion-static-anchor`). Unset, the host
+behaves exactly as before: one 20 Hz `MotionSnapshot` batch broadcast
+unfiltered to every client.
+
+Set, each **live** client (a client still pulling a late-join baseline keeps
+getting its catch-up keyframe, not the live feed) gets its own filtered batch:
+
+- **Relevance by bounds.** `crates/spall_server/src/replication.rs` classifies
+  every body/player against the client's `InterestSet` — anchored at the
+  client's player capsule on a player scene, else at `static_anchor_m`, else
+  `Global`. A body is `Near` (every batch) within `near_radius_m` of its
+  bounding-sphere *near face* (so a large body is relevant when its bounds
+  reach in, per "Large bodies are relevant if their bounds intersect
+  interest"), `Far` (reduced cadence) out to `far_radius_m`, and `Excluded`
+  beyond that plus a 1.25x outward hysteresis band. A player is never
+  `Excluded` — only slowed to the `Far` cadence.
+- **Motion-frequency tiers.** `Far`-tier snapshots are sent only every
+  `far_interval`-th batch; the batches between are deferred (superseded, so no
+  geometry is lost).
+- **Per-client byte budget.** `per_client_budget_bytes` caps one client's
+  motion per batch, accounted at a fixed 48 B/snapshot. Over budget, the
+  lowest-priority motion is deferred first: far, then near-sleeping, then
+  near-awake, then other players, then the client's own player.
+- **Egress accounting.** `ServeSummary` (now `version: 2`) reports
+  `motion_snapshots_sent` / `_interest_culled` / `_budget_deferred`,
+  `max_client_motion_batch_bytes`, and both `app_egress_bytes` (the
+  `spall_net` application-byte counter) and `transport_egress_bytes` (Quinn's
+  `udp_tx.bytes` — actual UDP payload including QUIC framing and
+  retransmission), summed over every client connection.
+
+Committed `TopologyTransaction`s are never interest-filtered or dropped here —
+the ENG-48 reliable-backlog bound remains the only thing that sheds them, and
+only by disconnecting the client so it re-baselines. Not yet in this
+increment: the eight-client separated-interest bandwidth scenario and its
+xtask acceptance assertions (needs a world larger than the current fixtures),
+per-body motion-frequency priority by velocity, and cross-region dependency
+baselines for an interest-crossing split.
+
 ## T01 wire encoding decisions (implemented)
 
 `spall_core` and `spall_protocol` implement the record families above. The
 following are now fixed and must be reused, not re-derived, by dependent tasks.
-`spall_protocol` version-0 headers use `WIRE_SCHEMA_VERSION = 1` and
-`PROTOCOL_VERSION = 1`.
+`spall_protocol` record headers use `WIRE_SCHEMA_VERSION = 1`. The connection
+protocol is `PROTOCOL_VERSION = 2` after adding server-authenticated player
+principals to the pre-stream authentication exchange.
 
 **Endianness.** Every canonical hash pre-image and every frame header field is
 little-endian, fixed width. Canonical sequences carry a `u32` LE length prefix;
@@ -163,17 +270,27 @@ baseline regions, 4096 baseline parts.
 ## T09 transport adapter (implemented)
 
 `crates/spall_net` layers Quinn/QUIC on the T01 records. It owns transport only:
-no simulation, storage, or rendering. ALPN is `spall/1`; TLS is 1.3-only.
+no simulation, storage, or rendering. ALPN is `spall/3`; TLS is 1.3-only.
 
-**Sessions.** Development uses server-certificate **fingerprint pinning**
-(BLAKE3 of the certificate DER, carried out of band) plus a per-run 32-byte
-**join token** (constant-time compared). A wrong certificate fails the QUIC/TLS
-handshake (`TransportError::Connect`); a wrong token or an incompatible
-`Handshake` fails after TLS with a distinct `AuthReject::{BadToken,
-Incompatible(field)}` sent back to the client before the connection is torn
-down. Authentication is a `spall_net`-local `ClientHello { token, handshake }` /
-`ServerAuthReply` exchange at the head of the control stream — not a frozen wire
-record — after which the same stream carries `NetMessage`s.
+**Sessions.** Clients pin the server certificate fingerprint (BLAKE3 of the
+certificate DER, carried out of band). Legacy development mode accepts one
+per-run 32-byte shared join token and assigns no stable player principal.
+Player-owned state uses per-player credential mode: the server provisions
+unique 32-byte bearer tokens bound to stable 128-bit `PlayerId`s. `ClientHello`
+contains only the token and compatibility handshake; the server checks the
+token and returns the assigned optional `PlayerId` in `ServerAccept`. The ID is
+never client-asserted. Credential files must be access-controlled and tokens
+provisioned to the corresponding client through a protected channel. A wrong
+certificate fails the QUIC/TLS handshake; an unknown token or incompatible
+`Handshake` gets a distinct `AuthReject` before teardown. This local
+`ClientHello` / `ServerAuthReply` exchange precedes the normal control stream.
+When `--player-credentials-file` is set, the server checks that file every
+500 ms. A valid atomic replacement rotates or revokes tokens while preserving
+the stable PlayerId. Registry changes close active sessions, so reconnects
+must use a currently registered token; malformed or unreadable updates revoke
+all credentials until a valid file is installed. Follow
+[`credential-operations.md`](credential-operations.md) for protected
+provisioning, rotation, and revocation steps.
 
 **Channels.** One reliable ordered **control stream** per connection carries
 `NetMessage` envelopes: `Heartbeat { seq }`, `Record { seq, <T01 frame> }`, or
@@ -187,7 +304,10 @@ carry datagrams is rejected at setup.
 
 **Liveness.** QUIC keep-alive plus an application `Heartbeat` on the control
 stream every `heartbeat_interval`; a connection with no inbound control traffic
-for `idle_timeout` is closed. Defaults: 500 ms / 10 s (2 s QUIC keep-alive).
+for `idle_timeout` is closed. Defaults: 500 ms / 30 s (2 s QUIC keep-alive). The
+30 s bound gives a dependency-complete baseline capture (a bounded, CPU-heavy
+snapshot before its first bulk byte) headroom to finish under legitimate
+server-side load while still bounding a genuinely stalled peer.
 
 **Deduplication.** Per-stream sequence gates (`spall_protocol::SequenceGate`):
 the control stream is strict (any replay dropped); datagrams tolerate a bounded

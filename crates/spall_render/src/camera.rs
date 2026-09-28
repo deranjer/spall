@@ -45,6 +45,22 @@ impl Default for Camera {
 const PITCH_LIMIT: f32 = 1.553_343; // ~89 degrees
 
 impl Camera {
+    /// A camera at `position` looking along `direction` (need not be unit
+    /// length; a zero vector keeps the default orientation).
+    pub fn looking_along(position: Vec3, direction: Vec3, fov_y: f32, aspect: f32) -> Self {
+        let mut camera = Self {
+            position,
+            fov_y,
+            aspect,
+            ..Self::default()
+        };
+        if let Some(dir) = direction.try_normalize() {
+            camera.yaw = (-dir.x).atan2(-dir.z);
+            camera.pitch = dir.y.clamp(-1.0, 1.0).asin();
+        }
+        camera
+    }
+
     /// Unit forward vector (the direction `-Z` maps to after yaw/pitch).
     pub fn forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
@@ -93,6 +109,23 @@ impl Camera {
     /// The view frustum in world space for culling.
     pub fn frustum(&self) -> Frustum {
         Frustum::from_view_projection(self.view_projection())
+    }
+
+    /// World-space ray through a point of the viewport, for picking. `ndc` is
+    /// in clip space (`x` right, `y` up, both `[-1, 1]`). Returns the origin
+    /// on the near plane and a unit direction.
+    pub fn ray(&self, ndc: [f32; 2]) -> (Vec3, Vec3) {
+        let inverse = self.view_projection().inverse();
+        let near = inverse.project_point3(Vec3::new(ndc[0], ndc[1], 0.0));
+        let far = inverse.project_point3(Vec3::new(ndc[0], ndc[1], 1.0));
+        (near, (far - near).normalize_or_zero())
+    }
+
+    /// Clip-space position (`x` right, `y` up, `[-1, 1]` inside the viewport)
+    /// of `world`, or `None` when the point is behind the near plane.
+    pub fn project(&self, world: Vec3) -> Option<[f32; 2]> {
+        let clip = self.view_projection() * world.extend(1.0);
+        (clip.w > 1e-6).then(|| [clip.x / clip.w, clip.y / clip.w])
     }
 }
 
@@ -191,6 +224,23 @@ impl Frustum {
 mod tests {
     use super::*;
 
+    #[test]
+    fn looking_along_reproduces_the_direction() {
+        for dir in [
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::new(1.0, 0.2, 0.3),
+            Vec3::new(-0.5, -0.4, 0.9),
+            Vec3::new(0.0, 0.7, 1.0),
+        ] {
+            let camera = Camera::looking_along(Vec3::ZERO, dir * 3.0, 1.0, 1.0);
+            let forward = camera.forward();
+            assert!(
+                forward.dot(dir.normalize()) > 0.9999,
+                "{dir:?} -> {forward:?}"
+            );
+        }
+    }
+
     fn cam() -> Camera {
         Camera {
             position: Vec3::new(0.0, 0.0, 5.0),
@@ -229,6 +279,25 @@ mod tests {
     }
 
     #[test]
+    fn a_pick_ray_round_trips_through_project() {
+        let mut c = cam();
+        c.look(0.4, -0.2);
+        for ndc in [[0.0, 0.0], [0.6, -0.3], [-0.9, 0.8]] {
+            let (origin, dir) = c.ray(ndc);
+            let point = origin + dir * 7.5;
+            let back = c.project(point).expect("in front of the camera");
+            assert!(
+                (back[0] - ndc[0]).abs() < 1e-3 && (back[1] - ndc[1]).abs() < 1e-3,
+                "{ndc:?} -> {back:?}"
+            );
+        }
+        // The centre ray is the camera's forward axis.
+        assert!((c.ray([0.0, 0.0]).1 - c.forward()).length() < 1e-4);
+        // Points behind the eye do not project.
+        assert!(c.project(c.position - c.forward() * 3.0).is_none());
+    }
+
+    #[test]
     fn look_clamps_pitch_and_wraps_yaw() {
         let mut c = cam();
         c.look(0.0, 10.0);
@@ -253,6 +322,70 @@ mod tests {
             Vec3::new(500.0, -1.0, -1.0),
             Vec3::new(502.0, 1.0, 1.0),
         )));
+    }
+
+    #[test]
+    fn linear_eye_space_depth_is_flat_across_a_camera_facing_plane() {
+        // The depth debug view (opaque.wgsl mode 2) derives linear depth as
+        // `-(view * world_pos).z`. On a plane at constant view-space Z every
+        // off-axis point must read the same depth; the old
+        // `length(world_pos - camera_pos)` grew toward the edges.
+        let c = Camera {
+            position: Vec3::new(0.0, 0.0, 5.0),
+            aspect: 1.0,
+            ..Camera::default()
+        };
+        let view = c.view();
+
+        let plane_z = -3.0_f32; // 8 m in front of the eye, perpendicular to -Z
+        let mut depths = Vec::new();
+        let mut radials = Vec::new();
+        for x in [-4.0_f32, -2.0, 0.0, 2.0, 4.0] {
+            for y in [-4.0_f32, -1.0, 0.0, 1.0, 4.0] {
+                let p = Vec3::new(x, y, plane_z);
+                depths.push(-view.transform_point3(p).z);
+                radials.push((p - c.position).length());
+            }
+        }
+
+        let d0 = depths[0];
+        assert!(
+            (d0 - 8.0).abs() < 1e-4,
+            "linear depth is the view-axis distance"
+        );
+        for d in &depths {
+            assert!((d - d0).abs() < 1e-4, "depth {d} varies across the plane");
+        }
+        // The radial distance the buggy shader used is clearly not flat.
+        let r_min = radials.iter().cloned().fold(f32::INFINITY, f32::min);
+        let r_max = radials.iter().cloned().fold(0.0_f32, f32::max);
+        assert!(
+            r_max - r_min > 1.5,
+            "radial distance spans {r_min}..{r_max}"
+        );
+    }
+
+    #[test]
+    fn linear_eye_space_depth_projects_onto_the_view_axis_under_rotation() {
+        // Even with the camera yawed/pitched, a point straight ahead at range R
+        // reads linear depth R, and a point of the same range off to the side
+        // reads a *smaller* depth (its view-axis projection), never a larger one.
+        let mut c = Camera {
+            position: Vec3::new(2.0, 1.0, -3.0),
+            aspect: 16.0 / 9.0,
+            ..Camera::default()
+        };
+        c.look(0.7, -0.3);
+        let view = c.view();
+        let fwd = c.forward();
+
+        let ahead = c.position + fwd * 10.0;
+        let off = c.position + (fwd + c.right() * 0.3).normalize() * 10.0;
+
+        let depth_ahead = -view.transform_point3(ahead).z;
+        let depth_off = -view.transform_point3(off).z;
+        assert!((depth_ahead - 10.0).abs() < 1e-3);
+        assert!(depth_off < depth_ahead && depth_off > 9.0);
     }
 
     #[test]

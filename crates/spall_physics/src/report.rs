@@ -119,40 +119,6 @@ impl SleepWakeReport {
     }
 }
 
-/// Result of the mixed-density mass-properties scenario for one representation:
-/// two adjacent 4³ blocks, the right one three times denser, built with mass
-/// properties installed from the fine material grid rather than a uniform
-/// collider density.
-#[derive(Debug, Clone, Copy)]
-pub struct MixedDensityReport {
-    /// Centre-of-mass x actually installed on the Rapier body, metres. The
-    /// analytic value is **1.25 m**; a uniform density (any value) would leave
-    /// the solver COM at the geometric centre, 1.0 m.
-    pub com_x_m: f64,
-    /// Max `|installed COM − analytic COM|` over the three axes, metres.
-    pub com_abs_err_m: f64,
-    /// `|installed mass − analytic mass| / analytic mass`.
-    pub mass_rel_err: f64,
-    /// Max relative error of the sorted principal inertia vs the analytic
-    /// reference.
-    pub inertia_rel_err: f64,
-    /// With gravity off and a torque-free spin about the vertical axis, the
-    /// furthest the body's centre of mass drifted from its start over 120 steps,
-    /// metres — near zero confirms the solver spins the body about the shifted
-    /// analytic COM, not the geometric centre.
-    pub spin_com_drift_m: f64,
-}
-
-impl MixedDensityReport {
-    /// Compact JSON object for the bench output.
-    pub fn to_json(&self) -> String {
-        format!(
-            "{{\"com_x_m\":{:.5},\"com_abs_err_m\":{:.6},\"mass_rel_err\":{:.6},\"inertia_rel_err\":{:.6},\"spin_com_drift_m\":{:.6}}}",
-            self.com_x_m, self.com_abs_err_m, self.mass_rel_err, self.inertia_rel_err, self.spin_com_drift_m,
-        )
-    }
-}
-
 /// Per-representation results.
 #[derive(Debug, Clone)]
 pub struct RepresentationReport {
@@ -204,10 +170,6 @@ pub struct RepresentationReport {
     pub com_abs_err_m: f64,
     /// Relative error of the sorted principal inertia vs the analytic reference.
     pub inertia_rel_err: f64,
-
-    /// Mixed-density body: solver mass / COM / inertia and torque-free spin
-    /// motion vs the analytic fine-grid reference (ENG-41).
-    pub mixed_density: MixedDensityReport,
 
     /// Highest CCD projectile speed (m/s) the thin wall still stopped.
     pub projectile_max_stop_m_s: f64,
@@ -602,6 +564,10 @@ fn building_drop(rep: Representation, steps: u32) -> (PercentileSummary, f64, bo
     let building = fixtures::hollow_building(vid(2));
     let grid = OccupancyGrid::from_volume(&building).unwrap().unwrap();
     let dims = grid.dims();
+    // The collider honours the grid origin as a body-local offset, so place the
+    // body so the building's solid cells still drop from just above the slab.
+    let origin = grid.origin();
+    let cell = fixtures::CELL_M;
     let id = world.add_body(BodySpec {
         kind: BodyKind::Dynamic { ccd: false },
         representation: rep,
@@ -609,7 +575,11 @@ fn building_drop(rep: Representation, steps: u32) -> (PercentileSummary, f64, bo
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
         mass_properties: None,
-        translation_m: [6.5, 1.3, 6.5],
+        translation_m: [
+            6.5 - origin.x as f32 * cell,
+            1.3 - origin.y as f32 * cell,
+            6.5 - origin.z as f32 * cell,
+        ],
         linvel_m_s: [0.0; 3],
     });
 

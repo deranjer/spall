@@ -4,15 +4,21 @@
 //! `cargo test -p spall_render -- --ignored` on a host with a working adapter.
 
 use std::fs;
+use std::process::{Child, Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 use glam::{Mat4, Vec3};
-use spall_mesh::MeshStrategy;
 use spall_mesh::fixtures::{acceptance_shapes, mesh_shape};
-use spall_render::{CaptureOptions, DebugView, RenderContext, Scene, SceneItem, capture_scene};
+use spall_mesh::{Mesh, MeshStrategy, Vertex};
+use spall_render::{
+    Camera, CaptureOptions, DebugView, LightingStep, RenderContext, Scene, SceneItem,
+    SequenceOptions, capture_lighting_sequence, capture_scene, colored_rooms,
+    emitter_occlusion_scenes, moving_body_overlap, panning_camera, rapid_destruction,
+};
 
 #[test]
 #[ignore = "requires a working GPU adapter"]
-fn every_acceptance_shape_captures_three_non_empty_images() {
+fn every_acceptance_shape_captures_all_t12_debug_images() {
     let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored capture test");
 
     let out_root = std::env::temp_dir().join(format!("spall-capture-gpu-{}", std::process::id()));
@@ -40,10 +46,30 @@ fn every_acceptance_shape_captures_three_non_empty_images() {
         let dir = out_root.join(shape.name);
         let report = capture_scene(&ctx, &scene, &dir, &opts).expect("capture");
 
+        // CPU/GPU timings are reported separately and never conflated.
+        assert!(
+            report.timing.cpu_total_millis > 0.0,
+            "{}: cpu capture time recorded",
+            shape.name
+        );
+        if ctx.supports_gpu_timestamps() {
+            let gpu = report
+                .timing
+                .gpu_render_millis
+                .expect("timestamp-capable adapter reports a GPU pass time");
+            assert!(gpu >= 0.0, "{}: non-negative GPU pass time", shape.name);
+        } else {
+            assert!(
+                report.timing.gpu_render_millis.is_none(),
+                "{}: GPU timing must be unavailable without timestamp support",
+                shape.name
+            );
+        }
+
         assert_eq!(
             report.images.len(),
-            3,
-            "{}: shaded + normals + depth",
+            6,
+            "{}: shaded + albedo + normals + depth + cascades + roughness",
             shape.name
         );
         assert_eq!(
@@ -82,7 +108,728 @@ fn every_acceptance_shape_captures_three_non_empty_images() {
             "{}: shaded image looks empty ({bright} lit px)",
             shape.name
         );
+
+        // Stone's linear 0.42 reflectance should land around sRGB 173 in the
+        // albedo view. Values near 107 indicate a missing transfer; values
+        // above 205 indicate it was applied twice.
+        if shape.name == "cube" {
+            let albedo = report
+                .images
+                .iter()
+                .find(|image| image.view == DebugView::Albedo)
+                .unwrap();
+            let pixels = image::open(&albedo.path).unwrap().to_rgb8();
+            let correctly_encoded = pixels
+                .pixels()
+                .filter(|pixel| {
+                    let [r, g, b] = pixel.0;
+                    (150..=195).contains(&r) && (150..=200).contains(&g) && (150..=205).contains(&b)
+                })
+                .count();
+            assert!(
+                correctly_encoded > pixels.pixels().len() / 50,
+                "linear albedo was not encoded to sRGB exactly once"
+            );
+        }
     }
 
     let _ = fs::remove_dir_all(&out_root);
+}
+
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn a_transformed_body_casts_a_shadow_onto_static_geometry() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let shapes = acceptance_shapes();
+    let cube = shapes.iter().find(|shape| shape.name == "cube").unwrap();
+    let mesh = mesh_shape(&cube.volume, MeshStrategy::Greedy).mesh;
+    let mut scene = Scene::new(Camera {
+        aspect: 1.0,
+        ..Default::default()
+    })
+    .with_item(SceneItem::new(
+        "ground",
+        mesh.clone(),
+        Mat4::from_scale(Vec3::new(4.0, 0.2, 4.0)),
+    ))
+    .with_item(SceneItem::new(
+        "moving-body",
+        mesh,
+        Mat4::from_translation(Vec3::new(0.4, 1.4, 0.2)) * Mat4::from_rotation_y(0.55),
+    ));
+    scene.frame_all(Vec3::new(1.1, 0.8, 1.2));
+    let dir = std::env::temp_dir().join(format!("spall-t12-shadow-{}", std::process::id()));
+    let report = capture_scene(
+        &ctx,
+        &scene,
+        &dir,
+        &CaptureOptions {
+            width: 512,
+            height: 512,
+            views: vec![DebugView::Shaded, DebugView::ShadowCascades],
+            ..Default::default()
+        },
+    )
+    .expect("capture");
+    assert_eq!(report.items_drawn, 2);
+    assert!(report.timing.gpu_passes.is_some());
+    let shadow = report
+        .images
+        .iter()
+        .find(|image| image.view == DebugView::ShadowCascades)
+        .unwrap();
+    let pixels = image::open(&shadow.path).unwrap().to_rgb8();
+    let background = pixels.get_pixel(0, 0).0;
+    let dark = pixels
+        .pixels()
+        .filter(|pixel| {
+            let rgb = pixel.0;
+            let differs_from_background = rgb
+                .iter()
+                .zip(background)
+                .any(|(&channel, bg)| channel.abs_diff(bg) > 20);
+            let min = rgb.iter().copied().min().unwrap_or(0);
+            let max = rgb.iter().copied().max().unwrap_or(0);
+            differs_from_background && max - min > 20 && max < 150
+        })
+        .count();
+    assert!(dark > 32, "expected an observable shadowed region");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A plane at constant view-space Z must show constant depth across off-axis
+/// pixels (ENG-45). The old shader used `length(world_pos - camera_pos)`, which
+/// grows toward the edges of a camera-facing plane.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn depth_debug_view_is_flat_across_a_camera_facing_plane() {
+    let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored depth test");
+
+    let (width, height) = (320u32, 320u32);
+    // A big quad in the z = 0 plane, facing +Z (toward the camera). CCW from
+    // the front so back-face culling keeps it.
+    let n = [0.0, 0.0, 1.0];
+    let corner = |x: f32, y: f32| Vertex {
+        position: [x, y, 0.0],
+        normal: n,
+        material: 1,
+        ao: 1.0,
+        local_uv: [0.0, 0.0],
+    };
+    let mesh = Mesh {
+        vertices: vec![
+            corner(-3.0, -3.0),
+            corner(3.0, -3.0),
+            corner(3.0, 3.0),
+            corner(-3.0, 3.0),
+        ],
+        indices: vec![0, 1, 2, 0, 2, 3],
+    };
+
+    // Camera dead ahead of the plane: plane sits at linear eye depth 5.
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 5.0),
+        yaw: 0.0,
+        pitch: 0.0,
+        aspect: width as f32 / height as f32,
+        z_near: 1.0,
+        z_far: 12.0,
+        ..Camera::default()
+    };
+    let scene = Scene::new(camera).with_item(SceneItem::new("plane", mesh, Mat4::IDENTITY));
+
+    let dir = std::env::temp_dir().join(format!("spall-depth-plane-{}", std::process::id()));
+    let opts = CaptureOptions {
+        width,
+        height,
+        views: vec![DebugView::Depth],
+        ..Default::default()
+    };
+    let report = capture_scene(&ctx, &scene, &dir, &opts).expect("capture");
+    let depth = report
+        .images
+        .iter()
+        .find(|i| i.view == DebugView::Depth)
+        .expect("depth image");
+    let img = image::open(&depth.path)
+        .expect("decode depth png")
+        .to_rgb8();
+
+    // Scan the centre row; the plane covers it edge to edge. Collect the grey
+    // (drawn) pixels and check they barely vary.
+    let y = height / 2;
+    let mut greys: Vec<i32> = Vec::new();
+    for x in 0..width {
+        let p = img.get_pixel(x, y).0;
+        let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+        if (r - g).abs() <= 3 && (g - b).abs() <= 3 {
+            greys.push(g);
+        }
+    }
+    assert!(
+        greys.len() > (width as usize) * 3 / 4,
+        "expected the plane to fill the centre row, got {} px",
+        greys.len()
+    );
+    let (lo, hi) = (*greys.iter().min().unwrap(), *greys.iter().max().unwrap());
+    assert!(
+        hi - lo <= 6,
+        "depth varies across a camera-facing plane: {lo}..{hi} (radial-distance bug)"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Mean sRGB luminance over the fractional image-x band `[band.0, band.1)`,
+/// full height. Geometry is identical across the compared captures, so clear
+/// pixels cancel and the band mean tracks receiver-wall brightness.
+fn band_mean_luminance(path: &std::path::Path, band: (f32, f32)) -> f64 {
+    let image = image::open(path).unwrap().to_rgb8();
+    let (w, h) = (image.width(), image.height());
+    let x0 = (band.0 * w as f32).round() as u32;
+    let x1 = ((band.1 * w as f32).round() as u32).min(w);
+    let mut sum = 0.0f64;
+    let mut count = 0u64;
+    for y in 0..h {
+        for x in x0..x1 {
+            let [r, g, b] = image.get_pixel(x, y).0;
+            sum += 0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b);
+            count += 1;
+        }
+    }
+    sum / count.max(1) as f64
+}
+
+/// Count receiver-band pixels whose sRGB luminance in `lit` exceeds the same
+/// pixel in `reference` by more than `delta` (8-bit units). With `reference`
+/// captured from an identical scene minus the emissive term, this is a direct
+/// pixel count of transported emitter light on the non-emissive receiver.
+fn transported_pixels(
+    lit: &std::path::Path,
+    reference: &std::path::Path,
+    band: (f32, f32),
+    delta: f64,
+) -> (u64, u64) {
+    let a = image::open(lit).unwrap().to_rgb8();
+    let b = image::open(reference).unwrap().to_rgb8();
+    assert_eq!(a.dimensions(), b.dimensions());
+    let (w, h) = a.dimensions();
+    let x0 = (band.0 * w as f32).round() as u32;
+    let x1 = ((band.1 * w as f32).round() as u32).min(w);
+    let luma =
+        |p: [u8; 3]| 0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2]);
+    let mut brighter = 0u64;
+    let mut total = 0u64;
+    for y in 0..h {
+        for x in x0..x1 {
+            total += 1;
+            if luma(a.get_pixel(x, y).0) - luma(b.get_pixel(x, y).0) > delta {
+                brighter += 1;
+            }
+        }
+    }
+    (brighter, total)
+}
+
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn colored_room_produces_real_indirect_only_pixels_and_separate_timings() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let mut fixtures = colored_rooms(16.0 / 9.0);
+    let closed = fixtures.pop().unwrap();
+    let open = fixtures.pop().unwrap();
+    assert_eq!(open.name, "colored_room_open");
+    assert_eq!(closed.name, "colored_room_closed");
+
+    // CPU probe copy direction, restated so the rendered check below can be read
+    // against the frozen decision-document numbers.
+    assert!(open.metrics.closed_probe_luminance < open.metrics.open_probe_luminance);
+    assert!(open.metrics.thin_wall_leakage_ratio <= 0.05);
+
+    let opts = CaptureOptions {
+        width: 640,
+        height: 360,
+        views: vec![DebugView::IndirectOnly],
+        ..Default::default()
+    };
+    let root = std::env::temp_dir().join(format!("spall-t13-colored-room-{}", std::process::id()));
+    let open_report =
+        capture_scene(&ctx, &open.scene, &root.join("open"), &opts).expect("open indirect capture");
+    let closed_report = capture_scene(&ctx, &closed.scene, &root.join("closed"), &opts)
+        .expect("closed indirect capture");
+
+    assert!(open_report.indirect_enabled);
+    assert_eq!(open_report.indirect_cells, 128usize.pow(3));
+    if ctx.supports_gpu_timestamps() {
+        let passes = open_report.timing.gpu_passes.expect("timestamp timings");
+        assert!(passes.indirect_trace_millis > 0.0);
+        assert!(passes.indirect_denoise_millis > 0.0);
+    } else {
+        assert!(open_report.timing.gpu_passes.is_none());
+    }
+
+    let open_image = image::open(&open_report.images[0].path).unwrap().to_rgb8();
+    let indirect_pixels = open_image
+        .pixels()
+        .filter(|pixel| pixel.0.iter().copied().max().unwrap_or(0) > 18)
+        .count();
+    assert!(
+        indirect_pixels > open_image.pixels().len() / 20,
+        "indirect-only image is empty"
+    );
+
+    // Rendered through GPU trace + GPU denoise + surface sample, the closed roof
+    // darkens the room in the same direction the CPU probe copy reports.
+    let lit_wall = (0.30f32, 0.70f32);
+    let open_luminance = band_mean_luminance(&open_report.images[0].path, lit_wall);
+    let closed_luminance = band_mean_luminance(&closed_report.images[0].path, lit_wall);
+    assert!(
+        closed_luminance < open_luminance,
+        "closed room not darker in the render: open={open_luminance:.3} closed={closed_luminance:.3}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The T13 GPU-quality claim, validated on rendered pixels rather than the CPU
+/// probe copy: a non-emissive receiver wall brightens where the represented
+/// emitter can reach it, and one represented 0.5 m wall removes most of that
+/// transported light. Both measurements come out of `DebugView::IndirectOnly`
+/// captures, i.e. through the GPU trace, GPU denoise, and surface sample.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn indirect_only_render_shows_emitter_transport_and_wall_occlusion() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let scenes = emitter_occlusion_scenes(16.0 / 9.0);
+    let band = (scenes.receiver_band[0], scenes.receiver_band[1]);
+    let opts = CaptureOptions {
+        width: 640,
+        height: 360,
+        views: vec![DebugView::IndirectOnly],
+        ..Default::default()
+    };
+    let root = std::env::temp_dir().join(format!("spall-t13-occlusion-{}", std::process::id()));
+    let capture = |name: &str, scene: &Scene| {
+        capture_scene(&ctx, scene, &root.join(name), &opts)
+            .expect("indirect capture")
+            .images[0]
+            .path
+            .clone()
+    };
+    let lit = capture("lit", &scenes.lit);
+    let occluded = capture("occluded", &scenes.occluded);
+    let dark = capture("dark", &scenes.dark);
+
+    let (lit_transport, band_pixels) = transported_pixels(&lit, &dark, band, 6.0);
+    let (occluded_transport, _) = transported_pixels(&occluded, &dark, band, 6.0);
+
+    // The emitter reaches the non-emissive receiver in the render at all.
+    assert!(
+        lit_transport > band_pixels / 12,
+        "no rendered emitter transport on the receiver: {lit_transport}/{band_pixels} px"
+    );
+    // One represented 0.5 m wall between the panel and this band removes at
+    // least half of the transported pixels (the CPU probe copy measures ~0).
+    assert!(
+        occluded_transport * 2 <= lit_transport,
+        "represented 0.5 m wall did not occlude the render: lit={lit_transport} occluded={occluded_transport}"
+    );
+    // And it is darker on the mean, not just on a pixel count.
+    let lit_mean = band_mean_luminance(&lit, band);
+    let occluded_mean = band_mean_luminance(&occluded, band);
+    let dark_mean = band_mean_luminance(&dark, band);
+    assert!(
+        occluded_mean < lit_mean && dark_mean <= occluded_mean + 1.0,
+        "band means inconsistent: lit={lit_mean:.3} occluded={occluded_mean:.3} dark={dark_mean:.3}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// T14 increment 2: a scripted lighting update reaches the rendered indirect
+/// lighting in the next frame, re-uploading only the changed cells and
+/// re-tracing only the changed region (plus a halo) rather than the whole cache.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn rapid_destruction_reexposes_the_band_with_a_bounded_retrace() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let rd = rapid_destruction(16.0 / 9.0);
+    let out = std::env::temp_dir().join(format!("spall-t14-seq-{}", std::process::id()));
+
+    let report = capture_lighting_sequence(
+        &ctx,
+        rd.scene,
+        // temporal accumulation off (default): each step is one settled frame
+        SequenceOptions {
+            band: rd.receiver_band,
+            ..Default::default()
+        },
+        &[LightingStep::edit("remove occluder", rd.remove_occluder)],
+        &out,
+    )
+    .expect("lighting sequence capture");
+
+    assert_eq!(report.steps.len(), 2);
+    let base = &report.steps[0];
+    let after = &report.steps[1];
+
+    // The edit reaches the rendered indirect lighting: the shadowed band
+    // brightens (measured ~22.8 -> ~26.3 sRGB luminance on the reference
+    // adapter).
+    assert!(
+        after.band_luminance > base.band_luminance + 2.0,
+        "occluder removal did not re-expose the band in the render: {:.3} -> {:.3}",
+        base.band_luminance,
+        after.band_luminance
+    );
+
+    // The base step re-traces everything; the edit step re-traces only the
+    // 80-cell occluder column grown by the 12-cell halo (27_200 cells, ~1.3% of
+    // the 128^3 cache on the reference adapter).
+    assert_eq!(base.retraced_cells, report.total_cells);
+    assert!(
+        after.retraced_cells < report.total_cells / 16,
+        "bounded re-trace touched {} of {} cells",
+        after.retraced_cells,
+        report.total_cells
+    );
+    assert!(
+        after.dirty_cells > 0 && after.dirty_cells <= 80,
+        "unexpected dirty cell count: {}",
+        after.dirty_cells
+    );
+
+    if ctx.supports_gpu_timestamps() {
+        let (base_trace, after_trace) = (
+            base.gpu_trace_millis.expect("base trace timing"),
+            after.gpu_trace_millis.expect("edit trace timing"),
+        );
+        // Bounded re-trace is cheaper than the full trace, not merely no slower
+        // (measured ~1.43 ms -> ~0.11 ms on the reference adapter).
+        assert!(after_trace >= 0.0);
+        assert!(
+            after_trace <= base_trace + 0.5,
+            "bounded re-trace slower than the full base trace: {base_trace:.3} -> {after_trace:.3}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// T14 increment 3: a moving lighting-cache body does not leave a ghost where
+/// it was, its shadow re-forms when it returns, and the static geometry it
+/// swept past is never erased — all through the GPU trace/denoise/sample path.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn moving_body_leaves_no_ghost_and_keeps_swept_geometry() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let mbo = moving_body_overlap(16.0 / 9.0);
+    let band = mbo.receiver_band;
+    let out = std::env::temp_dir().join(format!("spall-t14-move-{}", std::process::id()));
+
+    let report = capture_lighting_sequence(
+        &ctx,
+        mbo.scene,
+        SequenceOptions {
+            band,
+            ..Default::default()
+        },
+        &mbo.steps,
+        &out,
+    )
+    .expect("moving-body lighting sequence");
+
+    assert_eq!(report.steps.len(), 3);
+    let base = report.steps[0].band_luminance; // body in the path -> shadowed
+    let cleared = report.steps[1].band_luminance; // body left -> band recovers
+    let returned = report.steps[2].band_luminance; // body back -> shadow re-forms
+
+    // Measured on the reference adapter: 22.77 -> 28.46 -> 22.77 (the returned
+    // frame is bit-identical to the base — nothing left behind, wall intact).
+    assert!(
+        cleared > base + 2.0,
+        "ghost: shadowed band did not recover when the body left: {base:.3} -> {cleared:.3}"
+    );
+    assert!(
+        returned < cleared - 2.0,
+        "shadow did not re-form when the body returned: {cleared:.3} -> {returned:.3}"
+    );
+    assert!(
+        (returned - base).abs() < 1.0,
+        "returned lighting drifted from the original (swept geometry damaged?): {base:.3} vs {returned:.3}"
+    );
+
+    // Each move re-traces only the two body boxes grown by the halo.
+    for step in &report.steps[1..] {
+        assert!(
+            step.retraced_cells < report.total_cells / 8,
+            "re-trace not bounded on a body move: {} of {}",
+            step.retraced_cells,
+            report.total_cells
+        );
+    }
+
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// T14 increment 4: turning on heavy temporal accumulation must not reintroduce
+/// the ghost / stale-shadow that increment 3 removed. The moving occluder's
+/// shadow still clears when it leaves and re-forms when it returns, and the
+/// returned frame still matches the base — the region-forced refresh and the
+/// neighbourhood clamp keep the accumulated history honest.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn temporal_accumulation_keeps_a_moving_occluder_ghost_free() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let mbo = moving_body_overlap(16.0 / 9.0);
+    let band = mbo.receiver_band;
+    let out = std::env::temp_dir().join(format!("spall-t14-tmove-{}", std::process::id()));
+
+    let report = capture_lighting_sequence(
+        &ctx,
+        mbo.scene,
+        SequenceOptions {
+            band,
+            temporal_weight: 0.1, // heavy accumulation
+            ..Default::default()
+        },
+        &mbo.steps,
+        &out,
+    )
+    .expect("temporal moving-body lighting sequence");
+
+    assert_eq!(report.steps.len(), 3);
+    let base = report.steps[0].band_luminance;
+    let cleared = report.steps[1].band_luminance;
+    let returned = report.steps[2].band_luminance;
+
+    assert!(
+        cleared > base + 1.5,
+        "accumulated ghost: band did not recover when the occluder left ({base:.3} -> {cleared:.3})"
+    );
+    assert!(
+        returned < cleared - 1.5,
+        "shadow did not re-form under accumulation ({cleared:.3} -> {returned:.3})"
+    );
+    assert!(
+        (returned - base).abs() < 2.0,
+        "accumulation drifted the returned frame from the base ({base:.3} vs {returned:.3})"
+    );
+    if ctx.supports_gpu_timestamps() {
+        assert!(
+            report.steps[1].gpu_temporal_millis.unwrap_or(-1.0) >= 0.0,
+            "temporal pass was not timed"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// T14 increment 4: the lighting cache is world-anchored, so panning the camera
+/// over a static lit room must not smear or shift the accumulated lighting — a
+/// heavy-accumulation run matches a no-accumulation run frame for frame.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn panning_camera_temporal_matches_no_accumulation() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let out = std::env::temp_dir().join(format!("spall-t14-pan-{}", std::process::id()));
+
+    let run = |weight: f32, sub: &str| {
+        let pc = panning_camera(16.0 / 9.0);
+        capture_lighting_sequence(
+            &ctx,
+            pc.scene,
+            SequenceOptions {
+                band: pc.band,
+                temporal_weight: weight,
+                ..Default::default()
+            },
+            &pc.steps,
+            &out.join(sub),
+        )
+        .expect("panning-camera lighting sequence")
+    };
+    let reference = run(1.0, "reference");
+    let temporal = run(0.1, "temporal");
+
+    assert_eq!(reference.steps.len(), temporal.steps.len());
+    for (r, t) in reference.steps.iter().zip(&temporal.steps) {
+        assert!(
+            (r.band_luminance - t.band_luminance).abs() < 1.0,
+            "temporal accumulation smeared the panning view at '{}': {:.3} vs {:.3}",
+            r.label,
+            r.band_luminance,
+            t.band_luminance
+        );
+    }
+
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// `STATUS_ACCESS_VIOLATION` — the native exit code (`0xC0000005`) the pinned
+/// wgpu 24 / naga 24 Vulkan path used to fault with on the recorded NVIDIA
+/// Windows driver before the ENG-60 fix. As an `i32` process exit code this is
+/// `-1_073_741_819`. Kept as a regression marker: if this ever comes back out
+/// of `windows_vulkan_backend_compiles_t12_pipelines_without_crashing`, ENG-60
+/// has regressed.
+const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
+
+/// The probe exits `2` for "no usable adapter" / bad mode — a capability problem
+/// on the host, not a Vulkan verdict.
+const PROBE_CAPABILITY_EXIT: i32 = 2;
+
+/// Locate a compiled `--example` binary from the running test executable:
+/// `target/<profile>/deps/<test>-<hash>` → `target/<profile>/examples/<name>`.
+fn built_example_path(name: &str) -> std::path::PathBuf {
+    let mut dir = std::env::current_exe().expect("test executable path");
+    dir.pop(); // drop the test binary filename
+    if dir.file_name().and_then(|s| s.to_str()) == Some("deps") {
+        dir.pop();
+    }
+    dir.push("examples");
+    dir.push(name);
+    if cfg!(target_os = "windows") {
+        dir.set_extension("exe");
+    }
+    dir
+}
+
+/// Poll `child` until it exits or `deadline` elapses. `None` means it is still
+/// running (the caller must kill it).
+fn wait_with_deadline(child: &mut Child, deadline: Duration) -> Option<ExitStatus> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait().expect("poll child") {
+            Some(status) => return Some(status),
+            None if start.elapsed() >= deadline => return None,
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// ENG-60 regression guard (fixed 2026-09-18). On Windows the pinned wgpu 24 /
+/// naga 24 Vulkan path used to crash NVIDIA's driver (`STATUS_ACCESS_VIOLATION`)
+/// while compiling `create_tone_pipeline` — a naga/driver defect triggered by a
+/// vertex shader dynamically indexing a small `array<vec2<f32>, N>` constant
+/// table in a pipeline whose fragment shader also reads a uniform buffer, not a
+/// resource/binding bug in this crate. `shaders/tonemap.wgsl` now generates the
+/// fullscreen-triangle position with index arithmetic instead of an indexed
+/// array, which builds clean on the same driver. Full diagnosis, the minimal
+/// repros that pinned the trigger down, and the acceptance evidence (identical
+/// `capture_gpu` results and a pixel-identical 1920x1080 six-view capture on
+/// both backends) are in `docs/reports/ENG-60.md`.
+///
+/// This test is the permanent regression guard: it builds the
+/// `vulkan_shadow_probe` example, runs it with the Vulkan backend forced, and
+/// asserts `ScenePipeline::new()` — all 3 T13/T14 compute pipelines plus the
+/// T12 opaque/shadow/tone-map render pipelines — completes cleanly. A build
+/// break, a missing adapter, a hang, or the documented native
+/// `STATUS_ACCESS_VIOLATION` are each reported distinctly rather than being
+/// folded into a single pass/fail.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn windows_vulkan_backend_compiles_t12_pipelines_without_crashing() {
+    if !cfg!(target_os = "windows") {
+        eprintln!("skipped: ENG-60 was a Windows/NVIDIA Vulkan driver fault");
+        return;
+    }
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+
+    // 1. Build the probe as its own step. A failure here is broken
+    //    infrastructure, not a Vulkan result.
+    let build = Command::new(&cargo)
+        .args([
+            "build",
+            "--quiet",
+            "-p",
+            "spall_render",
+            "--example",
+            "vulkan_shadow_probe",
+        ])
+        .status()
+        .expect("spawn cargo build for vulkan_shadow_probe");
+    assert!(
+        build.success(),
+        "ENG-60 guard could not build the vulkan_shadow_probe example — this is \
+         a build failure, not a Vulkan result. Fix the build and re-run."
+    );
+
+    // 2. Run the built binary directly (no `cargo run` wrapper whose own exit
+    //    code could be mistaken for the child's) with a synced step log, under a
+    //    wall-clock deadline. The historical fault was a fast native crash
+    //    during pipeline compilation; anything slow is a different failure.
+    let exe = built_example_path("vulkan_shadow_probe");
+    assert!(
+        exe.is_file(),
+        "ENG-60 guard: built probe not found at {exe:?}"
+    );
+    let log = std::env::temp_dir().join(format!("spall-eng60-guard-{}.log", std::process::id()));
+    let _ = fs::remove_file(&log);
+
+    let mut child = Command::new(&exe)
+        .arg("case:pipelines")
+        .env("SPALL_WGPU_BACKEND", "vulkan")
+        .env("SPALL_PROBE_LOG", &log)
+        .spawn()
+        .expect("spawn vulkan_shadow_probe");
+
+    let deadline = Duration::from_secs(120);
+    let Some(status) = wait_with_deadline(&mut child, deadline) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "ENG-60: vulkan_shadow_probe did not exit within {}s building the T12/T13/T14 \
+             pipelines on Vulkan. A hang is a different failure from the historical fast \
+             native crash and must be investigated.",
+            deadline.as_secs()
+        );
+    };
+
+    let code = status.code();
+
+    if code == Some(PROBE_CAPABILITY_EXIT) {
+        eprintln!(
+            "skipped: vulkan_shadow_probe exited {PROBE_CAPABILITY_EXIT} (no usable Vulkan \
+             adapter on this host); ENG-60 guard is inconclusive here"
+        );
+        return;
+    }
+
+    if code == Some(STATUS_ACCESS_VIOLATION) {
+        panic!(
+            "ENG-60 has regressed: vulkan_shadow_probe crashed again with the documented \
+             native STATUS_ACCESS_VIOLATION (0xC0000005) building ScenePipeline::new() on \
+             Vulkan. Re-diagnose per docs/reports/ENG-60.md — the tonemap.wgsl vertex-shader \
+             fix (index arithmetic instead of a dynamically-indexed array) may have been \
+             reverted, or a new pipeline-creation-time construct has reintroduced the \
+             naga/driver defect."
+        );
+    }
+
+    assert!(
+        status.success(),
+        "ENG-60: vulkan_shadow_probe exited with {code:?} building the pipelines on Vulkan — \
+         not a clean exit and not the historical STATUS_ACCESS_VIOLATION. Investigate before \
+         treating Vulkan as accepted."
+    );
+
+    // Confirm it actually reached and passed pipeline creation. The probe
+    // fsyncs a marker before every GPU step, so the last line of its log must
+    // be the "all pipelines built" marker, not any earlier step.
+    let last_step = fs::read_to_string(&log)
+        .expect("vulkan_shadow_probe wrote its synced SPALL_PROBE_LOG step log")
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        last_step.contains("pipelines built OK"),
+        "ENG-60: vulkan_shadow_probe exited cleanly, but its last logged step was \
+         {last_step:?}, not the \"pipelines built OK\" marker. Re-diagnose per \
+         docs/reports/ENG-60.md."
+    );
+
+    let _ = fs::remove_file(&log);
 }

@@ -1,0 +1,25 @@
+{
+  "name": "body-rest-on-structure",
+  "scene": "cross-bridge-cut",
+  "description": "ENG-61. Sibling of g1-networked-destruction focused on a detached body coming to rest. Client 0 cuts the seam-straddling column so the cross-brick beam detaches as one unsupported body; both clients then excavate the outer ends of the floor while leaving the span under the beam intact. No further edits fire after tick 40, and the server keeps stepping physics past edit-quiescence (--await-body-settle) until the beam is asleep. Passes only if every scripted cut commits, the server and both clients agree on one canonical hash, the detached body was owned across a brick boundary (span >= 2), each live client saw real beam displacement, the tick-0 baseline replay reproduces the hash, and the server reports the detached beam at rest on the remaining floor: all detached bodies asleep, final linear speed <= body_settle_speed_epsilon_m_s, its origin held still (< 1 mm/tick) for >= body_settle_min_stable_ticks ticks, and contact penetration <= body_settle_max_penetration_m (it settled on the floor, not through it).",
+  "server_ticks": 600,
+  "quiescence_ticks": 45,
+  "clients": 2,
+  "minimum_transactions": 6,
+  "minimum_motion_snapshots": 1,
+  "minimum_body_displacement_m": 0.3,
+  "minimum_detached_body_brick_span": 2,
+  "replay_check": true,
+  "require_body_settled": true,
+  "body_settle_speed_epsilon_m_s": 0.05,
+  "body_settle_min_stable_ticks": 45,
+  "body_settle_max_penetration_m": 0.15,
+  "cuts": [
+    { "client": 0, "at_tick": 4,  "cell": [31, 4, 1], "radius": 3 },
+    { "client": 0, "at_tick": 8,  "cell": [32, 4, 2], "radius": 3 },
+    { "client": 1, "at_tick": 16, "cell": [21, 1, 1], "radius": 1 },
+    { "client": 1, "at_tick": 24, "cell": [43, 1, 1], "radius": 1 },
+    { "client": 0, "at_tick": 32, "cell": [21, 1, 2], "radius": 1 },
+    { "client": 1, "at_tick": 40, "cell": [43, 1, 2], "radius": 1 }
+  ]
+}

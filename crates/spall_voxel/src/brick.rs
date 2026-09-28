@@ -306,6 +306,11 @@ impl BrickSnapshot {
         self.0.is_modified_air()
     }
 
+    #[inline]
+    pub fn is_dense(&self) -> bool {
+        self.0.is_dense()
+    }
+
     pub fn content_hash(&self) -> BrickHash {
         self.0.content_hash()
     }

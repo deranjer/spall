@@ -1,0 +1,19 @@
+{
+  "name": "player-movement",
+  "scene": "walk",
+  "server_ticks": 420,
+  "clients": 2,
+  "player_paths": [
+    { "client": 0, "legs": [{ "from": 20, "to": 200, "movement": [0.0, 0.0, 1.0] }] },
+    { "client": 1, "legs": [{ "from": 20, "to": 180, "movement": [0.0, 0.0, 1.0] }] }
+  ],
+  "cuts": [
+    { "client": 0, "at_tick": 120, "cell": [100, 2, 8], "radius": 4 }
+  ],
+  "movement": {
+    "max_correction_m": 1.0,
+    "min_distance_m": 5.0,
+    "min_ground_contact_ratio": 0.9,
+    "expect_no_hover": true
+  }
+}
