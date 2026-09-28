@@ -53,7 +53,7 @@ pub use tls::{DevIdentity, Fingerprint, JoinToken, PlayerCredential};
 pub use spall_protocol;
 
 /// The ALPN protocol identifier negotiated on every Spall QUIC connection.
-pub const ALPN: &[u8] = b"spall/2";
+pub const ALPN: &[u8] = b"spall/3";
 
 /// Anything that can go wrong establishing or running a transport session.
 ///

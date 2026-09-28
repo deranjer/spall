@@ -21,7 +21,7 @@ use crate::limits::{
 };
 
 /// Schema version stamped into every encoded record header.
-pub const WIRE_SCHEMA_VERSION: u16 = 2;
+pub const WIRE_SCHEMA_VERSION: u16 = 3;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -119,6 +119,8 @@ pub enum ProgressionRejectCode {
     InsufficientItems,
     Overflow,
     Unavailable,
+    /// The bounded progression work queue is full. Retry the same request ID.
+    RetryableCapacity,
 }
 
 /// Compact, explicit inventory entry; numeric IDs are game-owned stable IDs.

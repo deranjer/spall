@@ -490,6 +490,20 @@ support propagation and brick-boundary ownership transfer); at least
 client; the body-targeted cut landing against the detached body; and the
 committed topology-event stream, replayed deterministically from the tick-0
 baseline via the durable journal, reproducing the live canonical hash. The
+### ENG-103 grid-fluid basin candidate gate
+
+For the isolated MAC feasibility prototype, report the raw maximum cell speed
+for diagnosis, but evaluate basin stability using volume-weighted speed
+statistics over water cells with fraction `C >= 1e-3`. In the final third of the
+declared 3-second basin run, require weighted p95 <= 0.5 m/s and <=1% of
+eligible water volume above 0.5 m/s, alongside the existing <=1 J kinetic-energy
+rise, <0.15 m surface-p95 drift, and zero intact-solid crossings. Always include
+the same speed metrics at `C >= 0`, `1e-6`, `1e-4`, `1e-3`, and `1e-2` so this
+occupancy choice can be sensitivity-checked. `C=1e-3` is 0.1% of one 0.25 m
+cell (15.625 mL); this gate changes only how basin residual motion is assessed,
+not solver fractions or mass accounting. It is a feasibility-candidate
+criterion and does not establish production readiness.
+
 `--loss-percent 2` variant additionally asserts the clients observed motion
 datagrams delivered out of `snapshot_seq` order.
 
