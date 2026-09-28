@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::Args;
 
 use crate::session::{ChildGuard, random_hex_32, wait_for_addr, write_file};
-use crate::{XtaskError, run_cargo, workspace_root};
+use crate::{XtaskError, run_cargo, sandbox_binary_profile, workspace_root};
 
 /// `cargo xtask play` — launches a server and an interactive window against
 /// it, for a hands-on local play session.
@@ -32,6 +32,16 @@ pub struct PlayArgs {
     /// `spall_client::BaselineScene` name.
     #[arg(long, default_value = "walk")]
     scene: String,
+    /// Play a scene authored in Spall Editor (a project directory or a scene
+    /// `.ron` inside one) instead of a built-in `--scene`. This is what the
+    /// editor's Run button launches.
+    #[arg(long, conflicts_with = "scene")]
+    editor_scene: Option<PathBuf>,
+    /// Lighting environment for the window: studio, daylight, overcast,
+    /// sunset or night. Defaults to the environment saved in the
+    /// `--editor-scene` file, else daylight.
+    #[arg(long)]
+    environment: Option<String>,
     /// Server tick budget, at the server's paced 60 Hz. Deliberately large —
     /// `--interactive` has no natural end (a person closes the window when
     /// done), unlike the scripted `session`/`scenario` harness this shares
@@ -42,12 +52,6 @@ pub struct PlayArgs {
     /// Build and run optimized (release) binaries instead of debug ones.
     #[arg(long)]
     release: bool,
-    /// Cargo target directory for the play binaries. Defaults to `target/play`, separate from the
-    /// workspace `target` that `cargo xtask scenario` / `session` build into, so an open play window
-    /// (which keeps its `.exe` locked on Windows) can never block a scenario run rebuilding, and a
-    /// scenario measurement never shares binaries with an interactive viewer.
-    #[arg(long)]
-    target_dir: Option<PathBuf>,
     /// How long to wait for the server to bind before giving up.
     #[arg(long, default_value_t = 20_000)]
     startup_timeout_ms: u64,
@@ -56,9 +60,31 @@ pub struct PlayArgs {
     /// omitted.
     #[arg(long)]
     output: Option<PathBuf>,
+    /// T17: request a full late-join baseline instead of installing the
+    /// fixed scene. Required to actually see a scene whose state is
+    /// populated directly on the server at startup rather than through the
+    /// ordinary commit pipeline (e.g. `g4-workload`'s debris bodies) — a
+    /// normal tick-0 scene install never learns about that population.
+    /// Implied automatically for `playground`, whose two emitters use staged
+    /// server-side bodies.
+    #[arg(long)]
+    late_join: bool,
+    /// **Testing only.** Forwarded to `sandbox-client --client-authoritative`:
+    /// the client owns player and detached-body runtime physics, including
+    /// push impulses and playground emitter timing, while replicated topology
+    /// still supplies voxel shapes. Only meaningful for this local,
+    /// single-player session.
+    #[arg(long)]
+    client_authoritative: bool,
 }
 
 pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskError> {
+    let needs_server_baseline = args.late_join
+        || args.editor_scene.is_some()
+        || matches!(
+            args.scene.as_str(),
+            "playground" | "play" | "sandbox-playground"
+        );
     let output = args.output.unwrap_or_else(unique_output);
     fs::create_dir_all(&output).map_err(|source| XtaskError::Output {
         path: output.display().to_string(),
@@ -80,23 +106,8 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         server_build.push("--release");
         client_build.push("--release");
     }
-    let target_dir = args
-        .target_dir
-        .map(|p| workspace_root().join(p))
-        .unwrap_or_else(|| workspace_root().join("target").join("play"));
-    let target_arg = target_dir.display().to_string();
-    server_build.extend(["--target-dir", target_arg.as_str()]);
-    client_build.extend(["--target-dir", target_arg.as_str()]);
     run_cargo(&server_build)?;
     run_cargo(&client_build)?;
-    let play_binary = |name: &str| {
-        let exe = if cfg!(windows) {
-            format!("{name}.exe")
-        } else {
-            name.to_owned()
-        };
-        target_dir.join(profile).join(exe)
-    };
 
     // A fresh token per session (unlike `session`/`scenario`'s seeded one —
     // there is nothing here that needs to reproduce deterministically).
@@ -112,7 +123,7 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     let _ = fs::remove_file(&fp_file);
     let _ = fs::remove_file(&addr_file);
 
-    let mut server_cmd = Command::new(play_binary("sandbox-server"));
+    let mut server_cmd = Command::new(sandbox_binary_profile("sandbox-server", profile));
     server_cmd.current_dir(workspace_root()).args([
         "--serve",
         "--listen",
@@ -127,8 +138,6 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         &output.join("server.jsonl").display().to_string(),
         "--ticks",
         &args.ticks.to_string(),
-        "--scene",
-        &args.scene,
         // A play session mostly just moves around; don't let the
         // idle-quiescence early-stop (meant for a scripted run with gaps
         // between edits) cut it short for want of a committed transaction.
@@ -136,6 +145,10 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         "0",
         "--paced",
     ]);
+    match &args.editor_scene {
+        Some(path) => server_cmd.arg("--editor-scene").arg(path),
+        None => server_cmd.args(["--scene", &args.scene]),
+    };
     hide_console(&mut server_cmd);
     let mut guard = ChildGuard::default();
     let server_child = server_cmd.spawn().map_err(|source| XtaskError::Output {
@@ -155,10 +168,13 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     eprintln!(
         "xtask play: server listening on {bound} (scene={}, ticks={}); opening the window \
          (WASD to move, mouse to look, Space to jump, Escape releases the cursor)...",
-        args.scene, args.ticks
+        args.editor_scene
+            .as_ref()
+            .map_or_else(|| args.scene.clone(), |path| path.display().to_string()),
+        args.ticks
     );
 
-    let mut client_cmd = Command::new(play_binary("sandbox-client"));
+    let mut client_cmd = Command::new(sandbox_binary_profile("sandbox-client", profile));
     client_cmd.current_dir(workspace_root()).args([
         "--connect",
         &bound.to_string(),
@@ -170,10 +186,19 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         "--log-json",
         &output.join("client.jsonl").display().to_string(),
     ]);
-    // Review scenes hold detached bodies built at server start; only a late-join
-    // baseline (captured from the live world) carries them to the window.
-    if args.scene.starts_with("review-") {
+    let environment = args
+        .environment
+        .clone()
+        .or_else(|| args.editor_scene.as_deref().and_then(scene_environment_key));
+    if let Some(environment) = &environment {
+        eprintln!("xtask play: environment={environment}");
+        client_cmd.args(["--environment", environment]);
+    }
+    if needs_server_baseline {
         client_cmd.arg("--late-join");
+    }
+    if args.client_authoritative {
+        client_cmd.arg("--client-authoritative");
     }
     // Deliberately not hidden and not captured: the window is the point, and
     // a connect failure's error message should land directly in this
@@ -197,6 +222,45 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             vec!["sandbox-client".into(), "--interactive".into()],
             client_status.code().unwrap_or(1),
         ))
+    }
+}
+
+/// The `environment` an editor scene file saved, read from a scene `.ron`
+/// (or a project directory's `scenes/main.ron`). A plain text scan: the
+/// editor writes it as a top-level `environment: "key",` field, and this
+/// launcher deliberately links no RON parser.
+fn scene_environment_key(path: &std::path::Path) -> Option<String> {
+    let file = if path.is_dir() {
+        path.join("scenes").join("main.ron")
+    } else {
+        path.to_path_buf()
+    };
+    parse_environment_key(&fs::read_to_string(file).ok()?)
+}
+
+fn parse_environment_key(scene_ron: &str) -> Option<String> {
+    scene_ron.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("environment:")?.trim();
+        let value = value.trim_end_matches(',').trim();
+        let key = value.strip_prefix('"')?.strip_suffix('"')?;
+        (!key.is_empty()).then(|| key.to_owned())
+    })
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::parse_environment_key;
+
+    #[test]
+    fn reads_the_saved_environment_key() {
+        let ron = "(
+    format_version: 1,
+    name: \"Main\",
+    environment: \"sunset\",
+    entities: {},
+)";
+        assert_eq!(parse_environment_key(ron).as_deref(), Some("sunset"));
+        assert_eq!(parse_environment_key("(name: \"Main\")"), None);
     }
 }
 

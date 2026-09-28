@@ -1,28 +1,21 @@
 # ENG-31 / T24 — G5 larger-world feasibility scoping
 
-Dependency update, 2026-09-18: the [current T23 acceptance audit](T23-acceptance-audit-2026-09-18.md)
-supersedes the dated blocker list below. Disk backing, impaired join-budget
-fixes, and soak increments have landed; full T23 acceptance has not. T24
-implementation remains blocked. This historical scoping report is not a
-measured larger-world envelope.
+Status update, 2026-09-23: ENG-30/T23 was moved to `done` in Loopira at the
+user's direction. ENG-31/T24 is now `in_progress`. The feasibility-scoping
+work below remains the completed Increment 1; the old dependency review and
+T23 audit are historical records, not the current ticket status. This report
+is not a measured larger-world envelope.
 
-Status: **feasibility scoping only. Not an implementation. No acceptance
-bullet of T24 is claimed met.** T24's own dependency (T23, ENG-30) is not
-done — `docs/tasks.md` lines 292-296 records T23 as still open ("T23 stays
-open; the next recommended fix is atomic failed-reload handling... Durable-
-backing and bounded-capture deferrals remain unmet contract requirements, not
-an accepted waiver"), and `docs/reports/G3.md`'s Open Items table (lines
-1816-1839) shows row 7 (resident-cache eviction reconciliation), row 11 (join
-budget at G4 scale), and rows 13-14 (sustained soak bandwidth separation) with
-still-open sub-items as of increment 27 (2026-09-13, `a02e475`). This report
-does the scoping work ENG-31 asks for — what the current architecture already
-supports, what it explicitly does not, and what experiments would need to run
-once T23 closes — without touching code and without prototyping.
+Increment 1 was feasibility scoping only; it did not meet any T24 acceptance
+bullet. It documents existing support, missing mechanisms, and experiments
+needed for a larger-world decision. The 2026-09-18 T23 audit and its open-item
+snapshot are preserved as historical evidence; they are not a claim about
+current Loopira status.
 
 Per `AGENTS.md` ("Respect the dependency graph... Do not start dependent
 implementation early merely to keep slots occupied") and the assigning
-instructions, no `spall_*` crate, fixture, or scenario file is modified by
-this change. Only this report is added.
+instructions, no `spall_*` crate, fixture, or scenario file was modified by
+the original scoping change.
 
 ---
 
@@ -405,20 +398,20 @@ claiming:
   "distant edits persist and affect support," "LOD changes never alter
   authoritative geometry") are met. None of the underlying mechanisms exist
   yet; this report only scopes the experiments that would test them.
-- That T23 is done. It is not (`docs/tasks.md` lines 292-296;
-  `docs/reports/G3.md` Open Items table, rows 7, 11, 13-14 as of increment
-  27 / commit `a02e475`).
+- That the original 2026-09-17 scoping report accepted T23 or the G3/G4 gate.
+  ENG-30 was moved to Done in Loopira on 2026-09-23 at the user's direction;
+  the remaining evidence limitations are recorded separately in `G3.md`.
 - That any numeric envelope (region radius, active-region count, debris
   count) is proposed here. `docs/validation.md` line 708 requires those
   numbers come from G4 measurements, which do not yet exist.
-- That any code, prototype, or benchmark was written or run as part of this
-  report. It was not — this is a documentation-only change.
+- That code or benchmarks were part of Increment 1. They were not; Increment
+  2 adds the precision prototype below.
 
 ---
 
 ## 5. ENG-32 / T25 — forward-looking note (not full scoping)
 
-T25 depends on T23 (not done) and, for the larger-world envelope
+At the time this note was written, T25 depended on T23 (not done) and, for the larger-world envelope
 specifically, likely on T24 (not started). Per the assigning instructions
 this section stays intentionally short — sequencing information only, not
 an API design.
@@ -448,20 +441,599 @@ trait/callback surface `spall_sim` (or `spall_server`) exposes and
 (explicitly ruled out, README.md line 94: "No plugin architecture... is part
 of the foundation").
 
-**Sequencing note only.** Given T23's still-open residency/join-budget/soak
-items (`docs/reports/G3.md` Open Items table) and T24's total absence of
-prototyping, real T25 work — beyond drafting the rules-interface shape on
-paper — is blocked. This report does not design that interface; it only
-notes where it would attach and that the attachment point (README.md's
+**Sequencing note only (historical, written before the 2026-09-23 ticket
+updates).** Given T23's then-open residency/join-budget/soak items
+(`docs/reports/G3.md` Open Items table) and T24's then-absence of prototyping,
+real T25 work — beyond drafting the rules-interface shape on paper — was
+considered blocked. This report does not design that interface; it only notes
+where it would attach and that the attachment point (README.md's
 "small statically linked rules interface") is already named in the docs, so
 whoever picks up T25 is not inventing the boundary concept from scratch.
 
 ---
 
-## Reproduce / verify this report's claims
+## Reproduce / verify the original scoping claims
 
-This report makes no measurement claims of its own; every quantitative
-figure cited above is reproduced from the existing `docs/reports/G3.md` and
-`docs/validation.md`, whose own reproduction commands are listed in
-`docs/reports/G3.md` lines 1841-1872 and `docs/validation.md`'s xtask block.
-No new commands were run for this report.
+Increment 1 made no new measurement claims; its quantitative context is
+reproduced from the existing `docs/reports/G3.md` and `docs/validation.md`.
+Increment 2's independent precision measurement and reproduction command are
+recorded below.
+
+---
+
+## Increment 2 — fixed versus locally rebased precision probe (2026-09-23)
+
+After ENG-30/T23 was moved to `done` in Loopira, `collision-bench --precision`
+was added as the first measured T24 prototype. It sweeps 11 offsets from 0 m
+to 100 km. At each, it drops a 0.5 m voxel cube onto an 8 m merged-cuboid
+floor for 900 frames, walks a capsule forward for 60 ticks, and drives one
+dynamic voxel cube into another for 240 ticks. Character and body interactions
+are also repeated in an explicit local physics frame whose origin equals the
+tested X offset; character positions are converted from global `f64` to local
+coordinates at the sweep boundary. Raw JSON is
+`.local/runs/eng-31-precision/collision-precision.json`.
+
+Measured on this checkout with `rustc 1.96.1`, Windows x86_64 MSVC: all eleven
+rigid-body floor drops and cube-to-cube contacts remained finite, with
+maximum floor penetration 3.427 mm. Dynamic-body target peak speed varied by
+at most 0.030 m/s from the 1.605 m/s origin-zero result. The fixed-world
+character sweep exposed a more sensitive issue: some ticks reported an
+immediate floor contact and zero horizontal movement despite grounded state.
+Across the 60-tick walk, lost travel versus origin zero ranged from zero to
+0.45 m (six 75 mm movement steps); the pattern was non-monotonic across tested
+offsets. Collision traces show time-of-impact zero and an upward floor normal
+on those ticks. With the same geometry and authority positions but an X-local
+physics frame at each tested offset, all 60 ticks moved as in the origin-zero
+control and the travel delta was zero at every offset. A paired 60-tick run
+stepped two independent local `PhysicsWorld`s concurrently with players 100 km
+apart: both stayed grounded, remained finite, and travelled 4.425 m (zero
+delta). This is a physics-adapter prototype, not server integration. Together,
+the measurements support local physics coordinates as the direction for T24,
+but do not yet prove the root cause or establish runtime origin routing and
+body transfer. This is not an accepted world envelope. CPU-only; no GPU capture
+was involved.
+
+Reproduce with:
+
+```sh
+cargo run --release -p spall_physics --bin collision-bench -- --precision --out .local/runs/eng-31-precision
+```
+
+## Increment 3 — coarse region grouping and resident-set sizing (2026-09-23)
+
+Added a configurable `RegionLayout` over signed brick coordinates and a small
+`region_bench` against the existing separated-regions fixture. The grouping is
+runtime spatial organization only: it does not rewrite voxel coordinates,
+volume identity, or structural connectivity. Euclidean division keeps regions
+well-defined for negative brick coordinates.
+
+On the fixture, 9 bricks are resident, of which 2 are dense and use 131,072
+bytes. Grouping those same bricks into cubic regions gives 9 active regions at
+1 brick per side (largest region: 1 brick / 65,536-byte dense upper bound), 4
+regions at 2 bricks per side (largest: 4 bricks / 262,144 bytes), and 1 active
+region at 4, 8, or 16 bricks per side (largest: 9 bricks / 589,824-byte dense
+upper bound). These are bounds assuming every brick in each group is dense;
+the current sparse fixture's actual dense payload is much smaller. The
+partitions were derived from the fixture's existing resident set, preserving
+its authoritative topology; this is a CPU sizing prototype, not streaming,
+eviction, or persistence behavior.
+
+Checks: `cargo fmt --all --check`; `cargo check -p spall_voxel --bin
+region_bench`; `cargo run --release -p spall_voxel --bin region_bench`; and
+`git diff --check` passed. No test suite was run. Next: exercise a continuous
+structural dependency across a region boundary, then prototype active-region
+selection and byte accounting without dropping distant authoritative edits.
+
+Reproduce with:
+
+```sh
+cargo run --release -p spall_voxel --bin region_bench
+```
+
+## Increment 4 — structural connectivity across coarse regions (2026-09-23)
+
+Added `region_topology_bench`: a 97-cell beam plus one-cell anchor spans three
+resident bricks and crosses the boundary between two regions at two bricks per
+axis. The existing global structure analysis read all three bricks and
+reported one component containing all 97 cells, all supported. The observed
+result confirms that coarse grouping can remain an index over the existing
+authoritative volume without cutting the structural graph at a region
+boundary. It does not exercise region unloading/reloading, dependency-driven
+streaming, or distant-edit durability.
+
+Checks: `cargo fmt --all --check`; `cargo check -p spall_structure --bin
+region_topology_bench`; `cargo run --release -p spall_structure --bin
+region_topology_bench`; and `git diff --check` passed. No test suite was run.
+Next: implement a bounded active-region selection prototype and measure its
+resident sets while keeping backing edits/topology durable across eviction.
+
+Reproduce with:
+
+```sh
+cargo run --release -p spall_structure --bin region_topology_bench
+```
+
+## Increment 5 — bounded active-region selection and durable eviction round trip (2026-09-23)
+
+Added `ActiveRegions`, which selects cubic regions around one or more brick
+centers, applies separate enter/retain radii, and fails atomically when the
+active-region limit is exceeded. `RegionLayout::active_bricks` expands that
+selection only when the full brick footprint is within a caller-provided cap.
+The shared residency cache now accepts an explicit active brick set and keeps
+that set for subsequently loaded bricks, so new loads inherit active status.
+
+`active_region_bench` exercises the existing server backing/eviction path on
+the separated-regions fixture. One active two-by-two-by-two-brick region
+represents an 8-brick slot footprint but contains 4 resident bricks in this
+fixture. Starting from 9 resident bricks, reducing the cache limit to those 4
+evicted 5 bricks, including an edited distant brick. The dirty revision was
+persisted before eviction; after moving interest to the distant region, that
+brick reloaded at revision 16 and the edited cell remained modified air. The
+reloaded cache had 4 resident bricks, 1 currently active brick, and 65,536
+resident dense bytes (262,144-byte all-dense upper bound for the one active
+region). The benchmark uses deterministic in-memory backing: it exercises the
+acknowledged brick eviction/load contract, not a cold process restart or disk
+failure/crash recovery. It also does not integrate region selection into the
+serve loop or validate active-region hysteresis under player motion.
+
+Checks: `cargo fmt --all --check`; `cargo check -p spall_voxel`; `cargo check -p
+spall_server --bin active_region_bench`; `cargo run --release -p spall_server
+--bin active_region_bench`; and `git diff --check` passed. No test suite was
+run. Next in the broader T24 measurements: render LOD seam behavior, then
+generation-version policy and the remaining merge/split, body-transfer,
+structural-growth, and measured-envelope work.
+
+Reproduce with:
+
+```sh
+cargo run --release -p spall_server --bin active_region_bench
+```
+
+## Increment 6 — render-only 2:1 heightfield seam spike (2026-09-23)
+
+Added an isolated `spall_mesh::lod` helper that builds vertical transition
+quads between aligned fine and coarse heightfield edge profiles. It accepts
+integer edge heights and returns ordinary render mesh quads; it has no access
+to `Volume`, physics, or structural state. A CPU probe used eight fine edge
+intervals against four coarse intervals (2:1). Six intervals differed, with a
+sum of 10 unmatched vertical cell-faces (`0.625 m²` at 25 cm cells). The
+transition produced six quads / 12 triangles. Quad bounds and directions were
+checked, and the emitted patch area equaled the measured boundary difference
+(zero residual for this profile).
+
+This is a narrow heightfield boundary prototype, not a general 3D LOD solution
+or integrated renderer. It does not cover caves, overhangs, multi-chunk mesh
+ownership, ambient occlusion continuity, GPU captures, transition cost under
+edits, or authoritative geometry. A broader strategy/design review is still
+needed before adopting LOD for general voxel terrain.
+
+Checks: `cargo fmt --all --check`; `cargo check -p spall_mesh --bin
+lod_seam_bench`; `cargo run --release -p spall_mesh --bin lod_seam_bench`; and
+`git diff --check` passed. No test suite or GPU capture was run. Next: resolve
+world generation-version policy for new regions adjacent to existing regions,
+then continue merge/split, body transfer, structural growth, and measured
+envelope work.
+
+Reproduce with:
+
+```sh
+cargo run --release -p spall_mesh --bin lod_seam_bench
+```
+
+## Increment 7 — world generation versioning audit (2026-09-23)
+
+The repository has no procedural terrain generator: current world setup builds
+fixed scenes from explicit voxel edits. The existing `generator_version` is a
+single world-level compatibility field. It is written to checkpoint metadata,
+checked for exact equality on restore, and checked for exact equality in the
+network handshake. Server and client fixtures currently hard-code version 1.
+No region or brick records identify which generator version produced them, and
+there is no path that regenerates evicted geometry.
+
+That means the present contract is coherent for baked/edited world data but
+does not support mixed generator versions within one world. The conservative
+current behavior is to keep the world-level version pinned and reject a
+whole-world mismatch; never regenerate persisted or modified terrain because a
+new generator is available. Per-region version coexistence requires an explicit
+product decision that procedural generation is part of G5, followed by a
+contract for boundary continuity or an explicit region migration. This audit
+does not select that direction or add per-region metadata.
+
+Evidence is a source audit of `spall_server::PersistConfig`,
+`StoredWorldMeta`, `validate_world_meta`, `spall_protocol::Handshake`, the
+server/client handshake builders, and the current fixture-based scene setup.
+No code or runtime behavior changed in this audit, and no tests were run.
+
+## Increment 8 — region merge and body-transfer design boundary (2026-09-23)
+
+The existing `BodySpatialIndex` is only a spatial query index over one
+`SimWorld`. `one_body_keeps_one_identity_while_crossing_partition_boundaries`
+already checks that a single body is referenced by every intersected partition
+before and after moving, while `body_count()` remains one. This establishes
+same-world partition indexing; it does not transfer a body between simulation
+regions or merge their physics origins.
+
+The actual ownership boundary is still one private `PhysicsWorld` inside each
+`SimWorld`. Dynamic bodies retain one authoritative `Volume`, stable entity and
+volume IDs, world-space `BodyPose`, linear/angular velocity, collider revision,
+and an opaque handle owned by that physics world. There is no current
+multi-origin router or API to stage a body's collider in another `PhysicsWorld`
+and atomically retire the old handle. Reusing `BodySpatialIndex` as if it
+implemented that transfer would leave ownership and solver state unresolved.
+
+Before implementing cross-origin transfer, the prototype needs explicit
+invariants: each stable body/volume pair has exactly one authoritative owner;
+the voxel geometry and world-space pose are unchanged at handoff; linear and
+angular velocity are preserved; the destination collider is valid before the
+source collider is retired; and failure leaves exactly one usable owner. A
+region merge must also reconcile terrain/brick revisions and structural graph
+dependencies before either region stops simulating. The existing occupied-cell
+split ledger is not sufficient by itself because body transfer preserves the
+same occupied geometry while changing its physics-frame representation.
+
+This is a design and implementation boundary, not a merge prototype or a claim
+that the T24 acceptance criterion is met. The next concrete implementation
+step is a two-origin transfer spike at the simulation/physics boundary, with a
+canonical geometry digest and before/after world-space pose and velocity
+measurements, followed by an atomic failure-injection scenario. Only after that
+should region merge add residency and structural-graph reconciliation. The
+residency paths remain separately implemented, so this increment does not
+combine their policy APIs.
+
+Checks: source audit of `BodySpatialIndex`, its existing partition-crossing
+scenario, `SimWorld` ownership and physics-handle fields, and the architecture's
+split ledger; `git diff --check` passed. No code or runtime behavior changed;
+no tests were run. The T24 acceptance criterion remains open.
+
+## Increment 9 — two-origin physics body-transfer spike (2026-09-23)
+
+Added `spall_physics`'s standalone `physics-transfer` scenario. It stages a
+64-cell voxel body in a destination `PhysicsWorld` whose local origin is 112 m
+from the source origin. The source and destination represent the same
+world-space body pose, orientation, linear/angular velocities, and voxel-grid
+geometry. A destination with an invalid cell size is rejected before it creates
+a body. A second injected rejection after destination collider creation retires
+that staged collider and confirms the source remains active. On retry, the
+destination state is compared before the source is retired. The transferred
+body then advances for 60 ticks beside a control body that stayed in the source
+origin.
+
+Measured by `physics-transfer`: geometry digest `cdfc59fa55414211` for 64 solid
+cells; staged world-pose, linear-velocity, angular-velocity, and rotation
+errors were all zero at the transfer boundary. After 60 ticks, transferred
+position differed from the control by `0.0006857 m`, and velocity difference
+was zero. After handoff there was one active body in the destination and none
+in the source. Both injected rejection paths preserved source ownership.
+
+This is an adapter-level feasibility spike, not authoritative body transfer:
+the harness supplies a cloned occupancy grid and kinematic snapshot directly
+to two physics worlds. Stable `EntityId`/`VolumeId` ownership, `SimWorld`
+registries, transaction publication, cross-region terrain/residency, and
+structural graph reconciliation are not involved. The source and staged
+destination collider coexist briefly before retirement; the harness does not
+prove that production callers can keep that interval unpublished or roll back
+every possible failure in collider construction. Region merge/split remains
+unimplemented, and the T24 acceptance criterion remains open.
+
+Checks: `cargo fmt --all`; `cargo check -p spall_physics --bin
+physics-transfer`; `cargo run --release -p spall_physics --bin
+physics-transfer` (passed, values above); `git diff --check` passed. No test
+suite was run. Reproduce with:
+
+```sh
+cargo run --release -p spall_physics --bin physics-transfer
+```
+
+Next: carry this staged handoff through `SimWorld` stable ownership and
+tick-boundary publication, with failure rollback, before implementing region
+merge, residency reconciliation, and structural graph stitching.
+
+## Increment 10 — SimWorld integration gate audit (2026-09-23)
+
+Tracing the handoff into `SimWorld` exposed two prerequisites the adapter spike
+does not cover. First, each `SimWorld` owns its own `IdRegistry`; the registry
+contract guarantees uniqueness only within one world. Two separately-created
+regions can therefore allocate the same `EntityId` and `VolumeId`. Moving one
+body while retaining those IDs is unsafe unless region worlds draw IDs from a
+shared authority or the coordinator proves and reconciles disjoint ranges.
+Second, the physics frame is currently implicit: terrain colliders, body spawn
+and split creation, physics-to-authority pose sync, and player sweeps all use
+world coordinates directly as `f32`. There is no origin field in `SimWorld` to
+convert all of those paths consistently.
+
+These are coordinator-level contracts, not a missing helper on `SimWorld`.
+Adding a body-transfer method now would either preserve IDs that may already
+collide or rebase one body's collider while the rest of that simulation still
+uses a different coordinate frame. Both would violate the stable-identity and
+single-frame assumptions in the existing code. The next implementation unit
+must establish one region coordinator with a shared authoritative ID registry
+and explicit origin per physics region, then route body ownership and tick
+publication through that coordinator. The transfer spike remains useful as
+the destination-staging metric, but it is not sufficient to integrate safely.
+
+Evidence: source audit of `SimWorld`'s private `registry`, `physics`, body and
+volume-owner maps; `IdRegistry`'s per-world monotonic counters;
+`spawn_body`/restore and split-collider creation; `step_physics` pose sync; and
+player sweep paths. No code or runtime behavior changed. No tests were run.
+`git diff --check` passed. Region-coordinator design and implementation are
+still required before `SimWorld` handoff or the region-merge criterion can be
+claimed.
+
+## Increment 11 — origin-aware SimWorld slice (2026-09-23)
+
+Added `PhysicsOrigin` as an explicit world-`f64` to local-physics-`f32` frame.
+`Simulation::new_with_physics_origin` and the corresponding `SimWorld`
+constructor now localize terrain collision grids by shifting their grid-cell
+origin, and localize body poses and player sweeps. Physics-to-authority body
+pose synchronization and contact-point conversion restore the origin. Split
+child creation and terrain collider publication validate localized positions
+before publishing the transaction. Existing constructors retain origin-zero
+behavior. IDs remain centralized in one `SimWorld` registry.
+
+`region-origin-bench` compared a falling 64-cell dynamic body on a terrain slab
+at origin zero with the same scene translated 100 km in world X and simulated
+relative to a 100 km local origin. Both runs retained one contact pair and
+finite state through 240 physics steps. After removing the 100 km world offset,
+position error was `0 m` and velocity error was `0 m/s`. The active-region
+eviction benchmark retained its previous result: 9 resident bricks reduced to
+4, 5 evicted, then 4 resident after reload; the edited cell reloaded as
+modified air at revision 16. The physics transfer spike also still passes.
+
+This slice gives one `SimWorld` one explicit local physics frame. It does not
+yet coordinate several simultaneous `PhysicsWorld`s, assign bodies/players to
+different frames, resolve cross-region contacts, or move a body between
+`SimWorld` instances. The safe architecture direction remains one authoritative
+ID/geometry owner with region-local physics worlds beneath a coordinator; do
+not create independent authoritative worlds with overlapping ID registries.
+Region merge and transfer acceptance remain open.
+
+Checks: `cargo fmt --all`; `cargo check -p spall_sim --bin region-origin-bench`;
+`cargo check -p spall_server --bins --all-features`; `cargo run --release -p
+spall_sim --bin region-origin-bench` (passed, measurements above); `cargo run
+--release -p spall_server --bin active_region_bench` (previous residency
+measurements reproduced); `cargo run --release -p spall_physics --bin
+physics-transfer` (passed, previous measurements reproduced); `git diff
+--check` passed. No test suite was run. Next: introduce the shared-authority
+region coordinator and route each body/character to a region-local physics
+world, preserving one registry and explicit cross-region contact/merge rules.
+
+Reproduce the origin scenario with:
+
+```sh
+cargo run --release -p spall_sim --bin region-origin-bench
+```
+
+## Increment 12 — stable-identity region merge coordinator (2026-09-23)
+
+Added `spall_sim::RegionCoordinator`, a deterministic ownership control plane
+keyed by stable world entity IDs rather than solver-local body handles. Regions
+carry explicit `PhysicsOrigin`s. A merge selects the lower region ID as the
+survivor, rewrites each retired entity's owner exactly once, and returns both
+origins plus the transfer count for tick-boundary application. Reassigning an
+entity to a second region is rejected; repeating assignment to its current
+region is idempotent.
+
+`region-coordination-bench` created two regions 100 km apart and merged 512
+entities split evenly between them. Measured result: 2 regions became 1, all
+512 IDs remained present with unique survivor ownership, 256 owner entries
+transferred, and a sample point converted back to the same world position from
+the retired and survivor frames. Merge preflight now requires every transferred
+entity's authoritative `f64` world position and confirms it is representable in
+the survivor frame before changing ownership. Missing-pose and out-of-range
+injections both failed atomically with the original two-region ownership
+unchanged. The planner also requires an explicit finite separation and merge
+threshold: a measured 100 km separation was rejected atomically against a 2 m
+threshold, while an approaching 0.5 m pair was eligible for preflight.
+
+At Increment 12 this was a control-plane prototype: live region worlds and
+collider handoff were not yet present. Increments 13–14 below add those
+adapter/coordinator layers and the character-query measurement. Production
+`SimWorld` integration and structural reconciliation remain open.
+
+Checks: `cargo fmt --all`; `cargo check -p spall_sim --bin
+region-coordination-bench`; `cargo run --release -p spall_sim --bin
+region-coordination-bench` (passed, including both atomic rejection cases);
+`git diff --check` passed. No test suite was run.
+
+Reproduce the control-plane scenario with:
+
+```sh
+cargo run --release -p spall_sim --bin region-coordination-bench
+```
+
+## Increment 14 — separated-player rebased query sweeps (2026-09-23)
+
+`PhysicsRegionSet::sweep_character` now routes each character to its region's
+world, creates/rebuilds that player's terrain query window against the
+authoritative shared voxel volume, localizes the derived grid by the region
+origin, and sweeps at local coordinates. The benchmark places two independent
+resident floor patches and players 100 km apart, with a separate query cache
+for each player. Across 60 ticks both remained grounded for all 60 and finite.
+Near/far travel was 4.422164551913816 m and 4.422164551913738 m; measured
+travel delta was `-7.82e-14 m` from floating-point roundoff.
+
+This covers separated-player precision through the actual region-set character
+query path, including per-region query-window construction. It remains separate
+from `SimWorld::advance_players`; production player registration, the shared
+body/terrain contact set, and server tick integration are still open.
+
+Checks: `cargo fmt --all`; `cargo check -p spall_physics --bins`; `cargo check
+-p spall_sim --bins --all-features`; `cargo check -p spall_server --bins
+--all-features`; `cargo run --release -p spall_physics --bin
+region-player-bench` (passed with the measurements above); `git diff --check`
+passed. No tests were run.
+
+## Increment 15 — distant support edit, disk eviction, and reload
+
+Added `region-support-reload-bench`, combining `ResidencyController`, the
+SQLite `DiskBrickBacking`, and `StructureIndex` on a 97-cell support bridge
+spanning three bricks. `DiskBrickBacking` now also implements the server
+controller's `ResidencyBacking` interface over the same SQLite table, so this
+scenario uses the production disk codec/store rather than a parallel fixture
+format.
+
+Measured sequence: all 97 cells were initially supported; removing the remote
+anchor made 96 beam cells unsupported. The edited anchor brick was persisted
+before eviction. While it was absent, streamed structural analysis classified
+64 resident cells as unknown instead of assuming air. After dropping the
+controller, reopening the SQLite file, and loading the brick, its revision
+matched the edited revision and the anchor sampled as modified air. Complete
+analysis then resolved to 96 unsupported cells and zero unknown cells. The
+scenario cleans up its uniquely named temporary SQLite files.
+
+This proves a distant durable edit changes structural support across a
+region/brick boundary after reload. It does not run the full server movement
+loop or automatically evict from player interest; the bounded residency
+controller is driven directly in this scenario.
+
+Checks: `cargo fmt --all`; `cargo check -p spall_server --bin
+region-support-reload-bench`; `cargo run --release -p spall_server --bin
+region-support-reload-bench` (passed with the measurements above). No tests
+were run.
+
+## Increment 16 — render seam and authoritative voxel invariance
+
+Extended `lod-seam-bench` with a seeded authoritative voxel volume. It records
+the resident brick content hash and a solid-cell sample before generating the
+2:1 render transition, then checks both after seam generation. The hash and
+sample remain identical (`authoritative_volume_hash_unchanged=true`); the seam
+function still has no `Volume` parameter and operates only on edge profiles.
+The existing seam measurement remains 6 transitions over 8 fine/4 coarse
+intervals, 10 cell-faces / `0.625 m²` stitched, residual boundary area 0.
+
+This verifies the current seam helper cannot mutate authoritative voxel data
+through its API and that the benchmark's volume remained unchanged. It does not
+prove an integrated renderer/LOD switch because the current seam helper is not
+yet wired into neighboring chunk mesh selection or GPU rendering.
+
+Checks: `cargo fmt --all`; `cargo check -p spall_mesh --bin lod_seam_bench`;
+`cargo run --release -p spall_mesh --bin lod_seam_bench` (passed, including
+unchanged authoritative hash/sample). No tests were run.
+
+## Increment 18 — bounded physics-region debris envelope
+
+Added `region-scale-bench` as a concrete, collision-producing workload across
+multiple local worlds: 8 regions at 100 km spacing (700 km between the outer
+origins), 8 dynamic 64-cell bodies and one 8,192-cell floor collider per
+region, for 64 dynamic bodies, 8 fixed terrain colliders, and 69,632 solid
+cells total. After 120 full region-step cycles, every body remained finite,
+population matched, and all 8 regions reported at least 8 body/floor contact
+pairs. One release measurement was `3.0189 ms` for the 120 step cycles plus
+64 body-state reads per cycle (`0.02516 ms` per step cycle) on the current
+Windows x86_64 workstation. The timer excludes world/collider construction and
+is one sample, not a p95 or saturation result.
+
+Together with `region-player-bench`, the evidence demonstrates two capsule
+players at 100 km separation and the above 8-region debris/floor fixture. These
+are separate adapter scenarios; they do not establish one integrated server
+limit, a maximum player/debris count, memory headroom, or sustained-load
+envelope. No larger scale claim is made.
+
+Checks: `cargo fmt --all --check`; `cargo check -p spall_physics --bin
+region-scale-bench`; `cargo run --release -p spall_physics --bin
+region-scale-bench` (passed with measurements above); `git diff --check` passed.
+No tests were run.
+
+## Increment 19 — T24 acceptance audit and durable empty-brick revision fix
+
+The disk-backed support scenario exposed a durable-format edge case during
+reload review: a known-empty modified brick was previously returned through
+the controller's revision-less `KnownEmpty` path. `DiskBrickBacking` now
+returns an all-air `StoredBrick` carrying the saved revision and edited bit,
+so a distant edit remains version-identical after reload. The SQLite support
+scenario still passes with the exact revision and modified-air sample.
+
+T24 evidence is bounded to measured fixture sizes. Demonstrated physics
+fixtures span 700 km between eight region origins, exercise 64 dynamic voxel
+bodies against eight terrain colliders, and separately exercise two grounded
+players 100 km apart. The persistent support fixture spans three 8 m bricks
+and restores the edited revision after a SQLite reopen. The render seam
+fixture is one synthetic 2:1 heightfield transition with an unchanged
+authoritative voxel hash. These are fixture bounds, not a production
+radius/height limit or a maximum world, player, debris, or storage claim.
+
+Remaining acceptance gaps:
+
+| T24 area | Evidence / status |
+| --- | --- |
+| Multiple rebased physics origins; separated-player precision | Adapter scenarios pass at 100 km separation; no integrated server `SimWorld` region routing. |
+| Approach/merge and split without duplicated bodies | Explicit transfer, split, merge guard, and 512-ID atomic preflight pass; no continuous approach-triggered merge, bulk transactional migration, recentering, terrain/structural reconciliation, or production routing. |
+| Streaming and distant persistent edit | SQLite eviction/reopen restores exact revision and support effect; no long-session churn/growth curve or movement-driven server streaming run. |
+| LOD seam authority | Synthetic 2:1 helper closes its seam and leaves voxel hash unchanged; no general cave/overhang or renderer/GPU integration. |
+| Far structural graph traversal | Three-brick/two-coarse-region graph proves boundary connectivity only; no physically far or large graph growth measurement. |
+| Generation and versioning | No procedural terrain generator exists; world-level generator version is pinned and mismatch fails closed. No honest generation throughput/seam measurement can be produced before a generator contract is assigned. |
+| Measured world envelope | Reported only as fixture spans and populations; no product radius/height, active-region cap, topology-metadata size, memory ceiling, p95/p99, or long-duration envelope is established. |
+
+Reproducible adapter evidence commands are listed in `docs/validation.md`.
+T24 cannot claim the G5 larger-world feasibility gate passed until these open
+integrations and measurements are resolved. This audit satisfies the ticket's
+reporting requirement while keeping gate failures visible.
+
+Checks for this increment: `cargo check -p spall_server --bins --all-features`;
+`cargo run --release -p spall_server --bin region-support-reload-bench` (passed,
+exact revision restored); `git diff --check` passed. No tests were run.
+
+## Increment 13 — multiple live region physics worlds and routed body transfer (2026-09-23)
+
+Added `PhysicsRegionSet` in `spall_physics`. Each region owns a local Rapier
+world at an explicit `PhysicsOrigin`; body IDs carry the region namespace and
+are rejected when used against the wrong world. The set steps all regions in
+stable namespace order, converts world-space body placement into local `f32`,
+and reports both local solver state and restored world translation.
+
+Added stable entity-to-region/body routing to `spall_sim::RegionCoordinator`.
+Its transfer operation builds the caller-provided authoritative collider in
+the destination frame, restores pose and linear/angular velocity, validates
+position, velocity, quaternion, and finite state, then retires the source and
+updates ownership. Merge refuses a retiring region that still owns live
+physics bodies; after those bodies are transferred to the survivor, the empty
+region can be removed. The live coordinator scenario transferred a 64-cell
+voxel body from origin 100000 m to 100112 m and back, each pose transfer had
+0 m world-space error, exactly one active owner was retained, and merge reduced
+the two-region state to one region. The independent `region-physics-bench`
+stepped three local worlds for 20 ticks before transfer and 60 after; compared
+with uninterrupted control, final position error was `0.0006933 m`, linear
+velocity error `0 m/s`, angular velocity error `0 rad/s`, rotation error `0`,
+and one active body existed at the destination after transfer.
+
+Added the `region-player-bench` character-query scenario using the same
+`PhysicsRegionSet`: two terrain patches and players 100 km apart, with one
+`CharacterQueryCache` per local world. Over 60 ticks both players remained
+grounded all 60 ticks and finite. Near/far travel was 4.422164551913816 m and
+4.422164551913738 m respectively; delta was `-7.82e-14 m` (floating-point
+roundoff). This includes query-window rebuild/localization and actual capsule
+sweeps. It is still an adapter-level prototype rather than the production
+`SimWorld` player path.
+
+This is still not a production `SimWorld` integration. Player queries, per-
+region terrain colliders, contact collection/damage, edit commits, and central
+registry allocation do not yet route through these types. The merge test uses
+an explicit handoff to the survivor's existing origin; origin recentering and
+bulk region merge with many bodies remain open. It proves adapter-level
+simultaneous region stepping and per-body transfer, not a player/debris/world
+scale envelope.
+
+Checks: `cargo fmt --all`; `cargo check -p spall_physics --bins`; `cargo check
+-p spall_sim --bins --all-features`; `cargo check -p spall_server --bins
+--all-features`; `cargo run --release -p spall_physics --bin
+region-physics-bench`; `cargo run --release -p spall_physics --bin
+region-player-bench`; `cargo run --release -p spall_sim --bin
+region-coordination-bench`; `cargo run --release -p spall_physics --bin
+physics-transfer`; `cargo run --release -p spall_sim --bin region-origin-bench`;
+`git diff --check` all passed. No test suite was run.
+
+## Increment 17 — live region split and merge ownership checks
+
+Extended `region-coordination-bench` to exercise a live split: two bodies begin
+in one namespaced physics world, one is rebuilt/transferred to a newly created
+region, and both stable entity IDs remain associated with exactly one active
+body in the expected region (1 body per region). The existing live merge path
+also verifies it refuses to retire a region while its body remains there, then
+succeeds after that body is handed to the survivor. This is an explicit
+per-body split/merge prototype; bulk transactional partitioning and automatic
+split thresholds are not implemented.
+
+Checks: `cargo fmt --all`; `cargo check -p spall_sim --bin
+region-coordination-bench`; `cargo run --release -p spall_sim --bin
+region-coordination-bench` (all three scenarios passed: live transfer+merge,
+live split, and 512-ID merge preflight). No tests were run.

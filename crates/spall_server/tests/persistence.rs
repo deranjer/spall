@@ -1169,3 +1169,76 @@ fn an_emptied_body_stays_retired_across_save_and_restart() {
         "recovered geometry matches the live world after the retirement"
     );
 }
+
+// --- ENG-95: appearance-only manifest migration ---------------------------
+
+fn recoloured(manifest: &spall_core::MaterialManifest) -> spall_core::MaterialManifest {
+    let entries = manifest
+        .entries()
+        .iter()
+        .cloned()
+        .map(|mut def| {
+            def.render.albedo = def.render.albedo.map(|c| c * 0.25);
+            def
+        })
+        .collect();
+    spall_core::MaterialManifest::validated(entries).unwrap()
+}
+
+#[test]
+fn a_world_saved_under_a_superseded_manifest_restores_and_is_restamped() {
+    let s = Scratch::new("supersede");
+    let sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let old = fixtures::stone_manifest();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+    }
+    let recovery = spall_store::recover(s.db()).unwrap();
+    let new = recoloured(&old).superseding_appearance(&old).unwrap();
+
+    let (restored, _) = persist::restore(
+        &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
+        new.clone(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .expect("an appearance-only successor restores the old world");
+    // The next checkpoint carries the new manifest's hash, ending the
+    // dependence on the predecessor.
+    let cp = persist::capture(&restored, &cfg(), 0).unwrap();
+    assert_eq!(
+        cp.meta.material_manifest_hash,
+        spall_protocol::content_manifest_hash(&new).0
+    );
+    assert_ne!(
+        cp.meta.material_manifest_hash,
+        spall_protocol::content_manifest_hash(&old).0
+    );
+}
+
+#[test]
+fn an_unrelated_recolour_is_still_rejected_without_the_supersession_declaration() {
+    let s = Scratch::new("no-supersede");
+    let sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+    }
+    let recovery = spall_store::recover(s.db()).unwrap();
+    match persist::restore(
+        &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
+        recoloured(&fixtures::stone_manifest()),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    ) {
+        Err(persist::PersistError::ManifestMismatch { .. }) => {}
+        other => panic!("expected ManifestMismatch, got {:?}", other.map(|_| ())),
+    }
+}

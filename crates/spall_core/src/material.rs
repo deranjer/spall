@@ -117,6 +117,8 @@ pub enum ManifestError {
     UnknownFlags { id: u16, name: String },
     #[error("entries are not sorted by ascending id (id {0} follows a larger id)")]
     NotSorted(u16),
+    #[error("manifest does not supersede the previous one by appearance alone: {0}")]
+    NotAppearanceOnly(String),
 }
 
 /// Upper bound on manifest size. Keeps handshake parsing bounded.
@@ -124,10 +126,22 @@ pub const MAX_MATERIALS: usize = 4096;
 
 /// A validated set of materials for one world. Construct with
 /// [`MaterialManifest::validated`]; the constructor is the only way in.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawMaterialManifest")]
 pub struct MaterialManifest {
     entries: Vec<MaterialDef>,
+    /// Earlier manifests this one replaces by appearance alone (see
+    /// [`Self::superseding_appearance`]). Local migration metadata: never
+    /// serialized, hashed, sent in a handshake, or part of equality.
+    #[serde(skip)]
+    appearance_predecessors: Vec<MaterialManifest>,
+}
+
+/// Equality is over the material entries only; migration lineage is metadata.
+impl PartialEq for MaterialManifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
 }
 
 #[derive(Deserialize)]
@@ -186,7 +200,111 @@ impl MaterialManifest {
             validate_fields(def)?;
         }
 
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            appearance_predecessors: Vec::new(),
+        })
+    }
+
+    /// Declares that this manifest replaces `previous` by *appearance alone*:
+    /// same ids, names and simulation properties, differing only in render
+    /// fields (albedo, roughness, metalness, emissive). A saved world written
+    /// under `previous` (or anything `previous` itself superseded) may then be
+    /// restored under this manifest and is re-stamped with this manifest's
+    /// hash at its next checkpoint. Anything else -- an added, removed or
+    /// renamed material, or a changed simulation property -- is refused here,
+    /// so a migration can never change what saved voxels mean.
+    pub fn superseding_appearance(
+        mut self,
+        previous: &MaterialManifest,
+    ) -> Result<Self, ManifestError> {
+        let bad = |detail: String| Err(ManifestError::NotAppearanceOnly(detail));
+        if self.entries.len() != previous.entries.len() {
+            return bad(format!(
+                "{} materials now, {} before",
+                self.entries.len(),
+                previous.entries.len()
+            ));
+        }
+        for (now, before) in self.entries.iter().zip(&previous.entries) {
+            if now.id != before.id || now.name != before.name {
+                return bad(format!(
+                    "id {} / {:?} does not match {:?}",
+                    now.id.0, now.name, before.name
+                ));
+            }
+            if now.sim != before.sim {
+                return bad(format!("simulation properties of {:?} changed", now.name));
+            }
+        }
+        self.appearance_predecessors.push(previous.clone());
+        self.appearance_predecessors
+            .extend(previous.appearance_predecessors.iter().cloned());
+        Ok(self)
+    }
+
+    /// Declares that this manifest **extends** `previous`: every material of
+    /// `previous` keeps its id, name, simulation properties **and render
+    /// fields** (a colour change is not an extension: it goes through
+    /// [`Self::superseding_appearance`], an explicit migration), and everything
+    /// new has an id above `previous`'s highest. Saved
+    /// worlds and replicas of `previous` therefore still mean exactly what they
+    /// did (they cannot contain the new ids), so they may be restored under this
+    /// manifest and are re-stamped at their next checkpoint, like
+    /// [`Self::superseding_appearance`]. Used to add appearance variants of
+    /// existing materials without touching what saved voxels mean.
+    pub fn superseding_extension(
+        mut self,
+        previous: &MaterialManifest,
+    ) -> Result<Self, ManifestError> {
+        let bad = |detail: String| Err(ManifestError::NotAppearanceOnly(detail));
+        for before in &previous.entries {
+            let Some(now) = self.get(before.id) else {
+                return bad(format!(
+                    "material {} ({:?}) was removed",
+                    before.id.0, before.name
+                ));
+            };
+            if now.name != before.name {
+                return bad(format!(
+                    "id {} was {:?}, now {:?}",
+                    before.id.0, before.name, now.name
+                ));
+            }
+            if now.sim != before.sim {
+                return bad(format!(
+                    "simulation properties of {:?} changed",
+                    before.name
+                ));
+            }
+            if now.render != before.render {
+                return bad(format!(
+                    "render fields of {:?} changed; recolouring is an appearance migration, not an extension",
+                    before.name
+                ));
+            }
+        }
+        let highest = previous.entries.last().map_or(0, |def| def.id.0);
+        if let Some(def) = self
+            .entries
+            .iter()
+            .find(|def| def.id.0 <= highest && !previous.contains(def.id))
+        {
+            return bad(format!(
+                "new material {:?} reuses id {}",
+                def.name, def.id.0
+            ));
+        }
+        self.appearance_predecessors.push(previous.clone());
+        self.appearance_predecessors
+            .extend(previous.appearance_predecessors.iter().cloned());
+        Ok(self)
+    }
+
+    /// Earlier manifests whose saved worlds this one may restore; see
+    /// [`Self::superseding_appearance`].
+    pub fn appearance_predecessors(&self) -> &[MaterialManifest] {
+        &self.appearance_predecessors
     }
 
     /// Entries in canonical order (ascending id).
@@ -369,6 +487,116 @@ mod tests {
                 ),
             },
         }
+    }
+
+    #[test]
+    fn supersession_accepts_only_appearance_changes() {
+        let old = MaterialManifest::validated(vec![air(), stone(1, "stone")]).unwrap();
+
+        let mut recoloured = old.entries().to_vec();
+        recoloured[1].render.albedo = [0.1, 0.2, 0.3];
+        recoloured[1].render.roughness = 0.5;
+        let new = MaterialManifest::validated(recoloured)
+            .unwrap()
+            .superseding_appearance(&old)
+            .expect("render-only change");
+        assert_eq!(new.appearance_predecessors(), std::slice::from_ref(&old));
+        assert_ne!(new, old, "the contents differ");
+        assert!(old.appearance_predecessors().is_empty());
+
+        let mut heavier = old.entries().to_vec();
+        heavier[1].sim.density_kg_m3 = 9000.0;
+        assert!(matches!(
+            MaterialManifest::validated(heavier)
+                .unwrap()
+                .superseding_appearance(&old),
+            Err(ManifestError::NotAppearanceOnly(_))
+        ));
+
+        let renamed = MaterialManifest::validated(vec![air(), stone(1, "granite")]).unwrap();
+        assert!(renamed.superseding_appearance(&old).is_err());
+        let extra =
+            MaterialManifest::validated(vec![air(), stone(1, "stone"), stone(2, "more")]).unwrap();
+        assert!(extra.superseding_appearance(&old).is_err());
+    }
+
+    #[test]
+    fn extension_allows_new_higher_ids_but_nothing_else() {
+        let old = MaterialManifest::validated(vec![air(), stone(1, "stone")]).unwrap();
+        let mut entries = old.entries().to_vec();
+        entries.push(stone(50, "stone.v1"));
+        let extended = MaterialManifest::validated(entries)
+            .unwrap()
+            .superseding_extension(&old)
+            .expect("a new higher id is an extension");
+        assert_eq!(extended.appearance_predecessors().len(), 1);
+
+        // Recolouring an existing material is not an extension.
+        let mut recoloured = old.entries().to_vec();
+        recoloured[1].render.albedo = [0.3; 3];
+        recoloured.push(stone(50, "stone.v1"));
+        assert!(
+            MaterialManifest::validated(recoloured)
+                .unwrap()
+                .superseding_extension(&old)
+                .is_err(),
+            "silent recolouring must be refused"
+        );
+
+        // Reusing a lower id for something new is refused.
+        let mut bad = old.entries().to_vec();
+        bad.push(stone(0, "x"));
+        assert!(
+            MaterialManifest::validated(bad).is_err(),
+            "duplicate air id"
+        );
+        let old3 = MaterialManifest::validated(vec![air(), stone(5, "stone")]).unwrap();
+        let mut low = old3.entries().to_vec();
+        low.insert(1, stone(2, "sneaky"));
+        assert!(
+            MaterialManifest::validated(low)
+                .unwrap()
+                .superseding_extension(&old3)
+                .is_err()
+        );
+        // Removing or changing sim is refused.
+        assert!(
+            MaterialManifest::validated(vec![air()])
+                .unwrap()
+                .superseding_extension(&old)
+                .is_err()
+        );
+        let mut heavier = old.entries().to_vec();
+        heavier[1].sim.density_kg_m3 = 1.0;
+        assert!(
+            MaterialManifest::validated(heavier)
+                .unwrap()
+                .superseding_extension(&old)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn lineage_is_not_serialized_and_chains_forward() {
+        let v1 = MaterialManifest::validated(vec![air(), stone(1, "stone")]).unwrap();
+        let mut e2 = v1.entries().to_vec();
+        e2[1].render.albedo = [0.2; 3];
+        let v2 = MaterialManifest::validated(e2)
+            .unwrap()
+            .superseding_appearance(&v1)
+            .unwrap();
+        let mut e3 = v1.entries().to_vec();
+        e3[1].render.albedo = [0.3; 3];
+        let v3 = MaterialManifest::validated(e3)
+            .unwrap()
+            .superseding_appearance(&v2)
+            .unwrap();
+        assert_eq!(v3.appearance_predecessors().len(), 2, "v2 and v1");
+        let json = serde_json::to_string(&v3).unwrap();
+        assert!(!json.contains("predecessor"));
+        let back: MaterialManifest = serde_json::from_str(&json).unwrap();
+        assert!(back.appearance_predecessors().is_empty());
+        assert_eq!(back, v3);
     }
 
     #[test]

@@ -53,6 +53,38 @@ fn world_solid_total(sim: &Simulation) -> u64 {
     n
 }
 
+fn assert_spawn_slots_walk(mut sim: Simulation, spawns: [[f64; 3]; 4]) {
+    let input = PlayerInput {
+        movement: [0.0, 0.0, 1.0],
+        view_dir: [1.0, 0.0, 0.0],
+        buttons: 0,
+    };
+    for (slot, spawn) in spawns.into_iter().enumerate() {
+        let entity = player_entity_for(slot as u32);
+        sim.add_player(entity, spawn);
+        assert!(sim.set_player_input(entity, input, InputSeq(1)));
+    }
+
+    for _ in 0..30 {
+        sim.tick().unwrap();
+    }
+
+    for player in sim.world().players() {
+        let start = player.spawn.position_m;
+        assert!(
+            player.state.position_m[0] - start[0] > 1.0,
+            "spawn {:?} did not move clear of the beam: {:?}",
+            start,
+            player.state.position_m
+        );
+        assert!(
+            player.state.grounded,
+            "player left the floor at {:?}",
+            start
+        );
+    }
+}
+
 #[test]
 fn cutting_one_region_leaves_the_other_region_intact() {
     let mut sim =
@@ -157,6 +189,21 @@ fn both_detached_beams_come_to_rest_on_their_own_floor() {
         solid_count(&sim.world().terrain().volume) > 0,
         "terrain floors survive the two collapses"
     );
+}
+
+#[test]
+fn separated_region_spawn_slots_can_walk_from_their_initial_positions() {
+    let sim = Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    assert_spawn_slots_walk(sim, fixtures::SEPARATED_REGION_SPAWNS);
+}
+
+#[test]
+fn full_envelope_spawn_slots_can_walk_from_their_initial_positions() {
+    let sim = Simulation::new(SimulationConfig::new(
+        fixtures::separated_regions_full_envelope_setup(),
+    ))
+    .unwrap();
+    assert_spawn_slots_walk(sim, fixtures::SEPARATED_REGION_FAR_SPAWNS);
 }
 
 // --- T23 / G3 open item row 2: full-envelope (> 100 m) separation ----------
@@ -343,12 +390,10 @@ fn causeway_connects_the_two_far_regions_with_continuous_solid_ground() {
 /// on solid ground inside the causeway/east-region span, matching the
 /// wire-harness scenario's `movement.min_distance_m` gate.
 ///
-/// This also pins the reason slot 0's spawn is *not* at the same local offset
-/// as [`fixtures::SEPARATED_REGION_SPAWNS`] (see that constant's doc comment):
-/// spawning within the first few metres of `x = 0` leaves a freshly-created
-/// player capsule unresponsive to horizontal input for hundreds of ticks — a
-/// pre-existing defect this test's spawn deliberately avoids, not a distance
-/// or collapse-independence property of this scene.
+/// Slot 0 starts at `x = 7 m` because this full-envelope scene provides the
+/// continuous causeway needed for the >100 m path. Its `z = 1.6 m` lane clears
+/// the raised beam; the earlier ENG-66 freeze was caused by a spawn that
+/// intersected that beam, not by proximity to `x = 0`.
 #[test]
 fn scripted_walk_from_slot_0_spawn_covers_over_100_m() {
     let mut sim = Simulation::new(SimulationConfig::new(

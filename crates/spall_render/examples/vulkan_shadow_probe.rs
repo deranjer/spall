@@ -167,7 +167,7 @@ fn dump_spirv(name: &str, wgsl: &str) {
 }
 
 fn print_adapters(instance: &wgpu::Instance, backends: wgpu::Backends) {
-    for adapter in instance.enumerate_adapters(backends) {
+    for adapter in pollster::block_on(instance.enumerate_adapters(backends)) {
         let i = adapter.get_info();
         println!(
             "  backend={:?} name={:?} vendor=0x{:04x} device=0x{:04x} type={:?} driver={:?} driver_info={:?}",
@@ -230,8 +230,8 @@ fn build_one_pipeline_fmt(
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("probe-layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
     mark(&format!(
         "  vkCreateGraphicsPipelines({label}, {format:?})..."
@@ -263,10 +263,10 @@ fn build_one_pipeline_fmt(
                 })],
                 compilation_options: Default::default(),
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
-    ctx.wait();
+    ctx.wait().expect("GPU polling failed");
     mark(&format!("  {label}: pipeline OK (no crash)"));
 }
 
@@ -306,8 +306,8 @@ fn build_one_pipeline(ctx: &RenderContext, label: &str, wgsl: &str) {
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("probe-layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
     mark(&format!("  vkCreateGraphicsPipelines({label})..."));
     let _pipeline = ctx
@@ -337,10 +337,10 @@ fn build_one_pipeline(ctx: &RenderContext, label: &str, wgsl: &str) {
                 })],
                 compilation_options: Default::default(),
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
-    ctx.wait();
+    ctx.wait().expect("GPU polling failed");
     mark(&format!("  {label}: pipeline OK (no crash)"));
 }
 
@@ -479,8 +479,8 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("probe-tone-separate-layout"),
-            bind_group_layouts: &[&bgl0, &bgl1],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl0), Some(&bgl1)],
+            immediate_size: 0,
         });
     mark("  vkCreateGraphicsPipelines(tone-uniform-separate-group)...");
     let _pipeline = ctx
@@ -510,10 +510,10 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32
                 })],
                 compilation_options: Default::default(),
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
-    ctx.wait();
+    ctx.wait().expect("GPU polling failed");
     mark("  tone-uniform-separate-group: pipeline OK (no crash)");
 }
 
@@ -585,8 +585,8 @@ fn build_tone_variant(ctx: &RenderContext, label: &str, wgsl: &str, with_uniform
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("probe-tone-layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
     mark(&format!(
         "  vkCreateGraphicsPipelines(tone-variant:{label})..."
@@ -618,10 +618,10 @@ fn build_tone_variant(ctx: &RenderContext, label: &str, wgsl: &str, with_uniform
                 })],
                 compilation_options: Default::default(),
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
-    ctx.wait();
+    ctx.wait().expect("GPU polling failed");
     mark(&format!("  tone-variant:{label}: pipeline OK (no crash)"));
 }
 
@@ -1036,10 +1036,9 @@ fn main() {
         return;
     }
 
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends,
-        ..Default::default()
-    });
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = backends;
+    let instance = wgpu::Instance::new(descriptor);
     mark("enumerate_adapters");
     print_adapters(&instance, backends);
 
@@ -1067,7 +1066,7 @@ fn main() {
         if stripped == "pipelines" {
             mark("ScenePipeline::new (naga SPIR-V + vkCreateGraphicsPipelines x3)");
             let _p = ScenePipeline::new(&ctx.device);
-            ctx.wait();
+            ctx.wait().expect("GPU polling failed");
             mark("  pipelines built OK (no crash)");
             return;
         }
@@ -1314,7 +1313,7 @@ fn main() {
 
     mark("ScenePipeline::new (naga SPIR-V + vkCreateGraphicsPipelines x3)");
     let pipeline = ScenePipeline::new(&ctx.device);
-    ctx.wait();
+    ctx.wait().expect("GPU polling failed");
     mark("  pipelines built OK");
 
     let materials = pipeline.material_buffer(&ctx.device, &scene.materials);
@@ -1326,7 +1325,7 @@ fn main() {
         let (v, idx) = to_gpu(&item.mesh, item.model);
         draws.push(GpuMesh::create(&ctx.device, &v, &idx, UploadBudget::default()).unwrap());
     }
-    ctx.wait();
+    ctx.wait().expect("GPU polling failed");
     mark("  meshes uploaded OK");
 
     let sun_dir = Vec3::new(-0.4, -0.82, -0.4).normalize();
@@ -1353,6 +1352,7 @@ fn main() {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(pipeline.shadow());
         pass.set_bind_group(0, &bind, &[]);
@@ -1363,7 +1363,7 @@ fn main() {
         }
     }
     ctx.queue.submit([enc.finish()]);
-    ctx.wait();
+    ctx.wait().expect("GPU polling failed");
     mark("  shadow raster OK");
 
     mark("opaque pass: build scene bind group + draw + sample depth array");
@@ -1390,6 +1390,7 @@ fn main() {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: target.depth_view(),
@@ -1401,6 +1402,7 @@ fn main() {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(pipeline.opaque());
         pass.set_bind_group(0, &scene_bind, &[]);
@@ -1411,7 +1413,7 @@ fn main() {
         }
     }
     ctx.queue.submit([enc.finish()]);
-    ctx.wait();
+    ctx.wait().expect("GPU polling failed");
     mark("  opaque sample OK");
     mark("probe end (clean)");
     let _ = CASCADE_COUNT;
