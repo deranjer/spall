@@ -10,15 +10,14 @@ manifests. Cargo may select compatible patch releases only by updating
 
 | Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by |
 | --- | ---: | --- | --- | --- |
-| salva3d | 0.10.0 | default features; DFSPH CPU solver | `Apache-2.0` | CPU dam/canal feasibility prototype and opt-in local `sandbox-client --fluid-demo`; not integrated into `spall_sim` |
 | rayon | 1.12.0 (vendored path `vendor/parallel/rayon-1.12.0`, with rayon-core 1.13.0) | default features; global pool, size from `RAYON_NUM_THREADS` or core count | `MIT OR Apache-2.0` | Data-parallel loops inside one MAC step: velocity advection, PLIC plane reconstruction, and face-flux assembly. Each element writes only its own slot and ordered `collect` keeps serial order, so results are bit-identical for any thread count. Pressure CG and the multigrid smoother stay serial because thread dispatch cost more than the work at scale 2. |
 
-Vendored crates (`salva3d` with local instrumentation, and `rayon`/`rayon-core`/`crossbeam-deque`/`crossbeam-epoch` for Salva's `parallel` feature and the MAC solver) live in the top-level `vendor/` directory, which the workspace lists in `exclude`. Cargo makes a path dependency an implicit workspace member when it sits inside a member's directory, and it ignores `exclude` there. Under `crates/spall_fluid/vendor` they were linted as Spall code, and `--all-features` enabled Salva's mutually exclusive `dim2`/`f64` and rayon-core's unsupported `web_spin_lock`. Do not move them back under a member.
+The vendored crates (`rayon`, `rayon-core`, `crossbeam-deque`, `crossbeam-epoch`) live in the top-level `vendor/` directory, which the workspace lists in `exclude`. Cargo makes a path dependency an implicit workspace member when it sits inside a member's directory, and it ignores `exclude` there. Under `crates/spall_fluid/vendor` they were linted as Spall code, and `--all-features` enabled rayon-core's unsupported `web_spin_lock` (and, while vendored, Salva's mutually exclusive `dim2`/`f64`). Do not move them back under a member.
 
-Salva's optional Rapier 0.35.1 dependency is compatible with the workspace's
-Rapier 0.35.3 semver line. Salva's internal CFL substep chooser is disabled in
-the inspected release source; measured runs report one substep. The probe
-does not alter the workspace Rapier version.
+The Salva 0.10.0 DFSPH particle backend was evaluated in ENG-103 and removed
+after the two-phase MAC grid was selected (roof-containment and cost gates
+failed; see `docs/reports/ENG-103.md`). The vendored `salva3d` copy and its
+`fnv`, `generational-arena`, and `itertools` 0.14 dependencies left the lock.
 
 ## T00 — build and process harness (verified 2026-09-06)
 

@@ -1,14 +1,13 @@
 //! CPU fluid state and voxel-boundary snapshots for Spall.
 //!
-//! Water is stored independently from voxel materials. This crate currently
-//! provides bounded domain construction, strict boundary capture, and water
-//! accounting. The feasibility backend uses Salva's CPU DFSPH particle solver;
-//! Rapier coupling, persistence, and network replication remain outside this
-//! prototype.
+//! Water is stored independently from voxel materials. This crate provides
+//! bounded domain construction, strict boundary capture, water accounting,
+//! and the two-phase MAC/VOF grid solver selected by ENG-103 (`grid_mac`).
+//! Rapier coupling, persistence, and network replication are not yet
+//! integrated (ENG-105).
 
 pub mod fixtures;
 pub mod grid_mac;
-pub mod sph;
 
 use spall_core::{GlobalCell, MaterialId};
 use spall_voxel::{AccessError, Residency, Sample, Volume};

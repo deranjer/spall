@@ -2591,9 +2591,8 @@ pub fn amplitude_ratio_per_period(peaks: &[(f64, f64)], period: f64) -> Option<f
     Some((num / den * period).exp())
 }
 
-/// MAC/VOF twin of the original ENG-103 voxel reservoir fixture. The Salva
-/// fixture is used only to obtain the original resident solid scene and
-/// reference liquid volume; its particles are not advanced by this backend.
+/// Grid water on the ENG-103 finite-reservoir voxel scene
+/// (`fixtures::ReservoirScene`), seeded with the scene's reference volume.
 pub struct GridReservoirFixture {
     volume: spall_voxel::Volume,
     grid: MacGridWorld,
@@ -2653,10 +2652,10 @@ impl GridReservoirFixture {
         scale: u32,
         refinement: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let source = crate::fixtures::TwoReservoirFixture::new_stability_basin(scale, 1.0 / 60.0)?;
+        let source = crate::fixtures::ReservoirScene::new_stability_basin(scale)?;
         let volume = source.volume().clone();
         let spec = source.domain();
-        let initial_volume_m3 = source.fluid().initial_volume_m3();
+        let initial_volume_m3 = source.reference_volume_m3();
         let base_boundary = SolidBoundary::capture(&volume, spec)?;
         let boundary = base_boundary.refined(refinement, 2_000_000)?;
         let config = MacConfig {
@@ -2688,13 +2687,13 @@ impl GridReservoirFixture {
         refinement: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let source = if tunnel_pool {
-            crate::fixtures::TwoReservoirFixture::new_tunnel_under_separate_pool(scale, 1.0 / 60.0)?
+            crate::fixtures::ReservoirScene::new_tunnel_under_separate_pool(scale)?
         } else {
-            crate::fixtures::TwoReservoirFixture::new_scaled(scale, 1.0 / 60.0)?
+            crate::fixtures::ReservoirScene::new_scaled(scale)?
         };
         let volume = source.volume().clone();
         let spec = source.domain();
-        let initial_volume_m3 = source.fluid().initial_volume_m3();
+        let initial_volume_m3 = source.reference_volume_m3();
         let base_boundary = SolidBoundary::capture(&volume, spec)?;
         let boundary = base_boundary.refined(refinement, 2_000_000)?;
         let config = MacConfig {
@@ -4706,7 +4705,7 @@ mod tests {
     }
 
     #[test]
-    fn voxel_reservoir_initialization_matches_salva_volume_and_canal_moves_water() {
+    fn voxel_reservoir_initialization_matches_reference_volume_and_canal_moves_water() {
         let mut fixture = GridReservoirFixture::new(1, true).unwrap();
         assert!((fixture.grid.water_volume_m3() - fixture.initial_volume_m3).abs() < 1.0e-10);
         let initial_difference = fixture.p95_level_difference_m();
