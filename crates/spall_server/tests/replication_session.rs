@@ -47,22 +47,7 @@ fn wait_for_file(path: &PathBuf, deadline: Duration) -> String {
 
 #[test]
 fn client_replica_matches_the_server_hash_over_real_quic() {
-    bridge_cut_session(false);
-}
-
-/// The experimental per-brick terrain colliders keep the networked contract: the client replica
-/// converges on the same authoritative hash and the detached beam still appears.
-#[test]
-fn client_replica_matches_the_server_hash_with_brick_terrain_colliders() {
-    bridge_cut_session(true);
-}
-
-fn bridge_cut_session(brick_colliders: bool) {
-    let dir = unique_dir(if brick_colliders {
-        "session-bricks"
-    } else {
-        "session"
-    });
+    let dir = unique_dir("session");
     let token = JoinToken::generate().unwrap();
     let fp_path = dir.join("server.fingerprint");
     let addr_path = dir.join("server.addr");
@@ -70,6 +55,7 @@ fn bridge_cut_session(brick_colliders: bool) {
     let server_cfg = ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 300,
         quiescence_ticks: 30,
@@ -97,13 +83,11 @@ fn bridge_cut_session(brick_colliders: bool) {
         motion_interest: None,
         residency: None,
         residency_disk_path: None,
-        terrain_brick_colliders: brick_colliders,
-        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
-        baseline_rate_limit_bytes_per_sec: None,
-        wake_audit: false,
+        credential_registry_file: None,
+        custom_world: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -133,9 +117,9 @@ fn bridge_cut_session(brick_colliders: bool) {
         summary_json: Some(dir.join("client.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
-        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     };
 
     let client = run_replication_client(client_cfg).expect("client run");
@@ -172,11 +156,6 @@ fn bridge_cut_session(brick_colliders: bool) {
         client.motion_snapshots >= 1,
         "the client received motion for the detached body"
     );
-    assert_eq!(
-        server.terrain_brick_colliders > 0,
-        brick_colliders,
-        "the summary reports whether per-brick terrain colliders were active"
-    );
 }
 
 /// Run the host once with `--save`, cut the column, let it checkpoint on
@@ -195,6 +174,7 @@ fn server_persists_and_recovers_across_a_restart() {
     let base_cfg = |tag: &str| ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 200,
         quiescence_ticks: 20,
@@ -220,13 +200,11 @@ fn server_persists_and_recovers_across_a_restart() {
         motion_interest: None,
         residency: None,
         residency_disk_path: None,
-        terrain_brick_colliders: false,
-        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
-        baseline_rate_limit_bytes_per_sec: None,
-        wake_audit: false,
+        credential_registry_file: None,
+        custom_world: None,
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {
@@ -253,9 +231,9 @@ fn server_persists_and_recovers_across_a_restart() {
             summary_json: None,
             transport: TransportConfig::for_tests(),
             client_residency: None,
-            baseline_staging_budget_bytes: None,
             on_replica_ready: None,
             interactive: None,
+            client_authoritative: false,
         };
         let _ = run_replication_client(client_cfg).expect("client run");
         server_thread
@@ -321,6 +299,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
     let cfg = ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 200,
         quiescence_ticks: 20,
@@ -347,13 +326,11 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         motion_interest: None,
         residency: None,
         residency_disk_path: None,
-        terrain_brick_colliders: false,
-        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
-        baseline_rate_limit_bytes_per_sec: None,
-        wake_audit: false,
+        credential_registry_file: None,
+        custom_world: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(cfg));
@@ -379,9 +356,9 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         summary_json: None,
         transport: TransportConfig::for_tests(),
         client_residency: None,
-        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     };
     let _ = run_replication_client(client_cfg).expect("client run");
 
@@ -406,29 +383,4 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         "server log records the failed shutdown: {log}"
     );
     assert!(save.exists(), "the world database is kept for inspection");
-}
-
-/// Unsupported combinations are refused before any state is built.
-#[test]
-fn brick_terrain_colliders_with_residency_are_refused_explicitly() {
-    let dir = unique_dir("refused");
-    let mut cfg = ServeConfig::headless(
-        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        Scene::BridgeCut,
-        JoinToken::generate().unwrap(),
-    );
-    cfg.log_json = dir.join("server.jsonl");
-    cfg.terrain_brick_colliders = true;
-    cfg.residency = Some(spall_server::ResidencyLimits {
-        budget_bricks: 8,
-        max_dense_bytes: u64::MAX,
-        interest_radius_bricks: 2,
-    });
-    let err = spall_server::serve::validate_config(&cfg).unwrap_err();
-    assert!(err.contains("unsupported with residency"), "{err}");
-    let err = serve(cfg).unwrap_err();
-    assert!(
-        matches!(err, spall_server::serve::ServeError::UnsupportedConfig(_)),
-        "{err}"
-    );
 }

@@ -20,9 +20,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::replication::{
-    BodyDigest, ClientReplication, InterestSet, MOTION_SNAPSHOT_WIRE_BYTES, MotionBudget,
-};
+use crate::action_catalog::ToolCatalog;
+use crate::replication::{BodyDigest, ClientReplication, InterestSet, MotionBudget};
 use glam::DVec3;
 use serde::Serialize;
 use spall_core::{
@@ -36,16 +35,17 @@ use spall_net::{
 use spall_physics::PhysicsConfig;
 use spall_protocol::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, AlgorithmVersions, BaselineAck,
-    ClaimedTarget, Handshake, Hash32, InputFrame, InterestEpoch, MotionSnapshot, NegotiatedLimits,
+    ClaimedTarget, Handshake, InputFrame, InterestEpoch, MotionSnapshot, NegotiatedLimits,
     PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
     frame_input, recent_input, session_player_entity,
 };
 use spall_sim::fixtures::{
     G4_WORKLOAD_SPAWNS, SEPARATED_REGION_FAR_SPAWNS, SEPARATED_REGION_SPAWNS, WALK_ARENA_SPAWNS,
 };
+use spall_sim::world::TerrainColliderMode;
 use spall_sim::{
     Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
-    SimulationConfig, action_statuses, fixtures,
+    SimulationConfig, action_statuses,
 };
 use spall_store::Writer;
 use spall_structure::AnchorPlane;
@@ -54,6 +54,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::baseline::{self, BaselineTransfer};
 use crate::commit_latency::{self, CommitLatency};
+use crate::input_schedule::PlayerInputSchedule;
 use crate::persist::{self, PersistConfig};
 use crate::persist_pipeline::{PersistPipeline, PipelineConfig};
 
@@ -153,10 +154,7 @@ pub const MAX_ACTIONS_PER_CLIENT_PER_TICK: u32 = 4;
 /// (`docs/protocol.md`: `RepairRequest` is "rate-limited"). Surplus is dropped;
 /// the replica re-requests, itself rate-limited (ENG-49).
 pub const MAX_REPAIRS_PER_CLIENT_PER_TICK: u32 = 8;
-
-/// Concurrent accept loops (each runs one QUIC handshake + authentication at a
-/// time).
-const ACCEPT_WORKERS: usize = 8;
+pub const MAX_PROGRESSION_PER_CLIENT_PER_TICK: u32 = 8;
 
 /// Most reliable messages (committed topology, `ActionStatus`, baseline
 /// transfers) that may sit unsent in one client's outbound queue before that
@@ -165,11 +163,6 @@ const ACCEPT_WORKERS: usize = 8;
 /// (`docs/protocol.md`: "repair or disconnect a client whose reliable backlog
 /// exceeds the bounded window").
 pub const MAX_RELIABLE_BACKLOG: usize = 2048;
-
-/// Count of reliable-backlog overflows (a client disconnected because its
-/// backlog blew a cap) since the last [`serve`] start.
-static RELIABLE_BACKLOG_OVERFLOWS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// Byte ceiling on that same per-client reliable queue.
 pub const MAX_RELIABLE_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
@@ -225,14 +218,6 @@ pub enum Scene {
     /// [`spall_sim::fixtures::g4_workload_setup`] /
     /// [`spall_sim::fixtures::spawn_g4_workload_bodies`].
     G4Workload,
-    /// T23 / G4 integrated workload, players **clustered**: the ground slab, a
-    /// dormant 64-brick giant, comb and tower bodies as edit targets, 256
-    /// agitated active + 4,096 sleeping debris bodies. See
-    /// [`spall_sim::fixtures::g4_integrated_setup`].
-    G4IntegratedClustered,
-    /// As [`Scene::G4IntegratedClustered`] with the players **separated** (two
-    /// clusters about 77 m apart).
-    G4IntegratedSeparated,
     /// Full-envelope separated regions joined by a causeway (T23 / G3 row 2).
     SeparatedRegionsFar,
     /// T11a / ENG-62: the full G1 gate envelope — `64 x 32 x 64 m` of real,
@@ -246,10 +231,55 @@ pub enum Scene {
     /// column-and-beam in the player lane. See
     /// [`spall_sim::fixtures::sleep_wake_setup`].
     SleepWake,
-    /// Review demo (2026-09-20): the integrated ground slab and perimeter wall with a
-    /// one-cell-foot lever on a broad dynamic base, for hands-on viewing with
-    /// `cargo xtask play --scene review-lever`. Cut a chunk out of either end of the beam.
-    ReviewLever,
+    /// Not a gate scene: a hands-on playground (plaza, stairs, maze, jump
+    /// course) with a live debris spawner, for `cargo xtask play --scene
+    /// playground`. See [`spall_sim::fixtures::playground_setup`] /
+    /// [`spall_sim::playground`].
+    Playground,
+    /// Not a gate scene: [`Scene::Walk`]'s arena with one dynamic 0.75 m box
+    /// resting in the player lane, for the headless prediction/push repro
+    /// (`crates/spall_server/tests/prediction_timeline.rs`). See
+    /// [`spall_sim::spawn_push_test_box`].
+    PushTest,
+    /// A game-supplied world (see [`CustomWorld`] and
+    /// [`ServeConfig::custom_world`]), e.g. a scene authored in the editor.
+    /// Never selected by name; the host must supply the world.
+    Custom,
+}
+
+/// A game-supplied world for [`Scene::Custom`]: a terrain/material/physics
+/// setup builder plus the feet positions (metres) for connecting players,
+/// indexed by connection slot. The builder runs once on the authoritative
+/// simulation thread when a new world is created.
+#[derive(Clone)]
+pub struct CustomWorld {
+    player_spawns: Vec<[f64; 3]>,
+    build: Arc<dyn Fn() -> spall_sim::WorldSetup + Send + Sync>,
+}
+
+impl CustomWorld {
+    /// `player_spawns` must be non-empty: every connection gets a capsule.
+    pub fn new(
+        player_spawns: Vec<[f64; 3]>,
+        build: impl Fn() -> spall_sim::WorldSetup + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            player_spawns,
+            build: Arc::new(build),
+        }
+    }
+
+    pub fn player_spawns(&self) -> &[[f64; 3]] {
+        &self.player_spawns
+    }
+}
+
+impl std::fmt::Debug for CustomWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomWorld")
+            .field("player_spawns", &self.player_spawns)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Scene {
@@ -266,33 +296,15 @@ impl Scene {
             "bulk-split" | "giant-split" => Some(Scene::BulkSplit),
             "separated-regions" | "t23-g3" | "g3" => Some(Scene::SeparatedRegions),
             "g4-workload" | "t23-g4" | "g4" => Some(Scene::G4Workload),
-            "g4-integrated-clustered" => Some(Scene::G4IntegratedClustered),
-            "g4-integrated-separated" | "g4-integrated" => Some(Scene::G4IntegratedSeparated),
             "separated-regions-far" | "t23-g3-full-envelope" | "g3-far" => {
                 Some(Scene::SeparatedRegionsFar)
             }
             "g1-full-envelope" | "g1-full-workload" | "g1" => Some(Scene::G1FullEnvelope),
             "sleep-wake" | "sleepwake" | "t21-sleep-wake" => Some(Scene::SleepWake),
-            "review-lever" => Some(Scene::ReviewLever),
+            "playground" | "play" | "sandbox-playground" => Some(Scene::Playground),
+            "push-test" | "pushtest" => Some(Scene::PushTest),
+            // `Scene::Custom` is host-supplied and never parsed from a name.
             _ => None,
-        }
-    }
-
-    /// `true` for the two T23 / G4 integrated-workload scenes.
-    pub fn is_g4_integrated(self) -> bool {
-        matches!(
-            self,
-            Scene::G4IntegratedClustered | Scene::G4IntegratedSeparated
-        )
-    }
-
-    /// The scene's always-awake debris the fixture agitator keeps in the solver
-    /// (empty for every scene but the integrated workload).
-    pub fn agitated_bodies(self) -> Vec<spall_sim::fixtures::G4ActiveBody> {
-        if self.is_g4_integrated() {
-            spall_sim::fixtures::g4_integrated_active_bodies()
-        } else {
-            Vec::new()
         }
     }
 
@@ -306,12 +318,12 @@ impl Scene {
             Scene::BulkSplit => "bulk-split",
             Scene::SeparatedRegions => "separated-regions",
             Scene::G4Workload => "g4-workload",
-            Scene::G4IntegratedClustered => "g4-integrated-clustered",
-            Scene::G4IntegratedSeparated => "g4-integrated-separated",
             Scene::SeparatedRegionsFar => "separated-regions-far",
             Scene::G1FullEnvelope => "g1-full-envelope",
             Scene::SleepWake => "sleep-wake",
-            Scene::ReviewLever => "review-lever",
+            Scene::Playground => "playground",
+            Scene::PushTest => "push-test",
+            Scene::Custom => "custom",
         }
     }
 
@@ -322,12 +334,12 @@ impl Scene {
             Scene::Walk
                 | Scene::SeparatedRegions
                 | Scene::G4Workload
-                | Scene::G4IntegratedClustered
-                | Scene::G4IntegratedSeparated
                 | Scene::SeparatedRegionsFar
                 | Scene::G1FullEnvelope
                 | Scene::SleepWake
-                | Scene::ReviewLever
+                | Scene::Playground
+                | Scene::PushTest
+                | Scene::Custom
         )
     }
 
@@ -338,17 +350,31 @@ impl Scene {
             Scene::Walk => &WALK_ARENA_SPAWNS,
             Scene::SeparatedRegions => &SEPARATED_REGION_SPAWNS,
             Scene::G4Workload => &G4_WORKLOAD_SPAWNS,
-            Scene::G4IntegratedClustered => &spall_sim::fixtures::G4_INTEGRATED_CLUSTERED_SPAWNS,
-            Scene::G4IntegratedSeparated => &spall_sim::fixtures::G4_INTEGRATED_SEPARATED_SPAWNS,
             Scene::SeparatedRegionsFar => &SEPARATED_REGION_FAR_SPAWNS,
             Scene::G1FullEnvelope => &spall_sim::fixtures::G1_WORKLOAD_SPAWNS,
             Scene::SleepWake => &WALK_ARENA_SPAWNS,
-            Scene::ReviewLever => &spall_sim::fixtures::REVIEW_LEVER_SPAWNS,
+            Scene::Playground => &spall_sim::fixtures::PLAYGROUND_SPAWNS,
+            Scene::PushTest => &WALK_ARENA_SPAWNS,
             _ => &[],
         }
     }
 
+    #[cfg(test)]
     fn simulation(self) -> Simulation {
+        self.simulation_with_terrain_collider_mode(TerrainColliderMode::PerBrick)
+    }
+
+    #[cfg(test)]
+    fn simulation_with_terrain_collider_mode(self, mode: TerrainColliderMode) -> Simulation {
+        self.simulation_with_materials(mode, spall_sim::fixtures::stone_manifest(), None)
+    }
+
+    fn simulation_with_materials(
+        self,
+        mode: TerrainColliderMode,
+        materials: spall_core::MaterialManifest,
+        custom: Option<&CustomWorld>,
+    ) -> Simulation {
         let mut setup = match self {
             Scene::BridgeCut => spall_sim::fixtures::bridged_terrain_setup(),
             Scene::CrossBridgeCut => spall_sim::fixtures::cross_brick_bridged_setup(),
@@ -357,16 +383,17 @@ impl Scene {
             Scene::BulkSplit => spall_sim::fixtures::bulk_split_setup(),
             Scene::SeparatedRegions => spall_sim::fixtures::separated_regions_setup(),
             Scene::G4Workload => spall_sim::fixtures::g4_workload_setup(),
-            Scene::G4IntegratedClustered | Scene::G4IntegratedSeparated => {
-                spall_sim::fixtures::g4_integrated_setup()
-            }
             Scene::SeparatedRegionsFar => {
                 spall_sim::fixtures::separated_regions_full_envelope_setup()
             }
             Scene::G1FullEnvelope => spall_sim::fixtures::g1_full_envelope_setup(),
             Scene::SleepWake => spall_sim::fixtures::sleep_wake_setup(),
-            Scene::ReviewLever => spall_sim::fixtures::g4_integrated_setup(),
+            Scene::Playground => spall_sim::fixtures::playground_setup(),
+            Scene::PushTest => spall_sim::fixtures::walk_arena_setup(),
+            // `serve` rejects a `Custom` scene without a world before this runs.
+            Scene::Custom => (custom.expect("Scene::Custom requires a CustomWorld").build)(),
         };
+        setup.materials = materials;
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
         // CCD broad-phase BVH can keep a stale proxy for the just-removed
@@ -374,31 +401,35 @@ impl Scene {
         // is still settling (repro: `cargo xtask scenario --name
         // g1-networked-destruction`). Skip the CCD pass — a no-op here.
         setup.physics.disable_ccd = true;
-        let mut sim =
-            Simulation::new(SimulationConfig::new(setup)).expect("built-in scene is valid");
+        let mut sim_config = SimulationConfig::new(setup);
+        sim_config.terrain_collider_mode = mode;
+        let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
         if matches!(self, Scene::G4Workload) {
             // Row 12: 256 active (64 near the west cluster's first spawn) +
             // 4096 sleeping debris bodies, built once at scene-construction
             // time (docs/reports/G3.md increment for this row).
             spall_sim::fixtures::spawn_g4_workload_bodies(sim.world_mut(), G4_WORKLOAD_SPAWNS[0]);
         }
-        if self.is_g4_integrated() {
-            // The integrated workload's destructible bodies and debris, built
-            // once at scene-construction time (entity-id order is part of the
-            // harness's edit generator; see `spall_voxel::fixtures`).
-            spall_sim::fixtures::spawn_g4_integrated_bodies(
-                sim.world_mut(),
-                self.player_spawns()[0],
-            );
-        }
-        if matches!(self, Scene::ReviewLever) {
-            spall_sim::fixtures::spawn_review_lever(sim.world_mut());
-        }
         if matches!(self, Scene::G1FullEnvelope) {
             // The gate's "moving hollow test volume" — built once at
             // scene-construction time, same as G4Workload's debris.
             spall_sim::fixtures::spawn_g1_hollow_test_volume(sim.world_mut())
                 .expect("hollow test volume spawns");
+        }
+        if matches!(self, Scene::PushTest) {
+            spall_sim::spawn_push_test_box(sim.world_mut());
+        }
+        if matches!(self, Scene::Playground) {
+            // Not a gate scene: the interactive playground's debris pile,
+            // built once at scene-construction time for the same reason
+            // G4Workload's and G1FullEnvelope's populations are — a body
+            // `spawn_body` creates bypasses the commit pipeline, so it must
+            // exist before any client's baseline pull to ever be seen (see
+            // `spall_sim::playground`'s module doc).
+            spall_sim::populate_playground_debris(
+                sim.world_mut(),
+                &spall_sim::playground_drop_zones(),
+            );
         }
         sim
     }
@@ -409,6 +440,9 @@ impl Scene {
 pub struct ServeConfig {
     pub listen: SocketAddr,
     pub scene: Scene,
+    /// Derived terrain collision mode. Per-brick is the adopted default;
+    /// whole-terrain is available for controlled legacy comparisons.
+    pub terrain_collider_mode: TerrainColliderMode,
     pub join_token: JoinToken,
     /// Hard cap on server ticks for this run.
     pub max_ticks: u64,
@@ -514,156 +548,12 @@ pub struct ServeConfig {
     /// are excluded; measured ticks include ingress through replication and
     /// residency, ending immediately before pacing sleep.
     pub timing_window: Option<TimingWindow>,
-    /// Optional per-connection pacing of baseline bulk transfers, in payload
-    /// bytes per second (`docs/validation.md`: baselines have a separate capped
-    /// `1 MiB/s/client` budget). `None` (the default) sends unpaced.
-    pub baseline_rate_limit_bytes_per_sec: Option<u64>,
-    /// Account which operations wake rapier-asleep bodies (`ServeSummary::wake_reasons`).
-    /// Each probed operation scans every body, so it is off by default.
-    pub wake_audit: bool,
-    /// **Experimental, default off.** Split the physics terrain into one collider per solid
-    /// brick so a far terrain edit no longer wakes unrelated resting bodies
-    /// (`docs/reports/terrain-collider-locality.md`). Unsupported combinations are refused by
-    /// [`validate_config`]: it cannot be combined with residency.
-    pub terrain_brick_colliders: bool,
-    /// Segmented late-join baselines. `Some(n)` forces the segmented format (per-segment decoded
-    /// budget `n` bytes) for every client that advertises support; `None` uses the single blob
-    /// unless the world would not fit it, then segments at
-    /// [`spall_protocol::segment::DEFAULT_SEGMENT_DECODED_BYTES`]. A client that does not
-    /// advertise support and needs a segmented transfer is refused explicitly.
-    pub baseline_segment_bytes: Option<usize>,
-}
-
-/// Body-state census at a **phase-jittered** tick. The workload digs terrain every 60 ticks and a
-/// dig wakes what rests on it, so a census that always lands on the same tick of that cycle (the
-/// per-60-tick telemetry does) reads a fixed phase of the wake / re-sleep cycle. These samples fall
-/// at `30k + (11k mod 30)`, sweeping every phase, so their mean is an unbiased awake-body time.
-#[derive(Debug, Clone, Serialize)]
-pub struct AwakeSampleRow {
-    pub tick: u64,
-    /// Dynamic bodies not asleep and not dormant.
-    pub awake: u32,
-    /// Asleep in the solver but still stepped (not dormant).
-    pub asleep: u32,
-    pub dormant: u32,
-}
-
-/// Most awake samples kept (one per ~30 ticks; 4,096 covers over 34 simulated minutes).
-const MAX_AWAKE_SAMPLES: usize = 4_096;
-
-/// One committed edit on a traced tick: what it was and how much geometry it touched.
-#[derive(Debug, Clone, Serialize)]
-pub struct TickEditRow {
-    pub request: u64,
-    /// `terrain_dig`, `body_cut` or `blast` (a body edit of at least the named-blast radius).
-    pub kind: &'static str,
-    /// The volume the brush hit (the terrain volume for a dig).
-    pub volume: u64,
-    /// Brush radius in cells, when the transaction carries an integer brush.
-    pub radius_cells: Option<i64>,
-    /// Bricks the commit revised (`before` / `after` revision lists).
-    pub bricks_before: usize,
-    pub bricks_after: usize,
-    /// Topology ops in the transaction, and bodies it created.
-    pub ops: usize,
-    pub children: usize,
-    /// It moved the topology epoch (a split) / shipped a bulk baseline.
-    pub split: bool,
-    pub bulk_baseline: bool,
-}
-
-/// One of the slowest measured ticks with the stage spans recorded **on that same tick**.
-#[derive(Debug, Clone, Serialize)]
-pub struct SlowTickRow {
-    pub tick: u64,
-    pub busy_ms: f64,
-    /// Every span recorded that tick (`name`, ms), in completion order; nested spans overlap
-    /// their parents, so these are not additive.
-    pub spans: Vec<(String, f64)>,
-    pub edits: Vec<TickEditRow>,
-    pub bodies_total: usize,
-    pub intents_pending: usize,
-}
-
-/// Tick cost over one successive window of measured ticks (`TICK_WINDOW_TICKS`), split so an
-/// occasional expensive dig can be told apart from a rising ordinary-tick cost.
-#[derive(Debug, Clone, Serialize)]
-pub struct TickWindowRow {
-    /// 0-based window index and the first measured tick it covers.
-    pub window: u32,
-    pub first_tick: u64,
-    pub ticks: u64,
-    /// Every tick in the window.
-    pub busy_p50_ms: f64,
-    pub busy_p95_ms: f64,
-    pub busy_p99_ms: f64,
-    pub busy_max_ms: f64,
-    /// Ticks that committed no edit ("ordinary" ticks).
-    pub ordinary_ticks: u64,
-    pub ordinary_p50_ms: f64,
-    pub ordinary_p95_ms: f64,
-    pub ordinary_p99_ms: f64,
-    /// Ticks that committed a terrain dig, and their mean and worst busy time.
-    pub dig_ticks: u64,
-    pub dig_mean_ms: f64,
-    pub dig_max_ms: f64,
-    /// Ticks that committed a body cut / blast / giant / a mix, and their mean busy time.
-    pub other_edit_ticks: u64,
-    pub other_edit_mean_ms: f64,
-    /// Mean physics (`rapier_step` + `pose_extract`) time per tick in the window.
-    pub physics_mean_ms: f64,
-    /// Mean of the terrain-commit hash stage over the window's dig ticks.
-    pub dig_hash_mean_ms: f64,
-    pub over_16_7_ms: u64,
-}
-
-/// Ticks per reporting window: one minute of server time.
-const TICK_WINDOW_TICKS: u64 = 3_600;
-
-/// Tick busy time and mean stage time for one class of tick, from the same ticks.
-#[derive(Debug, Clone, Serialize)]
-pub struct TickClassRow {
-    /// `no_edit`, `terrain_dig`, `body_cut`, `blast`, `giant` or `mixed`.
-    pub class: &'static str,
-    pub ticks: u64,
-    pub busy_p50_ms: f64,
-    pub busy_p95_ms: f64,
-    pub busy_p99_ms: f64,
-    pub busy_max_ms: f64,
-    /// Ticks over the 16.7 ms p99 target.
-    pub over_16_7_ms: u64,
-    /// Mean per-tick span sums over this class's ticks (`stage`, mean ms).
-    pub mean_stage_ms: Vec<(String, f64)>,
-}
-
-/// How the edit pipeline behaved under the offered load. `queue_full_rejections` are the explicit
-/// overload rejections; `pending_max` is the deepest the intent queue got (cap 256 by default);
-/// `retried_conflicts` / `stale_discards` count staged work redone because the world moved;
-/// `pending_ticks` is the number of ticks that ended with intents still waiting, and
-/// `commits_in_pending_ticks` the commits landed on those ticks (throughput while backlogged).
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct IntentStats {
-    pub queue_full_rejections: u64,
-    pub pending_max: u64,
-    pub retried_conflicts: u64,
-    pub stale_discards: u64,
-    pub serialized_regions: u64,
-    pub ticks: u64,
-    pub pending_ticks: u64,
-    pub commits_in_pending_ticks: u64,
-    /// `pending_after` summed over ticks (mean depth = sum / ticks).
-    pub pending_depth_sum: u64,
-}
-
-/// Refuses configurations the server cannot honour, explicitly and before any state is built.
-pub fn validate_config(config: &ServeConfig) -> Result<(), String> {
-    if config.terrain_brick_colliders && config.residency.is_some() {
-        return Err(
-            "terrain_brick_colliders is unsupported with residency (per-brick terrain colliders              have no eviction/reload lifecycle); disable one of them"
-                .into(),
-        );
-    }
-    Ok(())
+    /// Optional credential registry path polled for atomic rotation/revocation
+    /// updates. Only used by player-credential authentication.
+    pub credential_registry_file: Option<PathBuf>,
+    /// The world and player spawns for [`Scene::Custom`]; ignored for every
+    /// other scene. `serve` fails fast if `scene` is `Custom` and this is `None`.
+    pub custom_world: Option<CustomWorld>,
 }
 
 /// A bounded, explicit server timing window. The server records at most
@@ -703,22 +593,7 @@ pub struct MotionInterest {
     /// bridge scenes). `None` there leaves that client unfiltered
     /// ([`InterestSet::Global`]).
     pub static_anchor_m: Option<[f64; 3]>,
-    /// Cap each client's per-batch motion by its measured QUIC path: no more
-    /// than [`MOTION_CWND_SHARE`] of `cwnd / rtt`. Datagrams share the
-    /// congestion window with the reliable topology stream, so on a lossy
-    /// path unbounded motion starves committed topology (measured: cwnd 3-8 KB
-    /// at 100 ms / 2% loss, replicas 76 s behind by the end of a run).
-    pub congestion_aware: bool,
 }
-
-/// Fraction of a connection's `cwnd / rtt` motion may use when
-/// [`MotionInterest::congestion_aware`] is set.
-const MOTION_CWND_SHARE: f64 = 0.25;
-/// Floor on the congestion-aware budget: a batch always carries at least this
-/// many snapshots (the client's own player and the nearest bodies).
-const MOTION_MIN_BATCH_SNAPSHOTS: usize = 4;
-/// Seconds between motion batches (20 Hz).
-const MOTION_BATCH_SECONDS: f64 = 0.05;
 
 /// A player capsule's bounding radius for interest tests, metres. Small and
 /// fixed — a player is prioritised and never `Excluded` regardless.
@@ -730,6 +605,7 @@ impl ServeConfig {
         Self {
             listen,
             scene,
+            terrain_collider_mode: TerrainColliderMode::PerBrick,
             join_token: token,
             max_ticks: 1_200,
             quiescence_ticks: 45,
@@ -757,10 +633,8 @@ impl ServeConfig {
             contact_damage: None,
             dormancy: None,
             timing_window: None,
-            baseline_rate_limit_bytes_per_sec: None,
-            wake_audit: false,
-            terrain_brick_colliders: false,
-            baseline_segment_bytes: None,
+            credential_registry_file: None,
+            custom_world: None,
         }
     }
 }
@@ -857,12 +731,7 @@ pub struct ServeSummary {
     pub actions_staged: u64,
     /// T11a / ENG-62: staged requests that had not committed when the run ended
     /// ("queued" in the gate breakdown).
-    /// Admitted requests still awaiting an outcome at the end (genuinely pending; a request the
-    /// pipeline rejected after admitting it is terminal and is **not** counted here).
     pub actions_queued_unresolved: u64,
-    /// Attempts, unique logical edits, terminal rejections and pending work, kept apart.
-    #[serde(default)]
-    pub admission: crate::admission::AdmissionSummary,
     /// T11a / ENG-62: server commit latency — admission to commit — as a
     /// nearest-rank p95 (ms) per commit shape, with the sample count behind each
     /// figure. Gate targets (`docs/validation.md` "G1"): single-brick commit
@@ -981,90 +850,6 @@ pub struct ServeSummary {
     pub physics_max_ms: f64,
     pub physics_samples: u64,
     pub physics_window_complete: bool,
-    /// Measured-window ticks whose owning-thread busy time exceeded one 60 Hz
-    /// tick (16.7 ms).
-    pub tick_busy_over_budget_ticks: u64,
-    /// T23 / G4 (v10): one sample per 60 ticks — wall time, process memory,
-    /// reliable-backlog maxima, per-connection cumulative egress.
-    pub telemetry_samples: Vec<TelemetrySample>,
-    /// Server ticks at which a named blast (brush radius >= 8 cells) committed.
-    pub blast_commit_ticks: Vec<u64>,
-    /// Wall-clock commit time (ms since the timeline clock started) of each blast, parallel to
-    /// `blast_commit_ticks`; the recovery check is measured in wall time, not ticks.
-    #[serde(default)]
-    pub blast_commit_elapsed_ms: Vec<u64>,
-    /// Largest per-client unsent reliable backlog (bytes) seen at any sample.
-    pub reliable_backlog_peak_bytes: u64,
-    /// Age (ms) of the oldest unsent reliable message at the worst sample.
-    pub reliable_backlog_peak_age_ms: u64,
-    /// Longest enqueue-to-transport-hand-off wait (ms) of any reliable message.
-    pub reliable_delivery_age_max_ms: u64,
-    /// The configured hard caps on that backlog, for the report.
-    pub reliable_backlog_cap_messages: usize,
-    pub reliable_backlog_cap_bytes: usize,
-    /// Clients disconnected because their reliable backlog blew its cap.
-    pub reliable_backlog_overflows: u64,
-    /// Baseline bulk sends started / failed / peak simultaneous, plus the
-    /// bounded record of completed ones and the configured pacing limit.
-    pub baseline_sends_started: u64,
-    pub baseline_sends_failed: u64,
-    pub baseline_sends_active_max: u64,
-    pub baseline_send_records: Vec<BaselineSendRecord>,
-    pub baseline_rate_limit_bytes_per_sec: Option<u64>,
-    /// Background baseline-capture pool: workers, jobs submitted, peak running
-    /// at once and peak waiting for a worker.
-    pub capture_pool_workers: usize,
-    pub capture_pool_submitted: u64,
-    pub capture_pool_active_max: u64,
-    pub capture_pool_queued_max: u64,
-    /// Working-set bytes of this process when the run ended.
-    pub process_end_memory_bytes: Option<u64>,
-    /// Joins refused with `server at capacity` (live connections were at
-    /// `max_clients`).
-    pub admission_refused_at_capacity: u64,
-    /// Per-session join timelines and replication counters (T23 / G4).
-    pub session_timelines: Vec<SessionTimeline>,
-    /// Per-stage owning-thread timing (sim staging/commit/physics and server
-    /// stages), measured window only when one is configured; sorted by total.
-    pub stage_timings: Vec<StageTimingRow>,
-    /// Worker-thread encode time (ms) of each background baseline capture.
-    pub baseline_capture_encode_ms: Vec<f64>,
-    /// `(ms, outcome)` per accept attempt (success with time since the previous
-    /// attempt finished, or the error), for join-failure root-causing.
-    pub accept_log: Vec<(u64, String)>,
-    /// Server startup stages before the first tick: scene build, initial
-    /// checkpoint capture and publish. Clients connect while these run, so they
-    /// are inside every joiner's readiness time.
-    pub startup_ms: Vec<(String, f64)>,
-    /// Wake-reason accounting (empty unless `ServeConfig::wake_audit`).
-    pub wake_reasons: Vec<WakeReasonRow>,
-    /// Number of per-brick terrain colliders (0 when the experimental mode is off).
-    #[serde(default)]
-    pub terrain_brick_colliders: u64,
-    /// Edit-intent admission and pipeline pressure (see [`IntentStats`]).
-    #[serde(default)]
-    pub intent_stats: IntentStats,
-    /// The slowest measured ticks with their same-tick stage spans and edits (bounded).
-    #[serde(default)]
-    pub slow_ticks: Vec<SlowTickRow>,
-    /// Tick busy time by what the tick committed, with per-class mean stage times.
-    #[serde(default)]
-    pub tick_classes: Vec<TickClassRow>,
-    /// Per-minute tick cost windows (bounded: one row per 3,600 measured ticks).
-    #[serde(default)]
-    pub tick_windows: Vec<TickWindowRow>,
-    /// Phase-jittered body-state census (about every 30 ticks).
-    #[serde(default)]
-    pub awake_series: Vec<AwakeSampleRow>,
-    /// Bodies observed below the world floor (see [`OutOfWorldRow`]); empty when none.
-    #[serde(default)]
-    pub out_of_world_bodies: Vec<OutOfWorldRow>,
-    /// Coverage of the containment census that produced `out_of_world_bodies`.
-    #[serde(default)]
-    pub containment_coverage: ContainmentCoverage,
-    /// `(elapsed_ms, max unsent reliable bytes, max age ms)` over all clients, every 6 ticks.
-    #[serde(default)]
-    pub backlog_series: Vec<(u64, u64, u64)>,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -1093,27 +878,344 @@ pub enum ServeError {
     Io(#[from] std::io::Error),
     #[error("tokio runtime: {0}")]
     Runtime(String),
-    #[error("unsupported configuration: {0}")]
-    UnsupportedConfig(String),
+    #[error("invalid server configuration: {0}")]
+    Configuration(String),
 }
 
 /// Runs the networked host to completion and returns its summary. Builds its own
 /// current-thread-free multi-thread Tokio runtime.
 pub fn serve(config: ServeConfig) -> Result<ServeSummary, ServeError> {
-    if let Err(e) = validate_config(&config) {
-        return Err(ServeError::UnsupportedConfig(e));
-    }
+    serve_with_game_content(
+        config,
+        ToolCatalog::default(),
+        spall_sim::fixtures::stone_manifest(),
+    )
+}
+
+/// Runs the networked host with a game-owned, versioned action catalog.
+/// Engine callers can continue using [`serve`] for the legacy built-in rules.
+pub fn serve_with_catalog(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content(config, tool_catalog, spall_sim::fixtures::stone_manifest())
+}
+
+/// Runs the networked host with game-owned authoritative tools and material
+/// definitions. The manifest is used for world creation, save recovery, and
+/// handshake compatibility checks.
+pub fn serve_with_game_content(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        None,
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// A callback for game-owned entities that belong in a newly-created world.
+/// It runs on the authoritative simulation thread before the initial
+/// checkpoint is published; it is not run when an existing save is restored.
+pub type InitialGameWorldSetup =
+    Box<dyn FnOnce(&mut Simulation) -> Result<(), String> + Send + 'static>;
+
+/// Game-owned observer invoked on the authoritative thread only after a
+/// client edit commits. Material counts describe cells actually removed by
+/// that committed cut, sampled from the validated pre-edit snapshot.
+pub type CommittedEditHandler = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            RequestId,
+            &std::collections::BTreeMap<spall_core::MaterialId, u64>,
+        ) + Send
+        + 'static,
+>;
+/// Converts a committed harvest to opaque, versioned game bytes. The stable
+/// identity and journal cursor are supplied by the server for durable replay.
+pub type CommittedEditOutboxEncoder = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            RequestId,
+            spall_core::JournalSeq,
+            &std::collections::BTreeMap<spall_core::MaterialId, u64>,
+        ) -> Option<spall_store::OutboxRecord>
+        + Send
+        + 'static,
+>;
+/// Applies one durable game event idempotently to the game's progression store.
+pub type OutboxProcessor =
+    Box<dyn FnMut(&spall_store::OutboxRecord) -> Result<(), String> + Send + 'static>;
+pub type ProgressionHandler = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            spall_protocol::ProgressionRequest,
+        ) -> spall_protocol::ProgressionResponse
+        + Send
+        + 'static,
+>;
+
+/// Runs the host with game content and an optional initial-world setup hook.
+/// The hook runs only when creating a new world, before its initial durable
+/// checkpoint, so restored saves never receive duplicate starter entities.
+pub fn serve_with_game_content_and_setup(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    setup: impl FnOnce(&mut Simulation) -> Result<(), String> + Send + 'static,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        Some(Box::new(setup)),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Runs the host with game content, optional new-world setup, and material
+/// profiles for the opt-in authoritative contact-damage pass.
+pub fn serve_with_game_content_and_policies(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Same as `serve_with_game_content_and_policies`, with a game asset manifest
+/// included in the exact client/server handshake content hash.
+pub fn serve_with_game_content_and_asset_manifest(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: spall_protocol::Hash32,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        Some(asset_manifest_hash),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Game-owned callback for post-commit material rewards, with the optional
+/// asset manifest included in handshake compatibility.
+pub fn serve_with_game_content_and_commit_handler(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Host with both post-commit harvest and authenticated progression handlers.
+pub fn serve_with_game_content_and_handlers(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        None,
+        None,
+        None,
+    )
+}
+
+/// Same as [`serve_with_game_content_and_handlers`], but authenticates clients
+/// using server-provisioned credentials, each bound to a stable `PlayerId`.
+/// The shared development join token in `ServeConfig` is ignored on this path.
+pub fn serve_with_game_content_and_player_credentials(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+    credentials: Vec<spall_net::PlayerCredential>,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        Some(credentials),
+        None,
+        None,
+    )
+}
+
+/// Credential-authenticated host whose harvest events are transactionally
+/// coupled to the world journal and replayed through the game's idempotent
+/// outbox processor after restart.
+pub fn serve_with_game_content_and_player_credentials_and_outbox(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+    credentials: Vec<spall_net::PlayerCredential>,
+    encoder: CommittedEditOutboxEncoder,
+    processor: OutboxProcessor,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        Some(credentials),
+        Some(encoder),
+        Some(processor),
+    )
+}
+
+fn serve_with_game_content_and_optional_setup(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    game_setup: Option<InitialGameWorldSetup>,
+    damage_profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: Option<CommittedEditHandler>,
+    progression_handler: Option<ProgressionHandler>,
+    player_credentials: Option<Vec<spall_net::PlayerCredential>>,
+    outbox_encoder: Option<CommittedEditOutboxEncoder>,
+    outbox_processor: Option<OutboxProcessor>,
+) -> Result<ServeSummary, ServeError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| ServeError::Runtime(e.to_string()))?;
-    runtime.block_on(serve_async(config))
+    runtime.block_on(serve_async(
+        config,
+        tool_catalog,
+        materials,
+        game_setup,
+        damage_profiles,
+        asset_manifest_hash,
+        commit_handler,
+        progression_handler,
+        player_credentials,
+        outbox_encoder,
+        outbox_processor,
+    ))
 }
 
-fn server_handshake() -> Handshake {
+fn server_handshake(
+    materials: &spall_core::MaterialManifest,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+) -> Handshake {
     Handshake {
         protocol_version: PROTOCOL_VERSION,
-        content_manifest_hash: Hash32::of(T10_CONTENT_TAG),
+        content_manifest_hash: asset_manifest_hash.map_or_else(
+            || spall_protocol::content_manifest_hash(materials),
+            |asset_hash| spall_protocol::content_manifest_hash_with_assets(materials, asset_hash),
+        ),
         world_id: spall_core::WorldId::from_u128(T10_WORLD_ID),
         generator_version: 1,
         algorithms: AlgorithmVersions {
@@ -1132,10 +1234,11 @@ fn server_handshake() -> Handshake {
 /// One reliable/repair message from a client to the sim bridge.
 #[derive(Debug)]
 enum Inbound {
-    /// A connection was accepted; the sim loop learns its session (and, from the
-    /// generation, whether it supersedes an earlier one on the same slot).
-    Joined(SessionId),
+    /// A connection was accepted; the sim loop learns its session and any
+    /// server-authenticated stable player principal.
+    Joined(SessionId, Option<spall_protocol::PlayerId>),
     Action(SessionId, ActionRequest),
+    Progression(SessionId, spall_protocol::ProgressionRequest),
     Repair(SessionId, RepairRequest),
     /// T19: a player movement input frame (datagram). At most one is applied per
     /// player per tick; redundant `recent` copies recover a dropped frame.
@@ -1146,6 +1249,105 @@ enum Inbound {
     Gone(SessionId),
 }
 
+struct ProgressionWork {
+    session: SessionId,
+    player_id: Option<spall_protocol::PlayerId>,
+    request: spall_protocol::ProgressionRequest,
+}
+
+struct ProgressionDone {
+    session: SessionId,
+    response: spall_protocol::ProgressionResponse,
+}
+
+struct ProgressionWorker {
+    submit: std::sync::mpsc::SyncSender<ProgressionWork>,
+    completed: std::sync::mpsc::Receiver<ProgressionDone>,
+}
+
+struct CommittedEditWork {
+    session: SessionId,
+    player_id: Option<spall_protocol::PlayerId>,
+    request_id: RequestId,
+    removed: std::collections::BTreeMap<spall_core::MaterialId, u64>,
+}
+struct CommittedEditWorker {
+    submit: std::sync::mpsc::SyncSender<CommittedEditWork>,
+}
+
+impl CommittedEditWorker {
+    fn spawn(mut handler: CommittedEditHandler) -> Self {
+        let (submit, work) = std::sync::mpsc::sync_channel::<CommittedEditWork>(64);
+        std::thread::Builder::new()
+            .name("spall-committed-game-events".into())
+            .spawn(move || {
+                while let Ok(work) = work.recv() {
+                    handler(work.session, work.player_id, work.request_id, &work.removed);
+                }
+            })
+            .expect("committed-edit worker thread must start");
+        Self { submit }
+    }
+}
+
+struct OutboxWork(spall_store::OutboxRecord);
+struct OutboxDone {
+    event_id: [u8; 32],
+    result: Result<(), String>,
+}
+struct OutboxWorker {
+    submit: std::sync::mpsc::SyncSender<OutboxWork>,
+    completed: std::sync::mpsc::Receiver<OutboxDone>,
+}
+
+impl OutboxWorker {
+    fn spawn(mut processor: OutboxProcessor) -> Self {
+        let (submit, work) = std::sync::mpsc::sync_channel::<OutboxWork>(1);
+        let (done_tx, completed) = std::sync::mpsc::sync_channel::<OutboxDone>(1);
+        std::thread::Builder::new()
+            .name("spall-game-outbox".into())
+            .spawn(move || {
+                while let Ok(OutboxWork(event)) = work.recv() {
+                    let done = OutboxDone {
+                        event_id: event.event_id,
+                        result: processor(&event),
+                    };
+                    if done_tx.send(done).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("outbox worker thread must start");
+        Self { submit, completed }
+    }
+}
+
+impl ProgressionWorker {
+    fn spawn(mut handler: ProgressionHandler) -> Self {
+        const CAPACITY: usize = 64;
+        let (submit, work) = std::sync::mpsc::sync_channel::<ProgressionWork>(CAPACITY);
+        let (done_tx, completed) = std::sync::mpsc::sync_channel::<ProgressionDone>(CAPACITY);
+        std::thread::Builder::new()
+            .name("spall-progression-requests".into())
+            .spawn(move || {
+                while let Ok(work) = work.recv() {
+                    let response = handler(work.session, work.player_id, work.request);
+                    if done_tx
+                        .send(ProgressionDone {
+                            session: work.session,
+                            response,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("progression worker thread must start");
+        Self { submit, completed }
+    }
+}
+
 /// One message from the sim bridge to a client's writer task. Repair replies and
 /// baseline transfers are already routed to one client's queue, so they need no
 /// session tag here.
@@ -1153,6 +1355,7 @@ enum Inbound {
 enum Outbound {
     Transaction(Arc<TopologyTransaction>),
     Status(Arc<ActionStatus>),
+    Progression(Arc<spall_protocol::ProgressionResponse>),
     Motion(Arc<Vec<MotionSnapshot>>),
     /// A baseline transfer: `BaselineBegin` on control, parts on a bulk stream,
     /// `BaselineEnd` on control. Carries the whole world for a first late join,
@@ -1192,15 +1395,11 @@ impl AdmissionGate {
     /// refusal and returns `None`.
     fn try_admit(self: &Arc<Self>) -> Option<AdmissionSlot> {
         use std::sync::atomic::Ordering::Relaxed;
-        // Atomic check-and-increment: several accept loops share this gate.
-        if self
-            .live
-            .fetch_update(Relaxed, Relaxed, |n| (n < self.max).then_some(n + 1))
-            .is_err()
-        {
+        if self.live.load(Relaxed) >= self.max {
             self.refused.fetch_add(1, Relaxed);
             return None;
         }
+        self.live.fetch_add(1, Relaxed);
         Some(AdmissionSlot(Arc::clone(self)))
     }
 }
@@ -1229,18 +1428,7 @@ type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
 #[derive(Default)]
 struct OutboundQueue {
     reliable: VecDeque<Outbound>,
-    /// Enqueue time and accounted bytes of each entry of `reliable`, in the same
-    /// order (T23 / G4 backlog age telemetry).
-    reliable_meta: VecDeque<(std::time::Instant, usize)>,
-    /// Bytes of the messages currently in `reliable` only: `take` hands the
-    /// writer everything queued and resets this to zero, so the cap bounds what
-    /// the writer has not yet picked up, not every byte ever queued over the
-    /// connection's life (which would disconnect any long-lived client).
     reliable_bytes: usize,
-    /// Messages the writer has taken but not yet finished handing to the
-    /// transport (FIFO, oldest first). Together with `reliable_meta` this is
-    /// the full unsent reliable backlog.
-    inflight: VecDeque<(std::time::Instant, usize)>,
     motion: Option<Arc<Vec<MotionSnapshot>>>,
     /// Set once a reliable push blew the bound. The writer flushes what is
     /// already queued, says goodbye, and exits.
@@ -1264,7 +1452,6 @@ impl OutboundQueue {
             // The shutdown marker always goes through — it ends the stream.
             Outbound::Shutdown(reason) => {
                 self.reliable.push_back(Outbound::Shutdown(reason));
-                self.reliable_meta.push_back((std::time::Instant::now(), 0));
                 Ok(())
             }
             reliable => {
@@ -1278,14 +1465,11 @@ impl OutboundQueue {
                     // Do not enqueue and do not discard the accepted backlog:
                     // the writer still flushes it, then the connection closes
                     // and the client re-baselines.
-                    RELIABLE_BACKLOG_OVERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.overflowed = true;
                     return Err(OutboundOverflow);
                 }
                 self.reliable_bytes += add;
                 self.reliable.push_back(reliable);
-                self.reliable_meta
-                    .push_back((std::time::Instant::now(), add));
                 Ok(())
             }
         }
@@ -1313,24 +1497,9 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
                 + tx.result_hashes.len() * 40
         }
         Outbound::Status(_) => 96,
+        Outbound::Progression(reply) => 64 + reply.inventory.len() * 8,
         Outbound::Baseline(t) => 64 + t.payload_bytes(),
         Outbound::Motion(_) | Outbound::Shutdown(_) => 0,
-    }
-}
-
-impl OutboundQueue {
-    /// Unsent reliable backlog: bytes and the age of its oldest message.
-    fn backlog(&self, now: std::time::Instant) -> (usize, Duration) {
-        let inflight_bytes: usize = self.inflight.iter().map(|(_, b)| *b).sum();
-        let oldest = self
-            .inflight
-            .front()
-            .map(|(t, _)| *t)
-            .or_else(|| self.reliable_meta.front().map(|(t, _)| *t));
-        (
-            self.reliable_bytes + inflight_bytes,
-            oldest.map_or(Duration::ZERO, |t| now.saturating_duration_since(t)),
-        )
     }
 }
 
@@ -1344,125 +1513,6 @@ struct OutboundBatch {
 impl OutboundBatch {
     fn is_empty(&self) -> bool {
         self.reliable.is_empty() && self.motion.is_none()
-    }
-}
-
-/// T23 / G4: one client session's server-side join timeline and replication
-/// counters, for root-causing join readiness and replica divergence. Event
-/// times are ms since the server's serve loop began.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct SessionTimeline {
-    pub session: u64,
-    pub slot: u32,
-    pub generation: u32,
-    /// `(ms, event)`: joined, baseline_requested, capture_submitted,
-    /// capture_ready, baseline_queued_for_send, promoted_live,
-    /// catch_up_overflow, rebaseline, join_failed, connection_ended: <reason>.
-    pub events: Vec<(u64, String)>,
-    /// Transactions sent to this session while it was `Live`.
-    pub tx_sent_live: u64,
-    /// Transactions queued while it was joining (catch-up queue), and how many
-    /// of those were flushed at promotion.
-    pub tx_queued_joining: u64,
-    pub tx_flushed_at_promotion: u64,
-    pub max_catch_up_queue: u64,
-    /// Highest transaction id handed to this session (live or flushed).
-    pub last_tx_id_sent: u64,
-    pub retries: u64,
-    pub ended_reason: Option<String>,
-}
-
-const MAX_TIMELINE_EVENTS: usize = 64;
-
-/// T23 / G4 server-wide telemetry shared between the tick loop and every
-/// connection writer task. Everything here is a bounded counter or a small
-/// bounded record list.
-#[derive(Default)]
-struct ServerTelemetry {
-    /// Optional per-connection baseline pacing (bytes/s). `None`: unpaced.
-    baseline_rate_limit: Option<u64>,
-    /// Longest wait of any reliable message from enqueue to transport hand-off.
-    max_delivery_age_us: std::sync::atomic::AtomicU64,
-    baseline_sends_started: std::sync::atomic::AtomicU64,
-    baseline_sends_active: std::sync::atomic::AtomicU64,
-    baseline_sends_active_max: std::sync::atomic::AtomicU64,
-    baseline_sends_failed: std::sync::atomic::AtomicU64,
-    baseline_send_bytes: std::sync::atomic::AtomicU64,
-    /// Completed baseline sends (bounded), oldest first.
-    baseline_sends: Mutex<Vec<BaselineSendRecord>>,
-    /// Per-session timelines, keyed by `session.raw()`, and the run origin they
-    /// are measured from.
-    sessions: Mutex<HashMap<u64, SessionTimeline>>,
-    /// Worker-thread time (ms) of each background baseline encode.
-    capture_encode_ms: Mutex<Vec<f64>>,
-    /// `(ms, outcome)` of each accept attempt: handshake + authentication are
-    /// performed inside `Server::accept`, one connection at a time.
-    accept_log: Mutex<Vec<(u64, String)>>,
-    /// Startup stages (`(name, ms)`) run on the sim thread before the first tick.
-    startup_ms: Mutex<Vec<(String, f64)>>,
-    origin: std::sync::OnceLock<std::time::Instant>,
-}
-
-/// One completed baseline transfer to one client.
-#[derive(Debug, Clone, Serialize)]
-pub struct BaselineSendRecord {
-    pub session_slot: u32,
-    pub payload_bytes: u64,
-    pub duration_ms: u64,
-}
-
-const MAX_BASELINE_SEND_RECORDS: usize = 256;
-
-/// RAII counter for [`ServerTelemetry::baseline_sends_active`].
-struct ActiveBaselineSend<'a>(&'a ServerTelemetry);
-
-impl<'a> ActiveBaselineSend<'a> {
-    fn begin(t: &'a ServerTelemetry) -> Self {
-        use std::sync::atomic::Ordering::Relaxed;
-        t.baseline_sends_started.fetch_add(1, Relaxed);
-        let now = t.baseline_sends_active.fetch_add(1, Relaxed) + 1;
-        t.baseline_sends_active_max.fetch_max(now, Relaxed);
-        Self(t)
-    }
-}
-
-impl ServerTelemetry {
-    /// Milliseconds since the first call (made when the serve loop starts).
-    fn now_ms(&self) -> u64 {
-        self.origin
-            .get_or_init(std::time::Instant::now)
-            .elapsed()
-            .as_millis() as u64
-    }
-
-    /// Runs `f` on `session`'s timeline (creating it), under the lock.
-    fn with_session(&self, session: SessionId, f: impl FnOnce(&mut SessionTimeline, u64)) {
-        let now = self.now_ms();
-        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        let t = map.entry(session.raw()).or_insert_with(|| SessionTimeline {
-            session: session.raw(),
-            slot: session.slot().0,
-            generation: session.generation(),
-            ..SessionTimeline::default()
-        });
-        f(t, now);
-    }
-
-    fn session_event(&self, session: SessionId, event: impl Into<String>) {
-        let event = event.into();
-        self.with_session(session, |t, now| {
-            if t.events.len() < MAX_TIMELINE_EVENTS {
-                t.events.push((now, event));
-            }
-        });
-    }
-}
-
-impl Drop for ActiveBaselineSend<'_> {
-    fn drop(&mut self) {
-        self.0
-            .baseline_sends_active
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1505,10 +1555,7 @@ impl OutboundHandle {
         let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
         // The writer now owns everything queued: reset the byte count with the
         // queue, or the cap would count every reliable byte ever sent on this
-        // connection rather than what is waiting. (Telemetry keeps counting the
-        // taken-but-undelivered bytes and their age in `inflight`.)
-        let meta: Vec<_> = q.reliable_meta.drain(..).collect();
-        q.inflight.extend(meta);
+        // connection rather than what is waiting.
         q.reliable_bytes = 0;
         OutboundBatch {
             reliable: q.reliable.drain(..).collect(),
@@ -1527,29 +1574,38 @@ impl OutboundHandle {
             .reliable_bytes
     }
 
-    /// The writer finished handing the oldest in-flight reliable message to the
-    /// transport. Returns how long it waited from enqueue to hand-off.
-    fn delivered(&self) -> Duration {
-        let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
-        q.inflight
-            .pop_front()
-            .map_or(Duration::ZERO, |(t, _)| t.elapsed())
-    }
-
-    /// Unsent reliable bytes (queued plus taken-but-not-handed-off) and the age
-    /// of the oldest unsent message.
-    fn backlog(&self) -> (usize, Duration) {
-        let q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
-        q.backlog(std::time::Instant::now())
-    }
-
     async fn woken(&self) {
         self.inner.wake.notified().await;
     }
 }
 
-async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
-    RELIABLE_BACKLOG_OVERFLOWS.store(0, std::sync::atomic::Ordering::Relaxed);
+async fn serve_async(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    game_setup: Option<InitialGameWorldSetup>,
+    damage_profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: Option<CommittedEditHandler>,
+    progression_handler: Option<ProgressionHandler>,
+    player_credentials: Option<Vec<spall_net::PlayerCredential>>,
+    mut outbox_encoder: Option<CommittedEditOutboxEncoder>,
+    outbox_processor: Option<OutboxProcessor>,
+) -> Result<ServeSummary, ServeError> {
+    if matches!(config.scene, Scene::Custom)
+        && config
+            .custom_world
+            .as_ref()
+            .is_none_or(|world| world.player_spawns().is_empty())
+    {
+        return Err(ServeError::Configuration(
+            "Scene::Custom requires ServeConfig::custom_world with at least one player spawn"
+                .into(),
+        ));
+    }
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -1570,16 +1626,32 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         std::fs::rename(&tmp, path)?;
     }
 
-    let server = Arc::new(
+    let handshake = server_handshake(&materials, asset_manifest_hash);
+    let credential_registry_file = config.credential_registry_file.clone();
+    if credential_registry_file.is_some() && player_credentials.is_none() {
+        return Err(ServeError::Configuration(
+            "credential registry reload requires player-credential authentication".into(),
+        ));
+    }
+    let server = Arc::new(if let Some(credentials) = player_credentials {
+        NetServer::bind_with_player_credentials(
+            config.listen,
+            &identity,
+            credentials,
+            handshake,
+            config.transport,
+        )
+        .await?
+    } else {
         NetServer::bind(
             config.listen,
             &identity,
             config.join_token,
-            server_handshake(),
+            handshake,
             config.transport,
         )
-        .await?,
-    );
+        .await?
+    });
     let bound = server.local_addr()?;
     if let Some(path) = &config.addr_out {
         if let Some(parent) = path.parent() {
@@ -1596,6 +1668,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         ProcessRole::Server,
         Some(format!("bound={bound}")),
     ))?;
+    tracing::info!(
+        action_catalog_version = tool_catalog.version(),
+        "loaded authoritative action catalog"
+    );
 
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
     // T20 egress accounting: live connection handles (for a final stats read at
@@ -1608,85 +1684,116 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     // `session.raw()` — same close-once-counted discipline as the aggregate
     // version above.
     let egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
-    let telemetry = Arc::new(ServerTelemetry {
-        baseline_rate_limit: config.baseline_rate_limit_bytes_per_sec,
-        ..ServerTelemetry::default()
-    });
-    telemetry.now_ms(); // start the timeline clock
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
 
+    // Reload credentials atomically from the operator-managed registry. A
+    // malformed or unreadable update fails closed by revoking the whole live
+    // registry; no token bytes or file contents enter logs.
+    if let Some(path) = credential_registry_file {
+        let server_for_reload = server.clone();
+        let conns_for_reload = conns.clone();
+        let mut stop_for_reload = stop_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut previous_content: Option<Vec<u8>> = None;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = stop_for_reload.changed() => {
+                        if changed.is_err() || *stop_for_reload.borrow() { break; }
+                    }
+                }
+                let reload_path = path.clone();
+                let loaded =
+                    tokio::task::spawn_blocking(move || match std::fs::read(&reload_path) {
+                        Ok(bytes) => match parse_player_credentials(&bytes) {
+                            Ok(credentials) => (bytes, credentials, None),
+                            Err(error) => (bytes, Vec::new(), Some(error)),
+                        },
+                        Err(error) => (
+                            b"<unreadable>".to_vec(),
+                            Vec::new(),
+                            Some(format!("credential registry could not be read: {error}")),
+                        ),
+                    })
+                    .await;
+                let (content, credentials, invalid) = match loaded {
+                    Ok(value) => value,
+                    Err(_) => {
+                        tracing::error!(
+                            "credential registry reload worker failed; credentials unchanged"
+                        );
+                        continue;
+                    }
+                };
+                if previous_content.as_ref() == Some(&content) {
+                    continue;
+                }
+                let accepted_count = credentials.len();
+                let replacement = if invalid.is_some() {
+                    Vec::new()
+                } else {
+                    credentials
+                };
+                if let Err(error) = server_for_reload.replace_player_credentials(replacement) {
+                    tracing::error!(error = %error, "credential registry rejected; revoking all credentials");
+                    let _ = server_for_reload.replace_player_credentials(Vec::new());
+                }
+                previous_content = Some(content);
+                // Authentication state is deliberately not introspectable by
+                // token. Close live sessions on any rotation so a credential
+                // removed from the file loses its existing session at once.
+                let live = conns_for_reload
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                for connection in live.values() {
+                    connection.close("player credentials changed");
+                }
+                if let Some(reason) = invalid {
+                    tracing::error!(reason = %reason, "credential registry invalid; all player credentials revoked");
+                } else {
+                    tracing::info!(
+                        credential_count = accepted_count,
+                        "player credential registry reloaded; active sessions closed"
+                    );
+                }
+            }
+        });
+    }
+
     // Accept loop.
-    // Handshake + authentication run *inside* `Server::accept`, so a single
-    // accept loop serialises them: under a 100 ms RTT / 2% loss path each takes
-    // 1-3 s (measured, `accept_log`), and the N-th simultaneous joiner waits for
-    // the N-1 before it -- past the client's 5 s handshake timeout from N ~ 4.
-    // Several loops accept concurrently (bounded by the endpoint's
-    // pre-authentication budget).
-    let accept_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    // One gate shared by every accept loop: the cap counts live connections across all of them.
-    let admission = AdmissionGate::new(config.max_clients);
-    let count_tx = Arc::new(count_tx);
-    let mut accept_tasks = Vec::new();
-    for _ in 0..ACCEPT_WORKERS {
-        let accept_count = accept_count.clone();
-        let count_tx = count_tx.clone();
+    let accept = {
         let server = server.clone();
         let clients = clients.clone();
         let conns = conns.clone();
-        let telemetry = telemetry.clone();
         let egress_closed = egress_closed.clone();
         let inbound_tx = inbound_tx.clone();
         let stop_rx = stop_rx.clone();
-        let admission = admission.clone();
-        accept_tasks.push(tokio::spawn(async move {
+        let admission = AdmissionGate::new(config.max_clients);
+        tokio::spawn(async move {
+            let mut connected = 0usize;
             loop {
                 if *stop_rx.borrow() {
                     break;
                 }
-                let attempt_started = std::time::Instant::now();
                 let accepted = tokio::select! {
                     r = server.accept() => r,
                     _ = wait_true(stop_rx.clone()) => break,
                 };
                 let conn = match accepted {
-                    Ok(c) => {
-                        let mut log = telemetry
-                            .accept_log
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        if log.len() < 256 {
-                            log.push((
-                                telemetry.now_ms(),
-                                format!(
-                                    "accepted {} (this accept() call took {} ms incl. idle wait)",
-                                    c.session(),
-                                    attempt_started.elapsed().as_millis()
-                                ),
-                            ));
-                        }
-                        Arc::new(c)
-                    }
+                    Ok(c) => Arc::new(c),
                     Err(e) => {
                         tracing::warn!("accept failed: {e}");
-                        let mut log = telemetry
-                            .accept_log
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        if log.len() < 256 {
-                            log.push((telemetry.now_ms(), format!("accept failed: {e}")));
-                        }
                         continue;
                     }
                 };
-                // Admission counts connections that are *live now* (see `AdmissionGate`); the
-                // slot moves into the connection task and frees itself when that ends.
                 let Some(slot) = admission.try_admit() else {
                     conn.close("server at capacity");
                     continue;
                 };
-                let connected = accept_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                connected += 1;
                 let _ = count_tx.send(connected);
                 let handle = OutboundHandle::new();
                 clients
@@ -1704,13 +1811,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     clients.clone(),
                     conns.clone(),
                     egress_closed.clone(),
-                    telemetry.clone(),
                     stop_rx.clone(),
                     slot,
                 ));
             }
-        }));
-    }
+        })
+    };
 
     // Wait for the first `min_clients` (or time out).
     if config.min_clients > 0 {
@@ -1750,9 +1856,9 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let await_body_settle = config.await_body_settle;
     let motion_interest = config.motion_interest;
     let scene = config.scene;
+    let custom_world = config.custom_world.clone();
+    let terrain_collider_mode = config.terrain_collider_mode;
     let clients_for_sim = clients.clone();
-    let telemetry_for_lj = telemetry.clone();
-    let conns_for_sim = conns.clone();
     let save = config.save.clone();
     let save_faults = config.save_faults.clone();
     let checkpoint_interval = config.checkpoint_interval_ticks;
@@ -1760,19 +1866,25 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let max_join_retries = config.max_join_retries;
     let capture_workers = config.capture_workers.max(1);
     let dev_unvalidated_actions = config.dev_unvalidated_actions;
+    let action_catalog = tool_catalog;
+    let world_materials = materials;
     let residency_limits = config.residency;
     let residency_disk_path = config.residency_disk_path.clone();
     let contact_damage_cfg = config.contact_damage;
+    let contact_damage_profiles = damage_profiles;
     let dormancy_cfg = config.dormancy;
     let timing_window = config.timing_window;
-    let wake_audit_on = config.wake_audit;
-    let terrain_brick_colliders_on = config.terrain_brick_colliders;
-    let baseline_segment_bytes = config.baseline_segment_bytes;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
         generator_version: 1,
     };
+
+    // Progression callbacks may touch the game's SQLite store. Keep their
+    // bounded FIFO off the simulation thread; one worker preserves per-player
+    // request ordering and returns replies only after the callback completes.
+    let progression_worker = progression_handler.map(ProgressionWorker::spawn);
+    let committed_edit_worker = commit_handler.map(CommittedEditWorker::spawn);
 
     let sim_join = tokio::task::spawn_blocking(move || -> SimResult {
         // Open the world database (T16). If it already holds a checkpoint,
@@ -1787,28 +1899,30 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             mut pipeline,
             mut journalled_through,
             mut checkpoints_published,
-        } = match setup_persistence(save.as_deref(), scene, &persist_cfg, save_faults) {
+            outbox_processor,
+        } = match setup_persistence_with_game_content(
+            save.as_deref(),
+            scene,
+            custom_world.as_ref(),
+            &persist_cfg,
+            save_faults,
+            terrain_collider_mode,
+            world_materials,
+            game_setup,
+            outbox_processor,
+        ) {
             Ok(parts) => parts,
             Err(e) => {
                 return SimResult::error(format!("persistence setup failed: {e}"), 0);
             }
         };
-        for (name, d) in spall_sim::prof::drain() {
-            telemetry_for_lj
-                .startup_ms
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((name.to_string(), d.as_secs_f64() * 1000.0));
-        }
-        if wake_audit_on {
-            sim.world_mut().enable_wake_audit();
-        }
-        if terrain_brick_colliders_on
-            && let Err(e) = sim.world_mut().enable_terrain_brick_colliders()
-        {
-            return SimResult::error(format!("terrain brick colliders: {e}"), 0);
-        }
+        let progression_worker = progression_worker;
+        let committed_edit_worker = committed_edit_worker;
+        let outbox_worker = outbox_processor.map(OutboxWorker::spawn);
         let mut journal_records_written: u64 = 0;
+        let mut pending_outbox = Vec::<spall_store::OutboxRecord>::new();
+        let mut waiting_outbox = std::collections::VecDeque::<spall_store::OutboxRecord>::new();
+        let mut outbox_inflight = None;
 
         // T23 / G3 row 7, slice D: default-off residency pass. `None` -> the
         // world stays fully resident and every counter below is `0`.
@@ -1845,7 +1959,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // per-tick admission quota and were bounced with a retry response
         // (actions) or dropped (repairs).
         let mut actions_throttled = 0u64;
-        let mut intent_stats = IntentStats::default();
         let mut repairs_throttled = 0u64;
 
         // T11a / ENG-62: commit-latency measurement + admission accounting.
@@ -1856,33 +1969,47 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // run was staged but never committed — the "queued" bucket.
         let mut actions_requested = 0u64;
         let mut actions_staged = 0u64;
-        let mut ledger = crate::admission::AdmissionLedger::new();
-        let mut awake_series: Vec<AwakeSampleRow> = Vec::new();
-        let (mut awake_k, mut next_awake_sample) = (0u64, 0u64);
+        let mut submitted_at: HashMap<RequestId, std::time::Instant> = HashMap::new();
         // The session that staged each still-pending request, so the tick-report
         // outcome (`action_statuses`) can be routed back to only that client
         // instead of every connected client.
-        let mut submitted_by: HashMap<RequestId, SessionId> = HashMap::new();
+        let mut submitted_by: HashMap<RequestId, (SessionId, Option<spall_protocol::PlayerId>)> =
+            HashMap::new();
+        let mut player_principals: HashMap<u64, spall_protocol::PlayerId> = HashMap::new();
         let mut commit_latency = CommitLatency::default();
-        // T23 / G4: requests that are a "named blast" (4 m diameter or larger)
-        // and the server ticks at which each committed.
-        let mut blast_requests: std::collections::HashSet<RequestId> =
-            std::collections::HashSet::new();
-        let mut blast_commit_ticks: Vec<u64> = Vec::new();
-        let mut blast_commit_elapsed_ms: Vec<u64> = Vec::new();
-        let mut sampler = TelemetrySampler::new(std::time::Instant::now(), conns_for_sim.clone());
 
         // T21 / ENG-28 increment 4 (3c): default-off passes. `None` -> every
         // counter below stays `0` and neither pass is ever called, so an
         // ordinary run is byte-identical to before this increment.
-        let mut contact_damage_policy = contact_damage_cfg.map(spall_sim::ContactDamagePolicy::new);
+        let mut contact_damage_policy = contact_damage_cfg.map(|cfg| {
+            spall_sim::ContactDamagePolicy::with_material_profiles(cfg, contact_damage_profiles)
+        });
         let mut dormancy_policy = dormancy_cfg.map(spall_sim::DormancyPolicy::new);
         let mut contact_damage_cuts_submitted = 0u64;
         let mut contact_damage_cuts_rejected = 0u64;
         let mut dormancy_deactivations_total = 0u64;
         let mut dormancy_reactivations_total = 0u64;
         let mut timing = timing_window.map(TimingCollector::new);
-        let mut stage_agg = StageAgg::new(timing_window);
+
+        // Not a gate pass: the interactive playground's timed debris drops
+        // (`cargo xtask play --scene playground`). `populate_playground_debris`
+        // (called earlier, in `Scene::simulation`) already spawned every
+        // debris body dormant; nothing else in this scene ever creates a
+        // dormant body, so every currently-dormant entity is exactly this
+        // population, found by a fresh scan rather than threading a
+        // `Vec<EntityId>` all the way through `setup_persistence`.
+        let mut playground_drops = matches!(scene, Scene::Playground).then(|| {
+            let pools = spall_sim::pending_drop_pools(sim.world());
+            const SHOWCASE_INTERVAL_TICKS: u64 = 300; // 5 s at 60 Hz
+            const PLINKO_INTERVAL_TICKS: u64 = 60; // 1 s at 60 Hz
+            (
+                spall_sim::DropSchedule::new(pools.showcase, SHOWCASE_INTERVAL_TICKS)
+                    .at_height(7.0),
+                spall_sim::DropSchedule::new(pools.plinko, PLINKO_INTERVAL_TICKS)
+                    .at_height(10.5)
+                    .with_restitution(spall_sim::PLINKO_RESTITUTION),
+            )
+        });
 
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
@@ -1906,21 +2033,16 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let mut body_stable_ticks = 0u64;
 
         // T17 late-join / reconnect state.
-        // T23 / G4: the integrated scene's always-awake debris, and the observer
-        // (client slot 0's spawn) the near-observer census is taken around.
-        let agitated = scene.agitated_bodies();
-        let observer: [f64; 3] = scene.player_spawns().first().copied().unwrap_or([0.0; 3]);
         let mut lj = LateJoin::new(catch_up_cap, max_join_retries, capture_workers);
-        lj.segment_cap = baseline_segment_bytes;
         // T23 / G3 row 7, slice D: a late-join baseline or repair patch over a
         // brick the residency pass has evicted is filled from its durable
         // backing.
         lj.backing = residency.as_ref().map(|p| p.backing());
-        lj.telemetry = Some(telemetry_for_lj.clone());
 
+        let mut pacer = crate::pacing::TickPacer::new(tick_dt, std::time::Instant::now());
+        let mut pending_player_inputs = PlayerInputSchedule::default();
         for _ in 0..max_ticks {
             let started = std::time::Instant::now();
-
             // ENG-48: drain a bounded slice of what the clients have sent since
             // the last tick, with a per-session admission quota so one flooding
             // client can neither stall this loop nor starve the others. The
@@ -1929,19 +2051,43 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             let mut saw_client_work = false;
             let mut actions_admitted: HashMap<u64, u32> = HashMap::new();
             let mut repairs_admitted: HashMap<u64, u32> = HashMap::new();
+            let mut progression_admitted: HashMap<u64, u32> = HashMap::new();
+            if let Some(worker) = progression_worker.as_ref() {
+                for _ in 0..64 {
+                    match worker.completed.try_recv() {
+                        Ok(done) => send_to(
+                            &clients_for_sim,
+                            done.session,
+                            Outbound::Progression(Arc::new(done.response)),
+                        ),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
             let mut drained = 0usize;
-            let sp_ingress = spall_sim::prof::Span::start("srv.ingress_drain");
             while drained < MAX_INBOUND_PER_TICK {
                 let Ok(msg) = inbound_rx.try_recv() else {
                     break;
                 };
                 drained += 1;
                 match msg {
-                    Inbound::Joined(session) => {
+                    Inbound::Joined(session, player_id) => {
                         lj.on_joined(session);
+                        if let Some(player_id) = player_id {
+                            player_principals.insert(session.raw(), player_id);
+                        } else {
+                            player_principals.remove(&session.raw());
+                        }
+                        // Player identity is slot-stable across reconnects;
+                        // no input scheduled by the old generation may leak
+                        // into the replacement session.
+                        pending_player_inputs.remove_slot(session.slot().0);
                         // T19: give this connection an authoritative player
                         // capsule on a player scene (respawn on reconnect).
-                        let spawns = scene.player_spawns();
+                        let spawns = custom_world
+                            .as_ref()
+                            .map_or_else(|| scene.player_spawns(), CustomWorld::player_spawns);
                         if !spawns.is_empty() {
                             let slot = session.slot().0 as usize;
                             let spawn = spawns[slot.min(spawns.len() - 1)];
@@ -1960,24 +2106,44 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             continue;
                         }
                         let entity = session_player_entity(session);
-                        // Apply the redundant recent copies oldest-first, then
-                        // the current frame. `set_player_input` drops any that
-                        // are not newer than what the server already has, so a
-                        // single surviving datagram recovers a dropped frame.
+                        // Recover unseen redundant copies through the same
+                        // admission rule as the primary input below. A copy
+                        // carries its own intended_tick, so recovering one
+                        // that was dropped as a primary datagram still lands
+                        // on the tick it was tagged for -- applying it
+                        // immediately here would reproduce the whole-tick
+                        // edge snap this scheduling exists to remove, in
+                        // exactly the case (a dropped datagram) the
+                        // redundancy is for.
                         for r in frame.recent.iter().rev() {
-                            sim.set_player_input(entity, recent_input(r), r.input_seq);
+                            if let Some(input) = pending_player_inputs.admit(
+                                session,
+                                entity,
+                                recent_input(r),
+                                r.input_seq,
+                                r.intended_tick,
+                                sim.current_tick(),
+                                sim.player_acked_input(entity),
+                            ) {
+                                sim.set_player_input(entity, input, r.input_seq);
+                            }
                         }
-                        sim.set_player_input(entity, frame_input(&frame), frame.input_seq);
+                        if let Some(input) = pending_player_inputs.admit(
+                            session,
+                            entity,
+                            frame_input(&frame),
+                            frame.input_seq,
+                            frame.intended_tick,
+                            sim.current_tick(),
+                            sim.player_acked_input(entity),
+                        ) {
+                            sim.set_player_input(entity, input, frame.input_seq);
+                        }
                     }
                     Inbound::Action(session, req) => {
                         saw_client_work = true;
                         actions_requested += 1;
-                        ledger.attempt();
                         if lj.session_expired(session) {
-                            ledger.refused(
-                                req.request_id,
-                                crate::admission::AdmissionRefusal::Invalid,
-                            );
                             reject(&clients_for_sim, session, req.request_id, "expired session");
                             rejected_total += 1;
                             lj.expired_actions += 1;
@@ -1990,7 +2156,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         // request on its replacement session. Replaying this
                         // status must not restage or re-apply the edit.
                         if let Some(status) = replay_admitted_status(&sim, req.request_id) {
-                            ledger.duplicate_replayed();
                             send_to(
                                 &clients_for_sim,
                                 session,
@@ -2003,10 +2168,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             session.raw(),
                             MAX_ACTIONS_PER_CLIENT_PER_TICK,
                         ) {
-                            ledger.refused(
-                                req.request_id,
-                                crate::admission::AdmissionRefusal::Throttled,
-                            );
                             reject(
                                 &clients_for_sim,
                                 session,
@@ -2021,18 +2182,18 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             dev_intent_from_request(session, &req)
                                 .ok_or(ActionReject::Unsupported("unsupported target"))
                         } else {
-                            resolve_intent(sim.world(), session, &req)
+                            resolve_intent_with_catalog(sim.world(), session, &req, &action_catalog)
                         };
                         match resolved {
                             Ok(intent) => match sim.submit(intent) {
                                 Ok(status) => {
-                                    ledger.admitted(req.request_id, std::time::Instant::now());
-                                    submitted_by.entry(req.request_id).or_insert(session);
-                                    if req.claimed_brush.radius_units()
-                                        >= BLAST_MIN_RADIUS_CELLS * spall_core::BRUSH_UNIT
-                                    {
-                                        blast_requests.insert(req.request_id);
-                                    }
+                                    submitted_at
+                                        .entry(req.request_id)
+                                        .or_insert_with(std::time::Instant::now);
+                                    submitted_by.entry(req.request_id).or_insert((
+                                        session,
+                                        player_principals.get(&session.raw()).copied(),
+                                    ));
                                     actions_staged += 1;
                                     send_to(
                                         &clients_for_sim,
@@ -2041,41 +2202,54 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                     );
                                 }
                                 Err(e) => {
-                                    let queue_full =
-                                        matches!(e, spall_sim::IntentError::QueueFull { .. });
-                                    if queue_full {
-                                        intent_stats.queue_full_rejections += 1;
-                                    }
-                                    ledger.refused(
+                                    reject(
+                                        &clients_for_sim,
+                                        session,
                                         req.request_id,
-                                        if queue_full {
-                                            crate::admission::AdmissionRefusal::QueueFull
-                                        } else {
-                                            crate::admission::AdmissionRefusal::Invalid
-                                        },
+                                        &e.to_string(),
                                     );
-                                    // Overload is an explicit, *retryable* answer: clients back off
-                                    // and resend a bounded number of times. The request id was never
-                                    // admitted, so a resend is a fresh admission attempt (a request
-                                    // that was admitted replays its stored status instead).
-                                    let reason =
-                                        if matches!(e, spall_sim::IntentError::QueueFull { .. }) {
-                                            format!("overloaded: {e}; retry with backoff")
-                                        } else {
-                                            e.to_string()
-                                        };
-                                    reject(&clients_for_sim, session, req.request_id, &reason);
                                     rejected_total += 1;
                                 }
                             },
                             Err(rej) => {
-                                ledger.refused(
-                                    req.request_id,
-                                    crate::admission::AdmissionRefusal::Invalid,
-                                );
                                 reject(&clients_for_sim, session, req.request_id, &rej.reason());
                                 rejected_total += 1;
                             }
+                        }
+                    }
+                    Inbound::Progression(session, req) => {
+                        saw_client_work = true;
+                        if lj.session_expired(session) {
+                            continue;
+                        }
+                        let admitted = admit(
+                            &mut progression_admitted,
+                            session.raw(),
+                            MAX_PROGRESSION_PER_CLIENT_PER_TICK,
+                        );
+                        let queued = admitted
+                            && progression_worker.as_ref().is_some_and(|worker| {
+                                worker
+                                    .submit
+                                    .try_send(ProgressionWork {
+                                        session,
+                                        player_id: player_principals.get(&session.raw()).copied(),
+                                        request: req.clone(),
+                                    })
+                                    .is_ok()
+                            });
+                        if !queued {
+                            // The queue is bounded. This retryable response is
+                            // immediate and does not perform a fallback read.
+                            let response = progression_rejected(
+                                &req,
+                                spall_protocol::ProgressionRejectCode::RetryableCapacity,
+                            );
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Progression(Arc::new(response)),
+                            );
                         }
                     }
                     Inbound::Repair(session, req) => {
@@ -2097,64 +2271,27 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         saw_client_work = true;
                         lj.on_baseline_ack(session, ack, &sim, &clients_for_sim, &mut motion);
                     }
-                    Inbound::Gone(session) => lj.on_gone(session),
+                    Inbound::Gone(session) => {
+                        pending_player_inputs.remove_session(session);
+                        lj.on_gone(session);
+                        player_principals.remove(&session.raw());
+                    }
                 }
             }
 
-            drop(sp_ingress);
             lj.publish_ready_captures(&clients_for_sim);
-            if !agitated.is_empty() {
-                spall_sim::fixtures::agitate_g4_bodies(sim.world_mut(), &agitated, ticks_run);
+            let next_tick = spall_core::Tick(sim.current_tick().0.saturating_add(1));
+            for input in pending_player_inputs.take_due(next_tick) {
+                if !lj.session_expired(input.session) {
+                    sim.set_player_input(input.entity, input.input, input.seq);
+                }
             }
             let report = match sim.tick() {
                 Ok(r) => r,
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
             };
             ticks_run += 1;
-            if ticks_run >= next_awake_sample {
-                // One O(bodies) scan per ~30 ticks (about 50 us at 17k bodies).
-                let (mut awake, mut asleep, mut dormant) = (0u32, 0u32, 0u32);
-                for b in sim.world().bodies() {
-                    if b.dormant {
-                        dormant += 1;
-                    } else if b.sleeping {
-                        asleep += 1;
-                    } else {
-                        awake += 1;
-                    }
-                }
-                if awake_series.len() < MAX_AWAKE_SAMPLES {
-                    awake_series.push(AwakeSampleRow {
-                        tick: ticks_run,
-                        awake,
-                        asleep,
-                        dormant,
-                    });
-                }
-                awake_k += 1;
-                next_awake_sample = 30 * awake_k + (11 * awake_k) % 30;
-            }
-            intent_stats.ticks += 1;
-            intent_stats.pending_max = intent_stats.pending_max.max(report.pending_after as u64);
-            intent_stats.pending_depth_sum += report.pending_after as u64;
-            intent_stats.retried_conflicts += report.retried.len() as u64;
-            intent_stats.stale_discards += report.discarded_stale.len() as u64;
-            intent_stats.serialized_regions += report.serialized_regions.len() as u64;
-            if report.pending_after > 0 {
-                intent_stats.pending_ticks += 1;
-                intent_stats.commits_in_pending_ticks += report.committed.len() as u64;
-            }
             let tick = sim.current_tick();
-            if ticks_run.is_multiple_of(6) {
-                sampler.observe_backlog(&clients_for_sim);
-            }
-            if ticks_run.is_multiple_of(60) {
-                sampler.scan_escapes(ticks_run, sim.world());
-                sampler.sample(
-                    ticks_run,
-                    body_census(sim.world(), observer, !agitated.is_empty()),
-                );
-            }
 
             // T21 / ENG-28 increment 4 (3c): opt-in contact damage + region
             // dormancy, run every tick right after the commit they react to.
@@ -2171,6 +2308,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 let dp = sim.apply_dormancy(policy, &report);
                 dormancy_deactivations_total += dp.deactivate.len() as u64;
                 dormancy_reactivations_total += dp.reactivate.len() as u64;
+            }
+            if let Some((showcase, plinko)) = playground_drops.as_mut() {
+                showcase.tick(sim.world_mut(), tick.get());
+                plinko.tick(sim.world_mut(), tick.get());
             }
 
             // ENG-61: fold this tick into the "bodies holding still" window.
@@ -2200,13 +2341,44 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
-            let sp_fan = spall_sim::prof::Span::start("srv.commit_fanout");
             for (rid, committed) in &report.committed {
                 committed_total += 1;
-                if blast_requests.remove(rid) {
-                    blast_commit_ticks.push(ticks_run);
-                    // Same clock as the telemetry samples' `elapsed_ms`.
-                    blast_commit_elapsed_ms.push(sampler.start.elapsed().as_millis() as u64);
+                if !committed.removed_materials.is_empty()
+                    && let Some((session, player_id)) = submitted_by.get(rid).copied()
+                {
+                    let encoded = outbox_encoder.as_mut().and_then(|encoder| {
+                        encoder(
+                            session,
+                            player_id,
+                            *rid,
+                            committed.journal_seq,
+                            &committed.removed_materials,
+                        )
+                    });
+                    if let Some(event) = encoded.filter(|_| pipeline.is_some()) {
+                        pending_outbox.push(event);
+                    } else if let Some(worker) = committed_edit_worker.as_ref() {
+                        match worker.submit.try_send(CommittedEditWork {
+                            session,
+                            player_id,
+                            request_id: *rid,
+                            removed: committed.removed_materials.clone(),
+                        }) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                return SimResult::error(
+                                    "committed progression queue is full; server stopped with the award pending only in ephemeral memory".into(),
+                                    ticks_run,
+                                );
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                return SimResult::error(
+                                    "committed progression worker stopped".into(),
+                                    ticks_run,
+                                );
+                            }
+                        }
+                    }
                 }
                 // T17 increment 2: a giant split ships its geometry out of band
                 // as a `BaselineTransfer`, keyed to the transaction by
@@ -2233,7 +2405,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 // T11a / ENG-62: bucket each commit's server-side latency
                 // (admission → commit) by whether it split and how much
                 // geometry detached.
-                if let Some(started_at) = ledger.committed(*rid) {
+                if let Some(started_at) = submitted_at.remove(rid) {
                     let class =
                         commit_latency::classify(committed.bumped_epoch, &committed.topology);
                     commit_latency.record(class, started_at.elapsed());
@@ -2253,13 +2425,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     );
                 }
             }
-            drop(sp_fan);
             for status in action_statuses(&report) {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
                     rejected_total += 1;
                 }
-                // An admitted request the pipeline rejected is terminal, not pending.
-                ledger.on_status(&status);
                 // A tick-resolved outcome (commit or deterministic staging
                 // rejection) belongs to whichever session staged it — route it
                 // there only. `submitted_by` is best-effort bookkeeping (cleared
@@ -2267,7 +2436,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 // shouldn't be one) falls back to the old broadcast so a status
                 // is never silently dropped.
                 match submitted_by.remove(&status.request_id) {
-                    Some(session) => send_to(
+                    Some((session, _player_id)) => send_to(
                         &clients_for_sim,
                         session,
                         Outbound::Status(Arc::new(status)),
@@ -2278,7 +2447,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             // The 20 Hz motion batch: send it to replicas *and* keep the full
             // batch for the durable pose journal below (durability is never
             // interest-filtered).
-            let sp_motion = spall_sim::prof::Span::start("srv.motion_publish");
             let pose_batch: Option<Vec<MotionSnapshot>> = if motion.due(tick) {
                 let snaps = motion.snapshots(sim.world(), tick);
                 if !snaps.is_empty() {
@@ -2311,7 +2479,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                 &sim,
                                 &lj,
                                 &clients_for_sim,
-                                &conns_for_sim,
                                 &mut client_repl,
                                 &mut motion_egress,
                             );
@@ -2331,8 +2498,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             // The sim thread never blocks on the disk; when the backlog fills or
             // a durable write has failed, the run stops rather than silently
             // continuing an unsavable world (`docs/protocol.md` Persistence).
-            drop(sp_motion);
-            let sp_persist = spall_sim::prof::Span::start("srv.persistence_submit");
             if let Some(pipe) = pipeline.as_ref() {
                 let batch = match tick_journal_batch(
                     &mut sim,
@@ -2345,8 +2510,64 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         return SimResult::error(format!("journal encode failed: {e}"), ticks_run);
                     }
                 };
-                if let Err(e) = pipe.submit_journal(batch) {
+                let records = std::mem::take(&mut pending_outbox);
+                if let Err(e) = pipe.submit_journal_with_outbox(batch, records.clone()) {
                     return SimResult::error(format!("persistence: {e}"), ticks_run);
+                }
+                waiting_outbox.extend(records);
+                let durable = pipe.durable_seq();
+                let mut acknowledged = Vec::new();
+                if let Some(worker) = outbox_worker.as_ref() {
+                    match worker.completed.try_recv() {
+                        Ok(done) => {
+                            if outbox_inflight != Some(done.event_id) {
+                                return SimResult::error(
+                                    "outbox completion did not match the in-flight event".into(),
+                                    ticks_run,
+                                );
+                            }
+                            if let Err(error) = done.result {
+                                return SimResult::error(
+                                    format!("harvest outbox delivery failed: {error}"),
+                                    ticks_run,
+                                );
+                            }
+                            let Some(event) = waiting_outbox.pop_front() else {
+                                return SimResult::error(
+                                    "outbox completion has no retained event".into(),
+                                    ticks_run,
+                                );
+                            };
+                            if event.event_id != done.event_id {
+                                return SimResult::error(
+                                    "outbox completion order changed".into(),
+                                    ticks_run,
+                                );
+                            }
+                            acknowledged.push(done.event_id);
+                            outbox_inflight = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return SimResult::error("outbox worker stopped".into(), ticks_run);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                    if outbox_inflight.is_none()
+                        && let Some(event) = waiting_outbox
+                            .front()
+                            .filter(|event| event.journal_seq <= durable)
+                    {
+                        match worker.submit.try_send(OutboxWork(event.clone())) {
+                            Ok(()) => outbox_inflight = Some(event.event_id),
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                return SimResult::error("outbox worker stopped".into(), ticks_run);
+                            }
+                        }
+                    }
+                }
+                if let Err(e) = pipe.submit_acknowledge_outbox(acknowledged) {
+                    return SimResult::error(format!("outbox acknowledgement: {e}"), ticks_run);
                 }
 
                 // A checkpoint's journal cursor is `journalled_through`: the FIFO
@@ -2393,8 +2614,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
-            drop(sp_persist);
-            let sp_resid = spall_sim::prof::Span::start("srv.residency_pass");
             // Slice D: post-tick residency pass. Evicts terrain bricks outside
             // every player's interest box, reloads any back in interest. The
             // committed world (hash, conservation, result_hashes) is unchanged;
@@ -2418,46 +2637,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 pass.run(sim.world_mut(), &player_feet, &pending_edit_bricks);
             }
 
-            drop(sp_resid);
-            let tick_edits: Vec<TickEditRow> = report
-                .committed
-                .iter()
-                .map(|(rid, c)| {
-                    let brush = c.topology.ops.iter().find_map(|op| match op {
-                        spall_protocol::TopologyOp::IntegerBrush { volume, brush, .. } => {
-                            Some((volume.get(), brush.radius_units() / spall_core::BRUSH_UNIT))
-                        }
-                        _ => None,
-                    });
-                    let volume = brush.map_or(0, |b| b.0);
-                    let kind = if volume == terrain_vid.get() {
-                        "terrain_dig"
-                    } else if blast_requests.contains(rid) {
-                        "blast"
-                    } else {
-                        "body_cut"
-                    };
-                    TickEditRow {
-                        request: rid.0,
-                        kind,
-                        volume,
-                        radius_cells: brush.map(|b| b.1),
-                        bricks_before: c.topology.before.len(),
-                        bricks_after: c.topology.after.len(),
-                        ops: c.topology.ops.len(),
-                        children: c.children.len(),
-                        split: c.bumped_epoch,
-                        bulk_baseline: c.bulk_baseline.is_some(),
-                    }
-                })
-                .collect();
-            stage_agg.ingest(
-                ticks_run,
-                started.elapsed(),
-                tick_edits,
-                sim.world().body_count(),
-                report.pending_after,
-            );
             // G4 timing ends after all owning-thread work for this tick,
             // including replication, persistence submission, and residency,
             // but before the optional pacing sleep below. Warmup is explicit;
@@ -2495,8 +2674,23 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
-            if paced && let Some(rem) = tick_dt.checked_sub(started.elapsed()) {
-                std::thread::sleep(rem);
+            if paced {
+                // Absolute deadlines, not `tick_dt - work`: a relative sleep
+                // drifted the server to ~58.8 Hz under Windows sleep overshoot.
+                let now = std::time::Instant::now();
+                if let Some(rem) = pacer.finish_tick(now) {
+                    std::thread::sleep(rem);
+                }
+                if pacer.ticks().is_multiple_of(600) {
+                    tracing::info!(
+                        target: "spall_server::pacing",
+                        ticks = pacer.ticks(),
+                        achieved_hz = pacer.achieved_hz(std::time::Instant::now()),
+                        max_lag_ms = pacer.max_lag().as_secs_f64() * 1e3,
+                        resyncs = pacer.resyncs(),
+                        "tick pacing"
+                    );
+                }
             }
         }
 
@@ -2519,7 +2713,61 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             let final_tick = sim.current_tick().get();
             let tail = tick_journal_batch(&mut sim, &mut journalled_through, None, final_tick)
                 .unwrap_or_default();
-            let _ = pipe.submit_journal(tail);
+            let tail_events = std::mem::take(&mut pending_outbox);
+            if let Err(error) = pipe.submit_journal_with_outbox(tail, tail_events.clone()) {
+                shutdown_error = Some(format!("final journal/outbox submission failed: {error}"));
+            }
+            waiting_outbox.extend(tail_events);
+            if shutdown_error.is_none() {
+                if let Err(error) = pipe.wait_durable_through(journalled_through) {
+                    shutdown_error = Some(format!("final journal durability wait failed: {error}"));
+                } else {
+                    let mut acknowledged = Vec::new();
+                    if let Some(worker) = outbox_worker.as_ref() {
+                        while let Some(event) = waiting_outbox.front() {
+                            if outbox_inflight.is_none() {
+                                if let Err(error) = worker.submit.send(OutboxWork(event.clone())) {
+                                    shutdown_error = Some(format!(
+                                        "final harvest outbox submission failed: {error}"
+                                    ));
+                                    break;
+                                }
+                                outbox_inflight = Some(event.event_id);
+                            }
+                            let done = match worker.completed.recv() {
+                                Ok(done) => done,
+                                Err(error) => {
+                                    shutdown_error = Some(format!(
+                                        "final harvest outbox completion failed: {error}"
+                                    ));
+                                    break;
+                                }
+                            };
+                            if outbox_inflight != Some(done.event_id)
+                                || event.event_id != done.event_id
+                            {
+                                shutdown_error =
+                                    Some("final harvest outbox completion mismatch".into());
+                                break;
+                            }
+                            if let Err(error) = done.result {
+                                shutdown_error =
+                                    Some(format!("final harvest outbox delivery failed: {error}"));
+                                break;
+                            }
+                            waiting_outbox.pop_front();
+                            outbox_inflight = None;
+                            acknowledged.push(done.event_id);
+                        }
+                    }
+                    if shutdown_error.is_none() {
+                        if let Err(error) = pipe.submit_acknowledge_outbox(acknowledged) {
+                            shutdown_error =
+                                Some(format!("final outbox acknowledgement failed: {error}"));
+                        }
+                    }
+                }
+            }
             // T23 / G3 row 7 follow-up: the shutdown snapshot folds evicted
             // terrain in from the durable backing the same way the periodic
             // checkpoints above do now, instead of reloading it into the live
@@ -2541,10 +2789,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             // The final drain covers the journal tail, the final checkpoint, and
             // the retain pass; attribute any failure to that shutdown flush so a
             // stranded save is never reported as a pass.
-            shutdown_error = outcome
-                .status
-                .error
-                .map(|e| format!("final checkpoint/flush failed: {e}"));
+            shutdown_error = shutdown_error.or_else(|| {
+                outcome
+                    .status
+                    .error
+                    .map(|e| format!("final checkpoint/flush failed: {e}"))
+            });
             tracing::info!(
                 durable_seq = outcome.status.durable_seq,
                 journal_records = outcome.status.journal_records,
@@ -2557,58 +2807,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             );
         }
 
-        let (slow_ticks, tick_classes, tick_windows) = stage_agg.traces();
         SimResult {
-            terrain_brick_colliders: sim.world().terrain_brick_collider_count() as u64,
-            intent_stats: intent_stats.clone(),
-            slow_ticks: slow_ticks.clone(),
-            tick_classes: tick_classes.clone(),
-            tick_windows: tick_windows.clone(),
-            awake_series: awake_series.clone(),
-            stage_timings: stage_agg.finish(),
-            wake_reasons: sim
-                .world()
-                .wake_audit()
-                .map(|a| {
-                    a.reasons
-                        .iter()
-                        .map(|(reason, s)| WakeReasonRow {
-                            reason: (*reason).to_string(),
-                            operations: s.operations,
-                            waking_operations: s.waking_operations,
-                            bodies_woken: s.bodies_woken,
-                            max_woken_by_one: s.max_woken_by_one,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            out_of_world: {
-                sampler.scan_escapes(ticks_run, sim.world());
-                sampler.escapes.clone()
-            },
-            containment_coverage: sampler.coverage.clone(),
-            backlog_series: sampler.backlog_series.clone(),
-            samples: sampler.samples,
-            blast_commit_ticks,
-            blast_commit_elapsed_ms,
-            backlog_peak_bytes: sampler.peak_bytes.max(sampler.interval_bytes),
-            backlog_peak_age_ms: sampler.peak_age_ms.max(sampler.interval_age_ms),
-            capture_pool_workers: lj.capture_pool.workers,
-            capture_pool_submitted: lj
-                .capture_pool
-                .stats
-                .submitted
-                .load(std::sync::atomic::Ordering::Relaxed),
-            capture_pool_active_max: lj
-                .capture_pool
-                .stats
-                .active_max
-                .load(std::sync::atomic::Ordering::Relaxed),
-            capture_pool_queued_max: lj
-                .capture_pool
-                .stats
-                .queued_max
-                .load(std::sync::atomic::Ordering::Relaxed),
             ok: shutdown_error.is_none(),
             error: shutdown_error,
             ticks_run,
@@ -2659,8 +2858,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             max_client_motion_batch_bytes: motion_egress.max_client_batch_bytes,
             actions_requested,
             actions_staged,
-            actions_queued_unresolved: ledger.pending_len() as u64,
-            admission: ledger.summary(),
+            actions_queued_unresolved: submitted_at.len() as u64,
             latency: commit_latency.report(),
             residency: residency.as_ref().map(|p| p.stats_with_world(sim.world())),
             residency_backing_disk_bytes: residency.as_ref().and_then(|p| p.backing_disk_bytes()),
@@ -2669,6 +2867,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             contact_damage_cuts_rejected,
             dormancy_deactivations_total,
             dormancy_reactivations_total,
+            // An opt-in timing window leaves no samples when it is not
+            // configured; expose the same zeroed report as an ordinary run.
             timing: timing
                 .map(|stats| stats.finish(ticks_run))
                 .unwrap_or_default(),
@@ -2683,9 +2883,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let _ = stop_tx.send(true);
     server.close();
     let _ = tokio::time::timeout(Duration::from_secs(3), server.wait_idle()).await;
-    for task in accept_tasks {
-        let _ = task.await;
-    }
+    let _ = accept.await;
 
     // T20: total egress. Hold the `conns` lock across the whole read so a
     // late-closing `serve_conn` can neither remove-and-accumulate an entry
@@ -2752,10 +2950,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // residency_checkpoint_bricks_logical_total (incremental checkpoint
         // capture evidence).
         // v9: T23 / G4 bounded owning-tick and physics timing telemetry.
-        // v10: T23 / G4 per-60-tick samples (memory, backlog, per-connection
-        // egress), blast ticks, backlog peaks/caps, baseline-send and
-        // capture-pool concurrency.
-        version: 10,
+        version: 9,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -2792,7 +2987,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         actions_requested: sim_result.actions_requested,
         actions_staged: sim_result.actions_staged,
         actions_queued_unresolved: sim_result.actions_queued_unresolved,
-        admission: sim_result.admission.clone(),
         single_brick_commit_p95_ms: sim_result.latency.single_brick_commit_p95_ms,
         single_brick_commit_samples: sim_result.latency.single_brick_commit_samples,
         structure_split_p95_ms: sim_result.latency.structure_split_p95_ms,
@@ -2871,78 +3065,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         physics_max_ms: sim_result.timing.physics_max_ms,
         physics_samples: sim_result.timing.physics_samples,
         physics_window_complete: sim_result.timing.window_complete,
-        tick_busy_over_budget_ticks: sim_result.timing.over_budget_ticks,
-        telemetry_samples: sim_result.samples.clone(),
-        blast_commit_ticks: sim_result.blast_commit_ticks.clone(),
-        blast_commit_elapsed_ms: sim_result.blast_commit_elapsed_ms.clone(),
-        reliable_backlog_peak_bytes: sim_result.backlog_peak_bytes,
-        reliable_backlog_peak_age_ms: sim_result.backlog_peak_age_ms,
-        reliable_delivery_age_max_ms: telemetry
-            .max_delivery_age_us
-            .load(std::sync::atomic::Ordering::Relaxed)
-            / 1_000,
-        reliable_backlog_cap_messages: MAX_RELIABLE_BACKLOG,
-        reliable_backlog_cap_bytes: MAX_RELIABLE_BACKLOG_BYTES,
-        reliable_backlog_overflows: RELIABLE_BACKLOG_OVERFLOWS
-            .load(std::sync::atomic::Ordering::Relaxed),
-        baseline_sends_started: telemetry
-            .baseline_sends_started
-            .load(std::sync::atomic::Ordering::Relaxed),
-        baseline_sends_failed: telemetry
-            .baseline_sends_failed
-            .load(std::sync::atomic::Ordering::Relaxed),
-        baseline_sends_active_max: telemetry
-            .baseline_sends_active_max
-            .load(std::sync::atomic::Ordering::Relaxed),
-        baseline_send_records: telemetry
-            .baseline_sends
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone(),
-        baseline_rate_limit_bytes_per_sec: telemetry.baseline_rate_limit,
-        capture_pool_workers: sim_result.capture_pool_workers,
-        capture_pool_submitted: sim_result.capture_pool_submitted,
-        capture_pool_active_max: sim_result.capture_pool_active_max,
-        capture_pool_queued_max: sim_result.capture_pool_queued_max,
-        process_end_memory_bytes: crate::mem_stats::process_current_bytes(),
-        admission_refused_at_capacity: admission.refused.load(std::sync::atomic::Ordering::Relaxed),
-        stage_timings: sim_result.stage_timings.clone(),
-        wake_reasons: sim_result.wake_reasons.clone(),
-        terrain_brick_colliders: sim_result.terrain_brick_colliders,
-        intent_stats: sim_result.intent_stats.clone(),
-        slow_ticks: sim_result.slow_ticks.clone(),
-        tick_classes: sim_result.tick_classes.clone(),
-        tick_windows: sim_result.tick_windows.clone(),
-        awake_series: sim_result.awake_series.clone(),
-        out_of_world_bodies: sim_result.out_of_world.clone(),
-        containment_coverage: sim_result.containment_coverage.clone(),
-        backlog_series: sim_result.backlog_series.clone(),
-        baseline_capture_encode_ms: telemetry
-            .capture_encode_ms
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone(),
-        accept_log: telemetry
-            .accept_log
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone(),
-        startup_ms: telemetry
-            .startup_ms
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone(),
-        session_timelines: {
-            let mut v: Vec<SessionTimeline> = telemetry
-                .sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .values()
-                .cloned()
-                .collect();
-            v.sort_by_key(|s| s.session);
-            v
-        },
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -2959,689 +3081,6 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     Ok(summary)
 }
 
-/// A request whose brush radius is at least this many cells (`8` cells at the
-/// `0.25 m` cell size is the G4 "4 m diameter blast") is a named blast for
-/// telemetry.
-pub const BLAST_MIN_RADIUS_CELLS: i64 = 8;
-
-/// Most retained [`TelemetrySample`]s per run (one per 60 ticks: over 2 hours).
-const MAX_TELEMETRY_SAMPLES: usize = 8192;
-
-/// One connection's cumulative egress at a [`TelemetrySample`].
-#[derive(Debug, Clone, Serialize)]
-pub struct ClientEgressSample {
-    pub slot: u32,
-    pub app_bytes: u64,
-    pub transport_bytes: u64,
-    /// QUIC path state at the sample: smoothed RTT (ms), congestion window
-    /// (bytes), and cumulative lost packets / congestion events. The window is
-    /// what caps *all* traffic on the connection, motion datagrams included.
-    pub rtt_ms: u64,
-    pub cwnd_bytes: u64,
-    pub lost_packets: u64,
-    pub congestion_events: u64,
-}
-
-/// T23 / G4: one once-per-60-ticks observation. `elapsed_ms` is wall clock
-/// since the tick loop began, so rates are computed against real time, not
-/// nominal ticks. Backlog maxima cover the interval since the previous sample.
-#[derive(Debug, Clone, Serialize)]
-pub struct TelemetrySample {
-    pub tick: u64,
-    pub elapsed_ms: u64,
-    pub process_bytes: Option<u64>,
-    pub backlog_max_bytes: u64,
-    pub backlog_max_age_ms: u64,
-    pub clients: Vec<ClientEgressSample>,
-    /// Body census: all bodies, dormant ones, solver-awake ones (neither dormant
-    /// nor asleep), and solver-awake ones within `12 m` of the observer.
-    pub bodies_total: u64,
-    pub bodies_dormant: u64,
-    pub bodies_awake: u64,
-    pub near_observer_awake: u64,
-    /// T23 / G4: `y` (m) of the giant body's origin (entity `1`) in the
-    /// integrated scene; `None` elsewhere. It falls `~8 m` when the column is
-    /// severed and the 64-brick block comes down.
-    pub giant_origin_y_m: Option<f64>,
-}
-
-/// A [`TelemetrySample`]'s body census.
-#[derive(Debug, Clone, Copy, Default)]
-struct BodyCensus {
-    total: u64,
-    dormant: u64,
-    awake: u64,
-    near_observer_awake: u64,
-    giant_y: Option<f64>,
-}
-
-fn body_census(world: &spall_sim::SimWorld, observer: [f64; 3], integrated: bool) -> BodyCensus {
-    let mut c = BodyCensus::default();
-    if integrated {
-        c.giant_y = spall_core::EntityId::new(spall_voxel::fixtures::G4_ENTITY_FIRST)
-            .ok()
-            .and_then(|e| world.body(e))
-            .map(|b| b.pose.translation_m[1]);
-    }
-    for b in world.bodies() {
-        c.total += 1;
-        if b.dormant {
-            c.dormant += 1;
-        } else if !b.sleeping {
-            c.awake += 1;
-            let t = b.pose.translation_m;
-            let d2 = (t[0] - observer[0]).powi(2)
-                + (t[1] - observer[1]).powi(2)
-                + (t[2] - observer[2]).powi(2);
-            if d2 <= 12.0 * 12.0 {
-                c.near_observer_awake += 1;
-            }
-        }
-    }
-    c
-}
-
-struct TelemetrySampler {
-    /// Escape watch: highest entity id already recorded, first scan tick per entity, bodies flagged.
-    known_max_entity: u64,
-    first_seen_scan: HashMap<u64, u64>,
-    escapes: Vec<OutOfWorldRow>,
-    census_offset: usize,
-    coverage: ContainmentCoverage,
-    backlog_series: Vec<(u64, u64, u64)>,
-    start: std::time::Instant,
-    conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
-    samples: Vec<TelemetrySample>,
-    interval_bytes: u64,
-    interval_age_ms: u64,
-    peak_bytes: u64,
-    peak_age_ms: u64,
-}
-
-impl TelemetrySampler {
-    fn new(start: std::time::Instant, conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>) -> Self {
-        Self {
-            start,
-            conns,
-            samples: Vec::new(),
-            interval_bytes: 0,
-            interval_age_ms: 0,
-            peak_bytes: 0,
-            peak_age_ms: 0,
-            known_max_entity: 0,
-            first_seen_scan: HashMap::new(),
-            escapes: Vec::new(),
-            census_offset: 0,
-            coverage: ContainmentCoverage::default(),
-            backlog_series: Vec::new(),
-        }
-    }
-
-    /// Folds every client's current unsent reliable backlog into the interval
-    /// maxima.
-    fn observe_backlog(&mut self, clients: &ClientMap) {
-        let guard = clients.lock().unwrap_or_else(|e| e.into_inner());
-        let (mut now_bytes, mut now_age) = (0u64, 0u64);
-        for handle in guard.values() {
-            let (bytes, age) = handle.backlog();
-            now_bytes = now_bytes.max(bytes as u64);
-            now_age = now_age.max(age.as_millis() as u64);
-        }
-        self.interval_bytes = self.interval_bytes.max(now_bytes);
-        self.interval_age_ms = self.interval_age_ms.max(now_age);
-        // A fine-grained (every 6 ticks) series: the once-per-second samples are too coarse to judge
-        // a recovery window that ends a couple of seconds before the next blast.
-        if self.backlog_series.len() < BACKLOG_SERIES_MAX {
-            self.backlog_series
-                .push((self.start.elapsed().as_millis() as u64, now_bytes, now_age));
-        }
-    }
-
-    fn sample(&mut self, tick: u64, census: BodyCensus) {
-        let mut clients: Vec<ClientEgressSample> = self
-            .conns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|conn| {
-                let t = conn.transport_stats();
-                ClientEgressSample {
-                    slot: conn.session().slot().0,
-                    app_bytes: conn.stats().app_bytes_sent,
-                    transport_bytes: t.udp_tx.bytes,
-                    rtt_ms: t.path.rtt.as_millis() as u64,
-                    cwnd_bytes: t.path.cwnd,
-                    lost_packets: t.path.lost_packets,
-                    congestion_events: t.path.congestion_events,
-                }
-            })
-            .collect();
-        clients.sort_by_key(|c| c.slot);
-        self.peak_bytes = self.peak_bytes.max(self.interval_bytes);
-        self.peak_age_ms = self.peak_age_ms.max(self.interval_age_ms);
-        if self.samples.len() < MAX_TELEMETRY_SAMPLES {
-            self.samples.push(TelemetrySample {
-                tick,
-                elapsed_ms: self.start.elapsed().as_millis() as u64,
-                process_bytes: crate::mem_stats::process_current_bytes(),
-                backlog_max_bytes: self.interval_bytes,
-                backlog_max_age_ms: self.interval_age_ms,
-                clients,
-                bodies_total: census.total,
-                bodies_dormant: census.dormant,
-                bodies_awake: census.awake,
-                near_observer_awake: census.near_observer_awake,
-                giant_origin_y_m: census.giant_y,
-            });
-        }
-        self.interval_bytes = 0;
-        self.interval_age_ms = 0;
-    }
-}
-
-/// A body flagged by the containment watch (`spall_sim::containment`), from its
-/// transformed collider bounds / occupied cells — never from its origin alone.
-/// `kind` separates the two assertions: `"deep_penetration"` (collision correctness:
-/// cells embedded in intact terrain) and `"external"` (out-of-world lifecycle:
-/// geometry wholly outside the bounded world; README declares a dormant external-body
-/// set that does not exist yet, so such a body keeps simulating).
-#[derive(Debug, Clone, Serialize)]
-pub struct OutOfWorldRow {
-    pub kind: &'static str,
-    pub entity: u64,
-    /// Server tick of the scan that first flagged it.
-    pub first_seen_below_tick: u64,
-    /// The entity's creation lies in `(created_after_tick, created_at_or_before_tick]`.
-    pub created_after_tick: u64,
-    pub created_at_or_before_tick: u64,
-    pub position_m: [f64; 3],
-    pub aabb_min_m: [f64; 3],
-    pub aabb_max_m: [f64; 3],
-    pub velocity_m_s: [f64; 3],
-    pub penetration_depth_m: f64,
-    pub overlapped_cells: u32,
-    pub sleeping: bool,
-    pub dormant: bool,
-    pub solid_cells: u64,
-    pub collider_revision: u64,
-    pub coarsen_k: u32,
-    pub collider_region_cells: [[i64; 3]; 2],
-    /// Later observations `(tick, y_m, speed_m_s)` of the same body.
-    pub later_samples: Vec<(u64, f64, f64)>,
-}
-
-const ESCAPE_MAX_ROWS: usize = 64;
-/// Upper bound on the fine-grained backlog series (one entry per 6 ticks: ~4.6 h at 60 Hz).
-const BACKLOG_SERIES_MAX: usize = 100_000;
-/// Per-body prefilter cap (terrain samples over the collider bounds) and per-scan budget: bodies
-/// beyond either are *counted* in [`ContainmentCoverage`], never treated as clear.
-const CENSUS_MAX_AABB_SAMPLES: u64 = 65_536;
-const CENSUS_SAMPLE_BUDGET: u64 = 400_000;
-
-/// How much of the world the containment census actually examined. A result of "no deep
-/// penetration" only means something alongside this.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ContainmentCoverage {
-    pub scans: u64,
-    /// Scans in which no body was skipped (every body's bounds were fully examined).
-    pub full_coverage_scans: u64,
-    /// The most recent scan.
-    pub last_bodies: u64,
-    pub last_prefilter_passed: u64,
-    pub last_cell_checked: u64,
-    pub last_skipped_large_cells: u64,
-    pub last_skipped_aabb_too_large: u64,
-    pub last_skipped_budget: u64,
-    /// Worst single scan.
-    pub max_skipped_aabb_too_large: u64,
-    pub max_skipped_budget: u64,
-    pub max_skipped_large_cells: u64,
-}
-
-impl ContainmentCoverage {
-    fn record(&mut self, c: &spall_sim::containment::ContainmentCensus) {
-        self.scans += 1;
-        if c.skipped_large + c.skipped_aabb_too_large + c.skipped_budget == 0 {
-            self.full_coverage_scans += 1;
-        }
-        self.last_bodies = c.bodies;
-        self.last_prefilter_passed = c.prefilter_passed;
-        self.last_cell_checked = c.cell_checked;
-        self.last_skipped_large_cells = c.skipped_large;
-        self.last_skipped_aabb_too_large = c.skipped_aabb_too_large;
-        self.last_skipped_budget = c.skipped_budget;
-        self.max_skipped_aabb_too_large = self
-            .max_skipped_aabb_too_large
-            .max(c.skipped_aabb_too_large);
-        self.max_skipped_budget = self.max_skipped_budget.max(c.skipped_budget);
-        self.max_skipped_large_cells = self.max_skipped_large_cells.max(c.skipped_large);
-    }
-}
-/// Deepest embedding of a body cell in terrain that counts as a penetration (m).
-const PENETRATION_MIN_DEPTH_M: f64 = 0.25;
-/// Bodies with more solid cells than this are not checked cell by cell.
-const PENETRATION_MAX_CELLS: u64 = 4096;
-
-impl TelemetrySampler {
-    fn scan_escapes(&mut self, tick: u64, world: &spall_sim::SimWorld) {
-        for b in world.bodies() {
-            let Some(e) = b.entity else { continue };
-            let id = e.get();
-            if id > self.known_max_entity {
-                self.known_max_entity = id;
-            }
-            self.first_seen_scan.entry(id).or_insert(tick);
-            if let Some(row) = self.escapes.iter_mut().find(|r| r.entity == id)
-                && row.later_samples.len() < 8
-            {
-                let v = b.linvel_m_s;
-                row.later_samples.push((
-                    tick,
-                    b.pose.translation_m[1],
-                    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt(),
-                ));
-            }
-        }
-        let census = spall_sim::containment::containment_census_with(
-            world,
-            spall_sim::containment::CensusOptions {
-                max_cells: PENETRATION_MAX_CELLS,
-                min_depth_m: PENETRATION_MIN_DEPTH_M,
-                max_aabb_samples: CENSUS_MAX_AABB_SAMPLES,
-                sample_budget: CENSUS_SAMPLE_BUDGET,
-                start_offset: self.census_offset,
-            },
-        );
-        self.census_offset = census.next_offset;
-        self.coverage.record(&census);
-        for (kind, rows) in [
-            ("deep_penetration", &census.deep_penetrations),
-            ("external", &census.external),
-        ] {
-            for r in rows {
-                if self.escapes.len() >= ESCAPE_MAX_ROWS
-                    || self
-                        .escapes
-                        .iter()
-                        .any(|x| x.entity == r.entity && x.kind == kind)
-                {
-                    continue;
-                }
-                let Some(b) = spall_core::EntityId::new(r.entity)
-                    .ok()
-                    .and_then(|e| world.body(e))
-                else {
-                    continue;
-                };
-                let seen = self.first_seen_scan.get(&r.entity).copied().unwrap_or(tick);
-                let (lo, hi) = b.collider_region;
-                self.escapes.push(OutOfWorldRow {
-                    kind,
-                    entity: r.entity,
-                    first_seen_below_tick: tick,
-                    created_after_tick: seen.saturating_sub(60),
-                    created_at_or_before_tick: seen,
-                    position_m: b.pose.translation_m,
-                    aabb_min_m: r.aabb_min_m,
-                    aabb_max_m: r.aabb_max_m,
-                    velocity_m_s: b.linvel_m_s,
-                    penetration_depth_m: r.penetration_depth_m,
-                    overlapped_cells: r.overlapped_cells,
-                    sleeping: b.sleeping,
-                    dormant: b.dormant,
-                    solid_cells: spall_sim::world::solid_cells(&b.volume),
-                    collider_revision: b.collider_revision,
-                    coarsen_k: b.coarsen_k,
-                    collider_region_cells: [[lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]],
-                    later_samples: Vec::new(),
-                });
-            }
-        }
-    }
-}
-
-/// One wake reason's totals (see `spall_sim::WakeAudit`).
-#[derive(Debug, Clone, Serialize)]
-pub struct WakeReasonRow {
-    pub reason: String,
-    pub operations: u64,
-    pub waking_operations: u64,
-    pub bodies_woken: u64,
-    pub max_woken_by_one: u64,
-}
-
-/// One stage's timing over the measured window (all ticks when no window is set).
-#[derive(Debug, Clone, Serialize)]
-pub struct StageTimingRow {
-    pub stage: String,
-    /// Spans recorded (a stage may fire several times per tick).
-    pub count: u64,
-    pub total_ms: f64,
-    pub mean_ms: f64,
-    pub p50_ms: f64,
-    pub p95_ms: f64,
-    pub p99_ms: f64,
-    pub max_ms: f64,
-    /// Ticks the stage fired in and how long the worst *tick's* sum of it was
-    /// (a stage that fires many times per tick shows there, not in `max_ms`).
-    pub ticks_active: u64,
-    pub worst_tick_total_ms: f64,
-}
-
-/// Aggregates [`spall_sim::prof`] spans (plus the whole-tick busy time) per stage.
-struct StageAgg {
-    window: Option<(u64, u64)>,
-    stages: HashMap<&'static str, StageSamples>,
-    /// The slowest measured ticks (bounded), and one compact row per measured tick.
-    slow: Vec<SlowTickRow>,
-    ticks: Vec<TickRow>,
-}
-
-/// Stages summed per tick for the per-class table.
-const CLASS_STAGES: [&str; 14] = [
-    "physics.rapier_step",
-    "physics.pose_extract",
-    "sim.commit",
-    "commit.hash_and_assemble",
-    "commit.clone_apply_edit",
-    "commit.occupancy_extract",
-    "commit.plan_collider",
-    "commit.publish_parent_collider",
-    "commit.build_children",
-    "commit.install_children",
-    "commit.remove_detached",
-    "stage.structure_index_build",
-    "stage.dry_run_and_reclassify",
-    "srv.persistence_submit",
-];
-
-/// Most slow ticks retained, and most spans kept per slow tick.
-const MAX_SLOW_TICKS: usize = 48;
-const MAX_SLOW_TICK_SPANS: usize = 96;
-
-struct TickRow {
-    tick: u64,
-    busy_ms: f32,
-    class: &'static str,
-    stages: [f32; CLASS_STAGES.len()],
-}
-
-/// Successive per-window cost rows over the measured ticks (a pure fold of the per-tick rows).
-fn tick_windows(ticks: &[TickRow], first: u64) -> Vec<TickWindowRow> {
-    let pct = |v: &mut Vec<f64>, q: f64| -> f64 {
-        if v.is_empty() {
-            return 0.0;
-        }
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let rank = ((q * v.len() as f64).ceil() as usize).clamp(1, v.len());
-        v[rank - 1]
-    };
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < ticks.len() {
-        let w = (ticks[i].tick.saturating_sub(first + 1)) / TICK_WINDOW_TICKS;
-        let mut j = i;
-        while j < ticks.len() && (ticks[j].tick.saturating_sub(first + 1)) / TICK_WINDOW_TICKS == w
-        {
-            j += 1;
-        }
-        let rows = &ticks[i..j];
-        let mut all: Vec<f64> = rows.iter().map(|t| f64::from(t.busy_ms)).collect();
-        let mut ord: Vec<f64> = rows
-            .iter()
-            .filter(|t| t.class == "no_edit")
-            .map(|t| f64::from(t.busy_ms))
-            .collect();
-        let digs: Vec<&TickRow> = rows.iter().filter(|t| t.class == "terrain_dig").collect();
-        let others: Vec<&TickRow> = rows
-            .iter()
-            .filter(|t| t.class != "no_edit" && t.class != "terrain_dig")
-            .collect();
-        let mean = |v: &[&TickRow]| {
-            v.iter().map(|t| f64::from(t.busy_ms)).sum::<f64>() / v.len().max(1) as f64
-        };
-        let hash_i = CLASS_STAGES
-            .iter()
-            .position(|n| *n == "commit.hash_and_assemble")
-            .unwrap_or(0);
-        out.push(TickWindowRow {
-            window: w as u32,
-            first_tick: rows[0].tick,
-            ticks: rows.len() as u64,
-            busy_p50_ms: pct(&mut all.clone(), 0.50),
-            busy_p95_ms: pct(&mut all.clone(), 0.95),
-            busy_p99_ms: pct(&mut all, 0.99),
-            busy_max_ms: rows
-                .iter()
-                .map(|t| f64::from(t.busy_ms))
-                .fold(0.0, f64::max),
-            ordinary_ticks: ord.len() as u64,
-            ordinary_p50_ms: pct(&mut ord.clone(), 0.50),
-            ordinary_p95_ms: pct(&mut ord.clone(), 0.95),
-            ordinary_p99_ms: pct(&mut ord, 0.99),
-            dig_ticks: digs.len() as u64,
-            dig_mean_ms: mean(&digs),
-            dig_max_ms: digs
-                .iter()
-                .map(|t| f64::from(t.busy_ms))
-                .fold(0.0, f64::max),
-            other_edit_ticks: others.len() as u64,
-            other_edit_mean_ms: mean(&others),
-            physics_mean_ms: rows
-                .iter()
-                .map(|t| f64::from(t.stages[0] + t.stages[1]))
-                .sum::<f64>()
-                / rows.len() as f64,
-            dig_hash_mean_ms: digs
-                .iter()
-                .map(|t| f64::from(t.stages[hash_i]))
-                .sum::<f64>()
-                / digs.len().max(1) as f64,
-            over_16_7_ms: rows.iter().filter(|t| t.busy_ms > 16.7).count() as u64,
-        });
-        i = j;
-    }
-    out
-}
-
-/// The class of a tick from the edits it committed.
-fn tick_class(edits: &[TickEditRow]) -> &'static str {
-    let has = |k: &str| edits.iter().any(|e| e.kind == k);
-    let giant = edits.iter().any(|e| e.bulk_baseline);
-    let kinds = [has("terrain_dig"), has("body_cut"), has("blast"), giant]
-        .iter()
-        .filter(|b| **b)
-        .count();
-    match (edits.is_empty(), kinds) {
-        (true, _) => "no_edit",
-        (false, 1) if giant => "giant",
-        (false, 1) if has("terrain_dig") => "terrain_dig",
-        (false, 1) if has("blast") => "blast",
-        (false, 1) => "body_cut",
-        _ => "mixed",
-    }
-}
-
-#[derive(Default)]
-struct StageSamples {
-    spans_ms: Vec<f32>,
-    /// `(tick, summed ms that tick)`, one entry per active tick.
-    per_tick: Vec<(u64, f32)>,
-}
-
-const MAX_STAGE_SAMPLES: usize = 400_000;
-
-impl StageAgg {
-    fn new(window: Option<TimingWindow>) -> Self {
-        Self {
-            window: window.map(|w| (w.warmup_ticks, w.warmup_ticks + w.measured_ticks)),
-            stages: HashMap::new(),
-            slow: Vec::new(),
-            ticks: Vec::new(),
-        }
-    }
-
-    /// Drains this thread's spans for `tick` and folds them in, plus the tick's
-    /// total owning-thread busy time under `srv.tick_busy`.
-    fn ingest(
-        &mut self,
-        tick: u64,
-        busy: Duration,
-        edits: Vec<TickEditRow>,
-        bodies_total: usize,
-        intents_pending: usize,
-    ) {
-        let spans = spall_sim::prof::drain();
-        if let Some((lo, hi)) = self.window
-            && (tick <= lo || tick > hi)
-        {
-            return;
-        }
-        // Same-tick attribution: keep this tick's raw spans and edits together.
-        let busy_ms = busy.as_secs_f64() * 1000.0;
-        let mut row = TickRow {
-            tick,
-            busy_ms: busy_ms as f32,
-            class: tick_class(&edits),
-            stages: [0.0; CLASS_STAGES.len()],
-        };
-        for (name, d) in &spans {
-            if let Some(i) = CLASS_STAGES.iter().position(|s| s == name) {
-                row.stages[i] += (d.as_secs_f64() * 1000.0) as f32;
-            }
-        }
-        self.ticks.push(row);
-        let admit = self.slow.len() < MAX_SLOW_TICKS
-            || self.slow.last().is_some_and(|w| busy_ms > w.busy_ms);
-        if admit {
-            let mut kept: Vec<(String, f64)> = spans
-                .iter()
-                .take(MAX_SLOW_TICK_SPANS)
-                .map(|(n, d)| ((*n).to_string(), d.as_secs_f64() * 1000.0))
-                .collect();
-            kept.shrink_to_fit();
-            self.slow.push(SlowTickRow {
-                tick,
-                busy_ms,
-                spans: kept,
-                edits,
-                bodies_total,
-                intents_pending,
-            });
-            self.slow.sort_by(|a, b| {
-                b.busy_ms
-                    .partial_cmp(&a.busy_ms)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            self.slow.truncate(MAX_SLOW_TICKS);
-        }
-        let mut per_tick: HashMap<&'static str, f32> = HashMap::new();
-        for (name, d) in spans
-            .into_iter()
-            .chain(std::iter::once(("srv.tick_busy", busy)))
-        {
-            let ms = d.as_secs_f64() as f32 * 1000.0;
-            let s = self.stages.entry(name).or_default();
-            if s.spans_ms.len() < MAX_STAGE_SAMPLES {
-                s.spans_ms.push(ms);
-            }
-            *per_tick.entry(name).or_default() += ms;
-        }
-        for (name, ms) in per_tick {
-            let s = self.stages.entry(name).or_default();
-            if s.per_tick.len() < MAX_STAGE_SAMPLES {
-                s.per_tick.push((tick, ms));
-            }
-        }
-    }
-
-    /// The retained slow ticks and the per-class breakdown (call before [`Self::finish`]).
-    fn traces(&self) -> (Vec<SlowTickRow>, Vec<TickClassRow>, Vec<TickWindowRow>) {
-        let mut classes: Vec<TickClassRow> = Vec::new();
-        for class in [
-            "no_edit",
-            "terrain_dig",
-            "body_cut",
-            "blast",
-            "giant",
-            "mixed",
-        ] {
-            let rows: Vec<&TickRow> = self.ticks.iter().filter(|t| t.class == class).collect();
-            if rows.is_empty() {
-                continue;
-            }
-            let mut busy: Vec<f64> = rows.iter().map(|t| f64::from(t.busy_ms)).collect();
-            busy.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let q = |p: f64| {
-                let rank = ((p * busy.len() as f64).ceil() as usize).clamp(1, busy.len());
-                busy[rank - 1]
-            };
-            let mean_stage_ms = CLASS_STAGES
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    let sum: f64 = rows.iter().map(|t| f64::from(t.stages[i])).sum();
-                    ((*name).to_string(), sum / rows.len() as f64)
-                })
-                .collect();
-            classes.push(TickClassRow {
-                class,
-                ticks: rows.len() as u64,
-                busy_p50_ms: q(0.50),
-                busy_p95_ms: q(0.95),
-                busy_p99_ms: q(0.99),
-                busy_max_ms: *busy.last().unwrap_or(&0.0),
-                over_16_7_ms: busy.iter().filter(|b| **b > 16.7).count() as u64,
-                mean_stage_ms,
-            });
-        }
-        let windows = tick_windows(&self.ticks, self.window.map_or(0, |w| w.0));
-        (self.slow.clone(), classes, windows)
-    }
-
-    fn finish(self) -> Vec<StageTimingRow> {
-        let mut rows: Vec<StageTimingRow> = self
-            .stages
-            .into_iter()
-            .map(|(name, mut s)| {
-                s.spans_ms
-                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let pct = |q: f64| -> f64 {
-                    if s.spans_ms.is_empty() {
-                        return 0.0;
-                    }
-                    let rank =
-                        ((q * s.spans_ms.len() as f64).ceil() as usize).clamp(1, s.spans_ms.len());
-                    f64::from(s.spans_ms[rank - 1])
-                };
-                let total: f64 = s.spans_ms.iter().map(|v| f64::from(*v)).sum();
-                StageTimingRow {
-                    stage: name.to_string(),
-                    count: s.spans_ms.len() as u64,
-                    total_ms: total,
-                    mean_ms: total / s.spans_ms.len().max(1) as f64,
-                    p50_ms: pct(0.50),
-                    p95_ms: pct(0.95),
-                    p99_ms: pct(0.99),
-                    max_ms: s.spans_ms.last().copied().map_or(0.0, f64::from),
-                    ticks_active: s.per_tick.len() as u64,
-                    worst_tick_total_ms: s
-                        .per_tick
-                        .iter()
-                        .map(|(_, v)| f64::from(*v))
-                        .fold(0.0, f64::max),
-                }
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            b.total_ms
-                .partial_cmp(&a.total_ms)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        rows
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 struct TimingReport {
     tick_busy_p95_ms: f64,
@@ -3652,7 +3091,6 @@ struct TimingReport {
     physics_p99_ms: f64,
     physics_max_ms: f64,
     physics_samples: u64,
-    over_budget_ticks: u64,
     window_complete: bool,
 }
 
@@ -3699,11 +3137,6 @@ impl TimingCollector {
             physics_p99_ms: percentile(&self.physics_ms, 0.99),
             physics_max_ms: self.physics_ms.iter().copied().fold(0.0, f64::max),
             physics_samples: self.physics_ms.len() as u64,
-            over_budget_ticks: self
-                .tick_busy_ms
-                .iter()
-                .filter(|ms| **ms > 1_000.0 / 60.0)
-                .count() as u64,
             window_complete: self.window.measured_ticks > 0 && ticks_run >= window_end,
         }
     }
@@ -3722,26 +3155,6 @@ fn percentile(samples: &[f64], fraction: f64) -> f64 {
 }
 
 struct SimResult {
-    out_of_world: Vec<OutOfWorldRow>,
-    containment_coverage: ContainmentCoverage,
-    backlog_series: Vec<(u64, u64, u64)>,
-    wake_reasons: Vec<WakeReasonRow>,
-    terrain_brick_colliders: u64,
-    intent_stats: IntentStats,
-    slow_ticks: Vec<SlowTickRow>,
-    tick_classes: Vec<TickClassRow>,
-    tick_windows: Vec<TickWindowRow>,
-    awake_series: Vec<AwakeSampleRow>,
-    stage_timings: Vec<StageTimingRow>,
-    samples: Vec<TelemetrySample>,
-    blast_commit_ticks: Vec<u64>,
-    blast_commit_elapsed_ms: Vec<u64>,
-    backlog_peak_bytes: u64,
-    backlog_peak_age_ms: u64,
-    capture_pool_workers: usize,
-    capture_pool_submitted: u64,
-    capture_pool_active_max: u64,
-    capture_pool_queued_max: u64,
     ok: bool,
     error: Option<String>,
     ticks_run: u64,
@@ -3775,7 +3188,6 @@ struct SimResult {
     actions_requested: u64,
     actions_staged: u64,
     actions_queued_unresolved: u64,
-    admission: crate::admission::AdmissionSummary,
     latency: commit_latency::LatencyReport,
     residency: Option<crate::ResidencyStats>,
     /// T23 / G3 row 7 item 3: the residency backing's on-disk footprint, when
@@ -3797,26 +3209,6 @@ struct SimResult {
 impl SimResult {
     fn error(msg: String, ticks_run: u64) -> Self {
         Self {
-            out_of_world: Vec::new(),
-            containment_coverage: ContainmentCoverage::default(),
-            backlog_series: Vec::new(),
-            stage_timings: Vec::new(),
-            wake_reasons: Vec::new(),
-            terrain_brick_colliders: 0,
-            intent_stats: IntentStats::default(),
-            slow_ticks: Vec::new(),
-            tick_classes: Vec::new(),
-            tick_windows: Vec::new(),
-            awake_series: Vec::new(),
-            samples: Vec::new(),
-            blast_commit_ticks: Vec::new(),
-            blast_commit_elapsed_ms: Vec::new(),
-            backlog_peak_bytes: 0,
-            backlog_peak_age_ms: 0,
-            capture_pool_workers: 0,
-            capture_pool_submitted: 0,
-            capture_pool_active_max: 0,
-            capture_pool_queued_max: 0,
             ok: false,
             error: Some(msg),
             ticks_run,
@@ -3849,7 +3241,6 @@ impl SimResult {
             actions_requested: 0,
             actions_staged: 0,
             actions_queued_unresolved: 0,
-            admission: crate::admission::AdmissionSummary::default(),
             latency: commit_latency::LatencyReport::default(),
             residency: None,
             residency_backing_disk_bytes: None,
@@ -3887,23 +3278,9 @@ enum Phase {
     },
 }
 
-/// One in-flight background baseline capture and the sessions waiting on it.
-struct PendingCapture {
-    /// Journal cursor the snapshot was taken at; a joiner may share the capture
-    /// only while the world's cursor still equals it (no commit since).
-    cursor: JournalSeq,
-    rx: std::sync::mpsc::Receiver<Result<BaselineTransfer, baseline::BaselineError>>,
-    /// The capture is a segmented transfer (only clients that advertised support may wait on it).
-    segmented: bool,
-    /// `(session.raw(), that session's transfer id)`.
-    waiters: Vec<(u64, TransferId)>,
-}
-
 struct ClientLink {
     session: SessionId,
     phase: Phase,
-    /// The client advertised segmented-baseline support in its baseline request.
-    segmented_ok: bool,
 }
 
 /// All the per-run late-join / reconnect bookkeeping the sim loop needs, kept
@@ -3926,20 +3303,8 @@ struct ClientLink {
 /// `spall_server` for one bounded-queue primitive would cut against this
 /// project's stated preference for minimal dependencies; a channel plus a
 /// fixed set of threads is a handful of lines and needs no new crate.
-/// Observed capture-pool load (T23 / G4 join/baseline concurrency evidence).
-#[derive(Default)]
-struct CapturePoolStats {
-    submitted: std::sync::atomic::AtomicU64,
-    started: std::sync::atomic::AtomicU64,
-    finished: std::sync::atomic::AtomicU64,
-    active_max: std::sync::atomic::AtomicU64,
-    queued_max: std::sync::atomic::AtomicU64,
-}
-
 struct CapturePool {
     job_tx: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
-    stats: Arc<CapturePoolStats>,
-    workers: usize,
 }
 
 impl CapturePool {
@@ -3967,11 +3332,7 @@ impl CapturePool {
                 }
             });
         }
-        Self {
-            job_tx,
-            stats: Arc::new(CapturePoolStats::default()),
-            workers,
-        }
+        Self { job_tx }
     }
 
     /// Enqueues `job` for the next free worker. Never blocks the caller (the
@@ -3983,18 +3344,7 @@ impl CapturePool {
         // any known input. If it ever did happen, the caller's
         // `pending_captures` entry simply never resolves rather than
         // panicking the tick loop.
-        use std::sync::atomic::Ordering::Relaxed;
-        let stats = Arc::clone(&self.stats);
-        let submitted = stats.submitted.fetch_add(1, Relaxed) + 1;
-        let queued = submitted.saturating_sub(stats.started.load(Relaxed));
-        stats.queued_max.fetch_max(queued, Relaxed);
-        let _ = self.job_tx.send(Box::new(move || {
-            let started = stats.started.fetch_add(1, Relaxed) + 1;
-            let active = started.saturating_sub(stats.finished.load(Relaxed));
-            stats.active_max.fetch_max(active, Relaxed);
-            job();
-            stats.finished.fetch_add(1, Relaxed);
-        }));
+        let _ = self.job_tx.send(Box::new(job));
     }
 }
 
@@ -4020,22 +3370,18 @@ struct LateJoin {
     /// it with a fresh transfer id; transactions after its cursor remain in the
     /// ordinary per-client catch-up queue.
     cached_baseline: Option<std::sync::Arc<BaselineTransfer>>,
-    /// Background baseline captures in flight. Joiners that request a baseline
-    /// while one is being captured *at the same journal cursor* wait on it
-    /// instead of each taking their own world snapshot on the tick thread (which
-    /// measured ~2 s per joiner: eight simultaneous joiners spent ~16 s of tick
-    /// thread on snapshots alone). The simulation owns publication and only
-    /// polls these at tick boundaries.
-    pending_captures: Vec<PendingCapture>,
+    /// Bounded worker results keyed by the joining session. The simulation owns
+    /// publication and only polls these at tick boundaries.
+    pending_captures: HashMap<
+        u64,
+        (
+            TransferId,
+            std::sync::mpsc::Receiver<Result<BaselineTransfer, baseline::BaselineError>>,
+        ),
+    >,
     /// ENG-30 / T23 row 11, increment 30: bounds concurrent background
     /// baseline captures. See [`CapturePool`].
     capture_pool: CapturePool,
-    /// Forced per-segment decoded budget (see [`ServeConfig::baseline_segment_bytes`]).
-    segment_cap: Option<usize>,
-    /// Test hook: treat every world as too large for the single blob.
-    assume_oversized: bool,
-    /// T23 / G4 session timelines (`None` in unit tests).
-    telemetry: Option<Arc<ServerTelemetry>>,
 }
 
 impl LateJoin {
@@ -4053,17 +3399,8 @@ impl LateJoin {
             baseline_bytes: 0,
             backing: None,
             cached_baseline: None,
-            pending_captures: Vec::new(),
+            pending_captures: HashMap::new(),
             capture_pool: CapturePool::new(capture_workers),
-            segment_cap: None,
-            assume_oversized: false,
-            telemetry: None,
-        }
-    }
-
-    fn ev(&self, session: SessionId, event: &str) {
-        if let Some(t) = &self.telemetry {
-            t.session_event(session, event);
         }
     }
 
@@ -4072,7 +3409,6 @@ impl LateJoin {
     }
 
     fn on_joined(&mut self, session: SessionId) {
-        self.ev(session, "joined");
         self.latest_gen
             .entry(session.slot().0)
             .and_modify(|g| *g = (*g).max(session.generation()))
@@ -4082,19 +3418,15 @@ impl LateJoin {
             ClientLink {
                 session,
                 phase: Phase::Live,
-                segmented_ok: false,
             },
         );
     }
 
     fn on_gone(&mut self, session: SessionId) {
-        self.ev(session, "gone (reader ended)");
         // Keep `latest_gen` so a straggler record from this session is still
         // rejected after the link is gone.
         self.links.remove(&session.raw());
-        for c in &mut self.pending_captures {
-            c.waiters.retain(|(raw, _)| *raw != session.raw());
-        }
+        self.pending_captures.remove(&session.raw());
     }
 
     /// Every connected client currently in normal (`Live`) replication. A client
@@ -4152,31 +3484,19 @@ impl LateJoin {
             return;
         }
         let want_baseline = ack.transfer_id == BASELINE_REQUEST_SENTINEL;
-        if want_baseline
-            && ack.verified_manifest_hash == spall_protocol::segment::baseline_cap_segmented()
-            && let Some(l) = self.links.get_mut(&session.raw())
-        {
-            l.segmented_ok = true;
-        }
         let Some(link) = self.links.get(&session.raw()) else {
             return;
         };
-        let capable = link.segmented_ok;
 
         if want_baseline {
             let id = self.next_id();
-            self.ev(session, "baseline_requested");
             match self
                 .cached_baseline
                 .as_ref()
                 .filter(|b| b.begin.journal_cursor == JournalSeq(sim.journal_cursor()))
             {
-                Some(transfer) if transfer.segments.is_some() && !capable => {
-                    self.refuse_unsupported_baseline(session, clients);
-                }
                 Some(transfer) => {
                     let transfer = transfer.reissue(id);
-                    self.ev(session, "baseline_reused_cached");
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&session.raw()) {
                         link.phase = Phase::Joining {
@@ -4188,71 +3508,22 @@ impl LateJoin {
                     send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
                 }
                 None => {
-                    let cursor = JournalSeq(sim.journal_cursor());
-                    let raw = session.raw();
-                    let joining = Phase::Joining {
-                        transfer_id: id,
-                        queue: VecDeque::new(),
-                        retries: 0,
-                    };
-                    if let Some(existing) = self
-                        .pending_captures
-                        .iter_mut()
-                        .find(|c| c.cursor == cursor)
-                    {
-                        // A capture at this very cursor is already running:
-                        // wait on it rather than snapshotting the world again.
-                        if existing.segmented && !capable {
-                            self.refuse_unsupported_baseline(session, clients);
-                            return;
-                        }
-                        existing.waiters.push((raw, id));
-                        if let Some(link) = self.links.get_mut(&raw) {
-                            link.phase = joining;
-                        }
-                        self.ev(session, "capture_shared_with_inflight");
-                        return;
-                    }
-                    let sp_snap = spall_sim::prof::Span::start("srv.baseline_snapshot_world");
                     let snapshot = baseline::snapshot_world(sim, self.backing_ref());
-                    drop(sp_snap);
-                    let segmented_cap = self.segmented_cap_for(&snapshot, capable);
-                    if segmented_cap.is_some() && !capable {
-                        self.refuse_unsupported_baseline(session, clients);
-                        return;
-                    }
-                    self.ev(session, "capture_submitted");
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                    let telemetry = self.telemetry.clone();
                     self.capture_pool.spawn(move || {
-                        let started = std::time::Instant::now();
-                        let result = match segmented_cap {
-                            Some(cap) => baseline::transfer_from_snapshot_segmented(
-                                snapshot,
-                                id,
-                                InterestEpoch(1),
-                                cap,
-                            ),
-                            None => {
-                                baseline::transfer_from_snapshot(snapshot, id, InterestEpoch(1))
-                            }
-                        };
-                        if let Some(t) = telemetry {
-                            t.capture_encode_ms
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .push(started.elapsed().as_secs_f64() * 1000.0);
-                        }
-                        let _ = tx.send(result);
+                        let _ = tx.send(baseline::transfer_from_snapshot(
+                            snapshot,
+                            id,
+                            InterestEpoch(1),
+                        ));
                     });
-                    if let Some(link) = self.links.get_mut(&raw) {
-                        link.phase = joining;
-                        self.pending_captures.push(PendingCapture {
-                            cursor,
-                            rx,
-                            segmented: segmented_cap.is_some(),
-                            waiters: vec![(raw, id)],
-                        });
+                    if let Some(link) = self.links.get_mut(&session.raw()) {
+                        link.phase = Phase::Joining {
+                            transfer_id: id,
+                            queue: VecDeque::new(),
+                            retries: 0,
+                        };
+                        self.pending_captures.insert(session.raw(), (id, rx));
                     }
                 }
             }
@@ -4271,31 +3542,6 @@ impl LateJoin {
             }) => queue.drain(..).collect(),
             _ => Vec::new(),
         };
-        let flushed_txs = drained
-            .iter()
-            .filter(|i| matches!(i, QueuedItem::Tx(_)))
-            .count() as u64;
-        let last_flushed_id = drained
-            .iter()
-            .filter_map(|i| match i {
-                QueuedItem::Tx(tx) => Some(tx.transaction_id.get()),
-                _ => None,
-            })
-            .max();
-        if let Some(t) = &self.telemetry {
-            t.with_session(session, |s, now| {
-                s.tx_flushed_at_promotion += flushed_txs;
-                if let Some(id) = last_flushed_id {
-                    s.last_tx_id_sent = s.last_tx_id_sent.max(id);
-                }
-                if s.events.len() < MAX_TIMELINE_EVENTS {
-                    s.events.push((
-                        now,
-                        format!("promoted_live (flushed {flushed_txs} queued txs)"),
-                    ));
-                }
-            });
-        }
         for item in drained {
             match item {
                 QueuedItem::Tx(tx) => send_to(clients, session, Outbound::Transaction(tx)),
@@ -4337,20 +3583,6 @@ impl LateJoin {
         for (raw, link) in self.links.iter_mut() {
             match &mut link.phase {
                 Phase::Live => {
-                    if let Some(t) = &self.telemetry {
-                        let id = tx.transaction_id.get();
-                        t.with_session(link.session, move |s, now_for_event| {
-                            s.tx_sent_live += 1;
-                            if s.tx_sent_live.is_multiple_of(100)
-                                && s.events.len() < MAX_TIMELINE_EVENTS
-                            {
-                                let n = s.tx_sent_live;
-                                let now = now_for_event;
-                                s.events.push((now, format!("tx_sent_live #{n} id={id}")));
-                            }
-                            s.last_tx_id_sent = s.last_tx_id_sent.max(id);
-                        });
-                    }
                     send_to(clients, link.session, Outbound::Transaction(tx.clone()));
                     if let Some(t) = &split_transfer {
                         send_to(clients, link.session, Outbound::Baseline(t.clone()));
@@ -4358,13 +3590,6 @@ impl LateJoin {
                 }
                 Phase::Joining { queue, .. } => {
                     queue.push_back(QueuedItem::Tx(tx.clone()));
-                    if let Some(t) = &self.telemetry {
-                        let qlen = queue.len() as u64;
-                        t.with_session(link.session, move |s, _| {
-                            s.tx_queued_joining += 1;
-                            s.max_catch_up_queue = s.max_catch_up_queue.max(qlen);
-                        });
-                    }
                     if let Some(t) = &split_transfer {
                         queue.push_back(QueuedItem::Blob(t.clone()));
                     }
@@ -4379,14 +3604,8 @@ impl LateJoin {
                 Some(ClientLink {
                     session,
                     phase: Phase::Joining { retries, .. },
-                    ..
                 }) => {
                     *retries += 1;
-                    if let Some(t) = &self.telemetry {
-                        let r = *retries;
-                        t.with_session(*session, move |s, _| s.retries = u64::from(r));
-                        t.session_event(*session, format!("catch_up_overflow -> rebaseline #{r}"));
-                    }
                     (*session, *retries)
                 }
                 _ => continue,
@@ -4403,8 +3622,7 @@ impl LateJoin {
             }
             self.retries += 1;
             let id = self.next_id();
-            let capable = self.links.get(&raw).is_some_and(|l| l.segmented_ok);
-            match self.capture_for(sim, id, capable) {
+            match self.capture_for(sim, id) {
                 Some(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&raw) {
@@ -4452,114 +3670,55 @@ impl LateJoin {
     /// Captures a baseline transfer at the current tick / journal cursor, over
     /// the logical brick set (evicted bricks filled from the residency
     /// backing when one is installed).
-    fn capture_for(
-        &mut self,
-        sim: &Simulation,
-        id: TransferId,
-        capable: bool,
-    ) -> Option<BaselineTransfer> {
+    fn capture_for(&mut self, sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
         let cursor = JournalSeq(sim.journal_cursor());
         if let Some(cached) = &self.cached_baseline
             && cached.begin.journal_cursor == cursor
-            && (capable || cached.segments.is_none())
         {
             return Some(cached.reissue(id));
         }
-        let snapshot = baseline::snapshot_world(sim, self.backing_ref());
-        let segmented_cap = self.segmented_cap_for(&snapshot, capable);
-        if segmented_cap.is_some() && !capable {
-            tracing::warn!(
-                "baseline recapture needs segmented support the client did not advertise"
-            );
-            return None;
-        }
-        let transfer = match segmented_cap {
-            Some(cap) => {
-                baseline::transfer_from_snapshot_segmented(snapshot, id, InterestEpoch(1), cap)
-            }
-            None => baseline::transfer_from_snapshot(snapshot, id, InterestEpoch(1)),
-        }
-        .map_err(|e| tracing::warn!("baseline capture failed: {e:?}"))
+        let transfer = baseline::logical_capture_transfer(
+            sim,
+            self.backing_ref(),
+            id,
+            InterestEpoch(1),
+            cursor,
+        )
         .ok()?;
         self.cached_baseline = Some(std::sync::Arc::new(transfer.reissue(id)));
         Some(transfer)
     }
 
-    /// The per-segment decoded budget to capture `snapshot` with, or `None` for the single blob.
-    /// Forced segmentation applies only to clients that advertised support; a world too large for
-    /// the single blob is segmented regardless (and refused later if the client cannot take it).
-    fn segmented_cap_for(
-        &self,
-        snapshot: &baseline::BaselineSnapshot,
-        capable: bool,
-    ) -> Option<usize> {
-        match (self.segment_cap, capable) {
-            (Some(n), true) => Some(n),
-            _ => (self.assume_oversized || snapshot.needs_segmentation())
-                .then_some(spall_protocol::segment::DEFAULT_SEGMENT_DECODED_BYTES),
-        }
-    }
-
-    /// Ends a join whose world needs a segmented baseline the client did not advertise.
-    fn refuse_unsupported_baseline(&mut self, session: SessionId, clients: &ClientMap) {
-        tracing::warn!(session = %session, "refusing join: baseline requires segmented transfer support");
-        self.ev(session, "baseline_refused_unsupported");
-        self.failed += 1;
-        self.links.remove(&session.raw());
-        send_to(
-            clients,
-            session,
-            Outbound::Shutdown(Connection::BYE_REASON_BASELINE_UNSUPPORTED),
-        );
-    }
-
     fn publish_ready_captures(&mut self, clients: &ClientMap) {
-        let mut i = 0;
-        while i < self.pending_captures.len() {
-            let Ok(result) = self.pending_captures[i].rx.try_recv() else {
-                i += 1;
+        let ready: Vec<(u64, Result<BaselineTransfer, baseline::BaselineError>)> = self
+            .pending_captures
+            .iter()
+            .filter_map(|(&raw, (_, rx))| rx.try_recv().ok().map(|result| (raw, result)))
+            .collect();
+        for (raw, result) in ready {
+            let Some((id, _)) = self.pending_captures.remove(&raw) else {
                 continue;
             };
-            let capture = self.pending_captures.swap_remove(i);
             match result {
                 Ok(transfer) => {
-                    let transfer = Arc::new(transfer);
-                    if let Some((_, first_id)) = capture.waiters.first() {
-                        self.cached_baseline = Some(Arc::new(transfer.reissue(*first_id)));
-                    }
-                    for (raw, id) in capture.waiters {
-                        // Only a session still joining on exactly this transfer.
-                        let Some(link) = self.links.get(&raw) else {
-                            continue;
-                        };
-                        if !matches!(&link.phase, Phase::Joining { transfer_id, .. } if *transfer_id == id)
-                        {
-                            continue;
-                        }
-                        let s = link.session;
-                        self.ev(s, "capture_ready");
-                        self.baseline_bytes += transfer.payload_bytes() as u64;
+                    self.baseline_bytes += transfer.payload_bytes() as u64;
+                    self.cached_baseline = Some(Arc::new(transfer.reissue(id)));
+                    if let Some(link) = self.links.get(&raw) {
                         send_to(
                             clients,
-                            s,
-                            Outbound::Baseline(Arc::new(transfer.reissue(id))),
+                            link.session,
+                            Outbound::Baseline(Arc::new(transfer)),
                         );
                     }
                 }
-                Err(e) => {
-                    // A failed capture used to be dropped silently, leaving only a generic bye at the
-                    // client; name the cause where an operator can see it.
-                    tracing::warn!("baseline capture failed: {e:?}");
-                    for (raw, _) in capture.waiters {
-                        self.failed += 1;
-                        if let Some(link) = self.links.remove(&raw) {
-                            self.ev(link.session, format!("capture_failed: {e:?}").as_str());
-                            send_to(
-                                clients,
-                                link.session,
-                                Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
-                            );
-                        }
+                _ => {
+                    self.failed += 1;
+                    if let Some(link) = self.links.remove(&raw) {
+                        send_to(
+                            clients,
+                            link.session,
+                            Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                        );
                     }
                 }
             }
@@ -4581,6 +3740,7 @@ struct Persistence {
     pipeline: Option<PersistPipeline>,
     journalled_through: u64,
     checkpoints_published: u64,
+    outbox_processor: Option<OutboxProcessor>,
 }
 
 /// Opens the world database, recovering from it when it already holds a
@@ -4596,43 +3756,92 @@ struct Persistence {
 /// exist but do not decode, aborts startup without touching the file — losing
 /// durable records requires an explicit operator choice
 /// ([`persist::RecoveryChoice`]), not an automatic resume or reinitialisation.
+#[cfg(test)]
 fn setup_persistence(
     save: Option<&std::path::Path>,
     scene: Scene,
     cfg: &PersistConfig,
     save_faults: Option<spall_store::FaultPlan>,
 ) -> Result<Persistence, String> {
+    setup_persistence_with_terrain_collider_mode(
+        save,
+        scene,
+        cfg,
+        save_faults,
+        TerrainColliderMode::PerBrick,
+    )
+}
+
+#[cfg(test)]
+fn setup_persistence_with_terrain_collider_mode(
+    save: Option<&std::path::Path>,
+    scene: Scene,
+    cfg: &PersistConfig,
+    save_faults: Option<spall_store::FaultPlan>,
+    terrain_collider_mode: TerrainColliderMode,
+) -> Result<Persistence, String> {
+    setup_persistence_with_game_content(
+        save,
+        scene,
+        None,
+        cfg,
+        save_faults,
+        terrain_collider_mode,
+        spall_sim::fixtures::stone_manifest(),
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_persistence_with_game_content(
+    save: Option<&std::path::Path>,
+    scene: Scene,
+    custom_world: Option<&CustomWorld>,
+    cfg: &PersistConfig,
+    save_faults: Option<spall_store::FaultPlan>,
+    terrain_collider_mode: TerrainColliderMode,
+    materials: spall_core::MaterialManifest,
+    mut game_setup: Option<InitialGameWorldSetup>,
+    mut outbox_processor: Option<OutboxProcessor>,
+) -> Result<Persistence, String> {
     let Some(path) = save else {
+        let mut sim =
+            scene.simulation_with_materials(terrain_collider_mode, materials, custom_world);
+        if let Some(setup) = game_setup.take() {
+            setup(&mut sim)?;
+        }
         return Ok(Persistence {
-            sim: scene.simulation(),
+            sim,
             pipeline: None,
             journalled_through: 0,
             checkpoints_published: 0,
+            outbox_processor,
         });
     };
     let mut writer = Writer::open(path).map_err(|e| e.to_string())?;
     let (sim, journalled_through, checkpoints_published) = match writer.recover() {
         Ok(recovery) => {
-            let (sim, seq) = persist::restore(
+            let (sim, seq) = persist::restore_with_terrain_collider_mode(
                 &recovery,
                 cfg,
                 persist::RecoveryChoice::RequireClean,
-                fixtures::stone_manifest(),
+                materials.clone(),
                 AnchorPlane::at(0),
                 PhysicsConfig::default(),
+                terrain_collider_mode,
             )
             .map_err(|e| e.to_string())?;
             (sim, seq, 0)
         }
         // A genuinely new/empty database: seed it with the built-in scene.
         Err(spall_store::StoreError::NoCheckpoint) => {
-            let sp = spall_sim::prof::Span::start("startup.scene_build");
-            let sim = scene.simulation();
-            drop(sp);
-            let sp = spall_sim::prof::Span::start("startup.initial_checkpoint_capture");
+            let mut sim =
+                scene.simulation_with_materials(terrain_collider_mode, materials, custom_world);
+            if let Some(setup) = game_setup.take() {
+                setup(&mut sim)?;
+            }
             let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
-            drop(sp);
-            let _sp = spall_sim::prof::Span::start("startup.initial_checkpoint_publish");
             writer
                 .publish_checkpoint(&checkpoint)
                 .map_err(|e| e.to_string())?;
@@ -4654,12 +3863,26 @@ fn setup_persistence(
     if let Some(faults) = save_faults {
         writer.set_faults(faults);
     }
+    if let Some(processor) = outbox_processor.as_mut() {
+        loop {
+            let events = writer.pending_outbox(256).map_err(|e| e.to_string())?;
+            if events.is_empty() {
+                break;
+            }
+            for event in &events {
+                processor(event)?;
+            }
+            let ids: Vec<_> = events.iter().map(|event| event.event_id).collect();
+            writer.acknowledge_outbox(&ids).map_err(|e| e.to_string())?;
+        }
+    }
     let pipeline = PersistPipeline::spawn(writer, PipelineConfig::default());
     Ok(Persistence {
         sim,
         pipeline: Some(pipeline),
         journalled_through,
         checkpoints_published,
+        outbox_processor,
     })
 }
 
@@ -4717,40 +3940,6 @@ fn dev_intent_from_request(session: SessionId, req: &ActionRequest) -> Option<Ed
 }
 
 // --- ENG-47: server-side action-claim validation -------------------------------
-
-/// A server-approved tool. On the wire `ActionRequest::tool` is an opaque `u16`;
-/// the server — not the client — decides what each id may do, how big a brush it
-/// may request, and how far its aim reaches. Unknown ids are refused. Real
-/// per-role tool grants are a later task; this is the minimum "action limits are
-/// resolved on the server" (`docs/architecture.md` Editing).
-#[derive(Debug, Clone, Copy)]
-struct ToolSpec {
-    /// The edit this tool performs on a validated hit.
-    kind: EditKind,
-    /// Largest brush radius this tool may request, in whole cells.
-    max_radius_cells: i64,
-    /// Farthest the aim ray may travel to a solid authoritative hit, in metres.
-    reach_m: f64,
-}
-
-/// The built-in T10 tool catalog.
-fn tool_spec(tool: u16) -> Option<ToolSpec> {
-    match tool {
-        // 0 — short-range cutter.
-        0 => Some(ToolSpec {
-            kind: EditKind::Cut,
-            max_radius_cells: 8,
-            reach_m: 12.0,
-        }),
-        // 1 — short-range stone placer.
-        1 => Some(ToolSpec {
-            kind: EditKind::Place(spall_voxel::fixtures::STONE),
-            max_radius_cells: 4,
-            reach_m: 8.0,
-        }),
-        _ => None,
-    }
-}
 
 /// Why an [`ActionRequest`] was refused before it could become an [`EditIntent`].
 /// The `&'static str` variants keep the `ActionStatus` reason strings stable.
@@ -4853,12 +4042,24 @@ fn target_matches(claimed: ClaimedTarget, struck: EditTarget) -> bool {
 /// exists; the aim ray hits solid authoritative geometry within reach; and the
 /// struck volume matches `claimed_target`. The `session` is already known-live
 /// (the caller rejects a superseded generation first).
+#[cfg(test)]
 fn resolve_intent(
     world: &SimWorld,
     session: SessionId,
     req: &ActionRequest,
 ) -> Result<EditIntent, ActionReject> {
-    let spec = tool_spec(req.tool).ok_or(ActionReject::UnknownTool(req.tool))?;
+    resolve_intent_with_catalog(world, session, req, &ToolCatalog::default())
+}
+
+fn resolve_intent_with_catalog(
+    world: &SimWorld,
+    session: SessionId,
+    req: &ActionRequest,
+    catalog: &ToolCatalog,
+) -> Result<EditIntent, ActionReject> {
+    let spec = catalog
+        .get(req.tool)
+        .ok_or(ActionReject::UnknownTool(req.tool))?;
 
     let action_fits = matches!(
         (req.action, spec.kind),
@@ -4866,6 +4067,13 @@ fn resolve_intent(
     );
     if !action_fits {
         return Err(ActionReject::ToolActionMismatch);
+    }
+    if let EditKind::Place(material) = spec.kind
+        && world.materials().get(material).is_none()
+    {
+        return Err(ActionReject::Unsupported(
+            "tool material is absent from the authoritative world manifest",
+        ));
     }
 
     let max_units = spec.max_radius_cells.saturating_mul(BRUSH_UNIT);
@@ -5007,7 +4215,6 @@ fn dispatch_motion_by_interest(
     sim: &Simulation,
     lj: &LateJoin,
     clients: &ClientMap,
-    conns: &Mutex<HashMap<u64, Arc<Connection>>>,
     client_repl: &mut HashMap<u64, ClientReplication>,
     egress: &mut MotionEgress,
 ) {
@@ -5041,30 +4248,7 @@ fn dispatch_motion_by_interest(
 
         let repl = client_repl.entry(session.raw()).or_default();
         repl.set_interest(interest);
-        let mut session_budget = budget;
-        if mi.congestion_aware
-            && let Some(conn) = conns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&session.raw())
-        {
-            let path = conn.transport_stats().path;
-            let rtt_s = path.rtt.as_secs_f64().max(0.02);
-            let cap =
-                ((path.cwnd as f64 / rtt_s) * MOTION_CWND_SHARE * MOTION_BATCH_SECONDS) as usize;
-            let cap = cap.max(MOTION_MIN_BATCH_SNAPSHOTS * MOTION_SNAPSHOT_WIRE_BYTES);
-            session_budget.per_batch_bytes = match budget.per_batch_bytes {
-                0 => cap,
-                fixed => fixed.min(cap),
-            };
-        }
-        let kept = repl.select(
-            batch_index,
-            own_player_key,
-            snaps,
-            &digests,
-            &session_budget,
-        );
+        let kept = repl.select(batch_index, own_player_key, snaps, &digests, &budget);
         let outcome = repl.last_outcome();
         egress.snapshots_sent += outcome.kept;
         egress.interest_culled += outcome.interest_culled;
@@ -5128,6 +4312,63 @@ fn reject(clients: &ClientMap, session: SessionId, request: RequestId, reason: &
     );
 }
 
+fn progression_rejected(
+    request: &spall_protocol::ProgressionRequest,
+    code: spall_protocol::ProgressionRejectCode,
+) -> spall_protocol::ProgressionResponse {
+    spall_protocol::ProgressionResponse {
+        request_id: request.request_id,
+        catalog_version: request.catalog_version.max(1),
+        inventory_revision: request.expected_inventory_revision,
+        outcome: spall_protocol::ProgressionOutcome::Rejected(code),
+        inventory: Vec::new(),
+    }
+}
+
+fn parse_player_credentials(bytes: &[u8]) -> Result<Vec<spall_net::PlayerCredential>, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "credential registry is not valid UTF-8".to_string())?;
+    let mut credentials = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let player_text = fields.next();
+        let token_text = fields.next();
+        if fields.next().is_some() {
+            return Err(format!(
+                "credential registry line {} has extra fields",
+                line_index + 1
+            ));
+        }
+        let (Some(player_text), Some(token_text)) = (player_text, token_text) else {
+            return Err(format!(
+                "credential registry line {} is incomplete",
+                line_index + 1
+            ));
+        };
+        let player_id = spall_protocol::PlayerId::from_hex(player_text).ok_or_else(|| {
+            format!(
+                "credential registry line {} has invalid player ID",
+                line_index + 1
+            )
+        })?;
+        let token = spall_net::JoinToken::from_hex(token_text).ok_or_else(|| {
+            format!(
+                "credential registry line {} has invalid token",
+                line_index + 1
+            )
+        })?;
+        credentials.push(spall_net::PlayerCredential { player_id, token });
+        if credentials.len() > 4096 {
+            return Err("credential registry exceeds the 4096-entry limit".into());
+        }
+    }
+    Ok(credentials)
+}
+
 /// Returns a replayable status only for an action that passed authoritative
 /// validation and was admitted to the simulation. Pre-admission validation and
 /// rate-limit refusals intentionally are not held here: no edit was staged, so
@@ -5140,90 +4381,29 @@ fn replay_admitted_status(sim: &Simulation, request: RequestId) -> Option<Action
 /// stream, every part on a fresh bulk stream, then `BaselineEnd` on control.
 /// Returns `false` if any leg fails (the writer loop then tears the connection
 /// down).
-async fn send_baseline(
-    conn: &Connection,
-    transfer: &BaselineTransfer,
-    telemetry: &ServerTelemetry,
-) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    let _active = ActiveBaselineSend::begin(telemetry);
-    let started = std::time::Instant::now();
-    let ok = send_baseline_paced(conn, transfer, telemetry.baseline_rate_limit).await;
-    if ok {
-        let bytes = transfer.payload_bytes() as u64;
-        telemetry.baseline_send_bytes.fetch_add(bytes, Relaxed);
-        let mut records = telemetry
-            .baseline_sends
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if records.len() < MAX_BASELINE_SEND_RECORDS {
-            records.push(BaselineSendRecord {
-                session_slot: conn.session().slot().0,
-                payload_bytes: bytes,
-                duration_ms: started.elapsed().as_millis() as u64,
-            });
-        }
-    } else {
-        telemetry.baseline_sends_failed.fetch_add(1, Relaxed);
-    }
-    ok
-}
-
-/// [`send_baseline`]'s wire work. With `rate_limit` set, the transfer is paced
-/// so the cumulative payload never runs ahead of `rate_limit` bytes/s, which
-/// keeps one joiner from consuming the link its neighbours' live topology
-/// shares.
-async fn send_baseline_paced(
-    conn: &Connection,
-    transfer: &BaselineTransfer,
-    rate_limit: Option<u64>,
-) -> bool {
-    // Every failure names its stage: a bare `false` used to surface upstream only as
-    // "reliable record send failed (connection lost or closed by peer)", which hid the case
-    // where the *record itself* was refused (e.g. over the control-record size limit).
-    let fail = |stage: &str, e: &dyn std::fmt::Display| {
-        tracing::warn!(
-            session = %conn.session(),
-            "baseline transfer failed at {stage}: {e} (parts {}, begin record ok)",
-            transfer.parts.len()
-        );
-        false
-    };
-    if let Err(e) = conn
+async fn send_baseline(conn: &Connection, transfer: &BaselineTransfer) -> bool {
+    if conn
         .send_record(WireRecord::BaselineBegin(transfer.begin.clone()))
         .await
+        .is_err()
     {
-        return fail("BaselineBegin", &e);
+        return false;
     }
     let mut bulk = match conn.open_bulk().await {
         Ok(b) => b,
-        Err(e) => return fail("open_bulk", &e),
+        Err(_) => return false,
     };
-    let started = tokio::time::Instant::now();
-    let mut sent = 0u64;
-    for shared in transfer.parts.iter() {
-        // The parts are shared between joiners; stamp this joiner's transfer id on a transient copy.
-        let mut part = shared.clone();
-        part.transfer_id = transfer.begin.transfer_id;
-        if let Err(e) = bulk.send_part(&part).await {
-            return fail("bulk part", &e);
-        }
-        if let Some(rate) = rate_limit.filter(|r| *r > 0) {
-            sent += part.payload.len() as u64;
-            let due = Duration::from_secs_f64(sent as f64 / rate as f64);
-            tokio::time::sleep_until(started + due).await;
+    for part in transfer.parts.iter() {
+        if bulk.send_part(part).await.is_err() {
+            return false;
         }
     }
-    if let Err(e) = bulk.finish() {
-        return fail("bulk finish", &e);
+    if bulk.finish().is_err() {
+        return false;
     }
-    match conn
-        .send_record(WireRecord::BaselineEnd(transfer.end))
+    conn.send_record(WireRecord::BaselineEnd(transfer.end))
         .await
-    {
-        Ok(_) => true,
-        Err(e) => fail("BaselineEnd", &e),
-    }
+        .is_ok()
 }
 
 async fn wait_true(mut rx: watch::Receiver<bool>) {
@@ -5247,7 +4427,6 @@ async fn serve_conn(
     clients: ClientMap,
     conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
     egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>>,
-    telemetry: Arc<ServerTelemetry>,
     stop: watch::Receiver<bool>,
     _slot: AdmissionSlot,
 ) {
@@ -5256,7 +4435,9 @@ async fn serve_conn(
 
     // Announce the join in order so the sim loop can supersede an earlier
     // session on the same slot (reconnect) and drive a late-join baseline.
-    let _ = inbound.send(Inbound::Joined(session)).await;
+    let _ = inbound
+        .send(Inbound::Joined(session, conn.player_id()))
+        .await;
 
     let liveness = tokio::spawn(conn.clone().run_liveness(stop.clone()));
 
@@ -5273,6 +4454,12 @@ async fn serve_conn(
                     // stays far under the cap.
                     Ok(Some(WireRecord::ActionRequest(req))) => {
                         match inbound.try_send(Inbound::Action(session, req)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                    Ok(Some(WireRecord::ProgressionRequest(req))) => {
+                        match inbound.try_send(Inbound::Progression(session, req)) {
                             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                             Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
@@ -5319,7 +4506,6 @@ async fn serve_conn(
     };
 
     let mut motion_seq = 0u64;
-    let end_reason;
     'writer: loop {
         // Flush everything queued, in commit order, before parking.
         loop {
@@ -5329,17 +4515,31 @@ async fn serve_conn(
             }
             for msg in batch.reliable {
                 let ok = match msg {
-                    Outbound::Transaction(tx) => conn
-                        .send_record(WireRecord::TopologyTransaction((*tx).clone()))
-                        .await
-                        .is_ok(),
+                    Outbound::Transaction(tx) => {
+                        let sent = conn
+                            .send_record(WireRecord::TopologyTransaction((*tx).clone()))
+                            .await;
+                        if let Err(error) = &sent {
+                            // Never a silent disconnect: an encode failure here
+                            // (e.g. a record over the control limit) ends this
+                            // client's stream, so say why.
+                            tracing::error!(
+                                transaction = tx.transaction_id.get(),
+                                %error,
+                                "topology transaction could not be sent; closing client stream"
+                            );
+                        }
+                        sent.is_ok()
+                    }
                     Outbound::Status(s) => conn
                         .send_record(WireRecord::ActionStatus((*s).clone()))
                         .await
                         .is_ok(),
-                    Outbound::Baseline(transfer) => {
-                        send_baseline(&conn, &transfer, &telemetry).await
-                    }
+                    Outbound::Progression(reply) => conn
+                        .send_record(WireRecord::ProgressionResponse((*reply).clone()))
+                        .await
+                        .is_ok(),
+                    Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
                     // Motion is never queued as reliable; ignore defensively.
                     Outbound::Motion(_) => true,
                     Outbound::Shutdown(reason) => {
@@ -5348,19 +4548,12 @@ async fn serve_conn(
                     }
                 };
                 if !ok {
-                    end_reason = "reliable record send failed (connection lost or closed by peer)"
-                        .to_string();
                     break 'writer;
                 }
-                let age = handle.delivered();
-                telemetry
-                    .max_delivery_age_us
-                    .fetch_max(age.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(snaps) = batch.motion {
                 for snap in snaps.iter() {
                     if conn.send_datagram(motion_seq, snap).await.is_err() {
-                        end_reason = "motion datagram send failed".to_string();
                         break 'writer;
                     }
                     motion_seq += 1;
@@ -5372,13 +4565,12 @@ async fn serve_conn(
                 // so it re-baselines on reconnect rather than the host holding
                 // an unbounded queue or discarding committed topology in place.
                 let _ = conn.say_bye("reliable backlog exceeded").await;
-                end_reason = "reliable backlog exceeded".to_string();
                 break 'writer;
             }
         }
         tokio::select! {
             _ = handle.woken() => {}
-            _ = wait_true(stop.clone()) => { end_reason = "server stop".to_string(); break 'writer },
+            _ = wait_true(stop.clone()) => break 'writer,
         }
     }
 
@@ -5402,8 +4594,6 @@ async fn serve_conn(
             );
         }
     }
-    telemetry.session_event(session, format!("connection_ended: {end_reason}"));
-    telemetry.with_session(session, |s, _| s.ended_reason = Some(end_reason.clone()));
     conn.close("connection complete");
     reader.abort();
     dgram_reader.abort();
@@ -5414,6 +4604,95 @@ async fn serve_conn(
 mod tests {
     use super::*;
     use spall_store::{JournalPayload, JournalRecord};
+
+    #[test]
+    fn player_credential_registry_parser_never_echoes_tokens() {
+        let player_id = "11".repeat(16);
+        let token = "a5".repeat(32);
+        let content = format!("# operator registry\n{player_id} {token}\n");
+        let credentials = parse_player_credentials(content.as_bytes()).unwrap();
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].player_id.to_hex(), player_id);
+        assert!(!format!("{:?}", credentials[0]).contains(&token));
+
+        let bad_token = "z1".repeat(32);
+        let malformed = format!("{player_id} {bad_token}");
+        let error = parse_player_credentials(malformed.as_bytes()).unwrap_err();
+        assert!(!error.contains(&bad_token));
+    }
+
+    #[test]
+    fn progression_queue_is_bounded_and_returns_in_serial_order() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = ProgressionWorker::spawn(Box::new(move |_session, _, request| {
+            if request.request_id == 1 {
+                let _ = started_tx.send(());
+                std::thread::sleep(std::time::Duration::from_millis(75));
+            }
+            spall_protocol::ProgressionResponse {
+                request_id: request.request_id,
+                catalog_version: 1,
+                inventory_revision: request.request_id,
+                outcome: spall_protocol::ProgressionOutcome::Inventory,
+                inventory: Vec::new(),
+            }
+        }));
+        let session = sess(1, 1);
+        let started = std::time::Instant::now();
+        worker
+            .submit
+            .try_send(ProgressionWork {
+                session,
+                player_id: None,
+                request: spall_protocol::ProgressionRequest {
+                    request_id: 1,
+                    catalog_version: 1,
+                    expected_inventory_revision: 0,
+                    operation: spall_protocol::ProgressionOperation::InspectInventory,
+                },
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        for request_id in 2..=65 {
+            worker
+                .submit
+                .try_send(ProgressionWork {
+                    session,
+                    player_id: None,
+                    request: spall_protocol::ProgressionRequest {
+                        request_id,
+                        catalog_version: 1,
+                        expected_inventory_revision: 0,
+                        operation: spall_protocol::ProgressionOperation::InspectInventory,
+                    },
+                })
+                .expect("one active and 64 queued requests fit");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert!(matches!(
+            worker.submit.try_send(ProgressionWork {
+                session,
+                player_id: None,
+                request: spall_protocol::ProgressionRequest {
+                    request_id: 66,
+                    catalog_version: 1,
+                    expected_inventory_revision: 0,
+                    operation: spall_protocol::ProgressionOperation::InspectInventory,
+                },
+            }),
+            Err(std::sync::mpsc::TrySendError::Full(_))
+        ));
+        for expected in 1..=65 {
+            let done = worker
+                .completed
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(done.session, session);
+            assert_eq!(done.response.request_id, expected);
+        }
+    }
 
     fn empty_clients() -> ClientMap {
         Arc::new(Mutex::new(HashMap::new()))
@@ -5778,20 +5057,18 @@ mod tests {
             DEFAULT_MAX_JOIN_RETRIES,
             default_capture_workers(),
         );
-        let first = lj.capture_for(&sim, TransferId(1), false).unwrap();
-        let second = lj.capture_for(&sim, TransferId(2), false).unwrap();
+        let first = lj.capture_for(&sim, TransferId(1)).unwrap();
+        let second = lj.capture_for(&sim, TransferId(2)).unwrap();
 
         assert_eq!(first.begin.journal_cursor, second.begin.journal_cursor);
         assert_eq!(first.begin.transfer_id, TransferId(1));
         assert_eq!(second.begin.transfer_id, TransferId(2));
-        assert!(std::sync::Arc::ptr_eq(&first.parts, &second.parts));
-        // The parts are shared and keep the capture's id; the sender stamps each joiner's transfer
-        // id on a transient copy, so the second joiner costs no second copy of the payload.
+        assert!(std::sync::Arc::ptr_eq(&first.world, &second.world));
         assert!(
             second
                 .parts
                 .iter()
-                .all(|part| part.transfer_id == TransferId(1))
+                .all(|part| part.transfer_id == TransferId(2))
         );
 
         let tx = Arc::new(TopologyTransaction {
@@ -5887,66 +5164,6 @@ mod tests {
         assert_eq!(max_concurrent.load(Ordering::SeqCst), 2);
     }
 
-    /// Joiners that ask for a baseline while a capture at the same journal
-    /// cursor is in flight share it: one world snapshot on the tick thread, one
-    /// encode, every waiter gets its own transfer id. (Measured: eight
-    /// simultaneous joiners each took a ~2 s snapshot on the tick thread.)
-    #[test]
-    fn simultaneous_joiners_share_one_capture() {
-        let sim = Scene::BridgeCut.simulation();
-        let clients = empty_clients();
-        let mut lj = LateJoin::new(64, 1, 2);
-        let mut handles = Vec::new();
-        let joiners: Vec<SessionId> = (0..4).map(|s| sess(s, 1)).collect();
-        for j in &joiners {
-            let h = OutboundHandle::new();
-            clients.lock().unwrap().insert(j.raw(), h.clone());
-            handles.push(h);
-            lj.on_joined(*j);
-            lj.on_baseline_ack(
-                *j,
-                BaselineAck {
-                    transfer_id: BASELINE_REQUEST_SENTINEL,
-                    verified_manifest_hash: Hash32::ZERO,
-                    installed_cursor: spall_core::JournalSeq(0),
-                },
-                &sim,
-                &clients,
-                &mut MotionPublisher::new(60, 20),
-            );
-        }
-        assert_eq!(lj.pending_captures.len(), 1, "one capture for all four");
-        assert_eq!(lj.pending_captures[0].waiters.len(), 4);
-
-        // Publish once the worker finishes; each joiner gets its own transfer id.
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while !lj.pending_captures.is_empty() {
-            lj.publish_ready_captures(&clients);
-            assert!(
-                std::time::Instant::now() < deadline,
-                "capture never finished"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let mut ids = Vec::new();
-        for h in &handles {
-            let batch = h.take();
-            let baselines: Vec<_> = batch
-                .reliable
-                .iter()
-                .filter_map(|m| match m {
-                    Outbound::Baseline(t) => Some(t.begin.transfer_id),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(baselines.len(), 1, "exactly one baseline per joiner");
-            ids.push(baselines[0]);
-        }
-        ids.sort_by_key(|i| i.0);
-        ids.dedup();
-        assert_eq!(ids.len(), 4, "distinct transfer ids per joiner");
-    }
-
     #[test]
     fn catch_up_overflow_recaptures_then_drops_after_the_retry_budget() {
         let sim = Scene::BridgeCut.simulation();
@@ -5959,7 +5176,7 @@ mod tests {
             joiner,
             BaselineAck {
                 transfer_id: BASELINE_REQUEST_SENTINEL,
-                verified_manifest_hash: Hash32::ZERO,
+                verified_manifest_hash: spall_protocol::Hash32::ZERO,
                 installed_cursor: spall_core::JournalSeq(0),
             },
             &sim,
@@ -6003,97 +5220,6 @@ mod tests {
         );
     }
 
-    fn baseline_request(hash: Hash32) -> BaselineAck {
-        BaselineAck {
-            transfer_id: BASELINE_REQUEST_SENTINEL,
-            verified_manifest_hash: hash,
-            installed_cursor: spall_core::JournalSeq(0),
-        }
-    }
-
-    /// Runs one baseline request and returns what the joiner was sent (`Baseline` transfers and
-    /// `Shutdown` reasons) after the background capture, if any, completed.
-    fn negotiate(
-        lj: &mut LateJoin,
-        hash: Hash32,
-    ) -> (Vec<Arc<BaselineTransfer>>, Vec<&'static str>) {
-        let sim = Scene::BridgeCut.simulation();
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        let joiner = sess(0, 1);
-        let handle = OutboundHandle::new();
-        clients.lock().unwrap().insert(joiner.raw(), handle.clone());
-        lj.on_joined(joiner);
-        lj.on_baseline_ack(
-            joiner,
-            baseline_request(hash),
-            &sim,
-            &clients,
-            &mut MotionPublisher::new(60, 20),
-        );
-        // Wait (bounded) for the background capture and publish it.
-        for _ in 0..200 {
-            lj.publish_ready_captures(&clients);
-            if lj.pending_captures.is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let mut transfers = Vec::new();
-        let mut shutdowns = Vec::new();
-        for msg in handle.take().reliable {
-            match msg {
-                Outbound::Baseline(t) => transfers.push(t),
-                Outbound::Shutdown(r) => shutdowns.push(r),
-                _ => {}
-            }
-        }
-        (transfers, shutdowns)
-    }
-
-    #[test]
-    fn a_capable_client_gets_a_segmented_baseline_when_the_world_needs_it_and_others_are_refused() {
-        // Capability advertised + oversized world -> segmented (world_version 2).
-        let mut lj = LateJoin::new(64, 1, 2);
-        lj.assume_oversized = true;
-        let (transfers, shutdowns) =
-            negotiate(&mut lj, spall_protocol::segment::baseline_cap_segmented());
-        assert!(shutdowns.is_empty(), "{shutdowns:?}");
-        assert_eq!(transfers.len(), 1);
-        assert_eq!(
-            transfers[0].begin.world_version,
-            spall_protocol::segment::BASELINE_SEGMENTED_WORLD_VERSION
-        );
-        assert!(transfers[0].segments.is_some());
-
-        // No capability + oversized world -> explicit refusal, never a partial world.
-        let mut lj = LateJoin::new(64, 1, 2);
-        lj.assume_oversized = true;
-        let (transfers, shutdowns) = negotiate(&mut lj, Hash32::ZERO);
-        assert!(transfers.is_empty());
-        assert_eq!(shutdowns, vec![Connection::BYE_REASON_BASELINE_UNSUPPORTED]);
-        assert_eq!(lj.failed, 1);
-
-        // No capability + a world that fits -> the ordinary single blob (byte-identical to before).
-        let mut lj = LateJoin::new(64, 1, 2);
-        let (transfers, shutdowns) = negotiate(&mut lj, Hash32::ZERO);
-        assert!(shutdowns.is_empty());
-        assert_eq!(transfers[0].begin.world_version, 1);
-        assert!(transfers[0].segments.is_none());
-
-        // Forced segmentation applies only to clients that advertised support.
-        let mut lj = LateJoin::new(64, 1, 2);
-        lj.segment_cap = Some(spall_protocol::segment::DENSE_BRICK_DECODED_COST);
-        let (transfers, _) = negotiate(&mut lj, Hash32::ZERO);
-        assert_eq!(
-            transfers[0].begin.world_version, 1,
-            "an old client still gets v1"
-        );
-        let mut lj = LateJoin::new(64, 1, 2);
-        lj.segment_cap = Some(spall_protocol::segment::DENSE_BRICK_DECODED_COST);
-        let (transfers, _) = negotiate(&mut lj, spall_protocol::segment::baseline_cap_segmented());
-        assert_eq!(transfers[0].begin.world_version, 2);
-    }
-
     /// T23 / G3 row 10: the joiner dropped after its retry budget is exhausted
     /// must be told with a `Bye` reason distinct from an ordinary end of
     /// session, so a client that sees its control loop end can tell the two
@@ -6113,7 +5239,7 @@ mod tests {
             joiner,
             BaselineAck {
                 transfer_id: BASELINE_REQUEST_SENTINEL,
-                verified_manifest_hash: Hash32::ZERO,
+                verified_manifest_hash: spall_protocol::Hash32::ZERO,
                 installed_cursor: spall_core::JournalSeq(0),
             },
             &sim,
@@ -6295,7 +5421,7 @@ mod tests {
     /// the connection (`take` never reset it), so any long-lived client was
     /// eventually disconnected however promptly its writer drained.
     #[test]
-    fn a_draining_writer_never_trips_the_byte_cap_and_backlog_age_is_tracked() {
+    fn a_draining_writer_never_trips_the_byte_cap() {
         let h = OutboundHandle::new();
         let per_msg = reliable_msg_bytes(&empty_tx());
         let rounds = MAX_RELIABLE_BACKLOG_BYTES / per_msg * 3;
@@ -6304,24 +5430,13 @@ mod tests {
                 h.push(empty_tx()).is_ok(),
                 "push {i} refused by a drained queue"
             );
-            let batch = h.take();
-            assert_eq!(batch.reliable.len(), 1);
+            assert_eq!(h.take().reliable.len(), 1);
             assert_eq!(
                 h.reliable_bytes(),
                 0,
                 "take hands the writer the whole queue"
             );
-            let (bytes, _) = h.backlog();
-            assert_eq!(bytes, per_msg, "taken-but-undelivered bytes stay counted");
-            h.delivered();
-            assert_eq!(h.backlog().0, 0);
         }
-        // A message waiting in the queue ages.
-        h.push(empty_tx()).unwrap();
-        std::thread::sleep(Duration::from_millis(15));
-        let (bytes, age) = h.backlog();
-        assert_eq!(bytes, per_msg);
-        assert!(age >= Duration::from_millis(10), "age {age:?}");
     }
 
     /// Regression: admission counted connections ever accepted, so after
@@ -6430,6 +5545,56 @@ mod tests {
         assert_eq!(other_ok, MAX_ACTIONS_PER_CLIENT_PER_TICK);
     }
 
+    #[test]
+    fn timing_window_excludes_warmup_and_reports_nearest_rank_percentiles() {
+        let mut timing = TimingCollector::new(TimingWindow {
+            warmup_ticks: 2,
+            measured_ticks: 4,
+            max_samples: 4,
+        });
+
+        // Warmup is deliberately expensive but must not contaminate the gate
+        // measurement. The six measured ticks are 1..=4 ms for tick time and
+        // 10..=40 ms for physics; the collector should retain only ticks 3..6.
+        timing.record(1, Duration::from_millis(100), Duration::from_millis(100));
+        timing.record(2, Duration::from_millis(99), Duration::from_millis(99));
+        for tick in 3..=6 {
+            timing.record(
+                tick,
+                Duration::from_millis(tick - 2),
+                Duration::from_millis((tick - 2) * 10),
+            );
+        }
+
+        let report = timing.finish(6);
+        assert_eq!(report.tick_busy_samples, 4);
+        assert_eq!(report.physics_samples, 4);
+        assert_eq!(report.tick_busy_p95_ms, 4.0);
+        assert_eq!(report.tick_busy_p99_ms, 4.0);
+        assert_eq!(report.physics_p95_ms, 40.0);
+        assert_eq!(report.physics_p99_ms, 40.0);
+        assert_eq!(report.tick_busy_max_ms, 4.0);
+        assert_eq!(report.physics_max_ms, 40.0);
+        assert!(report.window_complete);
+    }
+
+    #[test]
+    fn timing_window_is_fail_closed_when_the_requested_window_is_incomplete() {
+        let mut timing = TimingCollector::new(TimingWindow {
+            warmup_ticks: 1,
+            measured_ticks: 3,
+            max_samples: 3,
+        });
+        timing.record(2, Duration::from_millis(1), Duration::from_millis(1));
+        timing.record(3, Duration::from_millis(1), Duration::from_millis(1));
+
+        let report = timing.finish(3);
+        assert_eq!(report.tick_busy_samples, 2);
+        assert_eq!(report.physics_samples, 2);
+        assert!(!report.window_complete);
+        assert_eq!(report.tick_busy_p95_ms, 1.0);
+    }
+
     // --- ENG-36: recovery must fail closed on corruption -------------------
 
     fn persist_cfg() -> PersistConfig {
@@ -6474,6 +5639,40 @@ mod tests {
         );
         drop(pipeline);
         assert_eq!(checkpoint_row_count(&db), 1);
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn recovery_rebuilds_the_selected_terrain_collision_without_changing_world_hash() {
+        let db = scratch_db("terrain_collider_mode");
+        let original = setup_persistence_with_terrain_collider_mode(
+            Some(&db),
+            Scene::BridgeCut,
+            &persist_cfg(),
+            None,
+            TerrainColliderMode::WholeTerrain,
+        )
+        .unwrap();
+        assert!(!original.sim.world().terrain_brick_colliders_enabled());
+        let hash = original.sim.world().world_hash();
+        drop(original);
+
+        let restored = setup_persistence_with_terrain_collider_mode(
+            Some(&db),
+            Scene::BridgeCut,
+            &persist_cfg(),
+            None,
+            TerrainColliderMode::PerBrick,
+        )
+        .unwrap();
+        assert!(restored.sim.world().terrain_brick_colliders_enabled());
+        restored
+            .sim
+            .world()
+            .validate_terrain_brick_colliders()
+            .unwrap();
+        assert_eq!(restored.sim.world().world_hash(), hash);
+        drop(restored);
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 
@@ -6562,41 +5761,5 @@ mod tests {
             "the corrupt save was not overwritten with the built-in scene"
         );
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
-    }
-    #[test]
-    fn windows_separate_ordinary_ticks_from_digs_and_split_on_the_boundary() {
-        let row = |tick: u64, busy: f32, class: &'static str| TickRow {
-            tick,
-            busy_ms: busy,
-            class,
-            stages: [0.0; CLASS_STAGES.len()],
-        };
-        let mut ticks = Vec::new();
-        for t in 1..=7_200u64 {
-            let (busy, class) = if t % 60 == 0 {
-                (70.0, "terrain_dig")
-            } else {
-                (8.0, "no_edit")
-            };
-            ticks.push(row(t, busy, class));
-        }
-        let w = tick_windows(&ticks, 0);
-        assert_eq!(w.len(), 2, "7,200 ticks are two 3,600-tick windows");
-        assert_eq!(w[0].ticks, 3_600);
-        assert_eq!(w[0].first_tick, 1);
-        assert_eq!(w[1].first_tick, 3_601);
-        for r in &w {
-            assert_eq!(r.dig_ticks, 60);
-            assert!((r.dig_mean_ms - 70.0).abs() < 1e-6);
-            assert!(
-                (r.ordinary_p99_ms - 8.0).abs() < 1e-6,
-                "ordinary ticks are not the digs"
-            );
-            assert!(
-                r.busy_p99_ms > 60.0,
-                "the all-tick p99 is the digs: {}",
-                r.busy_p99_ms
-            );
-        }
     }
 }

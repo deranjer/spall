@@ -35,7 +35,10 @@ impl OffscreenTarget {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: COLOR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            // TEXTURE_BINDING lets a host UI sample the tone-mapped result.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let hdr = device.create_texture(&wgpu::TextureDescriptor {
@@ -127,7 +130,7 @@ impl OffscreenTarget {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        ctx.wait();
+        ctx.wait()?;
         rx.recv()
             .map_err(|_| RenderError::Readback)?
             .map_err(|_| RenderError::Readback)?;
@@ -136,7 +139,9 @@ impl OffscreenTarget {
         let unpadded = (self.width * 4) as usize;
         let mut out = Vec::with_capacity(unpadded * self.height as usize);
         {
-            let mapped = slice.get_mapped_range();
+            let mapped = slice
+                .get_mapped_range()
+                .map_err(|_| RenderError::Readback)?;
             for row in mapped.chunks_exact(padded) {
                 out.extend_from_slice(&row[..unpadded]);
             }

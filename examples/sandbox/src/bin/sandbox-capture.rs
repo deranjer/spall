@@ -866,6 +866,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
     let server_cfg = ServeConfig {
         listen: "127.0.0.1:0".parse().expect("valid loopback addr"),
         scene: ServerScene::CrossBridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: DESTRUCTION_TICKS,
         quiescence_ticks: 0,
@@ -894,13 +895,11 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         motion_interest: None,
         residency: None,
         residency_disk_path: None,
-        terrain_brick_colliders: false,
-        baseline_segment_bytes: None,
         contact_damage: None,
         dormancy: None,
         timing_window: None,
-        baseline_rate_limit_bytes_per_sec: None,
-        wake_audit: false,
+        credential_registry_file: None,
+        custom_world: None,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 
@@ -955,11 +954,9 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         summary_json: Some(dir.join("cutter.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
-        baseline_staging_budget_bytes: Some(
-            spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
-        ),
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     };
     let cutter_thread = std::thread::spawn(move || run_replication_client(cutter_cfg));
 
@@ -985,13 +982,11 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         summary_json: Some(dir.join("observer.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
-        baseline_staging_budget_bytes: Some(
-            spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
-        ),
         on_replica_ready: Some(Arc::new(move |r| {
             *replica_slot_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         })),
         interactive: None,
+        client_authoritative: false,
     };
     let observer_thread = std::thread::spawn(move || run_replication_client(observer_cfg));
 

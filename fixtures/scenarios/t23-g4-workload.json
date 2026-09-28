@@ -20,6 +20,11 @@
   "minimum_transactions": 20,
   "replay_check": true,
   "restart_check": true,
+  "server_timing": {
+    "warmup_ticks": 0,
+    "measured_ticks": 3000,
+    "max_samples": 3000
+  },
   "cuts": [
     {
       "client": 0,

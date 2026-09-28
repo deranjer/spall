@@ -105,7 +105,9 @@ The command captures open- and closed-roof variants as both `shaded.png` and
 an emissive orange panel, a fixed camera/exposure, and the same 128-cubed cache.
 
 Measured on Windows 11, NVIDIA GeForce RTX 4080 SUPER, D3D12, pinned `wgpu
-24.0.5`, debug build, 1920x1080, GPU timestamp queries enabled:
+24.0.5` (historical: the workspace has since moved to wgpu 30 — re-measure on the
+current stack before relying on these numbers; the frozen surface is unchanged),
+debug build, 1920x1080, GPU timestamp queries enabled:
 
 | Variant | CPU cache upload | GPU trace | GPU denoise | Total measured GPU passes |
 | --- | ---: | ---: | ---: | ---: |
@@ -178,3 +180,14 @@ the contract is frozen for T14 per "Freeze list (frozen for T14)".
   budget on this adapter, but it does not establish p95 frame cost, temporal
   stability, moving-object correctness, or cross-GPU quality. Those remain T14
   and T15 acceptance work.
+
+## Addendum (ENG-97, 2026-09-27): runtime bounce
+
+The interactive runtime (game window, editor viewport) uses the frozen cache
+*geometry and occupancy format* unchanged, but not the T13 trace: it adds a
+separate lit one-bounce pass with a directional six-face radiance buffer (see
+`docs/reports/ENG-97.md`). The T13/T14 prototype passes and their capture
+evidence stand as recorded above. The thin-wall evaluation there (walls of one
+voxel and up block completely; openings under 0.75 m close; a one-metre opening
+is guaranteed open) is the first measurement of the frozen cache against
+authored detail, and proposes no change to it.

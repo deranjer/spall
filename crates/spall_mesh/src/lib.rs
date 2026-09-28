@@ -38,6 +38,7 @@ pub mod enumerate;
 pub mod face;
 pub mod fixtures;
 pub mod greedy;
+pub mod lod;
 pub mod mesh;
 pub mod sample;
 
@@ -47,5 +48,6 @@ pub use culled::emit_culled;
 pub use enumerate::{ExposedFace, for_each_exposed_face};
 pub use face::{FACE_DIRS, FaceDir};
 pub use greedy::emit_greedy;
+pub use lod::{HeightfieldSeamPatch, LodSeamError, stitch_heightfield_edge};
 pub use mesh::{FaceQuad, Mesh, MeshStats, MeshStrategy, Vertex, mesh_digest, mesh_digest_hex};
 pub use sample::{CellBox, MeshError, Occupancy, ResidentCells, VolumeSampler};
