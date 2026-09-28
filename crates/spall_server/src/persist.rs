@@ -93,6 +93,11 @@ pub enum PersistError {
     )]
     UnrecoverableCorruption { reports: String, fallback: String },
     #[error(
+        "journal record seq {seq} has tick {found}, before the {previous} already reached \
+         (checkpoint tick or an earlier durable record) — the durable suffix is out of order"
+    )]
+    JournalTickRegression { seq: u64, previous: u64, found: u64 },
+    #[error(
         "save schema version mismatch: checkpoint {checkpoint}, runtime {runtime} \
          (a schema migration is required — do not replay this database in place)"
     )]
@@ -385,8 +390,20 @@ pub fn restore(
     let mut max_entity = cp.meta.next_entity.saturating_sub(1);
     let mut max_volume = cp.meta.next_volume.saturating_sub(1);
     let mut last_seq = cp.journal_cursor;
+    // Simulation time already covered by durable state. Every replayed record's
+    // tick must be >= this, and recovery resumes here so the first post-restart
+    // tick lands strictly after the whole durable suffix.
+    let mut durable_tick = cp.tick;
 
     for record in &recovery.journal {
+        if record.tick < durable_tick {
+            return Err(PersistError::JournalTickRegression {
+                seq: record.seq,
+                previous: durable_tick,
+                found: record.tick,
+            });
+        }
+        durable_tick = record.tick;
         match &record.payload {
             JournalPayload::Topology { .. } => {
                 let (tx, participants) =
@@ -425,7 +442,14 @@ pub fn restore(
 
     world.resume_registry(max_entity + 1, max_volume + 1, max_tx + 1, last_seq + 1)?;
 
-    Ok((Simulation::from_restored(world, Tick(cp.tick)), last_seq))
+    // Resume at the last applied durable tick (checkpoint tick when the suffix
+    // is empty). `Simulation::tick` advances the counter before it does any
+    // work, so the first post-recovery tick — and every event it stamps — is
+    // strictly newer than every durable record replayed above.
+    Ok((
+        Simulation::from_restored(world, Tick(durable_tick)),
+        last_seq,
+    ))
 }
 
 /// Validates the saved world metadata against the configured world identity and

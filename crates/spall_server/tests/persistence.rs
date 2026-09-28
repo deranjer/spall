@@ -604,3 +604,150 @@ fn review_restore_must_require_choice_after_corruption() {
         .is_ok()
     );
 }
+
+// --- ENG-39: resume time past the durable journal suffix ----------------
+
+#[test]
+fn review_replay_must_advance_tick_past_durable_suffix() {
+    let s = Scratch::new("resume_tick");
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        // Advance well past the checkpoint tick, then commit a topology edit.
+        for _ in 0..15 {
+            sim.tick().unwrap();
+        }
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(10, 4, 1, 2),
+        ))
+        .unwrap();
+        sim.run_until_idle(16).unwrap();
+        w.append_journal(&persist::journal_records(sim.journal().entries()).unwrap())
+            .unwrap();
+    }
+
+    let recovery = spall_store::recover(s.db()).unwrap();
+    let durable_tick = recovery.journal.last().unwrap().tick;
+    assert!(durable_tick >= 16, "the cut committed well past tick 0");
+
+    let (restored, _) = recover_restore(&s.db());
+    assert!(
+        restored.current_tick().get() >= durable_tick,
+        "recovered tick {} precedes the durable transaction at tick {durable_tick}",
+        restored.current_tick().get()
+    );
+}
+
+#[test]
+fn a_pose_only_suffix_also_advances_the_resume_tick() {
+    let s = Scratch::new("resume_pose");
+    let sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        w.append_journal(&[
+            spall_store::JournalRecord {
+                seq: 1,
+                tick: 40,
+                payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+            },
+            spall_store::JournalRecord {
+                seq: 2,
+                tick: 55,
+                payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+            },
+        ])
+        .unwrap();
+    }
+    let (restored, seq) = recover_restore(&s.db());
+    assert_eq!(seq, 2);
+    assert!(restored.current_tick().get() >= 55);
+}
+
+#[test]
+fn a_second_save_and_restart_keeps_simulation_time_monotone() {
+    let s1 = Scratch::new("restart_1");
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s1.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        for _ in 0..12 {
+            sim.tick().unwrap();
+        }
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(10, 4, 1, 2),
+        ))
+        .unwrap();
+        sim.run_until_idle(16).unwrap();
+        w.append_journal(&persist::journal_records(sim.journal().entries()).unwrap())
+            .unwrap();
+    }
+
+    let (mut restored, seq1) = recover_restore(&s1.db());
+    let t1 = restored.current_tick().get();
+    assert!(t1 >= 12);
+
+    // A fresh edit after the first restart commits and time moves strictly on.
+    restored
+        .submit(EditIntent::cut(
+            RequestId(2),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(6, 4, 1, 1),
+        ))
+        .unwrap();
+    restored.run_until_idle(16).unwrap();
+    assert!(restored.committed(RequestId(2)).is_some());
+    assert!(restored.current_tick().get() > t1);
+
+    // Second save/restart from the restarted simulation.
+    let s2 = Scratch::new("restart_2");
+    {
+        let mut w = Writer::open(s2.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&restored, &cfg(), seq1).unwrap())
+            .unwrap();
+    }
+    let (restored2, _) = recover_restore(&s2.db());
+    assert_eq!(
+        restored2.current_tick().get(),
+        restored.current_tick().get(),
+        "the second restart resumes at the same simulation time"
+    );
+}
+
+#[test]
+fn an_out_of_order_journal_tick_is_rejected() {
+    let s = Scratch::new("tick_regression");
+    let mut recovery = recovery_for_meta_tests(&s);
+    let cursor = recovery.checkpoint.journal_cursor;
+    recovery.journal.push(spall_store::JournalRecord {
+        seq: cursor + 1,
+        tick: 30,
+        payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+    });
+    recovery.journal.push(spall_store::JournalRecord {
+        seq: cursor + 2,
+        tick: 10,
+        payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+    });
+    match restore_err(&recovery, &cfg()) {
+        persist::PersistError::JournalTickRegression {
+            found: 10,
+            previous: 30,
+            ..
+        } => {}
+        other => panic!("expected JournalTickRegression, got {other:?}"),
+    }
+}
