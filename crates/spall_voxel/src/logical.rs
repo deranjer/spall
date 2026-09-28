@@ -102,6 +102,10 @@ pub enum DigestError {
     NotResident(BrickCoord),
     #[error("logical conflict: brick {0:?} is both resident and evicted")]
     ResidentEvictedConflict(BrickCoord),
+    /// The caller's configuration cannot support eviction of this volume (for example terrain
+    /// with per-brick physics colliders, which have no residency lifecycle).
+    #[error("eviction unsupported: {0}")]
+    Unsupported(&'static str),
     #[error(
         "brick {coord:?} digest conflict: retained rev {retained:?} / {retained_hash}, \
          offered rev {offered:?} / {offered_hash}"
@@ -124,6 +128,11 @@ pub enum DigestError {
         reloaded: Revision,
         reloaded_hash: BrickHash,
     },
+    /// The logical transition was valid, but derived physics could not be
+    /// rebuilt for the new resident geometry. The caller must keep the
+    /// digest / geometry transition unpublished.
+    #[error("resident collider rebuild failed: {0}")]
+    ColliderBuild(String),
     #[error("no retained digest for brick {0:?}")]
     NoRetained(BrickCoord),
 }

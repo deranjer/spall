@@ -340,9 +340,11 @@ impl MotionPublisher {
     fn build(&mut self, world: &SimWorld, tick: Tick, full: bool) -> Vec<MotionSnapshot> {
         let mut out = Vec::with_capacity(world.body_count() + world.player_count());
         let resync = full || tick.get() % REST_RESYNC_TICKS < self.interval_ticks;
+        let mut resting_now = std::collections::HashSet::new();
         for body in world.bodies() {
             let Some(entity) = body.entity else { continue };
             if body.dormant || body.sleeping {
+                resting_now.insert(entity.get());
                 // First resting pose goes out; then only on a resync batch.
                 if !self.rest_published.insert(entity.get()) && !resync {
                     continue;
@@ -363,6 +365,12 @@ impl MotionPublisher {
                 angular_velocity: body.angvel_rad_s.map(|v| v as f32),
                 sleeping: body.sleeping,
             });
+        }
+
+        // A resync batch also forgets bodies that no longer exist or woke, so the
+        // set cannot grow with retired bodies.
+        if resync {
+            self.rest_published = resting_now;
         }
 
         let terrain_rev = latest_revision(world, world.terrain_volume_id());

@@ -1,0 +1,48 @@
+(
+    format_version: 1,
+    name: "Main",
+    next_entity_id: 5,
+    environment: "daylight",
+    entities: {
+        (1): (
+            id: (1),
+            name: "Scene Voxels",
+            transform: (
+                translation: (0.0, 0.0, 0.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((1)),
+        ),
+        (2): (
+            id: (2),
+            name: "House (sealed)",
+            transform: (
+                translation: (4.0, 0.5, 6.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((2)),
+        ),
+        (3): (
+            id: (3),
+            name: "House (doorway)",
+            transform: (
+                translation: (16.75, 0.5, 6.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((3)),
+        ),
+        (4): (
+            id: (4),
+            name: "House (roofless)",
+            transform: (
+                translation: (29.5, 0.5, 6.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((4)),
+        ),
+    },
+)

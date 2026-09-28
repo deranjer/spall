@@ -55,6 +55,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
     let server_cfg = ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 300,
         quiescence_ticks: 30,
@@ -85,8 +86,8 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         contact_damage: None,
         dormancy: None,
         timing_window: None,
-        baseline_rate_limit_bytes_per_sec: None,
-        wake_audit: false,
+        credential_registry_file: None,
+        custom_world: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -118,6 +119,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         client_residency: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     };
 
     let client = run_replication_client(client_cfg).expect("client run");
@@ -172,6 +174,7 @@ fn server_persists_and_recovers_across_a_restart() {
     let base_cfg = |tag: &str| ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 200,
         quiescence_ticks: 20,
@@ -200,8 +203,8 @@ fn server_persists_and_recovers_across_a_restart() {
         contact_damage: None,
         dormancy: None,
         timing_window: None,
-        baseline_rate_limit_bytes_per_sec: None,
-        wake_audit: false,
+        credential_registry_file: None,
+        custom_world: None,
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {
@@ -230,6 +233,7 @@ fn server_persists_and_recovers_across_a_restart() {
             client_residency: None,
             on_replica_ready: None,
             interactive: None,
+            client_authoritative: false,
         };
         let _ = run_replication_client(client_cfg).expect("client run");
         server_thread
@@ -295,6 +299,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
     let cfg = ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 200,
         quiescence_ticks: 20,
@@ -324,8 +329,8 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         contact_damage: None,
         dormancy: None,
         timing_window: None,
-        baseline_rate_limit_bytes_per_sec: None,
-        wake_audit: false,
+        credential_registry_file: None,
+        custom_world: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(cfg));
@@ -353,6 +358,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         client_residency: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     };
     let _ = run_replication_client(client_cfg).expect("client run");
 

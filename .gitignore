@@ -2,6 +2,7 @@
 /target/
 **/target/
 /.local/
+**/.local/
 
 # Local MCP / tool config (may contain secrets)
 .codex/

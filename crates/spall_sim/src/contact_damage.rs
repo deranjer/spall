@@ -38,7 +38,7 @@
 use std::collections::{HashMap, HashSet};
 
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
-use spall_core::{BrickCoord, GlobalCell, SphereBrush, VolumeId};
+use spall_core::{BrickCoord, GlobalCell, MaterialId, SphereBrush, VolumeId};
 
 use crate::intent::{EditTarget, ExplosionImpulse};
 
@@ -113,6 +113,9 @@ pub struct ContactEvent {
     /// volume. Together with the brick of [`Self::point_cell`] it is the
     /// per-region cooldown key.
     pub target_volume: VolumeId,
+    /// Material sampled just inside the struck surface. This lets game-owned
+    /// profiles tune damage while the engine keeps contact resolution generic.
+    pub target_material: MaterialId,
     /// Contact point in the **target volume's local cell frame** (fractional
     /// cells): global cells for terrain (`world_m / cell_m`), body-local cells
     /// for a body (`RigidXform::world_to_local_cell`). The caller resolves the
@@ -178,18 +181,40 @@ impl ContactDamagePlan {
 /// The stateful part: per-region cooldown timers and a one-pass-per-tick guard.
 pub struct ContactDamagePolicy {
     config: ContactDamageConfig,
+    material_profiles: HashMap<MaterialId, ContactDamageMaterialProfile>,
     /// `(volume id, brick) -> first tick the region is eligible again`.
     cooldown_until: HashMap<(u64, BrickCoord), u64>,
     last_tick: Option<u64>,
+}
+
+/// Game-provided multipliers and brush size for one struck material.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContactDamageMaterialProfile {
+    pub impact_ratio_scale: f32,
+    pub brush_radius_cells: i64,
+    pub explosion_ratio_scale: f32,
+    pub explosion_scale: f64,
 }
 
 impl ContactDamagePolicy {
     pub fn new(config: ContactDamageConfig) -> Self {
         Self {
             config,
+            material_profiles: HashMap::new(),
             cooldown_until: HashMap::new(),
             last_tick: None,
         }
+    }
+
+    /// Builds a policy with game-owned material tuning. Duplicate IDs resolve
+    /// to the last entry, so callers should provide a stable unique list.
+    pub fn with_material_profiles(
+        config: ContactDamageConfig,
+        profiles: impl IntoIterator<Item = (MaterialId, ContactDamageMaterialProfile)>,
+    ) -> Self {
+        let mut policy = Self::new(config);
+        policy.material_profiles.extend(profiles);
+        policy
     }
 
     pub fn config(&self) -> &ContactDamageConfig {
@@ -240,9 +265,15 @@ impl ContactDamagePolicy {
         for (brick, _, event) in candidates {
             let region = (event.target_volume.get(), brick);
             let resting = event.resting_impulse_n_s.max(f32::MIN_POSITIVE);
+            let profile = self.material_profiles.get(&event.target_material);
+            let impact_ratio =
+                self.config.impact_ratio * profile.map_or(1.0, |p| p.impact_ratio_scale);
+            let explosion_ratio =
+                self.config.explosion_ratio * profile.map_or(1.0, |p| p.explosion_ratio_scale);
+            let radius = profile.map_or(self.config.brush_radius_cells, |p| p.brush_radius_cells);
 
             if event.impulse_n_s < self.config.min_impulse_n_s
-                || event.impulse_n_s < self.config.impact_ratio * resting
+                || event.impulse_n_s < impact_ratio * resting
             {
                 plan.suppressed_below_threshold += 1;
                 continue;
@@ -259,14 +290,15 @@ impl ContactDamagePolicy {
                 plan.dropped_over_cap += 1;
                 continue;
             }
-            let Some(brush) = brush_at(event.point_cell, self.config.brush_radius_cells) else {
+            let Some(brush) = brush_at(event.point_cell, radius) else {
                 plan.malformed += 1;
                 continue;
             };
 
-            let explosion = if event.impulse_n_s >= self.config.explosion_ratio * resting {
+            let explosion = if event.impulse_n_s >= explosion_ratio * resting {
                 Some(ExplosionImpulse {
-                    magnitude_ns: f64::from(event.impulse_n_s) * self.config.explosion_scale,
+                    magnitude_ns: f64::from(event.impulse_n_s)
+                        * profile.map_or(self.config.explosion_scale, |p| p.explosion_scale),
                     direction: event.normal,
                 })
             } else {
@@ -341,6 +373,7 @@ mod tests {
         ContactEvent {
             target: EditTarget::Terrain,
             target_volume: vol(),
+            target_material: MaterialId(1),
             point_cell,
             normal: [0.0, 1.0, 0.0],
             impulse_n_s: resting * ratio,
@@ -501,6 +534,7 @@ mod tests {
         ContactEvent {
             target: EditTarget::Body(body_ent()),
             target_volume: body_vol(),
+            target_material: MaterialId(1),
             point_cell,
             normal: [0.0, -1.0, 0.0],
             impulse_n_s: resting * ratio,

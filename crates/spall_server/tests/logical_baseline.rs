@@ -153,13 +153,14 @@ fn snapshot_world_over_evicted_terrain_matches_the_synchronous_logical_baseline(
     .expect("a background snapshot over evicted terrain with a backing must encode");
 
     let reference = logical_world_baseline(&sim, Some(&backing));
+    let world = transfer.decode_v1_world().expect("the transfer decodes");
     assert_eq!(
-        transfer.world.encode(),
+        world.encode(),
         reference.encode(),
         "the background-capture path must reach the same baseline as the synchronous one"
     );
 
-    let replica = ReplicaWorld::from_baseline_world(&transfer.world, ReplicaConfig::default())
+    let replica = ReplicaWorld::from_baseline_world(&world, ReplicaConfig::default())
         .expect("the baseline installs");
     assert_eq!(
         replica.world_hash(),

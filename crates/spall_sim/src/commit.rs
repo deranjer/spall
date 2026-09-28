@@ -66,6 +66,9 @@ pub struct Committed {
     /// bricks) the host must deliver on a bulk stream and journal alongside the
     /// transaction. `None` for every ordinary commit.
     pub bulk_baseline: Option<spall_protocol::baseline::BaselineWorld>,
+    /// Exact pre-edit material counts removed by this committed cut. This is
+    /// game-facing outcome metadata; it does not grant items by itself.
+    pub removed_materials: std::collections::BTreeMap<MaterialId, u64>,
 }
 
 impl Committed {
@@ -99,6 +102,8 @@ pub enum CommitError {
     Edit(#[from] EditError),
     #[error("occupancy extraction failed: {0}")]
     Occupancy(#[from] spall_physics::ExtractError),
+    #[error("world collider planning failed: {0}")]
+    World(#[from] crate::world::WorldError),
     #[error("no exact active collider for the body: {0}")]
     Collider(#[from] crate::collider::ColliderInfeasible),
     #[error("id space exhausted: {0}")]
@@ -124,54 +129,6 @@ impl From<crate::transfer::PlanChildError> for CommitError {
             crate::transfer::PlanChildError::Collider(x) => CommitError::Collider(x),
         }
     }
-}
-
-/// The cells whose occupancy an edit actually changes in the parent volume (old
-/// vs new), as an inclusive global-cell box, plus how many solid cells leave the
-/// parent. A write that sets a cell to the material it already has changes nothing;
-/// every cell of a detached component leaves the parent.
-struct ChangedRegion {
-    min: [i64; 3],
-    max: [i64; 3],
-    removed_cells: u64,
-}
-
-fn changed_region(world: &SimWorld, vid: VolumeId, staged: &StagedEdit) -> Option<ChangedRegion> {
-    use spall_voxel::Sample;
-    let old = world.volume_ref(vid)?;
-    let mut min = [i64::MAX; 3];
-    let mut max = [i64::MIN; 3];
-    let mut removed = 0u64;
-    let mut touch = |c: spall_core::GlobalCell| {
-        for (a, v) in [c.x, c.y, c.z].into_iter().enumerate() {
-            min[a] = min[a].min(v);
-            max[a] = max[a].max(v);
-        }
-    };
-    for w in &staged.plan.writes {
-        let before = match old.sample(w.cell) {
-            Ok(Sample::Filled(m)) => Some(m),
-            _ => None,
-        };
-        let after = (!w.material.is_air()).then_some(w.material);
-        if before != after {
-            touch(w.cell);
-            if before.is_some() && after.is_none() {
-                removed += 1;
-            }
-        }
-    }
-    for membership in &staged.memberships {
-        for cell in membership.cells() {
-            touch(cell);
-            removed += 1;
-        }
-    }
-    (min[0] != i64::MAX).then_some(ChangedRegion {
-        min,
-        max,
-        removed_cells: removed,
-    })
 }
 
 /// Commits `staged` into `world`, appending a journal entry on success.
@@ -225,11 +182,7 @@ pub fn commit(
                 f64::from(st.rotation[2]),
                 f64::from(st.rotation[3]),
             ),
-            [
-                f64::from(st.translation_m[0]),
-                f64::from(st.translation_m[1]),
-                f64::from(st.translation_m[2]),
-            ],
+            world.physics_origin().to_world_f64(st.translation_m),
         );
         ParentState {
             pose,
@@ -289,21 +242,12 @@ pub fn commit(
         }
     }
 
-    let changed = changed_region(world, vid, staged);
-    let parent_solid_before = if parent_is_terrain {
-        0
-    } else {
-        world.volume_ref(vid).map_or(0, crate::world::solid_cells)
-    };
-    let sp1 = crate::prof::Span::start("commit.clone_apply_edit");
     let mut parent_candidate: Volume = world
         .volume_ref(vid)
         .ok_or(CommitError::UnknownVolume(vid))?
         .clone();
     let cut_outcome = parent_candidate.apply_edit(&staged.plan)?;
 
-    drop(sp1);
-    let sp2 = crate::prof::Span::start("commit.build_children");
     // 5. Build every child from the post-cut candidate (components are still
     //    solid), and capture the canonical cell-run ops a replica needs to
     //    reconstruct the child without any structural code (`docs/protocol.md`).
@@ -328,8 +272,6 @@ pub fn commit(
     }
     transfer::apply_explosion(&mut children, staged.explosion);
 
-    drop(sp2);
-    let sp3 = crate::prof::Span::start("commit.remove_detached");
     // 6. Remove the detached cells from the candidate.
     let remove_outcome = if staged.splits() {
         let mut remove = EditPlan::new(vid);
@@ -343,13 +285,14 @@ pub fn commit(
         None
     };
 
-    drop(sp3);
     // 7. Plan the parent collider rebuild from the candidate's final geometry,
     //    plus the mass / COM / inertia to reinstall from its post-cut fine
     //    material grid (a dynamic parent lost mass to the cut / to its children;
-    //    a terrain parent has no solver mass) (`ENG-41`). A fragmented parent
-    //    with no exact active collider fails the commit here, before publish
-    //    (`ENG-42`).
+    //    a terrain parent has no solver mass) (`ENG-41`). Once terrain residency
+    //    has activated the per-brick representation, plan only the edited brick
+    //    colliders here; the whole-terrain collider is no longer authoritative.
+    // A fragmented parent with no exact active collider fails the commit here,
+    // before publish (`ENG-42`).
     // T23 / G3 row 7, slice B: the collider rebuild samples every cell in the
     // candidate's solid bounding box. If that box reaches an evicted brick, the
     // rebuild cannot see its geometry — refuse (the residency pass reloads it
@@ -360,31 +303,59 @@ pub fn commit(
     // pass re-evict an already-reloaded one before the set is ever whole. Ask
     // for every evicted brick in the volume at once so a single reload makes the
     // candidate's whole bounding box resident and the retry commits next tick.
-    let sp4 = crate::prof::Span::start("commit.occupancy_extract");
-    let occupancy = match OccupancyGrid::from_volume(&parent_candidate) {
-        Ok(o) => o,
-        Err(spall_physics::ExtractError::Unresident(_)) if !world.evicted(vid).is_empty() => {
-            return Err(CommitError::EvictedGeometryRequired {
-                volume: vid,
-                bricks: world.evicted(vid).iter().map(|(c, _)| c).collect(),
-            });
+    let use_terrain_brick_colliders = parent_is_terrain && world.terrain_brick_colliders_enabled();
+    let terrain_brick_rebuild = if use_terrain_brick_colliders {
+        let mut changed: Vec<BrickCoord> = cut_outcome.bricks.iter().map(|b| b.coord).collect();
+        if let Some(remove) = &remove_outcome {
+            changed.extend(remove.bricks.iter().map(|b| b.coord));
         }
-        Err(e) => return Err(e.into()),
-    };
-    drop(sp4);
-    let sp5 = crate::prof::Span::start("commit.plan_collider");
-    let parent_rebuild = match occupancy {
-        Some(grid) => {
-            let plan = plan_collider(&grid)?;
-            let mass_properties = (!parent_is_terrain).then(|| {
-                analytic_mass_properties(&grid, cell_size.metres(), |m| world.density(m))
-                    .to_body_properties()
-            });
-            Some((plan, mass_properties))
+        changed.sort_by_key(|coord| coord.sort_key());
+        changed.dedup();
+
+        let mut plans = Vec::with_capacity(changed.len());
+        for coord in changed {
+            plans.push((
+                coord,
+                SimWorld::plan_terrain_brick(&parent_candidate, coord)?,
+            ));
         }
-        None => None,
+        Some(plans)
+    } else {
+        None
     };
-    drop(sp5);
+
+    let parent_rebuild = if use_terrain_brick_colliders {
+        None
+    } else {
+        let occupancy = match OccupancyGrid::from_volume(&parent_candidate) {
+            Ok(o) => o,
+            Err(spall_physics::ExtractError::Unresident(_)) if !world.evicted(vid).is_empty() => {
+                return Err(CommitError::EvictedGeometryRequired {
+                    volume: vid,
+                    bricks: world.evicted(vid).iter().map(|(c, _)| c).collect(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        match occupancy {
+            Some(grid) => {
+                let mut plan = plan_collider(&grid)?;
+                if parent_is_terrain {
+                    let (localized, _) = world
+                        .physics_origin()
+                        .localize_terrain_grid(plan.grid, cell_size.metres())
+                        .ok_or(crate::world::WorldError::PhysicsFrameOutOfRange)?;
+                    plan.grid = localized;
+                }
+                let mass_properties = (!parent_is_terrain).then(|| {
+                    analytic_mass_properties(&grid, cell_size.metres(), |m| world.density(m))
+                        .to_body_properties()
+                });
+                Some((plan, mass_properties))
+            }
+            None => None,
+        }
+    };
     // The cut cleared the parent's last solid cell: its ownership is retired on
     // publish (`ENG-56`). A retired body emits no participant snapshot.
     let parent_emptied = !parent_is_terrain && parent_rebuild.is_none();
@@ -432,7 +403,6 @@ pub fn commit(
     // digests (unchanged — the guard above proved the edit touched none of
     // them). A replica that holds those bricks resident computes the same value.
     // Identical to `volume_topology_hash_for` when nothing is evicted.
-    let sp6 = crate::prof::Span::start("commit.hash_and_assemble");
     let parent_result_hash =
         spall_protocol::canonical_topology_hash(&[canonical_logical_volume_for(
             &parent_candidate,
@@ -503,23 +473,50 @@ pub fn commit(
     // remain the replica's acceptance check.
     let mut bulk_baseline = None;
     if !crate::replication::inline_wire_fits(&topology) {
-        match build_split_baseline_ops(
-            vid,
-            brush_op,
-            parent_owner,
-            &parent_candidate,
-            &affected,
-            &child_ids,
-            &children,
-            staged.splits(),
-            transaction_id,
-            server_tick,
-        )? {
-            SplitEncoding::Inline(ops) => topology.ops = ops,
-            SplitEncoding::Bulk { ops, baseline } => {
-                topology.ops = ops;
-                bulk_baseline = Some(baseline);
+        // Inline blobs are only chosen when each fits `MAX_SPLIT_BASELINE_BLOB`,
+        // but hundreds of small children (a tree crown) can still add up past
+        // one control record, so the re-encoded form is checked as a whole and
+        // falls back to the bulk form when it does not fit.
+        let mut force_bulk = false;
+        loop {
+            match build_split_baseline_ops(
+                vid,
+                brush_op.clone(),
+                parent_owner,
+                &parent_candidate,
+                &affected,
+                &child_ids,
+                &children,
+                staged.splits(),
+                transaction_id,
+                server_tick,
+                force_bulk,
+            )? {
+                SplitEncoding::Inline(ops) => {
+                    topology.ops = ops;
+                    if crate::replication::inline_wire_fits(&topology) {
+                        break;
+                    }
+                    force_bulk = true;
+                }
+                SplitEncoding::Bulk { ops, baseline } => {
+                    topology.ops = ops;
+                    bulk_baseline = Some(baseline);
+                    break;
+                }
             }
+        }
+        // Even the marker form must fit one record; if it cannot, fail the
+        // commit loudly rather than send a record the transport refuses (which
+        // would silently drop every live client).
+        if !crate::replication::inline_wire_fits(&topology) {
+            return Err(CommitError::Replication(
+                crate::replication::ReplicationError::SplitTooLarge {
+                    volume: vid.get(),
+                    blob_bytes: topology.ops.len(),
+                    cap: spall_protocol::limits::MAX_CONTROL_RECORD,
+                },
+            ));
         }
     }
     topology.validate()?;
@@ -536,6 +533,24 @@ pub fn commit(
         journal_seq,
     );
 
+    // Validate every narrowed/localized coordinate before any authoritative
+    // state or collider is published. The publication section below is then
+    // infallible with respect to physics-frame conversion.
+    for child in &children {
+        world.physics_translation(child.pose.translation_m)?;
+    }
+    if let Some(plans) = &terrain_brick_rebuild {
+        let cell_m = world.terrain().cell_size().metres();
+        for (_, plan) in plans {
+            if let Some(plan) = plan {
+                world
+                    .physics_origin()
+                    .localize_terrain_grid(plan.grid.clone(), cell_m)
+                    .ok_or(crate::world::WorldError::PhysicsFrameOutOfRange)?;
+            }
+        }
+    }
+
     // ---- Publish. Every step below is infallible: the candidate is committed
     // ---- to the live world in one shot at the tick boundary.
     *world.registry_mut() = reg;
@@ -544,65 +559,38 @@ pub fn commit(
         parent.volume = parent_candidate;
     }
 
-    drop(sp6);
-    let wake_probe = world.wake_probe();
-    let sp7 = crate::prof::Span::start("commit.publish_parent_collider");
-    match parent_rebuild {
-        Some((plan, mass_properties)) => {
-            match &changed {
-                // Wake only what the geometry change can affect (see
-                // `PhysicsWorld::rebuild_collider_localized`).
-                Some(ch) => {
-                    let m = cell_size.metres() as f32;
-                    let lo = [ch.min[0] as f32 * m, ch.min[1] as f32 * m, ch.min[2] as f32 * m];
-                    let hi = [
-                        (ch.max[0] + 1) as f32 * m,
-                        (ch.max[1] + 1) as f32 * m,
-                        (ch.max[2] + 1) as f32 * m,
-                    ];
-                    let removed_fraction = if parent_solid_before == 0 {
-                        0.0
-                    } else {
-                        ch.removed_cells as f32 / parent_solid_before as f32
-                    };
-                    world.physics_mut().rebuild_collider_localized(
-                        parent_phys,
-                        &plan.grid,
-                        plan.representation,
-                        mass_properties,
-                        (lo, hi),
-                        removed_fraction,
-                    );
-                }
-                None => {
+    if let Some(plans) = terrain_brick_rebuild {
+        for (coord, plan) in plans {
+            world.publish_terrain_brick(coord, plan.as_ref())?;
+        }
+    } else {
+        match parent_rebuild {
+            Some((plan, mass_properties)) => {
+                world
+                    .physics_mut()
+                    .rebuild_collider(parent_phys, &plan.grid, plan.representation);
+                if let Some(mass_properties) = mass_properties {
                     world
                         .physics_mut()
-                        .rebuild_collider(parent_phys, &plan.grid, plan.representation);
-                    if let Some(mass_properties) = mass_properties {
-                        world
-                            .physics_mut()
-                            .set_mass_properties(parent_phys, mass_properties);
-                    }
+                        .set_mass_properties(parent_phys, mass_properties);
+                }
+                if let Some(parent) = world.volume_body_mut(vid) {
+                    parent.collider_revision += 1;
+                    parent.coarsen_k = plan.coarsen_k;
                 }
             }
-            if let Some(parent) = world.volume_body_mut(vid) {
-                parent.collider_revision += 1;
-                parent.coarsen_k = plan.coarsen_k;
+            None => {
+                // The cut cleared the parent's last solid cell. Retire its
+                // ownership atomically with the edit (`ENG-56`): a detached body
+                // and its physics handle are removed; terrain loses its collider.
+                // Nothing keeps colliding with the obsolete solid shape, and the
+                // transaction's cell-removal ops already carry the emptying for
+                // replicas and for journal replay.
+                world.retire_empty_volume(vid);
             }
-        }
-        None => {
-            // The cut cleared the parent's last solid cell. Retire its
-            // ownership atomically with the edit (`ENG-56`): a detached body
-            // and its physics handle are removed; terrain loses its collider.
-            // Nothing keeps colliding with the obsolete solid shape, and the
-            // transaction's cell-removal ops already carry the emptying for
-            // replicas and for journal replay.
-            world.retire_empty_volume(vid);
         }
     }
 
-    drop(sp7);
-    let sp8 = crate::prof::Span::start("commit.install_children");
     // 8. Install every child body and its collider. Mass / COM / inertia come
     //    from the child's fine material grid (`child.mass_properties`), installed
     //    into the body independently of the collision shape, so coarse collider
@@ -612,7 +600,9 @@ pub fn commit(
         let child_cell_m = child.volume.cell_size().metres() as f32;
         let rot = child.pose.rotation;
         let rot_xyzw = [rot.x as f32, rot.y as f32, rot.z as f32, rot.w as f32];
-        let trans = child.pose.translation_m.map(|v| v as f32);
+        let trans = world
+            .physics_translation(child.pose.translation_m)
+            .expect("child physics translation was validated before publication");
         let linvel = child.linvel_m_s.map(|v| v as f32);
         let angvel = child.angvel_rad_s.map(|v| v as f32);
 
@@ -648,11 +638,6 @@ pub fn commit(
         child_entities.push(child.entity);
     }
 
-    drop(sp8);
-    world.wake_probe_end(
-        "edit.commit_publish (collider rebuild + child spawn)",
-        wake_probe,
-    );
     if bumped_epoch {
         world.bump_topology_epoch();
     }
@@ -671,6 +656,7 @@ pub fn commit(
         children: child_entities,
         bumped_epoch,
         bulk_baseline,
+        removed_materials: staged.removed_materials.clone(),
     }))
 }
 
@@ -709,6 +695,7 @@ fn build_split_baseline_ops(
     splits: bool,
     transaction_id: spall_core::TransactionId,
     server_tick: Tick,
+    force_bulk: bool,
 ) -> Result<SplitEncoding, CommitError> {
     use spall_protocol::baseline::{BaselineOwner, BaselineWorld};
     use spall_protocol::limits::{MAX_ASSEMBLED_TRANSFER, MAX_BULK_PART, MAX_SPLIT_BASELINE_BLOB};
@@ -734,10 +721,12 @@ fn build_split_baseline_ops(
         volumes.push((bv, blob));
     }
 
-    // Inline path: every compressed blob fits one op.
-    if volumes
-        .iter()
-        .all(|(_, blob)| blob.len() <= MAX_SPLIT_BASELINE_BLOB)
+    // Inline path: every compressed blob fits one op (the caller checks that
+    // the whole record fits, and forces the bulk form when it does not).
+    if !force_bulk
+        && volumes
+            .iter()
+            .all(|(_, blob)| blob.len() <= MAX_SPLIT_BASELINE_BLOB)
     {
         let mut ops = vec![brush_op];
         let mut it = volumes.into_iter();

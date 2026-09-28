@@ -23,7 +23,8 @@
 //! held for a body the replica has not created yet, and stale or
 //! too-new-topology snapshots wait or are dropped.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Instant;
 
 use spall_core::{
     BrickCoord, CellSizeCode, EntityId, GlobalCell, MaterialId, Pose, Revision, TransactionId,
@@ -128,13 +129,18 @@ impl From<&MotionSnapshot> for MotionState {
     }
 }
 
-/// Interpolation history for one replicated body: the two most recent accepted
-/// states, plus the first state ever accepted so a caller can measure how far
-/// the body has actually travelled.
-#[derive(Debug, Clone, Copy, Default)]
+/// States retained per body for interpolation. At the 20 Hz publish rate
+/// (3 server ticks apart) this covers well over the 100 ms render delay plus
+/// jitter, so the delayed target time always has a bracketing pair.
+const MOTION_HISTORY: usize = 8;
+
+/// Interpolation history for one replicated body: the most recent accepted
+/// states (oldest first), plus the first state ever accepted so a caller can
+/// measure how far the body has actually travelled.
+#[derive(Debug, Clone, Default)]
 pub struct MotionTrack {
     first: Option<MotionState>,
-    prev: Option<MotionState>,
+    history: VecDeque<MotionState>,
     latest: Option<MotionState>,
 }
 
@@ -146,10 +152,42 @@ impl MotionTrack {
                 if self.first.is_none() {
                     self.first = Some(state);
                 }
-                self.prev = self.latest;
+                if self.history.len() == MOTION_HISTORY {
+                    self.history.pop_front();
+                }
+                self.history.push_back(state);
                 self.latest = Some(state);
             }
         }
+    }
+
+    /// Pose at fractional server tick `target`: interpolated between the two
+    /// accepted states bracketing it, held at the oldest retained state if
+    /// `target` precedes them all, and extrapolated up to `max_extra_ticks`
+    /// past the newest.
+    fn sample(&self, target: f64, max_extra_ticks: f64) -> Option<Pose> {
+        let latest = self.latest?;
+        let idx = self
+            .history
+            .iter()
+            .position(|s| s.server_tick as f64 > target);
+        let (a, b) = match idx {
+            // Every state is at or before `target`: extrapolate off the newest pair.
+            None => match self
+                .history
+                .len()
+                .checked_sub(2)
+                .and_then(|i| self.history.get(i))
+            {
+                Some(&prev) => (prev, latest),
+                None => return Some(latest.pose),
+            },
+            Some(0) => return Some(self.history[0].pose),
+            Some(i) => (self.history[i - 1], self.history[i]),
+        };
+        let span = (b.server_tick - a.server_tick) as f64;
+        let t = ((target - a.server_tick as f64) / span).clamp(0.0, 1.0 + max_extra_ticks / span);
+        Some(lerp_pose(&a.pose, &b.pose, t))
     }
 
     /// The newest accepted server tick, if any.
@@ -171,6 +209,114 @@ impl MotionTrack {
             }
             _ => 0.0,
         }
+    }
+}
+
+/// Owned copy of one body's motion history plus the sampling parameters, see
+/// [`ReplicaWorld::body_sampler`].
+#[derive(Debug, Clone)]
+pub struct BodySampler {
+    track: MotionTrack,
+    delay_ticks: f64,
+    max_extra_ticks: f64,
+    hz: f64,
+}
+
+impl BodySampler {
+    /// Server ticks per second, for advancing a sampled `render_tick`.
+    pub fn hz(&self) -> f64 {
+        self.hz
+    }
+
+    /// Whether the newest snapshot says the body is awake and moving.
+    pub fn is_moving(&self) -> bool {
+        self.track.latest.is_some_and(|s| {
+            !s.sleeping && s.linear_velocity.iter().map(|v| v * v).sum::<f32>() > 0.0025
+        })
+    }
+
+    /// Age (server ticks) of the newest snapshot at `render_tick`.
+    pub fn latest_age_ticks(&self, render_tick: f64) -> Option<f64> {
+        Some(render_tick - self.track.latest?.server_tick as f64)
+    }
+
+    /// Same result as [`ReplicaWorld::presented_pose`] at `render_tick`.
+    pub fn presented(&self, render_tick: f64, focus_m: Option<[f64; 3]>) -> Option<Pose> {
+        let delayed = self
+            .track
+            .sample(render_tick - self.delay_ticks, self.max_extra_ticks)?;
+        let Some(focus) = focus_m else {
+            return Some(delayed);
+        };
+        let latest = self.track.latest?;
+        let present = advance_pose(
+            &latest.pose,
+            latest.linear_velocity,
+            latest.angular_velocity,
+            latest.sleeping,
+            (render_tick - latest.server_tick as f64).clamp(0.0, self.max_extra_ticks),
+            self.hz,
+        );
+        let d = present
+            .translation_m
+            .iter()
+            .zip(focus)
+            .map(|(p, f)| (p - f) * (p - f))
+            .sum::<f64>()
+            .sqrt();
+        let x = ((d - ReplicaWorld::PRESENT_FULL_WITHIN_M)
+            / (ReplicaWorld::PRESENT_NONE_BEYOND_M - ReplicaWorld::PRESENT_FULL_WITHIN_M))
+            .clamp(0.0, 1.0);
+        let smooth = x * x * (3.0 - 2.0 * x);
+        Some(lerp_pose(&present, &delayed, smooth))
+    }
+}
+
+/// A body's newest snapshot, see [`ReplicaWorld::latest_motion`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LatestMotion {
+    pub pose: Pose,
+    pub server_tick: u64,
+    pub linear_velocity_m_s: [f32; 3],
+    pub angular_velocity_rad_s: [f32; 3],
+    pub sleeping: bool,
+}
+
+/// Free-running render clock in fractional server ticks. It advances with wall
+/// time and is slewed (a few percent of real time) toward "newest received tick
+/// plus half a snapshot interval", so per-packet arrival jitter averages out
+/// instead of showing up as motion stutter. It is never allowed to run backwards
+/// and only snaps when it is wildly off (join, stall, or reconnect).
+#[derive(Debug, Clone, Copy, Default)]
+struct RenderClock {
+    last: Option<Instant>,
+    ticks: f64,
+}
+
+impl RenderClock {
+    /// Half of the default 3-tick publish interval: the average age of the
+    /// newest snapshot at an arbitrary instant.
+    const TARGET_LEAD_TICKS: f64 = 1.5;
+    const MAX_SLEW: f64 = 0.05;
+    const SNAP_ERROR_TICKS: f64 = 12.0;
+
+    fn advance(&mut self, now: Instant, newest_tick: u64, hz: f64) -> f64 {
+        let target = newest_tick as f64 + Self::TARGET_LEAD_TICKS;
+        let Some(last) = self.last else {
+            self.last = Some(now);
+            self.ticks = target;
+            return self.ticks;
+        };
+        let dt_ticks = now.saturating_duration_since(last).as_secs_f64() * hz;
+        self.last = Some(last.max(now));
+        let error = target - (self.ticks + dt_ticks);
+        if error.abs() > Self::SNAP_ERROR_TICKS {
+            self.ticks = target;
+        } else {
+            let slew = (error * 0.1).clamp(-Self::MAX_SLEW, Self::MAX_SLEW) * dt_ticks;
+            self.ticks += dt_ticks + slew;
+        }
+        self.ticks
     }
 }
 
@@ -219,11 +365,192 @@ pub struct ReplicaWorld {
     repair_requests_inflight: BTreeMap<(u64, i64, i64, i64), u64>,
     /// Highest server tick the client has observed on any record.
     now_tick: u64,
+    /// Continuously advancing render time; see [`ReplicaWorld::render_tick`].
+    render_clock: RenderClock,
     /// T23 / G3 row 7, slice B: per-volume digests of bricks evicted from this
     /// replica's cache. Empty by default (client eviction is off until a later
     /// slice), so `world_hash` / transaction validation are byte-identical to
     /// today. Keyed by raw volume id. See `docs/reports/G3-residency-hash.md`.
     evicted: BTreeMap<u64, spall_voxel::EvictedBricks>,
+    /// Monotonic local generation of the *resident terrain view*. This is a
+    /// derived-cache invalidation token, not protocol state: it changes only
+    /// after an atomic mutation that can change terrain geometry available to
+    /// client collision (baseline install/patch, published terrain transaction,
+    /// eviction, or reload). Motion-only records and body-only edits leave it
+    /// alone.
+    terrain_generation: u64,
+}
+
+/// A baseline being built off to the side while its segments arrive (`docs/protocol.md` late-join
+/// step 3). Nothing here is visible to prediction or rendering; [`ReplicaWorld::install_staged`]
+/// swaps it in atomically once the transfer is verified complete. Its memory is the world itself
+/// (class D in `docs/reports/large-world-baseline-design.md`): the caller budgets it before the
+/// first brick is staged.
+pub struct StagedBaseline {
+    checkpoint_tick: u64,
+    volumes: BTreeMap<u64, Volume>,
+    owner: BTreeMap<u64, CanonicalOwner>,
+    bodies: BTreeMap<u64, ReplicaBody>,
+    volume_of_entity: BTreeMap<u64, u64>,
+    terrain_id: Option<VolumeId>,
+    /// The volume currently open (header seen, `last` not yet).
+    open: Option<u64>,
+    bricks: u64,
+}
+
+impl StagedBaseline {
+    pub fn new(checkpoint_tick: u64) -> Self {
+        Self {
+            checkpoint_tick,
+            volumes: BTreeMap::new(),
+            owner: BTreeMap::new(),
+            bodies: BTreeMap::new(),
+            volume_of_entity: BTreeMap::new(),
+            terrain_id: None,
+            open: None,
+            bricks: 0,
+        }
+    }
+
+    /// Bricks staged so far.
+    pub fn brick_count(&self) -> u64 {
+        self.bricks
+    }
+
+    /// Volumes staged so far.
+    pub fn volume_count(&self) -> usize {
+        self.volumes.len()
+    }
+
+    /// Bodies staged so far (every non-terrain volume).
+    pub fn body_count(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Opens a volume from its header. It must not already exist and no other volume may be open.
+    pub fn open_volume(
+        &mut self,
+        vid: VolumeId,
+        header: &spall_protocol::segment::VolumeHeader,
+    ) -> Result<(), String> {
+        use spall_protocol::BaselineOwner;
+        if let Some(open) = self.open {
+            return Err(format!("volume {open} still open when {vid} began"));
+        }
+        if self.volumes.contains_key(&vid.get()) {
+            return Err(format!("baseline volume {vid} appears twice"));
+        }
+        let cs = CellSizeCode::from_u8(header.cell_size_code).ok_or_else(|| {
+            format!(
+                "baseline volume {vid} has unknown cell-size code {}",
+                header.cell_size_code
+            )
+        })?;
+        let volume = match header.bounds {
+            Some([mn, mx]) => {
+                let bb = spall_voxel::BrickBounds::new(
+                    BrickCoord::new(mn[0], mn[1], mn[2]),
+                    BrickCoord::new(mx[0], mx[1], mx[2]),
+                )
+                .ok_or_else(|| format!("baseline volume {vid} has inverted bounds"))?;
+                Volume::bounded(vid, cs, bb)
+            }
+            None => Volume::new(vid, cs),
+        };
+        match header.owner {
+            BaselineOwner::Terrain => {
+                if self.terrain_id.is_some() {
+                    return Err("baseline has a second terrain volume".to_string());
+                }
+                self.owner.insert(vid.get(), CanonicalOwner::Terrain);
+                self.terrain_id = Some(vid);
+            }
+            BaselineOwner::Body(entity) => {
+                if self.volume_of_entity.contains_key(&entity.get()) {
+                    return Err(format!("baseline entity {entity} owns two volumes"));
+                }
+                self.owner.insert(vid.get(), CanonicalOwner::Body(entity));
+                self.volume_of_entity.insert(entity.get(), vid.get());
+                self.bodies.insert(
+                    entity.get(),
+                    ReplicaBody {
+                        entity,
+                        volume_id: vid,
+                        track: MotionTrack::default(),
+                    },
+                );
+            }
+        }
+        self.volumes.insert(vid.get(), volume);
+        self.open = Some(vid.get());
+        Ok(())
+    }
+
+    /// Stages one brick into the open volume `vid`.
+    pub fn insert_brick(
+        &mut self,
+        vid: VolumeId,
+        bb: &spall_protocol::BaselineBrick,
+    ) -> Result<(), String> {
+        use spall_protocol::BaselineCells;
+        if self.open != Some(vid.get()) {
+            return Err(format!(
+                "brick for volume {vid}, which is not the open volume"
+            ));
+        }
+        let cells: Vec<MaterialId> = match &bb.cells {
+            BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
+            BaselineCells::Dense(raw) => {
+                if raw.len() != spall_core::CELLS_PER_BRICK {
+                    return Err(format!(
+                        "baseline brick in {vid} has {} cells, expected {}",
+                        raw.len(),
+                        spall_core::CELLS_PER_BRICK
+                    ));
+                }
+                raw.iter().copied().map(MaterialId).collect()
+            }
+        };
+        let brick = Brick::restored(&cells, Revision(bb.revision), bb.edited);
+        self.volumes
+            .get_mut(&vid.get())
+            .expect("open volume is staged")
+            .insert_brick(
+                BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                brick,
+            )
+            .map_err(|e| format!("baseline brick insert into {vid} failed: {e}"))?;
+        self.bricks += 1;
+        Ok(())
+    }
+
+    /// Closes the open volume `vid`.
+    pub fn close_volume(&mut self, vid: VolumeId) {
+        if self.open == Some(vid.get()) {
+            self.open = None;
+        }
+    }
+
+    /// Stages one segment. Structural validation (order, contiguity, completeness) belongs to the
+    /// `SequenceValidator`; this builds the volumes and fails on anything the voxel layer refuses
+    /// (bounds, cell-size, duplicate coordinates).
+    pub fn add_segment(
+        &mut self,
+        seg: &spall_protocol::segment::BaselineSegment,
+    ) -> Result<(), String> {
+        for v in &seg.volumes {
+            if let Some(h) = &v.header {
+                self.open_volume(v.volume_id, h)?;
+            }
+            for b in &v.bricks {
+                self.insert_brick(v.volume_id, b)?;
+            }
+            if v.last {
+                self.close_volume(v.volume_id);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ReplicaWorld {
@@ -253,7 +580,9 @@ impl ReplicaWorld {
             bulk_split_worlds: BTreeMap::new(),
             repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
+            render_clock: RenderClock::default(),
             evicted: BTreeMap::new(),
+            terrain_generation: 1,
         }
     }
 
@@ -278,7 +607,9 @@ impl ReplicaWorld {
             bulk_split_worlds: BTreeMap::new(),
             repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
+            render_clock: RenderClock::default(),
             evicted: BTreeMap::new(),
+            terrain_generation: 0,
         }
     }
 
@@ -304,86 +635,47 @@ impl ReplicaWorld {
         &mut self,
         world: &spall_protocol::BaselineWorld,
     ) -> Result<(), String> {
-        use spall_protocol::{BaselineCells, BaselineOwner};
-
         world.validate().map_err(|e| e.to_string())?;
-
-        let mut volumes = BTreeMap::new();
-        let mut owner = BTreeMap::new();
-        let mut bodies = BTreeMap::new();
-        let mut volume_of_entity = BTreeMap::new();
-        let mut terrain_id = None;
-
+        let mut staged = StagedBaseline::new(world.checkpoint_tick);
         for bv in &world.volumes {
-            let vid = bv.volume_id;
-            let cs = CellSizeCode::from_u8(bv.cell_size_code).ok_or_else(|| {
-                format!(
-                    "baseline volume {vid} has unknown cell-size code {}",
-                    bv.cell_size_code
-                )
-            })?;
-            let mut volume = match bv.bounds {
-                Some([mn, mx]) => {
-                    let bb = spall_voxel::BrickBounds::new(
-                        BrickCoord::new(mn[0], mn[1], mn[2]),
-                        BrickCoord::new(mx[0], mx[1], mx[2]),
-                    )
-                    .ok_or_else(|| format!("baseline volume {vid} has inverted bounds"))?;
-                    Volume::bounded(vid, cs, bb)
-                }
-                None => Volume::new(vid, cs),
+            let header = spall_protocol::segment::VolumeHeader {
+                cell_size_code: bv.cell_size_code,
+                owner: bv.owner,
+                bounds: bv.bounds,
             };
+            staged.open_volume(bv.volume_id, &header)?;
             for bb in &bv.bricks {
-                let cells: Vec<MaterialId> = match &bb.cells {
-                    BaselineCells::Uniform(id) => {
-                        vec![MaterialId(*id); spall_core::CELLS_PER_BRICK]
-                    }
-                    BaselineCells::Dense(raw) => {
-                        if raw.len() != spall_core::CELLS_PER_BRICK {
-                            return Err(format!(
-                                "baseline brick in {vid} has {} cells, expected {}",
-                                raw.len(),
-                                spall_core::CELLS_PER_BRICK
-                            ));
-                        }
-                        raw.iter().copied().map(MaterialId).collect()
-                    }
-                };
-                let brick = Brick::restored(&cells, Revision(bb.revision), bb.edited);
-                volume
-                    .insert_brick(
-                        BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
-                        brick,
-                    )
-                    .map_err(|e| format!("baseline brick insert into {vid} failed: {e}"))?;
+                staged.insert_brick(bv.volume_id, bb)?;
             }
-            match bv.owner {
-                BaselineOwner::Terrain => {
-                    owner.insert(vid.get(), CanonicalOwner::Terrain);
-                    terrain_id = Some(vid);
-                }
-                BaselineOwner::Body(entity) => {
-                    owner.insert(vid.get(), CanonicalOwner::Body(entity));
-                    volume_of_entity.insert(entity.get(), vid.get());
-                    bodies.insert(
-                        entity.get(),
-                        ReplicaBody {
-                            entity,
-                            volume_id: vid,
-                            track: MotionTrack::default(),
-                        },
-                    );
-                }
-            }
-            volumes.insert(vid.get(), volume);
+            staged.close_volume(bv.volume_id);
         }
-        let terrain_id = terrain_id.ok_or("baseline has no terrain volume")?;
+        self.install_staged(staged)
+    }
 
+    /// Decoded bytes the replica's terrain and bodies hold, counting every resident brick as a
+    /// dense one (conservative). Used to admit a replacement baseline, which coexists with the
+    /// current world until the atomic swap.
+    pub fn decoded_bytes_estimate(&self) -> u64 {
+        self.volumes
+            .values()
+            .map(|v| v.resident_brick_count() as u64)
+            .sum::<u64>()
+            * spall_protocol::segment::DENSE_BRICK_DECODED_COST as u64
+    }
+
+    /// Installs a fully staged baseline atomically: the same swap `install_baseline_world`
+    /// performs, for a world built segment by segment. The previous state is untouched until this
+    /// call, and a staged world with no terrain or an open volume is refused.
+    pub fn install_staged(&mut self, staged: StagedBaseline) -> Result<(), String> {
+        let terrain_id = staged.terrain_id.ok_or("baseline has no terrain volume")?;
+        if let Some(open) = staged.open {
+            return Err(format!("baseline volume {open} was left open"));
+        }
         self.terrain_id = terrain_id;
-        self.volumes = volumes;
-        self.owner = owner;
-        self.bodies = bodies;
-        self.volume_of_entity = volume_of_entity;
+        self.volumes = staged.volumes;
+        self.owner = staged.owner;
+        self.bodies = staged.bodies;
+        self.volume_of_entity = staged.volume_of_entity;
         self.tombstoned = BTreeSet::new();
         self.applied_tx = BTreeSet::new();
         self.control_gate = SequenceGate::new();
@@ -397,7 +689,8 @@ impl ReplicaWorld {
         // A full baseline replaces the whole logical state, digest namespace
         // included (G3-residency-hash.md lifecycle).
         self.evicted = BTreeMap::new();
-        self.now_tick = world.checkpoint_tick;
+        self.now_tick = staged.checkpoint_tick;
+        self.bump_terrain_generation();
         Ok(())
     }
 
@@ -423,6 +716,7 @@ impl ReplicaWorld {
         // part-way (unknown volume, malformed brick, out-of-bounds coord) never
         // half-replaces live state — the repair either restores exact parity or
         // changes nothing.
+        let terrain_touched = world.volumes.iter().any(|v| v.volume_id == self.terrain_id);
         let mut staged: BTreeMap<u64, Volume> = BTreeMap::new();
         for bv in &world.volumes {
             let vid = bv.volume_id;
@@ -480,6 +774,9 @@ impl ReplicaWorld {
                     bb.coord[2],
                 ));
             }
+        }
+        if terrain_touched {
+            self.bump_terrain_generation();
         }
         Ok(())
     }
@@ -606,10 +903,30 @@ impl ReplicaWorld {
         self.now_tick
     }
 
+    /// Fractional server tick to hand [`Self::interpolated_pose`] for a frame
+    /// drawn at `now`. Unlike [`Self::now_tick`] (which only moves when a
+    /// snapshot lands, so sampling it makes bodies advance in snapshot-sized
+    /// steps), this runs continuously at the server tick rate and is only
+    /// slewed gently toward the observed stream, so motion stays smooth
+    /// between and across snapshot arrivals.
+    pub fn render_tick(&mut self, now: Instant) -> f64 {
+        self.render_clock
+            .advance(now, self.now_tick, self.config.server_tick_hz)
+    }
+
     /// The live terrain volume, for building a client-side collision world (T19
     /// prediction). `None` before a baseline is installed.
     pub fn terrain_volume(&self) -> Option<&Volume> {
         self.volumes.get(&self.terrain_id.get())
+    }
+
+    /// Cheap invalidation token for a cached immutable terrain clone.
+    pub fn terrain_generation(&self) -> u64 {
+        self.terrain_generation
+    }
+
+    fn bump_terrain_generation(&mut self) {
+        self.terrain_generation = self.terrain_generation.wrapping_add(1).max(1);
     }
 
     /// Any live volume by stable id. Streamed client caches use this to account
@@ -644,6 +961,9 @@ impl ReplicaWorld {
             return false;
         }
         v.evict_brick(coord);
+        if volume == self.terrain_id {
+            self.bump_terrain_generation();
+        }
         true
     }
 
@@ -857,6 +1177,10 @@ impl ReplicaWorld {
         }
 
         // 4. Commit the candidate. Nothing above mutated live state.
+        let terrain_touched = tx
+            .ops
+            .iter()
+            .any(|op| topology_op_touches_volume(op, self.terrain_id));
         self.volumes = candidate;
         // slice E: a committed op that wrote into a brick this replica had
         // evicted (its `before` gap was healed by a repair patch just before
@@ -880,6 +1204,9 @@ impl ReplicaWorld {
             );
         }
         self.applied_tx.insert(tx.transaction_id.get());
+        if terrain_touched {
+            self.bump_terrain_generation();
+        }
 
         // ENG-49: this transaction is applied — drop it from the pending-repair
         // hold and clear any repair keys its `before` bricks were blocked on so
@@ -990,25 +1317,62 @@ impl ReplicaWorld {
     /// `max_extrapolation_s`, then holds. `None` if the body has no state yet.
     pub fn interpolated_pose(&self, entity: EntityId, render_tick: f64) -> Option<Pose> {
         let track = &self.bodies.get(&entity.get())?.track;
-        let latest = track.latest?;
         let delay_ticks = self.config.interpolation_delay_s * self.config.server_tick_hz;
-        let target = render_tick - delay_ticks;
-
-        let Some(prev) = track.prev else {
-            return Some(latest.pose);
-        };
-        let (a, b) = if prev.server_tick <= latest.server_tick {
-            (prev, latest)
-        } else {
-            (latest, prev)
-        };
-        if b.server_tick == a.server_tick {
-            return Some(b.pose);
-        }
-        let span = (b.server_tick - a.server_tick) as f64;
         let max_extra = self.config.max_extrapolation_s * self.config.server_tick_hz;
-        let t = ((target - a.server_tick as f64) / span).clamp(0.0, 1.0 + max_extra / span);
-        Some(lerp_pose(&a.pose, &b.pose, t))
+        track.sample(render_tick - delay_ticks, max_extra)
+    }
+
+    /// Bodies within this distance of the player are drawn at the server's
+    /// *present* estimate, fully.
+    pub const PRESENT_FULL_WITHIN_M: f64 = 2.0;
+    /// Beyond this distance bodies are drawn `interpolation_delay_s` in the past.
+    pub const PRESENT_NONE_BEYOND_M: f64 = 5.0;
+
+    /// Pose to draw `entity` at. Far from `focus_m` (the player's predicted
+    /// feet) this is the smooth, render-delayed [`Self::interpolated_pose`].
+    /// The character, though, collides with bodies at their *present* poses
+    /// (the server sweeps it against them as they are now), and a body the
+    /// player is pushing at walking speed is ~0.5 m ahead of where a 100 ms
+    /// delayed draw shows it: the player stops against nothing visible. So
+    /// inside [`Self::PRESENT_FULL_WITHIN_M`] the newest snapshot is advanced
+    /// to `render_tick` along its own velocity instead, cross-faded to the
+    /// delayed pose out to [`Self::PRESENT_NONE_BEYOND_M`].
+    pub fn presented_pose(
+        &self,
+        entity: EntityId,
+        render_tick: f64,
+        focus_m: Option<[f64; 3]>,
+    ) -> Option<Pose> {
+        self.body_sampler(entity)?.presented(render_tick, focus_m)
+    }
+
+    /// A self-contained copy of what [`Self::presented_pose`] reads for
+    /// `entity`, so a caller can drop the replica lock and still pose the body
+    /// at any later `render_tick` (the renderer re-poses at each frame's own
+    /// timestamp instead of reusing a worker's stale sample).
+    pub fn body_sampler(&self, entity: EntityId) -> Option<BodySampler> {
+        let track = self.bodies.get(&entity.get())?.track.clone();
+        track.latest?;
+        Some(BodySampler {
+            track,
+            delay_ticks: self.config.interpolation_delay_s * self.config.server_tick_hz,
+            max_extra_ticks: self.config.max_extrapolation_s * self.config.server_tick_hz,
+            hz: self.config.server_tick_hz,
+        })
+    }
+
+    /// The newest snapshot for `entity`, with the velocities needed to advance
+    /// it to any nearby server tick (character prediction collides with bodies
+    /// at the tick it is simulating, not at the 100 ms render-delayed pose).
+    pub(crate) fn latest_motion(&self, entity: EntityId) -> Option<LatestMotion> {
+        let latest = self.bodies.get(&entity.get())?.track.latest?;
+        Some(LatestMotion {
+            pose: latest.pose,
+            server_tick: latest.server_tick,
+            linear_velocity_m_s: latest.linear_velocity,
+            angular_velocity_rad_s: latest.angular_velocity,
+            sleeping: latest.sleeping,
+        })
     }
 
     /// The newest raw motion state's server tick for `entity`.
@@ -1060,6 +1424,21 @@ impl ReplicaWorld {
 }
 
 // --- op replay --------------------------------------------------------------
+
+fn topology_op_touches_volume(op: &TopologyOp, volume: VolumeId) -> bool {
+    match op {
+        TopologyOp::IntegerBrush { volume: v, .. } | TopologyOp::CellRun { volume: v, .. } => {
+            *v == volume
+        }
+        TopologyOp::SplitOff { source, child, .. }
+        | TopologyOp::SplitOffBaseline { source, child, .. }
+        | TopologyOp::SplitOffBulkBaseline { source, child, .. } => {
+            *source == volume || *child == volume
+        }
+        TopologyOp::SourcePatchBaseline { source, .. }
+        | TopologyOp::SourcePatchBulkBaseline { source, .. } => *source == volume,
+    }
+}
 
 /// A batch of same-volume writes not yet applied.
 struct PendingGroup {
@@ -1427,13 +1806,65 @@ fn lerp_pose(a: &Pose, b: &Pose, t: f64) -> Pose {
     for i in 0..3 {
         out.translation_m[i] = a.translation_m[i] + (b.translation_m[i] - a.translation_m[i]) * t;
     }
+    out.rotation = nlerp_rotation(&a.rotation, &b.rotation, t).unwrap_or(b.rotation);
+    out
+}
+
+/// Shortest-arc normalised lerp between two orientations. `None` if either is
+/// degenerate (the caller keeps the newer one).
+fn nlerp_rotation(
+    a: &spall_core::QuantizedQuat,
+    b: &spall_core::QuantizedQuat,
+    t: f64,
+) -> Option<spall_core::QuantizedQuat> {
+    let [ax, ay, az, aw] = a.to_unit().ok()?;
+    let [bx, by, bz, bw] = b.to_unit().ok()?;
+    let qa = glam::Quat::from_xyzw(ax, ay, az, aw);
+    let mut qb = glam::Quat::from_xyzw(bx, by, bz, bw);
+    if qa.dot(qb) < 0.0 {
+        qb = -qb;
+    }
+    let q = qa.lerp(qb, t as f32).normalize();
+    spall_core::QuantizedQuat::from_unit(q.x, q.y, q.z, q.w).ok()
+}
+
+/// `pose` advanced by `ticks` server ticks (either sign) along constant linear
+/// and angular velocity; a sleeping body does not move. No contact response:
+/// callers bound `ticks` themselves.
+pub(crate) fn advance_pose(
+    pose: &Pose,
+    linear_velocity_m_s: [f32; 3],
+    angular_velocity_rad_s: [f32; 3],
+    sleeping: bool,
+    ticks: f64,
+    server_tick_hz: f64,
+) -> Pose {
+    if sleeping {
+        return *pose;
+    }
+    let dt = ticks / server_tick_hz;
+    let mut out = *pose;
+    for (t, v) in out.translation_m.iter_mut().zip(linear_velocity_m_s) {
+        *t += f64::from(v) * dt;
+    }
+    let w = glam::Vec3::from_array(angular_velocity_rad_s);
+    if w.length_squared() > 1.0e-12
+        && let Ok([x, y, z, wq]) = pose.rotation.to_unit()
+    {
+        let q = (glam::Quat::from_scaled_axis(w * dt as f32) * glam::Quat::from_xyzw(x, y, z, wq))
+            .normalize();
+        if let Ok(rotation) = spall_core::QuantizedQuat::from_unit(q.x, q.y, q.z, q.w) {
+            out.rotation = rotation;
+        }
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spall_core::CellSizeCode;
+    use spall_core::{CellSizeCode, Tick};
+    use spall_protocol::InputSeq;
     use spall_voxel::EditPlan;
 
     fn terrain() -> Volume {
@@ -1629,6 +2060,151 @@ mod tests {
         );
     }
 
+    fn moving_replica(ticks: &[(u64, f64)], vx: f32) -> (ReplicaWorld, EntityId) {
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        let body = EntityId::new(42).unwrap();
+        replica.install_body(body, {
+            let mut v = Volume::new(VolumeId::new(9).unwrap(), CellSizeCode::Quarter);
+            v.apply_edit(&EditPlan::filled_box(
+                VolumeId::new(9).unwrap(),
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(0, 0, 0),
+                MaterialId(1),
+            ))
+            .unwrap();
+            v
+        });
+        for &(tick, x) in ticks {
+            replica.ingest_snapshot(&MotionSnapshot {
+                server_tick: spall_core::Tick(tick),
+                snapshot_seq: spall_protocol::SnapshotSeq(tick),
+                acked_input: spall_protocol::InputSeq(0),
+                body,
+                topology_revision: Revision(0),
+                pose: Pose {
+                    translation_m: [x, 0.0, 0.0],
+                    rotation: spall_core::QuantizedQuat::from_unit(0.0, 0.0, 0.0, 1.0).unwrap(),
+                },
+                linear_velocity: [vx, 0.0, 0.0],
+                angular_velocity: [0.0; 3],
+                sleeping: false,
+            });
+        }
+        (replica, body)
+    }
+
+    #[test]
+    fn interpolation_is_continuous_at_the_normal_snapshot_spacing() {
+        // 20 Hz snapshots (3 server ticks apart), 1 unit per tick, and the
+        // default 6-tick render delay: the delayed target sits before the two
+        // newest states, so it must come from older retained history rather
+        // than clamping to the older of the newest pair.
+        let (replica, body) = moving_replica(&[(0, 0.0), (3, 3.0), (6, 6.0), (9, 9.0)], 60.0);
+        let x = |tick: f64| replica.interpolated_pose(body, tick).unwrap().translation_m[0];
+        assert!((x(9.0) - 3.0).abs() < 1e-9);
+        assert!((x(10.0) - 4.0).abs() < 1e-9);
+        assert!((x(10.5) - 4.5).abs() < 1e-9);
+        // Before all retained history: held at the oldest state.
+        assert_eq!(x(2.0), 0.0);
+    }
+
+    #[test]
+    fn body_rotation_is_interpolated_not_stepped() {
+        let q = |angle: f32| {
+            spall_core::QuantizedQuat::from_unit((angle / 2.0).sin(), 0.0, 0.0, (angle / 2.0).cos())
+                .unwrap()
+        };
+        let a = Pose {
+            translation_m: [0.0; 3],
+            rotation: q(0.0),
+        };
+        let b = Pose {
+            translation_m: [1.0, 0.0, 0.0],
+            rotation: q(1.0),
+        };
+        let mid = lerp_pose(&a, &b, 0.5);
+        let [x, _, _, w] = mid.rotation.to_unit().unwrap();
+        assert!(
+            (2.0 * x.atan2(w) - 0.5).abs() < 1e-2,
+            "half way is half the angle"
+        );
+        assert!((mid.translation_m[0] - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bodies_near_the_player_are_drawn_at_the_present_far_ones_delayed() {
+        // 60 units/s along x; snapshots at ticks 0..9 (x = tick).
+        let (replica, body) = moving_replica(&[(0, 0.0), (3, 3.0), (6, 6.0), (9, 9.0)], 60.0);
+        let render_tick = 10.0; // delayed target is tick 4 (x = 4); present is x = 10
+        let x = |focus: [f64; 3]| {
+            replica
+                .presented_pose(body, render_tick, Some(focus))
+                .unwrap()
+                .translation_m[0]
+        };
+        let delayed = replica
+            .interpolated_pose(body, render_tick)
+            .unwrap()
+            .translation_m[0];
+        assert!((delayed - 4.0).abs() < 1e-9);
+        assert!(
+            (x([10.0, 0.0, 0.0]) - 10.0).abs() < 1e-4,
+            "player at the body: present pose"
+        );
+        assert!(
+            (x([100.0, 0.0, 0.0]) - delayed).abs() < 1e-9,
+            "far away: delayed pose"
+        );
+        let mid = x([10.0 + 3.5, 0.0, 0.0]);
+        assert!(delayed < mid && mid < 10.0, "cross-faded in between: {mid}");
+        assert_eq!(
+            replica.presented_pose(body, render_tick, None).unwrap(),
+            replica.interpolated_pose(body, render_tick).unwrap()
+        );
+    }
+
+    /// The renderer re-poses a body at every frame's own render tick from a
+    /// sampler copied out of the replica once; that must agree with asking the
+    /// replica directly, and must advance every frame (no held poses) even
+    /// though the copy is only refreshed when a worker pass runs.
+    #[test]
+    fn body_sampler_poses_at_each_frame_time_like_the_replica() {
+        let (replica, body) = moving_replica(&[(0, 0.0), (3, 3.0), (6, 6.0), (9, 9.0)], 60.0);
+        let sampler = replica.body_sampler(body).unwrap();
+        let focus = Some([10.0, 0.0, 0.0]);
+        let mut prev = f64::MIN;
+        // 240 Hz "frames" between 10.0 and 12.0 server ticks, all off one copy.
+        for i in 0..=480 {
+            let tick = 10.0 + f64::from(i) / 240.0;
+            let mine = sampler.presented(tick, focus).unwrap();
+            assert_eq!(mine, replica.presented_pose(body, tick, focus).unwrap());
+            assert!(
+                mine.translation_m[0] > prev,
+                "pose held or went backwards at tick {tick}"
+            );
+            prev = mine.translation_m[0];
+        }
+        assert!(sampler.is_moving());
+        assert!((sampler.latest_age_ticks(10.5).unwrap() - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn render_clock_is_continuous_and_never_runs_backwards() {
+        let mut clock = RenderClock::default();
+        let t0 = Instant::now();
+        let mut prev = clock.advance(t0, 30, 60.0);
+        for frame in 1..=120u64 {
+            // Snapshots land every 3 ticks, so `newest` is a staircase.
+            let elapsed_ticks = frame as f64 * (60.0 / 120.0);
+            let newest = 30 + (elapsed_ticks as u64 / 3) * 3;
+            let now = t0 + std::time::Duration::from_secs_f64(frame as f64 / 120.0);
+            let cur = clock.advance(now, newest, 60.0);
+            assert!(cur > prev, "clock must advance every frame");
+            assert!(cur - prev < 1.0, "no snapshot-sized jump: {}", cur - prev);
+            prev = cur;
+        }
+    }
+
     #[test]
     fn a_snapshot_for_an_unknown_body_is_held_then_applied() {
         let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
@@ -1745,6 +2321,110 @@ mod tests {
             replica.apply_transaction(&tx),
             ApplyOutcome::Published { .. }
         ));
+    }
+
+    #[test]
+    fn terrain_generation_tracks_only_published_resident_terrain_mutations() {
+        use spall_protocol::{
+            BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume, BaselineWorld,
+        };
+
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        let initial = replica.terrain_generation();
+
+        // Body-only installation and motion do not invalidate terrain-derived
+        // collision.
+        let body = EntityId::new(44).unwrap();
+        let mut body_volume = Volume::new(VolumeId::new(44).unwrap(), CellSizeCode::Quarter);
+        body_volume
+            .apply_edit(&EditPlan::filled_box(
+                body_volume.id(),
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(0, 0, 0),
+                MaterialId(1),
+            ))
+            .unwrap();
+        replica.install_body(body, body_volume);
+        let snap = MotionSnapshot {
+            server_tick: Tick(2),
+            snapshot_seq: spall_protocol::SnapshotSeq(1),
+            acked_input: InputSeq(0),
+            body,
+            topology_revision: Revision(1),
+            pose: Pose {
+                translation_m: [1.0, 2.0, 3.0],
+                rotation: spall_core::QuantizedQuat::from_unit(0.0, 0.0, 0.0, 1.0).unwrap(),
+            },
+            linear_velocity: [0.0; 3],
+            angular_velocity: [0.0; 3],
+            sleeping: false,
+        };
+        replica.ingest_snapshot(&snap);
+        assert_eq!(replica.terrain_generation(), initial);
+
+        let terrain_id = replica.terrain_volume_id();
+        assert!(replica.evict_brick(terrain_id, BrickCoord::new(0, 0, 0)));
+        let evicted = replica.terrain_generation();
+        assert!(evicted > initial);
+
+        let mut cells = vec![MaterialId::AIR.0; spall_core::CELLS_PER_BRICK];
+        cells[..10].fill(MaterialId(1).0);
+        let patch = BaselineWorld {
+            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            checkpoint_tick: 3,
+            volumes: vec![BaselineVolume {
+                volume_id: terrain_id,
+                cell_size_code: CellSizeCode::Quarter.to_u8(),
+                owner: BaselineOwner::Terrain,
+                bounds: None,
+                bricks: vec![BaselineBrick {
+                    coord: [0, 0, 0],
+                    revision: 1,
+                    edited: true,
+                    cells: BaselineCells::Dense(cells),
+                }],
+            }],
+        };
+        replica.apply_baseline_patch(&patch).unwrap();
+        let repaired = replica.terrain_generation();
+        assert!(repaired > evicted);
+
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(991).unwrap(),
+            server_tick: Tick(4),
+            control_seq: spall_protocol::ControlSeq(2),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: terrain_id,
+                start: GlobalCell::new(0, 0, 0),
+                len: 1,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![],
+        };
+        assert!(matches!(
+            replica.apply_transaction(&tx),
+            ApplyOutcome::Published { .. }
+        ));
+        assert!(replica.terrain_generation() > repaired);
+
+        let before_rejected = replica.terrain_generation();
+        let mut invalid = tx;
+        invalid.transaction_id = TransactionId::new(992).unwrap();
+        invalid.ops = vec![TopologyOp::CellRun {
+            volume: terrain_id,
+            start: GlobalCell::new(0, 0, 0),
+            len: 0,
+            material: MaterialId::AIR,
+        }];
+        assert!(matches!(
+            replica.apply_transaction(&invalid),
+            ApplyOutcome::Rejected { .. }
+        ));
+        assert_eq!(replica.terrain_generation(), before_rejected);
     }
 
     #[test]

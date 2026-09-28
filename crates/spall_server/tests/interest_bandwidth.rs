@@ -55,6 +55,7 @@ fn base_config(
     ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 300,
         quiescence_ticks: 30,
@@ -82,8 +83,8 @@ fn base_config(
         contact_damage: None,
         dormancy: None,
         timing_window: None,
-        baseline_rate_limit_bytes_per_sec: None,
-        wake_audit: false,
+        credential_registry_file: None,
+        custom_world: None,
     }
 }
 
@@ -114,6 +115,7 @@ fn column_cut_client(
         client_residency: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     }
 }
 
@@ -133,7 +135,6 @@ fn a_scene_covering_interest_set_changes_nothing_and_reports_egress() {
             far_interval: 1,
             per_client_budget_bytes: 0,
             static_anchor_m: Some([0.0, 0.0, 0.0]),
-            congestion_aware: false,
         },
     );
     let fp_path = cfg.fingerprint_out.clone().unwrap();
@@ -207,7 +208,6 @@ fn a_far_interest_anchor_culls_body_motion_but_never_geometry() {
             far_interval: 4,
             per_client_budget_bytes: 0,
             static_anchor_m: Some([1000.0, 0.0, 0.0]),
-            congestion_aware: false,
         },
     );
     let fp_path = cfg.fingerprint_out.clone().unwrap();

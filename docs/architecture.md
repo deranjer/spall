@@ -13,18 +13,37 @@ spall_jobs    -> spall_core                     bounded scheduling, result token
 spall_mesh    -> spall_voxel, spall_jobs        surface generation, no GPU
 spall_structure -> spall_voxel, spall_jobs      connectivity, support, split plans
 spall_physics -> spall_voxel                    Rapier adapter, collision builds
+spall_fluid  -> spall_core, spall_voxel          CPU fluid state and solid-boundary snapshots
 spall_sim     -> spall_structure, spall_physics, spall_jobs, spall_protocol   authoritative state and tick order
 spall_protocol -> spall_core                   explicit DTOs and codecs only
 spall_net     -> spall_protocol                 Quinn transport adapter (Tokio; T09)
 spall_store   -> spall_protocol                 checkpoint/journal bytes and indexes
 spall_render  -> spall_mesh, spall_core            wgpu resources and render passes
 spall_server  -> spall_sim, spall_net, spall_store, spall_jobs
-spall_client  -> spall_net, spall_voxel, spall_physics, spall_render, spall_jobs
+spall_client  -> spall_net, spall_voxel, spall_physics, spall_render, spall_jobs, spall_fluid
 sandbox (example) -> spall_server, spall_client   game rules and executable entry points
 xtask                                    process/scenario/build orchestration
 ```
 
 spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The graph edge is refined from `spall_sim -> spall_structure, spall_physics` to add `-> spall_jobs, spall_protocol` (T08): staging is submitted to a `spall_jobs::Scheduler` and re-validated through a `JobToken` like any other off-tick result, and every commit emits a `spall_protocol::TopologyTransaction`. Both new targets are foundation crates (`-> spall_core`); no cycle is introduced. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
+
+ENG-103 introduces `spall_fluid -> spall_core, spall_voxel` as a CPU-only
+water crate. It captures only fully resident voxel geometry and rejects
+unknown cells. Its solver is a dense two-phase (water plus air) MAC grid:
+staggered face velocities, fractional water volume with geometric (PLIC)
+conservative transport, a variable-density pressure projection with a
+multigrid preconditioner, and isothermal compressible sealed air. A Salva
+particle backend was evaluated and removed. Evidence is in
+[`docs/reports/ENG-103.md`](reports/ENG-103.md). The solver is not yet
+advanced by the authoritative `spall_sim` tick, coupled to Rapier, replicated,
+or persisted; that integration is ENG-105. Rapier remains the sole rigid-body
+solver.
+
+ENG-104 adds a local-only client presentation path to `spall_fluid` for the
+interactive feasibility playground. That explicit `sandbox-client --grid-fluid-demo`
+mode owns and advances its own grid fixture for visual experimentation; normal
+networked clients do not advance or claim authority over fluid state. Gameplay
+authority, replication, and recovery remain future work.
 
 Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
 in-process `cargo xtask net-check` transport harness. Add `games/survival` only
@@ -155,11 +174,24 @@ Exact occupied-space compounds are the correctness baseline. A single convex hul
 
 T06 outcome (`spall_physics`, pinned `rapier3d 0.35.3`): the **merged-cuboid compound** is the selected representation for both terrain and dynamic bodies. Versus a native `parry` `Voxels` shape it rebuilds ~150x faster after an edit, stops a fast CCD projectile the voxel shape lets tunnel, and matches the analytic mass/COM/inertia exactly, while a deterministic greedy box decomposition keeps the occupied set exact. Its failure mode — one box per cell on highly fragmented occupancy — is bounded by a per-body primitive budget with a conservative coarse-downsample fallback (never a hull, never dropped mass). Full rationale, measurements, and the coarse-fracture policy are in [`docs/collision-decision.md`](collision-decision.md). `spall_physics` depends only on `spall_voxel`; Rapier types stay inside its `world` / `collider` modules.
 
-Use a capsule character controller with grounded state, gravity, jump, slope/step constraints, swept movement, and server-authoritative interaction with dynamic bodies. Physics queries need up-to-date collider revisions. Enable CCD selectively for fast damaging bodies; test tunneling and contact-energy thresholds before enabling impact-triggered destruction.
+Use a capsule character controller with grounded state, gravity, jump, slope/step constraints, swept movement, and server-authoritative interaction with dynamic bodies. Ground input selects horizontal velocity; takeoff preserves that horizontal momentum until the capsule regains ground, with no mid-air steering or braking. The shipped arc uses a `5.7 m/s` launch and `16 m/s²` character gravity: about a `1.0 m` apex with roughly `0.71 s` airtime. The authoritative capsule has an `80 kg` effective contact mass; its sweep transfers impulses to dynamic bodies, whose exact mass / COM / inertia come from the fine material voxel grid, so a larger same-density block is harder to push. Replica colliders remain query-only and never apply client-side impulses. Physics queries need up-to-date collider revisions. Enable CCD selectively for fast damaging bodies; test tunneling and contact-energy thresholds before enabling impact-triggered destruction.
 
 Client player movement is predicted and reconciled. Remote bodies initially use snapshot interpolation plus kinematic collision proxies. They never gain authority from a client's local collision. Later local dynamic extrapolation is optional only if correction tests show a benefit.
 
-T19 outcome — headless core (`spall_physics::character` + `spall_sim::player` + `spall_client::predict`): a player is a **kinematic capsule**, not a `spall_sim` body — it has no voxel volume, never splits, and never enters the dynamic-body set, so it does not touch the edit / split / collider path. `spall_physics::character::step_character` is the one **pure** movement kernel (input → world-frame wish velocity, gravity, rising-edge jump, post-move vertical clamp) and both sides run it: `PhysicsWorld::sweep_character` wraps Rapier's `KinematicCharacterController` (frozen tuning — walk/jump speed, `MAX_STEP_M ≈ 0.5`, slope-climb/slide angles, ground snap) against the authoritative collider world, and `spall_client::predict::ClientPhysics` runs the identical kernel against a collider rebuilt from the replica terrain. Physics is not lockstep (`docs/protocol.md`), so this buys only bounded agreement — `PredictedPlayer` keeps a bounded input history, snaps to each authoritative `MotionSnapshot` at its `acked_input`, and replays the still-unacknowledged inputs; the residual is reported as a bounded correction. The player capsule advances in `Simulation::tick` **after** `step_physics` (so the sweep sees the broad-phase BVH that tick's collider rebuilds refreshed) and before snapshot extraction. A committed edit within `INVALIDATION_MARGIN_M` of a player bumps its `movement_epoch` and depenetrates it server-side; the client, on any terrain-hash change near its path, rebuilds `ClientPhysics` and rebases prediction on the last authoritative state rather than replaying through geometry that no longer exists. Held input is reused for a 250 ms window then cleared to neutral, so a lost "button up" cannot leave the player walking or holding jump. The player id is a reserved band (`spall_core::player_entity_for(slot)` — `1 << 48 + slot`) both ends derive from the session slot, so no wire record was added; player state rides the existing 20 Hz `MotionSnapshot` with `body =` the player entity and `acked_input =` the last consumed input sequence. `spall_server::serve` gains `Scene::Walk`, gives each connecting client a capsule, and reads `InputFrame` datagrams (one applied per player per tick, redundant `recent` copies recover a dropped frame). Interactive WASD/mouse-look wiring in the graphical client, moving-body **crush** outcomes beyond "server owns push / no client authority" (contact→damage is T21), and formalising the reserved player-id band in `IdRegistry` are follow-up.
+T19 outcome — headless core (`spall_physics::character` + `spall_sim::player` + `spall_client::predict`): a player is a **kinematic capsule**, not a `spall_sim` body — it has no voxel volume, never splits, and never enters the dynamic-body set, so it does not touch the edit / split / collider path. It nevertheless carries an explicit effective contact mass for server-side momentum transfer. `spall_physics::character::step_character` is the one **pure** movement kernel (ground input → world-frame wish velocity, preserved airborne horizontal momentum, gravity, rising-edge jump, post-move vertical clamp) and both sides run it: the server uses `PhysicsWorld::sweep_character_pushing_excluding`, which wraps Rapier's `KinematicCharacterController` and solves contact impulses against dynamic bodies; `spall_client::predict::ClientPhysics` runs the non-pushing sweep against replica terrain plus query-only, server-pose-driven mirrors of detached-body voxel colliders. These mirrors affect only the character query; they never simulate body motion or gain client authority. Physics is not lockstep (`docs/protocol.md`), so this buys only bounded agreement — `PredictedPlayer` keeps a bounded input history, snaps to each authoritative `MotionSnapshot` at its `acked_input`, and replays the still-unacknowledged inputs; the residual is reported as a bounded correction. The player capsule advances in `Simulation::tick` **after** `step_physics` (so the sweep sees the broad-phase BVH that tick's collider rebuilds refreshed) and before snapshot extraction. A committed edit within `INVALIDATION_MARGIN_M` of a player bumps its `movement_epoch` and depenetrates it server-side; the client, on any terrain-hash change near its path, rebuilds `ClientPhysics` and rebases prediction on the last authoritative state rather than replaying through geometry that no longer exists. Held input is reused for a 250 ms window then cleared to neutral, so a lost "button up" cannot leave the player walking or holding jump. The player id is a reserved band (`spall_core::player_entity_for(slot)` — `1 << 48 + slot`) both ends derive from the session slot, so no wire record was added; player state rides the existing 20 Hz `MotionSnapshot` with `body =` the player entity and `acked_input =` the last consumed input sequence. `spall_server::serve` gives each connecting client a capsule and reads `InputFrame` datagrams (one applied per player per tick, redundant `recent` copies recover a dropped frame). Moving-body **crush** outcomes are handled by the separate T21 contact-damage path.
+
+The interactive launcher also has an explicit testing-only escape hatch:
+`--client-authoritative`. In that mode `ClientPhysics` promotes replicated body
+colliders to locally stepped dynamic bodies, computes mass/COM/inertia from the
+occupied fine voxels (using the playground's current uniform `2000 kg/m³`
+density), applies the 80 kg player push impulses locally, owns playground
+emitter timing, and supplies body poses directly to rendering. Server player
+and body motion continues as a shadow simulation but cannot correct the local
+runtime poses. Replicated topology remains the source of terrain and body voxel
+shapes; on a server topology revision, local mass/COM/inertia are recomputed
+from the new voxel grid as well. This mode does not transfer topology/edit
+authority and is never a multiplayer protocol mode. With the flag absent, the
+normal server-authoritative path above is unchanged.
 
 For a larger world, multiple independently rebased physics regions are necessary when players are far apart. Region merge/split and body transfer must be atomic and tested. A single origin following one player is not an acceptable multiplayer large-world solution. This is a G5 gate, not hidden work in the initial sandbox.
 
@@ -176,6 +208,8 @@ Implement in this order:
 5. Temporal reprojection with depth/normal rejection, neighborhood clamping, disocclusion handling, and history invalidation after edits. Denoise and composite; reserve full-resolution raster silhouettes even when lighting is lower resolution.
 6. Expand quality/range only after G2: multiple clipmap levels, better diffuse visibility, local lights, reflections, and distant LOD.
 
+R3 (ENG-96) adds two direct-light contracts to the shared renderer (`docs/reports/ENG-96.md`): sun shadows are cascaded maps with normal-offset bias and physically-scaled PCSS penumbrae (the sun's angular size is an `Environment` parameter), and skylight is *visibility-aware* -- a derived, client-local occupancy grid in the frozen 128 cubed / 0.5 m layout feeds a six-direction sky-visibility pass, so enclosed rooms receive no outdoor ambient; unknown (non-resident) space blocks rays rather than counting as sky.
+
 The clipmap is a derived GPU lighting cache, not the world format. Do not require experimental hardware ray tracing or a sparse voxel octree for the initial renderer. Optional future hardware acceleration must preserve a supported baseline and be justified by captured evidence.
 
 Check indoor light leakage, emissive bounce, moving debris shadows, rapid edits, and motion ghosting. AO plus bloom alone does not pass G2. The exact indirect-light sampling/denoising implementation is a graphics integration decision in T13, not an invitation for separate agents to invent incompatible render pipelines.
@@ -189,6 +223,18 @@ Brick states: absent -> requested -> resident -> dirty -> checkpointed -> evicta
 Storage partitions index data; they do not own indivisible physical objects. A body spanning partitions has one authoritative identity and geometry owner, plus spatial index references. Relevance uses its bounds, not just its centre.
 
 Begin G1/G2 with all scene geometry resident. G3 introduces eviction against the same invariants. Distant render LOD never changes authoritative voxels, collision, support, or replicated destruction outcomes.
+
+Per-brick terrain collision is the current provisional default: each resident
+solid terrain brick owns one derived fixed physics collider from its exact
+voxel revision, even when residency eviction is disabled. The authoritative
+terrain remains one volume; this creates no per-voxel entities or bodies.
+Eviction retires only the evicted brick's collider, and validated reload or a
+committed edit republishes current collision at the owning tick boundary.
+The legacy whole-terrain collider remains an explicit server comparison mode
+(`--whole-terrain-collider`), and it switches to per-brick before any terrain
+eviction. Collision mode is rebuilt from voxel state on recovery, not stored
+as a runtime handle. See ENG-80 and the G4 rubble-lane report for the
+user-directed decision and measured timing limits.
 
 T18 implements the shared policy in `spall_voxel::residency`: server and client
 hosts account resident brick count and dense material bytes against explicit
