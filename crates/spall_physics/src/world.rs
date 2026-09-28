@@ -7,7 +7,30 @@ use std::time::{Duration, Instant};
 use rapier3d::prelude::*;
 
 use crate::collider::{Representation, build_collider};
+use crate::mass::MassProperties as FineMassProps;
 use crate::occupancy::OccupancyGrid;
+
+/// Converts the analytic fine-grid [`FineMassProps`] (grid-local metre frame,
+/// full inertia tensor about the COM) into a Rapier [`MassProperties`]. The
+/// grid-local frame is the body-local frame (the collider shape is placed with
+/// grid cell `(0,0,0)`'s corner at the body origin), so COM and inertia carry
+/// over unchanged. Rapier diagonalises the tensor internally to recover the
+/// principal moments and their frame, so a mixed-density body with a genuinely
+/// rotated principal frame is represented faithfully.
+fn to_rapier_mass_props(mp: &FineMassProps) -> MassProperties {
+    let com = Vector::new(
+        mp.com_m[0] as f32,
+        mp.com_m[1] as f32,
+        mp.com_m[2] as f32,
+    );
+    let t = &mp.inertia_com;
+    let inertia = Matrix::from_cols_array_2d(&[
+        [t[0][0] as f32, t[0][1] as f32, t[0][2] as f32],
+        [t[1][0] as f32, t[1][1] as f32, t[1][2] as f32],
+        [t[2][0] as f32, t[2][1] as f32, t[2][2] as f32],
+    ]);
+    MassProperties::with_inertia_matrix(com, mp.mass_kg as f32, inertia)
+}
 
 /// Opaque, stable identifier for a body in a [`PhysicsWorld`]. Never a Rapier
 /// handle; safe to store outside the adapter for the life of the world.
@@ -62,8 +85,18 @@ pub struct BodySpec {
     pub grid: OccupancyGrid,
     /// Cell edge length, metres.
     pub cell_m: f32,
-    /// Uniform collider density, kg/m³ (mass is derived from the shape).
+    /// Uniform collider density, kg/m³. Used only when `mass_properties` is
+    /// `None`: mass, centre of mass and inertia are then derived from the
+    /// collision shape at this density.
     pub density_kg_m3: f32,
+    /// Rigid mass, centre of mass and full inertia derived from the **fine
+    /// material grid**, in the body-local (grid) metre frame. When `Some`, these
+    /// are installed on the rigid body verbatim and the collision shape
+    /// contributes no mass — so a mixed-density or coarsened-collider body has
+    /// solver mass/COM/inertia that match the authoritative material calc rather
+    /// than the collision geometry. When `None`, `density_kg_m3` and the shape
+    /// are used (single-material bodies, fixed terrain).
+    pub mass_properties: Option<FineMassProps>,
     /// World translation of the body-local origin, metres.
     pub translation_m: [f32; 3],
     /// Initial linear velocity, m/s (ignored for `Fixed`).
@@ -118,6 +151,11 @@ struct Entry {
     cell_m: f32,
     representation: Representation,
     density: f32,
+    /// Fine-grid mass properties installed on this body, if any. While `Some`,
+    /// the collider is always built at zero density and these values are the
+    /// body's authoritative mass/COM/inertia — preserved across every collider
+    /// rebuild and re-derived by the caller after a split.
+    mass_props: Option<FineMassProps>,
 }
 
 /// A fixed-step rigid-body world over voxel colliders.
@@ -186,13 +224,28 @@ impl PhysicsWorld {
         .build();
         let body = self.bodies.insert(rb);
 
+        // With fine-grid mass properties the shape must not contribute mass:
+        // build the collider at zero density and install the analytic values on
+        // the rigid body directly.
+        let collider_density = if spec.mass_properties.is_some() {
+            0.0
+        } else {
+            spec.density_kg_m3
+        };
         let built = build_collider(&spec.grid, spec.cell_m, spec.representation);
         let collider = ColliderBuilder::new(built.collider.shared_shape().clone())
-            .density(spec.density_kg_m3)
+            .density(collider_density)
             .build();
         let collider = self
             .colliders
             .insert_with_parent(collider, body, &mut self.bodies);
+
+        if let Some(mp) = &spec.mass_properties {
+            let rapier_mp = to_rapier_mass_props(mp);
+            let rb = &mut self.bodies[body];
+            rb.set_additional_mass_properties(rapier_mp, false);
+            rb.recompute_mass_properties_from_colliders(&self.colliders);
+        }
 
         let id = BodyId(self.entries.len() as u32);
         self.entries.push(Entry {
@@ -201,6 +254,7 @@ impl PhysicsWorld {
             cell_m: spec.cell_m,
             representation: spec.representation,
             density: spec.density_kg_m3,
+            mass_props: spec.mass_properties,
         });
         id
     }
@@ -216,20 +270,31 @@ impl PhysicsWorld {
         grid: &OccupancyGrid,
         rep: Representation,
     ) -> Duration {
-        let entry = &mut self.entries[id.0 as usize];
-        let (cell_m, density, body, old_collider) =
-            (entry.cell_m, entry.density, entry.body, entry.collider);
+        let entry = &self.entries[id.0 as usize];
+        let (cell_m, body, old_collider) = (entry.cell_m, entry.body, entry.collider);
+        // Preserve installed fine-grid mass properties across the rebuild: the
+        // new collider is built at the same (zero) density and the analytic
+        // values are re-asserted on the body afterwards.
+        let (collider_density, mass_props) = match &entry.mass_props {
+            Some(mp) => (0.0, Some(to_rapier_mass_props(mp))),
+            None => (entry.density, None),
+        };
 
         let start = Instant::now();
         self.colliders
             .remove(old_collider, &mut self.islands, &mut self.bodies, true);
         let built = build_collider(grid, cell_m, rep);
         let collider = ColliderBuilder::new(built.collider.shared_shape().clone())
-            .density(density)
+            .density(collider_density)
             .build();
         let handle = self
             .colliders
             .insert_with_parent(collider, body, &mut self.bodies);
+        if let Some(rapier_mp) = mass_props {
+            let rb = &mut self.bodies[body];
+            rb.set_additional_mass_properties(rapier_mp, false);
+            rb.recompute_mass_properties_from_colliders(&self.colliders);
+        }
         let total = start.elapsed();
 
         self.entries[id.0 as usize].collider = handle;
@@ -356,12 +421,38 @@ impl PhysicsWorld {
         );
     }
 
-    /// Mass properties Rapier derived for a body's collider: `(mass_kg, local
-    /// centre of mass in metres, principal inertia diagonal)`.
+    /// Replaces the fine-grid mass properties installed on a body — used after a
+    /// split or an edit changes a body's geometry, so the solver's mass, COM and
+    /// inertia keep matching the authoritative material calc. The body must have
+    /// been created with `BodySpec::mass_properties: Some(..)`; on a body without
+    /// installed properties this is a no-op.
+    pub fn set_mass_properties(&mut self, id: BodyId, mp: FineMassProps) {
+        let entry = &mut self.entries[id.0 as usize];
+        if entry.mass_props.is_none() {
+            return;
+        }
+        entry.mass_props = Some(mp);
+        let body = entry.body;
+        let rapier_mp = to_rapier_mass_props(&mp);
+        let rb = &mut self.bodies[body];
+        rb.set_additional_mass_properties(rapier_mp, false);
+        rb.recompute_mass_properties_from_colliders(&self.colliders);
+    }
+
+    /// The body's effective mass properties: `(mass_kg, local centre of mass in
+    /// metres, principal inertia)`. When fine-grid properties are installed
+    /// (`BodySpec::mass_properties`), these are the analytic values actually
+    /// driving the solver; otherwise they are derived from the collision shape
+    /// at the body's uniform density.
     pub fn derived_mass_properties(&self, id: BodyId) -> (f32, [f32; 3], [f32; 3]) {
         let entry = &self.entries[id.0 as usize];
-        let shape = self.colliders[entry.collider].shared_shape().clone();
-        let mp = shape.mass_properties(entry.density);
+        let mp = match &entry.mass_props {
+            Some(fine) => to_rapier_mass_props(fine),
+            None => {
+                let shape = self.colliders[entry.collider].shared_shape().clone();
+                shape.mass_properties(entry.density)
+            }
+        };
         let com = mp.local_com;
         let inertia = mp.principal_inertia();
         (
