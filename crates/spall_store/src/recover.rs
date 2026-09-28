@@ -62,7 +62,19 @@ impl Recovery {
     }
 }
 
-/// Opens `path` read/write (it must exist) and recovers the durable state.
+/// Which complete checkpoint a recovery resumes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverBase {
+    /// The newest complete checkpoint — normal resume (least journal replay).
+    Latest,
+    /// The **oldest** complete checkpoint, replaying the whole journal after it.
+    /// Used to verify that the committed topology-event stream, replayed from
+    /// the original baseline, reproduces the live world (T11 exact replay).
+    Oldest,
+}
+
+/// Opens `path` read/write (it must exist) and recovers the durable state from
+/// the newest checkpoint.
 pub fn recover(path: impl AsRef<Path>) -> Result<Recovery, StoreError> {
     let conn = Connection::open_with_flags(
         path.as_ref(),
@@ -71,9 +83,26 @@ pub fn recover(path: impl AsRef<Path>) -> Result<Recovery, StoreError> {
     recover_conn(&conn)
 }
 
+/// Like [`recover`], but resumes from the **oldest** complete checkpoint and
+/// replays the entire durable journal after it — a full-history replay from the
+/// original baseline.
+pub fn recover_from_base(path: impl AsRef<Path>) -> Result<Recovery, StoreError> {
+    let conn = Connection::open_with_flags(
+        path.as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    recover_conn_from(&conn, RecoverBase::Oldest)
+}
+
 /// Recovers using an already-open connection (the live [`crate::Writer`] uses
-/// this).
+/// this), resuming from the newest checkpoint.
 pub fn recover_conn(conn: &Connection) -> Result<Recovery, StoreError> {
+    recover_conn_from(conn, RecoverBase::Latest)
+}
+
+/// Recovers using an already-open connection, choosing which checkpoint to
+/// resume from.
+pub fn recover_conn_from(conn: &Connection, base: RecoverBase) -> Result<Recovery, StoreError> {
     let version = read_user_version(conn)?;
     if version > STORE_SCHEMA_VERSION {
         return Err(StoreError::SchemaTooNew {
@@ -92,8 +121,13 @@ pub fn recover_conn(conn: &Connection) -> Result<Recovery, StoreError> {
     }
 
     let complete_ticks: Vec<i64> = {
-        let mut stmt =
-            conn.prepare("SELECT tick FROM checkpoints WHERE complete = 1 ORDER BY tick DESC")?;
+        let order = match base {
+            RecoverBase::Latest => "DESC",
+            RecoverBase::Oldest => "ASC",
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT tick FROM checkpoints WHERE complete = 1 ORDER BY tick {order}"
+        ))?;
         let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
         rows.collect::<Result<_, _>>()?
     };
@@ -113,7 +147,21 @@ pub fn recover_conn(conn: &Connection) -> Result<Recovery, StoreError> {
             ))),
         }
     }
-    let checkpoint = selected.ok_or(StoreError::NoCheckpoint)?;
+    // Distinguish a genuinely empty database (no complete checkpoint rows at all)
+    // from a corrupt one (checkpoint rows exist but none decoded). The caller
+    // must not treat the latter as a fresh DB and overwrite it.
+    let checkpoint = match selected {
+        Some(cp) => cp,
+        None if corruption.is_empty() => return Err(StoreError::NoCheckpoint),
+        None => {
+            let details = corruption
+                .iter()
+                .map(|c| c.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(StoreError::CheckpointsUnrecoverable(details));
+        }
+    };
 
     // Walk the journal suffix, stopping at the first gap or CRC failure.
     let cursor = checkpoint.journal_cursor;

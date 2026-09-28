@@ -1,0 +1,31 @@
+{
+  "name": "sleep-wake-settle-20",
+  "scene": "sleep-wake",
+  "description": "T21/ENG-76 networked policy evaluation: the existing sleep-wake support-removal, proximity wake, and body-edit path with an explicit 20-tick settle window. This is evidence for the override only; it does not change the default dormancy tuning.",
+  "server_ticks": 900,
+  "quiescence_ticks": 901,
+  "clients": 1,
+  "dormancy": true,
+  "dormancy_settle_ticks": 20,
+  "minimum_transactions": 2,
+  "replay_check": true,
+  "dormancy_assertions": {
+    "min_deactivations": 1,
+    "min_reactivations": 1
+  },
+  "player_paths": [
+    {
+      "client": 0,
+      "legs": [
+        { "from": 400, "to": 550, "movement": [0.0, 0.0, 1.0] }
+      ]
+    }
+  ],
+  "movement": {
+    "min_distance_m": 4.0
+  },
+  "cuts": [
+    { "client": 0, "at_tick": 10, "cell": [60, 6, 6], "radius": 3 },
+    { "client": 0, "at_tick": 650, "cell": [62, 10, 6], "radius": 3, "target": "body" }
+  ]
+}

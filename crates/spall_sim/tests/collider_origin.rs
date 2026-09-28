@@ -1,21 +1,34 @@
-//! ENG-55: a body whose occupied minimum is not local cell zero must collide on
-//! its authoritative voxels, not near the body-local origin.
+//! ENG-55: a voxel collider must be installed (and rebuilt) at its occupancy
+//! grid's origin, not near body-local zero.
 //!
-//! `spall_physics` now offsets every collider shape by `OccupancyGrid::origin()
-//! * cell_m` in the body frame, and refreshes that offset on each rebuild. These
-//! tests check the end-to-end result through the authoritative sim: a terrain
-//! split child, a source whose tight origin shifts after a cut, and a rotated
-//! moving-body split all keep collision, render geometry and the journalled pose
-//! on the same world cells.
+//! `spall_physics` builds a collider shape with the tight `OccupancyGrid`'s cell
+//! `(0, 0, 0)` at the shape origin; the authoritative sim only ever handed Rapier
+//! the volume/body pose and dropped `OccupancyGrid::origin`. Any volume whose
+//! occupied minimum is not local cell zero therefore had its collision displaced
+//! from its authoritative voxels, and a rebuild after cutting the minimum cells
+//! shifted the tight origin again.
+//!
+//! These probes drive dynamic bodies past world positions that are only solid /
+//! only air once the grid origin is honoured, so a displaced collider is caught:
+//!
+//! - `a_detached_terrain_child_*` — a terrain split whose child's floor sits only
+//!   under the child's own x-range: a collider parked near local zero misses it
+//!   and the body free-falls.
+//! - `a_source_rebuild_*` — a non-splitting terrain cut that erases the tight
+//!   origin's cells: the rebuilt collider must track the shifted origin, so the
+//!   cleared span stops colliding and the far span keeps colliding.
+//! - `a_rotated_moving_body_split_*` — a spinning body with a large grid origin:
+//!   the child's world geometry and inherited velocity must still match a
+//!   from-cells reference.
 
 use glam::{DQuat, DVec3};
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
-use spall_core::{CELLS_PER_BRICK, CellSizeCode, EntityId, GlobalCell, LocalCell, MaterialId, SphereBrush};
+use spall_core::{CELLS_PER_BRICK, EntityId, GlobalCell, LocalCell, SphereBrush};
 use spall_protocol::RequestId;
 use spall_sim::fixtures::{self, STONE};
 use spall_sim::{BodyPose, EditIntent, EditTarget, Simulation, SimulationConfig};
 use spall_structure::AnchorPlane;
-use spall_voxel::{EditPlan, Volume};
+use spall_voxel::{Sample, Volume};
 
 fn brush_cell(x: i64, y: i64, z: i64, radius_cells: i64) -> SphereBrush {
     let h = BRUSH_UNIT / 2;
@@ -30,7 +43,11 @@ fn actor() -> EntityId {
     EntityId::new(1).unwrap()
 }
 
-fn solid_cells(v: &Volume) -> Vec<GlobalCell> {
+fn run(sim: &mut Simulation, ticks: u32) {
+    sim.run_until_idle(ticks).expect("ticks");
+}
+
+fn solid_cells_vec(v: &Volume) -> Vec<GlobalCell> {
     let mut out = Vec::new();
     for c in v.resident_brick_coords() {
         let s = v.snapshot_brick(c).unwrap().unwrap();
@@ -44,213 +61,267 @@ fn solid_cells(v: &Volume) -> Vec<GlobalCell> {
     out
 }
 
-/// Centroid of a volume's solid cells, in body-local metres (uniform density).
-fn cell_centroid_local_m(v: &Volume) -> [f64; 3] {
-    let cells = solid_cells(v);
+/// Uniform-density centre of mass, world metres, for `v` at `pose`.
+fn uniform_com_world(v: &Volume, pose: &BodyPose, cs: spall_core::CellSizeCode) -> DVec3 {
+    let cells = solid_cells_vec(v);
     let n = cells.len() as f64;
-    let cs = v.cell_size().metres();
-    let mut sum = [0.0f64; 3];
+    let mut sum = DVec3::ZERO;
     for g in &cells {
-        sum[0] += (g.x as f64 + 0.5) * cs;
-        sum[1] += (g.y as f64 + 0.5) * cs;
-        sum[2] += (g.z as f64 + 0.5) * cs;
+        sum += DVec3::new(g.x as f64 + 0.5, g.y as f64 + 0.5, g.z as f64 + 0.5);
     }
-    [sum[0] / n, sum[1] / n, sum[2] / n]
+    pose.local_cell_to_world_m(sum / n, cs)
 }
 
-/// `world.physics().body_local_com` for a body, as `[f64; 3]`.
-fn body_local_com(sim: &Simulation, entity: EntityId) -> [f64; 3] {
-    let phys = sim.world().body(entity).unwrap().phys;
-    sim.world()
-        .physics()
-        .body_local_com(phys)
-        .map(f64::from)
+fn journalled(sim: &Simulation, entity: EntityId) -> spall_protocol::MotionSnapshot {
+    *sim.journal()
+        .last()
+        .expect("a journal entry")
+        .participants
+        .iter()
+        .find(|p| p.body == entity)
+        .expect("participant snapshot for the body")
 }
 
-fn run(sim: &mut Simulation, ticks: u32) {
-    sim.run_until_idle(ticks).expect("ticks");
+/// Drops a 1-cell probe at `world_m`, steps physics, and returns its resting Y.
+fn drop_probe(sim: &mut Simulation, world_m: [f64; 3], steps: usize) -> f64 {
+    let probe = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(1),
+            BodyPose::new(DQuat::IDENTITY, world_m),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    for _ in 0..steps {
+        sim.step_physics_only();
+    }
+    sim.world().body(probe).unwrap().pose.translation_m[1]
 }
 
-/// The beam that detaches from `bridged_terrain_setup` has its tight grid origin
-/// at `(4, 8, 1)`. Its collider must sit on those cells: the beam then rests on
-/// the bridge floor directly beneath it instead of tunnelling through.
+// --- terrain split: the child lands on the floor beneath its real cells -----
+
 #[test]
-fn a_terrain_split_child_collides_on_its_authoritative_cells() {
+fn a_detached_terrain_child_lands_on_the_floor_under_its_authoritative_cells() {
     let mut sim =
-        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+        Simulation::new(SimulationConfig::new(fixtures::far_bridged_terrain_setup())).unwrap();
+    let terrain = sim.world().terrain_volume_id();
 
     let req = RequestId(1);
     sim.submit(EditIntent::cut(
         req,
         actor(),
         EditTarget::Terrain,
-        brush_cell(10, 4, 1, 2),
+        brush_cell(31, 4, 1, 2),
     ))
     .unwrap();
-    run(&mut sim, 12);
-    assert!(sim.committed(req).is_some(), "the column cut commits");
+    run(&mut sim, 8);
+
+    let committed = sim.committed(req).expect("the column cut commits").clone();
     assert_eq!(sim.world().body_count(), 1, "the beam detaches as one body");
+    let child = *committed.children.first().expect("one child");
 
-    let child = *sim.committed(req).unwrap().children.first().unwrap();
+    // Commit-tick coincidence: the journalled transform is the identity (terrain
+    // child), and the beam's cells are exactly the world cells they were.
+    let snap = journalled(&sim, child);
+    assert!(
+        snap.pose.translation_m.iter().all(|v| v.abs() < 1e-9),
+        "a terrain child journals the identity translation, got {:?}",
+        snap.pose.translation_m
+    );
+    let beam_cell = GlobalCell::new(36, 7, 1);
+    assert_eq!(
+        sim.world()
+            .body(child)
+            .unwrap()
+            .volume
+            .sample(beam_cell)
+            .unwrap(),
+        Sample::Filled(STONE),
+        "the child owns the beam cell"
+    );
+    assert_eq!(
+        sim.world()
+            .volume_ref(terrain)
+            .unwrap()
+            .sample(beam_cell)
+            .unwrap(),
+        Sample::Empty { modified: true },
+        "and the terrain no longer holds it"
+    );
 
-    // The collider's body-local COM coincides with the authoritative cell
-    // centroid (they would differ by origin*cell_m if the origin were ignored).
-    let expect = cell_centroid_local_m(&sim.world().body(child).unwrap().volume);
-    let com = body_local_com(&sim, child);
-    for a in 0..3 {
-        assert!(
-            (com[a] - expect[a]).abs() < 0.05,
-            "axis {a}: collider COM {com:?} vs authoritative centroid {expect:?}"
-        );
-    }
-
-    // Settle. With the collider on the beam cells (bottom face y = 2.0 m) it
-    // lands on the bridge floor (top y = 0.5 m); the pre-fix displaced collider
-    // spawned inside the floor and was flung past y = -5 m.
+    // Physics: the beam's collider is under its real cells (world x in 6..10 m),
+    // where the floor is, so it drops a short distance and comes to rest. A
+    // collider parked near body-local zero (x in 0..4 m) has no floor beneath it
+    // and the beam free-falls past y = -5.
+    let start_y = sim.world().body(child).unwrap().pose.translation_m[1];
     for _ in 0..240 {
         sim.step_physics_only();
     }
-    let body = sim.world().body(child).unwrap();
+    let end_y = sim.world().body(child).unwrap().pose.translation_m[1];
     assert!(
-        body.pose.translation_m.iter().all(|v| v.is_finite()),
-        "child pose stays finite"
+        end_y.is_finite() && end_y > -3.0,
+        "the beam landed on the floor beneath it (y {start_y} -> {end_y})"
     );
     assert!(
-        body.pose.translation_m[1] > -3.0,
-        "beam settled on the floor under its cells (frame y = {})",
-        body.pose.translation_m[1]
-    );
-    // A known beam cell ends up just above the floor top, not tunnelled.
-    let probe = GlobalCell::new(12, 8, 1);
-    let world_y = body
-        .pose
-        .local_cell_to_world_m(
-            DVec3::new(
-                probe.x as f64 + 0.5,
-                probe.y as f64 + 0.5,
-                probe.z as f64 + 0.5,
-            ),
-            body.volume.cell_size(),
-        )
-        .y;
-    assert!(
-        (0.0..2.0).contains(&world_y),
-        "beam cell rests near the floor top (world y = {world_y})"
+        end_y < start_y + 0.5,
+        "the beam settled downward, it did not launch (y {start_y} -> {end_y})"
     );
 }
 
-/// A body-local dumbbell shifted so its cells start at `(5, 5, 5)`: a cut
-/// through the bridge disconnects it into two bodies. Body-local frame stays
-/// authoritative regardless of the origin offset.
-fn offset_dumbbell(s: i64, gap: i64, shift: i64) -> impl FnOnce(spall_core::VolumeId) -> Volume {
-    move |id| {
-        let mut v = Volume::new(id, CellSizeCode::Quarter);
-        let b = |v: &mut Volume, a: GlobalCell, c: GlobalCell| {
-            v.apply_edit(&EditPlan::filled_box(id, a, c, STONE)).unwrap();
-        };
-        let o = shift;
-        b(
-            &mut v,
-            GlobalCell::new(o, o, o),
-            GlobalCell::new(o + s - 1, o + s - 1, o + s - 1),
-        );
-        let rx = o + s + gap;
-        b(
-            &mut v,
-            GlobalCell::new(rx, o, o),
-            GlobalCell::new(rx + s - 1, o + s - 1, o + s - 1),
-        );
-        let mid = o + s / 2;
-        b(
-            &mut v,
-            GlobalCell::new(o + s, mid, mid),
-            GlobalCell::new(rx - 1, mid, mid),
-        );
-        v
-    }
-}
+// --- source rebuild: the collider tracks the shifted tight origin ----------
 
 #[test]
-fn a_rotated_moving_body_split_keeps_collision_on_its_cells() {
+fn a_source_rebuild_after_cutting_the_minimum_cells_moves_the_collider_with_the_origin() {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::far_raised_block_setup())).unwrap();
+
+    // Baseline: the slab's top face (y = 10 cells = 2.5 m) collides at its far
+    // x end (world x = 10.5 m; cells x 24..43 -> world 6..11 m).
+    let far_top = [10.5, 3.2, 0.375];
+    let rest0 = drop_probe(&mut sim, far_top, 120);
+    assert!(
+        rest0 > 2.0,
+        "probe rests on the intact slab top (y = {rest0})"
+    );
+
+    // Erase the slab's low-x cells, which currently define its tight occupancy
+    // origin. This is a non-splitting terrain edit: the collider is rebuilt from
+    // the shrunk grid, whose origin has moved +~4 cells on X.
+    let bodies_before = sim.world().body_count();
+    let req = RequestId(1);
+    sim.submit(EditIntent::cut(
+        req,
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(25, 8, 2, 3),
+    ))
+    .unwrap();
+    run(&mut sim, 8);
+    assert!(sim.committed(req).is_some(), "the low-x cut commits");
+    assert_eq!(
+        sim.world().body_count(),
+        bodies_before,
+        "the terrain cut detached nothing"
+    );
+
+    // The cleared low-x span (world x ~= 6.35 m) must no longer collide: a probe
+    // there falls straight through. A collider still parked at the old origin
+    // keeps solid geometry under this column.
+    let cleared = drop_probe(&mut sim, [6.35, 3.2, 0.375], 90);
+    assert!(
+        cleared.is_finite() && cleared < 1.5,
+        "probe fell through the cleared low-x span (y = {cleared})"
+    );
+
+    // The untouched far x end must still collide at the same height: a collider
+    // that shifted left with the shrunk grid would leave world x = 10.5 m in the
+    // air.
+    let rest1 = drop_probe(&mut sim, far_top, 120);
+    assert!(
+        rest1 > 2.0,
+        "probe still rests on the far end of the rebuilt collider (y = {rest1})"
+    );
+}
+
+// --- rotated moving-body split: geometry and velocity stay put ------------
+
+#[test]
+fn a_rotated_moving_body_split_keeps_child_geometry_and_inherited_velocity() {
     let mut setup = fixtures::flat_terrain_setup();
-    setup.anchor = AnchorPlane::at(-100_000); // nothing anchored
+    setup.anchor = AnchorPlane::at(-100_000); // nothing is anchored
     let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
 
-    let parent_pose = BodyPose::new(fixtures::oblique_spin(), [6.0, 9.0, 6.0]);
+    // A dumbbell whose occupancy minimum is 40 cells (10 m) off the volume
+    // origin, spun about an oblique axis and moving.
+    let off = GlobalCell::new(40, 40, 40);
+    let parent_pose = BodyPose::new(fixtures::oblique_spin(), [3.0, 30.0, 3.0]);
+    let linvel = [1.5, 0.0, -0.5];
+    let angvel = [0.0, 0.8, 0.0];
     let parent = sim
         .world_mut()
         .spawn_body(
-            offset_dumbbell(4, 3, 5),
+            fixtures::offset_dumbbell(4, 3, off),
             parent_pose,
-            [1.2, 0.0, -0.4],
-            [0.0, 0.7, 0.0],
+            linvel,
+            angvel,
             2600.0,
             0,
         )
         .unwrap();
+    let parent_vid = sim.world().body(parent).unwrap().volume_id;
+    let cs = sim.world().body(parent).unwrap().volume.cell_size();
 
-    // The offset body's own collider already sits on its cells.
-    let pexpect = cell_centroid_local_m(&sim.world().body(parent).unwrap().volume);
-    let pcom = body_local_com(&sim, parent);
-    for a in 0..3 {
-        assert!(
-            (pcom[a] - pexpect[a]).abs() < 0.05,
-            "parent axis {a}: {pcom:?} vs {pexpect:?}"
-        );
-    }
+    let full_body = sim.world().volume_ref(parent_vid).unwrap().clone();
+    // Right cube: local x 7..10 -> shifted by `off`.
+    let right_cube_cell = GlobalCell::new(off.x + 8, off.y + 1, off.z + 1);
+    let cell_centre = DVec3::new(
+        right_cube_cell.x as f64 + 0.5,
+        right_cube_cell.y as f64 + 0.5,
+        right_cube_cell.z as f64 + 0.5,
+    );
+    let world_before = parent_pose.local_cell_to_world_m(cell_centre, cs);
+    let parent_com = uniform_com_world(&full_body, &parent_pose, cs);
 
     let req = RequestId(7);
     sim.submit(EditIntent::cut(
         req,
         actor(),
         EditTarget::Body(parent),
-        // bridge midpoint of the shifted dumbbell: s=4, gap=3, shift=5 ->
-        // bridge x in 9..11, y=z=7.
-        brush_cell(10, 7, 7, 2),
+        brush_cell(off.x + 5, off.y + 2, off.z + 2, 2),
     ))
     .unwrap();
     run(&mut sim, 12);
-    assert!(sim.committed(req).is_some(), "the body cut commits");
+
+    let committed = sim.committed(req).expect("the body cut commits").clone();
     assert_eq!(sim.world().body_count(), 2, "dumbbell -> two bodies");
+    let child = *committed.children.first().expect("a child");
+    let child_body = sim.world().body(child).expect("child body");
+    assert_eq!(
+        child_body.volume.sample(right_cube_cell).unwrap(),
+        Sample::Filled(STONE),
+        "the child holds the right cube"
+    );
 
-    let child = *sim.committed(req).unwrap().children.first().unwrap();
-    let body = sim.world().body(child).unwrap();
+    // The split-instant transform (journalled) reproduces the parent's, so the
+    // cell is at the same world position it was before the cut.
+    let snap = journalled(&sim, child);
+    let sq = snap.pose.rotation.to_unit().unwrap();
+    let split_pose = BodyPose::new(
+        DQuat::from_xyzw(sq[0] as f64, sq[1] as f64, sq[2] as f64, sq[3] as f64),
+        snap.pose.translation_m,
+    );
+    let world_after = split_pose.local_cell_to_world_m(cell_centre, cs);
+    assert!(
+        (world_after - world_before).length() < 3e-3,
+        "split geometry stays at the same world location ({world_before} -> {world_after})"
+    );
 
-    // Collision (body-local COM) and render geometry (cell centroid) coincide in
-    // the same committed tick, for a rotated moving body whose grid origin is
-    // not local zero.
-    let expect = cell_centroid_local_m(&body.volume);
-    let com = body_local_com(&sim, child);
-    for a in 0..3 {
-        assert!(
-            (com[a] - expect[a]).abs() < 0.05,
-            "child axis {a}: collider COM {com:?} vs authoritative centroid {expect:?}"
-        );
-    }
-
-    // ... and the journalled split pose reproduces the parent transform, so the
-    // world geometry is unchanged at the split instant.
-    let snap = *sim
-        .journal()
-        .last()
-        .unwrap()
-        .participants
-        .iter()
-        .find(|p| p.body == child)
-        .unwrap();
-    let q = snap.pose.rotation.to_unit().unwrap();
-    let pq = parent_pose.rotation;
-    let dot = (f64::from(q[0]) * pq.x
-        + f64::from(q[1]) * pq.y
-        + f64::from(q[2]) * pq.z
-        + f64::from(q[3]) * pq.w)
-        .abs();
-    assert!(dot > 0.999, "child split rotation matches the parent (dot {dot})");
-    for a in 0..3 {
-        assert!(
-            (snap.pose.translation_m[a] - parent_pose.translation_m[a]).abs() < 1e-6,
-            "child split translation matches the parent"
-        );
-    }
-    let _ = (STONE, MaterialId::AIR);
+    // Inherited velocity: v_child ~= v_parent + omega x (r_child_com - r_parent_com),
+    // with the parent COM taken in the same origin-aware world frame. A parent
+    // COM computed without the grid-origin offset is wrong by ~10 m, which
+    // omega = 0.8 rad/s turns into several m/s of error here.
+    let omega = DVec3::from_array(angvel);
+    let child_com = uniform_com_world(&child_body.volume, &parent_pose, cs);
+    let expected = DVec3::from_array(linvel) + omega.cross(child_com - parent_com);
+    let got = DVec3::new(
+        snap.linear_velocity[0] as f64,
+        snap.linear_velocity[1] as f64,
+        snap.linear_velocity[2] as f64,
+    );
+    assert!(
+        (got - expected).length() < 0.5,
+        "child velocity inherits parent motion: expected ~{expected}, got {got}"
+    );
+    let got_w = DVec3::new(
+        snap.angular_velocity[0] as f64,
+        snap.angular_velocity[1] as f64,
+        snap.angular_velocity[2] as f64,
+    );
+    assert!(
+        (got_w - omega).length() < 1e-4,
+        "child inherits parent angular velocity exactly"
+    );
 }

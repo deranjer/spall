@@ -88,6 +88,7 @@ fn process_role() {
                     loss_ratio: 0.02,
                     delay: Duration::from_millis(15),
                     jitter: Duration::from_millis(5),
+                    reorder_period: 0,
                     ..PacketFaultPlan::transparent(1)
                 };
                 let proxy = UdpProxy::spawn(upstream.addr, plan).await.unwrap();
@@ -125,7 +126,11 @@ fn process_role() {
                 assert!(outcome.connected);
                 assert_eq!(outcome.records_recv, 8);
                 assert_eq!(outcome.bulk_parts_recv, 3);
-                assert!(outcome.datagrams_recv > 0);
+                assert!(
+                    outcome.datagrams_recv > 0,
+                    "client {index} received no motion datagrams (sent {})",
+                    outcome.datagrams_sent
+                );
                 assert!(outcome.app_bytes_recv > outcome.records_recv);
             }
             _ => panic!("unknown child role"),

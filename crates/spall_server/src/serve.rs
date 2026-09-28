@@ -20,30 +20,43 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::action_catalog::ToolCatalog;
+use crate::replication::{BodyDigest, ClientReplication, InterestSet, MotionBudget};
+use glam::DVec3;
 use serde::Serialize;
 use spall_core::{
-    EntityId, JournalSeq, JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole,
+    BRUSH_UNIT, BrushPoint, EntityId, GlobalCell, JournalSeq, JsonlError, JsonlLog, ProcessEvent,
+    ProcessRecord, ProcessRole, SphereBrush,
 };
 use spall_net::{
-    Connection, DevIdentity, JoinToken, NetServer, Role, TransportConfig, TransportError,
-    WireRecord,
+    Connection, DatagramRecord, DevIdentity, JoinToken, NetServer, Role, TransportConfig,
+    TransportError, WireRecord,
 };
 use spall_physics::PhysicsConfig;
 use spall_protocol::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, AlgorithmVersions, BaselineAck,
-    ClaimedTarget, Handshake, Hash32, InterestEpoch, MotionSnapshot, NegotiatedLimits,
+    ClaimedTarget, Handshake, InputFrame, InterestEpoch, MotionSnapshot, NegotiatedLimits,
     PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
+    frame_input, recent_input, session_player_entity,
 };
+use spall_sim::fixtures::{
+    G4_WORKLOAD_SPAWNS, SEPARATED_REGION_FAR_SPAWNS, SEPARATED_REGION_SPAWNS, WALK_ARENA_SPAWNS,
+};
+use spall_sim::world::TerrainColliderMode;
 use spall_sim::{
-    EditIntent, EditKind, EditTarget, MotionPublisher, Simulation, SimulationConfig,
-    action_statuses, committed_transactions, fixtures,
+    Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
+    SimulationConfig, action_statuses,
 };
 use spall_store::Writer;
 use spall_structure::AnchorPlane;
-use tokio::sync::{mpsc, watch};
+use spall_voxel::{Ray, RayOutcome, cast_ray_world};
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::baseline::{self, BaselineTransfer};
+use crate::commit_latency::{self, CommitLatency};
+use crate::input_schedule::PlayerInputSchedule;
 use crate::persist::{self, PersistConfig};
+use crate::persist_pipeline::{PersistPipeline, PipelineConfig};
 
 /// A joining client's sentinel `BaselineAck.transfer_id`: "I am a late-join
 /// replica, send me a baseline". A real transfer id is always `>= 1`, so `0`
@@ -59,6 +72,108 @@ pub const DEFAULT_CATCH_UP_CAP: usize = 512;
 /// Default bounded retry count for late-join transfer restarts.
 pub const DEFAULT_MAX_JOIN_RETRIES: u32 = 3;
 
+/// Default size of the background baseline-capture worker pool
+/// ([`LateJoin`]'s `capture_pool`), when [`ServeConfig::capture_workers`] is
+/// left unset by a caller.
+///
+/// ENG-30 / T23 row 11, increment 30: increment 29 traced a deterministic
+/// `t23-g4-join-budget` failure (a real ~30s+ span of *genuine* silence on
+/// every connection, not a false idle read) to real CPU/scheduling
+/// contention from eight concurrent, unbounded `std::thread::spawn` calls in
+/// `LateJoin::on_baseline_ack` -- one per simultaneous late join -- plus
+/// nine-plus OS processes (one server, eight clients) on one machine, and
+/// flagged sizing a bounded pool without first measuring this environment's
+/// real schedulable CPU budget as exactly the kind of unprincipled,
+/// environment-fitted guess this project's convention asks not to ship.
+///
+/// This increment measured that budget with a standalone, dependency-free
+/// CPU-bound thread sweep (`docs/reports/G3.md` increment 30 has the full
+/// methodology and raw numbers) independent of the join-budget scenario
+/// itself. Headline results on this environment (`available_parallelism()`
+/// reports 16): per-worker completion time grows only ~12-21% over solo
+/// execution through a quarter of that count, ~29% at half, and ~48% at the
+/// full count, with throughput saturating almost exactly at
+/// `available_parallelism()` workers and then flatlining (pure queueing, not
+/// a lower real core count) -- i.e. the reported 16 logical cores are real
+/// and genuinely schedulable in isolation. The isolated single-process probe
+/// does not, however, exercise this workspace's actual multi-process shape:
+/// the server and every client each build their own
+/// `tokio::runtime::Builder::new_multi_thread()` at its own default worker
+/// count (`available_parallelism()`, uncustomized anywhere in this
+/// workspace), so a real `t23-g4-join-budget` run puts up to nine such
+/// runtimes (~9 x 16 = up to 144 OS threads) on the same physical cores
+/// before a single capture thread is even spawned -- confirmed by inspecting
+/// every `Builder::new_multi_thread()` call site in this workspace
+/// (`spall_server::serve`, `spall_client::net`, and `xtask`'s own harness
+/// connections): none calls `.worker_threads(..)`, so all default to
+/// `available_parallelism()`. Because background capture must share this
+/// machine with that additional, unmeasured multi-process load -- not just
+/// with itself -- this picks the
+/// conservative quarter-of-parallelism point from the measured curve rather
+/// than the fuller "still efficient" range the isolated probe alone would
+/// suggest.
+///
+/// This is a general server-hygiene default (an unbounded thread-per-request
+/// spawn is a known scalability antipattern regardless of any one sandbox's
+/// contention), not a constant fitted to this one scenario -- see
+/// `docs/reports/G3.md` increment 30 for whether it actually closes row 11.
+pub fn default_capture_workers() -> usize {
+    (std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        / 4)
+    .max(1)
+}
+
+// --- ENG-48: minimum safe replication-host queue bounds ----------------------
+//
+// The full per-connection bandwidth / interest budget is T20. These caps only
+// stop a flooding client from stalling the tick loop or a stalled reliable
+// reader from growing host memory without bound. Quinn flow control bounds the
+// wire, not these application allocations.
+
+/// Depth of the shared inbound bridge channel (records buffered between the
+/// connection readers and the sim loop). Past this a reader's `try_send` drops
+/// the surplus `ActionRequest` / `RepairRequest` (both are client-retryable and
+/// rate-limited) so host memory stays flat under a flood.
+pub const INBOUND_CHANNEL_CAP: usize = 4096;
+
+/// Most inbound bridge records the sim loop drains in a single tick. The
+/// remainder waits in the bounded channel for the next tick, so an ingress
+/// burst can never prevent the drain loop from ending.
+pub const MAX_INBOUND_PER_TICK: usize = 1024;
+
+/// Most `ActionRequest`s one session may have admitted in one tick
+/// (`docs/architecture.md`: "Drain bounded input queues; validate client
+/// sequence numbers, permissions, and action limits"). Past this the request
+/// gets an explicit throttled rejection — an actionable retry response — rather
+/// than queueing more work, and every other session keeps its own quota.
+pub const MAX_ACTIONS_PER_CLIENT_PER_TICK: u32 = 4;
+
+/// Most `RepairRequest`s one session may have admitted in one tick
+/// (`docs/protocol.md`: `RepairRequest` is "rate-limited"). Surplus is dropped;
+/// the replica re-requests, itself rate-limited (ENG-49).
+pub const MAX_REPAIRS_PER_CLIENT_PER_TICK: u32 = 8;
+pub const MAX_PROGRESSION_PER_CLIENT_PER_TICK: u32 = 8;
+
+/// Most reliable messages (committed topology, `ActionStatus`, baseline
+/// transfers) that may sit unsent in one client's outbound queue before that
+/// client is disconnected and left to re-baseline on reconnect. Committed
+/// topology is never silently discarded to stay under budget
+/// (`docs/protocol.md`: "repair or disconnect a client whose reliable backlog
+/// exceeds the bounded window").
+pub const MAX_RELIABLE_BACKLOG: usize = 2048;
+
+/// Byte ceiling on that same per-client reliable queue.
+pub const MAX_RELIABLE_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
+
+/// ENG-61: with [`ServeConfig::await_body_settle`], how many consecutive ticks
+/// every detached body's origin must hold still (< 1 mm/tick) — on top of being
+/// asleep — before the run is allowed to stop on edit-quiescence. One second at
+/// 60 Hz: long enough that the reported rest is real, short enough to keep the
+/// gate fixture quick.
+pub const AWAIT_SETTLE_STABLE_TICKS: u64 = 60;
+
 /// Content-manifest tag both ends of a T10 session agree on out of band. Real
 /// manifest negotiation is T16/T17; this keeps the handshake honest meanwhile.
 pub const T10_CONTENT_TAG: &[u8] = b"spall-t10-bridge-v1";
@@ -71,14 +186,252 @@ pub enum Scene {
     /// Anchored floor + single column + raised beam; cutting the column
     /// detaches the beam. See [`spall_voxel::fixtures::bridge_scene`].
     BridgeCut,
+    /// Like [`Scene::BridgeCut`] but the seam-straddling column and the beam it
+    /// holds both cross the `x = 32` brick boundary, so cutting the column
+    /// detaches a body whose cells were owned across two bricks. See
+    /// [`spall_voxel::fixtures::cross_brick_bridge_scene`].
+    CrossBridgeCut,
+    /// T19: a flat anchored walking arena with a step ledge. Each connecting
+    /// client is given an authoritative player capsule; clients script movement
+    /// and predict it locally. See [`spall_sim::fixtures::walk_arena_setup`].
+    Walk,
+    /// T17 / ENG-64: an anchored floor holds a `24³` checkerboard block through
+    /// one column; cutting the column detaches a component whose ~13.8k
+    /// single-cell runs overflow the inline `CellRun` budget, so the commit
+    /// falls back to the compressed-baseline-blob op path. See
+    /// [`spall_sim::fixtures::checkerboard_split_setup`].
+    CheckerboardSplit,
+    /// T17 increment 2 / ENG-64: like [`Scene::CheckerboardSplit`] but the
+    /// detached block's compressed geometry exceeds even the inline op-blob cap,
+    /// so the commit ships a bulk `BaselineWorld` on a stream. See
+    /// [`spall_sim::fixtures::bulk_split_setup`].
+    BulkSplit,
+    /// T23 / G3 integrated acceptance: two independent collapsible bridge
+    /// structures in one bounded `256 x 128 x 256 m` world. Connecting clients
+    /// get a player capsule; alternating slots spawn in the two regions, so the
+    /// harness drives geographically separated players and a multi-region
+    /// collapse. See [`spall_sim::fixtures::separated_regions_setup`].
+    SeparatedRegions,
+    /// T23 / G4 eight-client workload (row 12): the same bounded world as
+    /// [`Scene::SeparatedRegions`], eight player spawns in two 4-player
+    /// clusters, plus 256 active + 4096 sleeping debris bodies. See
+    /// [`spall_sim::fixtures::g4_workload_setup`] /
+    /// [`spall_sim::fixtures::spawn_g4_workload_bodies`].
+    G4Workload,
+    /// Full-envelope separated regions joined by a causeway (T23 / G3 row 2).
+    SeparatedRegionsFar,
+    /// T11a / ENG-62: the full G1 gate envelope — `64 x 32 x 64 m` of real,
+    /// resident, walkable terrain (not just isolated structures), a hollow
+    /// tower/bridge spanning brick boundaries, an excavatable ramp, and a
+    /// moving hollow test-volume body. See
+    /// [`spall_sim::fixtures::g1_full_envelope_setup`] /
+    /// [`spall_sim::fixtures::spawn_g1_hollow_test_volume`].
+    G1FullEnvelope,
+    /// T21 / ENG-28 increment 4 (3c): [`Scene::Walk`]'s arena with a small
+    /// column-and-beam in the player lane. See
+    /// [`spall_sim::fixtures::sleep_wake_setup`].
+    SleepWake,
+    /// Not a gate scene: a hands-on playground (plaza, stairs, maze, jump
+    /// course) with a live debris spawner, for `cargo xtask play --scene
+    /// playground`. See [`spall_sim::fixtures::playground_setup`] /
+    /// [`spall_sim::playground`].
+    Playground,
+    /// Not a gate scene: [`Scene::Walk`]'s arena with one dynamic 0.75 m box
+    /// resting in the player lane, for the headless prediction/push repro
+    /// (`crates/spall_server/tests/prediction_timeline.rs`). See
+    /// [`spall_sim::spawn_push_test_box`].
+    PushTest,
+    /// A game-supplied world (see [`CustomWorld`] and
+    /// [`ServeConfig::custom_world`]), e.g. a scene authored in the editor.
+    /// Never selected by name; the host must supply the world.
+    Custom,
+}
+
+/// A game-supplied world for [`Scene::Custom`]: a terrain/material/physics
+/// setup builder plus the feet positions (metres) for connecting players,
+/// indexed by connection slot. The builder runs once on the authoritative
+/// simulation thread when a new world is created.
+#[derive(Clone)]
+pub struct CustomWorld {
+    player_spawns: Vec<[f64; 3]>,
+    build: Arc<dyn Fn() -> spall_sim::WorldSetup + Send + Sync>,
+}
+
+impl CustomWorld {
+    /// `player_spawns` must be non-empty: every connection gets a capsule.
+    pub fn new(
+        player_spawns: Vec<[f64; 3]>,
+        build: impl Fn() -> spall_sim::WorldSetup + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            player_spawns,
+            build: Arc::new(build),
+        }
+    }
+
+    pub fn player_spawns(&self) -> &[[f64; 3]] {
+        &self.player_spawns
+    }
+}
+
+impl std::fmt::Debug for CustomWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomWorld")
+            .field("player_spawns", &self.player_spawns)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Scene {
+    /// Parses the `--scene` / scenario `scene` value. Unknown names are an error
+    /// the caller surfaces rather than silently falling back.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "bridge-cut" | "bridgecut" | "bridge" => Some(Scene::BridgeCut),
+            "cross-bridge-cut" | "cross-brick-bridge" | "crossbridgecut" => {
+                Some(Scene::CrossBridgeCut)
+            }
+            "walk" | "walk-arena" | "player-movement" => Some(Scene::Walk),
+            "checkerboard-split" | "oversized-split" => Some(Scene::CheckerboardSplit),
+            "bulk-split" | "giant-split" => Some(Scene::BulkSplit),
+            "separated-regions" | "t23-g3" | "g3" => Some(Scene::SeparatedRegions),
+            "g4-workload" | "t23-g4" | "g4" => Some(Scene::G4Workload),
+            "separated-regions-far" | "t23-g3-full-envelope" | "g3-far" => {
+                Some(Scene::SeparatedRegionsFar)
+            }
+            "g1-full-envelope" | "g1-full-workload" | "g1" => Some(Scene::G1FullEnvelope),
+            "sleep-wake" | "sleepwake" | "t21-sleep-wake" => Some(Scene::SleepWake),
+            "playground" | "play" | "sandbox-playground" => Some(Scene::Playground),
+            "push-test" | "pushtest" => Some(Scene::PushTest),
+            // `Scene::Custom` is host-supplied and never parsed from a name.
+            _ => None,
+        }
+    }
+
+    /// A short stable name for the run summary.
+    pub fn name(self) -> &'static str {
+        match self {
+            Scene::BridgeCut => "bridge-cut",
+            Scene::CrossBridgeCut => "cross-bridge-cut",
+            Scene::Walk => "walk",
+            Scene::CheckerboardSplit => "checkerboard-split",
+            Scene::BulkSplit => "bulk-split",
+            Scene::SeparatedRegions => "separated-regions",
+            Scene::G4Workload => "g4-workload",
+            Scene::SeparatedRegionsFar => "separated-regions-far",
+            Scene::G1FullEnvelope => "g1-full-envelope",
+            Scene::SleepWake => "sleep-wake",
+            Scene::Playground => "playground",
+            Scene::PushTest => "push-test",
+            Scene::Custom => "custom",
+        }
+    }
+
+    /// `true` if this scene gives every connecting client a player capsule.
+    pub fn has_players(self) -> bool {
+        matches!(
+            self,
+            Scene::Walk
+                | Scene::SeparatedRegions
+                | Scene::G4Workload
+                | Scene::SeparatedRegionsFar
+                | Scene::G1FullEnvelope
+                | Scene::SleepWake
+                | Scene::Playground
+                | Scene::PushTest
+                | Scene::Custom
+        )
+    }
+
+    /// Feet spawn positions (metres) for a player scene, indexed by connection
+    /// slot. Empty for a scene without players.
+    pub fn player_spawns(self) -> &'static [[f64; 3]] {
+        match self {
+            Scene::Walk => &WALK_ARENA_SPAWNS,
+            Scene::SeparatedRegions => &SEPARATED_REGION_SPAWNS,
+            Scene::G4Workload => &G4_WORKLOAD_SPAWNS,
+            Scene::SeparatedRegionsFar => &SEPARATED_REGION_FAR_SPAWNS,
+            Scene::G1FullEnvelope => &spall_sim::fixtures::G1_WORKLOAD_SPAWNS,
+            Scene::SleepWake => &WALK_ARENA_SPAWNS,
+            Scene::Playground => &spall_sim::fixtures::PLAYGROUND_SPAWNS,
+            Scene::PushTest => &WALK_ARENA_SPAWNS,
+            _ => &[],
+        }
+    }
+
+    #[cfg(test)]
     fn simulation(self) -> Simulation {
-        let setup = match self {
+        self.simulation_with_terrain_collider_mode(TerrainColliderMode::PerBrick)
+    }
+
+    #[cfg(test)]
+    fn simulation_with_terrain_collider_mode(self, mode: TerrainColliderMode) -> Simulation {
+        self.simulation_with_materials(mode, spall_sim::fixtures::stone_manifest(), None)
+    }
+
+    fn simulation_with_materials(
+        self,
+        mode: TerrainColliderMode,
+        materials: spall_core::MaterialManifest,
+        custom: Option<&CustomWorld>,
+    ) -> Simulation {
+        let mut setup = match self {
             Scene::BridgeCut => spall_sim::fixtures::bridged_terrain_setup(),
+            Scene::CrossBridgeCut => spall_sim::fixtures::cross_brick_bridged_setup(),
+            Scene::Walk => spall_sim::fixtures::walk_arena_setup(),
+            Scene::CheckerboardSplit => spall_sim::fixtures::checkerboard_split_setup(),
+            Scene::BulkSplit => spall_sim::fixtures::bulk_split_setup(),
+            Scene::SeparatedRegions => spall_sim::fixtures::separated_regions_setup(),
+            Scene::G4Workload => spall_sim::fixtures::g4_workload_setup(),
+            Scene::SeparatedRegionsFar => {
+                spall_sim::fixtures::separated_regions_full_envelope_setup()
+            }
+            Scene::G1FullEnvelope => spall_sim::fixtures::g1_full_envelope_setup(),
+            Scene::SleepWake => spall_sim::fixtures::sleep_wake_setup(),
+            Scene::Playground => spall_sim::fixtures::playground_setup(),
+            Scene::PushTest => spall_sim::fixtures::walk_arena_setup(),
+            // `serve` rejects a `Custom` scene without a world before this runs.
+            Scene::Custom => (custom.expect("Scene::Custom requires a CustomWorld").build)(),
         };
-        Simulation::new(SimulationConfig::new(setup)).expect("built-in scene is valid")
+        setup.materials = materials;
+        // No detached body in these scenes enables per-body CCD, and the serve
+        // loop rebuilds the terrain collider on every committed cut. Rapier's
+        // CCD broad-phase BVH can keep a stale proxy for the just-removed
+        // collider and panic with "No element at index" mid-sweep when a body
+        // is still settling (repro: `cargo xtask scenario --name
+        // g1-networked-destruction`). Skip the CCD pass — a no-op here.
+        setup.physics.disable_ccd = true;
+        let mut sim_config = SimulationConfig::new(setup);
+        sim_config.terrain_collider_mode = mode;
+        let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
+        if matches!(self, Scene::G4Workload) {
+            // Row 12: 256 active (64 near the west cluster's first spawn) +
+            // 4096 sleeping debris bodies, built once at scene-construction
+            // time (docs/reports/G3.md increment for this row).
+            spall_sim::fixtures::spawn_g4_workload_bodies(sim.world_mut(), G4_WORKLOAD_SPAWNS[0]);
+        }
+        if matches!(self, Scene::G1FullEnvelope) {
+            // The gate's "moving hollow test volume" — built once at
+            // scene-construction time, same as G4Workload's debris.
+            spall_sim::fixtures::spawn_g1_hollow_test_volume(sim.world_mut())
+                .expect("hollow test volume spawns");
+        }
+        if matches!(self, Scene::PushTest) {
+            spall_sim::spawn_push_test_box(sim.world_mut());
+        }
+        if matches!(self, Scene::Playground) {
+            // Not a gate scene: the interactive playground's debris pile,
+            // built once at scene-construction time for the same reason
+            // G4Workload's and G1FullEnvelope's populations are — a body
+            // `spawn_body` creates bypasses the commit pipeline, so it must
+            // exist before any client's baseline pull to ever be seen (see
+            // `spall_sim::playground`'s module doc).
+            spall_sim::populate_playground_debris(
+                sim.world_mut(),
+                &spall_sim::playground_drop_zones(),
+            );
+        }
+        sim
     }
 }
 
@@ -87,6 +440,9 @@ impl Scene {
 pub struct ServeConfig {
     pub listen: SocketAddr,
     pub scene: Scene,
+    /// Derived terrain collision mode. Per-brick is the adopted default;
+    /// whole-terrain is available for controlled legacy comparisons.
+    pub terrain_collider_mode: TerrainColliderMode,
     pub join_token: JoinToken,
     /// Hard cap on server ticks for this run.
     pub max_ticks: u64,
@@ -123,7 +479,125 @@ pub struct ServeConfig {
     /// T17: bounded late-join transfer restarts before the client is dropped
     /// with an explicit failure (connected clients keep running).
     pub max_join_retries: u32,
+    /// ENG-30 / T23 row 11, increment 30: number of long-lived worker threads
+    /// in the background baseline-capture pool (`LateJoin::on_baseline_ack`).
+    /// Bounds how many captures run *concurrently* -- a request past this is
+    /// queued, never rejected. Clamped to at least `1`. See
+    /// [`default_capture_workers`] for how the default is derived and
+    /// `docs/reports/G3.md` increment 30 for the measurement behind it.
+    pub capture_workers: usize,
+    /// **Development only.** Skip the server-side action-claim validation
+    /// (`resolve_intent`) and take each `ActionRequest`'s `claimed_target` /
+    /// `claimed_brush` verbatim. This is the "explicitly scoped authenticated
+    /// development scenario path" from ENG-47: it still requires the join token
+    /// and a live session, but it lets a fixture harness script arbitrary cuts
+    /// that no real aim ray would produce. Never enable it on a shared host —
+    /// with it on, any authenticated peer can edit any cell of any body.
+    pub dev_unvalidated_actions: bool,
+    /// Test-only. A fault plan armed on the world [`Writer`] *after* initial
+    /// recovery / first checkpoint, so an injected disk fault lands on a
+    /// periodic or clean-shutdown durable write. `None` in production.
+    pub save_faults: Option<spall_store::FaultPlan>,
+    /// ENG-61: a gate scenario that must show a detached body *come to rest*
+    /// keeps stepping physics past edit-quiescence until every detached body is
+    /// asleep (still bounded by [`Self::max_ticks`]). Off by default so ordinary
+    /// runs still stop as soon as the edit pipeline is idle.
+    pub await_body_settle: bool,
+    /// T20: per-client interest relevance + motion bandwidth policy. `None`
+    /// keeps the pre-T20 behaviour — one 20 Hz motion batch broadcast
+    /// unfiltered to every client. `Some(_)` filters each client's motion to
+    /// its interest set, tiers `Far` bodies onto a reduced cadence, and caps
+    /// each client's per-batch motion bytes.
+    pub motion_interest: Option<MotionInterest>,
+    /// T23 / G3 row 7, slice D: default-off resident-cache eviction. `None`
+    /// keeps every brick resident (byte-identical to every prior run). `Some(_)`
+    /// installs a durable in-memory backing, evicts terrain bricks outside a
+    /// per-player interest box each tick, and reloads them on demand for edits
+    /// (`crate::residency_pass`). The committed world is unchanged — see
+    /// `docs/reports/G3-residency-hash.md`.
+    pub residency: Option<crate::ResidencyLimits>,
+    /// T23 / G3 row 7, item 2: when residency is on, install a real
+    /// disk-backed `crate::disk_backing::DiskBrickBacking` at this path
+    /// instead of the in-process `MemoryBacking` default. `None` (the
+    /// default) keeps the prior in-memory behaviour byte-identical;
+    /// ignored when [`Self::residency`] is `None`.
+    pub residency_disk_path: Option<PathBuf>,
+    /// T21 / ENG-28 increment 4 (3c): default-off contact-to-terrain/body
+    /// damage pass. `None` keeps every prior run byte-identical (the pass is
+    /// never invoked, exactly like every scene before this increment).
+    /// `Some(_)` runs [`spall_sim::Simulation::apply_contact_damage`] every
+    /// tick with this config, so a hard enough impact carves a cut into
+    /// terrain or a struck body — a normal committed transaction that changes
+    /// the committed hash. Never enable on a fixture a hash-replaying gate
+    /// scenario depends on unless that scenario has accepted the resulting
+    /// hash (`docs/reports/ENG-28-increment-3-handoff.md` "3c").
+    pub contact_damage: Option<spall_sim::ContactDamageConfig>,
+    /// T21 / ENG-28 increment 4 (3c): default-off region-dormancy pass. `None`
+    /// keeps every body live in physics forever, byte-identical to every
+    /// prior run. `Some(_)` runs [`spall_sim::Simulation::apply_dormancy`]
+    /// every tick with this config: a settled body with no active region
+    /// nearby is deactivated (dropped from the physics step, record kept),
+    /// and a dormant body a player or edit approaches is reactivated.
+    /// Dormancy never changes authoritative geometry, ownership, damage, or
+    /// `world_hash`, but a deactivated body **leaves the live physics world**
+    /// — a gate scenario that reads physics state directly (e.g.
+    /// [`Self::await_body_settle`]'s `max_penetration_m`) must keep this off,
+    /// which is why it defaults to `None` for every existing gate fixture.
+    pub dormancy: Option<spall_sim::DormancyConfig>,
+    /// Optional bounded timing window for the owning server tick. Warmup ticks
+    /// are excluded; measured ticks include ingress through replication and
+    /// residency, ending immediately before pacing sleep.
+    pub timing_window: Option<TimingWindow>,
+    /// Optional credential registry path polled for atomic rotation/revocation
+    /// updates. Only used by player-credential authentication.
+    pub credential_registry_file: Option<PathBuf>,
+    /// The world and player spawns for [`Scene::Custom`]; ignored for every
+    /// other scene. `serve` fails fast if `scene` is `Custom` and this is `None`.
+    pub custom_world: Option<CustomWorld>,
 }
+
+/// A bounded, explicit server timing window. The server records at most
+/// `max_samples` observations while still reporting whether the requested
+/// measured tick window completed. A caller that wants acceptance evidence
+/// should set `max_samples >= measured_ticks`.
+#[derive(Debug, Clone, Copy)]
+pub struct TimingWindow {
+    pub warmup_ticks: u64,
+    pub measured_ticks: u64,
+    pub max_samples: usize,
+}
+
+/// T20 per-client interest + motion bandwidth policy for a [`serve`] run.
+///
+/// `docs/protocol.md` ("Network budget and overload behavior"): "Prioritize
+/// players, imminent contacts, nearby moving bodies … send distant/sleeping
+/// bodies less frequently with periodic keyframes."
+#[derive(Debug, Clone, Copy)]
+pub struct MotionInterest {
+    /// A body whose bounds are within this distance of a client's anchor is
+    /// replicated every 20 Hz batch.
+    pub near_radius_m: f64,
+    /// Out to this distance a body is replicated on the reduced `far_interval`
+    /// cadence; beyond it (plus hysteresis) a non-player body is not replicated
+    /// to that client at all.
+    pub far_radius_m: f64,
+    /// Send `Far`-tier snapshots only on every Nth 20 Hz batch (`1` or `0` =
+    /// every batch).
+    pub far_interval: u64,
+    /// Per-client, per-batch motion byte ceiling, accounted at
+    /// [`crate::MOTION_SNAPSHOT_WIRE_BYTES`] per snapshot (`0` = no ceiling). When it
+    /// bites, the lowest-priority motion (far, then sleeping) is deferred to the
+    /// next batch — committed topology is never affected.
+    pub per_client_budget_bytes: usize,
+    /// Interest anchor for a client on a scene with no player capsule (the
+    /// bridge scenes). `None` there leaves that client unfiltered
+    /// ([`InterestSet::Global`]).
+    pub static_anchor_m: Option<[f64; 3]>,
+}
+
+/// A player capsule's bounding radius for interest tests, metres. Small and
+/// fixed — a player is prioritised and never `Excluded` regardless.
+const PLAYER_INTEREST_RADIUS_M: f64 = 1.0;
 
 impl ServeConfig {
     /// A headless bounded config for `scene` on `listen` with `token`.
@@ -131,6 +605,7 @@ impl ServeConfig {
         Self {
             listen,
             scene,
+            terrain_collider_mode: TerrainColliderMode::PerBrick,
             join_token: token,
             max_ticks: 1_200,
             quiescence_ticks: 45,
@@ -148,6 +623,18 @@ impl ServeConfig {
             seed: 0,
             catch_up_cap: DEFAULT_CATCH_UP_CAP,
             max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
+            capture_workers: default_capture_workers(),
+            dev_unvalidated_actions: false,
+            save_faults: None,
+            await_body_settle: false,
+            motion_interest: None,
+            residency: None,
+            residency_disk_path: None,
+            contact_damage: None,
+            dormancy: None,
+            timing_window: None,
+            credential_registry_file: None,
+            custom_world: None,
         }
     }
 }
@@ -166,6 +653,27 @@ pub struct ServeSummary {
     pub final_world_hash: String,
     pub total_solid_cells: u64,
     pub body_count: usize,
+    /// Largest number of distinct bricks any single detached (non-terrain) body
+    /// occupied at end of run. `>= 2` means a body's cells were owned across a
+    /// brick boundary — the cross-brick ownership-transfer signal for T11.
+    pub max_detached_body_brick_span: u64,
+    /// ENG-61: largest linear speed (m/s) of any detached body at end of run.
+    /// `0.0` when there is no detached body.
+    pub detached_body_max_final_speed_m_s: f64,
+    /// ENG-61: every detached body was asleep — at rest — at end of run. `true`
+    /// when there is no detached body.
+    pub detached_bodies_all_asleep: bool,
+    /// ENG-61: consecutive final ticks over which no detached body's origin
+    /// moved more than 1 mm on any axis — "vertical position stable for N ticks".
+    pub detached_body_stable_ticks: u64,
+    /// ENG-61: deepest contact penetration (m) anywhere in the physics world at
+    /// end of run. A body that came to rest *clipped through* the remaining
+    /// floor rather than on top of it shows up here.
+    pub max_contact_penetration_m: f64,
+    /// ENG-61: lowest detached-body origin Y (m) at end of run. A body that
+    /// free-fell instead of settling leaves this far below the floor. `0.0` when
+    /// there is no detached body.
+    pub detached_body_min_origin_y_m: f64,
     /// Engine checkpoints published this run (T16). `0` when `--save` is unset.
     pub checkpoints_published: u64,
     /// Topology journal records written this run.
@@ -185,6 +693,176 @@ pub struct ServeSummary {
     pub expired_actions_rejected: u64,
     /// T17: total baseline bulk payload bytes pushed this run.
     pub baseline_bytes_sent: u64,
+    /// ENG-48: `ActionRequest`s bounced with a throttled rejection because their
+    /// session exceeded [`MAX_ACTIONS_PER_CLIENT_PER_TICK`] this tick.
+    pub inbound_actions_throttled: u64,
+    /// ENG-48: `RepairRequest`s dropped because their session exceeded
+    /// [`MAX_REPAIRS_PER_CLIENT_PER_TICK`] this tick.
+    pub inbound_repairs_throttled: u64,
+    /// T20: motion snapshots actually sent this run, summed over every client
+    /// and batch. With `motion_interest` unset this is `batches * bodies *
+    /// clients`; with it set, interest-culled and cadence-deferred snapshots are
+    /// not counted here.
+    pub motion_snapshots_sent: u64,
+    /// T20: motion snapshots withheld because the body was outside a client's
+    /// interest set (`Relevance::Excluded`). `0` when `motion_interest` is unset.
+    pub motion_snapshots_interest_culled: u64,
+    /// T20: motion snapshots deferred to a later batch by the `Far` cadence or
+    /// the per-client byte ceiling — motion is superseded, so this is a
+    /// bandwidth measure, not lost geometry. `0` when `motion_interest` is unset.
+    pub motion_snapshots_budget_deferred: u64,
+    /// T20: largest single-batch motion payload sent to one client, accounted
+    /// bytes ([`crate::MOTION_SNAPSHOT_WIRE_BYTES`] each).
+    pub max_client_motion_batch_bytes: u64,
+    /// T20: total **application** bytes this host sent across every client
+    /// connection (control records + datagrams + bulk parts, excluding QUIC
+    /// framing) — `spall_net`'s own `app_bytes_sent` counter.
+    pub app_egress_bytes: u64,
+    /// T20: total **transport** bytes this host sent across every client
+    /// connection — Quinn's `udp_tx.bytes`, i.e. actual UDP payload on the wire
+    /// including QUIC framing and retransmission.
+    pub transport_egress_bytes: u64,
+    /// T11a / ENG-62: inbound `ActionRequest`s received this run, retries
+    /// included ("requested" in the gate's requested / rejected / queued /
+    /// committed breakdown). "rejected" is [`Self::actions_rejected`];
+    /// "committed" is [`Self::transactions_committed`].
+    pub actions_requested: u64,
+    /// T11a / ENG-62: `ActionRequest`s the simulation accepted for staging.
+    pub actions_staged: u64,
+    /// T11a / ENG-62: staged requests that had not committed when the run ended
+    /// ("queued" in the gate breakdown).
+    pub actions_queued_unresolved: u64,
+    /// T11a / ENG-62: server commit latency — admission to commit — as a
+    /// nearest-rank p95 (ms) per commit shape, with the sample count behind each
+    /// figure. Gate targets (`docs/validation.md` "G1"): single-brick commit
+    /// p95 `<= 100 ms`, ordinary structure split `<= 500 ms`, designated
+    /// large-collapse `<= 2000 ms`. A bucket with `0` samples was not exercised.
+    pub single_brick_commit_p95_ms: f64,
+    pub single_brick_commit_samples: u64,
+    pub structure_split_p95_ms: f64,
+    pub structure_split_samples: u64,
+    pub large_collapse_p95_ms: f64,
+    pub large_collapse_samples: u64,
+    /// T23 / G3 row 7, slice D: residency pass activity. All `0` when
+    /// `ServeConfig.residency` is `None` (the default).
+    pub residency_evictions_total: u64,
+    pub residency_reloads_total: u64,
+    /// Fewest / most / final resident terrain bricks the pass observed.
+    pub resident_terrain_bricks_min: u64,
+    pub resident_terrain_bricks_max: u64,
+    pub resident_terrain_bricks_final: u64,
+    /// Ticks the resident-brick count exceeded `budget_bricks` (a player's
+    /// interest set is larger than the declared budget).
+    pub residency_budget_miss_ticks: u64,
+    /// T23 / G3 row 7 item 3: fewest / most / final total resident
+    /// dense-material bytes across the whole world (terrain + every body
+    /// volume), sampled every tick the residency pass runs
+    /// ([`spall_server::residency_pass::total_resident_dense_bytes`]). All `0`
+    /// when `ServeConfig.residency` is `None`, matching every other residency
+    /// counter's convention.
+    pub resident_dense_bytes_min: u64,
+    pub resident_dense_bytes_max: u64,
+    pub resident_dense_bytes_final: u64,
+    /// T23 / G3 row 7 item 3: the residency backing's on-disk footprint in
+    /// bytes -- the durable-side counterpart to `resident_dense_bytes_*`.
+    /// `Some(_)` only when `ServeConfig.residency_disk_path` installed a real
+    /// disk-backed store; `None` for the in-process `MemoryBacking` default
+    /// and when residency is off.
+    pub residency_backing_disk_bytes: Option<u64>,
+    /// T23 / G3 row 14: **per-connection** application/transport egress — the
+    /// aggregate `app_egress_bytes` / `transport_egress_bytes` above prove
+    /// total bandwidth is bounded, but not that `motion_interest` actually
+    /// separates load *between* clients. One row per connection that was ever
+    /// accepted this run (order not meaningful; sorted by slot).
+    pub per_client_egress: Vec<PerClientEgress>,
+    /// T21 / ENG-28 increment 4: contact-damage cuts admitted into the edit
+    /// pipeline this run. `0` when `ServeConfig.contact_damage` is `None`.
+    pub contact_damage_cuts_submitted: u64,
+    /// T21 / ENG-28 increment 4: contact-damage cuts the pipeline refused
+    /// (queue full — bounded backpressure, not an error). `0` when
+    /// `ServeConfig.contact_damage` is `None`.
+    pub contact_damage_cuts_rejected: u64,
+    /// T21 / ENG-28 increment 4: bodies the dormancy pass deactivated this
+    /// run. `0` when `ServeConfig.dormancy` is `None`.
+    pub dormancy_deactivations_total: u64,
+    /// T21 / ENG-28 increment 4: bodies the dormancy pass reactivated this
+    /// run (proximity or a hard-wake edit). `0` when `ServeConfig.dormancy` is
+    /// `None`.
+    pub dormancy_reactivations_total: u64,
+    /// ENG-30 row 7 increment 13: largest pin-set size the residency pass
+    /// observed in one tick (pending-edit dependencies, swept-collision
+    /// footprints, and pipeline reload grace, unioned). `0` when residency is
+    /// off.
+    pub residency_pinned_bricks_max: u64,
+    /// ENG-30 row 7 increment 13: interest-driven (non-required) reloads
+    /// skipped because admitting them would have exceeded `budget_bricks` or
+    /// the new dense-byte cap — the "loads happen before an `over_budget`
+    /// count" gap the coordinator review named is now a real, counted
+    /// deferral. `0` when residency is off.
+    pub residency_admission_deferred_total: u64,
+    /// ENG-30 row 7 increment 13: ticks where the *required* (interest ∪
+    /// pinned) set alone exceeded `budget_bricks` — genuine capacity
+    /// pressure the pass could not resolve by evicting only optional
+    /// geometry. `0` when residency is off.
+    pub residency_required_over_budget_ticks: u64,
+    /// ENG-30 row 7 increment 13: approximate bytes of retained evicted-brick
+    /// digest metadata at end of run — the frozen contract's "digest-metadata
+    /// bytes" retained-memory line item, distinct from resident dense payload
+    /// and disk footprint. `0` when residency is off.
+    pub residency_digest_bytes_final: u64,
+    /// ENG-30 row 7 increment 13: the durable backing's own retained
+    /// in-process bytes at end of run (`spall_sim::BrickBackingWriter::resident_bytes`)
+    /// — `None` when residency is off or the installed backing keeps no
+    /// resident cache (a pure disk store).
+    pub residency_backing_resident_bytes: Option<u64>,
+    /// ENG-30 row 7 increment 13: this process's peak resident/working-set
+    /// memory in bytes since start, independent of residency being on —
+    /// `docs/reports/G3-residency-hash.md`'s "process peak memory" retained-
+    /// memory line item. `None` on a platform `spall_server::mem_stats` does
+    /// not support.
+    pub process_peak_memory_bytes: Option<u64>,
+    /// ENG-30 row 7 increment 15: cumulative, across every periodic +
+    /// shutdown checkpoint this run, of terrain bricks
+    /// `ResidencyPass::capture_checkpoint` actually re-snapshotted / reloaded
+    /// / re-encoded (its revision differed from the last checkpoint that
+    /// captured it). `0` when residency is off (that path always uses
+    /// `persist::capture`'s unconditional full walk).
+    pub residency_checkpoint_bricks_captured_total: u64,
+    /// ENG-30 row 7 increment 15: cumulative count of terrain bricks each of
+    /// those `capture_checkpoint` calls' complete logical (resident ∪
+    /// evicted) set contained. `captured_total < logical_total` is the
+    /// direct evidence that checkpoint capture is incremental rather than a
+    /// full walk with a cache wrapped around it. `0` when residency is off.
+    pub residency_checkpoint_bricks_logical_total: u64,
+    /// T23 / G4: owning server tick busy-time percentiles, excluding the
+    /// configured warmup window and pacing sleep. Zero samples means no timing
+    /// window was configured or the run ended before it completed.
+    pub tick_busy_p95_ms: f64,
+    pub tick_busy_p99_ms: f64,
+    pub tick_busy_max_ms: f64,
+    pub tick_busy_samples: u64,
+    pub tick_busy_window_complete: bool,
+    /// T23 / G4: physics-step duration percentiles. This measures
+    /// `world.step_physics` and body-pose extraction; player sweep/advance is
+    /// reported in the owning tick busy time, not this physics field.
+    pub physics_p95_ms: f64,
+    pub physics_p99_ms: f64,
+    pub physics_max_ms: f64,
+    pub physics_samples: u64,
+    pub physics_window_complete: bool,
+}
+
+/// One connection's total egress this run, alongside where its interest
+/// anchor (player spawn) was, so a reviewer can read bandwidth separation
+/// directly off the numbers without any client-side cooperation.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PerClientEgress {
+    pub slot: u32,
+    /// `None` on a scene with no player spawns (a `motion_static_anchor`
+    /// scenario) or if the connection closed before `Joined` was processed.
+    pub spawn_m: Option<[f64; 3]>,
+    pub app_bytes: u64,
+    pub transport_bytes: u64,
 }
 
 /// Anything that stops a [`serve`] run.
@@ -200,22 +878,344 @@ pub enum ServeError {
     Io(#[from] std::io::Error),
     #[error("tokio runtime: {0}")]
     Runtime(String),
+    #[error("invalid server configuration: {0}")]
+    Configuration(String),
 }
 
 /// Runs the networked host to completion and returns its summary. Builds its own
 /// current-thread-free multi-thread Tokio runtime.
 pub fn serve(config: ServeConfig) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content(
+        config,
+        ToolCatalog::default(),
+        spall_sim::fixtures::stone_manifest(),
+    )
+}
+
+/// Runs the networked host with a game-owned, versioned action catalog.
+/// Engine callers can continue using [`serve`] for the legacy built-in rules.
+pub fn serve_with_catalog(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content(config, tool_catalog, spall_sim::fixtures::stone_manifest())
+}
+
+/// Runs the networked host with game-owned authoritative tools and material
+/// definitions. The manifest is used for world creation, save recovery, and
+/// handshake compatibility checks.
+pub fn serve_with_game_content(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        None,
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// A callback for game-owned entities that belong in a newly-created world.
+/// It runs on the authoritative simulation thread before the initial
+/// checkpoint is published; it is not run when an existing save is restored.
+pub type InitialGameWorldSetup =
+    Box<dyn FnOnce(&mut Simulation) -> Result<(), String> + Send + 'static>;
+
+/// Game-owned observer invoked on the authoritative thread only after a
+/// client edit commits. Material counts describe cells actually removed by
+/// that committed cut, sampled from the validated pre-edit snapshot.
+pub type CommittedEditHandler = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            RequestId,
+            &std::collections::BTreeMap<spall_core::MaterialId, u64>,
+        ) + Send
+        + 'static,
+>;
+/// Converts a committed harvest to opaque, versioned game bytes. The stable
+/// identity and journal cursor are supplied by the server for durable replay.
+pub type CommittedEditOutboxEncoder = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            RequestId,
+            spall_core::JournalSeq,
+            &std::collections::BTreeMap<spall_core::MaterialId, u64>,
+        ) -> Option<spall_store::OutboxRecord>
+        + Send
+        + 'static,
+>;
+/// Applies one durable game event idempotently to the game's progression store.
+pub type OutboxProcessor =
+    Box<dyn FnMut(&spall_store::OutboxRecord) -> Result<(), String> + Send + 'static>;
+pub type ProgressionHandler = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            spall_protocol::ProgressionRequest,
+        ) -> spall_protocol::ProgressionResponse
+        + Send
+        + 'static,
+>;
+
+/// Runs the host with game content and an optional initial-world setup hook.
+/// The hook runs only when creating a new world, before its initial durable
+/// checkpoint, so restored saves never receive duplicate starter entities.
+pub fn serve_with_game_content_and_setup(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    setup: impl FnOnce(&mut Simulation) -> Result<(), String> + Send + 'static,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        Some(Box::new(setup)),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Runs the host with game content, optional new-world setup, and material
+/// profiles for the opt-in authoritative contact-damage pass.
+pub fn serve_with_game_content_and_policies(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Same as `serve_with_game_content_and_policies`, with a game asset manifest
+/// included in the exact client/server handshake content hash.
+pub fn serve_with_game_content_and_asset_manifest(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: spall_protocol::Hash32,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        Some(asset_manifest_hash),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Game-owned callback for post-commit material rewards, with the optional
+/// asset manifest included in handshake compatibility.
+pub fn serve_with_game_content_and_commit_handler(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Host with both post-commit harvest and authenticated progression handlers.
+pub fn serve_with_game_content_and_handlers(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        None,
+        None,
+        None,
+    )
+}
+
+/// Same as [`serve_with_game_content_and_handlers`], but authenticates clients
+/// using server-provisioned credentials, each bound to a stable `PlayerId`.
+/// The shared development join token in `ServeConfig` is ignored on this path.
+pub fn serve_with_game_content_and_player_credentials(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+    credentials: Vec<spall_net::PlayerCredential>,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        Some(credentials),
+        None,
+        None,
+    )
+}
+
+/// Credential-authenticated host whose harvest events are transactionally
+/// coupled to the world journal and replayed through the game's idempotent
+/// outbox processor after restart.
+pub fn serve_with_game_content_and_player_credentials_and_outbox(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+    credentials: Vec<spall_net::PlayerCredential>,
+    encoder: CommittedEditOutboxEncoder,
+    processor: OutboxProcessor,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        Some(credentials),
+        Some(encoder),
+        Some(processor),
+    )
+}
+
+fn serve_with_game_content_and_optional_setup(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    game_setup: Option<InitialGameWorldSetup>,
+    damage_profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: Option<CommittedEditHandler>,
+    progression_handler: Option<ProgressionHandler>,
+    player_credentials: Option<Vec<spall_net::PlayerCredential>>,
+    outbox_encoder: Option<CommittedEditOutboxEncoder>,
+    outbox_processor: Option<OutboxProcessor>,
+) -> Result<ServeSummary, ServeError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| ServeError::Runtime(e.to_string()))?;
-    runtime.block_on(serve_async(config))
+    runtime.block_on(serve_async(
+        config,
+        tool_catalog,
+        materials,
+        game_setup,
+        damage_profiles,
+        asset_manifest_hash,
+        commit_handler,
+        progression_handler,
+        player_credentials,
+        outbox_encoder,
+        outbox_processor,
+    ))
 }
 
-fn server_handshake() -> Handshake {
+fn server_handshake(
+    materials: &spall_core::MaterialManifest,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+) -> Handshake {
     Handshake {
         protocol_version: PROTOCOL_VERSION,
-        content_manifest_hash: Hash32::of(T10_CONTENT_TAG),
+        content_manifest_hash: asset_manifest_hash.map_or_else(
+            || spall_protocol::content_manifest_hash(materials),
+            |asset_hash| spall_protocol::content_manifest_hash_with_assets(materials, asset_hash),
+        ),
         world_id: spall_core::WorldId::from_u128(T10_WORLD_ID),
         generator_version: 1,
         algorithms: AlgorithmVersions {
@@ -234,15 +1234,118 @@ fn server_handshake() -> Handshake {
 /// One reliable/repair message from a client to the sim bridge.
 #[derive(Debug)]
 enum Inbound {
-    /// A connection was accepted; the sim loop learns its session (and, from the
-    /// generation, whether it supersedes an earlier one on the same slot).
-    Joined(SessionId),
+    /// A connection was accepted; the sim loop learns its session and any
+    /// server-authenticated stable player principal.
+    Joined(SessionId, Option<spall_protocol::PlayerId>),
     Action(SessionId, ActionRequest),
+    Progression(SessionId, spall_protocol::ProgressionRequest),
     Repair(SessionId, RepairRequest),
+    /// T19: a player movement input frame (datagram). At most one is applied per
+    /// player per tick; redundant `recent` copies recover a dropped frame.
+    Input(SessionId, InputFrame),
     /// A `BaselineAck`: the sentinel (`transfer_id == 0`) asks for a late-join
     /// baseline; a real id confirms one is installed.
     Baseline(SessionId, BaselineAck),
     Gone(SessionId),
+}
+
+struct ProgressionWork {
+    session: SessionId,
+    player_id: Option<spall_protocol::PlayerId>,
+    request: spall_protocol::ProgressionRequest,
+}
+
+struct ProgressionDone {
+    session: SessionId,
+    response: spall_protocol::ProgressionResponse,
+}
+
+struct ProgressionWorker {
+    submit: std::sync::mpsc::SyncSender<ProgressionWork>,
+    completed: std::sync::mpsc::Receiver<ProgressionDone>,
+}
+
+struct CommittedEditWork {
+    session: SessionId,
+    player_id: Option<spall_protocol::PlayerId>,
+    request_id: RequestId,
+    removed: std::collections::BTreeMap<spall_core::MaterialId, u64>,
+}
+struct CommittedEditWorker {
+    submit: std::sync::mpsc::SyncSender<CommittedEditWork>,
+}
+
+impl CommittedEditWorker {
+    fn spawn(mut handler: CommittedEditHandler) -> Self {
+        let (submit, work) = std::sync::mpsc::sync_channel::<CommittedEditWork>(64);
+        std::thread::Builder::new()
+            .name("spall-committed-game-events".into())
+            .spawn(move || {
+                while let Ok(work) = work.recv() {
+                    handler(work.session, work.player_id, work.request_id, &work.removed);
+                }
+            })
+            .expect("committed-edit worker thread must start");
+        Self { submit }
+    }
+}
+
+struct OutboxWork(spall_store::OutboxRecord);
+struct OutboxDone {
+    event_id: [u8; 32],
+    result: Result<(), String>,
+}
+struct OutboxWorker {
+    submit: std::sync::mpsc::SyncSender<OutboxWork>,
+    completed: std::sync::mpsc::Receiver<OutboxDone>,
+}
+
+impl OutboxWorker {
+    fn spawn(mut processor: OutboxProcessor) -> Self {
+        let (submit, work) = std::sync::mpsc::sync_channel::<OutboxWork>(1);
+        let (done_tx, completed) = std::sync::mpsc::sync_channel::<OutboxDone>(1);
+        std::thread::Builder::new()
+            .name("spall-game-outbox".into())
+            .spawn(move || {
+                while let Ok(OutboxWork(event)) = work.recv() {
+                    let done = OutboxDone {
+                        event_id: event.event_id,
+                        result: processor(&event),
+                    };
+                    if done_tx.send(done).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("outbox worker thread must start");
+        Self { submit, completed }
+    }
+}
+
+impl ProgressionWorker {
+    fn spawn(mut handler: ProgressionHandler) -> Self {
+        const CAPACITY: usize = 64;
+        let (submit, work) = std::sync::mpsc::sync_channel::<ProgressionWork>(CAPACITY);
+        let (done_tx, completed) = std::sync::mpsc::sync_channel::<ProgressionDone>(CAPACITY);
+        std::thread::Builder::new()
+            .name("spall-progression-requests".into())
+            .spawn(move || {
+                while let Ok(work) = work.recv() {
+                    let response = handler(work.session, work.player_id, work.request);
+                    if done_tx
+                        .send(ProgressionDone {
+                            session: work.session,
+                            response,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("progression worker thread must start");
+        Self { submit, completed }
+    }
 }
 
 /// One message from the sim bridge to a client's writer task. Repair replies and
@@ -252,18 +1355,257 @@ enum Inbound {
 enum Outbound {
     Transaction(Arc<TopologyTransaction>),
     Status(Arc<ActionStatus>),
+    Progression(Arc<spall_protocol::ProgressionResponse>),
     Motion(Arc<Vec<MotionSnapshot>>),
     /// A baseline transfer: `BaselineBegin` on control, parts on a bulk stream,
     /// `BaselineEnd` on control. Carries the whole world for a first late join,
     /// or one brick for a hash repair — the client decides replace vs. merge
     /// from whether it has installed a baseline yet.
     Baseline(Arc<BaselineTransfer>),
-    Shutdown,
+    /// Ends the connection with the given `Bye` reason (T23 / G3 row 10: a
+    /// catch-up-exhaustion give-up carries a reason distinct from an ordinary
+    /// end of session, so the client can tell the two apart on the wire).
+    Shutdown(&'static str),
 }
 
-type ClientMap = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Outbound>>>>;
+/// Admission control for live connections. The cap counts connections that are
+/// live *now*: a slot is released when the connection's task ends, however it
+/// ends. (It used to count every connection ever accepted, so a server that had
+/// admitted `max_clients` sessions over its life refused every later join
+/// forever, however many had since left.)
+struct AdmissionGate {
+    max: usize,
+    live: std::sync::atomic::AtomicUsize,
+    refused: std::sync::atomic::AtomicU64,
+}
 
-async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
+/// One admitted connection's slot; dropping it frees the slot.
+struct AdmissionSlot(Arc<AdmissionGate>);
+
+impl AdmissionGate {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max,
+            live: std::sync::atomic::AtomicUsize::new(0),
+            refused: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// `Some(slot)` if fewer than `max` connections are live; otherwise counts a
+    /// refusal and returns `None`.
+    fn try_admit(self: &Arc<Self>) -> Option<AdmissionSlot> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.live.load(Relaxed) >= self.max {
+            self.refused.fetch_add(1, Relaxed);
+            return None;
+        }
+        self.live.fetch_add(1, Relaxed);
+        Some(AdmissionSlot(Arc::clone(self)))
+    }
+}
+
+impl Drop for AdmissionSlot {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
+
+/// A bounded per-client outbound queue (ENG-48).
+///
+/// * Reliable traffic — committed [`TopologyTransaction`]s, [`ActionStatus`],
+///   baseline transfers, the shutdown marker — is FIFO and counted against
+///   [`MAX_RELIABLE_BACKLOG`] / [`MAX_RELIABLE_BACKLOG_BYTES`]. A stalled
+///   reliable reader that blows either bound is disconnected (and re-baselines
+///   on reconnect); the backlog already accepted is still flushed, so committed
+///   topology is never silently discarded to stay under budget.
+/// * Motion is lossy: only the newest unsent batch is retained, so a slow
+///   reader accumulates no stale motion (`docs/protocol.md`: "Drop superseded
+///   unsent motion snapshots").
+#[derive(Default)]
+struct OutboundQueue {
+    reliable: VecDeque<Outbound>,
+    reliable_bytes: usize,
+    motion: Option<Arc<Vec<MotionSnapshot>>>,
+    /// Set once a reliable push blew the bound. The writer flushes what is
+    /// already queued, says goodbye, and exits.
+    overflowed: bool,
+}
+
+/// The reliable backlog blew [`MAX_RELIABLE_BACKLOG`] /
+/// [`MAX_RELIABLE_BACKLOG_BYTES`]; the caller must drop this client from the
+/// fan-out set.
+#[derive(Debug)]
+struct OutboundOverflow;
+
+impl OutboundQueue {
+    fn push(&mut self, msg: Outbound) -> Result<(), OutboundOverflow> {
+        match msg {
+            // Lossy: keep only the newest unsent batch.
+            Outbound::Motion(snaps) => {
+                self.motion = Some(snaps);
+                Ok(())
+            }
+            // The shutdown marker always goes through — it ends the stream.
+            Outbound::Shutdown(reason) => {
+                self.reliable.push_back(Outbound::Shutdown(reason));
+                Ok(())
+            }
+            reliable => {
+                if self.overflowed {
+                    return Err(OutboundOverflow);
+                }
+                let add = reliable_msg_bytes(&reliable);
+                if self.reliable.len() >= MAX_RELIABLE_BACKLOG
+                    || self.reliable_bytes.saturating_add(add) > MAX_RELIABLE_BACKLOG_BYTES
+                {
+                    // Do not enqueue and do not discard the accepted backlog:
+                    // the writer still flushes it, then the connection closes
+                    // and the client re-baselines.
+                    self.overflowed = true;
+                    return Err(OutboundOverflow);
+                }
+                self.reliable_bytes += add;
+                self.reliable.push_back(reliable);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Rough serialized size of one reliable outbound message, for the byte cap.
+fn reliable_msg_bytes(msg: &Outbound) -> usize {
+    match msg {
+        Outbound::Transaction(tx) => {
+            let blob_bytes: usize = tx
+                .ops
+                .iter()
+                .map(|op| match op {
+                    spall_protocol::TopologyOp::SplitOffBaseline { blob, .. }
+                    | spall_protocol::TopologyOp::SourcePatchBaseline { blob, .. } => blob.len(),
+                    _ => 0,
+                })
+                .sum();
+            128 + tx.ops.len() * 48
+                + blob_bytes
+                + tx.before.len() * 24
+                + tx.after.len() * 24
+                + tx.dependencies.len() * 16
+                + tx.result_hashes.len() * 40
+        }
+        Outbound::Status(_) => 96,
+        Outbound::Progression(reply) => 64 + reply.inventory.len() * 8,
+        Outbound::Baseline(t) => 64 + t.payload_bytes(),
+        Outbound::Motion(_) | Outbound::Shutdown(_) => 0,
+    }
+}
+
+/// What one [`OutboundHandle::take`] pass handed the writer.
+struct OutboundBatch {
+    reliable: Vec<Outbound>,
+    motion: Option<Arc<Vec<MotionSnapshot>>>,
+    overflowed: bool,
+}
+
+impl OutboundBatch {
+    fn is_empty(&self) -> bool {
+        self.reliable.is_empty() && self.motion.is_none()
+    }
+}
+
+/// A cloneable handle: the sim bridge enqueues through it, the client's writer
+/// task drains it.
+#[derive(Clone)]
+struct OutboundHandle {
+    inner: Arc<OutboundShared>,
+}
+
+struct OutboundShared {
+    queue: Mutex<OutboundQueue>,
+    wake: Notify,
+}
+
+impl OutboundHandle {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(OutboundShared {
+                queue: Mutex::new(OutboundQueue::default()),
+                wake: Notify::new(),
+            }),
+        }
+    }
+
+    /// Enqueues one message and wakes the writer. `Err(OutboundOverflow)` means
+    /// the reliable backlog blew its bound and the caller must drop this client
+    /// from the fan-out set (its writer is now draining-then-closing).
+    fn push(&self, msg: Outbound) -> Result<(), OutboundOverflow> {
+        let res = {
+            let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.push(msg)
+        };
+        self.inner.wake.notify_one();
+        res
+    }
+
+    /// Takes everything queued in one pass.
+    fn take(&self) -> OutboundBatch {
+        let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        // The writer now owns everything queued: reset the byte count with the
+        // queue, or the cap would count every reliable byte ever sent on this
+        // connection rather than what is waiting.
+        q.reliable_bytes = 0;
+        OutboundBatch {
+            reliable: q.reliable.drain(..).collect(),
+            motion: q.motion.take(),
+            overflowed: q.overflowed,
+        }
+    }
+
+    /// Current queued reliable bytes (test-only introspection of the byte cap).
+    #[cfg(test)]
+    fn reliable_bytes(&self) -> usize {
+        self.inner
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reliable_bytes
+    }
+
+    async fn woken(&self) {
+        self.inner.wake.notified().await;
+    }
+}
+
+async fn serve_async(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    game_setup: Option<InitialGameWorldSetup>,
+    damage_profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: Option<CommittedEditHandler>,
+    progression_handler: Option<ProgressionHandler>,
+    player_credentials: Option<Vec<spall_net::PlayerCredential>>,
+    mut outbox_encoder: Option<CommittedEditOutboxEncoder>,
+    outbox_processor: Option<OutboxProcessor>,
+) -> Result<ServeSummary, ServeError> {
+    if matches!(config.scene, Scene::Custom)
+        && config
+            .custom_world
+            .as_ref()
+            .is_none_or(|world| world.player_spawns().is_empty())
+    {
+        return Err(ServeError::Configuration(
+            "Scene::Custom requires ServeConfig::custom_world with at least one player spawn"
+                .into(),
+        ));
+    }
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -284,16 +1626,32 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         std::fs::rename(&tmp, path)?;
     }
 
-    let server = Arc::new(
+    let handshake = server_handshake(&materials, asset_manifest_hash);
+    let credential_registry_file = config.credential_registry_file.clone();
+    if credential_registry_file.is_some() && player_credentials.is_none() {
+        return Err(ServeError::Configuration(
+            "credential registry reload requires player-credential authentication".into(),
+        ));
+    }
+    let server = Arc::new(if let Some(credentials) = player_credentials {
+        NetServer::bind_with_player_credentials(
+            config.listen,
+            &identity,
+            credentials,
+            handshake,
+            config.transport,
+        )
+        .await?
+    } else {
         NetServer::bind(
             config.listen,
             &identity,
             config.join_token,
-            server_handshake(),
+            handshake,
             config.transport,
         )
-        .await?,
-    );
+        .await?
+    });
     let bound = server.local_addr()?;
     if let Some(path) = &config.addr_out {
         if let Some(parent) = path.parent() {
@@ -310,19 +1668,110 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         ProcessRole::Server,
         Some(format!("bound={bound}")),
     ))?;
+    tracing::info!(
+        action_catalog_version = tool_catalog.version(),
+        "loaded authoritative action catalog"
+    );
 
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Inbound>();
+    // T20 egress accounting: live connection handles (for a final stats read at
+    // teardown) plus the summed `(app_bytes, transport_bytes)` of connections
+    // that already closed. A closing `serve_conn` removes itself from `conns`
+    // and folds its final counts into `egress_closed` under the `conns` lock, so
+    // teardown counts every connection exactly once.
+    let conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>> = Arc::new(Mutex::new(HashMap::new()));
+    // T20 / T23 G3 row 14: per-session (not just summed) egress, keyed by
+    // `session.raw()` — same close-once-counted discipline as the aggregate
+    // version above.
+    let egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
+
+    // Reload credentials atomically from the operator-managed registry. A
+    // malformed or unreadable update fails closed by revoking the whole live
+    // registry; no token bytes or file contents enter logs.
+    if let Some(path) = credential_registry_file {
+        let server_for_reload = server.clone();
+        let conns_for_reload = conns.clone();
+        let mut stop_for_reload = stop_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut previous_content: Option<Vec<u8>> = None;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = stop_for_reload.changed() => {
+                        if changed.is_err() || *stop_for_reload.borrow() { break; }
+                    }
+                }
+                let reload_path = path.clone();
+                let loaded =
+                    tokio::task::spawn_blocking(move || match std::fs::read(&reload_path) {
+                        Ok(bytes) => match parse_player_credentials(&bytes) {
+                            Ok(credentials) => (bytes, credentials, None),
+                            Err(error) => (bytes, Vec::new(), Some(error)),
+                        },
+                        Err(error) => (
+                            b"<unreadable>".to_vec(),
+                            Vec::new(),
+                            Some(format!("credential registry could not be read: {error}")),
+                        ),
+                    })
+                    .await;
+                let (content, credentials, invalid) = match loaded {
+                    Ok(value) => value,
+                    Err(_) => {
+                        tracing::error!(
+                            "credential registry reload worker failed; credentials unchanged"
+                        );
+                        continue;
+                    }
+                };
+                if previous_content.as_ref() == Some(&content) {
+                    continue;
+                }
+                let accepted_count = credentials.len();
+                let replacement = if invalid.is_some() {
+                    Vec::new()
+                } else {
+                    credentials
+                };
+                if let Err(error) = server_for_reload.replace_player_credentials(replacement) {
+                    tracing::error!(error = %error, "credential registry rejected; revoking all credentials");
+                    let _ = server_for_reload.replace_player_credentials(Vec::new());
+                }
+                previous_content = Some(content);
+                // Authentication state is deliberately not introspectable by
+                // token. Close live sessions on any rotation so a credential
+                // removed from the file loses its existing session at once.
+                let live = conns_for_reload
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                for connection in live.values() {
+                    connection.close("player credentials changed");
+                }
+                if let Some(reason) = invalid {
+                    tracing::error!(reason = %reason, "credential registry invalid; all player credentials revoked");
+                } else {
+                    tracing::info!(
+                        credential_count = accepted_count,
+                        "player credential registry reloaded; active sessions closed"
+                    );
+                }
+            }
+        });
+    }
 
     // Accept loop.
     let accept = {
         let server = server.clone();
         let clients = clients.clone();
+        let conns = conns.clone();
+        let egress_closed = egress_closed.clone();
         let inbound_tx = inbound_tx.clone();
         let stop_rx = stop_rx.clone();
-        let max_clients = config.max_clients;
+        let admission = AdmissionGate::new(config.max_clients);
         tokio::spawn(async move {
             let mut connected = 0usize;
             loop {
@@ -340,23 +1789,30 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         continue;
                     }
                 };
-                if connected >= max_clients {
+                let Some(slot) = admission.try_admit() else {
                     conn.close("server at capacity");
                     continue;
-                }
+                };
                 connected += 1;
                 let _ = count_tx.send(connected);
-                let (out_tx, out_rx) = mpsc::unbounded_channel::<Outbound>();
+                let handle = OutboundHandle::new();
                 clients
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(conn.session().raw(), out_tx);
+                    .insert(conn.session().raw(), handle.clone());
+                conns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(conn.session().raw(), conn.clone());
                 tokio::spawn(serve_conn(
                     conn,
                     inbound_tx.clone(),
-                    out_rx,
+                    handle,
                     clients.clone(),
+                    conns.clone(),
+                    egress_closed.clone(),
                     stop_rx.clone(),
+                    slot,
                 ));
             }
         })
@@ -397,61 +1853,355 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let paced = config.paced;
     let max_ticks = config.max_ticks;
     let quiescence = config.quiescence_ticks;
+    let await_body_settle = config.await_body_settle;
+    let motion_interest = config.motion_interest;
     let scene = config.scene;
+    let custom_world = config.custom_world.clone();
+    let terrain_collider_mode = config.terrain_collider_mode;
     let clients_for_sim = clients.clone();
     let save = config.save.clone();
+    let save_faults = config.save_faults.clone();
     let checkpoint_interval = config.checkpoint_interval_ticks;
     let catch_up_cap = config.catch_up_cap.max(1);
     let max_join_retries = config.max_join_retries;
+    let capture_workers = config.capture_workers.max(1);
+    let dev_unvalidated_actions = config.dev_unvalidated_actions;
+    let action_catalog = tool_catalog;
+    let world_materials = materials;
+    let residency_limits = config.residency;
+    let residency_disk_path = config.residency_disk_path.clone();
+    let contact_damage_cfg = config.contact_damage;
+    let contact_damage_profiles = damage_profiles;
+    let dormancy_cfg = config.dormancy;
+    let timing_window = config.timing_window;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
         generator_version: 1,
     };
 
+    // Progression callbacks may touch the game's SQLite store. Keep their
+    // bounded FIFO off the simulation thread; one worker preserves per-player
+    // request ordering and returns replies only after the callback completes.
+    let progression_worker = progression_handler.map(ProgressionWorker::spawn);
+    let committed_edit_worker = commit_handler.map(CommittedEditWorker::spawn);
+
     let sim_join = tokio::task::spawn_blocking(move || -> SimResult {
         // Open the world database (T16). If it already holds a checkpoint,
         // recover from it; otherwise start the built-in scene and publish an
         // initial checkpoint so recovery always has a floor.
-        let (mut sim, mut durable_seq, mut store, mut checkpoints_published) =
-            match setup_persistence(save.as_deref(), scene, &persist_cfg) {
-                Ok(parts) => parts,
-                Err(e) => {
-                    return SimResult::error(format!("persistence setup failed: {e}"), 0);
-                }
-            };
+        // `setup_persistence` arms any test-only `save_faults` on the recovered
+        // writer *after* recovery and the initial checkpoint, so the fault
+        // falls on a later durable write, then hands the writer to the bounded
+        // off-thread `PersistPipeline` (ENG-50).
+        let Persistence {
+            mut sim,
+            mut pipeline,
+            mut journalled_through,
+            mut checkpoints_published,
+            outbox_processor,
+        } = match setup_persistence_with_game_content(
+            save.as_deref(),
+            scene,
+            custom_world.as_ref(),
+            &persist_cfg,
+            save_faults,
+            terrain_collider_mode,
+            world_materials,
+            game_setup,
+            outbox_processor,
+        ) {
+            Ok(parts) => parts,
+            Err(e) => {
+                return SimResult::error(format!("persistence setup failed: {e}"), 0);
+            }
+        };
+        let progression_worker = progression_worker;
+        let committed_edit_worker = committed_edit_worker;
+        let outbox_worker = outbox_processor.map(OutboxWorker::spawn);
         let mut journal_records_written: u64 = 0;
+        let mut pending_outbox = Vec::<spall_store::OutboxRecord>::new();
+        let mut waiting_outbox = std::collections::VecDeque::<spall_store::OutboxRecord>::new();
+        let mut outbox_inflight = None;
+
+        // T23 / G3 row 7, slice D: default-off residency pass. `None` -> the
+        // world stays fully resident and every counter below is `0`.
+        let terrain_vid = sim.world().terrain_volume_id();
+        // T23 / G3 row 7, item 2: `--residency-disk-backing` swaps the
+        // in-process `MemoryBacking` default for a real disk-backed
+        // `DiskBrickBacking` (`crate::disk_backing`) at
+        // `<world>/residency.db`. Unset (the default), behaviour is
+        // byte-identical to every prior run.
+        let mut residency = match residency_limits {
+            None => None,
+            Some(limits) => match &residency_disk_path {
+                None => Some(crate::ResidencyPass::install(sim.world_mut(), limits)),
+                Some(path) => match crate::disk_backing::DiskBrickBacking::open(path) {
+                    Ok(backing) => Some(crate::ResidencyPass::install_with_backing(
+                        sim.world_mut(),
+                        limits,
+                        std::sync::Arc::new(backing),
+                    )),
+                    Err(e) => {
+                        return SimResult::error(
+                            format!("residency disk backing open failed: {e}"),
+                            0,
+                        );
+                    }
+                },
+            },
+        };
 
         let mut motion = MotionPublisher::new(60, 20);
         let mut committed_total = 0u64;
         let mut rejected_total = 0u64;
+        // ENG-48: `ActionRequest`s / `RepairRequest`s that exceeded a session's
+        // per-tick admission quota and were bounced with a retry response
+        // (actions) or dropped (repairs).
+        let mut actions_throttled = 0u64;
+        let mut repairs_throttled = 0u64;
+
+        // T11a / ENG-62: commit-latency measurement + admission accounting.
+        // `actions_requested` counts every inbound `ActionRequest` (retries
+        // included); `actions_staged` counts those the sim accepted for staging;
+        // `submitted_at` times each staged request from admission to the tick
+        // its transaction commits. Whatever is still in `submitted_at` at end of
+        // run was staged but never committed — the "queued" bucket.
+        let mut actions_requested = 0u64;
+        let mut actions_staged = 0u64;
+        let mut submitted_at: HashMap<RequestId, std::time::Instant> = HashMap::new();
+        // The session that staged each still-pending request, so the tick-report
+        // outcome (`action_statuses`) can be routed back to only that client
+        // instead of every connected client.
+        let mut submitted_by: HashMap<RequestId, (SessionId, Option<spall_protocol::PlayerId>)> =
+            HashMap::new();
+        let mut player_principals: HashMap<u64, spall_protocol::PlayerId> = HashMap::new();
+        let mut commit_latency = CommitLatency::default();
+
+        // T21 / ENG-28 increment 4 (3c): default-off passes. `None` -> every
+        // counter below stays `0` and neither pass is ever called, so an
+        // ordinary run is byte-identical to before this increment.
+        let mut contact_damage_policy = contact_damage_cfg.map(|cfg| {
+            spall_sim::ContactDamagePolicy::with_material_profiles(cfg, contact_damage_profiles)
+        });
+        let mut dormancy_policy = dormancy_cfg.map(spall_sim::DormancyPolicy::new);
+        let mut contact_damage_cuts_submitted = 0u64;
+        let mut contact_damage_cuts_rejected = 0u64;
+        let mut dormancy_deactivations_total = 0u64;
+        let mut dormancy_reactivations_total = 0u64;
+        let mut timing = timing_window.map(TimingCollector::new);
+
+        // Not a gate pass: the interactive playground's timed debris drops
+        // (`cargo xtask play --scene playground`). `populate_playground_debris`
+        // (called earlier, in `Scene::simulation`) already spawned every
+        // debris body dormant; nothing else in this scene ever creates a
+        // dormant body, so every currently-dormant entity is exactly this
+        // population, found by a fresh scan rather than threading a
+        // `Vec<EntityId>` all the way through `setup_persistence`.
+        let mut playground_drops = matches!(scene, Scene::Playground).then(|| {
+            let pools = spall_sim::pending_drop_pools(sim.world());
+            const SHOWCASE_INTERVAL_TICKS: u64 = 300; // 5 s at 60 Hz
+            const PLINKO_INTERVAL_TICKS: u64 = 60; // 1 s at 60 Hz
+            (
+                spall_sim::DropSchedule::new(pools.showcase, SHOWCASE_INTERVAL_TICKS)
+                    .at_height(7.0),
+                spall_sim::DropSchedule::new(pools.plinko, PLINKO_INTERVAL_TICKS)
+                    .at_height(10.5)
+                    .with_restitution(spall_sim::PLINKO_RESTITUTION),
+            )
+        });
+
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
         let tick_dt = Duration::from_nanos(1_000_000_000 / 60);
 
-        // T17 late-join / reconnect state.
-        let mut lj = LateJoin::new(catch_up_cap, max_join_retries);
+        // T20: per-client interest / bandwidth state and run counters. Empty and
+        // untouched unless `motion_interest` is configured.
+        let mut client_repl: HashMap<u64, ClientReplication> = HashMap::new();
+        let mut motion_batch_index = 0u64;
+        let mut motion_egress = MotionEgress::default();
+        // T23 / G3 row 14: each slot's player spawn, so the final per-connection
+        // egress report can be read alongside where that connection's interest
+        // anchor was.
+        let mut client_spawns: HashMap<u32, [f64; 3]> = HashMap::new();
 
+        // ENG-61: rolling "every detached body is holding still" window. Each
+        // tick we compare every body's origin Y against the previous tick; a run
+        // of ticks under 1 mm of movement is the "vertical position stable for N
+        // ticks" evidence the G1 body-at-rest case needs.
+        let mut prev_body_y: HashMap<u64, f64> = HashMap::new();
+        let mut body_stable_ticks = 0u64;
+
+        // T17 late-join / reconnect state.
+        let mut lj = LateJoin::new(catch_up_cap, max_join_retries, capture_workers);
+        // T23 / G3 row 7, slice D: a late-join baseline or repair patch over a
+        // brick the residency pass has evicted is filled from its durable
+        // backing.
+        lj.backing = residency.as_ref().map(|p| p.backing());
+
+        let mut pacer = crate::pacing::TickPacer::new(tick_dt, std::time::Instant::now());
+        let mut pending_player_inputs = PlayerInputSchedule::default();
         for _ in 0..max_ticks {
             let started = std::time::Instant::now();
-
-            // Drain everything the clients have sent since the last tick.
+            // ENG-48: drain a bounded slice of what the clients have sent since
+            // the last tick, with a per-session admission quota so one flooding
+            // client can neither stall this loop nor starve the others. The
+            // surplus stays in the bounded channel for the next tick.
             let mut repairs: Vec<(SessionId, RepairRequest)> = Vec::new();
             let mut saw_client_work = false;
-            while let Ok(msg) = inbound_rx.try_recv() {
+            let mut actions_admitted: HashMap<u64, u32> = HashMap::new();
+            let mut repairs_admitted: HashMap<u64, u32> = HashMap::new();
+            let mut progression_admitted: HashMap<u64, u32> = HashMap::new();
+            if let Some(worker) = progression_worker.as_ref() {
+                for _ in 0..64 {
+                    match worker.completed.try_recv() {
+                        Ok(done) => send_to(
+                            &clients_for_sim,
+                            done.session,
+                            Outbound::Progression(Arc::new(done.response)),
+                        ),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
+            let mut drained = 0usize;
+            while drained < MAX_INBOUND_PER_TICK {
+                let Ok(msg) = inbound_rx.try_recv() else {
+                    break;
+                };
+                drained += 1;
                 match msg {
-                    Inbound::Joined(session) => lj.on_joined(session),
+                    Inbound::Joined(session, player_id) => {
+                        lj.on_joined(session);
+                        if let Some(player_id) = player_id {
+                            player_principals.insert(session.raw(), player_id);
+                        } else {
+                            player_principals.remove(&session.raw());
+                        }
+                        // Player identity is slot-stable across reconnects;
+                        // no input scheduled by the old generation may leak
+                        // into the replacement session.
+                        pending_player_inputs.remove_slot(session.slot().0);
+                        // T19: give this connection an authoritative player
+                        // capsule on a player scene (respawn on reconnect).
+                        let spawns = custom_world
+                            .as_ref()
+                            .map_or_else(|| scene.player_spawns(), CustomWorld::player_spawns);
+                        if !spawns.is_empty() {
+                            let slot = session.slot().0 as usize;
+                            let spawn = spawns[slot.min(spawns.len() - 1)];
+                            sim.add_player(session_player_entity(session), spawn);
+                            // T23 / G3 row 14: remember which spawn this slot
+                            // got, so the final per-connection egress report
+                            // can be read alongside *where* that connection's
+                            // interest anchor was — self-describing bandwidth
+                            // separation evidence with no client cooperation.
+                            client_spawns.insert(session.slot().0, spawn);
+                        }
+                    }
+                    Inbound::Input(session, frame) => {
+                        saw_client_work = true;
+                        if lj.session_expired(session) {
+                            continue;
+                        }
+                        let entity = session_player_entity(session);
+                        // Recover unseen redundant copies through the same
+                        // admission rule as the primary input below. A copy
+                        // carries its own intended_tick, so recovering one
+                        // that was dropped as a primary datagram still lands
+                        // on the tick it was tagged for -- applying it
+                        // immediately here would reproduce the whole-tick
+                        // edge snap this scheduling exists to remove, in
+                        // exactly the case (a dropped datagram) the
+                        // redundancy is for.
+                        for r in frame.recent.iter().rev() {
+                            if let Some(input) = pending_player_inputs.admit(
+                                session,
+                                entity,
+                                recent_input(r),
+                                r.input_seq,
+                                r.intended_tick,
+                                sim.current_tick(),
+                                sim.player_acked_input(entity),
+                            ) {
+                                sim.set_player_input(entity, input, r.input_seq);
+                            }
+                        }
+                        if let Some(input) = pending_player_inputs.admit(
+                            session,
+                            entity,
+                            frame_input(&frame),
+                            frame.input_seq,
+                            frame.intended_tick,
+                            sim.current_tick(),
+                            sim.player_acked_input(entity),
+                        ) {
+                            sim.set_player_input(entity, input, frame.input_seq);
+                        }
+                    }
                     Inbound::Action(session, req) => {
                         saw_client_work = true;
+                        actions_requested += 1;
                         if lj.session_expired(session) {
                             reject(&clients_for_sim, session, req.request_id, "expired session");
                             rejected_total += 1;
                             lj.expired_actions += 1;
                             continue;
                         }
-                        match intent_from_request(session, &req) {
-                            Some(intent) => {
-                                if let Err(e) = sim.submit(intent) {
+                        // ENG-57: check the authoritative admission ledger
+                        // before rate limiting or resolving the claim. A
+                        // committed cut can make the original ray miss, and a
+                        // reconnect may legitimately retry the same reliable
+                        // request on its replacement session. Replaying this
+                        // status must not restage or re-apply the edit.
+                        if let Some(status) = replay_admitted_status(&sim, req.request_id) {
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Status(Arc::new(status.clone())),
+                            );
+                            continue;
+                        }
+                        if !admit(
+                            &mut actions_admitted,
+                            session.raw(),
+                            MAX_ACTIONS_PER_CLIENT_PER_TICK,
+                        ) {
+                            reject(
+                                &clients_for_sim,
+                                session,
+                                req.request_id,
+                                "throttled: too many actions this tick, retry shortly",
+                            );
+                            rejected_total += 1;
+                            actions_throttled += 1;
+                            continue;
+                        }
+                        let resolved = if dev_unvalidated_actions {
+                            dev_intent_from_request(session, &req)
+                                .ok_or(ActionReject::Unsupported("unsupported target"))
+                        } else {
+                            resolve_intent_with_catalog(sim.world(), session, &req, &action_catalog)
+                        };
+                        match resolved {
+                            Ok(intent) => match sim.submit(intent) {
+                                Ok(status) => {
+                                    submitted_at
+                                        .entry(req.request_id)
+                                        .or_insert_with(std::time::Instant::now);
+                                    submitted_by.entry(req.request_id).or_insert((
+                                        session,
+                                        player_principals.get(&session.raw()).copied(),
+                                    ));
+                                    actions_staged += 1;
+                                    send_to(
+                                        &clients_for_sim,
+                                        session,
+                                        Outbound::Status(Arc::new(status)),
+                                    );
+                                }
+                                Err(e) => {
                                     reject(
                                         &clients_for_sim,
                                         session,
@@ -460,32 +2210,82 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                     );
                                     rejected_total += 1;
                                 }
-                            }
-                            None => {
-                                reject(
-                                    &clients_for_sim,
-                                    session,
-                                    req.request_id,
-                                    "unsupported target",
-                                );
+                            },
+                            Err(rej) => {
+                                reject(&clients_for_sim, session, req.request_id, &rej.reason());
                                 rejected_total += 1;
                             }
                         }
                     }
+                    Inbound::Progression(session, req) => {
+                        saw_client_work = true;
+                        if lj.session_expired(session) {
+                            continue;
+                        }
+                        let admitted = admit(
+                            &mut progression_admitted,
+                            session.raw(),
+                            MAX_PROGRESSION_PER_CLIENT_PER_TICK,
+                        );
+                        let queued = admitted
+                            && progression_worker.as_ref().is_some_and(|worker| {
+                                worker
+                                    .submit
+                                    .try_send(ProgressionWork {
+                                        session,
+                                        player_id: player_principals.get(&session.raw()).copied(),
+                                        request: req.clone(),
+                                    })
+                                    .is_ok()
+                            });
+                        if !queued {
+                            // The queue is bounded. This retryable response is
+                            // immediate and does not perform a fallback read.
+                            let response = progression_rejected(
+                                &req,
+                                spall_protocol::ProgressionRejectCode::RetryableCapacity,
+                            );
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Progression(Arc::new(response)),
+                            );
+                        }
+                    }
                     Inbound::Repair(session, req) => {
                         saw_client_work = true;
-                        if !lj.session_expired(session) {
+                        if lj.session_expired(session) {
+                            continue;
+                        }
+                        if admit(
+                            &mut repairs_admitted,
+                            session.raw(),
+                            MAX_REPAIRS_PER_CLIENT_PER_TICK,
+                        ) {
                             repairs.push((session, req));
+                        } else {
+                            repairs_throttled += 1;
                         }
                     }
                     Inbound::Baseline(session, ack) => {
                         saw_client_work = true;
                         lj.on_baseline_ack(session, ack, &sim, &clients_for_sim, &mut motion);
                     }
-                    Inbound::Gone(session) => lj.on_gone(session),
+                    Inbound::Gone(session) => {
+                        pending_player_inputs.remove_session(session);
+                        lj.on_gone(session);
+                        player_principals.remove(&session.raw());
+                    }
                 }
             }
 
+            lj.publish_ready_captures(&clients_for_sim);
+            let next_tick = spall_core::Tick(sim.current_tick().0.saturating_add(1));
+            for input in pending_player_inputs.take_due(next_tick) {
+                if !lj.session_expired(input.session) {
+                    sim.set_player_input(input.entity, input.input, input.seq);
+                }
+            }
             let report = match sim.tick() {
                 Ok(r) => r,
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
@@ -493,91 +2293,554 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             ticks_run += 1;
             let tick = sim.current_tick();
 
-            for tx in committed_transactions(&report).map(|(_, t)| t.clone()) {
+            // T21 / ENG-28 increment 4 (3c): opt-in contact damage + region
+            // dormancy, run every tick right after the commit they react to.
+            // A contact-damage cut stages off-tick and commits on a later
+            // tick, like any client edit; a dormancy deactivation/reactivation
+            // applies to `sim.world()` immediately but never touches
+            // authoritative geometry, ownership, or `world_hash`.
+            if let Some(policy) = contact_damage_policy.as_mut() {
+                let cd = sim.apply_contact_damage(policy, &report);
+                contact_damage_cuts_submitted += cd.submitted as u64;
+                contact_damage_cuts_rejected += cd.rejected as u64;
+            }
+            if let Some(policy) = dormancy_policy.as_mut() {
+                let dp = sim.apply_dormancy(policy, &report);
+                dormancy_deactivations_total += dp.deactivate.len() as u64;
+                dormancy_reactivations_total += dp.reactivate.len() as u64;
+            }
+            if let Some((showcase, plinko)) = playground_drops.as_mut() {
+                showcase.tick(sim.world_mut(), tick.get());
+                plinko.tick(sim.world_mut(), tick.get());
+            }
+
+            // ENG-61: fold this tick into the "bodies holding still" window.
+            // Only when the scenario asked for it — an ordinary run does no
+            // extra per-tick work, so its timing (and an impaired run's
+            // proxy-reordering outcome) is byte-for-byte unchanged.
+            if await_body_settle {
+                let mut max_dy = 0.0_f64;
+                let mut have_history = !prev_body_y.is_empty();
+                let mut seen = 0usize;
+                let mut next_body_y: HashMap<u64, f64> = HashMap::with_capacity(prev_body_y.len());
+                for b in sim.world().bodies() {
+                    seen += 1;
+                    let key = b.entity.map(|e| e.get()).unwrap_or(0);
+                    let y = b.pose.translation_m[1];
+                    match prev_body_y.get(&key) {
+                        Some(py) => max_dy = max_dy.max((y - py).abs()),
+                        None => have_history = false,
+                    }
+                    next_body_y.insert(key, y);
+                }
+                prev_body_y = next_body_y;
+                if seen > 0 && have_history && max_dy < 1.0e-3 {
+                    body_stable_ticks += 1;
+                } else {
+                    body_stable_ticks = 0;
+                }
+            }
+
+            for (rid, committed) in &report.committed {
                 committed_total += 1;
-                lj.fan_out_transaction(Arc::new(tx), &sim, &clients_for_sim);
+                if !committed.removed_materials.is_empty()
+                    && let Some((session, player_id)) = submitted_by.get(rid).copied()
+                {
+                    let encoded = outbox_encoder.as_mut().and_then(|encoder| {
+                        encoder(
+                            session,
+                            player_id,
+                            *rid,
+                            committed.journal_seq,
+                            &committed.removed_materials,
+                        )
+                    });
+                    if let Some(event) = encoded.filter(|_| pipeline.is_some()) {
+                        pending_outbox.push(event);
+                    } else if let Some(worker) = committed_edit_worker.as_ref() {
+                        match worker.submit.try_send(CommittedEditWork {
+                            session,
+                            player_id,
+                            request_id: *rid,
+                            removed: committed.removed_materials.clone(),
+                        }) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                return SimResult::error(
+                                    "committed progression queue is full; server stopped with the award pending only in ephemeral memory".into(),
+                                    ticks_run,
+                                );
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                return SimResult::error(
+                                    "committed progression worker stopped".into(),
+                                    ticks_run,
+                                );
+                            }
+                        }
+                    }
+                }
+                // T17 increment 2: a giant split ships its geometry out of band
+                // as a `BaselineTransfer`, keyed to the transaction by
+                // `transfer_id` (= the split's `TransactionId` | high bit).
+                let split_transfer = committed.bulk_baseline.as_ref().and_then(|world| {
+                    let id = TransferId(
+                        committed.transaction.get() | spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT,
+                    );
+                    baseline::transfer_from_world(
+                        world.clone(),
+                        id,
+                        InterestEpoch(1),
+                        JournalSeq(sim.journal_cursor()),
+                    )
+                    .ok()
+                    .map(Arc::new)
+                });
+                lj.fan_out_transaction(
+                    Arc::new(committed.topology.clone()),
+                    split_transfer,
+                    &sim,
+                    &clients_for_sim,
+                );
+                // T11a / ENG-62: bucket each commit's server-side latency
+                // (admission → commit) by whether it split and how much
+                // geometry detached.
+                if let Some(started_at) = submitted_at.remove(rid) {
+                    let class =
+                        commit_latency::classify(committed.bumped_epoch, &committed.topology);
+                    commit_latency.record(class, started_at.elapsed());
+                }
+                // Slice D: keep the durable backing current for the terrain
+                // bricks this edit changed, so a later reload gets this
+                // revision.
+                if let Some(pass) = &residency {
+                    pass.on_commit(
+                        sim.world(),
+                        committed
+                            .topology
+                            .after
+                            .iter()
+                            .filter(|br| br.volume == terrain_vid)
+                            .map(|br| br.coord),
+                    );
+                }
             }
             for status in action_statuses(&report) {
                 if matches!(status.outcome, ActionOutcome::Rejected { .. }) {
                     rejected_total += 1;
                 }
-                broadcast(&clients_for_sim, Outbound::Status(Arc::new(status)));
-            }
-            if motion.due(tick) {
-                let snaps = motion.snapshots(sim.world(), tick);
-                if !snaps.is_empty() {
-                    broadcast(&clients_for_sim, Outbound::Motion(Arc::new(snaps)));
+                // A tick-resolved outcome (commit or deterministic staging
+                // rejection) belongs to whichever session staged it — route it
+                // there only. `submitted_by` is best-effort bookkeeping (cleared
+                // here on first resolution); an untracked request (there
+                // shouldn't be one) falls back to the old broadcast so a status
+                // is never silently dropped.
+                match submitted_by.remove(&status.request_id) {
+                    Some((session, _player_id)) => send_to(
+                        &clients_for_sim,
+                        session,
+                        Outbound::Status(Arc::new(status)),
+                    ),
+                    None => broadcast(&clients_for_sim, Outbound::Status(Arc::new(status))),
                 }
             }
+            // The 20 Hz motion batch: send it to replicas *and* keep the full
+            // batch for the durable pose journal below (durability is never
+            // interest-filtered).
+            let pose_batch: Option<Vec<MotionSnapshot>> = if motion.due(tick) {
+                let snaps = motion.snapshots(sim.world(), tick);
+                if !snaps.is_empty() {
+                    match motion_interest {
+                        // Pre-T20: one batch, unfiltered *among live replicas*.
+                        // A client still installing its late-join baseline must
+                        // receive neither the live 20 Hz feed nor its stale
+                        // datagram backlog: the baseline barrier supplies a
+                        // current keyframe when it becomes live. The
+                        // interest-aware path below already has this property
+                        // through `LateJoin::live_sessions`; keep the default
+                        // path on the same protocol contract.
+                        None => {
+                            let recipients: Vec<_> = lj.live_sessions().collect();
+                            motion_egress.snapshots_sent +=
+                                snaps.len() as u64 * recipients.len() as u64;
+                            send_motion_to_sessions(
+                                &clients_for_sim,
+                                recipients,
+                                Arc::new(snaps.clone()),
+                            );
+                        }
+                        // T20: per-client interest relevance + bandwidth budget.
+                        Some(mi) => {
+                            dispatch_motion_by_interest(
+                                &mi,
+                                scene,
+                                motion_batch_index,
+                                &snaps,
+                                &sim,
+                                &lj,
+                                &clients_for_sim,
+                                &mut client_repl,
+                                &mut motion_egress,
+                            );
+                        }
+                    }
+                    motion_batch_index += 1;
+                }
+                Some(snaps)
+            } else {
+                None
+            };
             for (session, req) in repairs {
                 lj.answer_repair(session, &req, &sim, &clients_for_sim);
             }
 
-            // T16: journal every newly committed transaction, then checkpoint
-            // on the interval. A durable-write failure stops the run rather
-            // than silently continuing an unsavable world.
-            if let Some(writer) = store.as_mut() {
-                match flush_journal(writer, &sim, &mut durable_seq) {
-                    Ok(n) => journal_records_written += n,
+            // ENG-50: queue immutable records to the bounded off-thread writer.
+            // The sim thread never blocks on the disk; when the backlog fills or
+            // a durable write has failed, the run stops rather than silently
+            // continuing an unsavable world (`docs/protocol.md` Persistence).
+            if let Some(pipe) = pipeline.as_ref() {
+                let batch = match tick_journal_batch(
+                    &mut sim,
+                    &mut journalled_through,
+                    pose_batch.as_deref(),
+                    tick.get(),
+                ) {
+                    Ok(b) => b,
                     Err(e) => {
-                        return SimResult::error(format!("journal flush failed: {e}"), ticks_run);
+                        return SimResult::error(format!("journal encode failed: {e}"), ticks_run);
                     }
+                };
+                let records = std::mem::take(&mut pending_outbox);
+                if let Err(e) = pipe.submit_journal_with_outbox(batch, records.clone()) {
+                    return SimResult::error(format!("persistence: {e}"), ticks_run);
                 }
-                if checkpoint_interval > 0 && tick.get().is_multiple_of(checkpoint_interval) {
-                    match publish_checkpoint(writer, &sim, &persist_cfg, durable_seq) {
-                        Ok(()) => checkpoints_published += 1,
-                        Err(e) => {
-                            return SimResult::error(format!("checkpoint failed: {e}"), ticks_run);
+                waiting_outbox.extend(records);
+                let durable = pipe.durable_seq();
+                let mut acknowledged = Vec::new();
+                if let Some(worker) = outbox_worker.as_ref() {
+                    match worker.completed.try_recv() {
+                        Ok(done) => {
+                            if outbox_inflight != Some(done.event_id) {
+                                return SimResult::error(
+                                    "outbox completion did not match the in-flight event".into(),
+                                    ticks_run,
+                                );
+                            }
+                            if let Err(error) = done.result {
+                                return SimResult::error(
+                                    format!("harvest outbox delivery failed: {error}"),
+                                    ticks_run,
+                                );
+                            }
+                            let Some(event) = waiting_outbox.pop_front() else {
+                                return SimResult::error(
+                                    "outbox completion has no retained event".into(),
+                                    ticks_run,
+                                );
+                            };
+                            if event.event_id != done.event_id {
+                                return SimResult::error(
+                                    "outbox completion order changed".into(),
+                                    ticks_run,
+                                );
+                            }
+                            acknowledged.push(done.event_id);
+                            outbox_inflight = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return SimResult::error("outbox worker stopped".into(), ticks_run);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                    if outbox_inflight.is_none()
+                        && let Some(event) = waiting_outbox
+                            .front()
+                            .filter(|event| event.journal_seq <= durable)
+                    {
+                        match worker.submit.try_send(OutboxWork(event.clone())) {
+                            Ok(()) => outbox_inflight = Some(event.event_id),
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                return SimResult::error("outbox worker stopped".into(), ticks_run);
+                            }
                         }
                     }
                 }
+                if let Err(e) = pipe.submit_acknowledge_outbox(acknowledged) {
+                    return SimResult::error(format!("outbox acknowledgement: {e}"), ticks_run);
+                }
+
+                // A checkpoint's journal cursor is `journalled_through`: the FIFO
+                // writer commits every journal record up to that cursor *before*
+                // this checkpoint, so a durable checkpoint always has a durable
+                // journal prefix behind it. Retain right after, so disk use
+                // stays bounded during the run — not only at shutdown.
+                if checkpoint_interval > 0 && tick.get().is_multiple_of(checkpoint_interval) {
+                    // T23 / G3 row 7 follow-up: a checkpoint is a full-world
+                    // snapshot, but it no longer reloads evicted terrain into
+                    // the live world to get there — `capture_checkpoint` folds
+                    // the durable backing's evicted-brick records straight
+                    // into the checkpoint, so residency's bounded memory
+                    // holds even at checkpoint time.
+                    let captured = match &mut residency {
+                        Some(pass) => {
+                            pass.capture_checkpoint(&sim, &persist_cfg, journalled_through)
+                        }
+                        None => persist::capture(&sim, &persist_cfg, journalled_through),
+                    };
+                    match captured {
+                        Ok(cp) => {
+                            if let Err(e) = pipe
+                                .submit_checkpoint(cp)
+                                .and_then(|()| pipe.submit_retain(RETAIN_CHECKPOINTS))
+                            {
+                                return SimResult::error(format!("persistence: {e}"), ticks_run);
+                            }
+                        }
+                        Err(e) => {
+                            return SimResult::error(
+                                format!("checkpoint capture failed: {e}"),
+                                ticks_run,
+                            );
+                        }
+                    }
+                }
+
+                // Drop the in-memory journal suffix the store has acknowledged.
+                sim.prune_journal(pipe.durable_seq());
+
+                if let Some(err) = pipe.error() {
+                    return SimResult::error(format!("persistence failed: {err}"), ticks_run);
+                }
+            }
+
+            // Slice D: post-tick residency pass. Evicts terrain bricks outside
+            // every player's interest box, reloads any back in interest. The
+            // committed world (hash, conservation, result_hashes) is unchanged;
+            // an edit that needs an evicted brick reloads it via the pipeline.
+            //
+            // ENG-30 row 7 increment 13: before running, hand the pass every
+            // brick the pipeline itself reloaded this tick (pinned for a short
+            // grace window) and the bounded dependency footprint of every
+            // still-queued edit (pinned for as long as it stays queued) — the
+            // preflight/consumer-lifetime reservation the frozen contract asks
+            // for, on top of the reactive `EvictedGeometryRequired` protection
+            // that already existed.
+            if let Some(pass) = &mut residency {
+                pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+                let pending_edit_bricks = sim.pending_edit_bricks(terrain_vid);
+                let player_feet: Vec<(u64, [f64; 3])> = sim
+                    .world()
+                    .players()
+                    .map(|p| (p.entity.get(), p.state.position_m))
+                    .collect();
+                pass.run(sim.world_mut(), &player_feet, &pending_edit_bricks);
+            }
+
+            // G4 timing ends after all owning-thread work for this tick,
+            // including replication, persistence submission, and residency,
+            // but before the optional pacing sleep below. Warmup is explicit;
+            // a short run therefore remains visibly incomplete instead of
+            // turning absent measurements into a pass.
+            if let Some(stats) = &mut timing {
+                stats.record(ticks_run, started.elapsed(), report.physics_duration);
             }
 
             // Quiesce only after the pipeline is drained *and* no client has
             // sent anything for `quiescence` ticks — a late scripted action from
-            // one client keeps the run alive for the others.
-            if sim.is_idle() && !saw_client_work && report.committed.is_empty() {
+            // one client keeps the run alive for the others. A client still
+            // mid-baseline (`lj.any_joining()`) also keeps the run alive: under
+            // an impaired transport its bulk transfer can legitimately take
+            // longer than `quiescence` ticks of otherwise-quiet simulation, and
+            // ending the run out from under it would strand the connection
+            // before the client ever gets to replicate.
+            if sim.is_idle() && !saw_client_work && report.committed.is_empty() && !lj.any_joining()
+            {
                 idle_streak += 1;
             } else {
                 idle_streak = 0;
             }
             if quiescence > 0 && committed_total > 0 && idle_streak >= quiescence {
-                break;
+                // ENG-61: when the scenario needs a detached body to come to
+                // rest, keep stepping physics past edit-quiescence until every
+                // detached body is asleep *and* has held its position still for
+                // a stretch of ticks (still bounded by `max_ticks`), so the run
+                // ends with real "came to rest" evidence rather than catching
+                // the body mid-fall.
+                let settled = sim.world().bodies().all(|b| b.sleeping)
+                    && body_stable_ticks >= AWAIT_SETTLE_STABLE_TICKS;
+                if !await_body_settle || settled {
+                    break;
+                }
             }
 
-            if paced && let Some(rem) = tick_dt.checked_sub(started.elapsed()) {
-                std::thread::sleep(rem);
+            if paced {
+                // Absolute deadlines, not `tick_dt - work`: a relative sleep
+                // drifted the server to ~58.8 Hz under Windows sleep overshoot.
+                let now = std::time::Instant::now();
+                if let Some(rem) = pacer.finish_tick(now) {
+                    std::thread::sleep(rem);
+                }
+                if pacer.ticks().is_multiple_of(600) {
+                    tracing::info!(
+                        target: "spall_server::pacing",
+                        ticks = pacer.ticks(),
+                        achieved_hz = pacer.achieved_hz(std::time::Instant::now()),
+                        max_lag_ms = pacer.max_lag().as_secs_f64() * 1e3,
+                        resyncs = pacer.resyncs(),
+                        "tick pacing"
+                    );
+                }
             }
         }
 
-        broadcast(&clients_for_sim, Outbound::Shutdown);
+        broadcast(
+            &clients_for_sim,
+            Outbound::Shutdown(Connection::BYE_REASON_COMPLETE),
+        );
 
-        // Clean-shutdown checkpoint: flush the journal tail, publish a final
-        // checkpoint, and prune to the last two.
+        // Clean-shutdown durability: queue the final journal tail + checkpoint
+        // + retain, then block until the off-thread writer has drained and
+        // exited (`docs/protocol.md`: "Clean shutdown waits for a final
+        // checkpoint/flush"). A failure on that final drain is surfaced through
+        // `shutdown_error` with every counter below still reported, so the
+        // failing summary keeps its diagnostics instead of returning early —
+        // silently reporting success would strand an unsavable world.
         let mut persist_bytes_per_write = 0.0;
         let mut persist_commit_bytes_per_sec = 0.0;
-        if let Some(writer) = store.as_mut() {
-            if let Ok(n) = flush_journal(writer, &sim, &mut durable_seq) {
-                journal_records_written += n;
+        let mut shutdown_error: Option<String> = None;
+        if let Some(pipe) = pipeline.take() {
+            let final_tick = sim.current_tick().get();
+            let tail = tick_journal_batch(&mut sim, &mut journalled_through, None, final_tick)
+                .unwrap_or_default();
+            let tail_events = std::mem::take(&mut pending_outbox);
+            if let Err(error) = pipe.submit_journal_with_outbox(tail, tail_events.clone()) {
+                shutdown_error = Some(format!("final journal/outbox submission failed: {error}"));
             }
-            if publish_checkpoint(writer, &sim, &persist_cfg, durable_seq).is_ok() {
-                checkpoints_published += 1;
+            waiting_outbox.extend(tail_events);
+            if shutdown_error.is_none() {
+                if let Err(error) = pipe.wait_durable_through(journalled_through) {
+                    shutdown_error = Some(format!("final journal durability wait failed: {error}"));
+                } else {
+                    let mut acknowledged = Vec::new();
+                    if let Some(worker) = outbox_worker.as_ref() {
+                        while let Some(event) = waiting_outbox.front() {
+                            if outbox_inflight.is_none() {
+                                if let Err(error) = worker.submit.send(OutboxWork(event.clone())) {
+                                    shutdown_error = Some(format!(
+                                        "final harvest outbox submission failed: {error}"
+                                    ));
+                                    break;
+                                }
+                                outbox_inflight = Some(event.event_id);
+                            }
+                            let done = match worker.completed.recv() {
+                                Ok(done) => done,
+                                Err(error) => {
+                                    shutdown_error = Some(format!(
+                                        "final harvest outbox completion failed: {error}"
+                                    ));
+                                    break;
+                                }
+                            };
+                            if outbox_inflight != Some(done.event_id)
+                                || event.event_id != done.event_id
+                            {
+                                shutdown_error =
+                                    Some("final harvest outbox completion mismatch".into());
+                                break;
+                            }
+                            if let Err(error) = done.result {
+                                shutdown_error =
+                                    Some(format!("final harvest outbox delivery failed: {error}"));
+                                break;
+                            }
+                            waiting_outbox.pop_front();
+                            outbox_inflight = None;
+                            acknowledged.push(done.event_id);
+                        }
+                    }
+                    if shutdown_error.is_none() {
+                        if let Err(error) = pipe.submit_acknowledge_outbox(acknowledged) {
+                            shutdown_error =
+                                Some(format!("final outbox acknowledgement failed: {error}"));
+                        }
+                    }
+                }
             }
-            let _ = writer.retain(2);
-            let m = writer.metrics();
-            persist_bytes_per_write = m.bytes_per_journal_write();
-            persist_commit_bytes_per_sec = m.commit_bytes_per_sec();
+            // T23 / G3 row 7 follow-up: the shutdown snapshot folds evicted
+            // terrain in from the durable backing the same way the periodic
+            // checkpoints above do now, instead of reloading it into the live
+            // world first.
+            let captured = match &mut residency {
+                Some(pass) => pass.capture_checkpoint(&sim, &persist_cfg, journalled_through),
+                None => persist::capture(&sim, &persist_cfg, journalled_through),
+            };
+            if let Ok(cp) = captured {
+                let _ = pipe
+                    .submit_checkpoint(cp)
+                    .and_then(|()| pipe.submit_retain(RETAIN_CHECKPOINTS));
+            }
+            let outcome = pipe.shutdown();
+            journal_records_written = outcome.status.journal_records;
+            checkpoints_published += outcome.status.checkpoints_published;
+            persist_bytes_per_write = outcome.metrics.bytes_per_journal_write();
+            persist_commit_bytes_per_sec = outcome.metrics.commit_bytes_per_sec();
+            // The final drain covers the journal tail, the final checkpoint, and
+            // the retain pass; attribute any failure to that shutdown flush so a
+            // stranded save is never reported as a pass.
+            shutdown_error = shutdown_error.or_else(|| {
+                outcome
+                    .status
+                    .error
+                    .map(|e| format!("final checkpoint/flush failed: {e}"))
+            });
+            tracing::info!(
+                durable_seq = outcome.status.durable_seq,
+                journal_records = outcome.status.journal_records,
+                checkpoints = outcome.status.checkpoints_published,
+                max_queue_depth = outcome.status.max_queue_depth,
+                last_flush_us = outcome.status.last_journal_flush.as_micros() as u64,
+                max_flush_us = outcome.status.max_journal_flush.as_micros() as u64,
+                max_checkpoint_us = outcome.status.max_checkpoint.as_micros() as u64,
+                "persistence pipeline drained"
+            );
         }
 
         SimResult {
-            ok: true,
-            error: None,
+            ok: shutdown_error.is_none(),
+            error: shutdown_error,
             ticks_run,
             committed_total,
             rejected_total,
             final_world_hash: sim.world().world_hash().to_string(),
             total_solid_cells: sim.world().total_solid_cells(),
             body_count: sim.world().body_count(),
+            max_detached_body_brick_span: sim
+                .world()
+                .bodies()
+                .map(|b| b.volume.resident_brick_coords().len() as u64)
+                .max()
+                .unwrap_or(0),
+            detached_body_max_final_speed_m_s: sim
+                .world()
+                .bodies()
+                .map(|b| {
+                    (b.linvel_m_s[0].powi(2) + b.linvel_m_s[1].powi(2) + b.linvel_m_s[2].powi(2))
+                        .sqrt()
+                })
+                .fold(0.0_f64, f64::max),
+            detached_bodies_all_asleep: sim.world().bodies().all(|b| b.sleeping),
+            detached_body_stable_ticks: body_stable_ticks,
+            max_contact_penetration_m: f64::from(sim.world().physics().max_penetration_m()),
+            detached_body_min_origin_y_m: {
+                let min_y = sim
+                    .world()
+                    .bodies()
+                    .map(|b| b.pose.translation_m[1])
+                    .fold(f64::INFINITY, f64::min);
+                if min_y.is_finite() { min_y } else { 0.0 }
+            },
             checkpoints_published,
             journal_records_written,
             persist_bytes_per_write,
@@ -587,6 +2850,28 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             late_joins_failed: lj.failed,
             expired_actions_rejected: lj.expired_actions,
             baseline_bytes_sent: lj.baseline_bytes,
+            actions_throttled,
+            repairs_throttled,
+            motion_snapshots_sent: motion_egress.snapshots_sent,
+            motion_snapshots_interest_culled: motion_egress.interest_culled,
+            motion_snapshots_budget_deferred: motion_egress.budget_deferred,
+            max_client_motion_batch_bytes: motion_egress.max_client_batch_bytes,
+            actions_requested,
+            actions_staged,
+            actions_queued_unresolved: submitted_at.len() as u64,
+            latency: commit_latency.report(),
+            residency: residency.as_ref().map(|p| p.stats_with_world(sim.world())),
+            residency_backing_disk_bytes: residency.as_ref().and_then(|p| p.backing_disk_bytes()),
+            client_spawns,
+            contact_damage_cuts_submitted,
+            contact_damage_cuts_rejected,
+            dormancy_deactivations_total,
+            dormancy_reactivations_total,
+            // An opt-in timing window leaves no samples when it is not
+            // configured; expose the same zeroed report as an ordinary run.
+            timing: timing
+                .map(|stats| stats.finish(ticks_run))
+                .unwrap_or_default(),
         }
     });
 
@@ -599,6 +2884,41 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     server.close();
     let _ = tokio::time::timeout(Duration::from_secs(3), server.wait_idle()).await;
     let _ = accept.await;
+
+    // T20: total egress. Hold the `conns` lock across the whole read so a
+    // late-closing `serve_conn` can neither remove-and-accumulate an entry
+    // concurrently (it takes the same lock first) nor be missed — every
+    // connection is counted once, here or in `egress_closed`.
+    let (app_egress_bytes, transport_egress_bytes, per_client_egress) = {
+        let conns_guard = conns.lock().unwrap_or_else(|e| e.into_inner());
+        let mut acc = egress_closed.lock().unwrap_or_else(|e| e.into_inner());
+        for (raw, conn) in conns_guard.iter() {
+            acc.insert(
+                *raw,
+                (
+                    conn.stats().app_bytes_sent,
+                    conn.transport_stats().udp_tx.bytes,
+                ),
+            );
+        }
+        let mut app_total = 0u64;
+        let mut transport_total = 0u64;
+        let mut rows: Vec<PerClientEgress> = Vec::with_capacity(acc.len());
+        for (&raw, &(app_bytes, transport_bytes)) in acc.iter() {
+            app_total = app_total.saturating_add(app_bytes);
+            transport_total = transport_total.saturating_add(transport_bytes);
+            // `SessionId`'s high 32 bits are the slot (see spall_protocol::session).
+            let slot = (raw >> 32) as u32;
+            rows.push(PerClientEgress {
+                slot,
+                spawn_m: sim_result.client_spawns.get(&slot).copied(),
+                app_bytes,
+                transport_bytes,
+            });
+        }
+        rows.sort_by_key(|r| r.slot);
+        (app_total, transport_total, rows)
+    };
 
     let clients_connected = *count_rx.borrow();
     let result = if sim_result.ok { "passed" } else { "failed" };
@@ -616,7 +2936,21 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     ))?;
 
     let summary = ServeSummary {
-        version: 1,
+        // v5: T21 / ENG-28 increment 4 adds contact_damage_cuts_submitted /
+        // contact_damage_cuts_rejected / dormancy_deactivations_total /
+        // dormancy_reactivations_total; T23 / G3 row 14 adds per_client_egress.
+        // v6: T23 / G3 row 7 item 3 adds resident_dense_bytes_min/max/final and
+        // residency_backing_disk_bytes.
+        // v7: ENG-30 row 7 increment 13 adds residency_pinned_bricks_max,
+        // residency_admission_deferred_total, residency_required_over_budget_ticks,
+        // residency_digest_bytes_final, residency_backing_resident_bytes, and
+        // process_peak_memory_bytes.
+        // v8: ENG-30 row 7 increment 15 adds
+        // residency_checkpoint_bricks_captured_total and
+        // residency_checkpoint_bricks_logical_total (incremental checkpoint
+        // capture evidence).
+        // v9: T23 / G4 bounded owning-tick and physics timing telemetry.
+        version: 9,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -627,6 +2961,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         final_world_hash: sim_result.final_world_hash.clone(),
         total_solid_cells: sim_result.total_solid_cells,
         body_count: sim_result.body_count,
+        max_detached_body_brick_span: sim_result.max_detached_body_brick_span,
+        detached_body_max_final_speed_m_s: sim_result.detached_body_max_final_speed_m_s,
+        detached_bodies_all_asleep: sim_result.detached_bodies_all_asleep,
+        detached_body_stable_ticks: sim_result.detached_body_stable_ticks,
+        max_contact_penetration_m: sim_result.max_contact_penetration_m,
+        detached_body_min_origin_y_m: sim_result.detached_body_min_origin_y_m,
         checkpoints_published: sim_result.checkpoints_published,
         journal_records_written: sim_result.journal_records_written,
         persist_bytes_per_write: sim_result.persist_bytes_per_write,
@@ -636,6 +2976,95 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         late_joins_failed: sim_result.late_joins_failed,
         expired_actions_rejected: sim_result.expired_actions_rejected,
         baseline_bytes_sent: sim_result.baseline_bytes_sent,
+        inbound_actions_throttled: sim_result.actions_throttled,
+        inbound_repairs_throttled: sim_result.repairs_throttled,
+        motion_snapshots_sent: sim_result.motion_snapshots_sent,
+        motion_snapshots_interest_culled: sim_result.motion_snapshots_interest_culled,
+        motion_snapshots_budget_deferred: sim_result.motion_snapshots_budget_deferred,
+        max_client_motion_batch_bytes: sim_result.max_client_motion_batch_bytes,
+        app_egress_bytes,
+        transport_egress_bytes,
+        actions_requested: sim_result.actions_requested,
+        actions_staged: sim_result.actions_staged,
+        actions_queued_unresolved: sim_result.actions_queued_unresolved,
+        single_brick_commit_p95_ms: sim_result.latency.single_brick_commit_p95_ms,
+        single_brick_commit_samples: sim_result.latency.single_brick_commit_samples,
+        structure_split_p95_ms: sim_result.latency.structure_split_p95_ms,
+        structure_split_samples: sim_result.latency.structure_split_samples,
+        large_collapse_p95_ms: sim_result.latency.large_collapse_p95_ms,
+        large_collapse_samples: sim_result.latency.large_collapse_samples,
+        residency_evictions_total: sim_result.residency.map(|r| r.evictions_total).unwrap_or(0),
+        residency_reloads_total: sim_result.residency.map(|r| r.reloads_total).unwrap_or(0),
+        resident_terrain_bricks_min: sim_result
+            .residency
+            .map(|r| r.resident_terrain_bricks_min as u64)
+            .unwrap_or(0),
+        resident_terrain_bricks_max: sim_result
+            .residency
+            .map(|r| r.resident_terrain_bricks_max as u64)
+            .unwrap_or(0),
+        resident_terrain_bricks_final: sim_result
+            .residency
+            .map(|r| r.resident_terrain_bricks_final as u64)
+            .unwrap_or(0),
+        residency_budget_miss_ticks: sim_result
+            .residency
+            .map(|r| r.budget_miss_ticks)
+            .unwrap_or(0),
+        resident_dense_bytes_min: sim_result
+            .residency
+            .map(|r| r.resident_dense_bytes_min)
+            .unwrap_or(0),
+        resident_dense_bytes_max: sim_result
+            .residency
+            .map(|r| r.resident_dense_bytes_max)
+            .unwrap_or(0),
+        resident_dense_bytes_final: sim_result
+            .residency
+            .map(|r| r.resident_dense_bytes_final)
+            .unwrap_or(0),
+        residency_backing_disk_bytes: sim_result.residency_backing_disk_bytes,
+        per_client_egress,
+        contact_damage_cuts_submitted: sim_result.contact_damage_cuts_submitted,
+        contact_damage_cuts_rejected: sim_result.contact_damage_cuts_rejected,
+        dormancy_deactivations_total: sim_result.dormancy_deactivations_total,
+        dormancy_reactivations_total: sim_result.dormancy_reactivations_total,
+        residency_pinned_bricks_max: sim_result
+            .residency
+            .map(|r| r.pinned_bricks_max as u64)
+            .unwrap_or(0),
+        residency_admission_deferred_total: sim_result
+            .residency
+            .map(|r| r.admission_deferred_total)
+            .unwrap_or(0),
+        residency_required_over_budget_ticks: sim_result
+            .residency
+            .map(|r| r.required_over_budget_ticks)
+            .unwrap_or(0),
+        residency_digest_bytes_final: sim_result
+            .residency
+            .map(|r| r.digest_bytes_final)
+            .unwrap_or(0),
+        residency_backing_resident_bytes: sim_result.residency.and_then(|r| r.backing_bytes_final),
+        process_peak_memory_bytes: crate::mem_stats::process_peak_bytes(),
+        residency_checkpoint_bricks_captured_total: sim_result
+            .residency
+            .map(|r| r.checkpoint_bricks_captured_total)
+            .unwrap_or(0),
+        residency_checkpoint_bricks_logical_total: sim_result
+            .residency
+            .map(|r| r.checkpoint_bricks_logical_total)
+            .unwrap_or(0),
+        tick_busy_p95_ms: sim_result.timing.tick_busy_p95_ms,
+        tick_busy_p99_ms: sim_result.timing.tick_busy_p99_ms,
+        tick_busy_max_ms: sim_result.timing.tick_busy_max_ms,
+        tick_busy_samples: sim_result.timing.tick_busy_samples,
+        tick_busy_window_complete: sim_result.timing.window_complete,
+        physics_p95_ms: sim_result.timing.physics_p95_ms,
+        physics_p99_ms: sim_result.timing.physics_p99_ms,
+        physics_max_ms: sim_result.timing.physics_max_ms,
+        physics_samples: sim_result.timing.physics_samples,
+        physics_window_complete: sim_result.timing.window_complete,
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -652,6 +3081,79 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     Ok(summary)
 }
 
+#[derive(Debug, Clone, Default)]
+struct TimingReport {
+    tick_busy_p95_ms: f64,
+    tick_busy_p99_ms: f64,
+    tick_busy_max_ms: f64,
+    tick_busy_samples: u64,
+    physics_p95_ms: f64,
+    physics_p99_ms: f64,
+    physics_max_ms: f64,
+    physics_samples: u64,
+    window_complete: bool,
+}
+
+struct TimingCollector {
+    window: TimingWindow,
+    tick_busy_ms: Vec<f64>,
+    physics_ms: Vec<f64>,
+}
+
+impl TimingCollector {
+    fn new(window: TimingWindow) -> Self {
+        Self {
+            window,
+            tick_busy_ms: Vec::with_capacity(window.max_samples),
+            physics_ms: Vec::with_capacity(window.max_samples),
+        }
+    }
+
+    fn record(&mut self, tick: u64, busy: Duration, physics: Duration) {
+        let measured_end = self
+            .window
+            .warmup_ticks
+            .saturating_add(self.window.measured_ticks);
+        if tick <= self.window.warmup_ticks || tick > measured_end {
+            return;
+        }
+        if self.tick_busy_ms.len() < self.window.max_samples {
+            self.tick_busy_ms.push(busy.as_secs_f64() * 1_000.0);
+            self.physics_ms.push(physics.as_secs_f64() * 1_000.0);
+        }
+    }
+
+    fn finish(self, ticks_run: u64) -> TimingReport {
+        let window_end = self
+            .window
+            .warmup_ticks
+            .saturating_add(self.window.measured_ticks);
+        TimingReport {
+            tick_busy_p95_ms: percentile(&self.tick_busy_ms, 0.95),
+            tick_busy_p99_ms: percentile(&self.tick_busy_ms, 0.99),
+            tick_busy_max_ms: self.tick_busy_ms.iter().copied().fold(0.0, f64::max),
+            tick_busy_samples: self.tick_busy_ms.len() as u64,
+            physics_p95_ms: percentile(&self.physics_ms, 0.95),
+            physics_p99_ms: percentile(&self.physics_ms, 0.99),
+            physics_max_ms: self.physics_ms.iter().copied().fold(0.0, f64::max),
+            physics_samples: self.physics_ms.len() as u64,
+            window_complete: self.window.measured_ticks > 0 && ticks_run >= window_end,
+        }
+    }
+}
+
+fn percentile(samples: &[f64], fraction: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = (fraction * sorted.len() as f64)
+        .ceil()
+        .clamp(1.0, sorted.len() as f64) as usize;
+    sorted[rank - 1]
+}
+
 struct SimResult {
     ok: bool,
     error: Option<String>,
@@ -661,6 +3163,12 @@ struct SimResult {
     final_world_hash: String,
     total_solid_cells: u64,
     body_count: usize,
+    max_detached_body_brick_span: u64,
+    detached_body_max_final_speed_m_s: f64,
+    detached_bodies_all_asleep: bool,
+    detached_body_stable_ticks: u64,
+    max_contact_penetration_m: f64,
+    detached_body_min_origin_y_m: f64,
     checkpoints_published: u64,
     journal_records_written: u64,
     persist_bytes_per_write: f64,
@@ -670,6 +3178,32 @@ struct SimResult {
     late_joins_failed: u64,
     expired_actions_rejected: u64,
     baseline_bytes_sent: u64,
+    actions_throttled: u64,
+    repairs_throttled: u64,
+    motion_snapshots_sent: u64,
+    motion_snapshots_interest_culled: u64,
+    motion_snapshots_budget_deferred: u64,
+    max_client_motion_batch_bytes: u64,
+    // T11a / ENG-62.
+    actions_requested: u64,
+    actions_staged: u64,
+    actions_queued_unresolved: u64,
+    latency: commit_latency::LatencyReport,
+    residency: Option<crate::ResidencyStats>,
+    /// T23 / G3 row 7 item 3: the residency backing's on-disk footprint, when
+    /// it is a real disk-backed store (`crate::disk_backing::DiskBrickBacking`).
+    /// `None` for the in-process `MemoryBacking` default and when residency
+    /// is off.
+    residency_backing_disk_bytes: Option<u64>,
+    /// T23 / G3 row 14: each slot's player spawn, keyed by slot so the outer
+    /// per-connection egress report (built after this blocking task returns)
+    /// can be read alongside where that connection's interest anchor was.
+    client_spawns: HashMap<u32, [f64; 3]>,
+    contact_damage_cuts_submitted: u64,
+    contact_damage_cuts_rejected: u64,
+    dormancy_deactivations_total: u64,
+    dormancy_reactivations_total: u64,
+    timing: TimingReport,
 }
 
 impl SimResult {
@@ -683,6 +3217,12 @@ impl SimResult {
             final_world_hash: String::new(),
             total_solid_cells: 0,
             body_count: 0,
+            max_detached_body_brick_span: 0,
+            detached_body_max_final_speed_m_s: 0.0,
+            detached_bodies_all_asleep: true,
+            detached_body_stable_ticks: 0,
+            max_contact_penetration_m: 0.0,
+            detached_body_min_origin_y_m: 0.0,
             checkpoints_published: 0,
             journal_records_written: 0,
             persist_bytes_per_write: 0.0,
@@ -692,6 +3232,24 @@ impl SimResult {
             late_joins_failed: 0,
             expired_actions_rejected: 0,
             baseline_bytes_sent: 0,
+            actions_throttled: 0,
+            repairs_throttled: 0,
+            motion_snapshots_sent: 0,
+            motion_snapshots_interest_culled: 0,
+            motion_snapshots_budget_deferred: 0,
+            max_client_motion_batch_bytes: 0,
+            actions_requested: 0,
+            actions_staged: 0,
+            actions_queued_unresolved: 0,
+            latency: commit_latency::LatencyReport::default(),
+            residency: None,
+            residency_backing_disk_bytes: None,
+            client_spawns: HashMap::new(),
+            contact_damage_cuts_submitted: 0,
+            contact_damage_cuts_rejected: 0,
+            dormancy_deactivations_total: 0,
+            dormancy_reactivations_total: 0,
+            timing: TimingReport::default(),
         }
     }
 }
@@ -699,6 +3257,14 @@ impl SimResult {
 // --- T17 late-join / catch-up / session renewal ---------------------------
 
 /// How the server is currently treating one connected client.
+/// One entry in a joining client's catch-up queue. A giant split (T17
+/// increment 2) enqueues its marker transaction *and* the out-of-band
+/// `BaselineTransfer` that carries its geometry, drained in order.
+enum QueuedItem {
+    Tx(Arc<TopologyTransaction>),
+    Blob(Arc<BaselineTransfer>),
+}
+
 enum Phase {
     /// Normal replication: every committed transaction is pushed immediately.
     Live,
@@ -707,7 +3273,7 @@ enum Phase {
     /// past the cap cancels and re-captures a fresher baseline.
     Joining {
         transfer_id: TransferId,
-        queue: VecDeque<Arc<TopologyTransaction>>,
+        queue: VecDeque<QueuedItem>,
         retries: u32,
     },
 }
@@ -720,6 +3286,68 @@ struct ClientLink {
 /// All the per-run late-join / reconnect bookkeeping the sim loop needs, kept
 /// out of the loop body. Also the unit-test surface for the catch-up bound and
 /// the session-generation guard.
+/// A small fixed-size worker pool bounding how many background baseline
+/// captures (`LateJoin::on_baseline_ack`) run concurrently. ENG-30 / T23 row
+/// 11, increment 30: replaces one raw `std::thread::spawn` per join request
+/// with a bounded set of long-lived workers pulling from a shared job queue
+/// -- see [`default_capture_workers`] and `docs/reports/G3.md` increment 30
+/// for the measurement this pool's default size is derived from. A job past
+/// the worker count is queued, never rejected or dropped: this bounds
+/// *concurrency*, not the number of simultaneously in-flight joins (that is
+/// [`ServeConfig::catch_up_cap`] / [`ServeConfig::max_join_retries`]'s job).
+///
+/// Rayon (mentioned only as a design inspiration in this workspace's README,
+/// not an actual `[workspace.dependencies]` entry -- confirmed via `cargo
+/// tree -i rayon`, which finds no such package) was considered first per
+/// this ticket's instructions, but adding it as a new real dependency of
+/// `spall_server` for one bounded-queue primitive would cut against this
+/// project's stated preference for minimal dependencies; a channel plus a
+/// fixed set of threads is a handful of lines and needs no new crate.
+struct CapturePool {
+    job_tx: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
+}
+
+impl CapturePool {
+    /// Spawns `workers` (clamped to at least `1`) long-lived OS threads
+    /// sharing one job queue.
+    fn new(workers: usize) -> Self {
+        let workers = workers.max(1);
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        for _ in 0..workers {
+            let job_rx = Arc::clone(&job_rx);
+            std::thread::spawn(move || {
+                loop {
+                    // Hold the lock only long enough to pull the next job --
+                    // the actual capture work below runs unlocked, so workers
+                    // never serialize on anything but the handoff itself.
+                    let job = {
+                        let rx = job_rx.lock().unwrap_or_else(|poison| poison.into_inner());
+                        rx.recv()
+                    };
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => break, // every `CapturePool` (sender) is gone
+                    }
+                }
+            });
+        }
+        Self { job_tx }
+    }
+
+    /// Enqueues `job` for the next free worker. Never blocks the caller (the
+    /// simulation tick loop) -- the queue itself is unbounded, only
+    /// concurrent *execution* is bounded by the worker count.
+    fn spawn(&self, job: impl FnOnce() + Send + 'static) {
+        // The only failure mode is every worker thread having panicked and
+        // dropped its receiver handle -- the job closure here never panics on
+        // any known input. If it ever did happen, the caller's
+        // `pending_captures` entry simply never resolves rather than
+        // panicking the tick loop.
+        let _ = self.job_tx.send(Box::new(job));
+    }
+}
+
 struct LateJoin {
     /// `session.raw()` → link.
     links: HashMap<u64, ClientLink>,
@@ -734,10 +3362,30 @@ struct LateJoin {
     failed: u64,
     expired_actions: u64,
     baseline_bytes: u64,
+    /// T23 / G3 row 7, slice D: the residency pass's durable backing, so a
+    /// late-join baseline / repair patch can fill a brick the server has
+    /// evicted. `None` when residency is off.
+    backing: Option<std::sync::Arc<dyn spall_sim::BrickBacking>>,
+    /// The most recent immutable topology baseline. A current join may reuse
+    /// it with a fresh transfer id; transactions after its cursor remain in the
+    /// ordinary per-client catch-up queue.
+    cached_baseline: Option<std::sync::Arc<BaselineTransfer>>,
+    /// Bounded worker results keyed by the joining session. The simulation owns
+    /// publication and only polls these at tick boundaries.
+    pending_captures: HashMap<
+        u64,
+        (
+            TransferId,
+            std::sync::mpsc::Receiver<Result<BaselineTransfer, baseline::BaselineError>>,
+        ),
+    >,
+    /// ENG-30 / T23 row 11, increment 30: bounds concurrent background
+    /// baseline captures. See [`CapturePool`].
+    capture_pool: CapturePool,
 }
 
 impl LateJoin {
-    fn new(catch_up_cap: usize, max_retries: u32) -> Self {
+    fn new(catch_up_cap: usize, max_retries: u32, capture_workers: usize) -> Self {
         Self {
             links: HashMap::new(),
             latest_gen: HashMap::new(),
@@ -749,7 +3397,15 @@ impl LateJoin {
             failed: 0,
             expired_actions: 0,
             baseline_bytes: 0,
+            backing: None,
+            cached_baseline: None,
+            pending_captures: HashMap::new(),
+            capture_pool: CapturePool::new(capture_workers),
         }
+    }
+
+    fn backing_ref(&self) -> Option<&dyn spall_sim::BrickBacking> {
+        self.backing.as_deref()
     }
 
     fn on_joined(&mut self, session: SessionId) {
@@ -770,6 +3426,32 @@ impl LateJoin {
         // Keep `latest_gen` so a straggler record from this session is still
         // rejected after the link is gone.
         self.links.remove(&session.raw());
+        self.pending_captures.remove(&session.raw());
+    }
+
+    /// Every connected client currently in normal (`Live`) replication. A client
+    /// still pulling a late-join baseline is excluded — it gets a motion
+    /// keyframe when its catch-up barrier is reached, not the live 20 Hz feed
+    /// (`docs/protocol.md` late-join step 4).
+    fn live_sessions(&self) -> impl Iterator<Item = SessionId> + '_ {
+        self.links
+            .values()
+            .filter(|link| matches!(link.phase, Phase::Live))
+            .map(|link| link.session)
+    }
+
+    /// `true` while any connected client is still mid-baseline: it has sent its
+    /// `BaselineAck` sentinel (or been re-captured after a catch-up overflow)
+    /// but has not yet sent back the confirming ack that promotes it to `Live`.
+    /// A run must never be declared quiescent while this holds — an impaired
+    /// transport can stretch a bulk transfer well past `quiescence_ticks` of
+    /// otherwise-idle ticks, and ending the session early strands that client's
+    /// connection before its transfer completes (it never gets a chance to
+    /// replicate, let alone run its scripted movement/residency).
+    fn any_joining(&self) -> bool {
+        self.links
+            .values()
+            .any(|link| matches!(link.phase, Phase::Joining { .. }))
     }
 
     /// `true` if `session`'s generation has been superseded by a reconnect on
@@ -808,8 +3490,13 @@ impl LateJoin {
 
         if want_baseline {
             let id = self.next_id();
-            match capture_for(sim, id) {
+            match self
+                .cached_baseline
+                .as_ref()
+                .filter(|b| b.begin.journal_cursor == JournalSeq(sim.journal_cursor()))
+            {
                 Some(transfer) => {
+                    let transfer = transfer.reissue(id);
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&session.raw()) {
                         link.phase = Phase::Joining {
@@ -821,9 +3508,23 @@ impl LateJoin {
                     send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
                 }
                 None => {
-                    self.failed += 1;
-                    self.links.remove(&session.raw());
-                    send_to(clients, session, Outbound::Shutdown);
+                    let snapshot = baseline::snapshot_world(sim, self.backing_ref());
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    self.capture_pool.spawn(move || {
+                        let _ = tx.send(baseline::transfer_from_snapshot(
+                            snapshot,
+                            id,
+                            InterestEpoch(1),
+                        ));
+                    });
+                    if let Some(link) = self.links.get_mut(&session.raw()) {
+                        link.phase = Phase::Joining {
+                            transfer_id: id,
+                            queue: VecDeque::new(),
+                            retries: 0,
+                        };
+                        self.pending_captures.insert(session.raw(), (id, rx));
+                    }
                 }
             }
             return;
@@ -834,18 +3535,21 @@ impl LateJoin {
         if !matches {
             return; // stale / duplicate ack
         }
-        let drained: Vec<Arc<TopologyTransaction>> = match self.links.get_mut(&session.raw()) {
+        let drained: Vec<QueuedItem> = match self.links.get_mut(&session.raw()) {
             Some(ClientLink {
                 phase: Phase::Joining { queue, .. },
                 ..
             }) => queue.drain(..).collect(),
             _ => Vec::new(),
         };
-        for tx in drained {
-            send_to(clients, session, Outbound::Transaction(tx));
+        for item in drained {
+            match item {
+                QueuedItem::Tx(tx) => send_to(clients, session, Outbound::Transaction(tx)),
+                QueuedItem::Blob(t) => send_to(clients, session, Outbound::Baseline(t)),
+            }
         }
         // A current motion keyframe for every body (`docs/protocol.md` step 4).
-        let keyframe = motion.snapshots(sim.world(), sim.current_tick());
+        let keyframe = motion.full_snapshots(sim.world(), sim.current_tick());
         if !keyframe.is_empty() {
             send_to(clients, session, Outbound::Motion(Arc::new(keyframe)));
         }
@@ -858,20 +3562,37 @@ impl LateJoin {
     /// Routes one committed transaction: live clients get it now; joining
     /// clients get it queued, and a queue past the cap triggers a bounded
     /// re-capture (or an explicit drop once the retry budget is spent).
+    ///
+    /// `split_transfer` is the out-of-band `BaselineWorld` for a giant split
+    /// (T17 increment 2): a live client also gets it as an `Outbound::Baseline`
+    /// right after the marker transaction; a joining client gets both queued.
     fn fan_out_transaction(
         &mut self,
         tx: Arc<TopologyTransaction>,
+        split_transfer: Option<Arc<BaselineTransfer>>,
         sim: &Simulation,
         clients: &ClientMap,
     ) {
+        // A topology transaction invalidates the snapshot/cursor pairing. Body
+        // motion alone does not: the promotion keyframe supplies current poses.
+        self.cached_baseline = None;
+        if let Some(t) = &split_transfer {
+            self.baseline_bytes += t.payload_bytes() as u64;
+        }
         let mut overflowed: Vec<u64> = Vec::new();
         for (raw, link) in self.links.iter_mut() {
             match &mut link.phase {
                 Phase::Live => {
                     send_to(clients, link.session, Outbound::Transaction(tx.clone()));
+                    if let Some(t) = &split_transfer {
+                        send_to(clients, link.session, Outbound::Baseline(t.clone()));
+                    }
                 }
                 Phase::Joining { queue, .. } => {
-                    queue.push_back(tx.clone());
+                    queue.push_back(QueuedItem::Tx(tx.clone()));
+                    if let Some(t) = &split_transfer {
+                        queue.push_back(QueuedItem::Blob(t.clone()));
+                    }
                     if queue.len() > self.catch_up_cap {
                         overflowed.push(*raw);
                     }
@@ -892,12 +3613,16 @@ impl LateJoin {
             if retries > self.max_retries {
                 self.failed += 1;
                 self.links.remove(&raw);
-                send_to(clients, session, Outbound::Shutdown);
+                send_to(
+                    clients,
+                    session,
+                    Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                );
                 continue;
             }
             self.retries += 1;
             let id = self.next_id();
-            match capture_for(sim, id) {
+            match self.capture_for(sim, id) {
                 Some(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&raw) {
@@ -912,7 +3637,11 @@ impl LateJoin {
                 None => {
                     self.failed += 1;
                     self.links.remove(&raw);
-                    send_to(clients, session, Outbound::Shutdown);
+                    send_to(
+                        clients,
+                        session,
+                        Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                    );
                 }
             }
         }
@@ -927,96 +3656,271 @@ impl LateJoin {
         sim: &Simulation,
         clients: &ClientMap,
     ) {
-        let Some(world) = baseline::brick_repair_patch(sim, req) else {
+        let Some(world) = baseline::logical_brick_repair_patch(sim, req, self.backing_ref()) else {
             return;
         };
         let id = self.next_id();
-        let cursor = JournalSeq(sim.journal().entries().last().map(|e| e.seq.0).unwrap_or(0));
+        let cursor = JournalSeq(sim.journal_cursor());
         if let Ok(transfer) = baseline::transfer_from_world(world, id, InterestEpoch(1), cursor) {
             self.baseline_bytes += transfer.payload_bytes() as u64;
             send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
         }
     }
+
+    /// Captures a baseline transfer at the current tick / journal cursor, over
+    /// the logical brick set (evicted bricks filled from the residency
+    /// backing when one is installed).
+    fn capture_for(&mut self, sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
+        let cursor = JournalSeq(sim.journal_cursor());
+        if let Some(cached) = &self.cached_baseline
+            && cached.begin.journal_cursor == cursor
+        {
+            return Some(cached.reissue(id));
+        }
+        let transfer = baseline::logical_capture_transfer(
+            sim,
+            self.backing_ref(),
+            id,
+            InterestEpoch(1),
+            cursor,
+        )
+        .ok()?;
+        self.cached_baseline = Some(std::sync::Arc::new(transfer.reissue(id)));
+        Some(transfer)
+    }
+
+    fn publish_ready_captures(&mut self, clients: &ClientMap) {
+        let ready: Vec<(u64, Result<BaselineTransfer, baseline::BaselineError>)> = self
+            .pending_captures
+            .iter()
+            .filter_map(|(&raw, (_, rx))| rx.try_recv().ok().map(|result| (raw, result)))
+            .collect();
+        for (raw, result) in ready {
+            let Some((id, _)) = self.pending_captures.remove(&raw) else {
+                continue;
+            };
+            match result {
+                Ok(transfer) => {
+                    self.baseline_bytes += transfer.payload_bytes() as u64;
+                    self.cached_baseline = Some(Arc::new(transfer.reissue(id)));
+                    if let Some(link) = self.links.get(&raw) {
+                        send_to(
+                            clients,
+                            link.session,
+                            Outbound::Baseline(Arc::new(transfer)),
+                        );
+                    }
+                }
+                _ => {
+                    self.failed += 1;
+                    if let Some(link) = self.links.remove(&raw) {
+                        send_to(
+                            clients,
+                            link.session,
+                            Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
-/// Captures a baseline transfer at the current tick / journal cursor.
-fn capture_for(sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
-    let cursor = JournalSeq(sim.journal().entries().last().map(|e| e.seq.0).unwrap_or(0));
-    baseline::capture_transfer(sim, id, InterestEpoch(1), cursor).ok()
+/// Complete checkpoints kept on disk at each retention pass. Older ones — and
+/// the journal rows they alone covered — are pruned (`docs/protocol.md`: "Cap
+/// retention; lagging joins get a fresh baseline").
+const RETAIN_CHECKPOINTS: usize = 2;
+
+/// What [`setup_persistence`] hands back: the simulation, the bounded async
+/// persistence pipeline (`None` when `--save` is unset), the highest journal
+/// sequence already durable at startup, and how many checkpoints were published
+/// synchronously during setup.
+struct Persistence {
+    sim: Simulation,
+    pipeline: Option<PersistPipeline>,
+    journalled_through: u64,
+    checkpoints_published: u64,
+    outbox_processor: Option<OutboxProcessor>,
 }
 
 /// Opens the world database, recovering from it when it already holds a
 /// checkpoint and otherwise starting the built-in `scene` and publishing an
-/// initial checkpoint. `None` save path → no persistence.
+/// initial checkpoint. Any test-only `save_faults` are armed on the recovered
+/// [`Writer`] *after* recovery and that initial checkpoint, then the writer is
+/// handed to a [`PersistPipeline`] so every later durable write happens off the
+/// simulation thread (ENG-50). `None` save path → no persistence.
+///
+/// This fails closed on corruption: only a genuinely empty database
+/// ([`spall_store::StoreError::NoCheckpoint`]) is initialised with the built-in
+/// scene. A recovery that reports corruption, or a database whose checkpoints
+/// exist but do not decode, aborts startup without touching the file — losing
+/// durable records requires an explicit operator choice
+/// ([`persist::RecoveryChoice`]), not an automatic resume or reinitialisation.
+#[cfg(test)]
 fn setup_persistence(
     save: Option<&std::path::Path>,
     scene: Scene,
     cfg: &PersistConfig,
-) -> Result<(Simulation, u64, Option<Writer>, u64), String> {
+    save_faults: Option<spall_store::FaultPlan>,
+) -> Result<Persistence, String> {
+    setup_persistence_with_terrain_collider_mode(
+        save,
+        scene,
+        cfg,
+        save_faults,
+        TerrainColliderMode::PerBrick,
+    )
+}
+
+#[cfg(test)]
+fn setup_persistence_with_terrain_collider_mode(
+    save: Option<&std::path::Path>,
+    scene: Scene,
+    cfg: &PersistConfig,
+    save_faults: Option<spall_store::FaultPlan>,
+    terrain_collider_mode: TerrainColliderMode,
+) -> Result<Persistence, String> {
+    setup_persistence_with_game_content(
+        save,
+        scene,
+        None,
+        cfg,
+        save_faults,
+        terrain_collider_mode,
+        spall_sim::fixtures::stone_manifest(),
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_persistence_with_game_content(
+    save: Option<&std::path::Path>,
+    scene: Scene,
+    custom_world: Option<&CustomWorld>,
+    cfg: &PersistConfig,
+    save_faults: Option<spall_store::FaultPlan>,
+    terrain_collider_mode: TerrainColliderMode,
+    materials: spall_core::MaterialManifest,
+    mut game_setup: Option<InitialGameWorldSetup>,
+    mut outbox_processor: Option<OutboxProcessor>,
+) -> Result<Persistence, String> {
     let Some(path) = save else {
-        return Ok((scene.simulation(), 0, None, 0));
+        let mut sim =
+            scene.simulation_with_materials(terrain_collider_mode, materials, custom_world);
+        if let Some(setup) = game_setup.take() {
+            setup(&mut sim)?;
+        }
+        return Ok(Persistence {
+            sim,
+            pipeline: None,
+            journalled_through: 0,
+            checkpoints_published: 0,
+            outbox_processor,
+        });
     };
     let mut writer = Writer::open(path).map_err(|e| e.to_string())?;
-    match writer.recover() {
+    let (sim, journalled_through, checkpoints_published) = match writer.recover() {
         Ok(recovery) => {
-            let (sim, seq) = persist::restore(
+            let (sim, seq) = persist::restore_with_terrain_collider_mode(
                 &recovery,
-                fixtures::stone_manifest(),
+                cfg,
+                persist::RecoveryChoice::RequireClean,
+                materials.clone(),
                 AnchorPlane::at(0),
                 PhysicsConfig::default(),
+                terrain_collider_mode,
             )
             .map_err(|e| e.to_string())?;
-            Ok((sim, seq, Some(writer), 0))
+            (sim, seq, 0)
         }
+        // A genuinely new/empty database: seed it with the built-in scene.
         Err(spall_store::StoreError::NoCheckpoint) => {
-            let sim = scene.simulation();
+            let mut sim =
+                scene.simulation_with_materials(terrain_collider_mode, materials, custom_world);
+            if let Some(setup) = game_setup.take() {
+                setup(&mut sim)?;
+            }
             let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
             writer
                 .publish_checkpoint(&checkpoint)
                 .map_err(|e| e.to_string())?;
-            Ok((sim, 0, Some(writer), 1))
+            (sim, 0, 1)
         }
-        Err(e) => Err(e.to_string()),
+        // Checkpoints exist but none decoded — corruption, not an empty DB. Do
+        // not overwrite the save with a fresh scene.
+        Err(e @ spall_store::StoreError::CheckpointsUnrecoverable(_)) => {
+            return Err(format!(
+                "world database at {} is unrecoverable and must not be overwritten: {e}; \
+                 an operator must supply a verified recovery source",
+                path.display()
+            ));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    // Test-only: arm the writer only now, so recovery and the first checkpoint
+    // are unaffected and the fault falls on a later durable write.
+    if let Some(faults) = save_faults {
+        writer.set_faults(faults);
     }
-}
-
-/// Appends every simulation journal entry past `durable_seq` to the store and
-/// advances `durable_seq` to the acknowledged sequence. Returns how many
-/// records were written.
-fn flush_journal(
-    writer: &mut Writer,
-    sim: &Simulation,
-    durable_seq: &mut u64,
-) -> Result<u64, String> {
-    let pending: Vec<_> = sim
-        .journal()
-        .entries()
-        .iter()
-        .filter(|e| e.seq.0 > *durable_seq)
-        .cloned()
-        .collect();
-    if pending.is_empty() {
-        return Ok(0);
+    if let Some(processor) = outbox_processor.as_mut() {
+        loop {
+            let events = writer.pending_outbox(256).map_err(|e| e.to_string())?;
+            if events.is_empty() {
+                break;
+            }
+            for event in &events {
+                processor(event)?;
+            }
+            let ids: Vec<_> = events.iter().map(|event| event.event_id).collect();
+            writer.acknowledge_outbox(&ids).map_err(|e| e.to_string())?;
+        }
     }
-    let records = persist::journal_records(&pending).map_err(|e| e.to_string())?;
-    let durable = writer.append_journal(&records).map_err(|e| e.to_string())?;
-    *durable_seq = durable.journal_seq.0;
-    Ok(records.len() as u64)
+    let pipeline = PersistPipeline::spawn(writer, PipelineConfig::default());
+    Ok(Persistence {
+        sim,
+        pipeline: Some(pipeline),
+        journalled_through,
+        checkpoints_published,
+        outbox_processor,
+    })
 }
 
-fn publish_checkpoint(
-    writer: &mut Writer,
-    sim: &Simulation,
-    cfg: &PersistConfig,
-    durable_seq: u64,
-) -> Result<(), String> {
-    let checkpoint = persist::capture(sim, cfg, durable_seq).map_err(|e| e.to_string())?;
-    writer
-        .publish_checkpoint(&checkpoint)
-        .map_err(|e| e.to_string())
+/// Builds the contiguous journal batch owed for one tick: every committed
+/// topology entry past `journalled_through`, followed by this tick's 20 Hz pose
+/// batch (if any). The pose sequence is reserved from the simulation so it is
+/// contiguous with the topology sequences (`docs/protocol.md`: "Journal
+/// periodic body pose batches at 20 Hz"; ENG-50: "contiguous sequence
+/// ownership"). Advances `journalled_through` to the last sequence in the
+/// batch.
+fn tick_journal_batch(
+    sim: &mut Simulation,
+    journalled_through: &mut u64,
+    pose_batch: Option<&[MotionSnapshot]>,
+    tick: u64,
+) -> Result<Vec<spall_store::JournalRecord>, String> {
+    let mut batch = persist::journal_records(sim.journal().entries_after(*journalled_through))
+        .map_err(|e| e.to_string())?;
+    if let Some(snaps) = pose_batch.filter(|s| !s.is_empty()) {
+        let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
+        batch.push(persist::pose_batch_record(seq.0, tick, snaps).map_err(|e| e.to_string())?);
+    }
+    if let Some(last) = batch.last() {
+        *journalled_through = last.seq;
+    }
+    Ok(batch)
 }
 
-fn intent_from_request(session: SessionId, req: &ActionRequest) -> Option<EditIntent> {
+/// A stable per-session actor id. Authority is the server's; this is only
+/// journal provenance.
+fn actor_for(session: SessionId) -> EntityId {
+    EntityId::new(1 + u64::from(session.slot().0)).unwrap_or(EntityId::new(1).unwrap())
+}
+
+/// **Development-scenario path** (`ServeConfig::dev_unvalidated_actions`). Trusts
+/// `claimed_target` / `claimed_brush` verbatim so a fixture harness can script
+/// arbitrary cuts. `None` only for a genuinely unrepresentable target.
+fn dev_intent_from_request(session: SessionId, req: &ActionRequest) -> Option<EditIntent> {
     let target = match req.claimed_target {
         ClaimedTarget::Terrain => EditTarget::Terrain,
         ClaimedTarget::Body(entity) => EditTarget::Body(entity),
@@ -1025,12 +3929,9 @@ fn intent_from_request(session: SessionId, req: &ActionRequest) -> Option<EditIn
         ActionKind::Cut => EditKind::Cut,
         ActionKind::Place => EditKind::Place(spall_voxel::fixtures::STONE),
     };
-    // A stable per-session actor id; authority is the server's, this is only
-    // journal provenance.
-    let actor = EntityId::new(1 + u64::from(session.slot().0)).unwrap_or(EntityId::new(1).unwrap());
     Some(EditIntent {
         request_id: req.request_id,
-        actor,
+        actor: actor_for(session),
         target,
         kind,
         brush: req.claimed_brush,
@@ -1038,15 +3939,363 @@ fn intent_from_request(session: SessionId, req: &ActionRequest) -> Option<EditIn
     })
 }
 
+// --- ENG-47: server-side action-claim validation -------------------------------
+
+/// Why an [`ActionRequest`] was refused before it could become an [`EditIntent`].
+/// The `&'static str` variants keep the `ActionStatus` reason strings stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionReject {
+    UnknownTool(u16),
+    ToolActionMismatch,
+    RadiusTooLarge {
+        requested_cells: i64,
+        max_cells: i64,
+    },
+    BadAim,
+    NoAuthoritativeHit,
+    TargetMismatch,
+    StaleTarget,
+    Unsupported(&'static str),
+}
+
+impl ActionReject {
+    fn reason(&self) -> String {
+        match self {
+            ActionReject::UnknownTool(t) => format!("tool {t} is not an approved tool"),
+            ActionReject::ToolActionMismatch => {
+                "requested action is not permitted for this tool".to_string()
+            }
+            ActionReject::RadiusTooLarge {
+                requested_cells,
+                max_cells,
+            } => format!(
+                "brush radius {requested_cells} cells exceeds this tool's limit of {max_cells}"
+            ),
+            ActionReject::BadAim => "aim origin/direction is not a usable ray".to_string(),
+            ActionReject::NoAuthoritativeHit => {
+                "aim does not hit authoritative geometry within reach".to_string()
+            }
+            ActionReject::TargetMismatch => {
+                "claimed target does not match the authoritative hit".to_string()
+            }
+            ActionReject::StaleTarget => "claimed target no longer exists".to_string(),
+            ActionReject::Unsupported(s) => s.to_string(),
+        }
+    }
+}
+
+/// One authoritative ray hit, resolved against committed geometry.
+struct Struck {
+    target: EditTarget,
+    /// Struck solid cell, in the hit volume's **local cell space**.
+    cell: GlobalCell,
+    /// Empty cell against the struck face (where a placement lands), same space.
+    placement_cell: GlobalCell,
+    /// Distance from the aim origin, metres.
+    t_m: f64,
+}
+
+/// The nearest solid cell an aim ray meets across the terrain and every detached
+/// body, or `None` if nothing solid is within `reach_m`. This is the server's
+/// authoritative hit: a client-supplied hit point / body id is only a claim
+/// (`docs/architecture.md`: "The server determines the hit against its current
+/// authoritative geometry").
+fn nearest_hit(world: &SimWorld, ray: Ray, reach_m: f64) -> Option<Struck> {
+    let mut best: Option<Struck> = None;
+    let mut consider = |target: EditTarget, body: &Body| {
+        let xform = body.pose.xform(body.cell_size());
+        if let Ok(RayOutcome::Hit(hit)) = cast_ray_world(&body.volume, &xform, ray, reach_m)
+            && hit.t <= reach_m
+            && best.as_ref().is_none_or(|b| hit.t < b.t_m)
+        {
+            best = Some(Struck {
+                target,
+                cell: hit.cell,
+                placement_cell: hit.placement_cell,
+                t_m: hit.t,
+            });
+        }
+    };
+    consider(EditTarget::Terrain, world.terrain());
+    for body in world.bodies() {
+        if let Some(entity) = body.entity {
+            consider(EditTarget::Body(entity), body);
+        }
+    }
+    best
+}
+
+fn target_matches(claimed: ClaimedTarget, struck: EditTarget) -> bool {
+    match (claimed, struck) {
+        (ClaimedTarget::Terrain, EditTarget::Terrain) => true,
+        (ClaimedTarget::Body(a), EditTarget::Body(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Validates an `ActionRequest`'s claims against the authoritative world and
+/// turns it into an [`EditIntent`] whose brush is re-derived in the accepted
+/// target frame from the server's own raycast — never copied from the client.
+///
+/// Checks, in order: the tool id is approved; the requested action fits the
+/// tool; the requested radius is within the tool's cap; a named body still
+/// exists; the aim ray hits solid authoritative geometry within reach; and the
+/// struck volume matches `claimed_target`. The `session` is already known-live
+/// (the caller rejects a superseded generation first).
+#[cfg(test)]
+fn resolve_intent(
+    world: &SimWorld,
+    session: SessionId,
+    req: &ActionRequest,
+) -> Result<EditIntent, ActionReject> {
+    resolve_intent_with_catalog(world, session, req, &ToolCatalog::default())
+}
+
+fn resolve_intent_with_catalog(
+    world: &SimWorld,
+    session: SessionId,
+    req: &ActionRequest,
+    catalog: &ToolCatalog,
+) -> Result<EditIntent, ActionReject> {
+    let spec = catalog
+        .get(req.tool)
+        .ok_or(ActionReject::UnknownTool(req.tool))?;
+
+    let action_fits = matches!(
+        (req.action, spec.kind),
+        (ActionKind::Cut, EditKind::Cut) | (ActionKind::Place, EditKind::Place(_))
+    );
+    if !action_fits {
+        return Err(ActionReject::ToolActionMismatch);
+    }
+    if let EditKind::Place(material) = spec.kind
+        && world.materials().get(material).is_none()
+    {
+        return Err(ActionReject::Unsupported(
+            "tool material is absent from the authoritative world manifest",
+        ));
+    }
+
+    let max_units = spec.max_radius_cells.saturating_mul(BRUSH_UNIT);
+    let requested_units = req.claimed_brush.radius_units();
+    if requested_units > max_units {
+        return Err(ActionReject::RadiusTooLarge {
+            requested_cells: requested_units / BRUSH_UNIT,
+            max_cells: spec.max_radius_cells,
+        });
+    }
+
+    // A named body must still be part of the authoritative world.
+    if let ClaimedTarget::Body(entity) = req.claimed_target
+        && world.body(entity).is_none()
+    {
+        return Err(ActionReject::StaleTarget);
+    }
+
+    let origin = DVec3::from_array(req.aim_origin_m);
+    let dir = DVec3::new(
+        req.aim_dir[0] as f64,
+        req.aim_dir[1] as f64,
+        req.aim_dir[2] as f64,
+    );
+    if !origin.is_finite() || !dir.is_finite() || dir.length_squared() < 1e-24 {
+        return Err(ActionReject::BadAim);
+    }
+
+    let hit = nearest_hit(world, Ray::new(origin, dir), spec.reach_m)
+        .ok_or(ActionReject::NoAuthoritativeHit)?;
+    if !target_matches(req.claimed_target, hit.target) {
+        return Err(ActionReject::TargetMismatch);
+    }
+
+    // Quantize the approved operation into the accepted target volume's local
+    // integer cell space, centred on the server's own hit cell (the empty cell
+    // against the struck face for a placement). The client's claimed centre is
+    // discarded; its radius is kept only after passing the tool cap above.
+    let base = match spec.kind {
+        EditKind::Cut => hit.cell,
+        EditKind::Place(_) => hit.placement_cell,
+    };
+    let h = BRUSH_UNIT / 2;
+    let centre = BrushPoint::from_units(
+        base.x.saturating_mul(BRUSH_UNIT).saturating_add(h),
+        base.y.saturating_mul(BRUSH_UNIT).saturating_add(h),
+        base.z.saturating_mul(BRUSH_UNIT).saturating_add(h),
+    );
+    let brush = SphereBrush::new(centre, requested_units.max(0)).map_err(|_| {
+        ActionReject::RadiusTooLarge {
+            requested_cells: requested_units / BRUSH_UNIT,
+            max_cells: spec.max_radius_cells,
+        }
+    })?;
+
+    Ok(EditIntent {
+        request_id: req.request_id,
+        actor: actor_for(session),
+        target: hit.target,
+        kind: spec.kind,
+        brush,
+        explosion: None,
+    })
+}
+
+/// Per-tick admission counter, shared by the action and repair intake. Returns
+/// `true` while `session` is still under `cap` for this tick and bumps its
+/// count; `false` once the quota is spent. Each session's count is independent,
+/// so one client's flood never consumes another's quota (ENG-48 fair
+/// scheduling).
+fn admit(counts: &mut HashMap<u64, u32>, session: u64, cap: u32) -> bool {
+    let n = counts.entry(session).or_insert(0);
+    if *n >= cap {
+        return false;
+    }
+    *n += 1;
+    true
+}
+
+/// T20: a [`BodyDigest`] per authoritative body **and** per player capsule,
+/// keyed by entity id, for this motion batch. The body centre is its pose
+/// origin and its interest radius is half the diagonal of the collider region
+/// box — a conservative bound (the origin need not be the box centre), which
+/// only ever keeps a body *more* relevant.
+fn build_body_digests(world: &SimWorld) -> HashMap<u64, BodyDigest> {
+    let mut digests: HashMap<u64, BodyDigest> = HashMap::new();
+    for body in world.bodies() {
+        let Some(entity) = body.entity else { continue };
+        let (lo, hi) = body.collider_region;
+        let cs = body.cell_size().metres();
+        let ex = (hi.x - lo.x + 1) as f64 * cs;
+        let ey = (hi.y - lo.y + 1) as f64 * cs;
+        let ez = (hi.z - lo.z + 1) as f64 * cs;
+        digests.insert(
+            entity.get(),
+            BodyDigest {
+                key: entity.get(),
+                center_m: body.pose.translation_m,
+                radius_m: 0.5 * (ex * ex + ey * ey + ez * ez).sqrt(),
+                is_player: false,
+                sleeping: body.sleeping,
+            },
+        );
+    }
+    for player in world.players() {
+        digests.insert(
+            player.entity.get(),
+            BodyDigest {
+                key: player.entity.get(),
+                center_m: player.state.position_m,
+                radius_m: PLAYER_INTEREST_RADIUS_M,
+                is_player: true,
+                sleeping: false,
+            },
+        );
+    }
+    digests
+}
+
+/// Run totals for the T20 motion path, accumulated across every batch and
+/// client. All zero (and untouched) unless `motion_interest` is configured.
+#[derive(Debug, Default)]
+struct MotionEgress {
+    snapshots_sent: u64,
+    interest_culled: u64,
+    budget_deferred: u64,
+    max_client_batch_bytes: u64,
+}
+
+/// T20: route one 20 Hz motion batch to each live client filtered by its
+/// interest set and bandwidth budget. Committed topology is untouched — only
+/// motion, which the next batch supersedes, is ever withheld here.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_motion_by_interest(
+    mi: &MotionInterest,
+    scene: Scene,
+    batch_index: u64,
+    snaps: &[MotionSnapshot],
+    sim: &Simulation,
+    lj: &LateJoin,
+    clients: &ClientMap,
+    client_repl: &mut HashMap<u64, ClientReplication>,
+    egress: &mut MotionEgress,
+) {
+    let world = sim.world();
+    let digests = build_body_digests(world);
+    let budget = MotionBudget {
+        far_interval: mi.far_interval,
+        per_batch_bytes: mi.per_client_budget_bytes,
+    };
+
+    for session in lj.live_sessions() {
+        // The client's interest anchor: its own player capsule on a player
+        // scene, else the configured static anchor, else unfiltered.
+        let own_entity = scene.has_players().then(|| session_player_entity(session));
+        let own_player_key = own_entity.map(|e| e.get());
+        let anchor = match own_entity {
+            Some(entity) => world
+                .players()
+                .find(|p| p.entity == entity)
+                .map(|p| p.state.position_m),
+            None => mi.static_anchor_m,
+        };
+        let interest = match anchor {
+            Some(center_m) => InterestSet::Anchored {
+                center_m,
+                near_radius_m: mi.near_radius_m,
+                far_radius_m: mi.far_radius_m,
+            },
+            None => InterestSet::Global,
+        };
+
+        let repl = client_repl.entry(session.raw()).or_default();
+        repl.set_interest(interest);
+        let kept = repl.select(batch_index, own_player_key, snaps, &digests, &budget);
+        let outcome = repl.last_outcome();
+        egress.snapshots_sent += outcome.kept;
+        egress.interest_culled += outcome.interest_culled;
+        egress.budget_deferred += outcome.budget_deferred;
+        egress.max_client_batch_bytes = egress.max_client_batch_bytes.max(outcome.bytes as u64);
+        if !kept.is_empty() {
+            send_to(clients, session, Outbound::Motion(Arc::new(kept)));
+        }
+    }
+}
+
+/// Sends a single shared, supersedable motion batch to the supplied sessions.
+/// The caller chooses those sessions from [`LateJoin::live_sessions`] so a
+/// joining replica cannot consume link capacity before its baseline barrier.
+fn send_motion_to_sessions(
+    clients: &ClientMap,
+    recipients: impl IntoIterator<Item = SessionId>,
+    batch: Arc<Vec<MotionSnapshot>>,
+) {
+    for session in recipients {
+        send_to(clients, session, Outbound::Motion(Arc::clone(&batch)));
+    }
+}
+
+/// Fans one message to every client. A client whose reliable backlog blew its
+/// bound ([`OutboundOverflow`]) is dropped from the fan-out set here; its
+/// writer task flushes the already-accepted backlog and then closes the
+/// connection, so committed topology is never silently discarded.
 fn broadcast(clients: &ClientMap, msg: Outbound) {
     let mut guard = clients.lock().unwrap_or_else(|e| e.into_inner());
-    guard.retain(|_, tx| tx.send(msg.clone()).is_ok());
+    let mut overflowed: Vec<u64> = Vec::new();
+    for (id, handle) in guard.iter() {
+        if handle.push(msg.clone()).is_err() {
+            overflowed.push(*id);
+        }
+    }
+    for id in overflowed {
+        guard.remove(&id);
+    }
 }
 
 fn send_to(clients: &ClientMap, session: SessionId, msg: Outbound) {
-    let guard = clients.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tx) = guard.get(&session.raw()) {
-        let _ = tx.send(msg);
+    let mut guard = clients.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard.get(&session.raw())
+        && handle.push(msg).is_err()
+    {
+        guard.remove(&session.raw());
     }
 }
 
@@ -1061,6 +4310,71 @@ fn reject(clients: &ClientMap, session: SessionId, request: RequestId, reason: &
             },
         })),
     );
+}
+
+fn progression_rejected(
+    request: &spall_protocol::ProgressionRequest,
+    code: spall_protocol::ProgressionRejectCode,
+) -> spall_protocol::ProgressionResponse {
+    spall_protocol::ProgressionResponse {
+        request_id: request.request_id,
+        catalog_version: request.catalog_version.max(1),
+        inventory_revision: request.expected_inventory_revision,
+        outcome: spall_protocol::ProgressionOutcome::Rejected(code),
+        inventory: Vec::new(),
+    }
+}
+
+fn parse_player_credentials(bytes: &[u8]) -> Result<Vec<spall_net::PlayerCredential>, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "credential registry is not valid UTF-8".to_string())?;
+    let mut credentials = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let player_text = fields.next();
+        let token_text = fields.next();
+        if fields.next().is_some() {
+            return Err(format!(
+                "credential registry line {} has extra fields",
+                line_index + 1
+            ));
+        }
+        let (Some(player_text), Some(token_text)) = (player_text, token_text) else {
+            return Err(format!(
+                "credential registry line {} is incomplete",
+                line_index + 1
+            ));
+        };
+        let player_id = spall_protocol::PlayerId::from_hex(player_text).ok_or_else(|| {
+            format!(
+                "credential registry line {} has invalid player ID",
+                line_index + 1
+            )
+        })?;
+        let token = spall_net::JoinToken::from_hex(token_text).ok_or_else(|| {
+            format!(
+                "credential registry line {} has invalid token",
+                line_index + 1
+            )
+        })?;
+        credentials.push(spall_net::PlayerCredential { player_id, token });
+        if credentials.len() > 4096 {
+            return Err("credential registry exceeds the 4096-entry limit".into());
+        }
+    }
+    Ok(credentials)
+}
+
+/// Returns a replayable status only for an action that passed authoritative
+/// validation and was admitted to the simulation. Pre-admission validation and
+/// rate-limit refusals intentionally are not held here: no edit was staged, so
+/// a corrected retry is a new admission attempt (see `docs/protocol.md`).
+fn replay_admitted_status(sim: &Simulation, request: RequestId) -> Option<ActionStatus> {
+    sim.action_status(request).cloned()
 }
 
 /// Pushes one baseline transfer to a client: `BaselineBegin` on the control
@@ -1079,7 +4393,7 @@ async fn send_baseline(conn: &Connection, transfer: &BaselineTransfer) -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
-    for part in &transfer.parts {
+    for part in transfer.parts.iter() {
         if bulk.send_part(part).await.is_err() {
             return false;
         }
@@ -1105,19 +4419,25 @@ async fn wait_true(mut rx: watch::Receiver<bool>) {
 
 /// One client connection: a reader that forwards records to the bridge and a
 /// writer that drains this client's outbound queue.
+#[allow(clippy::too_many_arguments)]
 async fn serve_conn(
     conn: Arc<Connection>,
-    inbound: mpsc::UnboundedSender<Inbound>,
-    mut outbound: mpsc::UnboundedReceiver<Outbound>,
+    inbound: mpsc::Sender<Inbound>,
+    handle: OutboundHandle,
     clients: ClientMap,
+    conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
+    egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>>,
     stop: watch::Receiver<bool>,
+    _slot: AdmissionSlot,
 ) {
     debug_assert_eq!(conn.role(), Role::Server);
     let session = conn.session();
 
     // Announce the join in order so the sim loop can supersede an earlier
     // session on the same slot (reconnect) and drive a late-join baseline.
-    let _ = inbound.send(Inbound::Joined(session));
+    let _ = inbound
+        .send(Inbound::Joined(session, conn.player_id()))
+        .await;
 
     let liveness = tokio::spawn(conn.clone().run_liveness(stop.clone()));
 
@@ -1127,61 +4447,130 @@ async fn serve_conn(
         tokio::spawn(async move {
             loop {
                 match conn.recv_record().await {
+                    // ENG-48: never block the reader on a full bridge. A
+                    // flooding client's surplus is dropped here (the records
+                    // are client-retryable and rate-limited); the bounded
+                    // channel keeps host memory flat. A well-behaved client
+                    // stays far under the cap.
                     Ok(Some(WireRecord::ActionRequest(req))) => {
-                        let _ = inbound.send(Inbound::Action(session, req));
+                        match inbound.try_send(Inbound::Action(session, req)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                    Ok(Some(WireRecord::ProgressionRequest(req))) => {
+                        match inbound.try_send(Inbound::Progression(session, req)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
                     }
                     Ok(Some(WireRecord::RepairRequest(req))) => {
-                        let _ = inbound.send(Inbound::Repair(session, req));
+                        match inbound.try_send(Inbound::Repair(session, req)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
                     }
                     Ok(Some(WireRecord::BaselineAck(ack))) => {
-                        let _ = inbound.send(Inbound::Baseline(session, ack));
+                        if inbound.send(Inbound::Baseline(session, ack)).await.is_err() {
+                            break;
+                        }
                     }
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => break,
                 }
             }
-            let _ = inbound.send(Inbound::Gone(session));
+            let _ = inbound.send(Inbound::Gone(session)).await;
+        })
+    };
+
+    // T19: player movement input arrives as datagrams. Same non-blocking policy
+    // as the reliable reader — a flooding client's surplus is dropped, and the
+    // sim applies at most one frame per player per tick anyway.
+    let dgram_reader = {
+        let conn = conn.clone();
+        let inbound = inbound.clone();
+        tokio::spawn(async move {
+            loop {
+                match conn.recv_datagram().await {
+                    Ok(Some(DatagramRecord::Input(frame))) => {
+                        match inbound.try_send(Inbound::Input(session, frame)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
         })
     };
 
     let mut motion_seq = 0u64;
-    loop {
-        tokio::select! {
-            msg = outbound.recv() => {
-                let Some(msg) = msg else { break };
+    'writer: loop {
+        // Flush everything queued, in commit order, before parking.
+        loop {
+            let batch = handle.take();
+            if batch.is_empty() && !batch.overflowed {
+                break;
+            }
+            for msg in batch.reliable {
                 let ok = match msg {
-                    Outbound::Transaction(tx) => conn
-                        .send_record(WireRecord::TopologyTransaction((*tx).clone()))
-                        .await
-                        .is_ok(),
+                    Outbound::Transaction(tx) => {
+                        let sent = conn
+                            .send_record(WireRecord::TopologyTransaction((*tx).clone()))
+                            .await;
+                        if let Err(error) = &sent {
+                            // Never a silent disconnect: an encode failure here
+                            // (e.g. a record over the control limit) ends this
+                            // client's stream, so say why.
+                            tracing::error!(
+                                transaction = tx.transaction_id.get(),
+                                %error,
+                                "topology transaction could not be sent; closing client stream"
+                            );
+                        }
+                        sent.is_ok()
+                    }
                     Outbound::Status(s) => conn
                         .send_record(WireRecord::ActionStatus((*s).clone()))
                         .await
                         .is_ok(),
-                    Outbound::Baseline(transfer) => {
-                        send_baseline(&conn, &transfer).await
-                    }
-                    Outbound::Motion(snaps) => {
-                        let mut ok = true;
-                        for snap in snaps.iter() {
-                            if conn.send_datagram(motion_seq, snap).await.is_err() {
-                                ok = false;
-                                break;
-                            }
-                            motion_seq += 1;
-                        }
-                        ok
-                    }
-                    Outbound::Shutdown => {
-                        let _ = conn.say_bye("server complete").await;
+                    Outbound::Progression(reply) => conn
+                        .send_record(WireRecord::ProgressionResponse((*reply).clone()))
+                        .await
+                        .is_ok(),
+                    Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
+                    // Motion is never queued as reliable; ignore defensively.
+                    Outbound::Motion(_) => true,
+                    Outbound::Shutdown(reason) => {
+                        let _ = conn.say_bye(reason).await;
                         false
                     }
                 };
                 if !ok {
-                    break;
+                    break 'writer;
                 }
             }
-            _ = wait_true(stop.clone()) => break,
+            if let Some(snaps) = batch.motion {
+                for snap in snaps.iter() {
+                    if conn.send_datagram(motion_seq, snap).await.is_err() {
+                        break 'writer;
+                    }
+                    motion_seq += 1;
+                }
+            }
+            if batch.overflowed {
+                // ENG-48: this client's reliable backlog blew its bound. The
+                // accepted backlog above has been flushed; end the connection
+                // so it re-baselines on reconnect rather than the host holding
+                // an unbounded queue or discarding committed topology in place.
+                let _ = conn.say_bye("reliable backlog exceeded").await;
+                break 'writer;
+            }
+        }
+        tokio::select! {
+            _ = handle.woken() => {}
+            _ = wait_true(stop.clone()) => break 'writer,
         }
     }
 
@@ -1189,14 +4578,121 @@ async fn serve_conn(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&session.raw());
+    // T20 egress accounting: fold this connection's final byte counters into the
+    // closed-connection accumulator and drop its handle, both under the `conns`
+    // lock so teardown counts every connection exactly once.
+    {
+        let mut conns_guard = conns.lock().unwrap_or_else(|e| e.into_inner());
+        if conns_guard.remove(&session.raw()).is_some() {
+            let mut acc = egress_closed.lock().unwrap_or_else(|e| e.into_inner());
+            acc.insert(
+                session.raw(),
+                (
+                    conn.stats().app_bytes_sent,
+                    conn.transport_stats().udp_tx.bytes,
+                ),
+            );
+        }
+    }
     conn.close("connection complete");
     reader.abort();
+    dgram_reader.abort();
     liveness.abort();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spall_store::{JournalPayload, JournalRecord};
+
+    #[test]
+    fn player_credential_registry_parser_never_echoes_tokens() {
+        let player_id = "11".repeat(16);
+        let token = "a5".repeat(32);
+        let content = format!("# operator registry\n{player_id} {token}\n");
+        let credentials = parse_player_credentials(content.as_bytes()).unwrap();
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].player_id.to_hex(), player_id);
+        assert!(!format!("{:?}", credentials[0]).contains(&token));
+
+        let bad_token = "z1".repeat(32);
+        let malformed = format!("{player_id} {bad_token}");
+        let error = parse_player_credentials(malformed.as_bytes()).unwrap_err();
+        assert!(!error.contains(&bad_token));
+    }
+
+    #[test]
+    fn progression_queue_is_bounded_and_returns_in_serial_order() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = ProgressionWorker::spawn(Box::new(move |_session, _, request| {
+            if request.request_id == 1 {
+                let _ = started_tx.send(());
+                std::thread::sleep(std::time::Duration::from_millis(75));
+            }
+            spall_protocol::ProgressionResponse {
+                request_id: request.request_id,
+                catalog_version: 1,
+                inventory_revision: request.request_id,
+                outcome: spall_protocol::ProgressionOutcome::Inventory,
+                inventory: Vec::new(),
+            }
+        }));
+        let session = sess(1, 1);
+        let started = std::time::Instant::now();
+        worker
+            .submit
+            .try_send(ProgressionWork {
+                session,
+                player_id: None,
+                request: spall_protocol::ProgressionRequest {
+                    request_id: 1,
+                    catalog_version: 1,
+                    expected_inventory_revision: 0,
+                    operation: spall_protocol::ProgressionOperation::InspectInventory,
+                },
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        for request_id in 2..=65 {
+            worker
+                .submit
+                .try_send(ProgressionWork {
+                    session,
+                    player_id: None,
+                    request: spall_protocol::ProgressionRequest {
+                        request_id,
+                        catalog_version: 1,
+                        expected_inventory_revision: 0,
+                        operation: spall_protocol::ProgressionOperation::InspectInventory,
+                    },
+                })
+                .expect("one active and 64 queued requests fit");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert!(matches!(
+            worker.submit.try_send(ProgressionWork {
+                session,
+                player_id: None,
+                request: spall_protocol::ProgressionRequest {
+                    request_id: 66,
+                    catalog_version: 1,
+                    expected_inventory_revision: 0,
+                    operation: spall_protocol::ProgressionOperation::InspectInventory,
+                },
+            }),
+            Err(std::sync::mpsc::TrySendError::Full(_))
+        ));
+        for expected in 1..=65 {
+            let done = worker
+                .completed
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(done.session, session);
+            assert_eq!(done.response.request_id, expected);
+        }
+    }
 
     fn empty_clients() -> ClientMap {
         Arc::new(Mutex::new(HashMap::new()))
@@ -1206,9 +4702,339 @@ mod tests {
         SessionId::from_parts(SlotId(slot), generation)
     }
 
+    // --- ENG-47: action-claim validation --------------------------------------
+
+    use spall_protocol::InputSeq;
+
+    /// An `ActionRequest` with a controllable aim, tool, claimed target, and
+    /// claimed brush. The brush centre is deliberately somewhere unrelated to
+    /// the aim so a passing test proves the server re-derived it.
+    fn action_req(
+        tool: u16,
+        action: ActionKind,
+        origin_m: [f64; 3],
+        dir: [f32; 3],
+        claimed_target: ClaimedTarget,
+        claimed_centre_cell: [i64; 3],
+        claimed_radius_cells: i64,
+    ) -> ActionRequest {
+        let h = BRUSH_UNIT / 2;
+        let brush = SphereBrush::new(
+            BrushPoint::from_units(
+                claimed_centre_cell[0] * BRUSH_UNIT + h,
+                claimed_centre_cell[1] * BRUSH_UNIT + h,
+                claimed_centre_cell[2] * BRUSH_UNIT + h,
+            ),
+            claimed_radius_cells * BRUSH_UNIT,
+        )
+        .expect("valid test brush");
+        ActionRequest {
+            request_id: RequestId(1),
+            input_seq: InputSeq(1),
+            action,
+            tool,
+            aim_origin_m: origin_m,
+            aim_dir: dir,
+            claimed_target,
+            claimed_brush: brush,
+        }
+    }
+
+    /// A `+X` aim from local cell `(0, 4, 1)` — inside the bridge scene's
+    /// resident brick, above the floor — that travels to the column at local
+    /// cell `(10, 4, 1)`. (An unbounded volume samples cells outside its
+    /// resident bricks as `Unknown`, so the ray must *start* inside one.)
+    const COLUMN_AIM_ORIGIN: [f64; 3] = [0.0, 1.0, 0.375];
+    const PLUS_X: [f32; 3] = [1.0, 0.0, 0.0];
+
+    fn bridge_after_cut() -> Simulation {
+        use spall_sim::{EditIntent, EditTarget};
+        let mut sim = Scene::BridgeCut.simulation();
+        let h = BRUSH_UNIT / 2;
+        let brush = SphereBrush::new(
+            BrushPoint::from_units(10 * BRUSH_UNIT + h, 4 * BRUSH_UNIT + h, BRUSH_UNIT + h),
+            2 * BRUSH_UNIT,
+        )
+        .unwrap();
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            EntityId::new(1).unwrap(),
+            EditTarget::Terrain,
+            brush,
+        ))
+        .unwrap();
+        // Enough ticks to commit the split; few enough that the freed beam has
+        // not fallen far.
+        sim.run_until_idle(8).unwrap();
+        assert!(sim.world().body_count() >= 1, "the cut detached the beam");
+        sim
+    }
+
+    #[test]
+    fn a_valid_aim_resolves_to_a_server_derived_brush_on_the_struck_cell() {
+        let sim = Scene::BridgeCut.simulation();
+        // Claimed centre `(3, 1, 1)` is nowhere near the aim; the resolved brush
+        // must sit on the server's hit cell `(10, 4, 1)` instead.
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [3, 1, 1],
+            2,
+        );
+        let intent = resolve_intent(sim.world(), sess(0, 1), &req).expect("resolves");
+        assert_eq!(intent.target, EditTarget::Terrain);
+        assert_eq!(intent.kind, EditKind::Cut);
+        let h = BRUSH_UNIT / 2;
+        assert_eq!(intent.brush.centre.x, 10 * BRUSH_UNIT + h);
+        assert_eq!(intent.brush.centre.y, 4 * BRUSH_UNIT + h);
+        assert_eq!(intent.brush.centre.z, BRUSH_UNIT + h);
+        assert_eq!(intent.brush.radius_units(), 2 * BRUSH_UNIT);
+    }
+
+    #[test]
+    fn an_unknown_tool_is_refused() {
+        let sim = Scene::BridgeCut.simulation();
+        let req = action_req(
+            77,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            2,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::UnknownTool(77))
+        );
+    }
+
+    #[test]
+    fn an_action_the_tool_does_not_grant_is_refused() {
+        let sim = Scene::BridgeCut.simulation();
+        // Tool 0 is a cutter; asking it to place is a mismatch.
+        let req = action_req(
+            0,
+            ActionKind::Place,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            2,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::ToolActionMismatch)
+        );
+    }
+
+    #[test]
+    fn an_excessive_tool_radius_is_refused() {
+        let sim = Scene::BridgeCut.simulation();
+        // Tool 0 caps at 8 cells; the request asks for 40.
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            40,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::RadiusTooLarge {
+                requested_cells: 40,
+                max_cells: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn an_aim_that_hits_nothing_within_reach_is_refused() {
+        let sim = Scene::BridgeCut.simulation();
+        // Aim out of the scene (toward -X off the resident geometry): no solid.
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            [-1.0, 0.0, 0.0],
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            2,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::NoAuthoritativeHit)
+        );
+    }
+
+    #[test]
+    fn a_spoofed_target_that_disagrees_with_the_raycast_is_refused() {
+        let sim = bridge_after_cut();
+        let beam = sim
+            .world()
+            .bodies()
+            .next()
+            .and_then(|b| b.entity)
+            .expect("the cut detached the beam");
+        // Aim straight down onto the terrain floor at x-cell 1 (clear of both
+        // the beam body's x-range and the cut column) but claim the real,
+        // still-live beam body.
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            [0.375, 2.0, 0.375],
+            [0.0, -1.0, 0.0],
+            ClaimedTarget::Body(beam),
+            [0, 0, 1],
+            1,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::TargetMismatch)
+        );
+    }
+
+    #[test]
+    fn a_stale_target_body_is_refused() {
+        let sim = Scene::BridgeCut.simulation();
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Body(EntityId::new(9999).unwrap()),
+            [10, 4, 1],
+            2,
+        );
+        assert_eq!(
+            resolve_intent(sim.world(), sess(0, 1), &req),
+            Err(ActionReject::StaleTarget)
+        );
+    }
+
+    #[test]
+    fn a_body_hit_resolves_in_the_body_local_frame() {
+        let sim = bridge_after_cut();
+        let beam = sim
+            .world()
+            .bodies()
+            .next()
+            .and_then(|b| b.entity)
+            .expect("the cut detached the beam");
+        // Aim straight down at x-cell 5: clear of the (surviving) column top,
+        // so the nearest solid is the detached beam body itself.
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            [1.375, 7.0, 0.375],
+            [0.0, -1.0, 0.0],
+            ClaimedTarget::Body(beam),
+            [999, 999, 999],
+            1,
+        );
+        let intent = resolve_intent(sim.world(), sess(0, 1), &req).expect("resolves");
+        assert_eq!(intent.target, EditTarget::Body(beam));
+        // Server-derived in the beam's local frame, not the client's
+        // `(999, 999, 999)` claim.
+        assert!(intent.brush.centre.x.abs() < 100 * BRUSH_UNIT);
+    }
+
+    #[test]
+    fn the_dev_scenario_path_trusts_the_claim_verbatim() {
+        let req = action_req(
+            0,
+            ActionKind::Cut,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            ClaimedTarget::Terrain,
+            [3, 1, 1],
+            2,
+        );
+        let intent = dev_intent_from_request(sess(0, 1), &req).expect("dev passthrough");
+        // No raycast, no re-derivation: exactly the claimed brush.
+        assert_eq!(intent.brush, req.claimed_brush);
+    }
+
+    #[test]
+    fn reliable_retry_after_reconnect_replays_before_stale_claim_validation() {
+        let original_session = sess(0, 1);
+        let replacement_session = sess(0, 2);
+        let mut sim = Scene::BridgeCut.simulation();
+        let mut request = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [3, 1, 1],
+            2,
+        );
+        request.request_id = RequestId(57);
+
+        let intent = resolve_intent(sim.world(), original_session, &request).unwrap();
+        assert!(matches!(
+            sim.submit(intent).unwrap().outcome,
+            ActionOutcome::Queued
+        ));
+        sim.run_until_idle(8).unwrap();
+        let committed = replay_admitted_status(&sim, request.request_id).unwrap();
+        assert!(matches!(committed.outcome, ActionOutcome::Committed { .. }));
+
+        // The original ray now points at removed column cells. A handler that
+        // validated first would turn this reliable retry into a fresh rejection.
+        assert!(
+            resolve_intent(sim.world(), replacement_session, &request).is_err(),
+            "the fixture must prove that commit changed the original claim's target"
+        );
+        assert_eq!(
+            replay_admitted_status(&sim, request.request_id),
+            Some(committed),
+            "the replacement session receives the original committed status"
+        );
+    }
+
+    #[test]
+    fn pre_admission_validation_refusals_do_not_reserve_request_ids() {
+        let sim = Scene::BridgeCut.simulation();
+        let session = sess(0, 1);
+        let rejected = action_req(
+            77,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            2,
+        );
+        assert!(resolve_intent(sim.world(), session, &rejected).is_err());
+        assert!(replay_admitted_status(&sim, rejected.request_id).is_none());
+
+        // This is deliberately still eligible for validation/admission with a
+        // corrected payload: only accepted pipeline work has a replay ledger.
+        let corrected = action_req(
+            0,
+            ActionKind::Cut,
+            COLUMN_AIM_ORIGIN,
+            PLUS_X,
+            ClaimedTarget::Terrain,
+            [10, 4, 1],
+            2,
+        );
+        assert!(resolve_intent(sim.world(), session, &corrected).is_ok());
+    }
+
     #[test]
     fn a_reconnect_supersedes_the_old_session_generation() {
-        let mut lj = LateJoin::new(DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES);
+        let mut lj = LateJoin::new(
+            DEFAULT_CATCH_UP_CAP,
+            DEFAULT_MAX_JOIN_RETRIES,
+            default_capture_workers(),
+        );
         let old = sess(0, 1);
         let new = sess(0, 2);
         lj.on_joined(old);
@@ -1224,18 +5050,133 @@ mod tests {
     }
 
     #[test]
+    fn simultaneous_joiners_reuse_the_same_immutable_baseline_at_one_cursor() {
+        let sim = Scene::BridgeCut.simulation();
+        let mut lj = LateJoin::new(
+            DEFAULT_CATCH_UP_CAP,
+            DEFAULT_MAX_JOIN_RETRIES,
+            default_capture_workers(),
+        );
+        let first = lj.capture_for(&sim, TransferId(1)).unwrap();
+        let second = lj.capture_for(&sim, TransferId(2)).unwrap();
+
+        assert_eq!(first.begin.journal_cursor, second.begin.journal_cursor);
+        assert_eq!(first.begin.transfer_id, TransferId(1));
+        assert_eq!(second.begin.transfer_id, TransferId(2));
+        assert!(std::sync::Arc::ptr_eq(&first.world, &second.world));
+        assert!(
+            second
+                .parts
+                .iter()
+                .all(|part| part.transfer_id == TransferId(2))
+        );
+
+        let tx = Arc::new(TopologyTransaction {
+            transaction_id: spall_core::TransactionId::new(1).unwrap(),
+            server_tick: spall_core::Tick(1),
+            control_seq: spall_protocol::ControlSeq(0),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![],
+            result_hashes: vec![],
+        });
+        lj.fan_out_transaction(tx, None, &sim, &empty_clients());
+        assert!(
+            lj.cached_baseline.is_none(),
+            "a topology commit invalidates the cache"
+        );
+    }
+
+    /// ENG-30 / T23 row 11, increment 30: a 1-worker [`CapturePool`] must run
+    /// submitted jobs strictly one after another, never overlapping -- the
+    /// whole point of bounding `LateJoin::on_baseline_ack`'s background
+    /// captures instead of one raw `std::thread::spawn` per join request.
+    #[test]
+    fn capture_pool_bounds_concurrent_execution_to_its_worker_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = CapturePool::new(1);
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        for _ in 0..4 {
+            let concurrent = Arc::clone(&concurrent);
+            let max_concurrent = Arc::clone(&max_concurrent);
+            let done_tx = done_tx.clone();
+            pool.spawn(move || {
+                let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                max_concurrent.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                concurrent.fetch_sub(1, Ordering::SeqCst);
+                let _ = done_tx.send(());
+            });
+        }
+        drop(done_tx);
+        for _ in 0..4 {
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("every queued job eventually runs");
+        }
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "a 1-worker pool must never run two jobs at once"
+        );
+    }
+
+    /// The complement of the test above: a pool sized for real concurrency
+    /// must actually provide it, not accidentally serialize everything
+    /// (which would defeat the point of a *pool* rather than a single
+    /// background thread).
+    #[test]
+    fn capture_pool_allows_real_concurrency_up_to_its_worker_count() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = CapturePool::new(2);
+        let barrier = Arc::new(Barrier::new(2));
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let concurrent = Arc::clone(&concurrent);
+            let max_concurrent = Arc::clone(&max_concurrent);
+            let done_tx = done_tx.clone();
+            pool.spawn(move || {
+                let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                max_concurrent.fetch_max(now, Ordering::SeqCst);
+                // Both jobs must reach this point "at once" -- a serialized
+                // pool would deadlock here and fail the test via timeout.
+                barrier.wait();
+                concurrent.fetch_sub(1, Ordering::SeqCst);
+                let _ = done_tx.send(());
+            });
+        }
+        drop(done_tx);
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("both jobs run concurrently, not serialized");
+        }
+        assert_eq!(max_concurrent.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn catch_up_overflow_recaptures_then_drops_after_the_retry_budget() {
         let sim = Scene::BridgeCut.simulation();
         let clients = empty_clients();
         // cap 2, one retry allowed.
-        let mut lj = LateJoin::new(2, 1);
+        let mut lj = LateJoin::new(2, 1, 2);
         let joiner = sess(0, 1);
         lj.on_joined(joiner);
         lj.on_baseline_ack(
             joiner,
             BaselineAck {
                 transfer_id: BASELINE_REQUEST_SENTINEL,
-                verified_manifest_hash: Hash32::ZERO,
+                verified_manifest_hash: spall_protocol::Hash32::ZERO,
                 installed_cursor: spall_core::JournalSeq(0),
             },
             &sim,
@@ -1263,14 +5204,14 @@ mod tests {
 
         // Fill past the cap → first overflow → one re-capture (retry 1).
         for _ in 0..3 {
-            lj.fan_out_transaction(tx(), &sim, &clients);
+            lj.fan_out_transaction(tx(), None, &sim, &clients);
         }
         assert_eq!(lj.retries, 1);
         assert!(lj.links.contains_key(&joiner.raw()));
 
         // Fill the fresh queue past the cap again → retry 2 > budget → dropped.
         for _ in 0..3 {
-            lj.fan_out_transaction(tx(), &sim, &clients);
+            lj.fan_out_transaction(tx(), None, &sim, &clients);
         }
         assert_eq!(lj.failed, 1);
         assert!(
@@ -1279,11 +5220,124 @@ mod tests {
         );
     }
 
+    /// T23 / G3 row 10: the joiner dropped after its retry budget is exhausted
+    /// must be told with a `Bye` reason distinct from an ordinary end of
+    /// session, so a client that sees its control loop end can tell the two
+    /// apart. Regression for the gap `docs/reports/G3.md` recorded: this used
+    /// to be the same bare `Outbound::Shutdown` sent at run end.
+    #[test]
+    fn catch_up_exhaustion_gives_the_dropped_joiner_a_distinguishable_bye_reason() {
+        let sim = Scene::BridgeCut.simulation();
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        let joiner = sess(0, 1);
+        let handle = OutboundHandle::new();
+        clients.lock().unwrap().insert(joiner.raw(), handle.clone());
+
+        let mut lj = LateJoin::new(2, 1, 2);
+        lj.on_joined(joiner);
+        lj.on_baseline_ack(
+            joiner,
+            BaselineAck {
+                transfer_id: BASELINE_REQUEST_SENTINEL,
+                verified_manifest_hash: spall_protocol::Hash32::ZERO,
+                installed_cursor: spall_core::JournalSeq(0),
+            },
+            &sim,
+            &clients,
+            &mut MotionPublisher::new(60, 20),
+        );
+
+        let tx = || {
+            Arc::new(TopologyTransaction {
+                transaction_id: spall_core::TransactionId::new(1).unwrap(),
+                server_tick: spall_core::Tick(1),
+                control_seq: spall_protocol::ControlSeq(0),
+                algorithm_version: 1,
+                dependencies: vec![],
+                before: vec![],
+                after: vec![],
+                ops: vec![],
+                result_hashes: vec![],
+            })
+        };
+        // First overflow (re-capture, retry 1), then a second past the budget
+        // (dropped).
+        for _ in 0..6 {
+            lj.fan_out_transaction(tx(), None, &sim, &clients);
+        }
+        assert_eq!(lj.failed, 1);
+
+        let shutdowns: Vec<&'static str> = handle
+            .take()
+            .reliable
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Outbound::Shutdown(reason) => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shutdowns,
+            vec![Connection::BYE_REASON_CATCH_UP_EXHAUSTED],
+            "the dropped joiner must see the catch-up-exhaustion reason, not the ordinary end-of-session one"
+        );
+    }
+
+    /// A late joiner's baseline/catch-up barrier supplies its first motion
+    /// keyframe. Sending the ordinary live feed before then can saturate a
+    /// shaped link with supersedable traffic and starve the reliable baseline.
+    #[test]
+    fn motion_is_held_until_a_joiner_is_live() {
+        let clients = empty_clients();
+        let live = sess(1, 1);
+        let joining = sess(2, 1);
+        let live_handle = OutboundHandle::new();
+        let joining_handle = OutboundHandle::new();
+        clients
+            .lock()
+            .unwrap()
+            .insert(live.raw(), live_handle.clone());
+        clients
+            .lock()
+            .unwrap()
+            .insert(joining.raw(), joining_handle.clone());
+
+        let mut lj = LateJoin::new(1, 1, 1);
+        lj.on_joined(live);
+        lj.on_joined(joining);
+        lj.links.get_mut(&joining.raw()).unwrap().phase = Phase::Joining {
+            transfer_id: TransferId(1),
+            queue: VecDeque::new(),
+            retries: 0,
+        };
+        let batch = Arc::new(Vec::new());
+        send_motion_to_sessions(&clients, lj.live_sessions(), Arc::clone(&batch));
+
+        assert!(Arc::ptr_eq(
+            &live_handle
+                .take()
+                .motion
+                .expect("live client receives motion"),
+            &batch
+        ));
+        assert!(
+            joining_handle.take().motion.is_none(),
+            "joining client must wait for the post-baseline keyframe"
+        );
+
+        lj.links.get_mut(&joining.raw()).unwrap().phase = Phase::Live;
+        send_motion_to_sessions(&clients, lj.live_sessions(), batch);
+        assert!(
+            joining_handle.take().motion.is_some(),
+            "once the baseline barrier completes, normal motion resumes"
+        );
+    }
+
     #[test]
     fn a_live_client_is_never_queued() {
         let sim = Scene::BridgeCut.simulation();
         let clients = empty_clients();
-        let mut lj = LateJoin::new(1, 1);
+        let mut lj = LateJoin::new(1, 1, 1);
         let live = sess(1, 1);
         lj.on_joined(live);
         for _ in 0..50 {
@@ -1299,6 +5353,7 @@ mod tests {
                     ops: vec![],
                     result_hashes: vec![],
                 }),
+                None,
                 &sim,
                 &clients,
             );
@@ -1309,5 +5364,402 @@ mod tests {
             lj.links.get(&live.raw()).map(|l| &l.phase),
             Some(Phase::Live)
         ));
+    }
+
+    // --- ENG-48: bounded replication host queues ----------------------------
+
+    fn empty_tx() -> Outbound {
+        Outbound::Transaction(Arc::new(TopologyTransaction {
+            transaction_id: spall_core::TransactionId::new(1).unwrap(),
+            server_tick: spall_core::Tick(1),
+            control_seq: spall_protocol::ControlSeq(0),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![],
+            result_hashes: vec![],
+        }))
+    }
+
+    #[test]
+    fn the_reliable_backlog_is_bounded_and_keeps_accepted_topology() {
+        let h = OutboundHandle::new();
+        let mut accepted = 0usize;
+        let mut overflowed = false;
+        // Sustained committed topology into a reader that never drains.
+        for _ in 0..(MAX_RELIABLE_BACKLOG * 8) {
+            match h.push(empty_tx()) {
+                Ok(()) => accepted += 1,
+                Err(_) => {
+                    overflowed = true;
+                    break;
+                }
+            }
+        }
+        assert!(overflowed, "the reliable backlog bound is enforced");
+        assert!(
+            accepted <= MAX_RELIABLE_BACKLOG,
+            "memory plateaus at the bound ({accepted} accepted)"
+        );
+        assert!(h.reliable_bytes() <= MAX_RELIABLE_BACKLOG_BYTES);
+        // The accepted backlog is still handed to the writer for delivery —
+        // committed topology is never silently discarded to stay under budget.
+        let batch = h.take();
+        assert_eq!(batch.reliable.len(), accepted);
+        assert!(
+            batch.overflowed,
+            "the writer is told to flush-then-disconnect this client"
+        );
+        assert!(
+            h.push(empty_tx()).is_err(),
+            "further reliable traffic stays refused; the client is being dropped"
+        );
+    }
+
+    /// Regression: the byte cap used to count every reliable byte ever queued on
+    /// the connection (`take` never reset it), so any long-lived client was
+    /// eventually disconnected however promptly its writer drained.
+    #[test]
+    fn a_draining_writer_never_trips_the_byte_cap() {
+        let h = OutboundHandle::new();
+        let per_msg = reliable_msg_bytes(&empty_tx());
+        let rounds = MAX_RELIABLE_BACKLOG_BYTES / per_msg * 3;
+        for i in 0..rounds {
+            assert!(
+                h.push(empty_tx()).is_ok(),
+                "push {i} refused by a drained queue"
+            );
+            assert_eq!(h.take().reliable.len(), 1);
+            assert_eq!(
+                h.reliable_bytes(),
+                0,
+                "take hands the writer the whole queue"
+            );
+        }
+    }
+
+    /// Regression: admission counted connections ever accepted, so after
+    /// `max_clients` lifetime sessions every later join was refused forever.
+    #[test]
+    fn admission_counts_live_connections_and_frees_slots() {
+        let gate = AdmissionGate::new(2);
+        let a = gate.try_admit().expect("first");
+        let b = gate.try_admit().expect("second");
+        assert!(
+            gate.try_admit().is_none(),
+            "third refused while two are live"
+        );
+        assert_eq!(gate.refused.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(a);
+        let c = gate
+            .try_admit()
+            .expect("a slot freed by a departed connection");
+        assert!(gate.try_admit().is_none());
+        drop((b, c));
+        // Far more sessions than `max` over the gate's life still admit.
+        for _ in 0..50 {
+            let _s = gate.try_admit().expect("no permanent lockout");
+        }
+    }
+
+    #[test]
+    fn unsent_motion_is_superseded_not_accumulated() {
+        let sim = bridge_after_cut();
+        let mut mp = MotionPublisher::new(60, 20);
+        let h = OutboundHandle::new();
+        for t in 1..=5_000u64 {
+            let snaps = mp.snapshots(sim.world(), spall_core::Tick(t));
+            h.push(Outbound::Motion(Arc::new(snaps)))
+                .expect("motion never overflows the queue");
+        }
+        let batch = h.take();
+        assert!(batch.reliable.is_empty());
+        let motion = batch.motion.expect("the newest motion batch is retained");
+        assert!(!motion.is_empty());
+        assert_eq!(
+            motion[0].server_tick.get(),
+            5_000,
+            "only the newest batch survives a stalled reader"
+        );
+        assert!(h.take().is_empty(), "nothing accumulated behind it");
+    }
+
+    #[test]
+    fn a_broadcast_drops_only_the_client_whose_backlog_overflows() {
+        let clients = empty_clients();
+        let keeps_up = sess(0, 1);
+        let stalled = sess(1, 1);
+        {
+            let mut g = clients.lock().unwrap_or_else(|e| e.into_inner());
+            g.insert(keeps_up.raw(), OutboundHandle::new());
+            g.insert(stalled.raw(), OutboundHandle::new());
+        }
+        for _ in 0..(MAX_RELIABLE_BACKLOG * 3) {
+            broadcast(&clients, empty_tx());
+            // The healthy reader drains every round; the stalled one never does.
+            if let Some(h) = clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&keeps_up.raw())
+            {
+                let _ = h.take();
+            }
+        }
+        let g = clients.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            g.contains_key(&keeps_up.raw()),
+            "a reader that keeps up stays in the fan-out set"
+        );
+        assert!(
+            !g.contains_key(&stalled.raw()),
+            "the stalled reader is removed once its reliable backlog blows the bound"
+        );
+    }
+
+    #[test]
+    fn per_tick_admission_caps_each_session_independently() {
+        let mut counts: HashMap<u64, u32> = HashMap::new();
+        let flooder = sess(0, 1).raw();
+        let other = sess(1, 1).raw();
+
+        let mut admitted = 0u32;
+        for _ in 0..1_000 {
+            if admit(&mut counts, flooder, MAX_ACTIONS_PER_CLIENT_PER_TICK) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, MAX_ACTIONS_PER_CLIENT_PER_TICK,
+            "one session's flood is capped for the tick"
+        );
+
+        // A different session still gets its full quota — fair scheduling, the
+        // flood above did not consume it.
+        let mut other_ok = 0u32;
+        for _ in 0..1_000 {
+            if admit(&mut counts, other, MAX_ACTIONS_PER_CLIENT_PER_TICK) {
+                other_ok += 1;
+            }
+        }
+        assert_eq!(other_ok, MAX_ACTIONS_PER_CLIENT_PER_TICK);
+    }
+
+    #[test]
+    fn timing_window_excludes_warmup_and_reports_nearest_rank_percentiles() {
+        let mut timing = TimingCollector::new(TimingWindow {
+            warmup_ticks: 2,
+            measured_ticks: 4,
+            max_samples: 4,
+        });
+
+        // Warmup is deliberately expensive but must not contaminate the gate
+        // measurement. The six measured ticks are 1..=4 ms for tick time and
+        // 10..=40 ms for physics; the collector should retain only ticks 3..6.
+        timing.record(1, Duration::from_millis(100), Duration::from_millis(100));
+        timing.record(2, Duration::from_millis(99), Duration::from_millis(99));
+        for tick in 3..=6 {
+            timing.record(
+                tick,
+                Duration::from_millis(tick - 2),
+                Duration::from_millis((tick - 2) * 10),
+            );
+        }
+
+        let report = timing.finish(6);
+        assert_eq!(report.tick_busy_samples, 4);
+        assert_eq!(report.physics_samples, 4);
+        assert_eq!(report.tick_busy_p95_ms, 4.0);
+        assert_eq!(report.tick_busy_p99_ms, 4.0);
+        assert_eq!(report.physics_p95_ms, 40.0);
+        assert_eq!(report.physics_p99_ms, 40.0);
+        assert_eq!(report.tick_busy_max_ms, 4.0);
+        assert_eq!(report.physics_max_ms, 40.0);
+        assert!(report.window_complete);
+    }
+
+    #[test]
+    fn timing_window_is_fail_closed_when_the_requested_window_is_incomplete() {
+        let mut timing = TimingCollector::new(TimingWindow {
+            warmup_ticks: 1,
+            measured_ticks: 3,
+            max_samples: 3,
+        });
+        timing.record(2, Duration::from_millis(1), Duration::from_millis(1));
+        timing.record(3, Duration::from_millis(1), Duration::from_millis(1));
+
+        let report = timing.finish(3);
+        assert_eq!(report.tick_busy_samples, 2);
+        assert_eq!(report.physics_samples, 2);
+        assert!(!report.window_complete);
+        assert_eq!(report.tick_busy_p95_ms, 1.0);
+    }
+
+    // --- ENG-36: recovery must fail closed on corruption -------------------
+
+    fn persist_cfg() -> PersistConfig {
+        PersistConfig {
+            world_id: T10_WORLD_ID,
+            seed: 42,
+            generator_version: 1,
+        }
+    }
+
+    fn scratch_db(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("spall_eng36_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("world.db")
+    }
+
+    fn checkpoint_row_count(db: &std::path::Path) -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM checkpoints", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn setup_persistence_seeds_only_a_genuinely_empty_database() {
+        let db = scratch_db("empty");
+        // Force the schema to exist with no checkpoint, exactly like a fresh DB.
+        drop(Writer::open(&db).unwrap());
+        assert_eq!(checkpoint_row_count(&db), 0);
+
+        let Persistence {
+            journalled_through,
+            pipeline,
+            checkpoints_published,
+            ..
+        } = setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg(), None).unwrap();
+        assert_eq!(journalled_through, 0);
+        assert!(pipeline.is_some());
+        assert_eq!(
+            checkpoints_published, 1,
+            "the built-in scene is published once"
+        );
+        drop(pipeline);
+        assert_eq!(checkpoint_row_count(&db), 1);
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn recovery_rebuilds_the_selected_terrain_collision_without_changing_world_hash() {
+        let db = scratch_db("terrain_collider_mode");
+        let original = setup_persistence_with_terrain_collider_mode(
+            Some(&db),
+            Scene::BridgeCut,
+            &persist_cfg(),
+            None,
+            TerrainColliderMode::WholeTerrain,
+        )
+        .unwrap();
+        assert!(!original.sim.world().terrain_brick_colliders_enabled());
+        let hash = original.sim.world().world_hash();
+        drop(original);
+
+        let restored = setup_persistence_with_terrain_collider_mode(
+            Some(&db),
+            Scene::BridgeCut,
+            &persist_cfg(),
+            None,
+            TerrainColliderMode::PerBrick,
+        )
+        .unwrap();
+        assert!(restored.sim.world().terrain_brick_colliders_enabled());
+        restored
+            .sim
+            .world()
+            .validate_terrain_brick_colliders()
+            .unwrap();
+        assert_eq!(restored.sim.world().world_hash(), hash);
+        drop(restored);
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn setup_persistence_fails_closed_on_interior_journal_corruption() {
+        let db = scratch_db("crc");
+        {
+            let mut w = Writer::open(&db).unwrap();
+            let sim = Scene::BridgeCut.simulation();
+            w.publish_checkpoint(&persist::capture(&sim, &persist_cfg(), 0).unwrap())
+                .unwrap();
+            w.append_journal(&[
+                JournalRecord {
+                    seq: 1,
+                    tick: 1,
+                    payload: JournalPayload::PoseBatch { snapshots: vec![] },
+                },
+                JournalRecord {
+                    seq: 2,
+                    tick: 2,
+                    payload: JournalPayload::PoseBatch { snapshots: vec![] },
+                },
+                JournalRecord {
+                    seq: 3,
+                    tick: 3,
+                    payload: JournalPayload::PoseBatch { snapshots: vec![] },
+                },
+            ])
+            .unwrap();
+        }
+        // Corrupt seq 2's payload without fixing its CRC — an interior CRC error.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("UPDATE journal SET payload = X'DEADBEEF' WHERE seq = 2", [])
+                .unwrap();
+        }
+
+        let before = checkpoint_row_count(&db);
+        let err = match setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg(), None) {
+            Ok(_) => panic!("host startup must not silently continue from a shortened history"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("corruption") || err.contains("RecoveryChoice"),
+            "error surfaces the corruption and the required operator choice: {err}"
+        );
+        assert!(db.exists(), "the original database is left in place");
+        assert_eq!(
+            checkpoint_row_count(&db),
+            before,
+            "no fresh-scene checkpoint was published automatically"
+        );
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn setup_persistence_refuses_a_database_whose_checkpoints_do_not_decode() {
+        let db = scratch_db("undecodable");
+        {
+            let mut w = Writer::open(&db).unwrap();
+            let sim = Scene::BridgeCut.simulation();
+            w.publish_checkpoint(&persist::capture(&sim, &persist_cfg(), 0).unwrap())
+                .unwrap();
+        }
+        // Every complete checkpoint's metadata is now undecodable.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("UPDATE checkpoints SET meta = X'DEADBEEF'", [])
+                .unwrap();
+        }
+
+        let before = checkpoint_row_count(&db);
+        assert_eq!(before, 1);
+        let err = match setup_persistence(Some(&db), Scene::BridgeCut, &persist_cfg(), None) {
+            Ok(_) => panic!("undecodable checkpoints are corruption, not an empty database"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("unrecoverable"),
+            "error distinguishes corruption from a fresh DB: {err}"
+        );
+        assert!(db.exists(), "the original database is left in place");
+        assert_eq!(
+            checkpoint_row_count(&db),
+            before,
+            "the corrupt save was not overwritten with the built-in scene"
+        );
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 }

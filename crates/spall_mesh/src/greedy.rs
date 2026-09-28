@@ -18,17 +18,17 @@ use spall_core::MaterialId;
 use crate::enumerate::for_each_exposed_face;
 use crate::face::FaceDir;
 use crate::mesh::FaceQuad;
-use crate::sample::{CellBox, VolumeSampler};
+use crate::sample::{ResidentCells, VolumeSampler};
 
 type BucketKey = (u8, i64, u16);
 /// Faces in one coplanar bucket, keyed by `(v, u)` so iteration is row-major.
 type Bucket = BTreeMap<(i64, i64), [u8; 4]>;
 
 /// Emit merged [`FaceQuad`]s for every exposed face of every solid cell in
-/// `cell_box`.
-pub fn emit_greedy(sampler: &VolumeSampler<'_>, cell_box: CellBox) -> Vec<FaceQuad> {
+/// `cells`.
+pub fn emit_greedy(sampler: &VolumeSampler<'_>, cells: &ResidentCells) -> Vec<FaceQuad> {
     let mut buckets: BTreeMap<BucketKey, Bucket> = BTreeMap::new();
-    for_each_exposed_face(sampler, cell_box, |face| {
+    for_each_exposed_face(sampler, cells, |face| {
         let (ua, va) = face.dir.tangent_axes();
         buckets
             .entry((
@@ -113,14 +113,15 @@ mod tests {
 
     const STONE: MaterialId = MaterialId(1);
 
-    fn scene(cells: &[[i64; 3]]) -> (Volume, CellBox) {
+    fn scene(cells: &[[i64; 3]]) -> (Volume, ResidentCells) {
         let mut v = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
         let mut plan = EditPlan::new(v.id());
         for c in cells {
             plan.set(GlobalCell::new(c[0], c[1], c[2]), STONE);
         }
         v.apply_edit(&plan).unwrap();
-        (v.clone(), CellBox::of_resident(&v).unwrap())
+        let cells = ResidentCells::plan(&v, ResidentCells::DEFAULT_CELL_VISIT_BUDGET).unwrap();
+        (v.clone(), cells)
     }
 
     fn flat_slab() -> Vec<[i64; 3]> {
@@ -137,7 +138,7 @@ mod tests {
     fn a_flat_slab_top_merges_into_one_quad() {
         let (v, cb) = scene(&flat_slab());
         let s = VolumeSampler::new(&v);
-        let greedy = emit_greedy(&s, cb);
+        let greedy = emit_greedy(&s, &cb);
         let top: Vec<_> = greedy.iter().filter(|q| q.dir == FaceDir::PosY).collect();
         assert_eq!(top.len(), 1);
         assert_eq!((top[0].u_len, top[0].v_len), (4, 4));
@@ -152,11 +153,11 @@ mod tests {
         ] {
             let (v, cb) = scene(&cells);
             let s = VolumeSampler::new(&v);
-            let culled: std::collections::BTreeSet<_> = emit_culled(&s, cb)
+            let culled: std::collections::BTreeSet<_> = emit_culled(&s, &cb)
                 .iter()
                 .flat_map(|q| q.unit_faces().collect::<Vec<_>>())
                 .collect();
-            let greedy: std::collections::BTreeSet<_> = emit_greedy(&s, cb)
+            let greedy: std::collections::BTreeSet<_> = emit_greedy(&s, &cb)
                 .iter()
                 .flat_map(|q| q.unit_faces().collect::<Vec<_>>())
                 .collect();
@@ -177,8 +178,8 @@ mod tests {
         }
         let (v, cb) = scene(&cells);
         let s = VolumeSampler::new(&v);
-        let culled = emit_culled(&s, cb);
-        let greedy = emit_greedy(&s, cb);
+        let culled = emit_culled(&s, &cb);
+        let greedy = emit_greedy(&s, &cb);
         assert_eq!(greedy.len(), culled.len());
         assert!(greedy.iter().all(|q| q.u_len == 1 && q.v_len == 1));
     }

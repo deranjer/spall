@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use spall_protocol::{
-    InputFrame, MotionSnapshot, Record, SessionId, WireTag, decode_datagram, encode_datagram,
+    InputFrame, MotionSnapshot, PlayerId, Record, SessionId, WireTag, decode_datagram,
+    encode_datagram,
 };
 
 use crate::config::TransportConfig;
@@ -85,6 +86,7 @@ pub struct Connection {
     cfg: TransportConfig,
     role: Role,
     session: SessionId,
+    player_id: Option<PlayerId>,
 
     ctrl_send: Mutex<quinn::SendStream>,
     ctrl_recv: Mutex<CtrlRecv>,
@@ -93,10 +95,23 @@ pub struct Connection {
     ctrl_dedup: Mutex<StreamDeduper>,
     dgram_dedup: Mutex<StreamDeduper>,
 
+    /// Last inbound traffic of any kind (control record, heartbeat, or a valid
+    /// datagram). Informational only.
     last_seen: Mutex<Instant>,
+    /// Last inbound *control-stream* traffic (a decoded `NetMessage`: record,
+    /// heartbeat, or `Bye`). This is what the idle watchdog checks -- datagrams,
+    /// fresh or duplicate, never refresh it.
+    last_control_seen: Mutex<Instant>,
     bulk_open: Arc<AtomicU32>,
 
     stats: Arc<ConnStats>,
+
+    /// The `reason` of the last `Bye` received on the control stream, if any.
+    /// `recv_record` returns `Ok(None)` for both a received `Bye` and a plain
+    /// stream close, so a caller that needs to tell those apart (e.g. a bounded
+    /// server-initiated disconnect vs. a peer that just vanished) reads this
+    /// after seeing `Ok(None)`.
+    bye_reason: std::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -120,6 +135,7 @@ impl Connection {
         ctrl_recv: quinn::RecvStream,
         cfg: TransportConfig,
         session: SessionId,
+        player_id: Option<PlayerId>,
         role: Role,
     ) -> Result<Self> {
         if quic.max_datagram_size().is_none() {
@@ -133,6 +149,7 @@ impl Connection {
             cfg,
             role,
             session,
+            player_id,
             ctrl_send: Mutex::new(ctrl_send),
             ctrl_recv: Mutex::new(CtrlRecv {
                 stream: ctrl_recv,
@@ -142,14 +159,23 @@ impl Connection {
             ctrl_dedup: Mutex::new(StreamDeduper::strict()),
             dgram_dedup: Mutex::new(StreamDeduper::with_window(256)),
             last_seen: Mutex::new(Instant::now()),
+            last_control_seen: Mutex::new(Instant::now()),
             bulk_open: Arc::new(AtomicU32::new(0)),
             stats: Arc::new(ConnStats::default()),
+            bye_reason: std::sync::Mutex::new(None),
         })
     }
 
     /// The session id assigned by the server during authentication.
     pub fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// Server-authenticated stable player principal, if this connection used
+    /// a per-player credential. Legacy shared-token connections have no
+    /// principal and must not be used for durable player-owned state.
+    pub fn player_id(&self) -> Option<PlayerId> {
+        self.player_id
     }
 
     /// Server or client end.
@@ -176,9 +202,26 @@ impl Connection {
         self.quic.stats()
     }
 
+    /// Quinn's current transport round-trip estimate, independent of
+    /// application work such as a server-scheduled input boundary.
+    pub fn rtt(&self) -> Duration {
+        self.quic.rtt()
+    }
+
     /// Shared counter handle, for a spawned pump that wants to record bytes.
     pub fn stats_handle(&self) -> Arc<ConnStats> {
         self.stats.clone()
+    }
+
+    /// The `reason` string of the last `Bye` this end received on the control
+    /// stream, if any has arrived yet. Set the moment `recv_record` decodes a
+    /// `Bye` (before it returns `Ok(None)`), so it is available to a caller
+    /// that just saw its control-record loop end.
+    pub fn bye_reason(&self) -> Option<String> {
+        self.bye_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     // --- control stream ----------------------------------------------------
@@ -226,12 +269,17 @@ impl Connection {
                 NetMessage::decode(&raw, self.cfg.limits.max_control_record).map_err(|e| {
                     TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
                 })?;
-            self.touch().await;
+            // Any decoded control message -- record, heartbeat, or `Bye`, fresh
+            // or a duplicate -- is inbound control progress for the watchdog.
+            self.touch_control().await;
             match msg {
                 NetMessage::Heartbeat { seq } => {
                     recv.peer_heartbeat_seq = seq;
                 }
-                NetMessage::Bye { .. } => return Ok(None),
+                NetMessage::Bye { reason } => {
+                    *self.bye_reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+                    return Ok(None);
+                }
                 NetMessage::Record { seq, record } => {
                     match self.ctrl_dedup.lock().await.admit(seq) {
                         DedupVerdict::Accept { .. } => {
@@ -247,7 +295,25 @@ impl Connection {
         }
     }
 
-    /// Sends a `Bye` then finishes the control send stream.
+    /// `say_bye` reason for an ordinary end of session (the server closing
+    /// every connection at run end, or a client leaving on its own).
+    pub const BYE_REASON_COMPLETE: &'static str = "server complete";
+    /// `say_bye` reason for a server-initiated disconnect of a joining client
+    /// whose catch-up queue kept overflowing past `max_join_retries` (T23 / G3
+    /// row 10): a *bounded, explicit* give-up, distinct on the wire from an
+    /// ordinary shutdown so the disconnected client can report a bounded
+    /// failure instead of silently keeping its stale pre-catch-up state.
+    pub const BYE_REASON_CATCH_UP_EXHAUSTED: &'static str = "catch-up exhausted";
+
+    /// Sends a `Bye` then finishes the control send stream. Waits briefly
+    /// (bounded) for the peer to acknowledge receipt before returning.
+    ///
+    /// `finish()` alone only stops *sending* -- it does not wait for
+    /// delivery, so a caller that immediately tears down the whole QUIC
+    /// connection afterward (every current caller does exactly this) can
+    /// race the `Bye` away before the peer's `recv_record` ever sees it,
+    /// turning a deliberate, reasoned goodbye into an indistinguishable
+    /// "connection lost" on the other end (T23 / G3 row 10).
     pub async fn say_bye(&self, reason: &str) -> Result<()> {
         let bytes = NetMessage::Bye {
             reason: reason.to_string(),
@@ -256,7 +322,9 @@ impl Connection {
         .map_err(|e| TransportError::Frame(crate::framing::FrameError::Stream(e.to_string())))?;
         let mut send = self.ctrl_send.lock().await;
         write_framed(&mut send, &bytes, self.cfg.limits.max_control_record).await?;
+        let stopped = send.stopped();
         let _ = send.finish();
+        let _ = tokio::time::timeout(Duration::from_secs(2), stopped).await;
         Ok(())
     }
 
@@ -336,6 +404,8 @@ impl Connection {
                 self.stats.dedup_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            // Datagrams refresh `last_seen` only; they are not control progress,
+            // so they must not keep the idle watchdog (`last_control_seen`) fed.
             self.touch().await;
             match self.dgram_dedup.lock().await.admit(seq) {
                 DedupVerdict::Accept { .. } => {
@@ -368,22 +438,45 @@ impl Connection {
         })
     }
 
-    /// Opens a raw bidirectional stream with no framing wrapper. For callers
+    /// Opens a raw bidirectional stream with no framing wrapper, for callers
     /// that drive their own framed reads (baseline plumbing in later tasks, and
-    /// the malformed-input tests here).
-    pub async fn open_bi_raw(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        self.quic
+    /// the malformed-input tests here). It counts against
+    /// [`TransportConfig::limits`]`.max_bulk_streams` exactly like [`open_bulk`]:
+    /// the returned [`RawBulkStream`] holds the reservation and releases it when
+    /// dropped, on success or error.
+    ///
+    /// [`open_bulk`]: Self::open_bulk
+    pub async fn open_bi_raw(&self) -> Result<RawBulkStream> {
+        let guard = self.reserve_bulk()?;
+        let (send, recv) = self
+            .quic
             .open_bi()
             .await
-            .map_err(|e| TransportError::ConnectionLost(e.to_string()))
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
+        Ok(RawBulkStream {
+            send,
+            recv,
+            _open: guard,
+        })
     }
 
-    /// Accepts a raw bidirectional stream with no framing wrapper.
-    pub async fn accept_bi_raw(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        self.quic
+    /// Accepts a raw bidirectional stream with no framing wrapper, applying the
+    /// same ceiling as [`accept_bulk`]. The returned [`RawBulkStream`] owns the
+    /// reservation and releases it on drop.
+    ///
+    /// [`accept_bulk`]: Self::accept_bulk
+    pub async fn accept_bi_raw(&self) -> Result<RawBulkStream> {
+        let (send, recv) = self
+            .quic
             .accept_bi()
             .await
-            .map_err(|e| TransportError::ConnectionLost(e.to_string()))
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
+        let guard = self.reserve_bulk()?;
+        Ok(RawBulkStream {
+            send,
+            recv,
+            _open: guard,
+        })
     }
 
     /// Accepts the next inbound bulk stream, applying the same ceiling.
@@ -401,6 +494,27 @@ impl Connection {
             assembled_cap: self.cfg.limits.max_assembled_transfer,
             _open: guard,
         })
+    }
+
+    /// Number of live bulk-stream reservations across every entry point
+    /// ([`open_bulk`](Self::open_bulk), [`accept_bulk`](Self::accept_bulk),
+    /// [`open_bi_raw`](Self::open_bi_raw), [`accept_bi_raw`](Self::accept_bi_raw)).
+    /// Exposed for diagnostics and tests; never exceeds
+    /// [`TransportConfig::limits`]`.max_bulk_streams`.
+    pub fn bulk_stream_count(&self) -> u32 {
+        self.bulk_open.load(Ordering::SeqCst)
+    }
+
+    /// Opens a bidirectional stream that deliberately does **not** count against
+    /// the bulk-stream ceiling, so a test can push a peer past the negotiated
+    /// cap on purpose. Gated behind the `test-util` feature; never reachable
+    /// from a production build.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn open_bi_unguarded(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+        self.quic
+            .open_bi()
+            .await
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))
     }
 
     fn reserve_bulk(&self) -> Result<BulkGuard> {
@@ -432,7 +546,7 @@ impl Connection {
             tokio::select! {
                 _ = self.quic.closed() => break,
                 _ = beat.tick() => {
-                    if self.since_last_seen().await > self.cfg.idle_timeout {
+                    if self.since_last_control_seen().await > self.cfg.idle_timeout {
                         self.quic.close(1u32.into(), b"idle timeout");
                         break;
                     }
@@ -446,8 +560,19 @@ impl Connection {
                         let mut s = self.ctrl_send.lock().await;
                         write_framed(&mut s, &bytes, self.cfg.limits.max_control_record).await
                     };
+                    // T23 / G3 row 11: bound the write by `idle_timeout`, not
+                    // `heartbeat_interval`. A heartbeat shares its connection's
+                    // congestion/flow-control budget with real application
+                    // traffic (a baseline transfer in particular); on a
+                    // bandwidth-capped link that traffic can legitimately keep
+                    // this write pending well past one `heartbeat_interval`
+                    // without the peer being unresponsive. `idle_timeout` is
+                    // already this connection's considered answer to "how long
+                    // is silence tolerated" -- reusing it here means a slow-but-
+                    // progressing write is never treated as a dead peer sooner
+                    // than genuine silence would be.
                     let sent = tokio::select! {
-                        result = tokio::time::timeout(self.cfg.heartbeat_interval, write) => result,
+                        result = tokio::time::timeout(self.cfg.idle_timeout, write) => result,
                         _ = stop.changed() => {
                             self.quic.close(0u32.into(), b"liveness stopped during write");
                             break;
@@ -462,7 +587,7 @@ impl Connection {
                     }
                     self.stats.heartbeats_sent.fetch_add(1, Ordering::Relaxed);
                     self.stats.app_bytes_sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    if self.since_last_seen().await > self.cfg.idle_timeout {
+                    if self.since_last_control_seen().await > self.cfg.idle_timeout {
                         self.quic.close(1u32.into(), b"idle timeout");
                         break;
                     }
@@ -476,13 +601,31 @@ impl Connection {
         }
     }
 
-    /// Time since the last inbound control traffic of any kind.
+    /// Time since the last inbound traffic of any kind (control or datagram).
+    /// Informational; the idle watchdog uses [`since_last_control_seen`] instead.
+    ///
+    /// [`since_last_control_seen`]: Self::since_last_control_seen
     pub async fn since_last_seen(&self) -> Duration {
         self.last_seen.lock().await.elapsed()
     }
 
+    /// Time since the last inbound *control-stream* traffic (record, heartbeat,
+    /// or `Bye`). Datagram activity, fresh or duplicate, does not advance this,
+    /// so a peer that stops its control heartbeat still trips the idle watchdog.
+    pub async fn since_last_control_seen(&self) -> Duration {
+        self.last_control_seen.lock().await.elapsed()
+    }
+
     async fn touch(&self) {
         *self.last_seen.lock().await = Instant::now();
+    }
+
+    /// Records inbound control-stream progress: refreshes both the general
+    /// liveness stamp and the watchdog's control-only stamp.
+    async fn touch_control(&self) {
+        let now = Instant::now();
+        *self.last_seen.lock().await = now;
+        *self.last_control_seen.lock().await = now;
     }
 
     /// True until the QUIC connection has closed.
@@ -533,6 +676,32 @@ struct BulkGuard(Arc<AtomicU32>);
 impl Drop for BulkGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A raw bidirectional stream pair with no framing wrapper, handed out by
+/// [`Connection::open_bi_raw`] / [`Connection::accept_bi_raw`]. It counts
+/// against the negotiated bulk-stream ceiling; dropping it (on success, error,
+/// or an early bail) releases the reservation, exactly like [`BulkSend`] /
+/// [`BulkRecv`].
+///
+/// The stream halves are only lent out by reference so the reservation guard
+/// cannot be split away from the live streams.
+pub struct RawBulkStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    _open: BulkGuard,
+}
+
+impl RawBulkStream {
+    /// The reliable send half; the caller drives its own framing.
+    pub fn send_mut(&mut self) -> &mut quinn::SendStream {
+        &mut self.send
+    }
+
+    /// The reliable receive half; the caller drives its own framing.
+    pub fn recv_mut(&mut self) -> &mut quinn::RecvStream {
+        &mut self.recv
     }
 }
 

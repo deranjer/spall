@@ -1,0 +1,27 @@
+(
+    format_version: 1,
+    name: "Main",
+    next_entity_id: 3,
+    entities: {
+        (1): (
+            id: (1),
+            name: "palm_tree_2",
+            transform: (
+                translation: (0.0, 0.0, 0.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((1)),
+        ),
+        (2): (
+            id: (2),
+            name: "weeping_willow_2",
+            transform: (
+                translation: (8.0, 0.0, 0.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((2)),
+        ),
+    },
+)

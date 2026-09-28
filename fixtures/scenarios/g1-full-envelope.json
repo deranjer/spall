@@ -1,0 +1,16 @@
+{
+  "name": "g1-full-envelope",
+  "scene": "g1-full-envelope",
+  "description": "T11a / ENG-62 — the full G1 gate envelope over real QUIC: 64 x 32 x 64 m of real, resident, walkable terrain (not just isolated structures), a hollow tower/bridge spanning brick boundaries, an excavatable ramp, and a moving hollow test-volume body. The hollow test volume is added to SimWorld at scene construction, bypassing the commit pipeline (same as g4-workload's debris), so both clients are deliberately --late-join to pull the real T17 baseline (terrain + the body) instead of installing the fixed compile-time scene -- the only path whose world_hash agrees with the server's (see t23-g4-workload.json's note). Client 0 severs the tower, detaching the bridge; client 1 digs into the ramp. Passes only if both cuts commit, server/client hashes agree, and the committed topology-event stream replays from the tick-0 baseline to the same hash.",
+  "server_ticks": 200,
+  "quiescence_ticks": 60,
+  "clients": 2,
+  "late_join_clients": [0, 1],
+  "minimum_transactions": 2,
+  "minimum_detached_body_brick_span": 1,
+  "replay_check": true,
+  "cuts": [
+    { "client": 0, "at_tick": 10, "cell": [31, 48, 39], "radius": 12 },
+    { "client": 1, "at_tick": 20, "cell": [195, 38, 107], "radius": 3 }
+  ]
+}

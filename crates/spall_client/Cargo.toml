@@ -6,8 +6,12 @@ rust-version.workspace = true
 
 [dependencies]
 spall_core = { path = "../spall_core" }
+spall_fluid = { path = "../spall_fluid" }
 spall_protocol = { path = "../spall_protocol" }
 spall_net = { path = "../spall_net" }
+spall_physics = { path = "../spall_physics" }
+spall_render = { path = "../spall_render" }
+spall_sim = { path = "../spall_sim" }
 spall_voxel = { path = "../spall_voxel" }
 serde.workspace = true
 serde_json.workspace = true
@@ -16,7 +20,9 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", 
 tracing.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
 pollster = "0.4.0"
-
-[dev-dependencies]
-spall_sim = { path = "../spall_sim" }
+yakui.workspace = true
+yakui-wgpu.workspace = true
+yakui-winit.workspace = true

@@ -21,9 +21,13 @@
 pub mod accounting;
 pub mod brick;
 pub mod brush;
+pub mod builtin_assets;
 pub mod edit;
 pub mod fixtures;
+pub mod logical;
 pub mod query;
+pub mod region;
+pub mod residency;
 pub mod transform;
 pub mod volume;
 
@@ -36,8 +40,18 @@ mod random_parity;
 pub use accounting::MemoryReport;
 pub use brick::{Brick, BrickHash, BrickSnapshot, DENSE_LAYER_BYTES, LayerKind};
 pub use edit::{BrickRevisionRecord, CellEdit, EditError, EditOutcome, EditPlan};
+pub use logical::{
+    BrickDigest, DigestError, EvictedBricks, LogicalBrick, logical_bricks, logical_solid_cells,
+};
 pub use query::{
     Face, MissReason, Ray, RayConfig, RayError, RayHit, RayOutcome, cast_ray, cast_ray_world,
+};
+pub use region::{
+    ActiveRegions, RegionCoord, RegionInterestRadii, RegionLayout, RegionLayoutError,
+};
+pub use residency::{
+    BrickCacheKey, CacheBudget, CacheEntryState, CollisionAdmission, CollisionReadiness,
+    InterestRadii, ResidencyCache, ResidencyPlan,
 };
 pub use transform::RigidXform;
 pub use volume::{AccessError, BrickBounds, BrickState, Residency, Sample, Volume};
