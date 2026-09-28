@@ -134,7 +134,10 @@ pub fn commit(
         }
     } else {
         let st = world.physics().body_state(parent_phys);
-        let (_, local_com, _) = world.physics().derived_mass_properties(parent_phys);
+        // Body-local COM with the grid-origin collider offset applied, so a
+        // parent whose occupancy does not start at local cell zero (e.g. a body
+        // that was itself split off) still reports its true world COM (`ENG-55`).
+        let local_com = world.physics().body_local_com(parent_phys);
         let pose = BodyPose::new(
             glam::DQuat::from_xyzw(
                 f64::from(st.rotation[0]),

@@ -47,6 +47,10 @@ pub struct ChildBody {
     pub mass_kg: f64,
     pub com_world_m: [f64; 3],
     pub collider_plan: ColliderPlan,
+    /// Global cell the child's tight occupancy grid starts at. `PhysicsWorld`
+    /// applies `collider_plan.grid.origin() * cell_m` as the body-local collider
+    /// offset when the body is installed (`ENG-55`); this field records the same
+    /// origin for the journal / DTO surface.
     pub collider_grid_origin: GlobalCell,
     pub collider_region: (GlobalCell, GlobalCell),
     pub cell_count: u64,

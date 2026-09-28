@@ -130,7 +130,9 @@ impl SimWorld {
             grid: plan.grid,
             cell_m,
             density_kg_m3: 1.0,
-            translation_m: grid_origin_translation(&grid, cell_m),
+            // Terrain sits at the identity transform; the grid-origin offset is
+            // applied to the collider shape by `PhysicsWorld` (`ENG-55`).
+            translation_m: [0.0; 3],
             linvel_m_s: [0.0; 3],
         });
 

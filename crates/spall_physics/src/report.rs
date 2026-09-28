@@ -339,16 +339,25 @@ fn building_drop(rep: Representation, steps: u32) -> (PercentileSummary, f64, bo
 
     // Floor slab top is at y = 4 cells * 0.25 m = 1.0 m; drop the building a
     // short distance onto it, centred over the slab (16 m wide, building 3 m).
+    // The building's tight grid origin is negative (it straddles the eight-brick
+    // corner), so subtract the grid-origin collider offset to keep its occupied
+    // region — not the body-local origin — centred over the slab (`ENG-55`).
     let building = fixtures::hollow_building(vid(2));
     let grid = OccupancyGrid::from_volume(&building).unwrap().unwrap();
     let dims = grid.dims();
+    let o = grid.origin();
+    let off = [
+        o.x as f32 * fixtures::CELL_M,
+        o.y as f32 * fixtures::CELL_M,
+        o.z as f32 * fixtures::CELL_M,
+    ];
     let id = world.add_body(BodySpec {
         kind: BodyKind::Dynamic { ccd: false },
         representation: rep,
         grid,
         cell_m: fixtures::CELL_M,
         density_kg_m3: fixtures::STONE_DENSITY,
-        translation_m: [6.5, 1.3, 6.5],
+        translation_m: [6.5 - off[0], 1.3 - off[1], 6.5 - off[2]],
         linvel_m_s: [0.0; 3],
     });
 

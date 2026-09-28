@@ -50,7 +50,9 @@ pub struct ColliderBuild {
 }
 
 /// Builds a collider for `grid` (cell edge `cell_m` metres) in `rep`. The shape
-/// is placed so grid cell `(0, 0, 0)`'s corner is the body-local origin.
+/// is built with grid cell `(0, 0, 0)`'s corner at the shape origin;
+/// [`crate::world::PhysicsWorld`] then offsets it by `grid.origin() * cell_m` so
+/// it lands on the volume's authoritative cells (`ENG-55`).
 pub fn build_collider(grid: &OccupancyGrid, cell_m: f32, rep: Representation) -> ColliderBuild {
     match rep {
         Representation::NativeVoxels => build_native(grid, cell_m),

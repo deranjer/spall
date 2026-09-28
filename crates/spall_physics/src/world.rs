@@ -118,6 +118,22 @@ struct Entry {
     cell_m: f32,
     representation: Representation,
     density: f32,
+    /// Body-local translation applied to the collider shape so its grid cell
+    /// `(0, 0, 0)` sits at `OccupancyGrid::origin() * cell_m` instead of at the
+    /// body-local origin (`ENG-55`). Refreshed on every `rebuild_collider`.
+    collider_offset_m: [f32; 3],
+}
+
+/// The body-local offset that places a tight [`OccupancyGrid`]'s cell `(0, 0, 0)`
+/// corner at `origin * cell_m` — so the collider shape lands on the volume's
+/// authoritative cells, not near the body-local origin.
+fn collider_grid_offset_m(grid: &OccupancyGrid, cell_m: f32) -> [f32; 3] {
+    let o = grid.origin();
+    [
+        o.x as f32 * cell_m,
+        o.y as f32 * cell_m,
+        o.z as f32 * cell_m,
+    ]
 }
 
 /// A fixed-step rigid-body world over voxel colliders.
@@ -186,9 +202,11 @@ impl PhysicsWorld {
         .build();
         let body = self.bodies.insert(rb);
 
+        let offset = collider_grid_offset_m(&spec.grid, spec.cell_m);
         let built = build_collider(&spec.grid, spec.cell_m, spec.representation);
         let collider = ColliderBuilder::new(built.collider.shared_shape().clone())
             .density(spec.density_kg_m3)
+            .translation(Vector::new(offset[0], offset[1], offset[2]))
             .build();
         let collider = self
             .colliders
@@ -201,6 +219,7 @@ impl PhysicsWorld {
             cell_m: spec.cell_m,
             representation: spec.representation,
             density: spec.density_kg_m3,
+            collider_offset_m: offset,
         });
         id
     }
@@ -218,10 +237,14 @@ impl PhysicsWorld {
         self.colliders
             .remove(entry.collider, &mut self.islands, &mut self.bodies, true);
 
+        // A rebuild after an edit can shift the tight grid's origin, so the
+        // body-local collider offset is recomputed here too (`ENG-55`).
+        let offset = collider_grid_offset_m(grid, cell_m);
         let built = build_collider(grid, cell_m, rep);
         let start = Instant::now();
         let collider = ColliderBuilder::new(built.collider.shared_shape().clone())
             .density(density)
+            .translation(Vector::new(offset[0], offset[1], offset[2]))
             .build();
         let handle = self
             .colliders
@@ -230,6 +253,7 @@ impl PhysicsWorld {
 
         self.entries[id.0 as usize].collider = handle;
         self.entries[id.0 as usize].representation = rep;
+        self.entries[id.0 as usize].collider_offset_m = offset;
         built.build + insert
     }
 
@@ -340,8 +364,12 @@ impl PhysicsWorld {
         );
     }
 
-    /// Mass properties Rapier derived for a body's collider: `(mass_kg, local
-    /// centre of mass in metres, principal inertia diagonal)`.
+    /// Mass properties Rapier derived for a body's collider, in the collider
+    /// shape's own frame (grid cell `(0, 0, 0)` corner at the origin):
+    /// `(mass_kg, centre of mass in metres, principal inertia diagonal)`. This
+    /// is the frame [`crate::analytic_mass_properties`] uses, so the two are
+    /// directly comparable. Use [`Self::body_local_com`] for the centre of mass
+    /// in the *body* frame (with the grid-origin collider offset applied).
     pub fn derived_mass_properties(&self, id: BodyId) -> (f32, [f32; 3], [f32; 3]) {
         let entry = &self.entries[id.0 as usize];
         let shape = self.colliders[entry.collider].shared_shape().clone();
@@ -353,5 +381,133 @@ impl PhysicsWorld {
             [com.x, com.y, com.z],
             [inertia.x, inertia.y, inertia.z],
         )
+    }
+
+    /// Centre of mass in the body-local frame, metres: the collider shape's own
+    /// centre of mass plus the grid-origin collider offset (`ENG-55`). This is
+    /// the quantity the authoritative sim needs to place a body's world COM.
+    pub fn body_local_com(&self, id: BodyId) -> [f32; 3] {
+        let entry = &self.entries[id.0 as usize];
+        let shape = self.colliders[entry.collider].shared_shape().clone();
+        let com = shape.mass_properties(entry.density).local_com;
+        [
+            com.x + entry.collider_offset_m[0],
+            com.y + entry.collider_offset_m[1],
+            com.z + entry.collider_offset_m[2],
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spall_core::{CellSizeCode, GlobalCell, MaterialId, VolumeId};
+    use spall_voxel::{EditPlan, Volume};
+
+    fn vid(n: u64) -> VolumeId {
+        VolumeId::new(n).unwrap()
+    }
+
+    fn box_grid(min: GlobalCell, max: GlobalCell) -> OccupancyGrid {
+        let mut v = Volume::new(vid(1), CellSizeCode::Quarter);
+        v.apply_edit(&EditPlan::filled_box(v.id(), min, max, MaterialId(1)))
+            .unwrap();
+        OccupancyGrid::from_volume(&v).unwrap().unwrap()
+    }
+
+    /// `ENG-55`: a body whose tight occupancy starts at `(8, 8, 1)` — not local
+    /// cell zero — must collide on those cells, not near the body-local origin.
+    /// A floor placed under the body's *authoritative* cells catches it; without
+    /// the grid-origin collider offset the shape sits ~2 m lower and tunnels
+    /// straight through.
+    #[test]
+    fn a_collider_lands_on_its_grid_origin_cells_not_the_body_local_origin() {
+        let cell_m = 0.25_f32;
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+
+        // Floor: cells x 6..13, y 0..1, z 0..3 -> top surface at y = 0.5 m,
+        // directly beneath the beam's authoritative x/z range.
+        let floor = box_grid(GlobalCell::new(6, 0, 0), GlobalCell::new(13, 1, 3));
+        world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: floor,
+            cell_m,
+            density_kg_m3: 2600.0,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+
+        // Beam: cells x 8..11, y 8..9, z 1..2 -> grid origin (8, 8, 1); bottom
+        // face at y = 2.0 m, 1.5 m above the floor.
+        let beam = box_grid(GlobalCell::new(8, 8, 1), GlobalCell::new(11, 9, 2));
+        let id = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::MergedCuboids,
+            grid: beam,
+            cell_m,
+            density_kg_m3: 2600.0,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+
+        // Body-local COM sits on the authoritative cells: cell-centre means
+        // x 10.0, y 9.0, z 2.0 -> (2.5, 2.25, 0.5) m.
+        let com = world.body_local_com(id);
+        assert!(
+            (com[0] - 2.5).abs() < 0.05
+                && (com[1] - 2.25).abs() < 0.05
+                && (com[2] - 0.5).abs() < 0.05,
+            "body-local COM {com:?} should be on the grid-origin cells"
+        );
+
+        for _ in 0..240 {
+            world.step();
+        }
+        let st = world.body_state(id);
+        assert!(st.is_finite());
+        // Rests on the floor (frame origin ends near y = 0.5 - 2.0 = -1.5 m),
+        // nowhere near the < -5 m free-fall the displaced collider produced.
+        assert!(
+            st.translation_m[1] > -2.5,
+            "beam settled on the floor under its authoritative cells (y = {})",
+            st.translation_m[1]
+        );
+    }
+
+    /// A rebuild after an edit that deletes the minimum cells shifts the tight
+    /// grid origin; the collider offset must follow so the remaining cells stay
+    /// put in world space.
+    #[test]
+    fn rebuild_tracks_a_shifted_grid_origin() {
+        let cell_m = 0.25_f32;
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+
+        let full = box_grid(GlobalCell::new(4, 4, 4), GlobalCell::new(11, 11, 11));
+        let id = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::MergedCuboids,
+            grid: full,
+            cell_m,
+            density_kg_m3: 2600.0,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+        // Cells 4..11 on each axis: cell-centre mean 8.0 -> 2.0 m.
+        let com0 = world.body_local_com(id);
+        assert!((com0[0] - 2.0).abs() < 0.05 && (com0[1] - 2.0).abs() < 0.05);
+
+        // Drop the x = 4..5, y = 4..5 and z = 4..5 slabs: tight origin moves to
+        // (6, 6, 4).
+        let shrunk = box_grid(GlobalCell::new(6, 6, 4), GlobalCell::new(11, 11, 11));
+        world.rebuild_collider(id, &shrunk, Representation::MergedCuboids);
+        // New cell-centre means: x/y 9.0 -> 2.25 m, z 8.0 -> 2.0 m.
+        let com1 = world.body_local_com(id);
+        assert!(
+            (com1[0] - 2.25).abs() < 0.05
+                && (com1[1] - 2.25).abs() < 0.05
+                && (com1[2] - 2.0).abs() < 0.05,
+            "rebuilt collider COM {com1:?} tracks the shifted grid origin"
+        );
     }
 }
