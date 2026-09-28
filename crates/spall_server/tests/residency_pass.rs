@@ -390,6 +390,71 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
     );
 }
 
+/// Incremental capture may reuse a previously verified record when an evicted
+/// brick's revision is unchanged.  A later backing mutation must not turn that
+/// cache hit into a read or make the checkpoint silently adopt the bad record.
+#[test]
+fn capture_checkpoint_reuses_cached_evicted_record_without_reading_backing() {
+    use spall_server::persist::PersistConfig;
+
+    let cfg = PersistConfig {
+        world_id: 0x5A11_0000_0000_C0DE,
+        seed: 11,
+        generator_version: 1,
+    };
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = Arc::new(MemoryBacking::default());
+    let mut pass = ResidencyPass::install_with_backing(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 1,
+        },
+        backing.clone(),
+    );
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+    let cached_coord = GlobalCell::new(82, 6, 75).split().0;
+
+    for _ in 1..=6u64 {
+        sim.tick().unwrap();
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
+    }
+    let retained = sim
+        .world()
+        .evicted(terrain)
+        .get(cached_coord)
+        .expect("the untouched east brick must be evicted");
+
+    // Corrupt the backing after install.  The unchanged revision should select
+    // the install-time checkpoint_cache entry and never inspect this record.
+    backing.insert(
+        terrain,
+        cached_coord,
+        spall_voxel::Brick::uniform(
+            spall_core::MaterialId(1),
+            spall_core::Revision(retained.revision.get() + 1000),
+        ),
+    );
+    let checkpoint = pass
+        .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect("an unchanged brick should reuse its verified cached record");
+    let stored = checkpoint
+        .bricks
+        .iter()
+        .find(|brick| {
+            brick.volume_id == terrain.get()
+                && brick.coord == [cached_coord.x, cached_coord.y, cached_coord.z]
+        })
+        .expect("the checkpoint must still include the cached logical brick");
+    assert_eq!(
+        stored.revision,
+        retained.revision.get(),
+        "cached capture must preserve the retained revision despite backing drift"
+    );
+}
+
 /// T23 / G3 row 7 increment 16 (durable exact-revision backing
 /// acknowledgement, audit + fix). The audit found `capture_checkpoint`
 /// trusted whatever the backing offered for an evicted brick without
@@ -450,12 +515,17 @@ fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_r
         pass.run(sim.world_mut(), &player_feet, &Default::default());
     }
 
-    let (evicted_coord, retained_digest) = sim
+    // The east region is edited by SCRIPT, so its retained revision differs
+    // from the install-time checkpoint cache and forces the cache-miss backing
+    // path under test.  Picking the first evicted brick could accidentally pick
+    // an untouched cache hit, in which case corrupting its backing is correctly
+    // ignored by incremental capture.
+    let evicted_coord = GlobalCell::new(82, 6, 75).split().0;
+    let retained_digest = sim
         .world()
         .evicted(terrain)
-        .iter()
-        .next()
-        .expect("the run must still have evicted terrain, or this test proves nothing");
+        .get(evicted_coord)
+        .expect("the edited east brick must still be evicted");
 
     // Overwrite the backing's record for this exact coord with real-looking
     // geometry at a revision the retained digest never agreed to -- a stand-in

@@ -628,6 +628,26 @@ impl ResidencyPass {
                             });
                         }
                     };
+                    // A cache miss must validate the backing record against the
+                    // retained digest before allowing its encoded bytes into a
+                    // checkpoint.  Incremental cache hits intentionally skip
+                    // this read: their previously encoded record is already the
+                    // verified value for the same retained revision.
+                    if world
+                        .evicted(self.terrain)
+                        .verify_candidate(coord, &brick)
+                        .is_err()
+                    {
+                        let offered = spall_voxel::BrickDigest::capture_brick(&brick);
+                        return Err(PersistError::EvictedBrickDigestMismatch {
+                            volume: self.terrain.get(),
+                            coord: [coord.x, coord.y, coord.z],
+                            retained_revision: digest.revision.get(),
+                            retained_hash: digest.content_hash.to_string(),
+                            backing_revision: offered.revision.get(),
+                            backing_hash: offered.content_hash.to_string(),
+                        });
+                    }
                     stored_brick_from_backing(self.terrain, coord, &brick)?
                 }
             };
