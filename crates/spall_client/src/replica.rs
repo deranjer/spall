@@ -224,6 +224,13 @@ pub struct ReplicaWorld {
     /// slice), so `world_hash` / transaction validation are byte-identical to
     /// today. Keyed by raw volume id. See `docs/reports/G3-residency-hash.md`.
     evicted: BTreeMap<u64, spall_voxel::EvictedBricks>,
+    /// Monotonic local generation of the *resident terrain view*. This is a
+    /// derived-cache invalidation token, not protocol state: it changes only
+    /// after an atomic mutation that can change terrain geometry available to
+    /// client collision (baseline install/patch, published terrain transaction,
+    /// eviction, or reload). Motion-only records and body-only edits leave it
+    /// alone.
+    terrain_generation: u64,
 }
 
 impl ReplicaWorld {
@@ -254,6 +261,7 @@ impl ReplicaWorld {
             repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
             evicted: BTreeMap::new(),
+            terrain_generation: 1,
         }
     }
 
@@ -279,6 +287,7 @@ impl ReplicaWorld {
             repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
             evicted: BTreeMap::new(),
+            terrain_generation: 0,
         }
     }
 
@@ -398,6 +407,7 @@ impl ReplicaWorld {
         // included (G3-residency-hash.md lifecycle).
         self.evicted = BTreeMap::new();
         self.now_tick = world.checkpoint_tick;
+        self.bump_terrain_generation();
         Ok(())
     }
 
@@ -423,6 +433,7 @@ impl ReplicaWorld {
         // part-way (unknown volume, malformed brick, out-of-bounds coord) never
         // half-replaces live state — the repair either restores exact parity or
         // changes nothing.
+        let terrain_touched = world.volumes.iter().any(|v| v.volume_id == self.terrain_id);
         let mut staged: BTreeMap<u64, Volume> = BTreeMap::new();
         for bv in &world.volumes {
             let vid = bv.volume_id;
@@ -480,6 +491,9 @@ impl ReplicaWorld {
                     bb.coord[2],
                 ));
             }
+        }
+        if terrain_touched {
+            self.bump_terrain_generation();
         }
         Ok(())
     }
@@ -612,6 +626,15 @@ impl ReplicaWorld {
         self.volumes.get(&self.terrain_id.get())
     }
 
+    /// Cheap invalidation token for a cached immutable terrain clone.
+    pub fn terrain_generation(&self) -> u64 {
+        self.terrain_generation
+    }
+
+    fn bump_terrain_generation(&mut self) {
+        self.terrain_generation = self.terrain_generation.wrapping_add(1).max(1);
+    }
+
     /// Any live volume by stable id. Streamed client caches use this to account
     /// resident bricks without reaching into replica internals.
     pub fn volume(&self, volume: VolumeId) -> Option<&Volume> {
@@ -644,6 +667,9 @@ impl ReplicaWorld {
             return false;
         }
         v.evict_brick(coord);
+        if volume == self.terrain_id {
+            self.bump_terrain_generation();
+        }
         true
     }
 
@@ -857,6 +883,10 @@ impl ReplicaWorld {
         }
 
         // 4. Commit the candidate. Nothing above mutated live state.
+        let terrain_touched = tx
+            .ops
+            .iter()
+            .any(|op| topology_op_touches_volume(op, self.terrain_id));
         self.volumes = candidate;
         // slice E: a committed op that wrote into a brick this replica had
         // evicted (its `before` gap was healed by a repair patch just before
@@ -880,6 +910,9 @@ impl ReplicaWorld {
             );
         }
         self.applied_tx.insert(tx.transaction_id.get());
+        if terrain_touched {
+            self.bump_terrain_generation();
+        }
 
         // ENG-49: this transaction is applied — drop it from the pending-repair
         // hold and clear any repair keys its `before` bricks were blocked on so
@@ -1060,6 +1093,21 @@ impl ReplicaWorld {
 }
 
 // --- op replay --------------------------------------------------------------
+
+fn topology_op_touches_volume(op: &TopologyOp, volume: VolumeId) -> bool {
+    match op {
+        TopologyOp::IntegerBrush { volume: v, .. } | TopologyOp::CellRun { volume: v, .. } => {
+            *v == volume
+        }
+        TopologyOp::SplitOff { source, child, .. }
+        | TopologyOp::SplitOffBaseline { source, child, .. }
+        | TopologyOp::SplitOffBulkBaseline { source, child, .. } => {
+            *source == volume || *child == volume
+        }
+        TopologyOp::SourcePatchBaseline { source, .. }
+        | TopologyOp::SourcePatchBulkBaseline { source, .. } => *source == volume,
+    }
+}
 
 /// A batch of same-volume writes not yet applied.
 struct PendingGroup {
@@ -1433,7 +1481,8 @@ fn lerp_pose(a: &Pose, b: &Pose, t: f64) -> Pose {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spall_core::CellSizeCode;
+    use spall_core::{CellSizeCode, Tick};
+    use spall_protocol::InputSeq;
     use spall_voxel::EditPlan;
 
     fn terrain() -> Volume {
@@ -1745,6 +1794,110 @@ mod tests {
             replica.apply_transaction(&tx),
             ApplyOutcome::Published { .. }
         ));
+    }
+
+    #[test]
+    fn terrain_generation_tracks_only_published_resident_terrain_mutations() {
+        use spall_protocol::{
+            BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume, BaselineWorld,
+        };
+
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        let initial = replica.terrain_generation();
+
+        // Body-only installation and motion do not invalidate terrain-derived
+        // collision.
+        let body = EntityId::new(44).unwrap();
+        let mut body_volume = Volume::new(VolumeId::new(44).unwrap(), CellSizeCode::Quarter);
+        body_volume
+            .apply_edit(&EditPlan::filled_box(
+                body_volume.id(),
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(0, 0, 0),
+                MaterialId(1),
+            ))
+            .unwrap();
+        replica.install_body(body, body_volume);
+        let snap = MotionSnapshot {
+            server_tick: Tick(2),
+            snapshot_seq: spall_protocol::SnapshotSeq(1),
+            acked_input: InputSeq(0),
+            body,
+            topology_revision: Revision(1),
+            pose: Pose {
+                translation_m: [1.0, 2.0, 3.0],
+                rotation: spall_core::QuantizedQuat::from_unit(0.0, 0.0, 0.0, 1.0).unwrap(),
+            },
+            linear_velocity: [0.0; 3],
+            angular_velocity: [0.0; 3],
+            sleeping: false,
+        };
+        replica.ingest_snapshot(&snap);
+        assert_eq!(replica.terrain_generation(), initial);
+
+        let terrain_id = replica.terrain_volume_id();
+        assert!(replica.evict_brick(terrain_id, BrickCoord::new(0, 0, 0)));
+        let evicted = replica.terrain_generation();
+        assert!(evicted > initial);
+
+        let mut cells = vec![MaterialId::AIR.0; spall_core::CELLS_PER_BRICK];
+        cells[..10].fill(MaterialId(1).0);
+        let patch = BaselineWorld {
+            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            checkpoint_tick: 3,
+            volumes: vec![BaselineVolume {
+                volume_id: terrain_id,
+                cell_size_code: CellSizeCode::Quarter.to_u8(),
+                owner: BaselineOwner::Terrain,
+                bounds: None,
+                bricks: vec![BaselineBrick {
+                    coord: [0, 0, 0],
+                    revision: 1,
+                    edited: true,
+                    cells: BaselineCells::Dense(cells),
+                }],
+            }],
+        };
+        replica.apply_baseline_patch(&patch).unwrap();
+        let repaired = replica.terrain_generation();
+        assert!(repaired > evicted);
+
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(991).unwrap(),
+            server_tick: Tick(4),
+            control_seq: spall_protocol::ControlSeq(2),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: terrain_id,
+                start: GlobalCell::new(0, 0, 0),
+                len: 1,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![],
+        };
+        assert!(matches!(
+            replica.apply_transaction(&tx),
+            ApplyOutcome::Published { .. }
+        ));
+        assert!(replica.terrain_generation() > repaired);
+
+        let before_rejected = replica.terrain_generation();
+        let mut invalid = tx;
+        invalid.transaction_id = TransactionId::new(992).unwrap();
+        invalid.ops = vec![TopologyOp::CellRun {
+            volume: terrain_id,
+            start: GlobalCell::new(0, 0, 0),
+            len: 0,
+            material: MaterialId::AIR,
+        }];
+        assert!(matches!(
+            replica.apply_transaction(&invalid),
+            ApplyOutcome::Rejected { .. }
+        ));
+        assert_eq!(replica.terrain_generation(), before_rejected);
     }
 
     #[test]

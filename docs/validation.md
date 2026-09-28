@@ -162,8 +162,25 @@ prediction/reconciliation acceptance is CPU tests: `cargo test -p spall_physics
 character::`, `-p spall_sim --test player_movement`, and `-p spall_client --test
 prediction` (predictor vs. a live `spall_sim::Simulation` through an injected
 100 ms link — convergence, floor-removal-no-hover, lost-button-release).
-Interactive window input and full moving-body crush outcomes remain unrun /
-follow-up.
+ENG-69 adds interactive window input and deadline-based prediction timing. The
+mover uses a resident-terrain mutation generation instead of hashing and cloning
+the full terrain every iteration, and bounded four-step catch-up instead of a
+fixed sleep after work. `ClientSummary` version 4 reports completed prediction
+steps / elapsed time, catch-up / dropped / maximum backlog, terrain clone and
+collider-refresh time, and prediction-step mean/max inputs; movement summaries
+report unconditional mean/max pre/post-reconcile displacement and the count over
+1 cm. `cargo test -p spall_client --test prediction_timing -- --nocapture`
+models the captured 825-server-tick / 318-client-step failure over 13.75 s with
+six 100 ms mover stalls, 50 ms delayed snapshots, direction changes, and a
+neutral tail. Measured CPU result: 812 local steps (59.05 Hz), 275 reconciles,
+0.008270 m median / 0.072685 m p95 / 0.150239 m maximum pre/post displacement;
+the pure scheduler fixture reaches 819 steps (59.56 Hz), drops 6 old deadlines,
+and never sees a due batch above 5. A real two-client QUIC `player-movement` run
+measured 427 steps in 7.117–7.120 s (59.97–60.00 Hz), 0 dropped, maximum backlog
+1–2, 9–22 us total terrain-clone time across two generations, and 0.007908–
+0.008916 m mean unconditional reconcile displacement. These are measured
+headless timing/correctness results; hands-on visual acceptance remains unrun.
+Full moving-body crush outcomes remain follow-up.
 T20 (increment 1) adds opt-in per-client interest + motion bandwidth
 scheduling to the host: `sandbox-server --serve --motion-interest`
 (with `--motion-near-m` / `--motion-far-m` / `--motion-far-interval` /
@@ -258,7 +275,9 @@ cargo xtask scenario --name giant-split --loss-percent 0 --output .local/runs/gi
 
 # T19: one `walk` server + two scripted player capsules that predict movement,
 # send InputFrame datagrams, and reconcile against the server's player snapshots.
-# Passes on bounded corrections, ground contact, travel distance, and no hover.
+# Passes on bounded corrections, ground contact, travel distance, no hover, and
+# writes prediction throughput/backlog/stage timing plus unconditional reconcile
+# displacement to each client summary.
 cargo xtask scenario --name player-movement --loss-percent 0 --output .local/runs/player-movement
 
 # T12: stable acceptance cameras with six views and per-pass GPU timing.

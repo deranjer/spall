@@ -14,6 +14,7 @@
 //! residual is reported as a bounded correction.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::time::Duration;
 
 use serde::Serialize;
 use spall_core::{BrickCoord, GlobalCell, MaterialId, PlayerInput, Tick};
@@ -27,10 +28,83 @@ use spall_voxel::{Sample, Volume};
 
 /// Bounded predicted-input history depth.
 pub const PREDICTION_HISTORY: usize = 128;
+/// Maximum fixed steps run back-to-back after a delayed wake. Longer stalls
+/// skip the excess wall-clock debt and let the next authoritative snapshot
+/// rebase prediction instead of monopolising the async runtime with an
+/// unbounded burst.
+pub const MAX_PREDICTION_CATCHUP_STEPS: u32 = 4;
 /// Terrain cell size, metres (the 0.25 m world grid).
 pub const CELL_M: f32 = 0.25;
 /// Cells per brick edge (`docs/architecture.md`'s fixed brick size).
 const BRICK_CELLS: i64 = 32;
+
+/// Result of polling [`FixedStepClock`] at one monotonic elapsed time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PredictionStepBatch {
+    /// Total fixed-step deadlines reached since the previous poll.
+    pub due: u32,
+    /// Steps the caller should execute now, capped by
+    /// [`MAX_PREDICTION_CATCHUP_STEPS`].
+    pub steps: u32,
+    /// Deadlines skipped to keep catch-up bounded (`due - steps`).
+    pub dropped: u32,
+}
+
+/// Deadline-based fixed-step scheduler driven by a caller-provided monotonic
+/// elapsed time. Work duration is naturally subtracted from the next wait:
+/// unlike `sleep(step)` after every iteration, a 6 ms prediction step waits
+/// only the remaining ~10.7 ms of a 60 Hz period. Delayed wakes catch up by at
+/// most four steps and discard older debt explicitly.
+#[derive(Debug, Clone)]
+pub struct FixedStepClock {
+    step: Duration,
+    next_deadline: Duration,
+}
+
+impl FixedStepClock {
+    pub fn new(step: Duration) -> Self {
+        assert!(!step.is_zero(), "prediction step must be non-zero");
+        Self {
+            step,
+            next_deadline: step,
+        }
+    }
+
+    /// Time remaining until the next fixed-step deadline.
+    pub fn wait_duration(&self, elapsed: Duration) -> Duration {
+        self.next_deadline.saturating_sub(elapsed)
+    }
+
+    /// Returns the bounded batch due at `elapsed` and advances the deadline by
+    /// all elapsed periods, including explicitly dropped excess debt.
+    pub fn poll(&mut self, elapsed: Duration) -> PredictionStepBatch {
+        if elapsed < self.next_deadline {
+            return PredictionStepBatch {
+                due: 0,
+                steps: 0,
+                dropped: 0,
+            };
+        }
+        let overdue = elapsed - self.next_deadline;
+        let step_ns = self.step.as_nanos();
+        let due_u128 = overdue.as_nanos() / step_ns + 1;
+        let due = due_u128.min(u128::from(u32::MAX)) as u32;
+        let steps = due.min(MAX_PREDICTION_CATCHUP_STEPS);
+        let dropped = due - steps;
+        self.next_deadline += self.step.saturating_mul(due);
+        PredictionStepBatch {
+            due,
+            steps,
+            dropped,
+        }
+    }
+
+    /// Discards accumulated debt while prediction is intentionally held (no
+    /// player yet, or unknown resident collision beneath it).
+    pub fn reset(&mut self, elapsed: Duration) {
+        self.next_deadline = elapsed + self.step;
+    }
+}
 
 /// A physics world that mirrors only the replica's terrain collider, so the
 /// predictor sweeps the capsule against the geometry the server used.
@@ -392,6 +466,11 @@ pub struct ReconcileOutcome {
     /// Records kept and re-simulated from `authoritative` — this call's
     /// actual replay depth. `history.len()` after is exactly this.
     pub records_replayed: usize,
+    /// Latest locally predicted tick minus this snapshot's server tick before
+    /// and after reconciliation. Negative-before values directly expose an
+    /// under-producing client clock; after is the retained replay depth.
+    pub prediction_tick_lead_before: i64,
+    pub prediction_tick_lead_after: i64,
     pub predicted_before: CharacterState,
     pub predicted_after: CharacterState,
     /// `Some` only when a `history` record was tagged for exactly
@@ -502,6 +581,13 @@ pub struct PredictedPlayer {
     /// seen on an unmatched reconcile — the actually-felt jump size for the
     /// cases `corrections`/`max_correction_m` cannot see at all.
     pub max_unmatched_displacement_m: f64,
+    /// Unconditional pre/post-reconcile displacement telemetry. This measures
+    /// the actual pose jump applied to the camera path whether or not an exact
+    /// prediction record was available for comparison.
+    pub reconciles: u64,
+    pub reconcile_displacement_sum_m: f64,
+    pub max_reconcile_displacement_m: f64,
+    pub reconcile_displacements_over_1cm: u64,
 }
 
 impl PredictedPlayer {
@@ -540,6 +626,10 @@ impl PredictedPlayer {
             hovered_after_floor_removal: false,
             unmatched_reconciles: 0,
             max_unmatched_displacement_m: 0.0,
+            reconciles: 0,
+            reconcile_displacement_sum_m: 0.0,
+            max_reconcile_displacement_m: 0.0,
+            reconcile_displacements_over_1cm: 0,
         }
     }
 
@@ -628,6 +718,11 @@ impl PredictedPlayer {
 
         let history_len_before = self.history.len();
         let predicted_before = self.predicted;
+        let latest_tick_before = self
+            .history
+            .back()
+            .map_or(self.next_tick.0.saturating_sub(1), |r| r.tick.0);
+        let prediction_tick_lead_before = latest_tick_before as i64 - server_tick.0 as i64;
 
         // Identity-based lookup, *before* any mutation: the record (if any)
         // whose own tag is exactly `server_tick` — not an index derived from
@@ -681,6 +776,7 @@ impl PredictedPlayer {
         self.history.retain(|r| r.tick.0 > server_tick.0);
         let records_replayed = self.history.len();
         let records_removed = history_len_before - records_replayed;
+        let prediction_tick_lead_after = records_replayed as i64;
 
         // Re-anchor every surviving record's tag exactly onto `server_tick`
         // — closes whatever drift accumulated *this* interval in one step
@@ -707,10 +803,21 @@ impl PredictedPlayer {
         }
         self.predicted = state;
 
+        let reconcile_displacement_m = predicted_before.distance_m(&self.predicted);
+        self.reconciles += 1;
+        self.reconcile_displacement_sum_m += reconcile_displacement_m;
+        self.max_reconcile_displacement_m = self
+            .max_reconcile_displacement_m
+            .max(reconcile_displacement_m);
+        if reconcile_displacement_m > 0.01 {
+            self.reconcile_displacements_over_1cm += 1;
+        }
+
         if comparison.is_none() {
             self.unmatched_reconciles += 1;
-            let displacement = predicted_before.distance_m(&self.predicted);
-            self.max_unmatched_displacement_m = self.max_unmatched_displacement_m.max(displacement);
+            self.max_unmatched_displacement_m = self
+                .max_unmatched_displacement_m
+                .max(reconcile_displacement_m);
         }
 
         ReconcileOutcome {
@@ -719,6 +826,8 @@ impl PredictedPlayer {
             history_len_before,
             records_removed,
             records_replayed,
+            prediction_tick_lead_before,
+            prediction_tick_lead_after,
             predicted_before,
             predicted_after: self.predicted,
             comparison,
@@ -768,6 +877,14 @@ impl PredictedPlayer {
             held_button_release_ok,
             final_predicted_pos_m: self.predicted.position_m,
             final_authoritative_pos_m: self.authoritative.position_m,
+            reconciles: self.reconciles,
+            mean_reconcile_displacement_m: if self.reconciles == 0 {
+                0.0
+            } else {
+                self.reconcile_displacement_sum_m / self.reconciles as f64
+            },
+            max_reconcile_displacement_m: self.max_reconcile_displacement_m,
+            reconcile_displacements_over_1cm: self.reconcile_displacements_over_1cm,
         }
     }
 }
@@ -788,4 +905,8 @@ pub struct PlayerMovementSummary {
     pub held_button_release_ok: bool,
     pub final_predicted_pos_m: [f64; 3],
     pub final_authoritative_pos_m: [f64; 3],
+    pub reconciles: u64,
+    pub mean_reconcile_displacement_m: f64,
+    pub max_reconcile_displacement_m: f64,
+    pub reconcile_displacements_over_1cm: u64,
 }

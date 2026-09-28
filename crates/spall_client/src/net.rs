@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
@@ -40,7 +40,9 @@ use spall_protocol::{
 };
 
 use crate::interactive::{InteractiveSession, InteractiveView};
-use crate::predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer, WindowStats};
+use crate::predict::{
+    ClientPhysics, FixedStepClock, PlayerMovementSummary, PredictedPlayer, WindowStats,
+};
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
 use crate::residency::ClientResidencyPass;
 
@@ -382,6 +384,37 @@ pub struct ClientSummary {
     /// separate server-side log.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub action_reject_reasons: Vec<String>,
+    /// Fixed prediction steps actually completed and the monotonic wall time
+    /// covered by the mover. Together these report measured prediction
+    /// throughput for headless and interactive runs.
+    #[serde(default)]
+    pub prediction_steps: u64,
+    #[serde(default)]
+    pub prediction_elapsed_ms: u64,
+    /// Extra steps executed after delayed wakes, deadlines intentionally
+    /// dropped by the bounded catch-up cap, and the largest due batch seen.
+    #[serde(default)]
+    pub prediction_catchup_steps: u64,
+    #[serde(default)]
+    pub prediction_dropped_steps: u64,
+    #[serde(default)]
+    pub prediction_max_backlog_steps: u64,
+    /// Terrain snapshots are cloned only when this count's replica generation
+    /// changes. Timings make accidental full-volume work visible in live runs.
+    #[serde(default)]
+    pub prediction_terrain_refreshes: u64,
+    #[serde(default)]
+    pub prediction_terrain_clone_us: u64,
+    #[serde(default)]
+    pub prediction_collider_rebuild_us: u64,
+    #[serde(default)]
+    pub prediction_step_us: u64,
+    #[serde(default)]
+    pub prediction_step_max_us: u64,
+    #[serde(default)]
+    pub prediction_send_us: u64,
+    #[serde(default)]
+    pub prediction_residency_us: u64,
 }
 
 /// Anything that stops a client run before it can report.
@@ -490,6 +523,18 @@ struct Counters {
     /// retry) already re-requests on its own schedule, so this is dropped and
     /// counted rather than treated as fatal.
     baseline_transfer_failures: AtomicU64,
+    prediction_steps: AtomicU64,
+    prediction_elapsed_ms: AtomicU64,
+    prediction_catchup_steps: AtomicU64,
+    prediction_dropped_steps: AtomicU64,
+    prediction_max_backlog_steps: AtomicU64,
+    prediction_terrain_refreshes: AtomicU64,
+    prediction_terrain_clone_us: AtomicU64,
+    prediction_collider_rebuild_us: AtomicU64,
+    prediction_step_us: AtomicU64,
+    prediction_step_max_us: AtomicU64,
+    prediction_send_us: AtomicU64,
+    prediction_residency_us: AtomicU64,
 }
 
 /// Cap on `Counters::action_reject_reasons` — a diagnostic log, not something
@@ -508,6 +553,10 @@ fn state_from_snapshot(snap: &MotionSnapshot) -> CharacterState {
     }
 }
 
+fn local_snapshot_is_newer(last: Option<(Tick, u64)>, tick: Tick, sequence: u64) -> bool {
+    last.is_none_or(|prev| (tick, sequence) > prev)
+}
+
 /// T19 predicted-player state shared by the mover and motion tasks. The mover
 /// owns terrain rebuilds and prediction ticks; the motion task only reconciles.
 struct Predictor {
@@ -515,7 +564,7 @@ struct Predictor {
     params: CharacterParams,
     phys: ClientPhysics,
     player: Option<PredictedPlayer>,
-    terrain_hash: Option<Hash32>,
+    terrain_generation: Option<u64>,
     input_seq: u64,
     recent: std::collections::VecDeque<RecentInput>,
     /// The server tick observed on the *first* authoritative snapshot for this
@@ -532,6 +581,63 @@ struct Predictor {
     script_origin_tick: Option<u64>,
 }
 
+#[derive(Clone)]
+struct CachedTerrainSnapshot {
+    generation: u64,
+    volume: Arc<spall_voxel::Volume>,
+}
+
+/// Returns the current immutable terrain snapshot, cloning the replica volume
+/// only when its resident-terrain generation changes. The cache is shared by
+/// the mover and motion reader so remote motion packets and ordinary 60 Hz
+/// prediction do no full-volume work.
+fn cached_terrain_snapshot(
+    replica: &Mutex<ReplicaWorld>,
+    cache: &Mutex<Option<CachedTerrainSnapshot>>,
+    counters: &Counters,
+) -> Option<CachedTerrainSnapshot> {
+    let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+    let generation = guard.terrain_generation();
+    let mut cached = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cached.as_ref().is_some_and(|c| c.generation == generation) {
+        return cached.clone();
+    }
+    let started = Instant::now();
+    let volume = Arc::new(guard.terrain_volume()?.clone());
+    let clone_us = started.elapsed().as_micros() as u64;
+    let fresh = CachedTerrainSnapshot { generation, volume };
+    *cached = Some(fresh.clone());
+    drop(cached);
+    drop(guard);
+    counters
+        .prediction_terrain_refreshes
+        .fetch_add(1, Ordering::Relaxed);
+    counters
+        .prediction_terrain_clone_us
+        .fetch_add(clone_us, Ordering::Relaxed);
+    Some(fresh)
+}
+
+fn refresh_predictor_terrain(
+    predictor: &mut Predictor,
+    terrain: &CachedTerrainSnapshot,
+    counters: &Counters,
+) {
+    if predictor.terrain_generation == Some(terrain.generation) {
+        return;
+    }
+    let first = predictor.terrain_generation.is_none();
+    let started = Instant::now();
+    predictor.phys.set_terrain(&terrain.volume);
+    counters
+        .prediction_collider_rebuild_us
+        .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    predictor.terrain_generation = Some(terrain.generation);
+    if !first && let Some(player) = &mut predictor.player {
+        player.invalidate();
+    }
+}
+
 impl Predictor {
     fn new(entity: EntityId) -> Self {
         Self {
@@ -539,7 +645,7 @@ impl Predictor {
             params: CharacterParams::DEFAULT,
             phys: ClientPhysics::new(),
             player: None,
-            terrain_hash: None,
+            terrain_generation: None,
             input_seq: 0,
             recent: std::collections::VecDeque::new(),
             script_origin_tick: None,
@@ -568,6 +674,104 @@ struct CorrectionStats {
     /// resync did.
     unmatched_reconciles: u64,
     max_unmatched_displacement_m: f64,
+}
+
+struct MoverStepOutcome {
+    frame: Option<InputFrame>,
+    feet: Option<[f64; 3]>,
+    script_tick: Option<u64>,
+    predicted_state: Option<CharacterState>,
+    correction_stats: Option<CorrectionStats>,
+    window_stats: WindowStats,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_prediction_step(
+    predictor: &mut Predictor,
+    terrain: Option<&CachedTerrainSnapshot>,
+    counters: &Counters,
+    script: &[MovementStep],
+    interactive: Option<&Arc<InteractiveSession>>,
+    session: spall_protocol::SessionId,
+    observed_server_tick: u64,
+    active_script_tick: &mut u64,
+    last_active_server_tick: &mut Option<u64>,
+) -> MoverStepOutcome {
+    if let Some(terrain) = terrain {
+        refresh_predictor_terrain(predictor, terrain, counters);
+    }
+    let ready = predictor
+        .player
+        .as_ref()
+        .is_some_and(|pl| predictor.phys.covers(pl.predicted().position_m));
+    let script_tick = predictor.script_origin_tick.map(|_| *active_script_tick);
+    let frame = if ready && predictor.phys.has_terrain() {
+        let input = match interactive {
+            Some(session) => session.input.snapshot(),
+            None => scripted_input(script, script_tick.unwrap_or(0)),
+        };
+        predictor.input_seq += 1;
+        let seq = InputSeq(predictor.input_seq);
+        if let Some(player) = &mut predictor.player
+            && let Some(terrain) = terrain
+        {
+            player.tick(
+                &mut predictor.phys,
+                &terrain.volume,
+                input,
+                seq,
+                MOVEMENT_DT_S,
+            );
+        }
+        let prior = last_active_server_tick.replace(observed_server_tick);
+        if let Some(prior) = prior {
+            *active_script_tick =
+                active_script_tick.saturating_add(observed_server_tick.saturating_sub(prior));
+        }
+        let recent: Vec<RecentInput> = predictor.recent.iter().rev().take(3).copied().collect();
+        predictor.recent.push_back(RecentInput {
+            input_seq: seq,
+            movement: input.movement,
+            view_dir: input.view_dir,
+            buttons: input.buttons,
+        });
+        while predictor.recent.len() > 3 {
+            predictor.recent.pop_front();
+        }
+        Some(InputFrame {
+            session,
+            player: predictor.entity,
+            input_seq: seq,
+            intended_tick: Tick(observed_server_tick + 1),
+            movement: input.movement,
+            view_dir: input.view_dir,
+            buttons: input.buttons,
+            recent,
+        })
+    } else {
+        *last_active_server_tick = None;
+        None
+    };
+    let predicted_state = predictor.player.as_ref().map(PredictedPlayer::predicted);
+    let feet = predicted_state.map(|st| st.position_m);
+    let correction_stats = predictor.player.as_ref().map(|pl| CorrectionStats {
+        corrections: pl.corrections,
+        max_correction_m: pl.max_correction_m,
+        idle_corrections: pl.idle_corrections,
+        max_idle_correction_m: pl.max_idle_correction_m,
+        max_vertical_correction_m: pl.max_vertical_correction_m,
+        max_horizontal_correction_m: pl.max_horizontal_correction_m,
+        unmatched_reconciles: pl.unmatched_reconciles,
+        max_unmatched_displacement_m: pl.max_unmatched_displacement_m,
+    });
+    MoverStepOutcome {
+        frame,
+        feet,
+        script_tick,
+        predicted_state,
+        correction_stats,
+        window_stats: predictor.phys.window_stats(),
+    }
 }
 
 /// Receives one baseline transfer whose `BaselineBegin` has already been read:
@@ -797,6 +1001,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                 conn.session(),
             ))))
         });
+    let prediction_terrain: Arc<Mutex<Option<CachedTerrainSnapshot>>> = Arc::new(Mutex::new(None));
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
@@ -978,8 +1183,13 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let replica = replica.clone();
         let counters = counters.clone();
         let predictor = predictor.clone();
+        let prediction_terrain = prediction_terrain.clone();
         let interactive = config.interactive.clone();
         tokio::spawn(async move {
+            let local_entity = predictor
+                .as_ref()
+                .map(|pred| pred.lock().unwrap_or_else(|e| e.into_inner()).entity);
+            let mut last_local_snapshot: Option<(Tick, u64)> = None;
             loop {
                 match conn.recv_datagram().await {
                     Ok(Some(DatagramRecord::Motion(snap))) => {
@@ -988,67 +1198,77 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             .fetch_max(snap.server_tick.get(), Ordering::Relaxed);
                         // T19: a snapshot for our own player entity reconciles
                         // the predictor rather than entering the body replica.
-                        if let Some(pred) = &predictor {
-                            // Locked (and dropped) before `pred`'s own lock below,
-                            // matching the mover loop's lock ordering
-                            // (`replica` then `pred`) to avoid a cross-task
-                            // deadlock risk.
-                            let terrain_volume = {
-                                let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
-                                guard.terrain_volume().cloned()
-                            };
-                            let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
-                            let p: &mut Predictor = &mut guard;
-                            if snap.body == p.entity {
-                                let st = state_from_snapshot(&snap);
-                                match &mut p.player {
-                                    None => {
-                                        p.player = Some(PredictedPlayer::new(
-                                            p.params,
-                                            st,
-                                            snap.server_tick,
-                                        ));
-                                        p.script_origin_tick.get_or_insert(snap.server_tick.get());
-                                    }
-                                    // The live HUD path only needs `PredictedPlayer`'s own
-                                    // running counters, read separately below; the returned
-                                    // per-event `CorrectionEvent` instead goes to
-                                    // `CorrectionLog` (ENG-69 round 10/11 — see its own doc)
-                                    // when this is an interactive session, for post-hoc
-                                    // analysis of a real hands-on run.
-                                    //
-                                    // `terrain_volume` is `None` only before the replica
-                                    // has any terrain object at all — skipping
-                                    // reconciliation this one time is the same as any
-                                    // other not-ready tick, not a hard failure.
-                                    Some(pl) => {
-                                        if let Some(volume) = &terrain_volume {
-                                            let outcome = pl.reconcile(
-                                                &mut p.phys,
-                                                volume,
-                                                st,
-                                                snap.acked_input,
-                                                snap.server_tick,
-                                            );
-                                            // Logged unconditionally, not only
-                                            // when `outcome.comparison` is
-                                            // `Some` (ENG-69 round 21): a
-                                            // silent full resync — every
-                                            // record dropped, no comparison
-                                            // possible — is exactly the case
-                                            // that must never read as "zero
-                                            // corrections".
-                                            if let Some(session) = &interactive
-                                                && let Some(log) = &session.corrections
-                                            {
-                                                log.record(&outcome);
-                                            }
-                                        }
-                                    }
-                                }
+                        if let Some(pred) = &predictor
+                            && Some(snap.body) == local_entity
+                        {
+                            // Player reconciliation must be monotonic even when
+                            // datagrams overtake one another. A stale player
+                            // snapshot used to run `reconcile` backward while
+                            // remote bodies already rejected old ticks in their
+                            // `MotionTrack`.
+                            let key = (snap.server_tick, snap.snapshot_seq.0);
+                            if !local_snapshot_is_newer(
+                                last_local_snapshot,
+                                snap.server_tick,
+                                snap.snapshot_seq.0,
+                            ) {
+                                counters.motion_reordered.fetch_add(1, Ordering::Relaxed);
                                 counters.motion.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
+                            last_local_snapshot = Some(key);
+                            let terrain =
+                                cached_terrain_snapshot(&replica, &prediction_terrain, &counters);
+                            let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
+                            let p: &mut Predictor = &mut guard;
+                            if let Some(terrain) = &terrain {
+                                refresh_predictor_terrain(p, terrain, &counters);
+                            }
+                            let st = state_from_snapshot(&snap);
+                            match &mut p.player {
+                                None => {
+                                    p.player =
+                                        Some(PredictedPlayer::new(p.params, st, snap.server_tick));
+                                    p.script_origin_tick.get_or_insert(snap.server_tick.get());
+                                }
+                                // The live HUD path only needs `PredictedPlayer`'s own
+                                // running counters, read separately below; the returned
+                                // per-event `CorrectionEvent` instead goes to
+                                // `CorrectionLog` (ENG-69 round 10/11 — see its own doc)
+                                // when this is an interactive session, for post-hoc
+                                // analysis of a real hands-on run.
+                                //
+                                // `terrain_volume` is `None` only before the replica
+                                // has any terrain object at all — skipping
+                                // reconciliation this one time is the same as any
+                                // other not-ready tick, not a hard failure.
+                                Some(pl) => {
+                                    if let Some(terrain) = &terrain {
+                                        let outcome = pl.reconcile(
+                                            &mut p.phys,
+                                            &terrain.volume,
+                                            st,
+                                            snap.acked_input,
+                                            snap.server_tick,
+                                        );
+                                        // Logged unconditionally, not only
+                                        // when `outcome.comparison` is
+                                        // `Some` (ENG-69 round 21): a
+                                        // silent full resync — every
+                                        // record dropped, no comparison
+                                        // possible — is exactly the case
+                                        // that must never read as "zero
+                                        // corrections".
+                                        if let Some(session) = &interactive
+                                            && let Some(log) = &session.corrections
+                                        {
+                                            log.record(&outcome);
+                                        }
+                                    }
+                                }
+                            }
+                            counters.motion.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
 
                         // A strictly-decreasing per-publisher `snapshot_seq`
@@ -1104,11 +1324,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             .store(u64::from(confirmed), Ordering::Relaxed);
     }
 
-    // T19 mover: every ~16 ms sample the scripted input for the observed tick,
-    // predict the capsule locally, and send an `InputFrame` datagram with up to
-    // three recent copies for loss recovery. It also rebuilds the predicted
-    // terrain collider (and rebases prediction) when the replica terrain hash
-    // changes — a committed edit near the player.
+    // T19 mover: deadline-driven 60 Hz prediction. Work time counts against the
+    // period, delayed wakes catch up in a bounded batch, and terrain is cloned
+    // only when the replica's resident-terrain generation changes.
     let mover = predictor.clone().map(|pred| {
         let conn = conn.clone();
         let replica = replica.clone();
@@ -1118,6 +1336,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let stop_rx = stop_rx.clone();
         let client_residency = config.client_residency;
         let interactive = config.interactive.clone();
+        let prediction_terrain = prediction_terrain.clone();
         tokio::spawn(async move {
             let end_tick = script_end_tick(&script);
             // Slice E2: a scripted mover optionally evicts terrain outside a
@@ -1131,148 +1350,86 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
             // without ever sending an input frame.
             let mut active_script_tick = 0_u64;
             let mut last_active_server_tick = None;
+            let started = Instant::now();
+            let mut clock = FixedStepClock::new(Duration::from_secs_f64(f64::from(MOVEMENT_DT_S)));
             loop {
                 if *stop_rx.borrow() {
                     return;
                 }
+                let wait = clock.wait_duration(started.elapsed());
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                let batch = clock.poll(started.elapsed());
+                if batch.steps == 0 {
+                    continue;
+                }
                 let tick = counters.last_tick.load(Ordering::Relaxed);
-
-                // Rebuild the collider if the terrain changed near us. Kept as
-                // two separate bindings, not one `Option<(Hash32, Volume)>`
-                // (as before ENG-69 round 18): `terrain_volume` needs to stay
-                // borrowable both for the dirty-check block below *and* for
-                // every `pl.tick` call afterward, which now also needs a
-                // fresh `&Volume` each tick for its own window cache.
-                let (terrain_hash, terrain_volume) = {
-                    let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
-                    (
-                        guard.terrain_resident_hash(),
-                        guard.terrain_volume().cloned(),
-                    )
-                };
-                // All predictor-lock work happens in this non-async block, which
-                // returns the datagram to send (and the predicted feet position
-                // for the residency pass) once the guard is dropped.
-                type MoverTickOutcome = (
-                    Option<InputFrame>,
-                    Option<[f64; 3]>,
-                    Option<u64>,
-                    Option<CharacterState>,
-                    Option<CorrectionStats>,
-                    WindowStats,
-                );
-                let (frame, feet, script_tick, predicted_state, correction_stats, window_stats): MoverTickOutcome = {
-                    let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
-                    let p: &mut Predictor = &mut guard;
-                    if let (Some(hash), Some(volume)) = (terrain_hash, &terrain_volume)
-                        && p.terrain_hash != Some(hash)
-                    {
-                        p.phys.set_terrain(volume);
-                        let first = p.terrain_hash.is_none();
-                        p.terrain_hash = Some(hash);
-                        if !first && let Some(pl) = &mut p.player {
-                            pl.invalidate();
-                        }
-                    }
-
-                    // Beyond simply having *a* collider, prediction needs it to
-                    // actually cover where the player is standing
-                    // (`ClientPhysics::covers`): the collider body survives a
-                    // residency gap (`set_terrain` keeps it, empty, for a later
-                    // refill), so `has_terrain` alone stays true while a reload
-                    // a lossy repair round trip hasn't delivered yet leaves the
-                    // player over unknown ground. Predicting through that as if
-                    // it were confirmed air is exactly what turns one delayed
-                    // reload into an unbounded free-fall; holding here instead
-                    // means the predicted tick simply resumes once the brick
-                    // lands, the same way it already pauses before the player
-                    // exists.
-                    let ready = p
-                        .player
-                        .as_ref()
-                        .is_some_and(|pl| p.phys.covers(pl.predicted().position_m));
-
-                    // Start only once the player is live, then advance only
-                    // when an input is actually predicted and sent.  This
-                    // pauses an authored leg through a known residency hold.
-                    let script_tick = p.script_origin_tick.map(|_| active_script_tick);
-
-                    let frame = if ready && p.phys.has_terrain() {
-                        let input = match &interactive {
-                            Some(session) => session.input.snapshot(),
-                            None => scripted_input(&script, script_tick.unwrap_or(0)),
-                        };
-                        p.input_seq += 1;
-                        let seq = InputSeq(p.input_seq);
-                        if let Some(pl) = &mut p.player
-                            && let Some(volume) = &terrain_volume
-                        {
-                            pl.tick(&mut p.phys, volume, input, seq, MOVEMENT_DT_S);
-                        }
-                        // Preserve the script's server-tick cadence.  The
-                        // mover itself samples more often than snapshots can
-                        // advance, so incrementing once per loop makes an
-                        // impaired client cover several scripted ticks per
-                        // authoritative tick.  Resetting this reference while
-                        // held intentionally discards the unknown-ground gap.
-                        let prior = last_active_server_tick.replace(tick);
-                        if let Some(prior) = prior {
-                            active_script_tick =
-                                active_script_tick.saturating_add(tick.saturating_sub(prior));
-                        }
-
-                        let recent: Vec<RecentInput> =
-                            p.recent.iter().rev().take(3).copied().collect();
-                        p.recent.push_back(RecentInput {
-                            input_seq: seq,
-                            movement: input.movement,
-                            view_dir: input.view_dir,
-                            buttons: input.buttons,
-                        });
-                        while p.recent.len() > 3 {
-                            p.recent.pop_front();
-                        }
-                        Some(InputFrame {
+                let terrain = cached_terrain_snapshot(&replica, &prediction_terrain, &counters);
+                let mut frames = Vec::with_capacity(batch.steps as usize);
+                let mut last_outcome = None;
+                let mut completed = 0_u32;
+                for _ in 0..batch.steps {
+                    let step_started = Instant::now();
+                    let mut outcome = {
+                        let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
+                        run_prediction_step(
+                            &mut guard,
+                            terrain.as_ref(),
+                            &counters,
+                            &script,
+                            interactive.as_ref(),
                             session,
-                            player: p.entity,
-                            input_seq: seq,
-                            intended_tick: Tick(tick + 1),
-                            movement: input.movement,
-                            view_dir: input.view_dir,
-                            buttons: input.buttons,
-                            recent,
-                        })
-                    } else {
-                        last_active_server_tick = None;
-                        None
+                            tick,
+                            &mut active_script_tick,
+                            &mut last_active_server_tick,
+                        )
                     };
-                    let predicted_state = p.player.as_ref().map(PredictedPlayer::predicted);
-                    let feet = predicted_state.map(|st| st.position_m);
-                    let correction_stats = p.player.as_ref().map(|pl| CorrectionStats {
-                        corrections: pl.corrections,
-                        max_correction_m: pl.max_correction_m,
-                        idle_corrections: pl.idle_corrections,
-                        max_idle_correction_m: pl.max_idle_correction_m,
-                        max_vertical_correction_m: pl.max_vertical_correction_m,
-                        max_horizontal_correction_m: pl.max_horizontal_correction_m,
-                        unmatched_reconciles: pl.unmatched_reconciles,
-                        max_unmatched_displacement_m: pl.max_unmatched_displacement_m,
-                    });
-                    let window_stats = p.phys.window_stats();
-                    (
-                        frame,
-                        feet,
-                        script_tick,
-                        predicted_state,
-                        correction_stats,
-                        window_stats,
-                    )
-                };
-                if let Some(frame) = frame {
+                    let step_us = step_started.elapsed().as_micros() as u64;
+                    counters
+                        .prediction_step_us
+                        .fetch_add(step_us, Ordering::Relaxed);
+                    counters
+                        .prediction_step_max_us
+                        .fetch_max(step_us, Ordering::Relaxed);
+                    if let Some(frame) = outcome.frame.take() {
+                        frames.push(frame);
+                        completed += 1;
+                    } else {
+                        // Waiting for spawn or collision residency is an
+                        // intentional hold, not overload debt.
+                        clock.reset(started.elapsed());
+                        last_outcome = Some(outcome);
+                        break;
+                    }
+                    last_outcome = Some(outcome);
+                }
+                if completed > 0 {
+                    counters
+                        .prediction_steps
+                        .fetch_add(u64::from(completed), Ordering::Relaxed);
+                    counters
+                        .prediction_catchup_steps
+                        .fetch_add(u64::from(completed.saturating_sub(1)), Ordering::Relaxed);
+                    counters
+                        .prediction_dropped_steps
+                        .fetch_add(u64::from(batch.dropped), Ordering::Relaxed);
+                    counters
+                        .prediction_max_backlog_steps
+                        .fetch_max(u64::from(batch.due), Ordering::Relaxed);
+                }
+                let send_started = Instant::now();
+                for frame in frames {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
                 }
-                if let (Some(session), Some(predicted)) = (&interactive, predicted_state) {
-                    let stats = correction_stats.unwrap_or_default();
+                counters
+                    .prediction_send_us
+                    .fetch_add(send_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let Some(outcome) = last_outcome else {
+                    continue;
+                };
+                if let (Some(session), Some(predicted)) = (&interactive, outcome.predicted_state) {
+                    let stats = outcome.correction_stats.unwrap_or_default();
                     *session.view.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(InteractiveView {
                             predicted,
@@ -1286,12 +1443,21 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                             max_horizontal_correction_m: stats.max_horizontal_correction_m,
                             unmatched_reconciles: stats.unmatched_reconciles,
                             max_unmatched_displacement_m: stats.max_unmatched_displacement_m,
-                            window_stats,
+                            prediction_steps: counters.prediction_steps.load(Ordering::Relaxed),
+                            prediction_elapsed_ms: started.elapsed().as_millis() as u64,
+                            prediction_max_backlog_steps: counters
+                                .prediction_max_backlog_steps
+                                .load(Ordering::Relaxed),
+                            prediction_dropped_steps: counters
+                                .prediction_dropped_steps
+                                .load(Ordering::Relaxed),
+                            window_stats: outcome.window_stats,
                         });
                 }
 
                 // Slice E2: evict / request-reload terrain around the player.
-                if let (Some(pass), Some(feet)) = (residency.as_mut(), feet) {
+                if let (Some(pass), Some(feet)) = (residency.as_mut(), outcome.feet) {
+                    let residency_started = Instant::now();
                     let reqs = {
                         let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
                         pass.step(&mut guard, feet)
@@ -1311,16 +1477,22 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     for req in reqs {
                         let _ = conn.send_record(WireRecord::RepairRequest(req)).await;
                     }
+                    counters.prediction_residency_us.fetch_add(
+                        residency_started.elapsed().as_micros() as u64,
+                        Ordering::Relaxed,
+                    );
                 }
 
                 // Stop predicting a while after the script ends (the neutral
                 // tail proves the player settles). `script_tick` advances only
                 // while controlled input is sent, so an unknown-ground hold
                 // cannot silently consume this neutral tail.
-                if end_tick > 0 && script_tick.is_some_and(|t| t > end_tick + 360) {
+                counters
+                    .prediction_elapsed_ms
+                    .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                if end_tick > 0 && outcome.script_tick.is_some_and(|t| t > end_tick + 360) {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(16)).await;
             }
         })
     });
@@ -1497,7 +1669,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         }
     };
     let summary = ClientSummary {
-        version: 3,
+        version: 4,
         result: if progressed && movement_ok {
             "passed"
         } else {
@@ -1549,6 +1721,24 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         late_join_ready_ms: counters.late_join_ready_ms.load(Ordering::Relaxed),
         late_join_ready_confirmed: counters.late_join_ready_confirmed.load(Ordering::Relaxed) != 0,
         baseline_transfer_failures: counters.baseline_transfer_failures.load(Ordering::Relaxed),
+        prediction_steps: counters.prediction_steps.load(Ordering::Relaxed),
+        prediction_elapsed_ms: counters.prediction_elapsed_ms.load(Ordering::Relaxed),
+        prediction_catchup_steps: counters.prediction_catchup_steps.load(Ordering::Relaxed),
+        prediction_dropped_steps: counters.prediction_dropped_steps.load(Ordering::Relaxed),
+        prediction_max_backlog_steps: counters
+            .prediction_max_backlog_steps
+            .load(Ordering::Relaxed),
+        prediction_terrain_refreshes: counters
+            .prediction_terrain_refreshes
+            .load(Ordering::Relaxed),
+        prediction_terrain_clone_us: counters.prediction_terrain_clone_us.load(Ordering::Relaxed),
+        prediction_collider_rebuild_us: counters
+            .prediction_collider_rebuild_us
+            .load(Ordering::Relaxed),
+        prediction_step_us: counters.prediction_step_us.load(Ordering::Relaxed),
+        prediction_step_max_us: counters.prediction_step_max_us.load(Ordering::Relaxed),
+        prediction_send_us: counters.prediction_send_us.load(Ordering::Relaxed),
+        prediction_residency_us: counters.prediction_residency_us.load(Ordering::Relaxed),
     };
     drop(guard);
 
@@ -1570,4 +1760,19 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         )?;
     }
     Ok(summary)
+}
+
+#[cfg(test)]
+mod prediction_net_tests {
+    use super::local_snapshot_is_newer;
+    use spall_core::Tick;
+
+    #[test]
+    fn local_player_snapshots_never_reconcile_backward() {
+        let last = Some((Tick(300), 90));
+        assert!(!local_snapshot_is_newer(last, Tick(297), 91));
+        assert!(!local_snapshot_is_newer(last, Tick(300), 90));
+        assert!(local_snapshot_is_newer(last, Tick(300), 91));
+        assert!(local_snapshot_is_newer(last, Tick(303), 1));
+    }
 }

@@ -109,6 +109,13 @@ pub struct InteractiveView {
     /// `corrections` — see `ReconcileOutcome::comparison`'s own doc.
     pub unmatched_reconciles: u64,
     pub max_unmatched_displacement_m: f64,
+    /// Deadline-scheduler telemetry as of this publication. `steps / elapsed`
+    /// is the actual local prediction rate; backlog/dropped distinguish brief
+    /// bounded catch-up from sustained overload.
+    pub prediction_steps: u64,
+    pub prediction_elapsed_ms: u64,
+    pub prediction_max_backlog_steps: u64,
+    pub prediction_dropped_steps: u64,
     /// `ClientPhysics::window_stats()` as of this tick (ENG-69 round 18) —
     /// live proof the character-query-window cache is actually serving
     /// sweeps, not just present and unused. Cumulative counters, like
@@ -143,6 +150,7 @@ pub struct InteractiveView {
 pub struct CorrectionLog {
     file: Mutex<std::io::BufWriter<std::fs::File>>,
     started_at: std::time::Instant,
+    last_record_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl CorrectionLog {
@@ -156,6 +164,7 @@ impl CorrectionLog {
         Ok(Self {
             file: Mutex::new(std::io::BufWriter::new(file)),
             started_at: std::time::Instant::now(),
+            last_record_at: Mutex::new(None),
         })
     }
 
@@ -164,6 +173,16 @@ impl CorrectionLog {
     /// a reason to disrupt the session itself.
     pub fn record(&self, outcome: &ReconcileOutcome) {
         use std::io::Write;
+        let now = std::time::Instant::now();
+        let snapshot_interval_ms = {
+            let mut last = self
+                .last_record_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let gap = last.map(|t| now.duration_since(t).as_millis());
+            *last = Some(now);
+            gap.map_or_else(|| "null".to_string(), |ms| ms.to_string())
+        };
         let displacement_m = outcome
             .predicted_before
             .distance_m(&outcome.predicted_after);
@@ -175,12 +194,16 @@ impl CorrectionLog {
             None => "null".to_string(),
         };
         let line = format!(
-            "{{\"tick\":{},\"wall_ms\":{},\"server_tick_delta\":{},\"history_len_before\":{},\
+            "{{\"tick\":{},\"wall_ms\":{},\"snapshot_interval_ms\":{snapshot_interval_ms},\
+             \"server_tick_delta\":{},\"prediction_tick_lead_before\":{},\
+             \"prediction_tick_lead_after\":{},\"history_len_before\":{},\
              \"records_removed\":{},\"records_replayed\":{},\"displacement_m\":{displacement_m:.6},\
              \"comparison\":{comparison}}}\n",
             outcome.server_tick.get(),
             self.started_at.elapsed().as_millis(),
             outcome.server_tick_delta,
+            outcome.prediction_tick_lead_before,
+            outcome.prediction_tick_lead_after,
             outcome.history_len_before,
             outcome.records_removed,
             outcome.records_replayed,
