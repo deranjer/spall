@@ -237,7 +237,7 @@ fn live_client_reload_work_is_globally_bounded_and_counts_completions() {
 
     // A wide box makes every victim eligible at once. The pass must still emit
     // no more than the global per-step ceiling.
-    let mut pass = ClientResidencyPass::new(128, 16);
+    let mut pass = ClientResidencyPass::new(128, 16, u64::MAX);
     let requests = pass.step(&mut replica, [0.5, 0.5, 0.5]);
     assert_eq!(requests.len(), MAX_RELOAD_REQUESTS_PER_STEP);
     assert_eq!(pass.reloads_requested_total(), requests.len() as u64);
@@ -265,7 +265,7 @@ fn live_client_does_not_duplicate_an_inflight_reload_before_its_retry_window() {
     let victim = east_bricks(&replica)[0];
     assert!(replica.evict_brick(terrain, victim));
 
-    let mut pass = ClientResidencyPass::new(128, 16);
+    let mut pass = ClientResidencyPass::new(128, 16, u64::MAX);
     let first = pass.step(&mut replica, [0.5, 0.5, 0.5]);
     assert_eq!(first.len(), 1);
     for _ in 0..119 {
@@ -275,4 +275,76 @@ fn live_client_does_not_duplicate_an_inflight_reload_before_its_retry_window() {
     let retry = pass.step(&mut replica, [0.5, 0.5, 0.5]);
     assert_eq!(retry.len(), 1);
     assert_eq!(pass.reloads_requested_total(), 2);
+}
+
+/// ENG-30 row 7 increment 14: `ClientResidencyPass` mirrors the server's
+/// increment-13 `max_dense_bytes` admission enforcement
+/// (`a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budget`
+/// in `crates/spall_server/tests/residency_pass.rs`) for a single predicted
+/// player: a zero-headroom cap defers every desired (box-driven) reload
+/// rather than admitting it over budget, leaves the brick evicted, and never
+/// moves `world_hash`; raising the cap lets the same desired reload succeed.
+#[test]
+fn a_tight_dense_byte_cap_defers_a_desired_client_reload_instead_of_admitting_over_budget() {
+    let sim = server();
+    let mut replica = replica_of(&sim);
+    let terrain = replica.terrain_volume_id();
+    let server_hash = sim.world().world_hash();
+
+    let victims = east_bricks(&replica);
+    assert!(
+        !victims.is_empty(),
+        "need at least one evictable east brick"
+    );
+    for c in &victims {
+        assert!(replica.evict_brick(terrain, *c));
+    }
+    assert_eq!(
+        replica.world_hash(),
+        server_hash,
+        "eviction alone must not move the logical hash"
+    );
+
+    let resident_dense_bytes = |replica: &ReplicaWorld| -> u64 {
+        replica
+            .volume(terrain)
+            .map(|v| v.memory_report().total_dense_bytes() as u64)
+            .unwrap_or(0)
+    };
+    // Zero headroom: the cap is exactly what is already resident, so any one
+    // of the evicted victims coming back (costed conservatively as `Dense`,
+    // like the server) would exceed it.
+    let tight_cap = resident_dense_bytes(&replica);
+    let mut pass = ClientResidencyPass::new(128, 16, tight_cap);
+
+    // A wide box (radius 16) makes every victim desired at once.
+    let requests = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+    assert!(
+        requests.is_empty(),
+        "a zero-headroom dense-byte cap must defer every desired reload, got {requests:?}"
+    );
+    assert!(
+        pass.admission_deferred_total() > 0,
+        "the tight dense-byte cap must have deferred at least one admission"
+    );
+    for c in &victims {
+        assert!(
+            replica.evicted(terrain).contains(*c),
+            "a deferred reload must leave the brick evicted, not admit it over budget"
+        );
+    }
+    // Logical topology is completely unaffected by residency placement.
+    assert_eq!(replica.world_hash(), server_hash);
+
+    // Raise the cap and confirm the same desired reload now succeeds.
+    let mut pass = ClientResidencyPass::new(
+        128,
+        16,
+        tight_cap + spall_voxel::MemoryReport::DENSE_BRICK_BYTES as u64,
+    );
+    let requests = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+    assert!(
+        !requests.is_empty(),
+        "once the cap has headroom, a previously deferred reload must be admitted"
+    );
 }

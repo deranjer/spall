@@ -289,17 +289,92 @@ Accept: long weak cantilevers fail, comparable strong supports hold within decla
 
 ### T23 — G3/G4 integrated engine acceptance
 
+ENG-76 takeover (2026-09-22): exact spatial indexing replaces the quadratic
+dormancy proximity scan without changing sleep/wake policy. See
+[measured evidence and remaining gates](reports/ENG-76-proximity-index.md).
+The historical worker diagnostic and the integrated G4 workload are reported
+separately; ENG-76 and T23 remain open.
+
+Current disposition: **ENG-30 is Done in Loopira (2026-09-23, user-directed); gate evidence remains qualified below.**
+This status does not claim every G3/G4 validation target passed. The
+[2026-09-18 acceptance audit](reports/T23-acceptance-audit-2026-09-18.md)
+records the then-current findings.
+Of the audit's five findings, increment 37 (`docs/reports/G3.md`) fixes
+finding 1 (a real checkpoint-integrity regression — evicted-brick backing
+reads on the incremental-capture cache-miss path had lost their digest
+verification across a merge) and confirms finding 2 (baseline/repair
+integrity) was already closed by a same-day commit the audit's own stated
+verification numbers predate. Findings 3-5 — partial G4 soak evidence, a
+workload narrower than the required integrated gate, and incomplete
+network/visual evidence — are measurement and workload-coverage gaps, not
+correctness defects, and remain recorded as evidence limitations. Full G4
+measurement / workload coverage is not claimed. T24 may proceed under the
+user-directed ENG-30 status update; this does not waive or rewrite those
+remaining measurement findings.
+
 Post-merge follow-ups and evidence limits are recorded in the
-[ENG-30 review](reviews/2026-09-10-eng-30-post-merge.md). T23 stays open; the next
-recommended fix is atomic failed-reload handling, followed by enforced
-residency/traversal assertions. Durable-backing and bounded-capture deferrals
-remain unmet contract requirements, not an accepted waiver.
+[ENG-30 review](reviews/2026-09-10-eng-30-post-merge.md). Historical review
+text saying T23 stays open predates the 2026-09-23 Loopira status update.
+Those initial atomic-reload and traversal-assertion fixes have landed, as have
+bounded checkpoint capture and disk-backed residency with restart evidence.
+The current [G3 report](reports/G3.md) records increments through 37: the
+passing row 11 impaired join-budget run, row 7's pin-lifetime and
+capacity-admission enforcement pass, row 7's incremental (non-full-reload)
+checkpoint capture, row 7's client-side dense-byte admission, a durable-ack
+audit that found the evict-time boundary already correct but fixed a real gap
+in checkpoint capture's verification of evicted-brick backing records, and
+(increment 37) the fix for the regression the 2026-09-18 acceptance audit
+found in that same checkpoint-capture verification after a later merge
+reintroduced the gap on a path the original fix predated. The only item row
+7's increment-13 deferred list named that remains unaddressed is the dormant
+`ResidencyController`/`ClientResidency` policy-engine merge, which an earlier
+coordinator review explicitly rejected as the objective — not something left
+to schedule. Whether row 7's addressed gaps constitute full T23 gate
+acceptance is still a judgment call for an integrator reviewing the whole
+report, not a claim made here. Earlier increment notes below are historical
+evidence, not the current remaining-work queue.
+
+**2026-09-20 update (increment 38, `docs/reports/G3.md`).** T23 stays **not accepted**.
+
+**2026-09-20 follow-up (increment 39, `docs/reports/G3.md`).** T23 stays **not accepted**. The checkpoint CI failure was reproduced on main `7d3ca00` and fixed by `8e0cbb2` (not yet on main). The first wake-locality fix (`8a18476`) was unsafe — its forced re-sleep trapped awake neighbours and pushed bodies out of the world (fixed and regression-tested in `ea4f1ae`/`6e55b82`); the corrected fix does not measurably change the workload (~99% of sleeping-body wakes are physics-step island propagation, unattributed). On the reviewed revision the 30-minute soak still **fails** (server cannot hold 60 Hz; awake bodies reach ~5,000) and rubble bodies still escape the world under soak-scale load; containment has no acceptance check. Physics p95, tick p95/p99, impaired-lane send-queue recovery, residency-under-G4 and GPU/visual evidence remain open. No compaction or lifecycle redesign is authorised.
+
+**2026-09-20 update 2 (increment 40, `docs/reports/G3.md`).** T23 stays **not accepted**. The forced re-sleep wake optimisation was withdrawn after an external review reproduced a stability regression; increment 39's origin-based containment claims are retracted (a rubble rod's geometry sits ~10 m from its body origin). Containment is now judged from transformed cells and collider bounds: no solver embeddings on the current revision; rubble crossing the west wall is physically legitimate but leaves the bounded world, and README's dormant external-body set is **declared but unimplemented** (Open items rows 17-18). Whole-world terrain collider replacement on each dig accounts for ~70% of sleeping-body wakes (control run without digs). Checkpoint-integrity fix prepared on local branch `fix/t23-checkpoint-integrity` (`a0b4907`; `cargo xtask check` and `smoke` pass), not pushed. Reviewer demos: `.local/reviews/2026-09-20-wake-locality/demos/wake_demos.html`. Compaction and lifecycle redesign remain unauthorised.
+The integrated G4 fixture, a declared terrain+body edit mix, and per-stage /
+per-client-timeline instrumentation are in. The three hard gate failures were
+root-caused and fixed on this branch: replica divergence (motion datagrams starved
+the reliable stream inside the QUIC congestion window -> congestion-aware motion
+budget), simultaneous-join failures (serial handshakes in one accept loop ->
+concurrent accept), and 35-41 s join readiness (serial per-joiner tick-thread
+snapshots -> shared capture; now 27-30 s). Final loopback and both impairment lanes
+converge on all 8 replicas with matching replay/restart hashes. **Still failing:**
+tick p95/p99 and physics p95 (17/50-60/12 ms vs 12/16.7/6), terrain-commit hashing
+(~32 ms per terrain edit) and physics are the identified costs; the 30-minute soak
+did not complete (rubble tunnels through the ground and never sleeps; one new body
+per edit; journal writes every awake body 20x/s); the overload client-retry gap; the
+stress lane is measured-but-unaccepted (its bounds are unratified candidates). GPU
+p95 14.8 ms vs 12 ms and human/cross-GPU review are separately open. Four
+independent fixes are in PR #136 (merged 2026-09-20 with the checkpoint-integrity fix, PR #137). **Gate blockers remain until the fixes above are reviewed:** the 2-minute physics p95 miss, the failed 30-minute soak, the impaired-convergence failures (fixed on this branch, not yet accepted) and the baseline-readiness miss (27-30 s, thin margin). Acceptance is an integrator decision; ENG-30 is not marked done here.
+
+**Update 2026-09-20 (G3.md increment 41; ENG-30 open, T23 not accepted):** v2 soak: 8,259 of 18,181 requested edits committed, 9,922 rejected (queue-full); convergence of committed work is reported separately from workload completion. Server restart recovery passes; fresh-client reconnect fails (baseline 377 MiB > 256 MiB `TooLarge` cap; the 300-tick lifetime theory is disproved). Blast-recovery rows with zero tail samples are missing evidence, not measured backlog (wall-clock clusters, fail-closed, thresholds unchanged; stress recovery unproven). Per-brick terrain colliders prototyped default-off (`docs/reports/terrain-collider-locality.md`). The 30-minute soak was not re-run.
 
 Dependencies: T15, T17, T18, T20, T21, T22. Own: complete gate report and targeted fixes.
 
 Run all correctness, crash, impairment, visual, and eight-client workload scenarios. Include geographically separated players inside the bounded world, a multi-region collapse, prolonged rubble accumulation, and late join after heavy edits.
 
 Accept: validation.md gates pass or remaining failures are clearly recorded as open. Produce reproducible commands and raw evidence. This is the first game-ready engine slice, still without menus/editor/survival content.
+
+ENG-31 / T24 increment 19 (2026-09-23): the feasibility report contains a
+criterion-by-criterion acceptance audit, measured fixture bounds, reproducible
+commands, and explicit open failures. The eight-origin debris and separated
+player fixtures, adapter split/merge/body-transfer checks, SQLite distant-edit
+reload, and render-only seam invariant are demonstrated. Procedural generation
+and version coexistence, far/large structural-graph growth, long-session
+storage growth, continuous approach-triggered production merge, full server
+region routing, and a product-scale envelope remain open; no larger-world gate
+pass or maximum-scale claim is made. The audit fulfills T24's reporting
+acceptance, which allows unresolved gate failures when they are clearly
+recorded. Follow-up work should be assigned before making a G5 feasibility
+claim.
 
 Lands in increments against `docs/reports/G3.md`.
 
@@ -315,7 +390,10 @@ Lands in increments against `docs/reports/G3.md`.
 - **Increment 10 (row 7 slice E1 — client reload digest lifecycle).** `spall_voxel::EvictedBricks::drop_resident(volume)` drops every retained digest whose brick is resident again (a traversal reload at the same revision or an authoritative repair patch at a newer one). `spall_client::ReplicaWorld::apply_baseline_patch` and the transaction-commit path call it, so the logical view never carries a resident-*and*-evicted brick. `ClientResidency::wanted_reloads(replica, centre, enter_radius, max)` names retained-digest terrain bricks back inside interest for a bounded `RepairRequest`; the digest stays retained until the patch lands. Evidence: `cargo test -p spall_voxel --lib logical` (`drop_resident`); `cargo test -p spall_server --test client_residency` (3 — a replica that evicted a region reloads it from ordinary server repair patches and drops the digests, `world_hash` + `resident_brick_count` match the server; a cut into a fully-evicted replica region gaps → `NeedsRepair` → repair + retry → converges with only the reloaded bricks' digests dropped; `wanted_reloads` targeting). Deferred to slice E2: wiring `ClientResidency` into `spall_client::net` behind `sandbox-client --residency-*`, and the row 8b scripted traversal fixture.
 - **Increment 11 (row 7 slice E2 — client residency in the session + row 8b traversal).** `spall_client::ClientResidencyPass` runs once per mover iteration against the predicted player capsule: keep a Chebyshev brick box around the player resident, evict the rest of the terrain after an `EVICT_SETTLE_STEPS` hysteresis (digest retained → `world_hash` exact), send a rate-limited `RepairRequest` for every retained-digest brick back inside the box (slice E1's `drop_resident` supersedes the digest as the patch lands). `ClientNetConfig.client_residency` (`None` → fully resident) + `sandbox-client --residency-budget-bricks` / `--residency-radius-bricks` + `session.rs` `client_residency_*` passthrough (movement-scripted clients only) + `BaselineScene::Walk`. The interest box must cover the predicted-collision region (the mover rebuilds its predicted collider from resident geometry only). Evidence: `cargo xtask scenario --name t23-g3-traversal` (`walk` lane, server + client residency on; client 0 walks ~14.6 m out and part-way back, evicting 6 terrain bricks and reloading 4; client 1 dents the far floor while client 0 has that brick evicted; server + both clients + exact replay + cold restart + reconnect all converge to `2a47eda7…`, deterministic; mover stays grounded). Follow-ups (own tickets): `ResidencyController` unification, durable-store `BrickBacking`, incremental checkpoint capture, logical-terrain predicted collider.
 - **Increment 12 (post-merge residency correctness + enforced evidence).** Reload candidates are digest-validated before publication, so wrong revision/content leaves the slot nonresident and logical state unchanged; correct retry still succeeds. `ClientResidencyPass` globally caps reloads at four requests/step and counts completed loads + budget misses. Prediction collision invalidates on resident-cache changes. `ClientSummary` / `SessionSummary` v2 and `session.rs` enforce server/client evictions, completed reloads, an edit gap on evicted geometry, and outbound/return waypoints. Evidence: `cargo test -p spall_sim --test logical_reload`; `cargo test -p spall_server --test client_residency`; `cargo test -p spall_client`; `cargo test -p xtask requirement_tests`; `cargo xtask scenario --name t23-g3-traversal` (23.38 m out → 10.03 m final, server 5/3 evict/reload, client 6/4/4 evict/request/complete, replay/restart/reconnect match). Prediction-safe traversal under `2%` loss remains open.
-- **Increment 13+ (later).** Exact-revision durable backing and bounded capture; the join-duration budget (row 11); live catch-up exhaustion (row 10); the G4 eight-client workload + soak (rows 12–14); full-envelope player separation + region-to-region traversal (row 2).
+- **Increment 13 (row 7 — pin lifecycle + capacity admission enforcement).** Coordinator review (`docs/reports/ENG-30-row7-remaining.md`, 2026-09-18) found `ResidencyPass::run`'s interest set had no explicit reservation for pending-edit dependencies, swept-collision paths, or a brick the pipeline had just reactively reloaded, and that `budget_bricks` was a reported ceiling only with no dense-byte cap. `ResidencyPass::run` now takes `pending_edit_bricks` (`Simulation::pending_edit_bricks` / `EditPipeline::pending_dependency_bricks` — a per-axis bounded brush AABB + one-brick halo per queued intent) and internally pins two more sources: a grace window (`note_pipeline_reloads`) for bricks the pipeline itself just reloaded, and the swept path of every player (keyed by stable entity id, not list position) and active body between ticks. The union is never evicted and always reloads regardless of budget. `ResidencyLimits::max_dense_bytes` is a real second ceiling enforced on admission (an interest-driven, non-required reload is deferred, not admitted, past either cap, using a conservative-then-corrected byte estimate); `PassTick::required_over_budget` reports, without evicting required geometry, when the required set alone cannot fit. `ServeSummary` v7 / `SessionSummary` v4 add `residency_pinned_bricks_max`, `residency_admission_deferred_total`, `residency_required_over_budget_ticks`, `residency_digest_bytes_final`, `residency_backing_resident_bytes`, and real OS `process_peak_memory_bytes` (`spall_server::mem_stats`, no new dependency). Evidence: `cargo test -p spall_server --test residency_pass` (10, 3 new — pending-edit pin lifetime, swept-path pin past the settle window, dense-byte admission deferral with paired on/off hash equality); `cargo xtask scenario --name t23-g3-residency` (now also `--residency-budget-dense-bytes`, converges to the residency-off agreed hash `cac2893c…d18e6de`, reports real `residency_pinned_bricks_max`/`residency_required_over_budget_ticks`); `cargo xtask scenario --name t23-g3-traversal` (new `min_pinned_bricks` floor, converges to `2a47eda7…` clean and at `--loss-percent 2`); `t23-g3`, `t23-g3-residency-disk`, `t23-g3-impaired-join` re-verified unchanged. Full `cargo fmt` / `cargo clippy -D warnings` / `cargo test --workspace --all-features` green. Deferred: client-side (`ClientResidencyPass`) dense-byte admission, durable exact-revision acknowledgement (still an in-memory/disk ack-before-evict contract), incremental (non-full-reload) checkpoint capture, and the `ResidencyController`/`ClientResidency` (T18, dormant) policy-engine merge — the coordinator review explicitly rejected literal class consolidation as the objective.
+- **Increment 14 (row 7 — client-side dense-byte admission).** Increment 13's deferred item: `ClientResidencyPass` mirrors the server's `ResidencyLimits::max_dense_bytes` admission enforcement for its single predicted player. `ClientResidencyLimits::max_dense_bytes` (`--residency-budget-dense-bytes` on `sandbox-client`, `Scenario.client_residency_budget_dense_bytes` in `session.rs`) is a real ceiling alongside `budget_bricks` — historically a reported-only field — both now enforced on the reload-*admission* path: every `RepairRequest` this pass would send for a box-driven (never pinned — this pass has no pending-edit/swept-collision sources of its own) reload is costed conservatively (candidate as if fully `Dense`, `spall_voxel::MemoryReport::DENSE_BRICK_BYTES`, the same shared estimator the server uses) against a running projection that includes bricks already requested but not yet completed (this pass's reload is asynchronous, unlike the server's synchronous `world.reload_brick`), and deferred rather than admitted past either cap; the projection is corrected to the real measured total every step. Eviction itself is unchanged — still governed unconditionally by the box, never by budget, so a tight cap only ever delays a desired reload, never forces an eviction inside the box. `ClientSummary` v4 adds `client_residency_admission_deferred_total`; `session.rs`'s `ClientRow` / `ResidencyAssertions.min_client_admission_deferred` mirror it. Evidence: `cargo test -p spall_server --test client_residency` (7, 1 new — `a_tight_dense_byte_cap_defers_a_desired_client_reload_instead_of_admitting_over_budget`: a zero-headroom cap defers every desired reload, leaves the brick evicted, never moves `world_hash`; raising the cap admits it); `cargo test -p xtask` (new `residency_assertions_cover_client_admission_deferral`); new fixture `fixtures/scenarios/t23-g3-traversal-dense-cap.json` (`t23-g3-traversal` + a `client_residency_budget_dense_bytes: 196608` tight enough to bind — measured `client_residency_admission_deferred_total: 21`, evictions 6 / requested 4 / completed 4 — converges to the same agreed hash `2a47eda7…` as `t23-g3-traversal`, which itself re-verified unchanged with the cap left at its default-disabled `u64::MAX`); `t23-g3-residency` re-verified unchanged (server-side, no cross-talk). Full `cargo fmt --all --check` / `cargo clippy --workspace --all-targets --all-features -- -D warnings` / `cargo test --workspace --all-features` (every crate, 0 failures, the historically flaky `spall_net::separate_process_transport` passed clean) / `cargo xtask check` all green. Deferred (unchanged from increment 13): durable exact-revision acknowledgement, incremental checkpoint capture, and the `ResidencyController`/`ClientResidency` (T18, dormant) policy-engine merge.
+- **Increment 15 (row 7 — incremental checkpoint capture).** Increment 22 stopped `ResidencyPass::capture_checkpoint` from `reload_all`-ing every evicted brick back into the live world before a checkpoint, but the capture itself still re-snapshotted / re-loaded / re-encoded **every** logical (resident ∪ evicted) terrain brick on every call — a full logical-world walk, just one that no longer disturbed live residency placement. `ResidencyPass` now keeps a per-brick `checkpoint_cache` (coord → last-captured `(Revision, StoredBrick)`), seeded at install time from every then-resident brick (the same walk that already seeds the backing) so even a run's first real checkpoint skips bricks untouched since world creation. On each `capture_checkpoint` call, a brick whose current revision (from the live snapshot if resident, from the retained digest if evicted) matches its cached revision reuses that prior `StoredBrick` record verbatim — no fresh snapshot/backing-load/zstd-encode; a brick whose revision differs (edited, or evicted/reloaded at a new revision) is re-captured and the cache updated. Every checkpoint's `bricks` list is still the *complete* logical set (checkpoints are pruned — `RETAIN_CHECKPOINTS` — and each one must stand alone for cold recovery); only how that list is assembled changed. `spall_server::persist::capture` is refactored (not behaviourally changed) into a thin wrapper over a new `capture_with_terrain_bricks(sim, cfg, cursor, terrain_bricks)` so `ResidencyPass` can supply its incrementally-computed terrain-brick list while reusing the same body/meta/hash logic; `persist::capture` itself, the crash suite, and the residency-off `serve()` path are untouched and still do the historical full walk. `ServeSummary` / `SessionSummary` add `residency_checkpoint_bricks_captured_total` (cumulative bricks actually re-captured) and `residency_checkpoint_bricks_logical_total` (cumulative complete-logical-set size) — `captured_total < logical_total` is the direct, measured evidence of incrementality. Evidence: `cargo test -p spall_server --test residency_pass` (12, 2 new — `a_second_checkpoint_only_recaptures_bricks_that_changed` proves a second checkpoint after one small edit re-touches only that edit's brick, not the whole resident set; `incremental_and_full_walk_capture_recover_to_the_same_world` proves an incrementally-captured checkpoint and one from a fresh (full-walk-equivalent) pass sharing the same backing produce byte-identical `Checkpoint.bricks`, the same `world_hash`, and recover to the same `restart_recovered_world_hash`); the pre-existing `capture_checkpoint_fails_closed_on_a_missing_durable_record` test now targets a genuinely-edited (cache-miss) evicted brick, since a never-touched brick's cached record is legitimately reused without touching the backing at all — the fail-closed guarantee is unchanged for the case it actually protects. `cargo xtask scenario --name t23-g3-residency`: converges to the agreed hash `cac2893c…d18e6de`, `restart_checked` / `restart_recovered_hash_matches` / `restart_reconnect_hash_matches` all `true`, and reports `residency_checkpoint_bricks_captured_total: 2` of `residency_checkpoint_bricks_logical_total: 9` (only the two edited terrain bricks were re-captured at the single shutdown checkpoint this scenario's `--checkpoint-interval-ticks 0` produces; the other seven reused their install-time cache seed). `cargo xtask scenario --name t23-g3-residency-disk`: same hash, same `2`/`9` split, disk-backed. `cargo xtask scenario --name t23-g3` and `t23-g3-traversal` re-verified unchanged (`cac2893c…d18e6de` and `2a47eda7…` respectively; the traversal scenario also runs server residency and reports `1`/`4` captured/logical). Full `cargo fmt --all --check` / `cargo clippy --workspace --all-targets --all-features -- -D warnings` / `cargo test --workspace --all-features` (every crate, 0 failures, including `spall_net::separate_process_transport`) / `cargo xtask check` all green. **Not done in this increment**: durable exact-revision backing acknowledgement (unchanged from increment 13); the `ResidencyController`/`ClientResidency` (T18) policy-engine merge (unchanged, explicitly not the objective); client-side (`ClientResidencyPass`) checkpoint capture is not incremental (the client has no checkpoint concept — this row item is server-only, matching the frozen contract's serve-loop boundary 6).
+- **Increment 16 (row 7 — durable exact-revision backing acknowledgement: audit, then a targeted fix).** Closes the item increments 13-15 all carried as deferred, but by auditing the actual call paths first rather than assuming the deferred-list wording meant the feature was missing — per `docs/reports/ENG-30-row7-remaining.md`'s explicit caution that "a boolean synchronous capture result is not by itself proof that exact-revision acknowledgement is missing; any API replacement needs a demonstrated need." The frozen contract's Evict boundary requires a durable ack of the exact revision before dropping geometry; tracing `ResidencyPass::run`'s evict call site found `backing.capture(...)` and `world.evict_brick(...)` already happen on the same tick, same thread, against the same `&mut SimWorld` borrow — the borrow checker itself rules out any interleaving, for both `MemoryBacking` and `DiskBrickBacking`. That boundary was already correct; no change made there, and `residency.db`'s `synchronous=NORMAL` pragma was left alone once tracing `spall_store::recover` confirmed crash recovery never reads `residency.db` at all (not load-bearing for any acknowledgement the contract requires). The real gap was found by tracing the checkpoint path instead: `capture_checkpoint` read evicted-brick records straight from the backing into the durable (`synchronous=FULL`) checkpoint with no verification against the retained digest — unlike `SimWorld::reload_brick`, which validates every candidate via `EvictedBricks::verify_candidate` first — so a stale or corrupted backing record could silently reach the durable save file while `checkpoint.world_hash` kept reporting the correct resident-only value. Fixed by reusing that same `verify_candidate` machinery inside `capture_checkpoint`: a mismatch now returns a new `PersistError::EvictedBrickDigestMismatch { volume, coord, retained_revision, backing_revision, .. }` and fails the whole capture closed, no new API shape or two-phase commit protocol invented. Evidence: new fault-injection test `capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_retained_digest`, confirmed failing against the pre-fix code (a forged record was silently accepted, forged bytes reaching `checkpoint.bricks`) and passing post-fix; `cargo test -p spall_server --test residency_pass` (12/12); `cargo xtask scenario --name t23-g3-residency` / `t23-g3-residency-disk` converge to the agreed hash `cac2893c…d18e6de`, unchanged; `cargo xtask scenario --name t23-g3-traversal` converges to `2a47eda7…3b51d8`, unchanged; `cargo xtask crash-test --suite persistence` (12/12); `cargo test -p spall_store --test abrupt_crash`. Full `cargo fmt --all --check` / `cargo clippy --workspace --all-targets --all-features -- -D warnings` / `cargo test --workspace --all-features` (every crate, 0 failures) / `cargo xtask check` all green. **Flagged, not fixed** (kept out of scope): `spall_server::baseline.rs`'s `baseline_volume` / `snapshot_world` / `logical_brick_repair_patch` have the same unverified-read-from-backing pattern on the client-facing late-join-baseline and repair-patch path — lower severity (corrupts one client's network resync, not the durable save file), real, own future item. **Not done in this increment**: the `ResidencyController`/`ClientResidency` (T18) policy-engine merge — unchanged, per the coordinator review's explicit guidance that literal class consolidation is not the objective; this is the only item increment 13's original deferred list still names as unaddressed. Also unchanged/out of scope: the join-duration budget follow-ups (row 11, already closed separately — see PR #129), live catch-up exhaustion (row 10), the G4 eight-client workload + soak (rows 12–14), full-envelope player separation + region-to-region traversal (row 2) — all closed by earlier increments, not reopened here.
 
 ### T24 — G5 larger-world feasibility
 
@@ -331,7 +409,468 @@ Dependencies: T23; T24 only if the game needs the larger-world envelope immediat
 
 Produce a game-facing API/examples for authoritative tools, placement, material definitions, recipes, damage, entity spawn, and asset loading. Recommend an ordered survival-content backlog separately. Keep game rules in sandbox_game, and preserve the engine's launch/scenario interface.
 
-Accept: one example game tool is added without editing renderer, transport, or storage internals; agents can reproduce all engine gate scenes from a clean checkout. UI/editor work remains unassigned.
+Acceptance amendment for the requested multiplayer progression increments:
+keep rendering and engine world-storage internals unchanged; allow explicit,
+versioned protocol records and thin client/server adapters for authenticated
+game progression, persisted by the sandbox-owned store. Provide the requested
+game-facing content APIs and examples, plus an ordered follow-on content
+backlog. Engine gate scenarios remain reproducible from a clean checkout as
+documented in Increment 5 below. UI/editor work remains unassigned.
+
+Delivered in increments. **Increment 1 (game-owned wood placement):**
+`sandbox_game::game::Tool::PLACE_WOOD` now creates the same validated
+`EditIntent` shape as the existing dig and stone-placement examples, targeting
+the stable game material ID `materials::WOOD`. The engine receives only the
+normal placement intent; the material catalog and tool choice remain in the
+example package. This is an API/content slice, not yet wired to a separate
+server-approved network tool ID: `spall_server` still owns its built-in tool
+whitelist. Renderer, transport, and storage internals were not changed.
+
+Recommended survival-content backlog, in dependency order: (1) define the
+versioned game rules/tool catalog and connect server-authorized tool IDs to
+game-owned rules; (2) finish placement and material interaction examples with
+server-side range/permission validation; (3) extend the versioned impact rule
+with material-specific damage profiles; (4) add versioned recipe definitions
+and crafting transactions; (5) add asset IDs/loading and
+persisted content manifests; (6) build survival inventory, gathering,
+crafting, and progression scenarios. Keep these as separate content work; do
+not fold UI/editor work into T25.
+
+**Increment 2 (versioned server action catalog):** `spall_server::ToolCatalog`
+stores validated unique tool IDs, an explicit catalog version, allowed edit
+kind/material, maximum brush radius, and aim reach. The ordinary `serve`
+entry point retains its legacy catalog; `serve_with_catalog` accepts the
+game-owned catalog. `sandbox-server` now supplies `sandbox_game::tool_catalog`
+with stable IDs for dig, stone, wood, and dirt placement. The server continues
+to derive hits and edit centers from authoritative geometry and rejects a
+place rule whose material is not registered in that world's manifest. Dirt
+is available in the current built-in manifest and is the immediately usable
+placement example; wood requires the later game-manifest/world-recovery wiring.
+The rules version is logged at startup, but is not yet negotiated in the client
+  handshake; clients with unknown/mismatched IDs receive normal action rejection.
+  No renderer, transport, or storage internals changed.
+
+  **Increment 3 (sandbox content identity and recovery):** The sandbox server
+  now creates fresh worlds and restores saved worlds with the sandbox material
+  manifest, including the established playground palette, and replay uses that
+  same manifest. Headless and interactive sandbox clients pass the matching
+  manifest into handshake validation; the advertised content hash now comes
+  from the canonical material manifest instead of a fixed engine tag. Existing
+  engine-only entry points retain the built-in stone manifest. This makes the
+  wood placement rule valid in sandbox worlds and prevents clients with a
+    different material catalog from joining. The action catalog version is still
+    logged but is not separately negotiated by the handshake.
+
+  **Increment 4 (sandbox client tool selection):** `spall_client::tool_request`
+  builds an action request with an explicit tool ID and operation; the existing
+  `cut_request` remains a compatibility wrapper for tool 0. `sandbox-client`
+  accepts `--tool dig|place-stone|place-wood|place-dirt` and writes the matching
+  stable game tool ID and action into scripted action schedules. The server
+  still resolves each ID through its catalog and checks action type, reach,
+  radius, target, and material availability before creating an edit intent.
+  This adds request selection, not a UI hotbar or live mouse aiming.
+
+  **Increment 5 (clean-checkout gate reproducibility audit):** Ran the
+  documented scenarios from an isolated clean worktree at commit
+  `e87ceac7fd3e089328c22b21765321d7275d1764`, with raw evidence retained under
+  `.local/runs/t25-gates/`. G1 passed for `g1-networked-destruction`, its 2%
+  loss variant (31 out-of-order motion snapshots), `g1-full-envelope`, and
+  `body-rest-on-structure`. G3 `t23-g3-traversal` passed with replay, recovery,
+  and reconnect hashes matching. The eight-client release-profile
+  `t23-g4-workload` passed with 4,352 bodies, 20 committed edits, replay, cold
+  restart, and reconnect at the same hash. G2 `g2-motion`, `g2-frames`,
+  `g2-loop`, `g2-terrain`, and `g2-collapse` all ran on RTX 4080 SUPER / DX12;
+  motion/terrain/collapse quality flags were empty, the persistent loop met its
+  client-frame target in all four scenes, and the cold full-cache frame-cost
+  capture remained above its explicitly provisional GPU target (as documented).
+  The `t23-g3` collapse scenario reproduced but did not pass its
+  `require_body_settled` gate: server/client/replay/recovery/reconnect hashes
+  all matched, but one detached body was still marked awake, so
+  `all_hashes_match` was false for the overall requirement summary. This is an
+  existing T23 evidence gap, not hidden as a T25 pass. The full-duration G4
+  soak, remaining impaired-join variants, and cross-GPU visual review were not
+  run; T23's docs already keep those measurements open.
+
+  **Increment 6 (game-owned impact-damage policy):** Added a versioned
+  sandbox-owned `IMPACT_DAMAGE_RULES` configuration and passed it to the
+  existing authoritative `Simulation::apply_contact_damage` path when
+  `sandbox-server --contact-damage` is enabled. The server logs the game damage
+  rules version. The engine still resolves collisions, caps work, creates
+  normal cut intents, and commits the resulting transactions. No material-
+  specific resistance table or client authority was introduced; entity spawn
+  rules remain open.
+
+  **Increment 7 (game-owned spawn rule):** Added
+  `sandbox::game::spawn_demo_wood_crate`, which constructs a stable game-owned
+  wood volume and delegates entity/physics allocation to
+  `SimWorld::spawn_body`. `sandbox-server --spawn-wood-crate` invokes the new
+  server setup hook only for a fresh world, before publishing its first
+  checkpoint. Existing saves restore without adding a duplicate crate. The
+  hook is game-provided but executes on the authoritative simulation thread;
+  clients cannot request arbitrary body spawns.
+
+  **Increment 8 (material-specific impact profiles):** Contact events now carry
+  the material sampled just inside the struck voxel surface. The authoritative
+  simulation resolves terrain and body-local contacts against their respective
+  volumes and drops events whose material cannot be read. `ContactDamagePolicy`
+  accepts game-provided per-material threshold, brush-radius, and detachment
+  profiles while retaining shared cooldown and per-tick safety caps. The
+  sandbox supplies distinct stone, dirt, and wood values, increments its damage
+  rules version, and passes profiles through the server's game policy setup.
+  **Checks:** `cargo fmt --all`; `cargo check -p spall_sim --all-targets
+  --all-features`; `cargo check -p spall_server --all-targets --all-features`;
+  `cargo check -p sandbox --bins --all-features`; `git diff --check` passed.
+  No tests were run. Values are initial sandbox tuning, not measured balance.
+  Next T25 item: versioned recipe definitions and authoritative crafting
+  transactions; then asset IDs/loading and progression examples.
+
+  **Increment 9 (versioned recipes and crafting transactions):** The sandbox
+  now defines stable item and recipe IDs plus an immutable recipe catalog with
+  an explicit catalog version. `RecipeCatalog::stage` validates catalog and
+  inventory revisions, scales ingredient/output quantities with checked
+  arithmetic, and builds a replacement inventory without mutating the source.
+  `Inventory::commit` applies that transaction only against its original
+  revision, so stale requests cannot double-spend; `game::craft` provides the
+  stage-and-commit path for the authoritative owner. Starter recipes convert
+  wood logs to planks and stone chunks to stone blocks, and the server logs the
+  catalog version. This is an in-memory game API: no client craft message,
+  player inventory ownership/persistence, or UI was added because those
+  systems do not yet exist in the assigned sandbox path. **Checks:** `cargo
+  fmt --all`; `cargo check -p sandbox --all-targets --all-features`;
+  `git diff --check` passed. No tests were run. This increment is followed by
+  the asset-loading slice below.
+
+  **Increment 10 (stable content asset manifest and loader):** Added
+  `sandbox::content` with stable game-owned `AssetId`s, versioned RON manifests,
+  and a canonical BLAKE3 manifest hash over explicit ID/version/path/hash
+  fields. Versioned manifests are immutable on write; `AssetStore` loads by ID,
+  confines relative paths to the manifest root, bounds file sizes, checks each
+  asset's recorded content digest, and verifies the SPVX major version, chunk bounds, required
+  chunk structure, decompression lengths, and embedded logical HASH before
+  returning file bytes. The editor's project-local asset IDs stay separate;
+  the sandbox runtime does not depend on the editor/UI package. The next
+  increment connects decoded static voxels to authoritative body spawn and
+  negotiates the manifest hash during client connection. **Checks:** `cargo fmt --all`; `cargo check -p
+  sandbox --all-targets --all-features`; `git diff --check` passed. No tests
+  were run.
+
+  **Increment 11 (asset/network integration and progression scenario):** The
+  loader now imports supported static single-root SPVX voxel runs into stable
+  material IDs and the sandbox maps those cells into a game-owned rigid body.
+  `sandbox-server --content-manifest` verifies all listed assets before
+  serving and incorporates the canonical asset manifest hash into the
+  handshake; clients pass the same manifest with `--content-manifest`, so a
+  different or missing asset catalog fails the existing compatibility check.
+  `--spawn-content-asset ID` places an imported asset in a new world. The
+  optional `--progression-demo` scenario grants one wood harvest drop to a
+  fresh authoritative inventory, crafts four planks using the versioned
+  recipe transaction, then places the selected imported asset. Example
+  sequence: start the server with `--content-manifest content-v1.ron
+  --spawn-content-asset 1 --progression-demo`, then connect either client mode
+  with the same `--content-manifest content-v1.ron`. The scenario is a
+  deterministic fresh-world integration fixture. At this stage harvest drops
+  are scenario-seeded rather than connected to normal committed world edits.
+  Animated/assembled/tinted SPVX
+  assets remain rejected by the static importer. **Checks:** `cargo fmt
+  --all`; `cargo check -p spall_client --all-targets --all-features`; `cargo
+  check -p spall_server --all-targets --all-features`; `cargo check -p sandbox
+  --bins --all-features`; `git diff --check` passed. No tests were run.
+
+  **Increment 12 (committed harvest drops and player-slot inventories):** The
+  staged cut now records per-material cell counts from its immutable input
+  snapshot, and the successful `Committed` result carries those counts. The
+  server invokes a game-owned callback only after commit, with the initiating
+  session and request ID; the sandbox awards wood logs and stone chunks to the
+  inventory keyed by that player's stable connection slot. Sixteen removed
+  cells yield one item. Crafting remains an in-memory API and is not yet
+  exposed as a client protocol request; connection slots are run-local, not
+  account identities, and inventories are not persisted. **Checks:**
+  `cargo fmt --all`; `cargo check -p spall_sim --all-targets --all-features`;
+  `cargo check -p spall_server --all-targets --all-features`; `cargo check -p
+  sandbox --bins --all-features` passed. No tests were run. Next: decide the
+  durable player identity and inventory storage boundary.
+
+  **Increment 13 (versioned crafting control protocol):** Added progression
+  request/response records on new reliable control tags. Requests carry a
+  nonzero request ID, recipe catalog version, expected inventory revision, and
+  inspect/craft operation; bounded responses carry current revisions, result
+  code, and a complete sorted inventory snapshot. The sandbox server routes
+  requests through its game-owned catalog and slot-owned inventory handler,
+  checks catalog and inventory revisions, and caches recent outcomes per
+  player slot to prevent duplicate craft application. Server admission is
+  capped at eight requests per slot per tick. Headless and interactive clients
+  can send progression records and surface responses; sandbox-client exposes
+  `--inspect-inventory` and `--craft RECIPE_ID:BATCH_COUNT` with an explicit
+  `--inventory-revision`. **Checks:** `cargo fmt --all`; `cargo check -p
+  spall_protocol --all-targets --all-features`; `cargo check -p spall_net
+  --all-targets --all-features`; `cargo check -p spall_client --all-targets
+  --all-features`; `cargo check -p spall_server --all-targets --all-features`;
+  `cargo check -p sandbox --bins --all-features`; `git diff --check` passed.
+  No tests were run. Limitation: player slots and inventories are server-run
+  local and in-memory; stable account identity and durable storage remain open.
+
+  **Increment 14 (identity/storage boundary review):** Do not persist
+  progression under `SlotId` or `SessionId`. `SessionId` changes on reconnect,
+  and connection slots are allocated by the live transport and can be reused
+  after restart. The current `JoinToken` authenticates membership in a server
+  run but is shared by clients; it does not identify an individual player.
+  The existing `spall_store` schema belongs to authoritative world saves and
+  does not define game-owned player records. Therefore durable inventory work
+  is blocked on an explicit authenticated player-principal contract and a
+  game-owned identity-to-inventory storage schema. Add that prerequisite
+  before associating a reconnecting client with a persisted inventory; do not
+  introduce client-asserted IDs or treat a connection slot as ownership.
+
+  **Increment 15 (server-authenticated player principals):** Added a stable
+  128-bit `PlayerId` and server-provisioned per-player bearer credentials.
+  `ClientHello` sends only the credential; `ServerAccept` returns the
+  server-assigned principal, which `Connection` and the authoritative game
+  callbacks expose. The sandbox accepts a bounded credential file with one
+  `<player-id-hex> <token-hex>` pair per line and keys in-memory inventories
+  and duplicate-request ledgers by `PlayerId` in this mode. The legacy shared
+  join token remains available for ephemeral sessions and has no stable
+  principal. The protocol/ALPN version was bumped to 2 because the auth reply
+  changed. This does not add durable inventory storage, account recovery,
+  credential revocation, or an external identity provider. **Checks:**
+  `cargo fmt --all`; `cargo check -p spall_protocol --all-targets
+  --all-features`; `cargo check -p spall_net --all-targets --all-features`;
+  `cargo check -p spall_server --all-targets --all-features`; `cargo check -p
+  sandbox --bins --all-features`; `git diff --check` passed. No tests were run.
+
+  **Increment 16 (durable per-player progression):** Added a game-owned,
+  versioned SQLite store under the sandbox world directory (or
+  `--progression-db`) for per-player inventory revisions/stacks and craft
+  request receipts, keyed only by authenticated `PlayerId`. It uses WAL plus
+  `synchronous=FULL`, a single bounded writer thread, and one transaction for
+  each craft's updated inventory, exact replay response, and request cursor.
+  The server restores progression on startup; harvest awards are persisted
+  idempotently by action request ID. At this increment's baseline, the
+  player's database was separate from the authoritative world database; see
+  Increment 18 for the durable outbox follow-up. The progression callback
+  waits for the writer result, so slow storage can delay a simulation tick.
+  **Checks:** `cargo fmt --all`; `cargo check -p sandbox --bins
+  --all-features`; `git diff --check` passed. No tests were run.
+
+  **Increment 17 (durable progression invariants):** Added focused SQLite
+  behavior tests for player isolation, committed-harvest idempotency, inventory
+  recovery after reopening the database, atomic craft/retry replay after
+  reopening, and rejection of an old request after its cached response has
+  aged out. **Checks:** `cargo fmt --all`; `cargo test -p sandbox --lib
+  progression_store::tests -- --nocapture` passed (3 tests);
+  `cargo xtask scenario --name t23-g3 --output .local/runs/t25-final-g3`
+  passed (7 committed edits, replay, cold restart, and reconnect converged to
+  `cac2893c…d18e6de`); `cargo xtask scenario --name
+  g1-networked-destruction --loss-percent 0 --output
+  .local/runs/t25-final-g1` passed (10 committed edits and replay converged to
+  `62164eee…d7a4b`); `cargo xtask scenario --name t23-g4-workload
+  --timeout-ms 240000 --output .local/runs/t25-final-g4` passed with all eight
+  clients, all 20 edits, replay, cold restart, and late reconnect converging to
+  `dafe0e5e…9547afa`; checks for spall_protocol, spall_net, spall_client,
+  spall_server and sandbox across all targets/features; `cargo fmt --all
+  --check`; and `git diff --check` passed. These scenario runs used the current
+  working tree, not a clean checkout. They do not establish atomicity with the
+  separate world journal or measure writer latency under server load. The
+  checks used the current working tree; the separate clean-checkout audit
+  remains documented in Increment 5.
+
+  **Increment 18 (review follow-up: contact normals and harvest durability):**
+  Contact material sampling now orients the physics pair normal from the
+  selected target toward its striker for both terrain/body and body/body
+  contacts; a pair-order regression test covers either target slot. For
+  authenticated harvests with world persistence enabled, sandbox emits a
+  versioned reward event into the world's durable outbox. The journal row and
+  outbox row share one SQLite transaction; startup and live delivery apply the
+  event to the progression database using its existing player/request
+  idempotency key and acknowledge it only after success. A crash before commit
+  leaves neither record, while a crash after commit or before acknowledgement
+  replays without losing or duplicating inventory. Ephemeral runs retain their
+  in-memory behavior and have no crash recovery promise. Exact checks and any
+  remaining integration limitations are recorded in the session work log.
+
+  **Increment 19 (bounded asynchronous progression and outbox delivery):**
+  progression requests, committed-cut callbacks, and live harvest outbox
+  delivery now execute on dedicated bounded worker queues. The request worker
+  is a single FIFO, so operations for each player stay serialized; the sim
+  thread enqueues with `try_send`, drains a bounded completion slice, and emits
+  craft replies only after the handler's durable transaction completes. A full
+  request queue returns the new explicit `RetryableCapacity` rejection and
+  clients must retry the same request ID. The world outbox remains unacknowledged
+  until the award worker reports success; only then does the sim submit the
+  world-database acknowledgement. Recovery and clean shutdown may wait outside
+  the active simulation tick. Wire schema, handshake protocol, and ALPN advance
+  to version 3 for the new rejection code. **Checks:** queue saturation/order
+  test with an injected 75 ms slow handler (enqueue stays below 50 ms; 64 queued
+  plus one active accepted, next rejected); `cargo test -p spall_protocol --lib`
+  (33 passed); eight-client `t23-g4-workload` (3,000 ticks, 20 committed edits,
+  replay/restart/reconnect hashes converged to `dafe0e5e…9547afa`). Measured
+  server tick busy p95 0.9893 ms / p99 2.7976 ms against 12 / 16.7 ms targets;
+  physics p95 0.2251 ms; process peak 2,732,171,264 bytes. The slow handler is
+  a deterministic queue-level injected delay, not an instrumented SQLite stall
+  inside the eight-client scenario. No claim is made for full G4 soak.
+
+  **Increment 20 (credential lifecycle):** Added
+  [credential operations](credential-operations.md) for protected server/client
+  secret files, provisioning, rotation with the same PlayerId, and revocation.
+  The server polls the registry every 500 ms; an atomic valid update replaces
+  the accepted credentials and closes active sessions, while malformed or
+  unreadable content fails closed by revoking all credentials. The stable
+  PlayerId remains independent from the bearer token, so progression ownership
+  survives rotation and revocation. Tests verify rotated-token acceptance,
+  old-token rejection, revocation, stable identity, redacted Debug output, and
+  parser errors that do not echo token bytes. **Checks:** `cargo check -p
+  spall_net --all-targets --all-features`; `cargo check -p spall_server --lib
+  --all-features`; `cargo check -p sandbox --bins --all-features`; focused
+  `spall_net` rotation/replacement tests and `spall_server` parser-redaction
+  test passed. Windows ACL commands are documented but were not exercised on
+  this run.
+
+  **Increment 21 (authenticated network crafting recovery):** Added a real
+  QUIC integration test with two credential-authenticated players and the
+  sandbox's durable progression database. It sends duplicate craft IDs and
+  verifies identical recorded replies, rejects a stale inventory revision,
+  isolates a player without ingredients, disconnects after admission but
+  before an injected slow durable reply, reconnects with the same request ID,
+  restarts the server and reopens the progression database, then verifies
+  exact inventory contents/revisions. The same test rotates one token while
+  retaining its PlayerId and revokes another, proving old tokens cannot
+  reconnect and that token strings do not appear in JSONL logs. **Check:**
+  `cargo test -p sandbox --all-features --test progression_network` passed
+  (1 integration scenario; ~20 s).
+
+  Remaining ordered completion checks and audit:
+  (1) the supplied acceptance key is `(WorldId, TransactionId)`, while the
+  current harvest store deduplicates `(PlayerId, RequestId)`; see
+  [T25 remaining checks](reports/T25-remaining-checks.md). (5) no authored
+  sandbox asset/manifest fixture is checked in, so assembly/animation/tint
+  runtime expansion cannot yet be validated against game-authored meaning;
+  SPVX v1.1 already specifies those format semantics and unsupported runtime
+  forms fail explicitly. (6) D3D12 and Vulkan G2 still/motion captures have
+  been run on the RTX 4080 SUPER, with Vulkan output recorded, but a distinct
+  physical adapter remains unavailable/unrun. See the report for exact
+  measurements and limits.
+
+### ENG-74 — Editor MVP (user-authorized follow-up)
+
+Original completion used egui; the UI toolkit was migrated to Yakui in ENG-90.
+
+Dependencies: current engine workspace. Own: `tools/spall_editor`, editor-owned RON schemas, and editor documentation. This is intentionally outside the G0–G5 engine gate sequence and must not alter those gate claims.
+
+Build a separate native editor crate using Rust, winit, wgpu, and Yakui. It may depend on Spall rendering/voxel libraries, but no engine/runtime crate may depend on it or on Yakui. Add versioned, human-readable RON project and scene documents, plus portable `.spvox` voxel assets according to `docs/spvox-format.md`. Project/scene references must use a stable `AssetId`, never an authored absolute or raw asset path.
+
+Implement an AssetDatabase and an EditorCommand-based undo/redo layer before UI mutations. The MVP launcher supports recent/open/new projects. Keep **Scenes** (placed objects and transforms) distinct from **Assets** (reusable authored voxel objects): the scene view has a collapsible hierarchy/inspector and a collapsible bottom toolbox that searches named assets, previews them, and places an asset as a new scene object. The asset view supports single-cell and bounded box painting/removal, selected material and RGB color, deterministic per-cell color jitter within a selected margin, and save. Keep advanced docking, procedural tools, animation, material authoring, and engine-management UI out of scope.
+
+Accept: commands are the sole mutation route and undo/redo restores entity and voxel edits; saving/reloading preserves stable references; a created voxel asset can be assigned to an entity and persisted with a scene; the editor opens as a native window and can launch the real sandbox runtime. CPU tests cover document round-trips and command invariants; graphical interaction is a separate hands-on check.
+
+### ENG-89 — wgpu 30 and Yakui HUD migration (user-authorized follow-up)
+
+Dependencies: current renderer and ENG-74 editor. Own: workspace GPU/UI dependency pins, `spall_render`, `spall_client`, `tools/spall_editor`, the local rendering proof of concept, and dependency/validation documentation. Keep Yakui crates on one exact upstream revision and keep editor UI crates compatible with the workspace wgpu types.
+
+Port instance/device/surface setup, pipelines, passes, polling, shader tooling, editor integration, and local proof of concept to wgpu 30. Integrate Yakui into the existing live client device and frame, including input/DPI/resize handling and CPU/GPU HUD timing where the adapter supports timestamps. Preserve rendering across surface loss and resize. Do not use Yakui's standalone application window as the client integration.
+
+Accept: `cargo tree -d` shows one wgpu/Naga line for application rendering; `cargo xtask check`, `cargo xtask smoke --graphical`, the G2 captures, the release G1 bounded run, and `cargo run -p spall_editor` complete. Inspect captures and the live HUD on D3D12 and Vulkan hardware; record frame/HUD CPU/GPU measurements against the pre-migration baseline. Hardware checks unavailable in the current environment must be recorded as unrun rather than inferred from compilation.
+
+### ENG-90 — Editor Yakui migration (user-authorized follow-up)
+
+Dependencies: ENG-74 and ENG-89. Port the complete editor launcher, scene and
+asset workspaces, hierarchy, inspector, toolbox, voxel painting controls, and
+viewport interaction to Yakui using the pinned workspace revision and the
+existing wgpu 30 surface/device. Preserve editor commands as the sole document
+mutation route, including undo/redo. Remove editor egui dependencies, update
+dependency and validation records, and inspect native interaction on hardware.
+Accept: `cargo check -p spall_editor --all-targets --all-features`, editor CPU
+tests, and `cargo run -p spall_editor` pass; no egui references remain in the
+workspace dependency graph; scene and voxel editing behavior matches ENG-74.
+
+### ENG-91 — Scene and built-in asset workspace layout
+
+Dependencies: ENG-74 and ENG-90. Own: `tools/spall_editor`, the built-in voxel
+asset catalog in `crates/spall_voxel`, and editor/asset documentation. Add File,
+Edit, and Help menus; a center scene/asset view; and collapsible, user-resizable
+left, right, and bottom panels. The viewport fills the space between side
+panels; the bottom panel always spans the workspace width. Keep the hierarchy,
+inspector, asset search, preview, painting, and EditorCommand-only project edits
+available in this layout. The starting screen opens Engine Assets directly
+without opening a scene. In the Assets workspace, keep the live 3D viewport in
+the center, voxel authoring controls in the right panel, and a searchable grid of
+small-preview assets across the resizable full-width bottom panel. Provide
+viewport cursor feedback and selectable lighting environments. Ship immutable built-in terrain assets under
+`crates/spall_voxel/assets/builtin/voxel/`, expose their canonical SPVX bytes
+through `spall_voxel` for generation consumers, and make the editor catalog
+searchable and previewable. Editing a built-in imports an undoable project copy
+under that project's `AssetDatabase`; it never overwrites the engine bundle.
+The initial catalog contains `palm_tree.spvox` and `weeping_willow.spvox`.
+Use readable, padded buttons and align row descriptions left with their
+actions on the right; labels and controls must remain readable at the default
+window size and when the side panels are resized.
+
+Accept: both built-ins decode with their stable portable material keys; the
+editor can browse/search/preview them and make editable project copies; the
+copy saves/reloads using a project `AssetId` and leaves bundled source bytes
+unchanged; scene and asset workspaces expose the three resize/collapse panels;
+`cargo test -p spall_voxel` and editor checks pass. Native drag/layout behavior
+is recorded as a hands-on check when a desktop session is available.
+
+### ENG-92 — SPVX 1.1 authoring layers
+
+User-authorized follow-up to ENG-91. Preserve the current editor work while
+extending static SPVX assets with optional editable layers. The canonical v1.1
+`LAYR` chunk stores stable layer IDs, order, names, visibility, and source cells;
+visible layers compose deterministically to the authoritative `VOXL` stream.
+Layer source is distinct from `PART` assembly and never enters world saves or
+network records. The editor saves, loads, selects, edits, and hides layers through
+undoable commands. Flat v1.0 assets remain readable and can be converted when a
+layer is added. The sandbox's static importer validates the optional feature
+marker and whole-file hash and continues to consume `VOXL` only. Update format
+and validation documentation without changing engine/editor dependency direction.
+
+Accept: layered SPVX round-trips retain hidden and overlapping source cells;
+the editor rejects a source/`VOXL` mismatch; layer edits and visibility undo
+exactly; the static runtime loads a valid layered asset; editor and sandbox
+checks pass. Record native layer interaction separately when a desktop session
+is available.
+
+### ENG-94..99 — Natural-lighting renderer programme (R1–R6)
+
+User-authorized 2026-09-26: a Teardown-inspired lighting direction shared by the
+editor and the game, rasterised visibility plus software voxel tracing for
+indirect light, with hardware ray tracing only as a separately-evaluated option.
+One bounded ticket per pass; `docs/reports/ENG-94.md` holds the audit that
+scoped it (what ran in the interactive game versus captures/editor).
+
+- **ENG-94 R1** — game window on the shared `spall_render` direct-light
+  pipeline (materials from the manifest, shadows for terrain and bodies, HDR,
+  tone map, resident buffers, debug views). First pass done; see the report.
+- **ENG-95 R2** — authored tint through edits, bodies, replication and
+  persistence; manifest-palette linearisation decision (changes the manifest
+  hash). Depends on R1. Implemented as material variants with explicit,
+  append-only variant ids (frozen v3 rows + generated extensions), an additive
+  manifest extension that refuses recolouring, and real client/late-join
+  evidence; validated on this machine, **not accepted** (release measurements and
+  editor/runtime parity metrics are ENG-99). See `docs/reports/ENG-95.md`.
+- **ENG-96 R3** — visibility-aware skylight, dark enclosed rooms, documented
+  shadow technique, geometry-submission decision. Depends on R1. First pass
+  done; see `docs/reports/ENG-96.md` (PCSS shadows, sky-visibility occupancy in
+  the game and editor, measured cube-vs-mesh decision). Enclosed rooms are black
+  until R4 adds bounce.
+- **ENG-97 R4** — the T13/T14 lighting cache in the interactive runtime.
+  Depends on R1, R3. The frozen cache surface changes only with new evidence.
+  First pass done (terrain, lit one-bounce sources, directional radiance, thin-wall
+  evaluation); see `docs/reports/ENG-97.md`. Bodies, dirty regions, scroll,
+  temporal and streamed boundaries are ENG-101 (R4b).
+- **ENG-100 R7** — move terrain (and body templates) from instanced cubes to
+  incremental greedy meshes (measured 23x fewer triangles, ~8x cheaper frame,
+  baked AO); depends on R3's evidence.
+- **ENG-101 R4b** — bodies as occluders/bounce sources, incremental sweeps.
+  First pass done; see `docs/reports/ENG-101.md`.
+- **ENG-102 R4c** — hitch-free scroll (double-buffered re-centre), low-angle
+  sampling, emissive manifest content, correlated edit-to-presented latency
+  instrumentation (real network + real renderer, one clock; commit → receipt →
+  rebuild → upload → sweep → presented), body-motion latency measured
+  separately. Debug-build only; release measurement and the streamed-world run
+  remain, and the dirty-bounds cull was deliberately not pursued (§2d). See
+  `docs/reports/ENG-102.md`.
+- **ENG-98 R5** — optional hardware ray tracing feasibility report. Independent.
+- **ENG-99 R6** — acceptance evidence and metrics. Depends on R1–R4.
 
 ## Assignment template
 
@@ -349,3 +888,148 @@ Return changed files, commands/results, evidence paths, and remaining risks.
 ```
 
 Work that can proceed independently after prerequisites: T09 alongside CPU geometry work; T12/T13 alongside replication integration; T16 alongside the graphics gate. This is a dependency observation, not a request to launch agents automatically. One integrator owns shared schemas and final gates.
+
+### ENG-103 — Water feasibility prototype: dam, canal, and flooded tunnel
+
+User-authorized follow-up scoped by `docs/water-agent-handoff.md`. This is the
+first bounded water assignment, not the complete water feature roadmap.
+
+**Dependencies:** Existing voxel and simulation foundations. First audit
+`spall_voxel`, simulation tick ownership, physics, jobs, and validation seams;
+do not assume a water API exists. **Owns:** a CPU-only `spall_*` fluid
+subsystem and its bounded fixture, meaningful invariant/scenario tests,
+reproducible metrics, solver decision, and evidence report. Compare custom
+sparse 3D grid and Salva capabilities/compatibility/licensing without changing
+shared dependency versions. Use actual voxel boundary data, a finite pair of
+reservoirs, editable dam, excavatable canal/tunnel, and one water type.
+
+Keep water state separate from solid occupancy and ECS entities. Preserve
+Rapier as the only rigid-body solver; no GPU/window/network dependency enters
+the fluid algorithm. Account for initial water, explicit sources/sinks and
+boundary outflow across flow and geometry edits. Unknown residency must never
+be silently treated as air, a drain, or a wall. Specify committed-edit and
+fluid tick ordering, fixed-tick substeps/stability limits, bounded overload
+behavior, and pressure-region consistency before integrated use.
+
+**Required evidence:** stable water and no leakage through intact walls,
+including a brick seam; canal transfer toward equilibrium and closure without
+water loss; a moving dam-break surge with downstream accumulation; a flooded
+tunnel under a second pool; absolute/relative accounting error and explicit
+outflow; fluid/total step timings, active cells, memory, pressure convergence,
+larger workload response, and a resolution or timestep sensitivity comparison.
+Record dimensions, water resolution, timestep/substeps, initial volume,
+boundaries, hardware, and numerical/performance targets before measuring.
+Targets remain targets until measured. Deliver exact commands and limitations;
+do not shrink the named workload or substitute visuals when a feasibility
+target fails. Current prototype measurements and failed gates:
+`docs/reports/ENG-103.md`.
+
+**Grid comparison increment (user-directed, 2026-09-27):** Preserve the Salva
+backend and its raw evidence. Add a separate fully resident, dense CPU 3D MAC
+grid with one water cell per terrain cell and fractional VOF state. The
+pre-coding numerical method, equations, units, boundary conditions, step order,
+and deliberate simplifications are recorded in
+`docs/reports/ENG-103-grid-method.md`. The acceptance extension is the full
+grid-prototype brief recorded in Loopira ENG-103: bounded conservative
+fraction transport, staggered velocity/pressure projection, explicit
+disconnected-region/nullspace handling, staged voxel boundaries, fixed outer
+tick with bounded stability substeps, analytical projection/hydrostatic check,
+and the listed physical fixtures, sensitivity runs, and base/scale-2 evidence.
+This static aligned-grid experiment does not establish support for coarse
+fluid cells, moving/rotating hulls, or production integration.
+
+  **Bounded correctness/profile follow-up (user-directed, 2026-09-27):** Correct
+the speed and face-weighted kinetic/potential energy diagnostics; reconcile the
+upper-pool region from the actually applied FCT face fluxes; and keep the scale-2
+pressure solve profile. Pressure matrix and Krylov work now iterate wet cells
+only. Equal-duration basin runs compare 0.25 m/60 Hz, 0.25 m/120 Hz, and
+0.125 m/60 Hz; equal-duration tunnel runs compare both spatial resolutions.
+The scale-2 pool discrepancy was caused by a region mask omitting the first
+cavity row and now balances to 1.8e-15 m³. Base sealed/canal/breach fit the
+  proposed 2 ms allocation after the bounded optimization. **Pressure-cost and
+  residual-motion follow-up (user-directed, 2026-09-27):** Correct the harness's
+  per-1/60-second normalization (half-dt work is nearly 2x, not cheaper), add
+  detailed PCG residual/component/timing traces, and remove redundant
+  enclosed-nullspace projection passes. Repeated scale-2 tunnel pressure cost
+  falls from 52.05 to 36.80 ms/tick with the same iterations; the complete
+  workload remains about 24x above the 2 ms proposal. The basin maximum is
+  retained at 0.854 m/s but occurs in a fraction 3.16e-18 interface cell; the
+  volume-weighted p95 is 0.075 m/s. Neither finding clears the failed
+  unfiltered speed gate. Keep ENG-103 in progress and production integration
+  blocked; the next bounded comparison is IC(0) preconditioning, including
+  setup cost and enclosed-component nullspaces. See
+  `docs/reports/ENG-103.md`, `docs/reports/ENG-103-grid-method.md`, and the
+  uniquely named evidence captures.
+
+**IC(0) comparison and corrected basin diagnostic (2026-09-27):** Add a
+selectable deterministic zero-fill incomplete-Cholesky PCG preconditioner while
+preserving Jacobi as the default baseline. Rebuild and measure the factor at
+every pressure projection; use a factor-only pinned gauge for enclosed
+components; reject bad pivots explicitly. The matched base basin/canal/breach
+and scale-2 tunnel fixtures preserve pressure convergence and flow results.
+Three release timing repeats show normalized mean-cost medians of Jacobi→IC(0):
+basin 1.941→1.870 ms, canal 1.854→1.748 ms, breach 1.820→1.742 ms, scale-2
+tunnel 49.002→37.598 ms. IC(0) cuts scale-2 pressure iterations from 229.6 to
+86.2 mean while adding factor storage and ~3 MiB peak process memory. Revise the
+basin gate to occupancy-weighted p95/high-speed share at C>=1e-3, retain the
+raw maximum, and publish 0 through 1e-2 threshold sensitivity. This clears the
+speed-only interpretation but finds that upper-bound basin kinetic-energy rise
+still misses by 0.101 J. Tiny fractions also cause 7 extra diagnostic-estimated
+CFL substeps in the basin and remain pressure rows; solver filtering was not
+applied. Recommendation: keep IC(0) for further isolated candidate work and
+Jacobi as the reproducible baseline. Scale 2 remains 18.8x over the proposed
+2 ms allocation; the Salva tunnel roof crossing remains. Production promotion,
+moving-body force coupling, boats, and networking stay blocked. See
+`docs/reports/ENG-103.md`, `docs/reports/ENG-103-grid-method.md`,
+`docs/validation.md`, and the `ic0-final-*`/`ic0-plain-*` JSONL captures.
+
+**Two-phase candidate, reference comparison, cost, and sealed air
+(2026-09-27):** The opt-in two-phase variable-density MAC/PLIC model
+(`--ambient-density 1.2`) passes the 30-second physical acceptance. The
+acceptance output is now v2. The level `equilibrium` basin keeps the at-rest
+KE gate. The historical `basin` is a small dam break, so it gates on total
+mechanical energy never exceeding its initial value. The legacy single-phase
+closure fails because it genuinely gains 15–20 kJ.
+
+An independent Basilisk C reference (the `reference-*.c` sources and
+`basilisk-*.jsonl` output in `docs/reports/ENG-103-evidence/`) agrees on
+conservation, energy released, dissipation, and final level. A new
+standing-wave benchmark shows resolved waves are not over-damped: 0.991
+amplitude ratio per period against Basilisk's 0.959. The remaining basin KE
+gap is under-resolved collapse. MacCormack advection was rejected because it
+grows waves 4.6–11% per period.
+
+Cost: a Galerkin-aggregation multigrid PCG (`--preconditioner mg`), exact
+transport savings, and rayon data-parallel loops that stay bit-identical for
+any thread count. Every scale-1 fixture now costs 1.1–1.3 ms per 1/60 s; the
+closed scale-2 tunnel costs 19 ms.
+
+Sealed air is an isothermal compressible gas by default. A diving-bell test
+lands within 7% of the analytic equilibrium.
+
+Recommendation: adopt the two-phase MAC grid as the water solver. Production
+integration (tick ordering with committed edits, overlap/displacement policy,
+replication, persistence, dormancy) is the next scoped assignment. See the
+dated sections of `docs/reports/ENG-103.md`.
+
+The Salva particle backend was removed after selection. The grid scenarios now
+build their scene and bit-identical reference volume in
+`fixtures::ReservoirScene`. Production integration is tracked as ENG-105.
+
+Swimming, boats, rigid-body coupling, multiplayer water DTOs, persistence,
+streaming-scale behavior, and replaceable water appearance are later scoped
+assignments. See Loopira ENG-103 for the matching tracked issue.
+
+### ENG-104 — Interactive sandbox water demo
+
+User-requested local visualization follow-up to ENG-103. Add a dedicated mode
+to `sandbox-client` using the shared Spall renderer and the bounded,
+voxel-backed water fixture. Show the actual solid walls/dam and live fluid
+particle positions. Provide direct controls for canal excavation, dam breach,
+pause/resume, scene reset, and camera movement. Keep this explicit
+client-local debug mode separate from normal network replication: it does not
+establish server-authoritative water, multiplayer water state, or completion of
+ENG-103's failed feasibility gates. Launch instructions and implementation
+evidence are recorded in `docs/reports/ENG-104.md`; tracked in Loopira ENG-104.
+The original particle view (`--fluid-demo`) was removed with the Salva backend;
+the MAC grid viewer (`--grid-fluid-demo`) is the remaining water view.

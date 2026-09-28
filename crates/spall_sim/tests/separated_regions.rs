@@ -53,6 +53,38 @@ fn world_solid_total(sim: &Simulation) -> u64 {
     n
 }
 
+fn assert_spawn_slots_walk(mut sim: Simulation, spawns: [[f64; 3]; 4]) {
+    let input = PlayerInput {
+        movement: [0.0, 0.0, 1.0],
+        view_dir: [1.0, 0.0, 0.0],
+        buttons: 0,
+    };
+    for (slot, spawn) in spawns.into_iter().enumerate() {
+        let entity = player_entity_for(slot as u32);
+        sim.add_player(entity, spawn);
+        assert!(sim.set_player_input(entity, input, InputSeq(1)));
+    }
+
+    for _ in 0..30 {
+        sim.tick().unwrap();
+    }
+
+    for player in sim.world().players() {
+        let start = player.spawn.position_m;
+        assert!(
+            player.state.position_m[0] - start[0] > 1.0,
+            "spawn {:?} did not move clear of the beam: {:?}",
+            start,
+            player.state.position_m
+        );
+        assert!(
+            player.state.grounded,
+            "player left the floor at {:?}",
+            start
+        );
+    }
+}
+
 #[test]
 fn cutting_one_region_leaves_the_other_region_intact() {
     let mut sim =
@@ -157,6 +189,21 @@ fn both_detached_beams_come_to_rest_on_their_own_floor() {
         solid_count(&sim.world().terrain().volume) > 0,
         "terrain floors survive the two collapses"
     );
+}
+
+#[test]
+fn separated_region_spawn_slots_can_walk_from_their_initial_positions() {
+    let sim = Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    assert_spawn_slots_walk(sim, fixtures::SEPARATED_REGION_SPAWNS);
+}
+
+#[test]
+fn full_envelope_spawn_slots_can_walk_from_their_initial_positions() {
+    let sim = Simulation::new(SimulationConfig::new(
+        fixtures::separated_regions_full_envelope_setup(),
+    ))
+    .unwrap();
+    assert_spawn_slots_walk(sim, fixtures::SEPARATED_REGION_FAR_SPAWNS);
 }
 
 // --- T23 / G3 open item row 2: full-envelope (> 100 m) separation ----------
@@ -343,12 +390,10 @@ fn causeway_connects_the_two_far_regions_with_continuous_solid_ground() {
 /// on solid ground inside the causeway/east-region span, matching the
 /// wire-harness scenario's `movement.min_distance_m` gate.
 ///
-/// This also pins the reason slot 0's spawn is *not* at the same local offset
-/// as [`fixtures::SEPARATED_REGION_SPAWNS`] (see that constant's doc comment):
-/// spawning within the first few metres of `x = 0` leaves a freshly-created
-/// player capsule unresponsive to horizontal input for hundreds of ticks — a
-/// pre-existing defect this test's spawn deliberately avoids, not a distance
-/// or collapse-independence property of this scene.
+/// Slot 0 starts at `x = 7 m` because this full-envelope scene provides the
+/// continuous causeway needed for the >100 m path. Its `z = 1.6 m` lane clears
+/// the raised beam; the earlier ENG-66 freeze was caused by a spawn that
+/// intersected that beam, not by proximity to `x = 0`.
 #[test]
 fn scripted_walk_from_slot_0_spawn_covers_over_100_m() {
     let mut sim = Simulation::new(SimulationConfig::new(
@@ -388,5 +433,65 @@ fn scripted_walk_from_slot_0_spawn_covers_over_100_m() {
     assert!(
         p.state.grounded,
         "the player should still be on solid ground"
+    );
+}
+
+/// T23 / G3 row 15 follow-up, **resolved as not an engine defect**: an earlier
+/// version of this test spawned at `x = 7 m` on the plain
+/// [`fixtures::separated_regions_setup`] scene (picked to sit past row 15's
+/// freeze band, mirroring [`fixtures::separated_regions_full_envelope_setup`]'s
+/// `x = 7 m` slot-0 spawn) and found the player fell through instead of
+/// walking, theorizing a divergence in occupancy extraction between the two
+/// scenes' differently-shaped `terrain_collider_region` union boxes.
+///
+/// Instrumenting per-tick position showed `grounded` is already `false` at
+/// tick 1, before any meaningful travel — the player free-falls from the
+/// very first tick, not partway through a walk. The real explanation is
+/// simpler: the west region's actual solid floor only spans `x` cells
+/// `0..=23` (`0..6 m`; see [`fixtures::separated_regions_scene`]'s doc
+/// comment), so `x = 7 m` is already past its edge, in real air, at spawn.
+/// `terrain_collider_region` is merely the bounding envelope the collider
+/// system extracts occupancy over (mostly air outside the two regions and
+/// their connecting causeway, if any) — not a claim that the whole box is
+/// solid ground. `separated_regions_full_envelope_setup` does not reproduce
+/// at the same `x` only because it fills a causeway from cell `24` (`x = 6
+/// m`) onward specifically to carry a scripted walker past this gap
+/// ([`fixtures::separated_regions_full_envelope_scene`]); the plain scene has
+/// no such causeway, by design — the whole point of `separated_regions_setup`
+/// is two small, isolated collapsible structures with genuine empty world
+/// between them. `PlayerInput::movement`'s forward axis is relative to
+/// `view_dir`; with `view_dir = [1, 0, 0]` (the convention used throughout
+/// `spall_physics::character`'s own tests), "forward" drives `x`, which is
+/// why `x` advances while `z` stays fixed here — also not a bug.
+///
+/// Kept as a sanity check that a spawn genuinely off any floor free-falls
+/// cleanly (no panic, no false-grounded) rather than as a regression pin —
+/// there is no defect here to pin.
+#[test]
+fn spawn_past_the_narrow_floors_edge_free_falls_through_the_gap() {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    let entity = player_entity_for(0);
+    // Past the west floor's own `x` extent (`0..6 m`) on the plain scene,
+    // which has no causeway past it (unlike the full-envelope scene) -- this
+    // is genuine void, not row 15's freeze band or an occupancy-extraction
+    // divergence. See the doc comment above.
+    let spawn = [7.0, 1.0, 1.0];
+    sim.add_player(entity, spawn);
+    let forward = PlayerInput {
+        movement: [0.0, 0.0, 1.0],
+        view_dir: [1.0, 0.0, 0.0],
+        buttons: 0,
+    };
+    for seq in 1..=200u64 {
+        sim.set_player_input(entity, forward, InputSeq(seq));
+        sim.tick().unwrap();
+    }
+    let p = sim.world().players().next().unwrap();
+    assert!(
+        !p.state.grounded && p.state.position_m[1] < spawn[1] - 1.0,
+        "expected a spawn off the floor's edge to free-fall, but is at y={} grounded={}",
+        p.state.position_m[1],
+        p.state.grounded
     );
 }

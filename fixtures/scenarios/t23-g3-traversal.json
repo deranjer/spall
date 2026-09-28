@@ -20,7 +20,8 @@
     "min_client_reloads_completed": 1,
     "min_evicted_transaction_gaps": 1,
     "min_outbound_distance_m": 20.0,
-    "max_return_distance_m": 12.0
+    "max_return_distance_m": 12.0,
+    "min_pinned_bricks": 5
   },
   "player_paths": [
     {

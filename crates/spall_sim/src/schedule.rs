@@ -61,6 +61,10 @@ struct QueuedIntent {
 /// What one [`EditPipeline::run_tick`] did.
 #[derive(Debug, Default)]
 pub struct TickReport {
+    /// Time spent in the owning world's physics step, including extraction of
+    /// updated body poses. This is populated by `Simulation::tick` so server
+    /// telemetry can report the physics portion without timing a replica.
+    pub physics_duration: std::time::Duration,
     /// Requests that committed this tick, with their transaction summary.
     pub committed: Vec<(RequestId, Committed)>,
     /// Requests whose commit lost a conflict and were re-queued for recompute.
@@ -73,6 +77,14 @@ pub struct TickReport {
     pub serialized_regions: Vec<RegionKey>,
     /// Intents still waiting after this tick.
     pub pending_after: usize,
+    /// T23 / G3 row 7 (ENG-30 row 7 increment 13): every brick the pipeline
+    /// itself reloaded this tick to satisfy a staging/commit
+    /// `EvictedGeometryRequired`. A residency pass uses this to grant the
+    /// reloaded brick a short pin so it is not evicted again before the
+    /// re-queued intent's retry (next tick) can actually use it — the
+    /// preflight/consumer-lifetime pinning the frozen contract calls for,
+    /// rather than relying only on the reactive reload succeeding.
+    pub reloaded_bricks: Vec<(VolumeId, BrickCoord)>,
 }
 
 /// The bounded staging + commit pipeline.
@@ -184,174 +196,298 @@ impl EditPipeline {
         next_control_seq: &mut u64,
     ) -> Result<TickReport, CommitError> {
         let mut report = TickReport::default();
-        self.active_regions.clear();
+        // A structural commit advances the global topology epoch.  Results
+        // staged later in the same batch therefore fail the commit-time token
+        // check even when they target an independent region.  Rebase a
+        // bounded number of those requests in this tick so a burst does not
+        // collapse to one topology commit per tick.  This deliberately keeps
+        // the global epoch contract (and its conservative invalidation) intact;
+        // region-scoped epochs are a separate design change.
+        const MAX_REBASE_ROUNDS: usize = 4;
+        let mut rebase_round = 0usize;
+        let mut serialized_regions_this_tick = HashSet::new();
+        // Geometry reloads are an external residency transition, not a stale
+        // topology rebase. Keep their intents out of `pending` until this
+        // tick has fully drained: otherwise an unrelated stale result can
+        // enter another same-tick round and execute a reload retry despite
+        // the retry contract promising the next tick.
+        let mut reload_retries_next_tick = VecDeque::new();
 
-        // 1. Submit eligible pending intents to the staging scheduler.
-        let generation = world.generation();
-        let epoch = world.topology_epoch();
-        let mut deferred: VecDeque<QueuedIntent> = VecDeque::new();
-        while let Some(queued) = self.pending.pop_front() {
-            // A serialized region admits at most one job per tick.
-            if self.serialized.contains(&queued.region)
-                && self.active_regions.contains(&queued.region)
-            {
-                deferred.push_back(queued);
-                continue;
-            }
+        loop {
+            self.active_regions.clear();
 
-            let Some(snapshot) = world.volume_ref(queued.volume_id).cloned() else {
-                let reason = "target volume vanished".to_string();
-                self.record_rejection(queued.intent.request_id, reason.clone());
-                report.rejected.push((queued.intent.request_id, reason));
-                continue;
-            };
-            let input = StageInput::new(
-                &queued.intent,
-                queued.volume_id,
-                snapshot,
-                world.evicted(queued.volume_id).clone(),
-                world.anchor(),
-                generation,
-                epoch,
-            );
-            let request = JobRequest::new(
-                Lane::Edit,
-                Priority::NORMAL,
-                JobToken::new(generation, epoch),
-                move || stage_edit(&input),
-            );
-            match self.scheduler.submit(request) {
-                Ok(handle) => {
-                    self.active_regions.insert(queued.region);
-                    self.inflight.insert(handle.id(), queued);
-                }
-                Err(_rejected) => {
-                    // Lane full: hold this and everything after it for next tick.
-                    deferred.push_front(queued);
-                    break;
-                }
-            }
-        }
-        self.pending.append(&mut deferred);
-
-        // 2. Run every dispatched staging job (deterministic, no threads).
-        for dispatch in self.scheduler.dispatch() {
-            let completion = dispatch.run();
-            self.scheduler.apply(completion);
-        }
-
-        // 3. Install: fresh staged results in completion (== request) order.
-        let installed = self.scheduler.install(&*world);
-        for discarded in installed.discarded {
-            if let Some(queued) = self.inflight.remove(&discarded.id) {
-                report.discarded_stale.push(queued.intent.request_id);
-                self.pending.push_back(queued); // recompute against the new world
-            }
-        }
-
-        // 4. Commit in order.
-        for entry in installed.installed {
-            let Some(queued) = self.inflight.remove(&entry.id) else {
-                continue;
-            };
-            let request = queued.intent.request_id;
-            let region = queued.region;
-
-            let staged = match entry.output {
-                Ok(staged) => staged,
-                // T23 / G3 row 7, slice C: the edit needs an evicted brick's
-                // cells. Reload it from the backing and re-stage next tick; if
-                // no backing has it, reject with a bounded explicit failure.
-                Err(StageError::EvictedGeometryRequired(bricks)) => {
-                    self.conflicts.remove(&region);
-                    match world.reload_bricks(queued.volume_id, bricks.iter().copied()) {
-                        Ok(true) => {
-                            report.retried.push(request);
-                            self.pending.push_back(QueuedIntent {
-                                attempts: queued.attempts + 1,
-                                ..queued
-                            });
-                        }
-                        _ => {
-                            let reason =
-                                format!("evicted geometry unavailable for reload: {bricks:?}");
-                            self.record_rejection(request, reason.clone());
-                            report.rejected.push((request, reason));
-                        }
-                    }
+            // 1. Submit eligible pending intents to the staging scheduler.
+            let generation = world.generation();
+            let epoch = world.topology_epoch();
+            let mut deferred: VecDeque<QueuedIntent> = VecDeque::new();
+            while let Some(queued) = self.pending.pop_front() {
+                // A serialized region admits at most one job per tick.  The
+                // separate per-tick set keeps that lane's contract intact
+                // across same-tick rebase rounds, while independent regions
+                // can still make progress in the same tick.
+                if self.serialized.contains(&queued.region)
+                    && (self.active_regions.contains(&queued.region)
+                        || serialized_regions_this_tick.contains(&queued.region))
+                {
+                    deferred.push_back(queued);
                     continue;
                 }
-                Err(err) => {
-                    let reason = err.to_string();
-                    self.record_rejection(request, reason.clone());
-                    report.rejected.push((request, reason));
-                    self.conflicts.remove(&region);
+
+                let Some(snapshot) = world.volume_ref(queued.volume_id).cloned() else {
+                    let reason = "target volume vanished".to_string();
+                    self.record_rejection(queued.intent.request_id, reason.clone());
+                    report.rejected.push((queued.intent.request_id, reason));
                     continue;
-                }
-            };
-
-            if self.committed.contains_key(&request.0) {
-                continue; // idempotent: already committed
-            }
-
-            let control_seq = ControlSeq(*next_control_seq);
-            match commit(world, journal, &staged, server_tick, control_seq) {
-                Ok(CommitOutcome::Committed(done)) => {
-                    *next_control_seq += 1;
-                    self.conflicts.remove(&region);
-                    self.committed.insert(request.0, done.clone());
-                    self.statuses.insert(request.0, done.action_status(request));
-                    report.committed.push((request, done));
-                }
-                // T23 / G3 row 7, slice C: the collider rebuild needs an evicted
-                // brick's cells. Reload from the backing and re-commit next
-                // tick; reject if unavailable.
-                Err(CommitError::EvictedGeometryRequired { volume, bricks }) => {
-                    self.conflicts.remove(&region);
-                    match world.reload_bricks(volume, bricks.iter().copied()) {
-                        Ok(true) => {
-                            report.retried.push(request);
-                            self.pending.push_back(QueuedIntent {
-                                attempts: queued.attempts + 1,
-                                ..queued
-                            });
+                };
+                let input = StageInput::new(
+                    &queued.intent,
+                    queued.volume_id,
+                    snapshot,
+                    world.evicted(queued.volume_id).clone(),
+                    world.anchor(),
+                    generation,
+                    epoch,
+                );
+                let request = JobRequest::new(
+                    Lane::Edit,
+                    Priority::NORMAL,
+                    JobToken::new(generation, epoch),
+                    move || stage_edit(&input),
+                );
+                match self.scheduler.submit(request) {
+                    Ok(handle) => {
+                        self.active_regions.insert(queued.region);
+                        if self.serialized.contains(&queued.region) {
+                            serialized_regions_this_tick.insert(queued.region);
                         }
-                        _ => {
-                            let reason =
-                                format!("evicted geometry unavailable for reload: {bricks:?}");
-                            self.record_rejection(request, reason.clone());
-                            report.rejected.push((request, reason));
-                        }
+                        self.inflight.insert(handle.id(), queued);
+                    }
+                    Err(_rejected) => {
+                        // Lane full: hold this and everything after it for next tick.
+                        deferred.push_front(queued);
+                        break;
                     }
                 }
-                Err(err) => {
-                    // The commit candidate failed a fallible step (id exhaustion,
-                    // DTO validation, op-budget) and was discarded before any
-                    // live state changed (`ENG-54`). Reject the request
-                    // deterministically; the tick continues and every other
-                    // staged request still commits.
-                    self.conflicts.remove(&region);
-                    let reason = err.to_string();
-                    self.record_rejection(request, reason.clone());
-                    report.rejected.push((request, reason));
-                }
-                Ok(CommitOutcome::Stale(_reason)) => {
-                    let count = self.conflicts.entry(region).or_insert(0);
-                    *count += 1;
-                    if *count >= self.serialize_threshold && self.serialized.insert(region) {
-                        report.serialized_regions.push(region);
-                    }
-                    report.retried.push(request);
-                    self.pending.push_back(QueuedIntent {
-                        attempts: queued.attempts + 1,
-                        ..queued
-                    });
+            }
+            self.pending.append(&mut deferred);
+
+            // 2. Run every dispatched staging job (deterministic, no threads).
+            for dispatch in self.scheduler.dispatch() {
+                let completion = dispatch.run();
+                self.scheduler.apply(completion);
+            }
+
+            // 3. Install: fresh staged results in completion (== request) order.
+            let installed = self.scheduler.install(&*world);
+            for discarded in installed.discarded {
+                if let Some(queued) = self.inflight.remove(&discarded.id) {
+                    report.discarded_stale.push(queued.intent.request_id);
+                    self.pending.push_back(queued); // recompute against the new world
                 }
             }
+
+            // 4. Commit in order.
+            let mut rebase_requested = false;
+            for entry in installed.installed {
+                let Some(queued) = self.inflight.remove(&entry.id) else {
+                    continue;
+                };
+                let request = queued.intent.request_id;
+                let region = queued.region;
+
+                let staged = match entry.output {
+                    Ok(staged) => staged,
+                    // T23 / G3 row 7, slice C: the edit needs an evicted brick's
+                    // cells. Reload it from the backing and re-stage next tick; if
+                    // no backing has it, reject with a bounded explicit failure.
+                    Err(StageError::EvictedGeometryRequired(bricks)) => {
+                        self.conflicts.remove(&region);
+                        match world.reload_bricks(queued.volume_id, bricks.iter().copied()) {
+                            Ok(true) => {
+                                report.retried.push(request);
+                                report
+                                    .reloaded_bricks
+                                    .extend(bricks.iter().map(|&b| (queued.volume_id, b)));
+                                reload_retries_next_tick.push_back(QueuedIntent {
+                                    attempts: queued.attempts + 1,
+                                    ..queued
+                                });
+                            }
+                            _ => {
+                                let reason =
+                                    format!("evicted geometry unavailable for reload: {bricks:?}");
+                                self.record_rejection(request, reason.clone());
+                                report.rejected.push((request, reason));
+                            }
+                        }
+                        continue;
+                    }
+                    Err(err) => {
+                        let reason = err.to_string();
+                        self.record_rejection(request, reason.clone());
+                        report.rejected.push((request, reason));
+                        self.conflicts.remove(&region);
+                        continue;
+                    }
+                };
+
+                if self.committed.contains_key(&request.0) {
+                    continue; // idempotent: already committed
+                }
+
+                let control_seq = ControlSeq(*next_control_seq);
+                match commit(world, journal, &staged, server_tick, control_seq) {
+                    Ok(CommitOutcome::Committed(done)) => {
+                        *next_control_seq += 1;
+                        self.conflicts.remove(&region);
+                        self.committed.insert(request.0, done.clone());
+                        self.statuses.insert(request.0, done.action_status(request));
+                        report.committed.push((request, done));
+                    }
+                    // T23 / G3 row 7, slice C: the collider rebuild needs an evicted
+                    // brick's cells. Reload from the backing and re-commit next
+                    // tick; reject if unavailable.
+                    Err(CommitError::EvictedGeometryRequired { volume, bricks }) => {
+                        self.conflicts.remove(&region);
+                        match world.reload_bricks(volume, bricks.iter().copied()) {
+                            Ok(true) => {
+                                report.retried.push(request);
+                                report
+                                    .reloaded_bricks
+                                    .extend(bricks.iter().map(|&b| (volume, b)));
+                                reload_retries_next_tick.push_back(QueuedIntent {
+                                    attempts: queued.attempts + 1,
+                                    ..queued
+                                });
+                            }
+                            _ => {
+                                let reason =
+                                    format!("evicted geometry unavailable for reload: {bricks:?}");
+                                self.record_rejection(request, reason.clone());
+                                report.rejected.push((request, reason));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        // The commit candidate failed a fallible step (id exhaustion,
+                        // DTO validation, op-budget) and was discarded before any
+                        // live state changed (`ENG-54`). Reject the request
+                        // deterministically; the tick continues and every other
+                        // staged request still commits.
+                        self.conflicts.remove(&region);
+                        let reason = err.to_string();
+                        self.record_rejection(request, reason.clone());
+                        report.rejected.push((request, reason));
+                    }
+                    Ok(CommitOutcome::Stale(_reason)) => {
+                        let count = self.conflicts.entry(region).or_insert(0);
+                        *count += 1;
+                        if *count >= self.serialize_threshold && self.serialized.insert(region) {
+                            report.serialized_regions.push(region);
+                            serialized_regions_this_tick.insert(region);
+                        }
+                        report.retried.push(request);
+                        self.pending.push_back(QueuedIntent {
+                            attempts: queued.attempts + 1,
+                            ..queued
+                        });
+                        rebase_requested = true;
+                    }
+                }
+            }
+
+            // Only a commit-time stale result requests an in-tick rebase.  All
+            // other retries (for example an evicted-brick reload) remain
+            // queued for the next tick.  The hard round limit guarantees a
+            // burst cannot turn one server tick into an unbounded retry loop.
+            if !rebase_requested || rebase_round == MAX_REBASE_ROUNDS {
+                break;
+            }
+            rebase_round += 1;
         }
 
+        self.pending.append(&mut reload_retries_next_tick);
         report.pending_after = self.pending.len();
         Ok(report)
+    }
+
+    /// T23 / G3 row 7 (ENG-30 row 7 increment 13): the bounded brick footprint
+    /// every currently-queued (not yet staged/committed) intent targeting
+    /// `volume` will need once it stages — its brush AABB grown by one brick,
+    /// the same halo a structural search can spill into. A residency pass
+    /// pins these so a pending edit's dependencies are reserved *before*
+    /// staging discovers them reactively via `EvictedGeometryRequired`, per
+    /// the frozen preflight-pinning contract
+    /// (`docs/reports/G3-residency-hash.md`).
+    ///
+    /// Bounded: `spall_core::SphereBrush` already caps a single edit's radius
+    /// at `MAX_BRUSH_RADIUS_CELLS` (256 cells), so one intent contributes at
+    /// most a bounded cube of bricks; a pending queue whose combined
+    /// footprint would exceed `MAX_PENDING_PIN_BRICKS` falls back to pinning
+    /// only each remaining intent's centre brick, so this call is never
+    /// unbounded allocation over an adversarial queue.
+    pub fn pending_dependency_bricks(&self, volume: VolumeId) -> HashSet<BrickCoord> {
+        const MAX_PENDING_PIN_BRICKS: usize = 4096;
+        // One brick of margin beyond the brush's own cell bounds, for a
+        // structural search spilling into a neighbour
+        // (`docs/architecture.md`: "Meshing includes a one-cell halo ...").
+        const HALO_BRICKS: i64 = 1;
+        let mut out = HashSet::new();
+        for queued in &self.pending {
+            if queued.volume_id != volume {
+                continue;
+            }
+            let brush = &queued.intent.brush;
+            let unit = spall_core::BRUSH_UNIT;
+            let r = brush.radius_units().div_euclid(unit)
+                + i64::from(brush.radius_units().rem_euclid(unit) != 0);
+            let centre_x = brush.centre.x.div_euclid(unit);
+            let centre_y = brush.centre.y.div_euclid(unit);
+            let centre_z = brush.centre.z.div_euclid(unit);
+            // A per-axis cell AABB converted to its own brick bounds, not a
+            // brick radius applied uniformly around the centre brick -- a
+            // small brush interior to one brick must not pin a disproportionate
+            // box just because a large brush centred at a brick boundary
+            // hypothetically could.
+            let (min_b, _) =
+                spall_core::GlobalCell::new(centre_x - r, centre_y - r, centre_z - r).split();
+            let (max_b, _) =
+                spall_core::GlobalCell::new(centre_x + r, centre_y + r, centre_z + r).split();
+            let lo = BrickCoord::new(
+                min_b.x - HALO_BRICKS,
+                min_b.y - HALO_BRICKS,
+                min_b.z - HALO_BRICKS,
+            );
+            let hi = BrickCoord::new(
+                max_b.x + HALO_BRICKS,
+                max_b.y + HALO_BRICKS,
+                max_b.z + HALO_BRICKS,
+            );
+            let nx = (hi.x - lo.x + 1).max(0);
+            let ny = (hi.y - lo.y + 1).max(0);
+            let nz = (hi.z - lo.z + 1).max(0);
+            let cube = (nx as i128) * (ny as i128) * (nz as i128);
+            if out.len() >= MAX_PENDING_PIN_BRICKS || cube > MAX_PENDING_PIN_BRICKS as i128 {
+                // Pathological (near-maximal-radius) brush: fall back to just
+                // the centre brick rather than skip the intent's dependency
+                // entirely.
+                let (centre_brick, _) =
+                    spall_core::GlobalCell::new(centre_x, centre_y, centre_z).split();
+                out.insert(centre_brick);
+                continue;
+            }
+            'brush: for z in lo.z..=hi.z {
+                for y in lo.y..=hi.y {
+                    for x in lo.x..=hi.x {
+                        out.insert(BrickCoord::new(x, y, z));
+                        if out.len() >= MAX_PENDING_PIN_BRICKS {
+                            break 'brush;
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn record_rejection(&mut self, request: RequestId, reason: String) {

@@ -171,9 +171,35 @@ const EVICT_SETTLE_STEPS: u32 = 8;
 /// touched. `radius` must be wide enough to cover the predicted-collision
 /// region — the mover rebuilds its predicted collider from resident geometry
 /// only, so a brick under the player's near path must stay loaded.
+///
+/// ## ENG-30 row 7 increment 14 — client-side dense-byte admission
+///
+/// `docs/reports/G3.md` increment 33 (ENG-30 row 7 increment 13) gave the
+/// server-side `ResidencyPass` a real `max_dense_bytes` ceiling enforced on
+/// admission (an interest-driven reload deferred, not admitted, past it) and
+/// explicitly deferred `ClientResidencyPass` as out of scope. This pass has a
+/// single predicted player and no pending-edit/swept-collision pin sources of
+/// its own (it never originates edits, and eviction is already governed
+/// unconditionally by the box, never by budget), so every reload request this
+/// pass emits is "interest-driven, non-required" in the server's terms — the
+/// admission cap below applies uniformly to all of them, using the same
+/// conservative (cost every candidate as if `Dense`,
+/// [`spall_voxel::MemoryReport::DENSE_BRICK_BYTES`]) estimate the server uses,
+/// corrected to the real measured total every step (this pass's reload is
+/// asynchronous — a `RepairRequest` only becomes resident once the server's
+/// patch lands — so the projected total also counts bricks already requested
+/// but not yet completed, the conservative upper bound for what could land
+/// before the next step's fresh measurement). `budget_bricks` — historically a
+/// reported ceiling only — is enforced by the same check, matching the
+/// server's "either cap" admission rule.
 pub struct ClientResidencyPass {
     radius: i64,
     budget_bricks: usize,
+    /// T23 / G3 row 7 increment 14: hard ceiling on resident terrain dense
+    /// bytes, enforced on the reload-admission path the same way as
+    /// `budget_bricks`. `u64::MAX` disables this cap while still enforcing
+    /// `budget_bricks` — the historical behaviour before this field existed.
+    max_dense_bytes: u64,
     /// Consecutive steps each resident, out-of-box brick has waited.
     out_of_box: BTreeMap<BrickCoord, u32>,
     reload_cooldown: BTreeMap<BrickCoord, u32>,
@@ -182,16 +208,25 @@ pub struct ClientResidencyPass {
     reloads_requested_total: u64,
     reloads_completed_total: u64,
     budget_miss_steps_total: u64,
+    /// T23 / G3 row 7 increment 14: a desired (box-driven) reload request was
+    /// skipped this step because admitting it would have exceeded the brick or
+    /// dense-byte cap. The brick stays evicted; a later step retries once
+    /// pressure eases.
+    admission_deferred_total: u64,
 }
 
 impl ClientResidencyPass {
-    /// `radius` is the Chebyshev brick radius kept resident around the player;
-    /// `budget_bricks` is a reported ceiling only (the pass evicts by the box,
-    /// never below it).
-    pub fn new(budget_bricks: usize, radius: i64) -> Self {
+    /// `radius` is the Chebyshev brick radius kept resident around the player.
+    /// `budget_bricks` and `max_dense_bytes` are both hard ceilings enforced on
+    /// the reload-admission path (T23 / G3 row 7 increment 14) — the pass
+    /// still evicts strictly by the box, never below it, so a tight cap only
+    /// ever defers a desired reload back into the box, never forces an
+    /// eviction inside it.
+    pub fn new(budget_bricks: usize, radius: i64, max_dense_bytes: u64) -> Self {
         Self {
             radius: radius.max(0),
             budget_bricks,
+            max_dense_bytes,
             out_of_box: BTreeMap::new(),
             reload_cooldown: BTreeMap::new(),
             pending_reloads: BTreeSet::new(),
@@ -199,6 +234,7 @@ impl ClientResidencyPass {
             reloads_requested_total: 0,
             reloads_completed_total: 0,
             budget_miss_steps_total: 0,
+            admission_deferred_total: 0,
         }
     }
 
@@ -216,6 +252,12 @@ impl ClientResidencyPass {
 
     pub fn budget_miss_steps_total(&self) -> u64 {
         self.budget_miss_steps_total
+    }
+
+    /// T23 / G3 row 7 increment 14: cumulative desired reloads skipped because
+    /// admitting them would have exceeded the brick or dense-byte cap.
+    pub fn admission_deferred_total(&self) -> u64 {
+        self.admission_deferred_total
     }
 
     /// Whether the run has held more resident terrain than `budget_bricks`
@@ -280,6 +322,30 @@ impl ClientResidencyPass {
             *wait = wait.saturating_sub(1);
             *wait > 0
         });
+
+        // T23 / G3 row 7 increment 14: a conservative running admission
+        // estimate for this step. Resident bricks/bytes are measured fresh
+        // (the correction half of "conservative-then-corrected" — a prior
+        // step's admitted requests either completed, feeding this fresh
+        // measurement, or are still `pending_reloads` and are added back in
+        // below as the worst case for what has not landed yet). Every
+        // candidate is then costed as if fully `Dense`
+        // (`MemoryReport::DENSE_BRICK_BYTES`), so the enforced cap can only be
+        // tighter than the true footprint once requests complete, never
+        // looser.
+        let resident_terrain_bricks = replica
+            .volume(terrain)
+            .map(|v| v.resident_brick_count())
+            .unwrap_or(0);
+        let resident_dense_bytes = replica
+            .volume(terrain)
+            .map(|v| v.memory_report().total_dense_bytes() as u64)
+            .unwrap_or(0);
+        let mut projected_bricks = resident_terrain_bricks + self.pending_reloads.len();
+        let mut projected_dense_bytes = resident_dense_bytes.saturating_add(
+            self.pending_reloads.len() as u64 * MemoryReport::DENSE_BRICK_BYTES as u64,
+        );
+
         let mut out = Vec::new();
         let evicted_now: Vec<(BrickCoord, Revision)> = replica
             .evicted(terrain)
@@ -290,21 +356,33 @@ impl ClientResidencyPass {
             if out.len() >= MAX_RELOAD_REQUESTS_PER_STEP {
                 break;
             }
-            if keep.contains(&coord) && !self.reload_cooldown.contains_key(&coord) {
-                self.reload_cooldown.insert(coord, RELOAD_COOLDOWN_STEPS);
-                self.pending_reloads.insert(coord);
-                self.reloads_requested_total += 1;
-                out.push(RepairRequest {
-                    key: RepairKey::Brick {
-                        volume: terrain,
-                        coord,
-                    },
-                    expected_revision: revision,
-                    current_revision: Revision::ZERO,
-                    expected_hash: Hash32::ZERO,
-                    current_hash: Hash32::ZERO,
-                });
+            if !keep.contains(&coord) || self.reload_cooldown.contains_key(&coord) {
+                continue;
             }
+            let projected_bricks_candidate = projected_bricks.saturating_add(1);
+            let projected_dense_candidate =
+                projected_dense_bytes.saturating_add(MemoryReport::DENSE_BRICK_BYTES as u64);
+            let fits = projected_bricks_candidate <= self.budget_bricks
+                && projected_dense_candidate <= self.max_dense_bytes;
+            if !fits {
+                self.admission_deferred_total += 1;
+                continue;
+            }
+            projected_bricks = projected_bricks_candidate;
+            projected_dense_bytes = projected_dense_candidate;
+            self.reload_cooldown.insert(coord, RELOAD_COOLDOWN_STEPS);
+            self.pending_reloads.insert(coord);
+            self.reloads_requested_total += 1;
+            out.push(RepairRequest {
+                key: RepairKey::Brick {
+                    volume: terrain,
+                    coord,
+                },
+                expected_revision: revision,
+                current_revision: Revision::ZERO,
+                expected_hash: Hash32::ZERO,
+                current_hash: Hash32::ZERO,
+            });
         }
 
         // Evict resident terrain bricks that have been out of the box for

@@ -30,7 +30,7 @@ use spall_store::{
     StoredWorldMeta, decode_cells, encode_cells,
 };
 use spall_structure::AnchorPlane;
-use spall_voxel::{Brick, BrickBounds, Volume};
+use spall_voxel::{Brick, BrickBounds, BrickSnapshot, Volume};
 
 /// Algorithm versions stamped into saved world metadata (mirrors
 /// `spall_sim::commit::ALGORITHM_VERSION` and the T01/T07 versions).
@@ -129,29 +129,73 @@ pub enum PersistError {
          a suffix that would stamp new events before older durable ones)"
     )]
     JournalTickRegression { seq: u64, tick: u64, durable: u64 },
+    #[error(
+        "evicted brick {coord:?} of volume {volume} has no durable backing record -- refusing to \
+         publish a checkpoint that would claim (via the already-logical world_hash) geometry it \
+         does not actually carry in its bricks"
+    )]
+    EvictedBrickUnavailable { volume: u64, coord: [i64; 3] },
+    #[error(
+        "evicted brick {coord:?} of volume {volume} disagrees with its retained digest -- backing \
+         offered revision {backing_revision} / {backing_hash:.16}, retained revision \
+         {retained_revision} / {retained_hash:.16} -- refusing to publish a checkpoint whose \
+         bricks would not reproduce the exact revision the logical world_hash already counts"
+    )]
+    EvictedBrickDigestMismatch {
+        volume: u64,
+        coord: [i64; 3],
+        retained_revision: u64,
+        retained_hash: String,
+        backing_revision: u64,
+        backing_hash: String,
+    },
 }
 
 // --- capture --------------------------------------------------------------
 
 /// Snapshots the live authoritative world into an immutable [`Checkpoint`]
 /// consistent with journal `journal_cursor` (the highest durable `JournalSeq`).
+///
+/// Always walks every currently-resident terrain brick fresh
+/// ([`stored_bricks`]) -- the historical, non-incremental behaviour, used by
+/// every caller that has no per-checkpoint dirty-tracking cache of its own
+/// (the initial world-creation checkpoint, the crash-suite workload, plain
+/// `serve()` with residency off). [`crate::residency_pass::ResidencyPass::
+/// capture_checkpoint`] instead calls [`capture_with_terrain_bricks`]
+/// directly with an incrementally computed terrain-brick list (T23 / G3 row 7
+/// increment 15) -- this function's own output is unchanged either way.
 pub fn capture(
     sim: &Simulation,
     cfg: &PersistConfig,
     journal_cursor: u64,
+) -> Result<Checkpoint, PersistError> {
+    let terrain_bricks = stored_bricks(&sim.world().terrain().volume)?;
+    capture_with_terrain_bricks(sim, cfg, journal_cursor, terrain_bricks)
+}
+
+/// [`capture`], except the terrain volume's brick records are supplied by the
+/// caller instead of always being recomputed by a full resident-brick walk
+/// here. Every non-terrain part (bodies, meta, hash) is captured exactly as
+/// `capture` does. `capture` itself calls this with precisely the same walk
+/// as before it was extracted (`stored_bricks(&terrain.volume)`), so its
+/// output is byte-identical to the pre-increment-15 implementation.
+pub(crate) fn capture_with_terrain_bricks(
+    sim: &Simulation,
+    cfg: &PersistConfig,
+    journal_cursor: u64,
+    terrain_bricks: Vec<StoredBrick>,
 ) -> Result<Checkpoint, PersistError> {
     let world = sim.world();
     let (next_entity, next_volume, next_transaction, next_journal_seq) =
         world.registry().counters();
 
     let mut bodies = Vec::new();
-    let mut bricks = Vec::new();
+    let mut bricks = terrain_bricks;
     let mut cell_sizes = std::collections::BTreeSet::new();
 
     let terrain = world.terrain();
     cell_sizes.insert(terrain.volume.cell_size().to_u8());
     bodies.push(stored_body(world, terrain, StoredBodyKind::Terrain));
-    bricks.extend(stored_bricks(&terrain.volume)?);
 
     for body in world.bodies() {
         cell_sizes.insert(body.volume.cell_size().to_u8());
@@ -232,20 +276,57 @@ fn stored_bricks(v: &Volume) -> Result<Vec<StoredBrick>, PersistError> {
             .ok()
             .flatten()
             .expect("coord came from the resident set");
-        let mut cells = vec![0u16; CELLS_PER_BRICK];
-        for (i, slot) in cells.iter_mut().enumerate() {
-            let local = LocalCell::from_linear_index(i as u16).expect("i < CELLS_PER_BRICK");
-            *slot = snap.get(local).raw();
-        }
-        out.push(StoredBrick {
-            volume_id: v.id().get(),
-            coord: [coord.x, coord.y, coord.z],
-            revision: snap.revision().get(),
-            edited: snap.is_edited(),
-            payload: encode_cells(&cells)?,
-        });
+        out.push(stored_brick_from_snapshot(v.id(), coord, &snap)?);
     }
     Ok(out)
+}
+
+/// Encodes one resident brick's live [`BrickSnapshot`] into a [`StoredBrick`].
+/// T23 / G3 row 7 increment 15: `ResidencyPass::capture_checkpoint`'s
+/// incremental capture calls this only for a brick whose revision has changed
+/// since the last checkpoint that captured it; an unchanged brick reuses its
+/// prior [`StoredBrick`] record instead, skipping this encode entirely.
+pub(crate) fn stored_brick_from_snapshot(
+    volume_id: VolumeId,
+    coord: BrickCoord,
+    snap: &BrickSnapshot,
+) -> Result<StoredBrick, PersistError> {
+    let mut cells = vec![0u16; CELLS_PER_BRICK];
+    for (i, slot) in cells.iter_mut().enumerate() {
+        let local = LocalCell::from_linear_index(i as u16).expect("i < CELLS_PER_BRICK");
+        *slot = snap.get(local).raw();
+    }
+    Ok(StoredBrick {
+        volume_id: volume_id.get(),
+        coord: [coord.x, coord.y, coord.z],
+        revision: snap.revision().get(),
+        edited: snap.is_edited(),
+        payload: encode_cells(&cells)?,
+    })
+}
+
+/// Encodes one durably-backed [`Brick`] into a [`StoredBrick`] record. T23 /
+/// G3 row 7 follow-up: `residency_pass`'s bounded checkpoint capture uses this
+/// to fold a currently-evicted terrain brick's durable record straight into a
+/// checkpoint, without reinstalling it into the live `Volume` first the way
+/// `ResidencyPass::reload_all` used to.
+pub(crate) fn stored_brick_from_backing(
+    volume_id: VolumeId,
+    coord: BrickCoord,
+    brick: &Brick,
+) -> Result<StoredBrick, PersistError> {
+    let mut cells = vec![0u16; CELLS_PER_BRICK];
+    for (i, slot) in cells.iter_mut().enumerate() {
+        let local = LocalCell::from_linear_index(i as u16).expect("i < CELLS_PER_BRICK");
+        *slot = brick.get(local).raw();
+    }
+    Ok(StoredBrick {
+        volume_id: volume_id.get(),
+        coord: [coord.x, coord.y, coord.z],
+        revision: brick.revision().get(),
+        edited: brick.is_edited(),
+        payload: encode_cells(&cells)?,
+    })
 }
 
 // --- journal records ----------------------------------------------------
@@ -327,6 +408,28 @@ pub fn restore(
     anchor: AnchorPlane,
     physics: PhysicsConfig,
 ) -> Result<(Simulation, u64), PersistError> {
+    restore_with_terrain_collider_mode(
+        recovery,
+        cfg,
+        choice,
+        materials,
+        anchor,
+        physics,
+        spall_sim::world::TerrainColliderMode::PerBrick,
+    )
+}
+
+/// Recovery with an explicit derived collision mode. The mode is not stored:
+/// collision is rebuilt from the durable voxel volume on every restart.
+pub fn restore_with_terrain_collider_mode(
+    recovery: &Recovery,
+    cfg: &PersistConfig,
+    choice: RecoveryChoice,
+    materials: MaterialManifest,
+    anchor: AnchorPlane,
+    physics: PhysicsConfig,
+    terrain_collider_mode: spall_sim::world::TerrainColliderMode,
+) -> Result<(Simulation, u64), PersistError> {
     let cp = &recovery.checkpoint;
 
     // Fail closed on a reported-corrupt recovery before anything is rebuilt.
@@ -351,7 +454,14 @@ pub fn restore(
     validate_world_meta(&cp.meta, cfg)?;
 
     let runtime_hash = content_manifest_hash(&materials).0;
-    if runtime_hash != cp.meta.material_manifest_hash {
+    // A world saved under a manifest this one supersedes by appearance alone
+    // (`MaterialManifest::superseding_appearance`) restores normally; its next
+    // checkpoint records this manifest's hash.
+    let saved_under_predecessor = materials
+        .appearance_predecessors()
+        .iter()
+        .any(|previous| content_manifest_hash(previous).0 == cp.meta.material_manifest_hash);
+    if runtime_hash != cp.meta.material_manifest_hash && !saved_under_predecessor {
         return Err(PersistError::ManifestMismatch {
             checkpoint: hex32(&cp.meta.material_manifest_hash),
             runtime: hex32(&runtime_hash),
@@ -372,13 +482,16 @@ pub fn restore(
         &cp.bricks,
     )?;
 
-    let mut world = SimWorld::new(WorldSetup {
-        terrain: terrain_vol,
-        terrain_collider_region: region_from(terrain_sb.collider_region),
-        materials,
-        anchor,
-        physics,
-    })?;
+    let mut world = SimWorld::new_with_terrain_collider_mode(
+        WorldSetup {
+            terrain: terrain_vol,
+            terrain_collider_region: region_from(terrain_sb.collider_region),
+            materials,
+            anchor,
+            physics,
+        },
+        terrain_collider_mode,
+    )?;
 
     for sb in cp
         .bodies
@@ -544,10 +657,19 @@ pub fn replay_from_base_builtin(
     db_path: &std::path::Path,
     cfg: &PersistConfig,
 ) -> Result<(Simulation, u64), PersistError> {
+    replay_from_base_with_manifest(db_path, cfg, spall_sim::fixtures::stone_manifest())
+}
+
+/// Replays a save against the selected game's validated content manifest.
+pub fn replay_from_base_with_manifest(
+    db_path: &std::path::Path,
+    cfg: &PersistConfig,
+    materials: MaterialManifest,
+) -> Result<(Simulation, u64), PersistError> {
     replay_from_base(
         db_path,
         cfg,
-        spall_sim::fixtures::stone_manifest(),
+        materials,
         AnchorPlane::at(0),
         PhysicsConfig::default(),
     )

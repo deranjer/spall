@@ -40,8 +40,12 @@ pub struct SessionArgs {
     /// Override the server tick budget from the scenario.
     #[arg(long)]
     server_ticks: Option<u64>,
-    /// Whole-run deadline in milliseconds.
-    #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(2_000..=600_000))]
+    /// Whole-run deadline in milliseconds. The upper bound covers the T23 /
+    /// G3 row 13 sustained-soak scenarios (`sustained_edits`), the longest of
+    /// which (`t23-g4-soak-30min`) needs a 30 s warmup + 30 measured minutes +
+    /// a settle buffer — comfortably under an hour but well past a "normal"
+    /// scenario's few minutes.
+    #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(2_000..=3_600_000))]
     timeout_ms: u64,
     /// Output directory. A unique `.local/runs` directory is created if omitted.
     #[arg(long)]
@@ -62,7 +66,9 @@ pub struct ScenarioArgs {
     seed: u64,
     #[arg(long)]
     server_ticks: Option<u64>,
-    #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(2_000..=600_000))]
+    /// Whole-run deadline in milliseconds — see `SessionArgs::timeout_ms` for
+    /// why the upper bound is an hour, not the usual few minutes.
+    #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(2_000..=3_600_000))]
     timeout_ms: u64,
     #[arg(long)]
     output: Option<PathBuf>,
@@ -141,6 +147,10 @@ struct Scenario {
     /// Build and run optimized binaries for CPU-heavy performance gates.
     #[serde(default)]
     release_profile: bool,
+    /// Compare against the legacy whole-terrain collider. Normal runs use
+    /// per-brick terrain colliders even when residency is disabled.
+    #[serde(default)]
+    whole_terrain_collider: bool,
     server_ticks: u64,
     /// Consecutive idle ticks before the server stops early. A gate fixture with
     /// widely-spaced scripted cuts under an impaired transport needs a larger
@@ -210,6 +220,26 @@ struct Scenario {
     /// when `residency_budget_bricks` is set. Defaults to the server's default.
     #[serde(default)]
     residency_radius_bricks: Option<i64>,
+    /// ENG-30 row 7 increment 13: hard ceiling on resident terrain dense
+    /// bytes (`--residency-budget-dense-bytes`), enforced the same way as
+    /// `residency_budget_bricks` — an interest-driven, non-pinned reload is
+    /// deferred rather than admitted past it. Only meaningful when
+    /// `residency_budget_bricks` is set; absent (the default) leaves the cap
+    /// disabled, preserving every existing scenario's exact prior behavior.
+    #[serde(default)]
+    residency_budget_dense_bytes: Option<u64>,
+    /// T23 / G3 row 7 item 2 (increment 31): back the server's residency pass
+    /// with a real on-disk `DiskBrickBacking` (`--residency-disk-backing`)
+    /// instead of the in-process `MemoryBacking` default. Only meaningful
+    /// when `residency_budget_bricks` is set; ignored otherwise. `false`
+    /// (absent, the default) preserves every existing scenario's exact prior
+    /// behavior. When set alongside `restart_check`, the cold-restarted
+    /// server is also launched with matching residency + disk-backing flags
+    /// (pointed at the same `<world>/residency.db`), proving a restart reads
+    /// the durable backing back correctly -- other scenarios' restart runs
+    /// are unaffected since this only activates when the flag is set.
+    #[serde(default)]
+    residency_disk_backing: bool,
     /// T23 / G3 row 7, slice E2: run each **movement-scripted** client with
     /// `--residency-budget-bricks` — the replica evicts terrain outside a brick
     /// box around its predicted player and pulls it back with repair requests
@@ -221,10 +251,31 @@ struct Scenario {
     /// `client_residency_budget_bricks` is set. Defaults to the client's default.
     #[serde(default)]
     client_residency_radius_bricks: Option<i64>,
+    /// ENG-30 row 7 increment 14: hard ceiling on resident terrain dense bytes
+    /// for a movement-scripted client (`--residency-budget-dense-bytes`),
+    /// enforced the same way as `client_residency_budget_bricks` — an
+    /// interest-driven (box-driven) reload back into the tracked box is
+    /// deferred rather than admitted past it. Only meaningful when
+    /// `client_residency_budget_bricks` is set; absent (the default) leaves
+    /// the cap disabled, preserving every existing scenario's exact prior
+    /// behavior.
+    #[serde(default)]
+    client_residency_budget_dense_bytes: Option<u64>,
     /// Enforced end-to-end proof that residency actually ran during this
     /// scenario. A configured block makes zero/default counters a failure.
     #[serde(default)]
     residency_assertions: Option<ResidencyAssertions>,
+    /// T23 / G3 row 14: run the server with `--motion-interest` — per-client
+    /// interest relevance + motion bandwidth budget (T20). `None` keeps the
+    /// pre-T20 unfiltered broadcast.
+    #[serde(default)]
+    motion_interest: Option<MotionInterestSpec>,
+    /// T23 / G3 row 13: a programmatically generated, sustained edit +
+    /// blast stream — too long to hand-author as individual `cuts` entries
+    /// (a 30-minute soak at the gate's rates is 18,000 small edits + 180
+    /// blasts). See `generate_sustained_cuts`.
+    #[serde(default)]
+    sustained_edits: Option<SustainedEdits>,
     /// Minimum straight-line distance (metres) some replicated body must have
     /// travelled on every live client — proof the detached geometry actually
     /// moved, not merely that a (possibly stationary) snapshot arrived.
@@ -260,6 +311,11 @@ struct Scenario {
     /// exercise (0 samples) is not asserted.
     #[serde(default)]
     latency_targets: Option<LatencyTargets>,
+    /// T23 / G4: opt-in bounded owning-server timing window. Warmup ticks are
+    /// excluded; all requested measured ticks must complete and retain samples
+    /// before any configured target can pass.
+    #[serde(default)]
+    server_timing: Option<ServerTiming>,
     /// T21 / ENG-28 increment 4 (3c): run the server with `--dormancy` — a
     /// settled body with nothing active nearby deactivates, and a dormant body
     /// a player or edit approaches reactivates. Never combine with
@@ -267,6 +323,11 @@ struct Scenario {
     /// world that reads from.
     #[serde(default)]
     dormancy: bool,
+    /// Optional settle-window override for an explicit dormancy evaluation.
+    /// Requires `dormancy: true`; absent preserves the server's 120-tick
+    /// default and keeps existing fixtures byte-for-byte equivalent.
+    #[serde(default)]
+    dormancy_settle_ticks: Option<u64>,
     /// T21 / ENG-28 increment 4: require the server's end-of-run report to
     /// show at least this many dormancy deactivations / reactivations —
     /// real end-to-end proof the pass ran, not just that `dormancy` was set.
@@ -280,6 +341,51 @@ struct Scenario {
     /// the edit history is not itself bandwidth-limited.
     #[serde(default)]
     join_budget: Option<JoinBudget>,
+    /// T23 / G3 row 10 follow-up: unlike `late_join_may_fail`'s existing
+    /// delayed-connect fixture (proves explicit-failure handling for a client
+    /// that never gets a baseline at all), this exercises **retry/catch-up
+    /// exhaustion while connected clients stay active** — the named
+    /// `late_join_clients` entry connects and starts joining normally, but a
+    /// severely shaped proxy plus a tiny server-side `catch_up_cap` /
+    /// `max_join_retries` make its catch-up queue overflow every recapture
+    /// until its retry budget is spent, ending in the same bounded
+    /// `join-failed` (exit 4) `late_join_may_fail` already accepts — while
+    /// `sustained_edits` keeps the other, live clients continuously
+    /// committing (the "connected clients keep running" half this exercises).
+    #[serde(default)]
+    retry_exhaustion: Option<RetryExhaustion>,
+}
+
+/// See `Scenario::retry_exhaustion`.
+#[derive(Debug, Clone, Deserialize)]
+struct RetryExhaustion {
+    /// Which `late_join_clients` entry gets the shaped proxy + is expected to
+    /// exhaust its retries.
+    #[serde(default)]
+    client: u64,
+    #[serde(default = "default_retry_exhaustion_catch_up_cap")]
+    catch_up_cap: usize,
+    #[serde(default = "default_retry_exhaustion_max_retries")]
+    max_join_retries: u32,
+    #[serde(default = "default_retry_exhaustion_bandwidth")]
+    bandwidth_bytes_per_sec: u64,
+    #[serde(default = "default_retry_exhaustion_rtt_ms")]
+    rtt_ms: u64,
+    #[serde(default = "default_join_budget_seed")]
+    seed: u64,
+}
+
+fn default_retry_exhaustion_catch_up_cap() -> usize {
+    1
+}
+fn default_retry_exhaustion_max_retries() -> u32 {
+    2
+}
+fn default_retry_exhaustion_bandwidth() -> u64 {
+    256
+}
+fn default_retry_exhaustion_rtt_ms() -> u64 {
+    50
 }
 
 /// T23 / G3 row 11 join-budget network profile + acceptance budget. Defaults
@@ -341,6 +447,43 @@ struct LatencyTargets {
     large_collapse_p95_ms: f64,
 }
 
+/// G4 owning-server timing assertions. Defaults are the validation contract:
+/// tick p95 <= 12 ms, p99 <= 16.7 ms, physics p95 <= 6 ms, and peak process
+/// memory <= 8 GiB. A scenario opts in by supplying the bounded window.
+#[derive(Debug, Clone, Deserialize)]
+struct ServerTiming {
+    #[serde(default)]
+    warmup_ticks: u64,
+    #[serde(default)]
+    measured_ticks: u64,
+    #[serde(default)]
+    max_samples: usize,
+    #[serde(default = "default_tick_p95_ms")]
+    tick_p95_ms: f64,
+    #[serde(default = "default_tick_p99_ms")]
+    tick_p99_ms: f64,
+    #[serde(default = "default_physics_p95_ms")]
+    physics_p95_ms: f64,
+    #[serde(default = "default_server_peak_memory_bytes")]
+    server_peak_memory_bytes: u64,
+}
+
+fn default_tick_p95_ms() -> f64 {
+    12.0
+}
+
+fn default_tick_p99_ms() -> f64 {
+    16.7
+}
+
+fn default_physics_p95_ms() -> f64 {
+    6.0
+}
+
+fn default_server_peak_memory_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
 fn default_single_brick_ms() -> f64 {
     100.0
 }
@@ -372,6 +515,26 @@ fn latency_targets_met(scenario: &Scenario, server: &ServerSummary) -> bool {
         server.large_collapse_p95_ms,
         t.large_collapse_p95_ms,
     )
+}
+
+/// T23 / G4: timing is fail-closed. A configured window that did not finish,
+/// retained no samples, or lacks the real process memory reading cannot pass.
+fn server_timing_requirements_met(scenario: &Scenario, server: &ServerSummary) -> bool {
+    let Some(t) = &scenario.server_timing else {
+        return true;
+    };
+    t.measured_ticks > 0
+        && t.max_samples >= t.measured_ticks as usize
+        && server.tick_busy_window_complete
+        && server.physics_window_complete
+        && server.tick_busy_samples >= t.measured_ticks
+        && server.physics_samples >= t.measured_ticks
+        && server.tick_busy_p95_ms <= t.tick_p95_ms
+        && server.tick_busy_p99_ms <= t.tick_p99_ms
+        && server.physics_p95_ms <= t.physics_p95_ms
+        && server
+            .process_peak_memory_bytes
+            .is_some_and(|bytes| bytes <= t.server_peak_memory_bytes)
 }
 
 fn one() -> u64 {
@@ -452,6 +615,172 @@ struct MovementAcceptance {
     expect_no_hover: bool,
 }
 
+/// T23 / G3 row 14: mirrors `sandbox-server`'s `--motion-interest` flag group.
+#[derive(Debug, Clone, Deserialize)]
+struct MotionInterestSpec {
+    #[serde(default = "default_motion_near_m")]
+    near_m: f64,
+    #[serde(default = "default_motion_far_m")]
+    far_m: f64,
+    #[serde(default = "default_motion_far_interval")]
+    far_interval: u64,
+    #[serde(default)]
+    client_budget_bytes: usize,
+    /// `x,y,z` metres for a scene with no player spawns. Omitted → those
+    /// clients stay unfiltered (matches the CLI default).
+    #[serde(default)]
+    static_anchor: Option<[f64; 3]>,
+}
+
+fn default_motion_near_m() -> f64 {
+    48.0
+}
+fn default_motion_far_m() -> f64 {
+    96.0
+}
+fn default_motion_far_interval() -> u64 {
+    4
+}
+
+/// T23 / G3 row 13: `docs/validation.md`'s G4 sustained-load gate ("Run for
+/// two measured minutes after 30 seconds warmup; also run a 30-minute
+/// reduced-telemetry soak... Drive 10 ordinary edits/s total and one 4 m
+/// diameter blast every 10 seconds"). Generates that stream programmatically
+/// against the `g4-workload` scene's already-proven-safe target cells (the
+/// same rows/points `t23-g4-workload.json`'s hand-authored `cuts` already
+/// exercise), round-robined across every connected client, from `start_tick`
+/// through `server_ticks` (minus a trailing buffer so the last few edits have
+/// time to commit before quiescence). Cycling back through a short cell list
+/// once it's exhausted is intentional and cheap (see `generate_sustained_cuts`)
+/// — this is a throughput/latency soak, not a claim of ever-fresh geometry.
+#[derive(Debug, Clone, Deserialize)]
+struct SustainedEdits {
+    start_tick: u64,
+    #[serde(default = "default_small_rate")]
+    small_rate_per_sec: f64,
+    #[serde(default = "default_blast_interval")]
+    blast_interval_sec: f64,
+    #[serde(default = "default_trailing_buffer")]
+    trailing_buffer_ticks: u64,
+}
+
+fn default_small_rate() -> f64 {
+    10.0
+}
+fn default_blast_interval() -> f64 {
+    10.0
+}
+fn default_trailing_buffer() -> u64 {
+    120
+}
+
+/// One generated `--cuts-file` entry, in the JSON shape `sandbox-client`'s
+/// `--cuts-file` reads (`tick`/`cell`/`radius`/`target`, `target` optional).
+#[derive(Debug, Serialize)]
+struct GeneratedCut {
+    tick: u64,
+    cell: [i64; 3],
+    radius: i64,
+}
+
+/// West/east floor rows already proven safe by `t23-g4-workload.json`'s
+/// hand-authored small cuts (`y = 1`) and blasts (`y = 12`, `z = 12` /
+/// `z = 73`) — see `docs/reports/G3.md` increment 18 for why those exact
+/// coordinates stay inside the declared volume bounds. Reused verbatim here
+/// rather than re-derived, so this generator carries no new bounds-safety
+/// risk.
+const WEST_SMALL_Z: i64 = 6;
+const EAST_SMALL_Z: i64 = 78;
+const EAST_X_OFFSET: i64 = 72;
+const SMALL_Y: i64 = 1;
+const SMALL_X_MIN: i64 = 1;
+const SMALL_X_MAX: i64 = 22;
+const BLAST_WEST: [i64; 3] = [20, 12, 12];
+const BLAST_EAST: [i64; 3] = [20 + EAST_X_OFFSET, 12, 73];
+
+/// The tick window available for the generated stream, its small-edit step
+/// (ticks), and the resulting `(n_small, n_blasts)` counts — shared between
+/// `generate_sustained_cuts` (which builds the lists) and `requirements_met`
+/// (which needs the same expected total without re-deriving it, so the two
+/// can never silently disagree).
+fn sustained_counts(s: &SustainedEdits, server_ticks: u64) -> (u64, u64, f64) {
+    let end_tick = server_ticks.saturating_sub(s.trailing_buffer_ticks);
+    let start = s.start_tick.min(end_tick);
+    let available = end_tick.saturating_sub(start);
+    let small_step = (60.0 / s.small_rate_per_sec.max(0.01)).max(1.0);
+    let blast_step = (s.blast_interval_sec * 60.0).max(1.0);
+    let n_small = (available as f64 / small_step).floor() as u64;
+    let n_blasts = (available as f64 / blast_step).floor() as u64;
+    (n_small, n_blasts, small_step)
+}
+
+/// Builds the sustained small-edit + blast stream `SustainedEdits`
+/// describes, round-robined across `clients` and grouped by client index
+/// (same shape `by_client` already uses for hand-authored `cuts`).
+fn generate_sustained_cuts(
+    s: &SustainedEdits,
+    server_ticks: u64,
+    clients: u64,
+) -> BTreeMap<u64, Vec<GeneratedCut>> {
+    let mut by_client: BTreeMap<u64, Vec<GeneratedCut>> = BTreeMap::new();
+    if clients == 0 {
+        return by_client;
+    }
+    let end_tick = server_ticks.saturating_sub(s.trailing_buffer_ticks);
+    let start = s.start_tick.min(end_tick);
+    let (n_small, n_blasts, small_step) = sustained_counts(s, server_ticks);
+
+    // Small edits: one every `60 / small_rate_per_sec` ticks, alternating
+    // west/east, cycling x across a `SMALL_X_MIN..=SMALL_X_MAX` row at the
+    // proven-safe y/z for that region.
+    let small_span = (SMALL_X_MAX - SMALL_X_MIN + 1).max(1);
+    for i in 0..n_small {
+        let tick = start + (i as f64 * small_step) as u64;
+        let west = i % 2 == 0;
+        let x = SMALL_X_MIN + (i as i64 / 2) % small_span;
+        let cell = if west {
+            [x, SMALL_Y, WEST_SMALL_Z]
+        } else {
+            [x + EAST_X_OFFSET, SMALL_Y, EAST_SMALL_Z]
+        };
+        let client = i % clients;
+        by_client.entry(client).or_default().push(GeneratedCut {
+            tick,
+            cell,
+            radius: 1,
+        });
+    }
+
+    // Blasts: one every `blast_interval_sec`, alternating west/east at the
+    // fixed proven-safe blast points. West is always sent by client 0, east
+    // always by the start of the east cluster (`clients / 2`, matching the
+    // g4-workload west/east client split) — deterministic and easy to audit,
+    // not a throughput concern (there are far fewer blasts than small edits).
+    let blast_step = (s.blast_interval_sec * 60.0).max(1.0);
+    let west_client = 0u64;
+    let east_client = (clients / 2).min(clients - 1);
+    for i in 0..n_blasts {
+        // Offset half a small-edit step so a blast never lands on the exact
+        // same tick as a small edit from the same client.
+        let tick = start + (i as f64 * blast_step + small_step / 2.0) as u64;
+        let (cell, client) = if i % 2 == 0 {
+            (BLAST_WEST, west_client)
+        } else {
+            (BLAST_EAST, east_client)
+        };
+        by_client.entry(client).or_default().push(GeneratedCut {
+            tick,
+            cell,
+            radius: 8,
+        });
+    }
+
+    for cuts in by_client.values_mut() {
+        cuts.sort_by_key(|c| c.tick);
+    }
+    by_client
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ResidencyAssertions {
     #[serde(default)]
@@ -470,6 +799,38 @@ struct ResidencyAssertions {
     min_outbound_distance_m: f64,
     #[serde(default)]
     max_return_distance_m: Option<f64>,
+    /// ENG-30 row 7 increment 13: the server must have pinned at least this
+    /// many bricks in its busiest tick (pending-edit dependencies, swept
+    /// paths, or pipeline reload grace) — real evidence the pin lifecycle
+    /// engaged, not only that eviction/reload happened.
+    #[serde(default)]
+    min_pinned_bricks: u64,
+    /// ENG-30 row 7 increment 13: the server must have deferred at least this
+    /// many interest-driven (non-required) reloads under capacity pressure —
+    /// real evidence the brick/dense-byte admission cap actually bound,
+    /// rather than only being reported.
+    #[serde(default)]
+    min_admission_deferred: u64,
+    /// ENG-30 row 7 increment 13: when set, the *required* (interest ∪
+    /// pinned) set must never have exceeded `budget_bricks` on its own — a
+    /// genuine capacity failure the pass could not resolve without evicting
+    /// needed geometry. `false` (the default, matching every other floor
+    /// here) does not require this: a small `residency_budget_bricks`
+    /// deliberately paired with a comfortable `residency_radius_bricks` (or
+    /// several players' union interest) legitimately exceeds the soft budget
+    /// routinely, and that is not itself a defect -- the pass still never
+    /// evicts required geometry to force a fit. Set `true` only on a
+    /// scenario whose budget is meant to always cover its own interest.
+    #[serde(default)]
+    forbid_required_over_budget: bool,
+    /// ENG-30 row 7 increment 14: the configured client must have deferred at
+    /// least this many desired (box-driven) reload requests under capacity
+    /// pressure — real evidence the client-side brick/dense-byte admission cap
+    /// actually bound, rather than only being reported. `0` (the default)
+    /// does not require this — most scenarios pair a comfortable client
+    /// residency budget with the box, and never trip it.
+    #[serde(default)]
+    min_client_admission_deferred: u64,
 }
 
 /// T21 / ENG-28 increment 4 (3c): minimum dormancy pass activity the server's
@@ -552,10 +913,75 @@ struct ServerSummary {
     residency_evictions_total: u64,
     #[serde(default)]
     residency_reloads_total: u64,
+    // T23 / G3 row 7 item 2 (increment 31): `ServeSummary` v6's durable-backing
+    // byte count -- `Some(n)` once a disk-backed run has captured at least one
+    // brick, `None` for in-process `MemoryBacking` or when residency is off.
+    #[serde(default)]
+    residency_backing_disk_bytes: Option<u64>,
+    // T23 / G3 row 14.
+    #[serde(default)]
+    app_egress_bytes: u64,
+    #[serde(default)]
+    transport_egress_bytes: u64,
+    #[serde(default)]
+    per_client_egress: Vec<PerClientEgressRow>,
     #[serde(default)]
     dormancy_deactivations_total: u64,
     #[serde(default)]
     dormancy_reactivations_total: u64,
+    // ENG-30 row 7 increment 13 (`ServeSummary` v7): pin lifetime + admission
+    // enforcement + expanded retained-memory evidence.
+    #[serde(default)]
+    residency_pinned_bricks_max: u64,
+    #[serde(default)]
+    residency_admission_deferred_total: u64,
+    #[serde(default)]
+    residency_required_over_budget_ticks: u64,
+    #[serde(default)]
+    residency_digest_bytes_final: u64,
+    #[serde(default)]
+    residency_backing_resident_bytes: Option<u64>,
+    #[serde(default)]
+    process_peak_memory_bytes: Option<u64>,
+    // ENG-30 row 7 increment 15 (`ServeSummary` v8): incremental checkpoint
+    // capture evidence -- cumulative terrain bricks actually re-captured vs.
+    // each checkpoint's complete logical set, summed across every periodic +
+    // shutdown checkpoint this run.
+    #[serde(default)]
+    residency_checkpoint_bricks_captured_total: u64,
+    #[serde(default)]
+    residency_checkpoint_bricks_logical_total: u64,
+    // T23 / G4 bounded owning-server timing telemetry (ServeSummary v9).
+    #[serde(default)]
+    tick_busy_p95_ms: f64,
+    #[serde(default)]
+    tick_busy_p99_ms: f64,
+    #[serde(default)]
+    tick_busy_max_ms: f64,
+    #[serde(default)]
+    tick_busy_samples: u64,
+    #[serde(default)]
+    tick_busy_window_complete: bool,
+    #[serde(default)]
+    physics_p95_ms: f64,
+    #[serde(default)]
+    physics_p99_ms: f64,
+    #[serde(default)]
+    physics_max_ms: f64,
+    #[serde(default)]
+    physics_samples: u64,
+    #[serde(default)]
+    physics_window_complete: bool,
+}
+
+/// Mirrors `spall_server::PerClientEgress`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PerClientEgressRow {
+    slot: u32,
+    #[serde(default)]
+    spawn_m: Option<[f64; 3]>,
+    app_bytes: u64,
+    transport_bytes: u64,
 }
 
 /// ENG-61: whether the server's end-of-run report shows every detached body at
@@ -602,6 +1028,9 @@ struct ClientSummary {
     client_residency_reloads_completed: u64,
     #[serde(default)]
     client_residency_budget_miss_steps: u64,
+    /// ENG-30 row 7 increment 14 (`ClientSummary` v4).
+    #[serde(default)]
+    client_residency_admission_deferred_total: u64,
     #[serde(default)]
     client_residency_evicted_transaction_gaps: u64,
     #[serde(default)]
@@ -668,6 +1097,34 @@ struct SessionSummary {
     restart_recovered_hash_matches: bool,
     restart_reconnect_hash_matches: bool,
     restart_recovered_world_hash: String,
+    /// T23 / G3 row 7 item 2 (increment 31): the server's reported durable
+    /// residency-backing byte count for this run -- `Some(n)` once a
+    /// `residency_disk_backing` run has captured at least one brick to disk,
+    /// `None` for an in-process-backed or residency-off run. Always surfaced
+    /// (not only on pass) so a scenario's `summary.json` shows the measured
+    /// value directly.
+    residency_backing_disk_bytes: Option<u64>,
+    /// ENG-30 row 7 increment 13: real pin-lifetime + admission-enforcement
+    /// evidence, always surfaced (not only on pass) so a scenario's
+    /// `summary.json` shows the measured values directly, matching
+    /// `residency_backing_disk_bytes`'s convention. All `0`/`None` when
+    /// residency is off.
+    residency_pinned_bricks_max: u64,
+    residency_admission_deferred_total: u64,
+    residency_required_over_budget_ticks: u64,
+    residency_digest_bytes_final: u64,
+    residency_backing_resident_bytes: Option<u64>,
+    /// This process's peak resident/working-set memory in bytes, independent
+    /// of residency being on -- `None` on an unsupported platform.
+    process_peak_memory_bytes: Option<u64>,
+    /// ENG-30 row 7 increment 15: incremental checkpoint capture evidence,
+    /// always surfaced (not only on pass) matching every other residency
+    /// counter's convention. `captured_total < logical_total` (once more than
+    /// one checkpoint has run against unchanged state) is the direct evidence
+    /// that checkpoint capture is incremental, not a full walk with a cache
+    /// wrapped around it. Both `0` when residency is off.
+    residency_checkpoint_bricks_captured_total: u64,
+    residency_checkpoint_bricks_logical_total: u64,
     /// T23 / G3 row 10: `late_join_may_fail` was set and an impaired late joiner
     /// ended in an accepted bounded explicit failure (`join-failed`, real exit)
     /// while the live clients + server still converged.
@@ -678,12 +1135,22 @@ struct SessionSummary {
     /// T11a / ENG-62: the gate's requested / rejected / queued / committed
     /// breakdown (server-authoritative) and the measured commit-latency p95s.
     admission: AdmissionRow,
+    /// T23 / G4 bounded owning-server timing evidence and acceptance result.
+    server_timing: ServerTimingRow,
     /// T23 / G3 row 11: the configured join-budget network profile / ceilings
     /// alongside the measured compressed baseline size and time-to-ready.
     /// `configured: false` (all other fields zeroed) when no `join_budget`
     /// scenario block is set.
     join_budget: JoinBudgetRow,
     per_client: Vec<ClientRow>,
+    /// T23 / G3 row 14: total application/transport egress this run, and the
+    /// per-connection breakdown (bytes alongside each connection's player
+    /// spawn) proving `motion_interest` separates bandwidth *between*
+    /// clients, not just that the total stays bounded. Empty when
+    /// `motion_interest` was not configured for this scenario.
+    app_egress_bytes: u64,
+    transport_egress_bytes: u64,
+    per_client_egress: Vec<PerClientEgressRow>,
     note: &'static str,
 }
 
@@ -705,6 +1172,49 @@ struct AdmissionRow {
     large_collapse_samples: u64,
     latency_targets_configured: bool,
     latency_targets_met: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerTimingRow {
+    configured: bool,
+    warmup_ticks: u64,
+    measured_ticks: u64,
+    max_samples: usize,
+    tick_busy_p95_ms: f64,
+    tick_busy_p99_ms: f64,
+    tick_busy_max_ms: f64,
+    tick_busy_samples: u64,
+    tick_busy_window_complete: bool,
+    physics_p95_ms: f64,
+    physics_p99_ms: f64,
+    physics_max_ms: f64,
+    physics_samples: u64,
+    physics_window_complete: bool,
+    process_peak_memory_bytes: Option<u64>,
+    requirements_met: bool,
+}
+
+impl ServerTimingRow {
+    fn unconfigured() -> Self {
+        Self {
+            configured: false,
+            warmup_ticks: 0,
+            measured_ticks: 0,
+            max_samples: 0,
+            tick_busy_p95_ms: 0.0,
+            tick_busy_p99_ms: 0.0,
+            tick_busy_max_ms: 0.0,
+            tick_busy_samples: 0,
+            tick_busy_window_complete: false,
+            physics_p95_ms: 0.0,
+            physics_p99_ms: 0.0,
+            physics_max_ms: 0.0,
+            physics_samples: 0,
+            physics_window_complete: false,
+            process_peak_memory_bytes: None,
+            requirements_met: true,
+        }
+    }
 }
 
 impl AdmissionRow {
@@ -743,6 +1253,7 @@ struct ClientRow {
     client_residency_reloads_requested: u64,
     client_residency_reloads_completed: u64,
     client_residency_budget_miss_steps: u64,
+    client_residency_admission_deferred_total: u64,
     client_residency_evicted_transaction_gaps: u64,
     hash_matches_server: bool,
     late_join_baseline_compressed_bytes: u64,
@@ -860,6 +1371,12 @@ fn residency_requirements_met(
         && client.client_residency_reloads_completed >= required.min_client_reloads_completed
         && client.client_residency_evicted_transaction_gaps >= required.min_evicted_transaction_gaps
         && movement_ok
+        && server.residency_pinned_bricks_max >= required.min_pinned_bricks
+        && server.residency_admission_deferred_total >= required.min_admission_deferred
+        && (!required.forbid_required_over_budget
+            || server.residency_required_over_budget_ticks == 0)
+        && client.client_residency_admission_deferred_total
+            >= required.min_client_admission_deferred
 }
 
 /// T21 / ENG-28 increment 4 (3c): when the scenario configured
@@ -873,8 +1390,22 @@ fn dormancy_requirements_met(scenario: &Scenario, server: &ServerSummary) -> boo
         && server.dormancy_reactivations_total >= required.min_reactivations
 }
 
+/// T23 / G3 row 7 item 2 (increment 31): when the scenario turned on
+/// `residency_disk_backing`, require the server to have actually reported a
+/// nonzero durable-backing byte count (`ServeSummary.residency_backing_disk_bytes
+/// == Some(n > 0)`) -- proving the disk-backed path was exercised end to end,
+/// not just accepted as a CLI flag. `true` when the scenario did not request
+/// disk backing.
+fn residency_disk_backing_requirements_met(scenario: &Scenario, server: &ServerSummary) -> bool {
+    if !scenario.residency_disk_backing {
+        return true;
+    }
+    server.residency_backing_disk_bytes.is_some_and(|n| n > 0)
+}
+
 fn requirements_met(
     scenario: &Scenario,
+    server_ticks: u64,
     transactions_committed: u64,
     clients: &[Option<ClientSummary>],
     proxy_active: bool,
@@ -882,8 +1413,21 @@ fn requirements_met(
     // The whole script must have run: a fixture that quiesces early (a gap
     // between scripted cuts longer than the server's idle window) commits fewer
     // transactions than it has cuts, and that is a failure no matter how the
-    // `minimum_transactions` floor is set.
-    let all_cuts_committed = transactions_committed >= scenario.cuts.len() as u64;
+    // `minimum_transactions` floor is set. `sustained_edits` (row 13) adds a
+    // programmatically generated count on top of any hand-authored `cuts` —
+    // computed with the exact same formula `generate_sustained_cuts` used to
+    // build the stream, so this can never silently drift from what was
+    // actually sent.
+    let expected_sustained: u64 = scenario
+        .sustained_edits
+        .as_ref()
+        .map(|s| {
+            let (n_small, n_blasts, _) = sustained_counts(s, server_ticks);
+            n_small + n_blasts
+        })
+        .unwrap_or(0);
+    let all_cuts_committed =
+        transactions_committed >= scenario.cuts.len() as u64 + expected_sustained;
 
     let work_ok = transactions_committed >= scenario.minimum_transactions && all_cuts_committed;
 
@@ -945,6 +1489,7 @@ mod requirement_tests {
             client_residency_reloads_requested: 0,
             client_residency_reloads_completed: 0,
             client_residency_budget_miss_steps: 0,
+            client_residency_admission_deferred_total: 0,
             client_residency_evicted_transaction_gaps: 0,
             late_join_baseline_compressed_bytes: 0,
             late_join_baseline_install_ms: 0,
@@ -987,6 +1532,57 @@ mod requirement_tests {
             &scenario,
             &ServerSummary::default()
         ));
+    }
+
+    #[test]
+    fn dormancy_settle_override_is_optional_and_preserves_default_path() {
+        let default_scenario: Scenario =
+            serde_json::from_str(r#"{ "server_ticks": 10, "dormancy": true }"#).unwrap();
+        assert!(default_scenario.dormancy);
+        assert_eq!(default_scenario.dormancy_settle_ticks, None);
+
+        let tuned_scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 112,
+                "dormancy": true,
+                "dormancy_settle_ticks": 20
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(tuned_scenario.dormancy_settle_ticks, Some(20));
+    }
+
+    #[test]
+    fn server_timing_requirements_fail_closed_until_the_full_window_is_measured() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "server_timing": {
+                    "warmup_ticks": 2,
+                    "measured_ticks": 4,
+                    "max_samples": 4
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut server = ServerSummary::default();
+        assert!(!server_timing_requirements_met(&scenario, &server));
+
+        server.tick_busy_window_complete = true;
+        server.physics_window_complete = true;
+        server.tick_busy_samples = 4;
+        server.physics_samples = 4;
+        server.tick_busy_p95_ms = 12.0;
+        server.tick_busy_p99_ms = 16.7;
+        server.physics_p95_ms = 6.0;
+        server.process_peak_memory_bytes = Some(8 * 1024 * 1024 * 1024);
+        assert!(server_timing_requirements_met(&scenario, &server));
+
+        server.tick_busy_p99_ms = 16.71;
+        assert!(!server_timing_requirements_met(&scenario, &server));
+        server.tick_busy_p99_ms = 16.7;
+        server.process_peak_memory_bytes = None;
+        assert!(!server_timing_requirements_met(&scenario, &server));
     }
 
     #[test]
@@ -1041,6 +1637,104 @@ mod requirement_tests {
         ));
     }
 
+    /// ENG-30 row 7 increment 13: `min_pinned_bricks` / `min_admission_deferred`
+    /// demand real pin-lifetime and admission-enforcement evidence, not only
+    /// eviction/reload counts; an opted-in `forbid_required_over_budget`
+    /// fails the run if the pass ever reported unresolved capacity pressure
+    /// (off by default -- a small budget deliberately paired with a
+    /// comfortable interest radius routinely exceeds it, harmlessly).
+    #[test]
+    fn residency_assertions_cover_pin_lifetime_and_admission_pressure() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "residency_assertions": {
+                    "client": 0,
+                    "min_pinned_bricks": 3,
+                    "min_admission_deferred": 1,
+                    "forbid_required_over_budget": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut mover = client(1);
+        mover.movement = Some(MovementRow {
+            ticks: 10,
+            distance_travelled_m: 0.0,
+            max_distance_from_start_m: 0.0,
+            max_correction_m: 0.0,
+            ground_contact_ratio: 1.0,
+            hovered_after_floor_removal: false,
+            held_button_release_ok: true,
+        });
+        let mut server = ServerSummary::default();
+        assert!(
+            !residency_requirements_met(&scenario, &server, &[Some(mover.clone())]),
+            "no pinning or deferral yet reported"
+        );
+
+        server.residency_pinned_bricks_max = 3;
+        assert!(
+            !residency_requirements_met(&scenario, &server, &[Some(mover.clone())]),
+            "pinning alone, with no admission pressure, is not enough"
+        );
+
+        server.residency_admission_deferred_total = 1;
+        assert!(residency_requirements_met(
+            &scenario,
+            &server,
+            &[Some(mover.clone())]
+        ));
+
+        // Real, unresolved capacity pressure fails the run even though the
+        // other two floors are cleared -- the pass never evicts required
+        // geometry to force a fit, so this must be visible, not hidden.
+        server.residency_required_over_budget_ticks = 1;
+        assert!(
+            !residency_requirements_met(&scenario, &server, &[Some(mover)]),
+            "forbid_required_over_budget was opted into"
+        );
+    }
+
+    /// ENG-30 row 7 increment 14: `min_client_admission_deferred` requires
+    /// real client-side dense-byte/brick admission-enforcement evidence, not
+    /// only that the client evicted and reloaded terrain.
+    #[test]
+    fn residency_assertions_cover_client_admission_deferral() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+                "server_ticks": 10,
+                "residency_assertions": {
+                    "client": 0,
+                    "min_client_admission_deferred": 1
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut mover = client(1);
+        mover.movement = Some(MovementRow {
+            ticks: 10,
+            distance_travelled_m: 0.0,
+            max_distance_from_start_m: 0.0,
+            max_correction_m: 0.0,
+            ground_contact_ratio: 1.0,
+            hovered_after_floor_removal: false,
+            held_button_release_ok: true,
+        });
+        let server = ServerSummary::default();
+        assert!(
+            !residency_requirements_met(&scenario, &server, &[Some(mover.clone())]),
+            "no admission deferral yet reported"
+        );
+
+        mover.client_residency_admission_deferred_total = 1;
+        assert!(residency_requirements_met(
+            &scenario,
+            &server,
+            &[Some(mover)]
+        ));
+    }
+
     #[test]
     fn gate_requirements_reject_insufficient_work_or_motion() {
         let scenario: Scenario = serde_json::from_str(
@@ -1051,10 +1745,23 @@ mod requirement_tests {
             }"#,
         )
         .unwrap();
-        assert!(!requirements_met(&scenario, 1, &[Some(client(2))], false));
-        assert!(!requirements_met(&scenario, 2, &[Some(client(0))], false));
+        assert!(!requirements_met(
+            &scenario,
+            10,
+            1,
+            &[Some(client(2))],
+            false
+        ));
+        assert!(!requirements_met(
+            &scenario,
+            10,
+            2,
+            &[Some(client(0))],
+            false
+        ));
         assert!(requirements_met(
             &scenario,
+            10,
             2,
             &[Some(client(1)), Some(client(4))],
             false
@@ -1083,6 +1790,7 @@ mod requirement_tests {
         // four scripted cuts: the run quiesced early.
         assert!(!requirements_met(
             &scenario,
+            600,
             3,
             &[Some(client(4)), Some(client(4))],
             false
@@ -1091,6 +1799,7 @@ mod requirement_tests {
         // All four cuts committed and both clients saw real displacement.
         assert!(requirements_met(
             &scenario,
+            600,
             4,
             &[Some(client(4)), Some(client(4))],
             false
@@ -1101,6 +1810,7 @@ mod requirement_tests {
         still.max_body_displacement_m = 0.01;
         assert!(!requirements_met(
             &scenario,
+            600,
             4,
             &[Some(still), Some(client(4))],
             false
@@ -1111,6 +1821,7 @@ mod requirement_tests {
         no_body_cut.body_cut_committed = false;
         assert!(!requirements_met(
             &scenario,
+            600,
             4,
             &[Some(no_body_cut.clone()), Some(no_body_cut)],
             false
@@ -1192,14 +1903,21 @@ mod requirement_tests {
         // Clean loopback run (no proxy): reordering is not required.
         assert!(requirements_met(
             &scenario,
+            600,
             1,
             &[Some(ordered.clone())],
             false
         ));
         // Impaired run: a client that never saw a reordered datagram fails.
-        assert!(!requirements_met(&scenario, 1, &[Some(ordered)], true));
+        assert!(!requirements_met(&scenario, 600, 1, &[Some(ordered)], true));
         // Impaired run with real reordering observed: passes.
-        assert!(requirements_met(&scenario, 1, &[Some(client(4))], true));
+        assert!(requirements_met(
+            &scenario,
+            600,
+            1,
+            &[Some(client(4))],
+            true
+        ));
     }
 
     #[test]
@@ -1328,6 +2046,79 @@ mod requirement_tests {
         assert!(join_budget_requirements_met(&unconfigured, &[]));
         assert!(!join_budget_row(&unconfigured, &[]).configured);
     }
+
+    /// T23 / G3 row 13: `generate_sustained_cuts` produces exactly the count
+    /// `sustained_counts` (and therefore `requirements_met`) expects, every
+    /// generated cell stays within the proven-safe ranges (see
+    /// `docs/reports/G3.md` increment 18 for why `y = 1` / `y = 12, z = 12`
+    /// or `z = 73` stay inside the declared volume bounds), and every
+    /// connected client is actually used.
+    #[test]
+    fn sustained_cuts_match_expected_count_stay_in_safe_ranges_and_cover_every_client() {
+        let s = SustainedEdits {
+            start_tick: 1800,
+            small_rate_per_sec: 10.0,
+            blast_interval_sec: 10.0,
+            trailing_buffer_ticks: 120,
+        };
+        let server_ticks = 1800 + 7200 + 120; // 30 s warmup + 2 measured minutes + buffer
+        let (n_small, n_blasts, _) = sustained_counts(&s, server_ticks);
+        assert_eq!(n_small, 1200, "10 edits/s over 2 measured minutes");
+        assert_eq!(n_blasts, 12, "one blast/10s over 2 measured minutes");
+
+        let by_client = generate_sustained_cuts(&s, server_ticks, 8);
+        let total: usize = by_client.values().map(|v| v.len()).sum();
+        assert_eq!(total as u64, n_small + n_blasts);
+        assert_eq!(
+            by_client.len(),
+            8,
+            "round-robin across 8 clients must actually reach all 8"
+        );
+
+        for cuts in by_client.values() {
+            for c in cuts {
+                assert!(
+                    c.tick >= s.start_tick && c.tick < server_ticks,
+                    "generated tick {} outside [{}, {server_ticks})",
+                    c.tick,
+                    s.start_tick
+                );
+                let [x, y, z] = c.cell;
+                assert!(x >= 0, "cell x must not be negative: {c:?}");
+                if c.radius == 8 {
+                    // Blasts: the two proven-safe fixed points only.
+                    assert!(
+                        c.cell == BLAST_WEST || c.cell == BLAST_EAST,
+                        "blast at an unproven cell: {c:?}"
+                    );
+                } else {
+                    // Small edits: proven-safe y/z rows, x within the safe span.
+                    assert!(y == SMALL_Y, "small edit at unproven y: {c:?}");
+                    assert!(
+                        z == WEST_SMALL_Z || z == EAST_SMALL_Z,
+                        "small edit at unproven z: {c:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The 30-minute soak scales the same formula to 18,000 small edits + 180
+    /// blasts — this is the count `docs/validation.md`'s gate spec requires
+    /// ("10 ordinary edits/s" / "one 4 m blast every 10 seconds" for 30 min).
+    #[test]
+    fn sustained_cuts_scale_to_the_thirty_minute_soak_count() {
+        let s = SustainedEdits {
+            start_tick: 1800,
+            small_rate_per_sec: 10.0,
+            blast_interval_sec: 10.0,
+            trailing_buffer_ticks: 200,
+        };
+        let server_ticks = 1800 + 108_000 + 200; // 30 s warmup + 30 measured minutes + buffer
+        let (n_small, n_blasts, _) = sustained_counts(&s, server_ticks);
+        assert_eq!(n_small, 18_000);
+        assert_eq!(n_blasts, 180);
+    }
 }
 
 // --- the run -----------------------------------------------------------------
@@ -1432,19 +2223,68 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         // produce; the harness is the authenticated dev-scenario path (ENG-47).
         "--dev-unvalidated-actions",
     ]);
+    if let Some(timing) = &scenario.server_timing {
+        server_cmd.args([
+            "--timing-warmup-ticks",
+            &timing.warmup_ticks.to_string(),
+            "--timing-measured-ticks",
+            &timing.measured_ticks.to_string(),
+            "--timing-max-samples",
+            &timing.max_samples.to_string(),
+        ]);
+    }
     if scenario.require_body_settled {
         // ENG-61: run physics past edit-quiescence until the detached body sleeps
         // so the run can actually show it come to rest.
         server_cmd.arg("--await-body-settle");
+    }
+    if scenario.whole_terrain_collider {
+        server_cmd.arg("--whole-terrain-collider");
     }
     if let Some(budget) = scenario.residency_budget_bricks {
         server_cmd.args(["--residency-budget-bricks", &budget.to_string()]);
         if let Some(r) = scenario.residency_radius_bricks {
             server_cmd.args(["--residency-radius-bricks", &r.to_string()]);
         }
+        if let Some(bytes) = scenario.residency_budget_dense_bytes {
+            server_cmd.args(["--residency-budget-dense-bytes", &bytes.to_string()]);
+        }
+        if scenario.residency_disk_backing {
+            server_cmd.arg("--residency-disk-backing");
+        }
+    }
+    if let Some(mi) = &scenario.motion_interest {
+        server_cmd.args([
+            "--motion-interest",
+            "--motion-near-m",
+            &mi.near_m.to_string(),
+            "--motion-far-m",
+            &mi.far_m.to_string(),
+            "--motion-far-interval",
+            &mi.far_interval.to_string(),
+            "--motion-client-budget-bytes",
+            &mi.client_budget_bytes.to_string(),
+        ]);
+        if let Some(a) = mi.static_anchor {
+            server_cmd.args([
+                "--motion-static-anchor",
+                &format!("{},{},{}", a[0], a[1], a[2]),
+            ]);
+        }
+    }
+    if let Some(re) = &scenario.retry_exhaustion {
+        server_cmd.args([
+            "--catch-up-cap",
+            &re.catch_up_cap.to_string(),
+            "--max-join-retries",
+            &re.max_join_retries.to_string(),
+        ]);
     }
     if scenario.dormancy {
         server_cmd.arg("--dormancy");
+    }
+    if let Some(settle_ticks) = scenario.dormancy_settle_ticks {
+        server_cmd.args(["--dormancy-settle-ticks", &settle_ticks.to_string()]);
     }
     // T11 exact-replay check (and the T23 cold-restart check) both journal every
     // committed transaction to a world DB. Replay rebuilds from the tick-0
@@ -1497,6 +2337,23 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             *slot = shaped;
         }
         Some(ProxyFarm::spawn_with_plans(bound, plans)?)
+    } else if let Some(re) = &scenario.retry_exhaustion {
+        // T23 / G3 row 10 follow-up: the same "shape only the named client"
+        // pattern as `join_budget` above, but tuned to make that one client's
+        // catch-up queue overflow (severely bandwidth-limited, so a re-capture
+        // can never land before `sustained_edits`'s next commit overflows the
+        // tiny `catch_up_cap` again) rather than to measure a join budget.
+        let mut plans: Vec<PacketFaultPlan> = (0..clients)
+            .map(|i| PacketFaultPlan::transparent(run.seed ^ (i + 1)))
+            .collect();
+        let shaped = PacketFaultPlan {
+            delay: Duration::from_millis(re.rtt_ms / 2),
+            ..PacketFaultPlan::shaped(re.seed, re.bandwidth_bytes_per_sec)
+        };
+        if let Some(slot) = plans.get_mut(re.client as usize) {
+            *slot = shaped;
+        }
+        Some(ProxyFarm::spawn_with_plans(bound, plans)?)
     } else if run.loss_percent > 0 {
         Some(ProxyFarm::spawn(
             bound,
@@ -1520,6 +2377,14 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             .or_default()
             .push(cut.clone());
     }
+    // T23 / G3 row 13: the generated sustained stream, kept separate from
+    // `by_client` (a different element type) until the per-client dispatch
+    // below decides `--cut` args vs a `--cuts-file`.
+    let generated_by_client: BTreeMap<u64, Vec<GeneratedCut>> = scenario
+        .sustained_edits
+        .as_ref()
+        .map(|s| generate_sustained_cuts(s, server_ticks, clients))
+        .unwrap_or_default();
 
     // Spawn the clients.
     let client_timeout = run
@@ -1563,6 +2428,22 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             }
             c.args(["--cut", &spec]);
         }
+        // T23 / G3 row 13: the generated sustained stream can run into the
+        // thousands of entries per client — well past what fits as individual
+        // `--cut` arguments on one process command line (Windows'
+        // `CreateProcess` caps the whole command line around 32K chars) — so
+        // it always goes through `--cuts-file`, never inline.
+        if let Some(cuts) = generated_by_client.get(&i)
+            && !cuts.is_empty()
+        {
+            let path = output.join(format!("client{i}.sustained-cuts.json"));
+            let body = serde_json::to_vec(cuts).expect("generated cuts are serializable");
+            fs::write(&path, body).map_err(|source| XtaskError::Output {
+                path: path.display().to_string(),
+                source,
+            })?;
+            c.args(["--cuts-file", &path.display().to_string()]);
+        }
         let mut client_moves = false;
         for path in scenario.player_paths.iter().filter(|p| p.client == i) {
             client_moves = true;
@@ -1587,6 +2468,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             if let Some(r) = scenario.client_residency_radius_bricks {
                 c.args(["--residency-radius-bricks", &r.to_string()]);
             }
+            if let Some(bytes) = scenario.client_residency_budget_dense_bytes {
+                c.args(["--residency-budget-dense-bytes", &bytes.to_string()]);
+            }
         }
         if scenario.late_join_clients.contains(&i) {
             c.args([
@@ -1594,6 +2478,33 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 "--connect-delay-ms",
                 &scenario.late_join_connect_delay_ms.to_string(),
             ]);
+        } else {
+            // T23 / G3 row 2 follow-up (increment 23): every client process
+            // below is `spawn()`ed back-to-back with no synchronization, but
+            // `spall_net::NetServer::authenticate` assigns each connection's
+            // `SessionId`/slot strictly by arrival order
+            // (`SessionLease::acquire`) — there is no way for a client to
+            // request a specific slot. A scenario's `player_paths`/`cuts`
+            // ownership and `Scene::player_spawns()` slot assignment are keyed
+            // to *this loop's own launch index* `i`, which is only guaranteed
+            // to match the slot the server hands out if connections complete
+            // in launch order. Under real OS process-scheduling contention
+            // (this harness runs the server and every client as separate
+            // processes) that is not guaranteed — confirmed live: a scripted
+            // mover's own predictor occasionally latched onto a *different*
+            // client's entity/spawn entirely (`t23-g3-full-envelope`, west
+            // walker landing at the east spawn, `111 m` instead of `7 m`),
+            // producing an apparently-random final position with no relation
+            // to the intended script. Staggering each client's own connect
+            // attempt by its launch index (independent of, and much smaller
+            // than, `late_join_connect_delay_ms` above) makes connection
+            // arrival order match launch order deterministically — the QUIC
+            // handshake + auth round trip this races against is at most a few
+            // milliseconds on loopback, so 50 ms per client is a comfortable
+            // margin without meaningfully slowing a large-client-count
+            // scenario's startup.
+            const CONNECT_STAGGER_MS: u64 = 50;
+            c.args(["--connect-delay-ms", &(i * CONNECT_STAGGER_MS).to_string()]);
         }
         hide_console(&mut c);
         let child = c.spawn().map_err(|source| XtaskError::Output {
@@ -1621,7 +2532,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             return finish(
                 &output,
                 SessionSummary {
-                    version: 3,
+                    version: 5,
                     result: "failed",
                     scenario: scenario.name.clone(),
                     clients,
@@ -1640,13 +2551,26 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     restart_recovered_hash_matches: false,
                     restart_reconnect_hash_matches: false,
                     restart_recovered_world_hash: String::new(),
+                    residency_backing_disk_bytes: None,
+                    residency_pinned_bricks_max: 0,
+                    residency_admission_deferred_total: 0,
+                    residency_required_over_budget_ticks: 0,
+                    residency_digest_bytes_final: 0,
+                    residency_backing_resident_bytes: None,
+                    process_peak_memory_bytes: None,
+                    residency_checkpoint_bricks_captured_total: 0,
+                    residency_checkpoint_bricks_logical_total: 0,
                     impaired_late_join_bounded_failure: false,
                     agreed_world_hash: String::new(),
                     all_hashes_match: false,
                     requirements_met: false,
                     admission: AdmissionRow::empty(),
+                    server_timing: ServerTimingRow::unconfigured(),
                     join_budget: JoinBudgetRow::unconfigured(),
                     per_client: Vec::new(),
+                    app_egress_bytes: 0,
+                    transport_egress_bytes: 0,
+                    per_client_egress: Vec::new(),
                     note: "server produced no summary; inspect server.jsonl",
                 },
             );
@@ -1722,6 +2646,8 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     client_residency_reloads_requested: c.client_residency_reloads_requested,
                     client_residency_reloads_completed: c.client_residency_reloads_completed,
                     client_residency_budget_miss_steps: c.client_residency_budget_miss_steps,
+                    client_residency_admission_deferred_total: c
+                        .client_residency_admission_deferred_total,
                     client_residency_evicted_transaction_gaps: c
                         .client_residency_evicted_transaction_gaps,
                     hash_matches_server: hash_ok,
@@ -1749,6 +2675,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                     client_residency_reloads_requested: 0,
                     client_residency_reloads_completed: 0,
                     client_residency_budget_miss_steps: 0,
+                    client_residency_admission_deferred_total: 0,
                     client_residency_evicted_transaction_gaps: 0,
                     hash_matches_server: false,
                     late_join_baseline_compressed_bytes: 0,
@@ -1763,6 +2690,7 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     }
     let mut requirements_met = requirements_met(
         &scenario,
+        server_ticks,
         server.transactions_committed,
         &client_summaries,
         run.loss_percent > 0 || scenario.join_budget.is_some(),
@@ -1771,6 +2699,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         requirements_met = false;
     }
     if !dormancy_requirements_met(&scenario, &server) {
+        requirements_met = false;
+    }
+    if !residency_disk_backing_requirements_met(&scenario, &server) {
         requirements_met = false;
     }
     // T23 / G3 row 11: the configured client's measured compressed baseline
@@ -1811,6 +2742,17 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     // from the shutdown checkpoint + journal), then a fresh `--late-join` client
     // against it. Both must reach the agreed hash.
     let restart = if scenario.restart_check {
+        // T23 / G3 row 7 item 2 (increment 31): when the live run was
+        // disk-backed, the cold-restarted server also gets matching residency
+        // + disk-backing flags, pointed at the same `<world>/residency.db` --
+        // proving a restart reads the durable backing back correctly, not
+        // just that the world DB's own journal recovers (which residency,
+        // by design, does not affect). Every other scenario's restart run
+        // passes `None`/`false` here, exactly as before this increment.
+        let restart_residency = scenario.residency_disk_backing.then_some(RestartResidency {
+            budget_bricks: scenario.residency_budget_bricks.unwrap_or(0),
+            radius_bricks: scenario.residency_radius_bricks,
+        });
         let r = run_restart_check(
             &output,
             &scenario.scene,
@@ -1818,6 +2760,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             &agreed,
             run.timeout,
             profile,
+            RestartOptions {
+                residency: restart_residency,
+                whole_terrain_collider: scenario.whole_terrain_collider,
+            },
         );
         if !(r.ran && r.recovered_matches && r.reconnect_matches) {
             requirements_met = false;
@@ -1831,6 +2777,10 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     // targets when the scenario configured them.
     let latency_ok = latency_targets_met(&scenario, &server);
     if scenario.latency_targets.is_some() && !latency_ok {
+        requirements_met = false;
+    }
+    let server_timing_ok = server_timing_requirements_met(&scenario, &server);
+    if scenario.server_timing.is_some() && !server_timing_ok {
         requirements_met = false;
     }
     let admission = AdmissionRow {
@@ -1848,12 +2798,34 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         latency_targets_configured: scenario.latency_targets.is_some(),
         latency_targets_met: latency_ok,
     };
+    let server_timing =
+        scenario
+            .server_timing
+            .as_ref()
+            .map_or_else(ServerTimingRow::unconfigured, |t| ServerTimingRow {
+                configured: true,
+                warmup_ticks: t.warmup_ticks,
+                measured_ticks: t.measured_ticks,
+                max_samples: t.max_samples,
+                tick_busy_p95_ms: server.tick_busy_p95_ms,
+                tick_busy_p99_ms: server.tick_busy_p99_ms,
+                tick_busy_max_ms: server.tick_busy_max_ms,
+                tick_busy_samples: server.tick_busy_samples,
+                tick_busy_window_complete: server.tick_busy_window_complete,
+                physics_p95_ms: server.physics_p95_ms,
+                physics_p99_ms: server.physics_p99_ms,
+                physics_max_ms: server.physics_max_ms,
+                physics_samples: server.physics_samples,
+                physics_window_complete: server.physics_window_complete,
+                process_peak_memory_bytes: server.process_peak_memory_bytes,
+                requirements_met: server_timing_ok,
+            });
 
     all_match &= requirements_met;
     finish(
         &output,
         SessionSummary {
-            version: 3,
+            version: 5,
             result: if all_match { "passed" } else { "failed" },
             scenario: scenario.name,
             clients,
@@ -1881,13 +2853,28 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
                 .as_ref()
                 .map(|r| r.recovered_hash.clone())
                 .unwrap_or_default(),
+            residency_backing_disk_bytes: server.residency_backing_disk_bytes,
+            residency_pinned_bricks_max: server.residency_pinned_bricks_max,
+            residency_admission_deferred_total: server.residency_admission_deferred_total,
+            residency_required_over_budget_ticks: server.residency_required_over_budget_ticks,
+            residency_digest_bytes_final: server.residency_digest_bytes_final,
+            residency_backing_resident_bytes: server.residency_backing_resident_bytes,
+            process_peak_memory_bytes: server.process_peak_memory_bytes,
+            residency_checkpoint_bricks_captured_total: server
+                .residency_checkpoint_bricks_captured_total,
+            residency_checkpoint_bricks_logical_total: server
+                .residency_checkpoint_bricks_logical_total,
             impaired_late_join_bounded_failure: bounded_join_failure_seen,
             agreed_world_hash: agreed,
             all_hashes_match: all_match,
             requirements_met,
             admission,
+            server_timing,
             join_budget,
             per_client: rows,
+            app_egress_bytes: server.app_egress_bytes,
+            transport_egress_bytes: server.transport_egress_bytes,
+            per_client_egress: server.per_client_egress.clone(),
             note: "real OS processes over QUIC; encrypted-packet loss via per-client UDP proxy; gate requirements are fixture-defined: every scripted cut commits, each live client sees real body displacement, any body-targeted cut lands, and (when enabled) the committed topology-event stream replays from baseline to the same hash",
         },
     )
@@ -1955,6 +2942,19 @@ struct RestartCheck {
     reconnect_matches: bool,
 }
 
+/// T23 / G3 row 7 item 2 (increment 31): matching residency + disk-backing
+/// config for the cold-restarted server in [`run_restart_check`], so it
+/// re-opens the exact same `<world>/residency.db` the live run wrote.
+struct RestartResidency {
+    budget_bricks: usize,
+    radius_bricks: Option<i64>,
+}
+
+struct RestartOptions {
+    residency: Option<RestartResidency>,
+    whole_terrain_collider: bool,
+}
+
 /// T23 / G3 cold restart. Launches a **fresh** `sandbox-server --serve --save`
 /// over the world DB the run just journalled — a cold recovery from the
 /// shutdown checkpoint plus the durable journal, no client edit replay — and
@@ -1968,6 +2968,7 @@ fn run_restart_check(
     expected: &str,
     deadline: Duration,
     profile: &str,
+    options: RestartOptions,
 ) -> RestartCheck {
     let miss = RestartCheck {
         ran: false,
@@ -2023,6 +3024,20 @@ fn run_restart_check(
         "0",
         "--dev-unvalidated-actions",
     ]);
+    if options.whole_terrain_collider {
+        srv.arg("--whole-terrain-collider");
+    }
+    // T23 / G3 row 7 item 2 (increment 31): re-open the same
+    // `<world>/residency.db` a disk-backed live run wrote, proving a cold
+    // restart's fresh `DiskBrickBacking` reads it back correctly. Absent for
+    // every scenario that didn't request disk backing (unchanged behavior).
+    if let Some(r) = &options.residency {
+        srv.args(["--residency-budget-bricks", &r.budget_bricks.to_string()]);
+        if let Some(radius) = r.radius_bricks {
+            srv.args(["--residency-radius-bricks", &radius.to_string()]);
+        }
+        srv.arg("--residency-disk-backing");
+    }
     hide_console(&mut srv);
     let Ok(child) = srv.spawn() else {
         return miss;

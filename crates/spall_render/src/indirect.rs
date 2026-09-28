@@ -457,10 +457,13 @@ impl IndirectPipeline {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("spall-t13-indirect-pipeline-layout"),
-            bind_group_layouts: &[&compute_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&compute_layout)],
+            immediate_size: 0,
         });
         let make = |label, entry| {
+            crate::probe::mark(&format!(
+                "  IndirectPipeline: vkCreateComputePipelines({label})"
+            ));
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
@@ -470,10 +473,14 @@ impl IndirectPipeline {
                 cache: None,
             })
         };
+        let trace = make("spall-t13-trace-pipeline", "trace_main");
+        let denoise = make("spall-t13-denoise-pipeline", "denoise_main");
+        let temporal = make("spall-t14-temporal-pipeline", "temporal_main");
+        crate::probe::mark("  IndirectPipeline::new: all 3 compute pipelines OK");
         Self {
-            trace: make("spall-t13-trace-pipeline", "trace_main"),
-            denoise: make("spall-t13-denoise-pipeline", "denoise_main"),
-            temporal: make("spall-t14-temporal-pipeline", "temporal_main"),
+            trace,
+            denoise,
+            temporal,
             compute_layout,
             display_layout,
         }

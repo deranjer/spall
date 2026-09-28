@@ -13,7 +13,7 @@ use spall_structure::{
     AnchorPlane, CancelToken, ComponentMembership, ConservationLedger, Interrupted, ResidencyMode,
     SearchBudget, StructureIndex, SupportReport,
 };
-use spall_voxel::{BrickState, EditError, EditOutcome, EditPlan, EvictedBricks, Volume};
+use spall_voxel::{BrickState, EditError, EditOutcome, EditPlan, EvictedBricks, Sample, Volume};
 
 use crate::intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse};
 
@@ -97,6 +97,10 @@ pub struct StagedEdit {
     pub ledger: ConservationLedger,
     /// Solid cells in the target volume before the edit.
     pub pre_solid: u64,
+    /// Material counts removed by a validated cut. These are calculated from
+    /// the immutable pre-edit snapshot and travel with the staged result; a
+    /// server game hook may award drops only after this edit commits.
+    pub removed_materials: std::collections::BTreeMap<spall_core::MaterialId, u64>,
 }
 
 impl StagedEdit {
@@ -140,9 +144,23 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         return Err(StageError::EmptyBrush);
     }
 
+    let mut removed_materials = std::collections::BTreeMap::new();
+    if input.kind == EditKind::Cut {
+        for write in &plan.writes {
+            if let Sample::Filled(material) = input
+                .volume
+                .sample(write.cell)
+                .map_err(|_| StageError::OutOfBounds(write.cell.split().0))?
+            {
+                *removed_materials.entry(material).or_default() += 1;
+            }
+        }
+    }
+
     let cancel = CancelToken::new();
 
     // Pre-edit structural read set + generation / epoch.
+    let sp_idx = crate::prof::Span::start("stage.structure_index_build");
     let mut index = StructureIndex::build(
         &input.volume,
         input.anchor,
@@ -151,6 +169,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         input.topology_epoch,
         &cancel,
     )?;
+    drop(sp_idx);
     let mut token = index.token();
 
     // Merge in the plan's touched bricks at their pre-edit state.
@@ -177,6 +196,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         .map_err(|_| StageError::EvictedGeometryRequired(Vec::new()))?;
 
     // Dry-run the edit and re-classify support on the result.
+    let sp_dry = crate::prof::Span::start("stage.dry_run_and_reclassify");
     let mut post = input.volume.clone();
     let outcome = post.apply_edit(&plan)?;
     let report = index.apply_edit(
@@ -187,6 +207,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         SearchBudget::UNLIMITED,
     )?;
 
+    drop(sp_dry);
     // Which components detach:
     // - Terrain: every component the support search calls unsupported.
     // - A dynamic body: a free body has no anchor, so keep the largest component
@@ -258,6 +279,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         memberships,
         ledger,
         pre_solid,
+        removed_materials,
     })
 }
 

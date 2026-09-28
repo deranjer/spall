@@ -5,6 +5,7 @@ use spall_mesh::Mesh;
 
 use crate::camera::{Aabb, Camera};
 use crate::indirect::LightingVolume;
+use spall_core::RenderProps;
 
 /// One placed mesh.
 pub struct SceneItem {
@@ -120,6 +121,9 @@ pub struct Material {
     pub metallic: f32,
     /// Emissive radiance multiplier, using the material base colour.
     pub emissive: f32,
+    /// Surface opacity used by alpha-blended debug geometry. Opaque scene
+    /// materials should keep this at `1.0`.
+    pub opacity: f32,
 }
 
 impl Material {
@@ -129,11 +133,17 @@ impl Material {
             roughness,
             metallic,
             emissive: 0.0,
+            opacity: 1.0,
         }
     }
 
     pub const fn emissive(mut self, radiance: f32) -> Self {
         self.emissive = radiance;
+        self
+    }
+
+    pub const fn opacity(mut self, opacity: f32) -> Self {
+        self.opacity = opacity;
         self
     }
 }
@@ -142,6 +152,54 @@ impl Default for Material {
     fn default() -> Self {
         Self::new([0.5, 0.5, 0.5], 0.8, 0.0)
     }
+}
+
+/// The runtime material table for `manifest`, indexed by `MaterialId` (the
+/// index the shader uses). Ids the manifest does not define get the loud
+/// fallback the shader also uses for out-of-range ids, so a missing entry is
+/// visible rather than silently grey.
+///
+/// Albedo, roughness and metalness map one-to-one. The manifest stores emitted
+/// radiance as linear RGB while [`Material`] stores a multiplier on the base
+/// colour (the frozen T13 encoding, `emission = base_color * emissive`). The
+/// multiplier is the least-squares fit of the radiance onto the albedo, exact
+/// for the common case of an emitter tinted like its surface. An emitter with
+/// black albedo cannot be expressed that way, so it takes its emission colour
+/// as its base colour instead.
+pub fn materials_from_manifest(manifest: &spall_core::MaterialManifest) -> Vec<Material> {
+    let fallback = Material::new([0.8, 0.1, 0.8], 0.8, 0.0);
+    let len = manifest
+        .entries()
+        .iter()
+        .map(|def| usize::from(def.id.0) + 1)
+        .max()
+        .unwrap_or(1);
+    let mut table = vec![fallback; len];
+    for def in manifest.entries() {
+        let RenderProps {
+            albedo,
+            roughness,
+            metalness,
+            emissive,
+        } = def.render;
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let (base_color, multiplier) = if dot(emissive, emissive) <= 0.0 {
+            (albedo, 0.0)
+        } else if dot(albedo, albedo) <= 1e-12 {
+            let peak = emissive.into_iter().fold(0.0_f32, f32::max);
+            (emissive.map(|c| c / peak), peak)
+        } else {
+            (albedo, dot(emissive, albedo) / dot(albedo, albedo))
+        };
+        table[usize::from(def.id.0)] = Material {
+            base_color,
+            roughness,
+            metallic: metalness,
+            emissive: multiplier,
+            opacity: 1.0,
+        };
+    }
+    table
 }
 
 /// Fixture materials keyed by material id (`0 = air`, `1 = stone`, ...).
@@ -227,5 +285,76 @@ mod tests {
                 item.name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+    use spall_core::{MaterialDef, MaterialFlags, MaterialId, MaterialManifest, SimProps};
+
+    fn def(id: u16, name: &str, render: RenderProps) -> MaterialDef {
+        MaterialDef {
+            id: MaterialId(id),
+            name: name.into(),
+            render,
+            sim: SimProps {
+                density_kg_m3: if id == 0 { 0.0 } else { 1000.0 },
+                friction: 0.5,
+                restitution: 0.0,
+                hardness: 1.0,
+                bond_strength: 1.0,
+                flags: if id == 0 {
+                    MaterialFlags::NONE
+                } else {
+                    MaterialFlags::OPAQUE
+                },
+            },
+        }
+    }
+
+    fn render(albedo: [f32; 3], emissive: [f32; 3]) -> RenderProps {
+        RenderProps {
+            albedo,
+            roughness: 0.4,
+            metalness: 0.25,
+            emissive,
+        }
+    }
+
+    #[test]
+    fn the_table_is_indexed_by_id_and_fills_gaps_loudly() {
+        let manifest = MaterialManifest::validated(vec![
+            def(0, "air", render([0.0; 3], [0.0; 3])),
+            def(3, "grass", render([0.2, 0.5, 0.1], [0.0; 3])),
+        ])
+        .unwrap();
+        let table = materials_from_manifest(&manifest);
+        assert_eq!(table.len(), 4);
+        assert_eq!(table[3].base_color, [0.2, 0.5, 0.1]);
+        assert_eq!((table[3].roughness, table[3].metallic), (0.4, 0.25));
+        assert_eq!(table[3].emissive, 0.0);
+        assert_eq!(
+            table[1].base_color,
+            [0.8, 0.1, 0.8],
+            "undefined id is magenta"
+        );
+    }
+
+    #[test]
+    fn emission_round_trips_as_base_colour_times_multiplier() {
+        let manifest = MaterialManifest::validated(vec![
+            def(0, "air", render([0.0; 3], [0.0; 3])),
+            def(1, "lamp", render([1.0, 0.42, 0.08], [5.0, 2.1, 0.4])),
+            def(2, "glow", render([0.0; 3], [0.0, 3.0, 1.5])),
+        ])
+        .unwrap();
+        let table = materials_from_manifest(&manifest);
+        let emitted = |m: &Material| m.base_color.map(|c| c * m.emissive);
+        let lamp = emitted(&table[1]);
+        for (got, want) in lamp.into_iter().zip([5.0, 2.1, 0.4]) {
+            assert!((got - want).abs() < 1e-4, "{lamp:?}");
+        }
+        assert_eq!(emitted(&table[2]), [0.0, 3.0, 1.5]);
     }
 }

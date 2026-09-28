@@ -579,6 +579,34 @@ async fn negotiated_limits_are_installed_on_both_ends() {
     server.close();
 }
 
+/// T23 / G3 row 10: `spall_server::serve`'s writer task sends `say_bye(reason)`
+/// then immediately calls `close(..)` (mirroring `Connection::close`'s doc:
+/// this is exactly the shape production uses to give up on a client). Prove
+/// the peer's `recv_record` still gets `Ok(None)` with that reason recorded on
+/// `bye_reason()` -- i.e. `close()` right after `say_bye()` does not race away
+/// the just-sent `Bye` before the peer reads it.
+#[tokio::test]
+async fn bye_reason_survives_an_immediate_close_after_say_bye() {
+    let (server, accepted, client) =
+        pair(TransportConfig::for_tests(), TransportConfig::for_tests()).await;
+    let sayer = tokio::spawn(async move {
+        accepted.say_bye("catch-up exhausted").await.unwrap();
+        accepted.close("connection complete");
+    });
+    let got = tokio::time::timeout(Duration::from_secs(5), client.recv_record())
+        .await
+        .expect("recv_record did not time out")
+        .expect("recv_record did not error");
+    assert_eq!(got, None, "a Bye ends the control-record stream");
+    assert_eq!(
+        client.bye_reason().as_deref(),
+        Some("catch-up exhausted"),
+        "the reason sent on say_bye must survive to the peer despite the immediate close"
+    );
+    sayer.await.unwrap();
+    server.close();
+}
+
 #[tokio::test]
 async fn handshake_deadline_includes_quic_establishment() {
     let sink = tokio::net::UdpSocket::bind(loopback()).await.unwrap();

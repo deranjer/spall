@@ -55,6 +55,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
     let server_cfg = ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 300,
         quiescence_ticks: 30,
@@ -73,6 +74,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         seed: 0,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        capture_workers: spall_server::serve::default_capture_workers(),
         // Fixture scripts cut at arbitrary cells no real aim ray would produce;
         // the ENG-47 dev-scenario path keeps this plumbing test working.
         dev_unvalidated_actions: true,
@@ -80,8 +82,12 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         await_body_settle: false,
         motion_interest: None,
         residency: None,
+        residency_disk_path: None,
         contact_damage: None,
         dormancy: None,
+        timing_window: None,
+        credential_registry_file: None,
+        custom_world: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(server_cfg));
@@ -113,6 +119,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         client_residency: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     };
 
     let client = run_replication_client(client_cfg).expect("client run");
@@ -167,6 +174,7 @@ fn server_persists_and_recovers_across_a_restart() {
     let base_cfg = |tag: &str| ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 200,
         quiescence_ticks: 20,
@@ -184,14 +192,19 @@ fn server_persists_and_recovers_across_a_restart() {
         seed: 9,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        capture_workers: spall_server::serve::default_capture_workers(),
         // See above: arbitrary fixture cuts need the dev-scenario path.
         dev_unvalidated_actions: true,
         save_faults: None,
         await_body_settle: false,
         motion_interest: None,
         residency: None,
+        residency_disk_path: None,
         contact_damage: None,
         dormancy: None,
+        timing_window: None,
+        credential_registry_file: None,
+        custom_world: None,
     };
 
     let run_once = |tag: &'static str, script: Vec<ScriptedAction>| {
@@ -220,6 +233,7 @@ fn server_persists_and_recovers_across_a_restart() {
             client_residency: None,
             on_replica_ready: None,
             interactive: None,
+            client_authoritative: false,
         };
         let _ = run_replication_client(client_cfg).expect("client run");
         server_thread
@@ -285,6 +299,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
     let cfg = ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 200,
         quiescence_ticks: 20,
@@ -304,13 +319,18 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         seed: 9,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        capture_workers: spall_server::serve::default_capture_workers(),
         dev_unvalidated_actions: false,
         save_faults: Some(FaultPlan::disk_fail_checkpoint()),
         await_body_settle: false,
         motion_interest: None,
         residency: None,
+        residency_disk_path: None,
         contact_damage: None,
         dormancy: None,
+        timing_window: None,
+        credential_registry_file: None,
+        custom_world: None,
     };
 
     let server_thread = std::thread::spawn(move || serve(cfg));
@@ -338,6 +358,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         client_residency: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     };
     let _ = run_replication_client(client_cfg).expect("client run");
 

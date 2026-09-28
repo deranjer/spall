@@ -62,6 +62,7 @@ use spall_voxel::Volume;
 
 use crate::character::{CharacterMove, CharacterParams};
 use crate::collider::Representation;
+use crate::coordinates::PhysicsOrigin;
 use crate::occupancy::{ExtractError, OccupancyGrid};
 use crate::world::{BodyId, BodyKind, BodySpec, PhysicsWorld};
 
@@ -197,6 +198,28 @@ impl CharacterQueryCache {
         position_m: [f64; 3],
         revision: u64,
     ) -> Result<(Option<BodyId>, Option<RebuildCost>), ExtractError> {
+        self.ensure_covers_in_frame(
+            world,
+            volume,
+            cell_m,
+            position_m,
+            revision,
+            PhysicsOrigin::ZERO,
+        )
+    }
+
+    /// [`Self::ensure_covers`] for a physics world whose local origin differs
+    /// from world space. The queried position stays authoritative/world-space;
+    /// only the derived terrain collider is localized.
+    pub fn ensure_covers_in_frame(
+        &mut self,
+        world: &mut PhysicsWorld,
+        volume: &Volume,
+        cell_m: f32,
+        position_m: [f64; 3],
+        revision: u64,
+        physics_origin: PhysicsOrigin,
+    ) -> Result<(Option<BodyId>, Option<RebuildCost>), ExtractError> {
         let needs_rebuild = self.body.is_none()
             || revision != self.revision
             || cell_m != self.cell_m
@@ -204,7 +227,7 @@ impl CharacterQueryCache {
         if !needs_rebuild {
             return Ok((self.body, None));
         }
-        let cost = self.rebuild(world, volume, cell_m, position_m, revision)?;
+        let cost = self.rebuild(world, volume, cell_m, position_m, revision, physics_origin)?;
         Ok((self.body, Some(cost)))
     }
 
@@ -253,6 +276,7 @@ impl CharacterQueryCache {
         cell_m: f32,
         position_m: [f64; 3],
         revision: u64,
+        physics_origin: PhysicsOrigin,
     ) -> Result<RebuildCost, ExtractError> {
         let radius_cells = (f64::from(WINDOW_RADIUS_M) / f64::from(cell_m)).ceil() as i64;
         let centre_cell = [
@@ -272,6 +296,9 @@ impl CharacterQueryCache {
         );
         let extraction_start = std::time::Instant::now();
         let grid = OccupancyGrid::from_region(volume, min, max)?;
+        let (grid, translation_m) = physics_origin
+            .localize_terrain_grid(grid, f64::from(cell_m))
+            .ok_or(ExtractError::OriginOutOfRange)?;
         let extraction = extraction_start.elapsed();
 
         self.centre_m = position_m;
@@ -305,7 +332,7 @@ impl CharacterQueryCache {
                 cell_m,
                 density_kg_m3: 1.0,
                 mass_properties: None,
-                translation_m: [0.0; 3],
+                translation_m,
                 linvel_m_s: [0.0; 3],
             });
             // A window must never act as a real obstacle for a dynamic

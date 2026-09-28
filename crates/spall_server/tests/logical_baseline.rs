@@ -3,10 +3,11 @@
 //! reaches the exact canonical topology hash.
 
 use spall_client::{ReplicaConfig, ReplicaWorld};
-use spall_core::BrickCoord;
+use spall_core::{BrickCoord, CELLS_PER_BRICK, LocalCell, MaterialId, Revision};
 use spall_protocol::{RepairKey, RepairRequest};
 use spall_server::{logical_brick_repair_patch, logical_world_baseline, world_baseline};
 use spall_sim::{MemoryBacking, Simulation, SimulationConfig, fixtures};
+use spall_voxel::{Brick, BrickSnapshot};
 
 fn sim_with_backing() -> (Simulation, MemoryBacking) {
     let sim = Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
@@ -121,4 +122,132 @@ fn world_baseline_is_unchanged_when_nothing_is_evicted() {
 
     let replica = ReplicaWorld::from_baseline_world(&a, ReplicaConfig::default()).unwrap();
     assert_eq!(replica.world_hash(), sim.world().world_hash());
+}
+
+/// T23 / G3 row 7 follow-up: regression for a real panic
+/// (`background snapshots require resident geometry`) found while landing
+/// bounded checkpoint capture. `snapshot_world` is the background/worker-thread
+/// baseline-capture path (increment 17) used for a client's *first* join when
+/// no cached baseline is ready; unlike `logical_world_baseline` it never took a
+/// backing and assumed every logical brick was resident, which held only by
+/// accident while `ResidencyPass::reload_all` still ran before every periodic
+/// checkpoint. Proves the fixed `snapshot_world` reaches the same world as the
+/// synchronous `logical_world_baseline` path over the same evicted terrain.
+#[test]
+fn snapshot_world_over_evicted_terrain_matches_the_synchronous_logical_baseline() {
+    let (mut sim, backing) = sim_with_backing();
+    let terrain = sim.world().terrain_volume_id();
+    let full_hash = sim.world().world_hash();
+
+    for c in evictable_bricks(&sim) {
+        assert!(sim.world_mut().evict_brick(terrain, c).unwrap());
+    }
+    assert!(sim.world().has_evicted());
+
+    let snapshot = spall_server::baseline::snapshot_world(&sim, Some(&backing));
+    let transfer = spall_server::baseline::transfer_from_snapshot(
+        snapshot,
+        spall_protocol::TransferId(1),
+        spall_protocol::InterestEpoch(1),
+    )
+    .expect("a background snapshot over evicted terrain with a backing must encode");
+
+    let reference = logical_world_baseline(&sim, Some(&backing));
+    let world = transfer.decode_v1_world().expect("the transfer decodes");
+    assert_eq!(
+        world.encode(),
+        reference.encode(),
+        "the background-capture path must reach the same baseline as the synchronous one"
+    );
+
+    let replica = ReplicaWorld::from_baseline_world(&world, ReplicaConfig::default())
+        .expect("the baseline installs");
+    assert_eq!(
+        replica.world_hash(),
+        full_hash,
+        "a joiner served by the background capture path did not reconstruct the full world"
+    );
+}
+
+fn brick_with_snapshot_cells(snapshot: &BrickSnapshot, revision: Revision) -> Brick {
+    let cells = (0..CELLS_PER_BRICK)
+        .map(|index| {
+            snapshot.get(LocalCell::from_linear_index(index as u16).expect("index < 32768"))
+        })
+        .collect::<Vec<_>>();
+    Brick::restored(&cells, revision, snapshot.is_edited())
+}
+
+/// Every client-facing path that reads an evicted brick must enforce the same
+/// retained digest contract as the reload path. A stale revision, forged cell
+/// content, or forged KnownEmpty tombstone must never become a baseline or
+/// repair payload.
+#[test]
+fn forged_evicted_backing_records_are_rejected_by_baseline_and_repair_paths() {
+    for case in ["revision", "content", "known-empty"] {
+        let (mut sim, backing) = sim_with_backing();
+        let terrain = sim.world().terrain_volume_id();
+        let victim = evictable_bricks(&sim)[0];
+        let original = sim
+            .world()
+            .terrain()
+            .volume
+            .snapshot_brick(victim)
+            .expect("victim is resident")
+            .expect("victim has geometry");
+        let revision = original.revision();
+        assert!(sim.world_mut().evict_brick(terrain, victim).unwrap());
+
+        match case {
+            "revision" => backing.insert(
+                terrain,
+                victim,
+                brick_with_snapshot_cells(&original, Revision(revision.get() + 1)),
+            ),
+            "content" => {
+                let mut forged = brick_with_snapshot_cells(&original, revision);
+                let cell = LocalCell::from_linear_index(0).expect("zero is a valid cell");
+                let material = if original.get(cell).is_air() {
+                    MaterialId(1)
+                } else {
+                    MaterialId::AIR
+                };
+                assert!(forged.set_cell(cell, material));
+                backing.insert(terrain, victim, forged);
+            }
+            "known-empty" => {
+                backing.mark_known_empty(terrain, victim, Revision(revision.get() + 1), false)
+            }
+            _ => unreachable!(),
+        }
+
+        let request = RepairRequest {
+            key: RepairKey::Brick {
+                volume: terrain,
+                coord: victim,
+            },
+            expected_revision: revision,
+            current_revision: Revision::ZERO,
+            expected_hash: spall_protocol::Hash32::ZERO,
+            current_hash: spall_protocol::Hash32::ZERO,
+        };
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                logical_world_baseline(&sim, Some(&backing));
+            }))
+            .is_err(),
+            "forged {case} backing must not reach a baseline"
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                spall_server::baseline::snapshot_world(&sim, Some(&backing));
+            }))
+            .is_err(),
+            "forged {case} backing must not reach a background snapshot"
+        );
+        assert!(
+            logical_brick_repair_patch(&sim, &request, Some(&backing)).is_none(),
+            "forged {case} backing must not reach a repair patch"
+        );
+    }
 }

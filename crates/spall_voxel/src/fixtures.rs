@@ -403,16 +403,36 @@ pub fn separated_regions_scene(id: VolumeId) -> Volume {
 /// East-region offset for the full-envelope T23 scene: 110 m on the x axis.
 pub const SEPARATED_REGIONS_FAR_EAST_OFFSET: GlobalCell = GlobalCell::new(440, 0, 0);
 
+/// T23 / G3 row 2 follow-up (increment 23): extra solid ground, in cells,
+/// appended past the east region's own floor (which otherwise ends a bare
+/// `5.75 m` past the causeway, only `~4.8 m` past `t23-g3-full-envelope.json`'s
+/// scripted leg's own deterministic stopping point). The pure-`spall_sim`
+/// version of this walk (`scripted_walk_from_slot_0_spawn_covers_over_100_m`)
+/// lands well short of that edge every time; the real multi-process harness
+/// occasionally does not, because the client's scripted-movement clock
+/// (`active_script_tick` in `spall_client::net`) advances from the *observed*
+/// server tick, not wall-clock time — a real OS-scheduling stall in receiving
+/// a `MotionSnapshot` delays the script's own release-to-neutral relative to
+/// true server time, and the player keeps walking for however much extra real
+/// time that stall cost. A `~4.8 m` margin was not enough headroom to absorb
+/// that (observed: the player walked off the far edge and fell, `y ≈ -60..-80`,
+/// in `4/6` real sessions). `120` cells (`30 m`) of extra apron makes that
+/// realistically un-reachable while `causeway_connects_the_two_far_regions_
+/// with_continuous_solid_ground`'s `resident_brick_count() <= 20` budget still
+/// holds (`19` bricks with this margin, `15` without it).
+pub const SEPARATED_REGIONS_FAR_EAST_LANDING_MARGIN_CELLS: i64 = 120;
+
 /// Two separated regions joined by a continuous, narrow stone causeway.
 pub fn separated_regions_full_envelope_scene(id: VolumeId) -> Volume {
     let bounds = BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(31, 15, 31))
         .expect("valid G3 world bounds");
     let mut v = Volume::bounded(id, CellSizeCode::Quarter, bounds);
     let e = SEPARATED_REGIONS_FAR_EAST_OFFSET;
+    let margin = SEPARATED_REGIONS_FAR_EAST_LANDING_MARGIN_CELLS;
     v.apply_edit(&EditPlan::filled_box(
         id,
         GlobalCell::new(0, 0, 0),
-        GlobalCell::new(23 + e.x, 19, 7),
+        GlobalCell::new(23 + e.x + margin, 19, 7),
         MaterialId::AIR,
     ))
     .expect("far-scene air envelope");
@@ -423,6 +443,17 @@ pub fn separated_regions_full_envelope_scene(id: VolumeId) -> Volume {
         STONE,
     ))
     .expect("far-scene causeway");
+    // Landing apron: continues the causeway's own floor slab past the east
+    // region's far edge, so a client-timing overshoot on the scripted walk
+    // lands on solid ground instead of falling into the void (see
+    // `SEPARATED_REGIONS_FAR_EAST_LANDING_MARGIN_CELLS`'s doc comment).
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(24 + e.x, 0, 0),
+        GlobalCell::new(23 + e.x + margin, 3, 7),
+        STONE,
+    ))
+    .expect("far-scene landing apron");
     let region = [
         (GlobalCell::new(0, 0, 0), GlobalCell::new(23, 3, 7), STONE),
         (GlobalCell::new(10, 4, 3), GlobalCell::new(11, 9, 4), STONE),
@@ -776,6 +807,237 @@ pub fn digest_hex(volume: &Volume) -> String {
     digest(volume).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// --- playground (interactive `cargo xtask play --scene playground`) ------
+//
+// Not a T23/G4 gate fixture (no pinned digest, deliberately -- this scene is
+// meant to keep changing as it gets played with). Built for a hands-on feel
+// for movement, jumping, and destruction that a headless CPU test can't give
+// -- see `spall_sim::fixtures::playground_setup` for the paired `WorldSetup`
+// and `spall_sim::playground` for the live debris-spawner pass. Paints with
+// the material ids `spall_sim::fixtures::playground_manifest` defines colour
+// for (`10`-`14`) -- **not** this module's own grey `STONE`/`DIRT` (`1`/`2`),
+// which that manifest has no entries for.
+
+/// [`playground_scene`]'s material ids -- paired one-for-one with
+/// `spall_sim::fixtures::playground_manifest`'s `PLAYGROUND_*` constants
+/// (duplicated here rather than imported: `spall_voxel` does not, and
+/// should not, depend on `spall_sim`).
+const PLAYGROUND_GRASS: MaterialId = MaterialId(10);
+const PLAYGROUND_LOAM: MaterialId = MaterialId(11);
+const PLAYGROUND_BRICK: MaterialId = MaterialId(12);
+const PLAYGROUND_SANDSTONE: MaterialId = MaterialId(13);
+const PLAYGROUND_SLATE: MaterialId = MaterialId(14);
+
+/// A large flat plaza, a staircase up to a lookout platform, a zigzag maze
+/// corridor, and a row of jump platforms with steadily increasing gaps --
+/// four connected areas in one volume, in that order along `+x`/`+z`, sized
+/// for a real hands-on feel (T19 movement, jumping, and -- via
+/// `spall_sim::playground`'s spawner -- watching debris pile up), not CPU-CI
+/// cheapness. Deterministic and RNG-free like every other fixture in this
+/// module; only the separate live spawner pass is randomized.
+///
+/// - **Plaza**: `x [0,127]`, `z [0,127]`, `y [0,3]` (`32 x 32 m`, top surface
+///   `y = 1.0 m`) -- grass, with a `4 m` loam checkerboard on the top layer.
+///   Player spawns here.
+/// - **Stairs**: `x [128,207]`, `z [52,75]` -- ten `2 m`-deep, `0.5 m`-tall
+///   brick steps climbing to `y = 5.0 m`.
+/// - **Lookout**: `x [208,239]`, `z [52,75]`, same height as the top step --
+///   a flat brick landing.
+/// - **Maze**: `x [0,127]`, `z [128,255]` (`32 x 32 m`) -- a sandstone floor
+///   under six `2.5 m`-tall zigzag walls forcing a back-and-forth path.
+/// - **Jump course**: `x [52,75]`, `z [256,~380]` -- six `3 x 3 m` slate
+///   platforms (`1 m` tall) with gaps growing from `1 m` to `3.5 m`.
+/// - **Plinko**: beside the player spawn at `x [21,28]`, `z [20,22]`, with
+///   staggered slate bumpers and a catch basin for the one-second emitter.
+/// - **Tower**: `x [24,28]`, `z [4,8]` (metres), `10 m` tall -- a brick
+///   landmark on the plaza, clear of the spawn point.
+///
+/// One resident air envelope covers the whole combined footprint, written
+/// first (as every other fixture here does) so the solid writes below win.
+pub fn playground_scene(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+
+    // Resident air over the whole combined footprint, high enough to clear
+    // the stairs/lookout (`y = 5.0 m`) with real headroom for jumping and
+    // for the debris spawner to drop things from `~3x` player height.
+    //
+    // `y` padded to `[-20, 50]`, not `[0, 30]`: `spall_physics::query_cache`'s
+    // `CharacterQueryCache` builds a `+-4 m` (16-cell) window around a
+    // character's *feet* on every movement query, so a player standing at
+    // `y = 1.0 m` (cell 4) queries cells down to `y = -12` and one standing
+    // on the lookout (`y ~= 4.75 m`, cell 19) queries up to `y = 35` --
+    // outside `[0, 30]` on both ends. Any query cell that was never made
+    // resident is `ExtractError::Unresident`, which the whole window falls
+    // back from -- not a graceful degradation: the fallback sweeps the
+    // *whole* resident terrain as one `MergedCuboids` collider, which is
+    // measurably worse (real, felt jitter whenever a sweep grazes one of its
+    // box seams -- `spall_physics::query_cache`'s own module doc) and far
+    // more expensive per query than the small window it replaces. A hands-on
+    // `cargo xtask play --scene playground --late-join` session found
+    // exactly this: `window cache: 0 sweeps ... N terrain fallbacks` on
+    // every reported line -- the window never once built successfully.
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, -20, 0),
+        GlobalCell::new(239, 50, 383),
+        MaterialId::AIR,
+    ))
+    .expect("playground air envelope");
+
+    // Plaza: grass slab, then a loam checkerboard on the top cell layer
+    // (`y = 3`) in 4 m tiles.
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(127, 3, 127),
+        PLAYGROUND_GRASS,
+    ))
+    .expect("playground plaza floor");
+    const TILE: i64 = 16; // 4 m
+    for tx in 0..(128 / TILE) {
+        for tz in 0..(128 / TILE) {
+            if (tx + tz) % 2 == 1 {
+                v.apply_edit(&EditPlan::filled_box(
+                    id,
+                    GlobalCell::new(tx * TILE, 3, tz * TILE),
+                    GlobalCell::new(tx * TILE + TILE - 1, 3, tz * TILE + TILE - 1),
+                    PLAYGROUND_LOAM,
+                ))
+                .expect("playground plaza checkerboard tile");
+            }
+        }
+    }
+
+    // Stairs: ten steps, each 8 cells (2 m) deep along x, 2 cells (0.5 m)
+    // taller than the last.
+    const STEP_DEPTH: i64 = 8;
+    const STEP_RISE: i64 = 2;
+    const STEP_COUNT: i64 = 10;
+    const STAIR_Z: (i64, i64) = (52, 75);
+    for step in 0..STEP_COUNT {
+        let x0 = 128 + step * STEP_DEPTH;
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(x0, 0, STAIR_Z.0),
+            GlobalCell::new(x0 + STEP_DEPTH - 1, step * STEP_RISE + 1, STAIR_Z.1),
+            PLAYGROUND_BRICK,
+        ))
+        .expect("playground stair step");
+    }
+    // Lookout landing at the top step's height.
+    let top_y = (STEP_COUNT - 1) * STEP_RISE + 1;
+    let landing_x0 = 128 + STEP_COUNT * STEP_DEPTH;
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(landing_x0, 0, STAIR_Z.0),
+        GlobalCell::new(landing_x0 + 31, top_y, STAIR_Z.1),
+        PLAYGROUND_BRICK,
+    ))
+    .expect("playground lookout landing");
+
+    // Maze: a sandstone floor, then six zigzag walls alternating which side
+    // is open so the only way through is back and forth across the width.
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 128),
+        GlobalCell::new(127, 3, 255),
+        PLAYGROUND_SANDSTONE,
+    ))
+    .expect("playground maze floor");
+    const WALL_COUNT: i64 = 6;
+    const WALL_SPACING: i64 = 16; // 4 m
+    const WALL_THICKNESS: i64 = 2; // 0.5 m
+    const WALL_TOP_Y: i64 = 9; // 2.5 m
+    const GAP: i64 = 16; // 4 m opening
+    for wall in 0..WALL_COUNT {
+        let z0 = 128 + WALL_SPACING + wall * WALL_SPACING;
+        let (x0, x1) = if wall % 2 == 0 {
+            (0, 127 - GAP) // opening on the east side
+        } else {
+            (GAP, 127) // opening on the west side
+        };
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(x0, 0, z0),
+            GlobalCell::new(x1, WALL_TOP_Y, z0 + WALL_THICKNESS - 1),
+            PLAYGROUND_SANDSTONE,
+        ))
+        .expect("playground maze wall");
+    }
+
+    // Jump course: platforms with a steadily growing gap between them.
+    const PLATFORM_SIZE: i64 = 12; // 3 m
+    const PLATFORM_X: (i64, i64) = (52, 63); // 3 m wide, aligned with the stairs
+    let mut z = 256 + WALL_SPACING;
+    for i in 0..6i64 {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(PLATFORM_X.0, 0, z),
+            GlobalCell::new(PLATFORM_X.1, 3, z + PLATFORM_SIZE - 1),
+            PLAYGROUND_SLATE,
+        ))
+        .expect("playground jump platform");
+        z += PLATFORM_SIZE;
+        let gap = 4 + i * 2; // 1.0 m, 1.5 m, 2.0 m, ... 3.5 m
+        z += gap;
+    }
+
+    // Spawn-side Plinko board. Each bumper spans the narrow z lane, so the
+    // falling 0.5 m cubes cannot miss by drifting in depth; staggered rows
+    // force alternating x deflections. Side rails and the low catch basin keep
+    // released bodies nearby so the player can push the resulting pile.
+    const PLINKO_Z: (i64, i64) = (82, 87); // 20.5..22.0 m
+    for (x0, x1) in [(84, 87), (112, 115)] {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(x0, 4, PLINKO_Z.0),
+            GlobalCell::new(x1, 37, PLINKO_Z.1),
+            PLAYGROUND_SLATE,
+        ))
+        .expect("playground Plinko side rail");
+    }
+    let rows = [
+        (31, [90, 98, 106]),
+        (25, [86, 94, 102]),
+        (19, [90, 98, 106]),
+        (13, [86, 94, 102]),
+    ];
+    for (y0, xs) in rows {
+        for x0 in xs {
+            v.apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(x0, y0, PLINKO_Z.0),
+                GlobalCell::new(x0 + 2, y0 + 1, PLINKO_Z.1),
+                PLAYGROUND_SLATE,
+            ))
+            .expect("playground Plinko bumper");
+        }
+    }
+    for (x0, x1) in [(84, 91), (108, 115)] {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(x0, 4, PLINKO_Z.0),
+            GlobalCell::new(x1, 7, PLINKO_Z.1),
+            PLAYGROUND_SLATE,
+        ))
+        .expect("playground Plinko catch basin");
+    }
+
+    // A large tall tower on the plaza, well clear of the spawn point
+    // (`PLAYGROUND_SPAWNS`, `x/z ~= 16-18 m`) and everything else -- a
+    // landmark, a line-of-sight blocker, and something to climb/jump around.
+    // `4 x 4 m` footprint, `10 m` tall.
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(96, 0, 16),
+        GlobalCell::new(111, 39, 31),
+        PLAYGROUND_BRICK,
+    ))
+    .expect("playground tower");
+
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,4 +1265,385 @@ mod tests {
         "46de0b892ccac5b223bf95a3d8ddd4dc6db64234787d958276bd9da4f9239434";
     const BULK_SPLIT_DIGEST: &str =
         "03f5ef01144a1d927f4caf372181c052cd375cbd4b644f6f3e504838982aceea";
+}
+
+// ---------------------------------------------------------------------------
+// T23 / G4 integrated workload: the "demolition yard".
+// ---------------------------------------------------------------------------
+//
+// Terrain is a `96 m x 56 m` ground slab and nothing else. The workload's
+// destructible content is **bodies**: 282 combs (ordinary-edit targets), 180
+// towers (blast targets), and one 64-brick giant, all persistent bodies that
+// wake when first edited, plus 256 always-awake and 4,096 sleeping debris
+// bodies. Why bodies and not terrain: every *terrain* commit re-indexes,
+// re-extracts, re-hashes and re-plans the whole terrain volume (measured
+// `~210 ms` per commit at 3.2 M solid cells even after the occupancy-extraction
+// fast path; see `crates/spall_sim/tests/g4_integrated.rs`
+// `full_terrain_edit_cost_*`), so a 10 edits/s terrain stream cannot be
+// sustained at yard scale. A body commit costs only its own volume.
+//
+// All lengths below are cells (`0.25 m`); body-local coordinates put the
+// body's origin at its `(0,0,0)` cell.
+
+/// Yard width (`x`): `384` cells = `96 m`.
+pub const G4_YARD_WIDTH_CELLS: i64 = 384;
+/// Yard depth (`z`): `224` cells = `56 m`.
+pub const G4_YARD_DEPTH_CELLS: i64 = 224;
+/// Top cell row (`y`) of the ground slab: `y 0..=3`, top surface at `1.0 m`.
+pub const G4_YARD_GROUND_TOP_CELL: i64 = 3;
+/// Height (cells) of the perimeter wall above the slab: `24` cells = `6 m`.
+pub const G4_YARD_WALL_HEIGHT_CELLS: i64 = 24;
+
+/// The integrated world's terrain: a bounded `256 x 128 x 256 m` volume holding
+/// only the `384 x 224 x 4` ground slab (`344,064` solid cells) in a resident
+/// air envelope one brick tall.
+pub fn g4_integrated_scene(id: VolumeId) -> Volume {
+    let bounds = BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(31, 15, 31))
+        .expect("valid G4 world bounds");
+    let mut v = Volume::bounded(id, CellSizeCode::Quarter, bounds);
+    for x in 0..G4_YARD_WIDTH_CELLS / 32 {
+        for z in 0..G4_YARD_DEPTH_CELLS / 32 {
+            v.insert_brick(
+                BrickCoord::new(x, 0, z),
+                Brick::uniform(MaterialId::AIR, Revision(1)),
+            )
+            .expect("g4 ground air envelope");
+        }
+    }
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(
+            G4_YARD_WIDTH_CELLS - 1,
+            G4_YARD_GROUND_TOP_CELL,
+            G4_YARD_DEPTH_CELLS - 1,
+        ),
+        STONE,
+    ))
+    .expect("g4 ground slab");
+    // Perimeter wall (1 m thick, 6 m tall): split debris leaves a body with a
+    // few m/s of sideways speed, and the first census found 229 rubble bodies
+    // (and one agitated body) walking off the slab edge into the void, awake
+    // forever. The wall keeps every body on the slab; it is terrain, so solid
+    // matter is conserved and durable.
+    let top = G4_YARD_GROUND_TOP_CELL + 1;
+    let (w, d, h) = (
+        G4_YARD_WIDTH_CELLS,
+        G4_YARD_DEPTH_CELLS,
+        G4_YARD_WALL_HEIGHT_CELLS,
+    );
+    for (a, b) in [
+        ([0, top, 0], [w - 1, top + h - 1, 3]),
+        ([0, top, d - 4], [w - 1, top + h - 1, d - 1]),
+        ([0, top, 0], [3, top + h - 1, d - 1]),
+        ([w - 4, top, 0], [w - 1, top + h - 1, d - 1]),
+    ] {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(a[0], a[1], a[2]),
+            GlobalCell::new(b[0], b[1], b[2]),
+            STONE,
+        ))
+        .expect("g4 perimeter wall");
+    }
+    v
+}
+
+/// The *terrain-edit scale* fixture: the same ground slab plus a pillar field, a
+/// tower field, and the 64-brick giant as **terrain**, filling the engine's
+/// 8,388,608-cell occupancy budget (`384 x 224 x 96`). It exists only to
+/// measure what a terrain commit costs at yard scale; the networked workload
+/// does not use it. Solid cells: ground `344,064`; `1,150` pillars (`2 x 2 x
+/// 88`) `404,800`; `60` towers (`8 x 8 x 88`) `337,920`; giant block `8 x 2 x 4`
+/// bricks `2,097,152` plus its column.
+pub fn g4_full_yard_terrain_scene(id: VolumeId) -> Volume {
+    let bounds = BrickBounds::new(BrickCoord::new(0, 0, 0), BrickCoord::new(31, 15, 31))
+        .expect("valid G4 world bounds");
+    let mut v = Volume::bounded(id, CellSizeCode::Quarter, bounds);
+    for x in 0..G4_YARD_WIDTH_CELLS / 32 {
+        for y in 0..3 {
+            for z in 0..G4_YARD_DEPTH_CELLS / 32 {
+                v.insert_brick(
+                    BrickCoord::new(x, y, z),
+                    Brick::uniform(MaterialId::AIR, Revision(1)),
+                )
+                .expect("air envelope");
+            }
+        }
+    }
+    let solid = |v: &mut Volume, a: [i64; 3], b: [i64; 3]| {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(a[0], a[1], a[2]),
+            GlobalCell::new(b[0], b[1], b[2]),
+            STONE,
+        ))
+        .expect("solid box");
+    };
+    solid(
+        &mut v,
+        [0, 0, 0],
+        [
+            G4_YARD_WIDTH_CELLS - 1,
+            G4_YARD_GROUND_TOP_CELL,
+            G4_YARD_DEPTH_CELLS - 1,
+        ],
+    );
+    for col in 0..50 {
+        for row in 0..23 {
+            let (x, z) = (4 + col * 4, 4 + row * 4);
+            solid(&mut v, [x, 4, z], [x + 1, 91, z + 1]);
+        }
+    }
+    for col in 0..10 {
+        for row in 0..6 {
+            let (x, z) = (212 + col * 12, 12 + row * 12);
+            solid(&mut v, [x, 4, z], [x + 7, 91, z + 7]);
+        }
+    }
+    solid(&mut v, [131, 4, 99], [132, 31, 100]);
+    for bx in 0..8 {
+        for by in 0..2 {
+            for bz in 0..4 {
+                v.insert_brick(
+                    BrickCoord::new(4 + bx, 1 + by, 3 + bz),
+                    Brick::uniform(STONE, Revision(1)),
+                )
+                .expect("giant block brick");
+            }
+        }
+    }
+    v
+}
+
+// --- Destructible bodies -------------------------------------------------------
+//
+// Every destructible stands on the ground slab (never in the air): a split
+// child inherits its parent's velocity, and floating stacks that woke and
+// tumbled threw rubble out over the yard edge (measured: 229 bodies lost).
+
+/// Combs: a `16 x 16 x 2` plate carrying an `8 x 8` grid of `1 x 1 x 40` poles
+/// (`y 2..=41`, `10 m`) at a `2`-cell pitch (cells `x, z = 1, 3, ..., 15`). Each
+/// pole is cut **top-down** every 5 cells with a radius-1 cut
+/// (`y = 38, 33, ..., 3`, [`G4_COMB_LEVELS`] cuts); each cut severs the pole and
+/// the segment above detaches as one small rubble body, while the plate and the
+/// remaining pole keep standing. `36 x 64 x 8 = 18,432` distinct cuts from
+/// `576 m^2` of ground (a tooth-per-comb design needed ~4,500 m^2).
+pub const G4_COMB_COUNT: usize = 36;
+pub const G4_COMB_TEETH_PER_SIDE: i64 = 8;
+pub const G4_COMB_LEVELS: i64 = 8;
+pub const G4_COMB_CUT_RADIUS_CELLS: i64 = 1;
+/// Ordinary comb cuts the combs supply: `36 x 64 x 8 = 18,432`.
+pub const fn g4_comb_cut_capacity() -> i64 {
+    G4_COMB_COUNT as i64 * G4_COMB_TEETH_PER_SIDE * G4_COMB_TEETH_PER_SIDE * G4_COMB_LEVELS
+}
+
+/// A comb body volume.
+pub fn g4_comb_body(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(15, 1, 15),
+        STONE,
+    ))
+    .expect("comb plate");
+    for tx in 0..G4_COMB_TEETH_PER_SIDE {
+        for tz in 0..G4_COMB_TEETH_PER_SIDE {
+            let (x, z) = (1 + 2 * tx, 1 + 2 * tz);
+            v.apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(x, 2, z),
+                GlobalCell::new(x, 41, z),
+                STONE,
+            ))
+            .expect("comb pole");
+        }
+    }
+    v
+}
+
+/// Body-local cell of pole `pole` (`0..64`)'s cut at `level` (`0..8`, top-down).
+pub fn g4_comb_cut_cell(pole: i64, level: i64) -> [i64; 3] {
+    let (tx, tz) = (pole % G4_COMB_TEETH_PER_SIDE, pole / G4_COMB_TEETH_PER_SIDE);
+    [1 + 2 * tx, 38 - 5 * level, 1 + 2 * tz]
+}
+
+/// Towers (blast targets): a `16 x 16 x 2` plate under an `8 x 8` column
+/// (`x, z 4..=11`, `y 2..=89`, `22 m`). Three `r = 8` blasts (a `4 m` diameter)
+/// at `y = 74, 50, 26` each sever the shaft; the segment above detaches as one
+/// large rubble body: `60 x 3 = 180` named blasts from `960 m^2`.
+pub const G4_TOWER_COUNT: usize = 60;
+pub const G4_TOWER_BLASTS: i64 = 3;
+pub const G4_BLAST_RADIUS_CELLS: i64 = 8;
+
+/// A tower body volume.
+pub fn g4_tower_body(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(15, 1, 15),
+        STONE,
+    ))
+    .expect("tower plate");
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(4, 2, 4),
+        GlobalCell::new(11, 89, 11),
+        STONE,
+    ))
+    .expect("tower column");
+    v
+}
+
+/// The 64-brick connected structure, as one body: a `16 x 16 x 2` base plate, a
+/// slender `2 x 2` column (`y 2..=31`), and a `4 x 4 x 4` brick block
+/// (`x, z 0..=127`, `y 32..=159`, `2,097,152` uniform stone cells) held up by
+/// the column alone. A radius-3 cut at [`G4_GIANT_CUT_CELL`] severs the column.
+pub const G4_GIANT_CUT_CELL: [i64; 3] = [63, 16, 63];
+pub const G4_GIANT_CUT_RADIUS_CELLS: i64 = 3;
+
+/// The giant body volume.
+pub fn g4_giant_body(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    // Plate and column live in brick row y = 0 (block bricks start at row 1):
+    // insert the resident air first, as `giant_collapse_scene` does, so every
+    // brick in the body's solid bounding box is resident.
+    for bx in 0..4 {
+        for bz in 0..4 {
+            v.insert_brick(
+                BrickCoord::new(bx, 0, bz),
+                Brick::uniform(MaterialId::AIR, Revision(1)),
+            )
+            .expect("giant air row");
+        }
+    }
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(56, 0, 56),
+        GlobalCell::new(71, 1, 71),
+        STONE,
+    ))
+    .expect("giant plate");
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(63, 2, 63),
+        GlobalCell::new(64, 31, 64),
+        STONE,
+    ))
+    .expect("giant column");
+    for bx in 0..4 {
+        for by in 1..5 {
+            for bz in 0..4 {
+                v.insert_brick(
+                    BrickCoord::new(bx, by, bz),
+                    Brick::uniform(STONE, Revision(1)),
+                )
+                .expect("giant block brick");
+            }
+        }
+    }
+    v
+}
+
+/// Entity id of the first body the integrated scene spawns (the giant); combs,
+/// towers, then debris follow consecutively. Asserted against the real registry
+/// in `crates/spall_sim/tests/g4_integrated.rs`.
+pub const G4_ENTITY_FIRST: u64 = 1;
+
+/// Entity id (raw) of comb `c` (`0..G4_COMB_COUNT`).
+pub const fn g4_comb_entity(c: u64) -> u64 {
+    G4_ENTITY_FIRST + 1 + c
+}
+
+/// Entity id (raw) of tower `t` (`0..G4_TOWER_COUNT`).
+pub const fn g4_tower_entity(t: u64) -> u64 {
+    G4_ENTITY_FIRST + 1 + G4_COMB_COUNT as u64 + t
+}
+
+/// One scripted destructive edit against a persistent body: which body (raw
+/// entity id), the body-local cell, and the brush radius in cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct G4BodyEdit {
+    pub entity: u64,
+    pub cell: [i64; 3],
+    pub radius: i64,
+}
+
+/// The `index`-th ordinary comb edit. Level-major (`index / (combs * 64)` is the
+/// top-down level), and within a level a bijective stride-7 walk over all
+/// `combs x 64` poles so consecutive edits hit different combs. `None` once every
+/// pole of every comb is spent.
+pub fn g4_ordinary_edit(index: u64) -> Option<G4BodyEdit> {
+    let poles = G4_COMB_COUNT as u64 * (G4_COMB_TEETH_PER_SIDE * G4_COMB_TEETH_PER_SIDE) as u64;
+    let level = (index / poles) as i64;
+    if level >= G4_COMB_LEVELS {
+        return None;
+    }
+    // gcd(7, 36 * 64) = 1: every pole once per level.
+    let p = (index % poles * 7) % poles;
+    let (comb, pole) = (p / 64, (p % 64) as i64);
+    Some(G4BodyEdit {
+        entity: g4_comb_entity(comb),
+        cell: g4_comb_cut_cell(pole, level),
+        radius: G4_COMB_CUT_RADIUS_CELLS,
+    })
+}
+
+/// The `index`-th named blast: level-major over the towers (top blast first).
+/// `None` past the last.
+pub fn g4_blast(index: u64) -> Option<G4BodyEdit> {
+    let towers = G4_TOWER_COUNT as u64;
+    let step = (index / towers) as i64;
+    if step >= G4_TOWER_BLASTS {
+        return None;
+    }
+    // gcd(7, 60) = 1.
+    let t = (index % towers * 7) % towers;
+    Some(G4BodyEdit {
+        entity: g4_tower_entity(t),
+        cell: [8, 74 - 24 * step, 8],
+        radius: G4_BLAST_RADIUS_CELLS,
+    })
+}
+
+/// The one 64-brick collapse.
+pub fn g4_giant_cut() -> G4BodyEdit {
+    G4BodyEdit {
+        entity: G4_ENTITY_FIRST,
+        cell: G4_GIANT_CUT_CELL,
+        radius: G4_GIANT_CUT_RADIUS_CELLS,
+    }
+}
+
+/// Terrain digs for the integrated workload's terrain share of ordinary edits:
+/// distinct radius-1 spheres at `y = 1` (a hole through the 4-cell slab), `2`
+/// cells apart, on two lanes of ground kept clear of every dormant body — a
+/// terrain edit within `4 m` hard-wakes dormant bodies (`Simulation::apply_dormancy`),
+/// and a dig in the sleeping block woke all 4,096 of them.
+///
+/// - lane A: `x 46..58 m`, `z 32..54.5 m` — between the sleeping block (`x <=
+///   41.3 m`) and the giant (`x >= 62 m`): `25 x 46 = 1,150` digs;
+/// - lane B: `x 2..28 m`, `z 46..54.5 m` — the west plaza's back strip: `53 x 18
+///   = 954` digs.
+pub const G4_TERRAIN_DIG_CAPACITY: i64 = 25 * 46 + 53 * 18;
+
+/// The `index`-th terrain dig: `(cell, radius)`, or `None` past both lanes.
+pub fn g4_terrain_dig(index: u64) -> Option<([i64; 3], i64)> {
+    if index >= G4_TERRAIN_DIG_CAPACITY as u64 {
+        return None;
+    }
+    let i = index as i64;
+    // Stride-11 walk (coprime with the capacity) so consecutive digs are far
+    // apart and every slot is used once.
+    let q = (i * 11) % G4_TERRAIN_DIG_CAPACITY;
+    let lane_a = 25 * 46;
+    let cell = if q < lane_a {
+        [184 + (q % 25) * 2, 1, 128 + (q / 25) * 2]
+    } else {
+        let r = q - lane_a;
+        [8 + (r % 53) * 2, 1, 184 + (r / 53) * 2]
+    };
+    Some((cell, 1))
 }

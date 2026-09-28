@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use spall_protocol::{
-    InputFrame, MotionSnapshot, Record, SessionId, WireTag, decode_datagram, encode_datagram,
+    InputFrame, MotionSnapshot, PlayerId, Record, SessionId, WireTag, decode_datagram,
+    encode_datagram,
 };
 
 use crate::config::TransportConfig;
@@ -85,6 +86,7 @@ pub struct Connection {
     cfg: TransportConfig,
     role: Role,
     session: SessionId,
+    player_id: Option<PlayerId>,
 
     ctrl_send: Mutex<quinn::SendStream>,
     ctrl_recv: Mutex<CtrlRecv>,
@@ -103,6 +105,13 @@ pub struct Connection {
     bulk_open: Arc<AtomicU32>,
 
     stats: Arc<ConnStats>,
+
+    /// The `reason` of the last `Bye` received on the control stream, if any.
+    /// `recv_record` returns `Ok(None)` for both a received `Bye` and a plain
+    /// stream close, so a caller that needs to tell those apart (e.g. a bounded
+    /// server-initiated disconnect vs. a peer that just vanished) reads this
+    /// after seeing `Ok(None)`.
+    bye_reason: std::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -126,6 +135,7 @@ impl Connection {
         ctrl_recv: quinn::RecvStream,
         cfg: TransportConfig,
         session: SessionId,
+        player_id: Option<PlayerId>,
         role: Role,
     ) -> Result<Self> {
         if quic.max_datagram_size().is_none() {
@@ -139,6 +149,7 @@ impl Connection {
             cfg,
             role,
             session,
+            player_id,
             ctrl_send: Mutex::new(ctrl_send),
             ctrl_recv: Mutex::new(CtrlRecv {
                 stream: ctrl_recv,
@@ -151,12 +162,20 @@ impl Connection {
             last_control_seen: Mutex::new(Instant::now()),
             bulk_open: Arc::new(AtomicU32::new(0)),
             stats: Arc::new(ConnStats::default()),
+            bye_reason: std::sync::Mutex::new(None),
         })
     }
 
     /// The session id assigned by the server during authentication.
     pub fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// Server-authenticated stable player principal, if this connection used
+    /// a per-player credential. Legacy shared-token connections have no
+    /// principal and must not be used for durable player-owned state.
+    pub fn player_id(&self) -> Option<PlayerId> {
+        self.player_id
     }
 
     /// Server or client end.
@@ -183,9 +202,26 @@ impl Connection {
         self.quic.stats()
     }
 
+    /// Quinn's current transport round-trip estimate, independent of
+    /// application work such as a server-scheduled input boundary.
+    pub fn rtt(&self) -> Duration {
+        self.quic.rtt()
+    }
+
     /// Shared counter handle, for a spawned pump that wants to record bytes.
     pub fn stats_handle(&self) -> Arc<ConnStats> {
         self.stats.clone()
+    }
+
+    /// The `reason` string of the last `Bye` this end received on the control
+    /// stream, if any has arrived yet. Set the moment `recv_record` decodes a
+    /// `Bye` (before it returns `Ok(None)`), so it is available to a caller
+    /// that just saw its control-record loop end.
+    pub fn bye_reason(&self) -> Option<String> {
+        self.bye_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     // --- control stream ----------------------------------------------------
@@ -240,7 +276,10 @@ impl Connection {
                 NetMessage::Heartbeat { seq } => {
                     recv.peer_heartbeat_seq = seq;
                 }
-                NetMessage::Bye { .. } => return Ok(None),
+                NetMessage::Bye { reason } => {
+                    *self.bye_reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+                    return Ok(None);
+                }
                 NetMessage::Record { seq, record } => {
                     match self.ctrl_dedup.lock().await.admit(seq) {
                         DedupVerdict::Accept { .. } => {
@@ -256,7 +295,29 @@ impl Connection {
         }
     }
 
-    /// Sends a `Bye` then finishes the control send stream.
+    /// `say_bye` reason for an ordinary end of session (the server closing
+    /// every connection at run end, or a client leaving on its own).
+    pub const BYE_REASON_COMPLETE: &'static str = "server complete";
+    /// `say_bye` reason for a server-initiated disconnect of a joining client
+    /// whose catch-up queue kept overflowing past `max_join_retries` (T23 / G3
+    /// row 10): a *bounded, explicit* give-up, distinct on the wire from an
+    /// ordinary shutdown so the disconnected client can report a bounded
+    /// failure instead of silently keeping its stale pre-catch-up state.
+    pub const BYE_REASON_CATCH_UP_EXHAUSTED: &'static str = "catch-up exhausted";
+    /// `say_bye` reason for refusing a joining client whose world needs a segmented baseline
+    /// the client did not advertise support for: an explicit, bounded failure, never a partial world.
+    pub const BYE_REASON_BASELINE_UNSUPPORTED: &'static str =
+        "baseline requires segmented transfer support";
+
+    /// Sends a `Bye` then finishes the control send stream. Waits briefly
+    /// (bounded) for the peer to acknowledge receipt before returning.
+    ///
+    /// `finish()` alone only stops *sending* -- it does not wait for
+    /// delivery, so a caller that immediately tears down the whole QUIC
+    /// connection afterward (every current caller does exactly this) can
+    /// race the `Bye` away before the peer's `recv_record` ever sees it,
+    /// turning a deliberate, reasoned goodbye into an indistinguishable
+    /// "connection lost" on the other end (T23 / G3 row 10).
     pub async fn say_bye(&self, reason: &str) -> Result<()> {
         let bytes = NetMessage::Bye {
             reason: reason.to_string(),
@@ -265,7 +326,9 @@ impl Connection {
         .map_err(|e| TransportError::Frame(crate::framing::FrameError::Stream(e.to_string())))?;
         let mut send = self.ctrl_send.lock().await;
         write_framed(&mut send, &bytes, self.cfg.limits.max_control_record).await?;
+        let stopped = send.stopped();
         let _ = send.finish();
+        let _ = tokio::time::timeout(Duration::from_secs(2), stopped).await;
         Ok(())
     }
 
@@ -434,6 +497,9 @@ impl Connection {
             cap: self.cfg.limits.max_bulk_part,
             assembled_cap: self.cfg.limits.max_assembled_transfer,
             _open: guard,
+            assembled: 0,
+            transfer: None,
+            next_part_index: 0,
         })
     }
 
@@ -501,8 +567,19 @@ impl Connection {
                         let mut s = self.ctrl_send.lock().await;
                         write_framed(&mut s, &bytes, self.cfg.limits.max_control_record).await
                     };
+                    // T23 / G3 row 11: bound the write by `idle_timeout`, not
+                    // `heartbeat_interval`. A heartbeat shares its connection's
+                    // congestion/flow-control budget with real application
+                    // traffic (a baseline transfer in particular); on a
+                    // bandwidth-capped link that traffic can legitimately keep
+                    // this write pending well past one `heartbeat_interval`
+                    // without the peer being unresponsive. `idle_timeout` is
+                    // already this connection's considered answer to "how long
+                    // is silence tolerated" -- reusing it here means a slow-but-
+                    // progressing write is never treated as a dead peer sooner
+                    // than genuine silence would be.
                     let sent = tokio::select! {
-                        result = tokio::time::timeout(self.cfg.heartbeat_interval, write) => result,
+                        result = tokio::time::timeout(self.cfg.idle_timeout, write) => result,
                         _ = stop.changed() => {
                             self.quic.close(0u32.into(), b"liveness stopped during write");
                             break;
@@ -561,6 +638,12 @@ impl Connection {
     /// True until the QUIC connection has closed.
     pub fn is_alive(&self) -> bool {
         self.quic.close_reason().is_none()
+    }
+
+    /// Why the QUIC connection closed (idle timeout, peer application close with its
+    /// reason bytes, reset, ...), or `None` while it is still open. Diagnostic only.
+    pub fn close_reason(&self) -> Option<String> {
+        self.quic.close_reason().map(|e| e.to_string())
     }
 
     /// Closes the connection with an application code.
@@ -686,82 +769,92 @@ pub struct BulkRecv {
     cap: usize,
     assembled_cap: usize,
     _open: BulkGuard,
+    /// Streaming state shared by [`Self::next_part`] and [`Self::collect_parts`].
+    assembled: usize,
+    transfer: Option<spall_protocol::TransferId>,
+    next_part_index: u32,
 }
 
 impl BulkRecv {
-    /// Reads framed parts until the stream ends, enforcing both the per-part
-    /// and the assembled-transfer limits. A transfer that would exceed
-    /// `max_assembled_transfer` is refused without buffering the overflow.
-    pub async fn collect_parts(mut self) -> Result<Vec<spall_protocol::BaselinePart>> {
-        let mut parts = Vec::new();
-        let mut assembled = 0usize;
-        let mut transfer = None;
-        let mut next_part_index = 0u32;
-        while let Some(bytes) = read_framed(
+    /// Reads the next framed part, enforcing the per-part and assembled-transfer limits, part
+    /// order, transfer id and part hash. `Ok(None)` when the stream ended cleanly. A transfer that
+    /// would exceed `max_assembled_transfer` is refused without buffering the overflow. Lets a
+    /// receiver process a transfer piece by piece without holding every part.
+    pub async fn next_part(&mut self) -> Result<Option<spall_protocol::BaselinePart>> {
+        let Some(bytes) = read_framed(
             &mut self.stream,
             self.cap + spall_protocol::codec::BULK_FRAME_OVERHEAD,
         )
         .await?
-        {
-            self.stats
-                .app_bytes_recv
-                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            if parts.len() >= spall_protocol::limits::MAX_BASELINE_PARTS {
-                return Err(TransportError::Frame(
-                    crate::framing::FrameError::BulkPartCount {
-                        limit: spall_protocol::limits::MAX_BASELINE_PARTS,
-                    },
-                ));
-            }
-            let part = spall_protocol::decode_bulk(&bytes).map_err(|e| {
-                TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
-            })?;
-            if part.payload.len() > self.cap {
-                return Err(TransportError::Frame(
-                    crate::framing::FrameError::Oversize {
-                        declared: part.payload.len(),
-                        limit: self.cap,
-                    },
-                ));
-            }
-            assembled = assembled.saturating_add(part.payload.len());
-            if assembled > self.assembled_cap {
-                return Err(TransportError::Frame(
-                    crate::framing::FrameError::Oversize {
-                        declared: assembled,
-                        limit: self.assembled_cap,
-                    },
-                ));
-            }
-            if let Some(expected) = transfer {
-                if part.transfer_id != expected {
-                    return Err(TransportError::Frame(
-                        crate::framing::FrameError::TransferMismatch,
-                    ));
-                }
-            } else {
-                transfer = Some(part.transfer_id);
-            }
-            if part.part_index != next_part_index {
-                return Err(TransportError::Frame(
-                    crate::framing::FrameError::PartOrder {
-                        expected: next_part_index,
-                        found: part.part_index,
-                    },
-                ));
-            }
-            if part.part_hash != spall_protocol::Hash32::of(&part.payload) {
-                return Err(TransportError::Frame(
-                    crate::framing::FrameError::PartHashMismatch {
-                        index: part.part_index,
-                    },
-                ));
-            }
-            next_part_index = next_part_index.checked_add(1).ok_or({
-                TransportError::Frame(crate::framing::FrameError::BulkPartCount {
+        else {
+            return Ok(None);
+        };
+        self.stats
+            .app_bytes_recv
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if self.next_part_index as usize >= spall_protocol::limits::MAX_BASELINE_PARTS {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::BulkPartCount {
                     limit: spall_protocol::limits::MAX_BASELINE_PARTS,
-                })
-            })?;
+                },
+            ));
+        }
+        let part = spall_protocol::decode_bulk(&bytes).map_err(|e| {
+            TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
+        })?;
+        if part.payload.len() > self.cap {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::Oversize {
+                    declared: part.payload.len(),
+                    limit: self.cap,
+                },
+            ));
+        }
+        self.assembled = self.assembled.saturating_add(part.payload.len());
+        if self.assembled > self.assembled_cap {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::Oversize {
+                    declared: self.assembled,
+                    limit: self.assembled_cap,
+                },
+            ));
+        }
+        if let Some(expected) = self.transfer {
+            if part.transfer_id != expected {
+                return Err(TransportError::Frame(
+                    crate::framing::FrameError::TransferMismatch,
+                ));
+            }
+        } else {
+            self.transfer = Some(part.transfer_id);
+        }
+        if part.part_index != self.next_part_index {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::PartOrder {
+                    expected: self.next_part_index,
+                    found: part.part_index,
+                },
+            ));
+        }
+        if part.part_hash != spall_protocol::Hash32::of(&part.payload) {
+            return Err(TransportError::Frame(
+                crate::framing::FrameError::PartHashMismatch {
+                    index: part.part_index,
+                },
+            ));
+        }
+        self.next_part_index = self.next_part_index.checked_add(1).ok_or({
+            TransportError::Frame(crate::framing::FrameError::BulkPartCount {
+                limit: spall_protocol::limits::MAX_BASELINE_PARTS,
+            })
+        })?;
+        Ok(Some(part))
+    }
+
+    /// Reads framed parts until the stream ends (see [`Self::next_part`] for the checks).
+    pub async fn collect_parts(mut self) -> Result<Vec<spall_protocol::BaselinePart>> {
+        let mut parts = Vec::new();
+        while let Some(part) = self.next_part().await? {
             parts.push(part);
         }
         Ok(parts)

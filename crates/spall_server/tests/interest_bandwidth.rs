@@ -55,6 +55,7 @@ fn base_config(
     ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 300,
         quiescence_ticks: 30,
@@ -72,13 +73,18 @@ fn base_config(
         seed: 0,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        capture_workers: spall_server::serve::default_capture_workers(),
         dev_unvalidated_actions: true,
         save_faults: None,
         await_body_settle: false,
         motion_interest: Some(motion_interest),
         residency: None,
+        residency_disk_path: None,
         contact_damage: None,
         dormancy: None,
+        timing_window: None,
+        credential_registry_file: None,
+        custom_world: None,
     }
 }
 
@@ -109,6 +115,7 @@ fn column_cut_client(
         client_residency: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     }
 }
 

@@ -6,7 +6,7 @@
 //! That keeps disk and network runtimes out of voxel algorithms while giving both
 //! hosts identical budget, hysteresis, and collision-readiness rules.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use spall_core::{BrickCoord, CellSizeCode, GlobalCell, Revision, VolumeId};
 
@@ -88,6 +88,7 @@ pub struct ResidencyPlan {
 pub struct ResidencyCache {
     budget: CacheBudget,
     entries: BTreeMap<BrickCacheKey, Entry>,
+    explicit_interest: BTreeMap<VolumeId, BTreeSet<BrickCoord>>,
     clock: u64,
 }
 
@@ -96,6 +97,7 @@ impl ResidencyCache {
         Self {
             budget,
             entries: BTreeMap::new(),
+            explicit_interest: BTreeMap::new(),
             clock: 0,
         }
     }
@@ -136,7 +138,10 @@ impl ResidencyCache {
                 revision,
                 dense_bytes,
                 last_used: self.clock,
-                interested: prior.is_some_and(|e| e.interested),
+                interested: self.explicit_interest.get(&key.volume).map_or_else(
+                    || prior.is_some_and(|e| e.interested),
+                    |set| set.contains(&key.coord),
+                ),
                 dirty: prior.is_some_and(|e| e.dirty && e.revision == revision) || !durable,
                 durable_revision: if durable {
                     Some(revision)
@@ -197,6 +202,7 @@ impl ResidencyCache {
     /// Refresh interest for one volume. Existing entries inside `enter` are
     /// touched; entries already interested remain so through `retain`.
     pub fn update_interest(&mut self, volume: VolumeId, center: BrickCoord, radii: InterestRadii) {
+        self.explicit_interest.remove(&volume);
         self.clock = self.clock.saturating_add(1);
         for (key, entry) in &mut self.entries {
             if key.volume != volume {
@@ -207,6 +213,28 @@ impl ResidencyCache {
                 || (entry.interested && distance <= radii.retain as u64);
             entry.interested = interested;
             if distance <= radii.enter as u64 {
+                entry.last_used = self.clock;
+            }
+        }
+    }
+
+    /// Replaces interest for one volume with an explicit brick set. Region
+    /// selectors can use this after applying their own hysteresis at a coarser
+    /// granularity. Listed resident bricks are touched for LRU purposes.
+    pub fn update_interest_set(
+        &mut self,
+        volume: VolumeId,
+        coords: impl IntoIterator<Item = BrickCoord>,
+    ) {
+        self.clock = self.clock.saturating_add(1);
+        let coords: BTreeSet<_> = coords.into_iter().collect();
+        self.explicit_interest.insert(volume, coords.clone());
+        for (key, entry) in &mut self.entries {
+            if key.volume != volume {
+                continue;
+            }
+            entry.interested = coords.contains(&key.coord);
+            if entry.interested {
                 entry.last_used = self.clock;
             }
         }

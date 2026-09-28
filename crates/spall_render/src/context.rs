@@ -19,6 +19,8 @@ pub enum RenderError {
     Device(#[from] wgpu::RequestDeviceError),
     #[error("GPU work failed: {0}")]
     Gpu(String),
+    #[error("waiting for GPU work failed: {0}")]
+    Poll(#[from] wgpu::PollError),
     #[error("mesh upload of {bytes} B exceeds the {budget} B budget")]
     UploadBudgetExceeded { bytes: u64, budget: u64 },
     #[error("readback buffer mapping failed")]
@@ -32,43 +34,79 @@ pub enum RenderError {
 }
 
 impl RenderContext {
+    /// Acquire the engine GPU device for a host-owned presentation surface.
+    /// The caller retains window/surface lifetime and presentation policy;
+    /// Spall retains device/queue ownership so tools can compose their UI over
+    /// an engine-rendered frame without creating a second GPU device.
+    pub fn for_surface(
+        instance: &wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+    ) -> Result<(Self, wgpu::SurfaceCapabilities), RenderError> {
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: Some(surface),
+            ..Default::default()
+        }))
+        .map_err(|_| RenderError::NoAdapter)?;
+        let capabilities = surface.get_capabilities(&adapter);
+        // Surface-backed applications should be able to render at native
+        // display resolutions. Keep the conservative downlevel baseline for
+        // other limits, but expose the adapter's real 2D texture cap instead
+        // of silently imposing the default 2048-pixel limit.
+        let mut surface_limits = wgpu::Limits::downlevel_defaults();
+        surface_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+        let context = Self::from_adapter(adapter, "spall-render-surface", surface_limits)?;
+        Ok((context, capabilities))
+    }
+
     /// Acquire a headless device. Returns [`RenderError::NoAdapter`] when the
     /// host has no usable GPU — the caller maps that to the "missing
     /// environment capability" exit code.
     pub fn headless() -> Result<Self, RenderError> {
         let requested_backends = match std::env::var("SPALL_WGPU_BACKEND").as_deref() {
             Ok("dx12") => wgpu::Backends::DX12,
-            Ok("vulkan") => {
-                // The pinned wgpu 24 / naga 24 Vulkan path crashes the NVIDIA
-                // Windows driver (STATUS_ACCESS_VIOLATION) while compiling this
-                // renderer's pipelines — before any draw. D3D12 with the
-                // identical shaders is unaffected and is the accepted default.
-                // Diagnosis and the regression probe: docs/reports/ENG-60.md.
-                if cfg!(target_os = "windows") {
-                    eprintln!(
-                        "spall_render: SPALL_WGPU_BACKEND=vulkan forces a Windows backend that \
-                         crashes NVIDIA's driver during pipeline compilation (ENG-60); \
-                         unset it to use the supported D3D12 path."
-                    );
-                }
-                wgpu::Backends::VULKAN
-            }
-            // D3D12 is the stable native baseline on Windows; see the comment
+            // ENG-60 (fixed): the pinned wgpu 24 / naga 24 Vulkan path used to
+            // crash the NVIDIA Windows driver (STATUS_ACCESS_VIOLATION) while
+            // compiling `create_tone_pipeline` — a naga/driver defect in how a
+            // vertex shader's dynamically-indexed `array<vec2<f32>, N>`
+            // fullscreen-triangle table interacted with a fragment-stage
+            // uniform-buffer read, not a resource/binding bug in this crate.
+            // `shaders/tonemap.wgsl` now generates that position with index
+            // arithmetic instead, and the full `capture_gpu` suite plus a
+            // 1920x1080 six-view capture pass on both backends with
+            // pixel-identical (max abs diff 1/255) output. Vulkan is an
+            // accepted backend again; D3D12 stays the Windows default only
+            // because nothing required changing it. See docs/reports/ENG-60.md.
+            Ok("vulkan") => wgpu::Backends::VULKAN,
+            // D3D12 is the stable native default on Windows; see the comment
             // above and docs/reports/ENG-60.md.
             _ if cfg!(target_os = "windows") => wgpu::Backends::DX12,
             _ => wgpu::Backends::all(),
         };
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: requested_backends,
-            ..Default::default()
-        });
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = requested_backends;
+        let instance = wgpu::Instance::new(descriptor);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: None,
+            ..Default::default()
         }))
-        .ok_or(RenderError::NoAdapter)?;
+        .map_err(|_| RenderError::NoAdapter)?;
 
+        Self::from_adapter(
+            adapter,
+            "spall-render-headless",
+            wgpu::Limits::downlevel_defaults(),
+        )
+    }
+
+    fn from_adapter(
+        adapter: wgpu::Adapter,
+        label: &str,
+        required_limits: wgpu::Limits,
+    ) -> Result<Self, RenderError> {
         // Opt into render-pass timestamp queries when (and only when) the adapter
         // reports support. Where they are unavailable the capture path reports
         // GPU timing as unavailable rather than substituting a CPU figure.
@@ -82,15 +120,14 @@ impl RenderContext {
             wgpu::Features::empty()
         };
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("spall-render-headless"),
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some(label),
                 required_features,
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))?;
+                ..Default::default()
+            }))?;
 
         Ok(Self {
             device,
@@ -121,7 +158,8 @@ impl RenderContext {
     }
 
     /// Block until every submitted GPU command has completed.
-    pub fn wait(&self) {
-        self.device.poll(wgpu::Maintain::Wait);
+    pub fn wait(&self) -> Result<(), RenderError> {
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        Ok(())
     }
 }

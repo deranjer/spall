@@ -84,6 +84,98 @@ pub fn stone_manifest() -> MaterialManifest {
     .expect("hand-built manifest is valid")
 }
 
+// --- playground (interactive `cargo xtask play --scene playground`) ------
+//
+// Not a gate fixture: this manifest exists purely to make the hands-on
+// playground scene visually varied ("spice things up" -- every material in
+// `stone_manifest()` above renders the same flat grey `albedo`, `dirt`
+// included). Kept entirely separate from `stone_manifest()` so no existing
+// pinned fixture hash or gate scenario is affected.
+
+fn coloured_material(id: u16, name: &str, density: f32, albedo: [f32; 3]) -> MaterialDef {
+    MaterialDef {
+        id: MaterialId(id),
+        name: name.into(),
+        render: RenderProps {
+            albedo,
+            roughness: 0.85,
+            metalness: 0.0,
+            emissive: [0.0; 3],
+        },
+        sim: SimProps {
+            density_kg_m3: density,
+            friction: 0.8,
+            restitution: 0.15,
+            hardness: 4.0,
+            bond_strength: 12.0,
+            flags: MaterialFlags(
+                MaterialFlags::OPAQUE.0 | MaterialFlags::COLLIDES.0 | MaterialFlags::STRUCTURAL.0,
+            ),
+        },
+    }
+}
+
+/// Playground grass (plaza floor primary tile), id 10.
+pub const PLAYGROUND_GRASS: MaterialId = MaterialId(10);
+/// Playground loam (plaza floor secondary/checkerboard tile), id 11.
+pub const PLAYGROUND_LOAM: MaterialId = MaterialId(11);
+/// Playground brick (stairs), id 12.
+pub const PLAYGROUND_BRICK: MaterialId = MaterialId(12);
+/// Playground sandstone (maze walls), id 13.
+pub const PLAYGROUND_SANDSTONE: MaterialId = MaterialId(13);
+/// Playground slate (jump-course platforms), id 14.
+pub const PLAYGROUND_SLATE: MaterialId = MaterialId(14);
+/// Debris red, id 15.
+pub const DEBRIS_RED: MaterialId = MaterialId(15);
+/// Debris orange, id 16.
+pub const DEBRIS_ORANGE: MaterialId = MaterialId(16);
+/// Debris yellow, id 17.
+pub const DEBRIS_YELLOW: MaterialId = MaterialId(17);
+/// Debris green, id 18.
+pub const DEBRIS_GREEN: MaterialId = MaterialId(18);
+/// Debris blue, id 19.
+pub const DEBRIS_BLUE: MaterialId = MaterialId(19);
+/// Debris purple, id 20.
+pub const DEBRIS_PURPLE: MaterialId = MaterialId(20);
+
+/// Every non-debris, non-air material [`crate::fixtures::playground_scene`]
+/// paints the terrain with, plus a bright palette [`crate::playground`]'s
+/// spawner picks a random material from for each dropped body.
+pub fn playground_manifest() -> MaterialManifest {
+    MaterialManifest::validated(vec![
+        MaterialDef {
+            id: MaterialId::AIR,
+            name: "air".into(),
+            render: RenderProps {
+                albedo: [0.0; 3],
+                roughness: 1.0,
+                metalness: 0.0,
+                emissive: [0.0; 3],
+            },
+            sim: SimProps {
+                density_kg_m3: 0.0,
+                friction: 0.0,
+                restitution: 0.0,
+                hardness: 0.0,
+                bond_strength: 0.0,
+                flags: MaterialFlags::NONE,
+            },
+        },
+        coloured_material(10, "grass", 1200.0, [0.25, 0.55, 0.2]),
+        coloured_material(11, "loam", 1400.0, [0.4, 0.28, 0.15]),
+        coloured_material(12, "brick", 2000.0, [0.65, 0.25, 0.18]),
+        coloured_material(13, "sandstone", 2200.0, [0.82, 0.7, 0.45]),
+        coloured_material(14, "slate", 2400.0, [0.35, 0.38, 0.42]),
+        coloured_material(15, "debris-red", 2000.0, [0.85, 0.15, 0.15]),
+        coloured_material(16, "debris-orange", 2000.0, [0.9, 0.5, 0.1]),
+        coloured_material(17, "debris-yellow", 2000.0, [0.9, 0.85, 0.15]),
+        coloured_material(18, "debris-green", 2000.0, [0.2, 0.75, 0.3]),
+        coloured_material(19, "debris-blue", 2000.0, [0.2, 0.4, 0.9]),
+        coloured_material(20, "debris-purple", 2000.0, [0.6, 0.25, 0.8]),
+    ])
+    .expect("hand-built manifest is valid")
+}
+
 fn box_plan(v: VolumeId, a: GlobalCell, b: GlobalCell, m: MaterialId) -> EditPlan {
     EditPlan::filled_box(v, a, b, m)
 }
@@ -212,6 +304,34 @@ pub const WALK_ARENA_SPAWNS: [[f64; 3]; 4] = [
     [1.0, 1.0, 3.0],
 ];
 
+/// The interactive playground (`cargo xtask play --scene playground`):
+/// [`spall_voxel::fixtures::playground_scene`]'s plaza / stairs / maze / jump
+/// course, plus [`crate::playground::PlaygroundSpawner`]'s drop zones spread
+/// across all four areas. Not a T23/G4 gate scene -- built for a hands-on
+/// feel, not reproducible evidence.
+pub fn playground_setup() -> WorldSetup {
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: spall_voxel::fixtures::playground_scene(id),
+        // Matches `playground_scene`'s own padded air envelope (see that
+        // function's doc comment for why `y` needs the `[-20, 50]` padding).
+        terrain_collider_region: (GlobalCell::new(0, -20, 0), GlobalCell::new(239, 50, 383)),
+        materials: playground_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: sim_physics_config(),
+    }
+}
+
+/// Feet spawn positions (metres) for [`playground_setup`] -- the plaza,
+/// clear of the checkerboard's edges. `y = 1.0 m` matches the plaza floor's
+/// top surface.
+pub const PLAYGROUND_SPAWNS: [[f64; 3]; 4] = [
+    [16.0, 1.0, 16.0],
+    [16.0, 1.0, 18.0],
+    [18.0, 1.0, 16.0],
+    [18.0, 1.0, 18.0],
+];
+
 /// The T11a / ENG-62 G1 full-workload world
 /// ([`spall_voxel::fixtures::g1_full_envelope_scene`]): the full
 /// `64 x 32 x 64 m` gate envelope with real, resident, walkable terrain
@@ -333,13 +453,14 @@ pub fn separated_regions_setup() -> WorldSetup {
 /// Feet spawn positions (metres) for [`separated_regions_setup`]; index is the
 /// player / connection slot. Even slots stand in the west region, odd slots in
 /// the east region (offset `+18 m` on `x` and `z`), so connected players start
-/// geographically separated. Floor top is `y = 1.0 m`; all positions clear the
-/// column footprint.
+/// geographically separated. Floor top is `y = 1.0 m`; the local `z = 1.6 m`
+/// offsets keep the standing capsules clear of the low beam (whose underside
+/// is at `y = 2.5 m`) while remaining on the floor.
 pub const SEPARATED_REGION_SPAWNS: [[f64; 3]; 4] = [
-    [1.0, 1.0, 1.0],
-    [18.5, 1.0, 18.5],
-    [2.0, 1.0, 1.5],
-    [19.25, 1.0, 18.0],
+    [1.0, 1.0, 1.6],
+    [18.5, 1.0, 19.6],
+    [2.0, 1.0, 1.6],
+    [19.25, 1.0, 19.6],
 ];
 
 /// The T23 / G3 **full-envelope** integrated-acceptance world
@@ -368,26 +489,22 @@ pub fn separated_regions_full_envelope_setup() -> WorldSetup {
 /// Feet spawn positions (metres) for [`separated_regions_full_envelope_setup`];
 /// index is the player / connection slot. Even slots stand in the west region;
 /// odd slots stand in the east region, `110 m` away on `x` alone (the region's
-/// own local layout is otherwise identical). Floor top is `y = 1.0 m`; all
-/// positions clear the column footprint.
+/// own local layout is otherwise identical). Floor top is `y = 1.0 m`; the
+/// local `z = 1.6 m` offsets keep standing capsules clear of the beam.
 ///
 /// Slot 0 (the scripted mover, [`fixtures/scenarios/t23-g3-full-envelope.json`])
-/// spawns at `x = 7.0 m` rather than the `x = 1.0 m` [`SEPARATED_REGION_SPAWNS`]
-/// uses — **not** the same local offset. A fresh authoritative player capsule
-/// spawned within roughly the first few metres of `x = 0` on *any* of this
-/// crate's bounded-volume fixtures (reproduced on the already-merged, unrelated
-/// [`separated_regions_setup`] too, with no terrain edit involved) does not
-/// respond to horizontal input for several hundred ticks after creation — a
-/// pre-existing defect in the shared T19 kinematic-character / collider-query
-/// path, not something this scene introduces, and out of scope to fix here.
-/// Spawning past that band (empirically, `x >= ~6.5 m`) sidesteps it cleanly;
-/// slot 2 (stationary, no script) is left at its original offset since a
-/// player that never receives non-neutral input is unaffected either way.
+/// spawns at `x = 7.0 m` because the full-envelope scenario drives it along a
+/// continuous causeway from west to east. All slots use a local `z = 1.6 m`
+/// offset so capsules spawned near the raised beam remain outside its
+/// footprint. The previous `z = 1.0 m` positions started capsules intersecting
+/// the beam; that overlap, rather than proximity to the world origin or a
+/// Rapier controller defect, caused the frozen movement in ENG-66's original
+/// repro.
 pub const SEPARATED_REGION_FAR_SPAWNS: [[f64; 3]; 4] = [
-    [7.0, 1.0, 1.0],
-    [111.0, 1.0, 1.0],
-    [2.0, 1.0, 1.5],
-    [112.0, 1.0, 1.5],
+    [7.0, 1.0, 1.6],
+    [111.0, 1.0, 1.6],
+    [2.0, 1.0, 1.6],
+    [112.0, 1.0, 1.6],
 ];
 
 /// Like [`bridged_terrain_setup`], but the whole scene is translated so its
@@ -627,18 +744,127 @@ pub const G4_WORKLOAD_SPAWNS: [[f64; 3]; 8] = [
     [20.0, 1.0, 20.0],
 ];
 
-/// The T23 / G4 eight-client workload world (row 12): identical terrain to
-/// [`separated_regions_setup`] — two independent collapsible bridge structures
-/// in one bounded `256 x 128 x 256 m` world. The workload's body population
-/// ([`spawn_g4_workload_bodies`]) is added separately after the [`Simulation`]
-/// is constructed: bodies are independent volumes placed by world-space
-/// transform, not terrain cells, so they need no additional terrain
-/// residency — the terrain footprint stays exactly the `separated-regions`
-/// scene.
+/// T23 / G4 workload (row 12) debris-landing floor, cell bounds. A stone slab
+/// well clear of [`separated_regions_scene`](spall_voxel::fixtures::separated_regions_scene)'s
+/// west and east regions *and* of the near-observer body cluster
+/// (`spawn_g4_workload_bodies` requires the near-observer sub-count to stay
+/// exactly 64 -- `G4_NEAR_OBSERVER_RADIUS_M`, `12 m`, from
+/// `G4_WORKLOAD_SPAWNS[0]` -- so this floor's nearest point must clear that
+/// radius with real margin). Added only by [`g4_workload_setup`]; it never
+/// touches `separated_regions_scene` itself, so every G3 fixture/scenario
+/// hash pinned against that scene (`fixture_digests_are_pinned`, the agreed
+/// `t23-g3*` hashes) stays exactly unchanged.
+///
+/// Gives the workload's non-near-observer active debris
+/// (`spawn_g4_workload_bodies`) real ground to land on and accumulate as
+/// rubble, inside the declared `256 x 128 x 256 m` envelope, instead of
+/// free-falling in open space hundreds of metres outside it (2026-09-18
+/// acceptance audit, finding 4: "the active debris falls into empty space
+/// ... despite the 256 m terrain envelope").
+///
+/// `separated_regions_scene`'s own resident air envelope only spans
+/// `x [0,95]` cells (`24 m`) -- not wide enough to place a floor `> 12 m`
+/// from the west observer *and* clear of the east region without the two
+/// clearances eating each other's margin in such a small box. So
+/// [`g4_workload_setup`] first extends the resident air envelope, air-filling
+/// only the *new* `x [96,255]` territory (`z`/`y` unchanged) so it never
+/// re-writes -- and so never erases -- `separated_regions_scene`'s own
+/// already-solid `x [0,95]` range, before adding this floor at
+/// `x [160,223]` -- comfortably far down that extension (`~40 m` from the
+/// west observer, `~15 m` clear of the east region's own `x` extent) and
+/// still entirely within `z [8, 71]` cells (`2-17.75 m`, clear of *both*
+/// regions regardless of `x`, since west only has solid cells at `z <= 7`
+/// and east only at `z >= 72`). The added envelope is one contiguous
+/// extension of the existing box (not a second disjoint region), so it costs
+/// one more (large but uniform, therefore cheap) `EditPlan::filled_box` air
+/// fill, not the giant per-cell walk that keeps the separate 64-brick
+/// collapse fixture (`giant_collapse_setup`) out of this scene.
+const G4_DEBRIS_ENVELOPE_MAX: GlobalCell = GlobalCell::new(255, 19, 79);
+const G4_DEBRIS_FLOOR_MIN: GlobalCell = GlobalCell::new(160, 0, 8);
+const G4_DEBRIS_FLOOR_MAX: GlobalCell = GlobalCell::new(223, 3, 71);
+
+/// World-space (metres) centre of [`G4_DEBRIS_FLOOR_MIN`]..=[`G4_DEBRIS_FLOOR_MAX`]'s
+/// top surface -- where [`spawn_g4_workload_bodies`] drops the
+/// non-near-observer active population. `y = 1.0 m` matches the west/east
+/// floors' own top-surface height (`separated_regions_scene`'s doc comment).
+const G4_DEBRIS_DROP_CENTRE: [f64; 3] = [47.875, 1.0, 9.875];
+
+/// A second, small stone floor dedicated to the near-observer active
+/// population -- its own dead ground, not shared with the tiny, already
+/// structure-filled west region floor (`~5.75 x 1.75 m`, holding the west
+/// column and beam too) or with the player capsule spawned at `observer`
+/// itself. Sits at `z [12, 43]` cells (`3.0-10.75 m`) -- clear of the west
+/// region's own solid cells, all of which are at `z <= 7` cells (`1.75 m`,
+/// `separated_regions_scene`'s doc comment) -- and entirely inside the
+/// resident air envelope that scene already fills (`x [0,95]`, `z [0,79]`,
+/// `y [0,19]` cells), so (like [`G4_DEBRIS_FLOOR_MIN`]) it costs one more
+/// small, cheap `EditPlan::filled_box` and no envelope extension.
+const G4_NEAR_FLOOR_MIN: GlobalCell = GlobalCell::new(0, 0, 12);
+const G4_NEAR_FLOOR_MAX: GlobalCell = GlobalCell::new(31, 3, 43);
+
+/// World-space (metres) centre of [`G4_NEAR_FLOOR_MIN`]..=[`G4_NEAR_FLOOR_MAX`]'s
+/// top surface -- where [`spawn_g4_workload_bodies`] drops the near-observer
+/// population. `~6.5 m` from `observer` -- comfortably inside
+/// `G4_NEAR_OBSERVER_RADIUS_M` (`12 m`) even at the flat grid's farthest
+/// corner (`~11.3 m`) -- and `y = 1.0 m` again matches the west/east floors'
+/// own top-surface height.
+const G4_NEAR_DROP_CENTRE: [f64; 3] = [3.875, 1.0, 6.875];
+
+/// The T23 / G4 eight-client workload world (row 12): [`separated_regions_setup`]'s
+/// terrain -- two independent collapsible bridge structures in one bounded
+/// `256 x 128 x 256 m` world -- plus an extended resident air envelope and
+/// one additional stone floor ([`G4_DEBRIS_FLOOR_MIN`]..=[`G4_DEBRIS_FLOOR_MAX`])
+/// for the workload's active debris population to land on
+/// ([`G4_DEBRIS_ENVELOPE_MAX`]'s doc comment explains why the floor cannot
+/// simply reuse `separated_regions_scene`'s existing envelope as-is). The
+/// workload's body population ([`spawn_g4_workload_bodies`]) is added
+/// separately after the [`Simulation`] is constructed: bodies are
+/// independent volumes placed by world-space transform, not terrain cells,
+/// so most of them need no additional terrain residency at all -- only the
+/// near-observer and remaining-active populations, which are actually
+/// simulated (not immediately dormant), need real ground under them to
+/// demonstrate real accumulation rather than an indefinite freefall.
 ///
 /// [`Simulation`]: crate::Simulation
 pub fn g4_workload_setup() -> WorldSetup {
-    separated_regions_setup()
+    let mut setup = separated_regions_setup();
+    let id = setup.terrain.id();
+    // The collider region must grow to cover the new debris floor too, or
+    // its solid cells would be resident terrain with no built collider at
+    // all -- debris would fall straight through it.
+    setup.terrain_collider_region.1 = G4_DEBRIS_ENVELOPE_MAX;
+    // Extend into the *new* x territory only (`96..=255`) -- re-filling
+    // `separated_regions_scene`'s own `x [0,95]` range with air here would
+    // run after (and so silently erase) the solid west/east geometry that
+    // scene already wrote.
+    setup
+        .terrain
+        .apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(96, 0, 0),
+            G4_DEBRIS_ENVELOPE_MAX,
+            MaterialId::AIR,
+        ))
+        .expect("g4 workload debris envelope extension");
+    setup
+        .terrain
+        .apply_edit(&EditPlan::filled_box(
+            id,
+            G4_DEBRIS_FLOOR_MIN,
+            G4_DEBRIS_FLOOR_MAX,
+            STONE,
+        ))
+        .expect("g4 workload debris floor stays inside the extended envelope");
+    setup
+        .terrain
+        .apply_edit(&EditPlan::filled_box(
+            id,
+            G4_NEAR_FLOOR_MIN,
+            G4_NEAR_FLOOR_MAX,
+            STONE,
+        ))
+        .expect("g4 workload near-observer floor stays inside the already-resident envelope");
+    setup
 }
 
 /// Fixture debris density (kg/m³) for every [`spawn_g4_workload_bodies`] body —
@@ -676,9 +902,13 @@ pub struct G4BodyCounts {
 
 /// Populates the T23 / G4 workload's debris population (row 12: "256 active
 /// bodies (64 near one observer), 4096 sleeping persistent bodies") on an
-/// already-constructed [`crate::world::SimWorld`]. `observer` is the world
-/// position the 64-body near-cluster is centred on — typically
-/// [`G4_WORKLOAD_SPAWNS`]`[0]`.
+/// already-constructed [`crate::world::SimWorld`]. `observer` must be
+/// [`G4_WORKLOAD_SPAWNS`]`[0]` -- every position this function drops debris
+/// at (including the near-observer cluster's own dedicated floor,
+/// [`G4_NEAR_FLOOR_MIN`]..=[`G4_NEAR_FLOOR_MAX`]) is terrain
+/// [`g4_workload_setup`] bakes in for exactly that spawn point; a debug
+/// assertion catches any other value immediately rather than silently
+/// dropping debris on the wrong (or no) floor.
 ///
 /// Every body is a small `2x2x2`-cell (8-cell) solid stone cube
 /// ([`solid_block`]) — deliberately minimal but genuinely multi-cell,
@@ -686,35 +916,66 @@ pub struct G4BodyCounts {
 /// occupied cells and collider complexity, not only body count"), so spawning
 /// ~4.3k of them stays inside CPU-CI cost.
 ///
-/// The 64 near-observer bodies sit on a grid centred on `observer`, elevated
-/// so they drop past head height without starting inside a spawned player
-/// capsule. The rest of the active population and every sleeping body are
-/// spread over two separate open-air fields, well clear of both terrain
-/// regions and of each other, so nothing starts overlapping. Active bodies are
-/// simply dropped with no floor beneath them: under gravity they remain part
-/// of the physics step for the whole run, which *is* "active" for a proof run
-/// of this length. Sleeping bodies are spawned then immediately
-/// [`crate::world::SimWorld::deactivate_body`]d (T21 dormancy): a dormant body
-/// carries zero physics-step cost while its authoritative record stays
-/// resident and persisted, exactly matching "sleeping (dormant but
-/// persistent)".
+/// The 64 near-observer bodies drop as a flat `8x8 m`, single-layer grid
+/// (`1 m` spacing) onto their own dedicated floor
+/// ([`G4_NEAR_FLOOR_MIN`]..=[`G4_NEAR_FLOOR_MAX`], centred under
+/// [`G4_NEAR_DROP_CENTRE`]) -- **not** the tiny, already structure-filled
+/// west region floor `observer` itself stands on (2026-09-18 acceptance
+/// audit, finding 4 discovery; see that floor's own doc comment for the
+/// chain of narrower attempts this replaced and why each one failed). A flat
+/// single layer, each body its own 1 m cell with nothing else falling
+/// through the same column, avoids the body-on-body pileup instability a
+/// compact multi-layer stack of identical same-size cubes turned out to
+/// have: even once every stack shape cleared the beam/column/player, bodies
+/// still occasionally launched off the world from contacts with their own
+/// close-packed neighbours (`disable_ccd = true`, this project's fixed
+/// physics config, does not stop a high-enough-energy contact from
+/// tunnelling a fast body through thin terrain in one step). The remaining active
+/// population drops onto
+/// [`G4_DEBRIS_FLOOR_MIN`]..=[`G4_DEBRIS_FLOOR_MAX`] (2026-09-18 acceptance
+/// audit, finding 4: real ground to land on and accumulate as rubble,
+/// instead of free-falling forever hundreds of metres outside the declared
+/// envelope), well clear of both terrain regions and of the near-observer
+/// cluster so nothing starts overlapping; under gravity it remains part of
+/// the physics step for the whole run, which *is* "active" for a proof run
+/// of this length. Every sleeping body sits in its own field, also inside
+/// the `256 x 128 x 256 m` envelope -- spawned then immediately
+/// [`crate::world::SimWorld::deactivate_body`]d (T21 dormancy) before any
+/// physics step ever runs, so a dormant body carries zero physics-step cost
+/// (and needs no floor: it is never simulated falling) while its
+/// authoritative record stays resident and persisted, exactly matching
+/// "sleeping (dormant but persistent)".
 pub fn spawn_g4_workload_bodies(
     world: &mut crate::world::SimWorld,
     observer: [f64; 3],
 ) -> G4BodyCounts {
+    // G4_NEAR_FLOOR_MIN/MAX (and every other absolute position this function
+    // uses) is terrain `g4_workload_setup` bakes in for exactly
+    // G4_WORKLOAD_SPAWNS[0] -- this is the only `observer` value any of it
+    // actually lands correctly for. `observer` stays a parameter (documented
+    // as "typically G4_WORKLOAD_SPAWNS[0]") so a future caller intending a
+    // genuinely different position gets a clear, immediate failure here
+    // instead of debris silently landing on the wrong (or no) floor.
+    debug_assert_eq!(
+        observer, G4_WORKLOAD_SPAWNS[0],
+        "spawn_g4_workload_bodies' fixed drop positions are only real ground for \
+         G4_WORKLOAD_SPAWNS[0] -- g4_workload_setup would need its own floor changes first \
+         to support a different observer"
+    );
+
     let mut counts = G4BodyCounts::default();
 
-    // 64 active bodies clustered near the observer: an 8x8 grid at 1 m
-    // spacing, elevated 6 m above the observer's feet. Half-diagonal extent is
-    // ~4 m, well inside G4_NEAR_OBSERVER_RADIUS_M once the 6 m rise is folded
-    // in (~8.2 m 3-D distance at the grid corners).
-    let near_side = 8usize; // 8 * 8 = G4_NEAR_OBSERVER_BODY_COUNT
+    // 64 active bodies on a flat 8x8 grid at 1 m spacing, centred on
+    // G4_NEAR_DROP_CENTRE (the dedicated near-observer floor -- not
+    // `observer` itself; see this function's doc comment), elevated so they
+    // drop a real distance without starting inside the floor.
+    let near_side = 8usize;
     debug_assert_eq!(near_side * near_side, G4_NEAR_OBSERVER_BODY_COUNT);
     for i in 0..near_side {
         for j in 0..near_side {
-            let x = observer[0] + (i as f64 - near_side as f64 / 2.0) * 1.0;
-            let z = observer[2] + (j as f64 - near_side as f64 / 2.0) * 1.0;
-            let y = observer[1] + 6.0;
+            let x = G4_NEAR_DROP_CENTRE[0] + (i as f64 - near_side as f64 / 2.0 + 0.5) * 1.0;
+            let z = G4_NEAR_DROP_CENTRE[2] + (j as f64 - near_side as f64 / 2.0 + 0.5) * 1.0;
+            let y = G4_NEAR_DROP_CENTRE[1] + 3.0;
             spawn_one(
                 world,
                 [x, y, z],
@@ -724,22 +985,30 @@ pub fn spawn_g4_workload_bodies(
         }
     }
 
-    // The rest of the active population: a separate open-air field far from
-    // the terrain regions and the near-observer cluster.
+    // The rest of the active population: dropped from a modest height onto
+    // the dedicated debris floor, centred so its footprint stays well inside
+    // that floor's bounds (row 12 finding 4).
     let remaining_active = G4_ACTIVE_BODY_COUNT - counts.active_near_observer;
     spawn_grid(
         world,
         remaining_active,
-        [400.0, 60.0, 400.0],
+        [
+            G4_DEBRIS_DROP_CENTRE[0],
+            G4_DEBRIS_DROP_CENTRE[1] + 3.0,
+            G4_DEBRIS_DROP_CENTRE[2],
+        ],
         BodyKindWanted::Active,
         &mut counts,
     );
 
-    // Every sleeping body: another separate field.
+    // Every sleeping body: a separate field, still inside the declared
+    // envelope but well clear of everything else. No floor needed -- a
+    // dormant body is deactivated before its first physics step, so it is
+    // never actually simulated falling.
     spawn_grid(
         world,
         G4_SLEEPING_BODY_COUNT,
-        [700.0, 60.0, 700.0],
+        [150.0, 3.0, 150.0],
         BodyKindWanted::Sleeping,
         &mut counts,
     );
@@ -758,6 +1027,12 @@ enum BodyKindWanted {
     Sleeping,
 }
 
+/// Places `count` bodies on a flat `x`/`z` grid at 1 m spacing, centred on
+/// `origin` (unlike a from-corner grid, this keeps the footprint's extent
+/// symmetric around a caller-chosen point regardless of `count`, which is
+/// what lets [`spawn_g4_workload_bodies`] centre the active-debris grid
+/// inside [`G4_DEBRIS_FLOOR_MIN`]..=[`G4_DEBRIS_FLOOR_MAX`] without
+/// duplicating this function's own sizing formula at the call site).
 fn spawn_grid(
     world: &mut crate::world::SimWorld,
     count: usize,
@@ -770,14 +1045,15 @@ fn spawn_grid(
     }
     let side = (count as f64).sqrt().ceil() as usize + 1;
     let spacing = 1.0;
+    let half = side as f64 / 2.0;
     let mut placed = 0usize;
     'outer: for i in 0..side {
         for j in 0..side {
             if placed >= count {
                 break 'outer;
             }
-            let x = origin[0] + i as f64 * spacing;
-            let z = origin[2] + j as f64 * spacing;
+            let x = origin[0] + (i as f64 - half) * spacing;
+            let z = origin[2] + (j as f64 - half) * spacing;
             let y = origin[1];
             spawn_one(world, [x, y, z], kind, counts);
             placed += 1;
@@ -847,4 +1123,399 @@ pub fn oblique_spin() -> DQuat {
         DVec3::new(1.0, 2.0, -0.5).normalize(),
         std::f64::consts::FRAC_PI_4,
     )
+}
+
+// ---------------------------------------------------------------------------
+// T23 / G4 integrated workload (the "demolition yard"; see
+// `spall_voxel::fixtures` for the terrain, the destructible bodies, and the
+// edit-target functions). Metres below are on the `96 m x 56 m` ground slab.
+// ---------------------------------------------------------------------------
+
+/// Feet spawns (metres) for the **clustered** integrated arrangement: all eight
+/// players inside a `4 m x 2 m` patch of the west plaza.
+pub const G4_INTEGRATED_CLUSTERED_SPAWNS: [[f64; 3]; 8] = [
+    [16.0, 1.0, 40.0],
+    [17.0, 1.0, 40.0],
+    [18.0, 1.0, 40.0],
+    [19.0, 1.0, 40.0],
+    [16.0, 1.0, 41.0],
+    [17.0, 1.0, 41.0],
+    [18.0, 1.0, 41.0],
+    [19.0, 1.0, 41.0],
+];
+
+/// Feet spawns (metres) for the **separated** integrated arrangement: two
+/// four-player clusters about `77 m` apart (west plaza / east strip).
+pub const G4_INTEGRATED_SEPARATED_SPAWNS: [[f64; 3]; 8] = [
+    [16.0, 1.0, 40.0],
+    [17.0, 1.0, 40.0],
+    [16.0, 1.0, 41.0],
+    [17.0, 1.0, 41.0],
+    [90.0, 1.0, 8.0],
+    [91.0, 1.0, 8.0],
+    [90.0, 1.0, 9.0],
+    [91.0, 1.0, 9.0],
+];
+
+/// The integrated workload's terrain (the ground slab) and its collider region.
+pub fn g4_integrated_setup() -> WorldSetup {
+    use spall_voxel::fixtures as v;
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: v::g4_integrated_scene(id),
+        terrain_collider_region: (
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(v::G4_YARD_WIDTH_CELLS - 1, 31, v::G4_YARD_DEPTH_CELLS - 1),
+        ),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
+/// The *terrain-edit scale* setup ([`spall_voxel::fixtures::g4_full_yard_terrain_scene`]).
+pub fn g4_full_yard_terrain_setup() -> WorldSetup {
+    use spall_voxel::fixtures as v;
+    let id = VolumeId::new(1).unwrap();
+    WorldSetup {
+        terrain: v::g4_full_yard_terrain_scene(id),
+        terrain_collider_region: (
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(v::G4_YARD_WIDTH_CELLS - 1, 95, v::G4_YARD_DEPTH_CELLS - 1),
+        ),
+        materials: stone_manifest(),
+        anchor: AnchorPlane::at(0),
+        physics: PhysicsConfig::default(),
+    }
+}
+
+/// One agitated (kept-awake) active body and the yard position it is steered
+/// back toward.
+#[derive(Debug, Clone, Copy)]
+pub struct G4ActiveBody {
+    pub entity: spall_core::EntityId,
+    pub home: [f64; 3],
+}
+
+/// What [`spawn_g4_integrated_bodies`] built.
+#[derive(Debug, Clone, Default)]
+pub struct G4IntegratedBodies {
+    /// The 64-brick giant (dormant until its column is cut).
+    pub giant: Option<spall_core::EntityId>,
+    /// Dormant comb / tower bodies, in entity-id order.
+    pub combs: Vec<spall_core::EntityId>,
+    pub towers: Vec<spall_core::EntityId>,
+    /// Awake bodies the fixture agitator keeps awake, with their home spots.
+    pub active: Vec<G4ActiveBody>,
+    /// Of `active`, how many started within [`G4_NEAR_OBSERVER_RADIUS_M`] of
+    /// the observer.
+    pub active_near_observer: usize,
+    /// Sleeping (deactivated, persistent) debris bodies.
+    pub sleeping_total: usize,
+    /// Solid cells summed over the active bodies.
+    pub active_cells: u64,
+    /// Solid cells summed over the sleeping debris bodies.
+    pub sleeping_cells: u64,
+    /// Solid cells of the giant, one comb, and one tower (collider-complexity
+    /// reporting).
+    pub giant_cells: u64,
+    pub comb_cells: u64,
+    pub tower_cells: u64,
+}
+
+/// A `size`-cube hollow shell with `wall`-cell walls: outer solid, inner carved
+/// to air (`size = 4`, `wall = 1` is `64 - 8 = 56` cells).
+fn hollow_crate(size: i64, wall: i64) -> impl FnOnce(VolumeId) -> Volume {
+    move |id| {
+        let mut v = Volume::new(id, CellSizeCode::Quarter);
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(size - 1, size - 1, size - 1),
+            STONE,
+        ))
+        .unwrap();
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(wall, wall, wall),
+            GlobalCell::new(size - 1 - wall, size - 1 - wall, size - 1 - wall),
+            spall_core::MaterialId::AIR,
+        ))
+        .unwrap();
+        v
+    }
+}
+
+/// An L-shaped beam: a `4 x 2 x 2` bar with a `2 x 3 x 2` leg (`28` cells).
+fn l_beam() -> impl FnOnce(VolumeId) -> Volume {
+    move |id| {
+        let mut v = Volume::new(id, CellSizeCode::Quarter);
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(3, 1, 1),
+            STONE,
+        ))
+        .unwrap();
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(0, 2, 0),
+            GlobalCell::new(1, 4, 1),
+            STONE,
+        ))
+        .unwrap();
+        v
+    }
+}
+
+fn cells_of(build: impl FnOnce(VolumeId) -> Volume) -> u64 {
+    crate::world::solid_cells(&build(VolumeId::new(1).unwrap()))
+}
+
+/// Sleeping debris: `2`-cell (`0.5 m`) cubes stacked in a `16 x 16 x 16` block
+/// on the east strip (`x 33..41 m`, `z 4..17 m`), spaced `0.52 m`.
+const G4_SLEEPER_ORIGIN_M: [f64; 2] = [33.0, 46.0];
+const G4_SLEEPER_SPACING_M: f64 = 0.52;
+const G4_SLEEPER_SIDE: usize = 16;
+
+/// Populates the integrated yard's bodies on an already-constructed world, in
+/// this order (entity ids follow it; see [`spall_voxel::fixtures::G4_ENTITY_FIRST`]):
+/// the 64-brick giant, [`G4_COMB_COUNT`] combs, [`G4_TOWER_COUNT`] towers (all
+/// dormant, waking on their first edit), 256 **active** nontrivial debris bodies
+/// (a rotation of `4^3` solid cubes, `4^3` hollow crates, and L-beams: 64, 56
+/// and 28 cells) — 64 within `12 m` of the observer, the other 192 in the west
+/// plaza — and [`G4_SLEEPING_BODY_COUNT`] deactivated `2^3` cubes. Every body is
+/// inside the world bounds and over the ground slab.
+pub fn spawn_g4_integrated_bodies(
+    world: &mut crate::world::SimWorld,
+    observer: [f64; 3],
+) -> G4IntegratedBodies {
+    use spall_voxel::fixtures as v;
+    let mut out = G4IntegratedBodies::default();
+    let spawn = |world: &mut crate::world::SimWorld,
+                 build: Box<dyn FnOnce(VolumeId) -> Volume>,
+                 at: [f64; 3]| {
+        world
+            .spawn_body(
+                build,
+                BodyPose::new(DQuat::IDENTITY, at),
+                [0.0; 3],
+                [0.0; 3],
+                G4_BODY_DENSITY_KG_M3,
+                0,
+            )
+            .expect("g4 integrated body spawns")
+    };
+
+    // The giant: block centred over x 40..72 m, z 24..56 m, plate on the ground.
+    let giant = spawn(world, Box::new(v::g4_giant_body), [62.0, 1.0, 24.0]);
+    world.deactivate_body(giant);
+    out.giant = Some(giant);
+    out.giant_cells = cells_of(v::g4_giant_body);
+
+    // Combs: a 6 x 6 grid on the west band (x 2..24 m, z 2..28 m); towers: 13 x 5
+    // slots on the north band (x 26..77 m, z 2..21 m). All stand on the ground.
+    for c in 0..v::G4_COMB_COUNT {
+        let at = [2.0 + (c % 6) as f64 * 4.4, 1.0, 2.0 + (c / 6) as f64 * 4.4];
+        let e = spawn(world, Box::new(v::g4_comb_body), at);
+        world.deactivate_body(e);
+        out.combs.push(e);
+    }
+    out.comb_cells = cells_of(v::g4_comb_body);
+    for t in 0..v::G4_TOWER_COUNT {
+        let at = [
+            30.0 + (t % 12) as f64 * 4.0,
+            1.0,
+            2.0 + (t / 12) as f64 * 4.0,
+        ];
+        let e = spawn(world, Box::new(v::g4_tower_body), at);
+        world.deactivate_body(e);
+        out.towers.push(e);
+    }
+    out.tower_cells = cells_of(v::g4_tower_body);
+
+    let mut n = 0usize;
+    let mut spawn_active =
+        |world: &mut crate::world::SimWorld, out: &mut G4IntegratedBodies, at: [f64; 3]| {
+            let (build, cells): (Box<dyn FnOnce(VolumeId) -> Volume>, u64) = match n % 3 {
+                0 => (Box::new(solid_block(4)), cells_of(solid_block(4))),
+                1 => (Box::new(hollow_crate(4, 1)), cells_of(hollow_crate(4, 1))),
+                _ => (Box::new(l_beam()), cells_of(l_beam())),
+            };
+            let entity = spawn(world, build, at);
+            out.active.push(G4ActiveBody { entity, home: at });
+            out.active_cells += cells;
+            n += 1;
+        };
+    for at in g4_integrated_active_homes() {
+        spawn_active(world, &mut out, at);
+        let d = ((at[0] - observer[0]).powi(2)
+            + (at[1] - observer[1]).powi(2)
+            + (at[2] - observer[2]).powi(2))
+        .sqrt();
+        if d <= G4_NEAR_OBSERVER_RADIUS_M {
+            out.active_near_observer += 1;
+        }
+    }
+    debug_assert_eq!(out.active.len(), G4_ACTIVE_BODY_COUNT);
+
+    let per_layer = G4_SLEEPER_SIDE * G4_SLEEPER_SIDE;
+    let sleeper_cells = cells_of(solid_block(2));
+    for k in 0..G4_SLEEPING_BODY_COUNT {
+        let layer = k / per_layer;
+        let slot = k % per_layer;
+        let x = G4_SLEEPER_ORIGIN_M[0] + (slot % G4_SLEEPER_SIDE) as f64 * G4_SLEEPER_SPACING_M;
+        let z = G4_SLEEPER_ORIGIN_M[1] + (slot / G4_SLEEPER_SIDE) as f64 * G4_SLEEPER_SPACING_M;
+        let entity = spawn(
+            world,
+            Box::new(solid_block(2)),
+            [x, 1.0 + layer as f64 * 0.5, z],
+        );
+        let deactivated = world.deactivate_body(entity);
+        debug_assert!(deactivated);
+        out.sleeping_total += 1;
+        out.sleeping_cells += sleeper_cells;
+    }
+    out
+}
+
+/// Keeps the fixture's designated active bodies genuinely awake and in the
+/// solver for the whole run: every `HOP_PERIOD` ticks (staggered per body) a
+/// body that has slowed below `0.6 m/s` is hopped upward with a steering
+/// velocity back toward its home spot, plus a deterministic jitter. This is
+/// **fixture stimulus** applied to authoritative physics state (motion is
+/// replicated to clients as ordinary snapshots); it is not an edit, and
+/// committed topology, replay, and hashes are unaffected by it.
+pub fn agitate_g4_bodies(world: &mut crate::world::SimWorld, bodies: &[G4ActiveBody], tick: u64) {
+    const HOP_PERIOD: u64 = 45;
+    for (i, b) in bodies.iter().enumerate() {
+        if !(tick + i as u64).is_multiple_of(HOP_PERIOD) {
+            continue;
+        }
+        let Some(body) = world.body(b.entity) else {
+            continue;
+        };
+        if body.dormant || body.linvel_m_s.iter().map(|v| v * v).sum::<f64>().sqrt() > 0.6 {
+            continue;
+        }
+        let phys = body.phys;
+        let pos = body.pose.translation_m;
+        let h = |salt: u64| -> f32 {
+            let mut x = (i as u64 + 1)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add((tick / HOP_PERIOD).wrapping_mul(0xBF58_476D_1CE4_E5B9))
+                .wrapping_add(salt);
+            x ^= x >> 31;
+            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^= x >> 29;
+            ((x % 2001) as f32 / 1000.0) - 1.0
+        };
+        let steer = |d: f64| (d * 0.8).clamp(-1.5, 1.5) as f32;
+        let lin = [
+            steer(b.home[0] - pos[0]) + 0.4 * h(1),
+            2.5 + 0.5 * h(2),
+            steer(b.home[2] - pos[2]) + 0.4 * h(3),
+        ];
+        let ang = [2.0 * h(4), 2.0 * h(5), 2.0 * h(6)];
+        world.physics_mut().set_body_velocity(phys, lin, ang);
+    }
+}
+
+/// Where each of the 256 active debris bodies spawns (and is steered back to),
+/// in spawn order: `64` within `12 m` of the observer (an `8 x 8` grid at
+/// `1.05 m`, `3.5 m` up), then `192` (`12 x 16` at `1.25 m`) across the west
+/// plaza.
+pub fn g4_integrated_active_homes() -> Vec<[f64; 3]> {
+    let mut homes = Vec::with_capacity(G4_ACTIVE_BODY_COUNT);
+    for i in 0..8 {
+        for j in 0..8 {
+            homes.push([19.0 + i as f64 * 1.05, 3.5, 37.0 + j as f64 * 1.05]);
+        }
+    }
+    for i in 0..12 {
+        for j in 0..16 {
+            homes.push([2.0 + i as f64 * 1.25, 3.0, 32.0 + j as f64 * 1.25]);
+        }
+    }
+    homes
+}
+
+/// The integrated scene's active debris (entity + home), reconstructed from the
+/// fixed spawn order — usable on a world restored from a checkpoint, where the
+/// spawn-time list is not at hand. Entries whose body no longer exists are
+/// dropped by the agitator.
+pub fn g4_integrated_active_bodies() -> Vec<G4ActiveBody> {
+    use spall_voxel::fixtures as v;
+    let first = v::G4_ENTITY_FIRST + 1 + v::G4_COMB_COUNT as u64 + v::G4_TOWER_COUNT as u64;
+    g4_integrated_active_homes()
+        .into_iter()
+        .enumerate()
+        .map(|(i, home)| G4ActiveBody {
+            entity: spall_core::EntityId::new(first + i as u64).expect("nonzero"),
+            home,
+        })
+        .collect()
+}
+
+// --- review demo: the unbalanced lever on a broad dynamic base (2026-09-20) --------
+
+/// Feet spawn for the review lever scene: 8 m south of the beam (inside the cutter's 12 m reach), facing the default
+/// camera direction (`-z`), so the beam's long axis runs across the screen.
+pub const REVIEW_LEVER_SPAWNS: [[f64; 3]; 1] = [[37.5, 1.0, 42.0]];
+
+/// A long stone beam standing on a one-cell-wide (0.25 m) foot: it balances only while its
+/// centre of mass stays over the foot. Cut a chunk out of either end and it must tip.
+pub fn review_lever_volume(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    for (lo, hi) in [([30, 0, 8], [30, 3, 15]), ([9, 4, 8], [51, 11, 15])] {
+        v.apply_edit(&box_plan(
+            id,
+            GlobalCell::new(lo[0], lo[1], lo[2]),
+            GlobalCell::new(hi[0], hi[1], hi[2]),
+            STONE,
+        ))
+        .expect("review lever");
+    }
+    v
+}
+
+/// A broad stone slab (16 x 12 m, 1 m thick) that the lever's foot rests on. It is a
+/// separate dynamic body: stable on its own, and not welded to the lever.
+pub fn review_base_volume(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+    v.apply_edit(&box_plan(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(63, 3, 47),
+        STONE,
+    ))
+    .expect("review base");
+    v
+}
+
+/// Spawns the base and the lever on it; returns `(base, lever)`.
+pub fn spawn_review_lever(
+    world: &mut crate::world::SimWorld,
+) -> (spall_core::EntityId, spall_core::EntityId) {
+    let base = world
+        .spawn_body(
+            review_base_volume,
+            BodyPose::new(DQuat::IDENTITY, [28.0, 1.0, 28.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .expect("review base spawns");
+    let lever = world
+        .spawn_body(
+            review_lever_volume,
+            BodyPose::new(DQuat::IDENTITY, [30.0, 2.0, 30.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .expect("review lever spawns");
+    (base, lever)
 }

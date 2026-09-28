@@ -135,7 +135,29 @@ it as proposed are historical. Increment 12 validates reload candidates before
 publication, globally bounds client reload requests, rebuilds prediction
 collision when resident cache placement changes, and makes the row-8b harness
 assert real eviction/completed reload/evicted-edit/outbound-return activity.
-Durable acknowledgement and bounded capture remain open.
+ENG-30 row 7 increment 13 (`docs/reports/G3.md` increment 33) adds explicit
+pin ownership across pending edits, swept-collision paths, and pipeline reload
+grace (never evicted, always reloaded regardless of budget), and enforces
+`budget_bricks` / a new `max_dense_bytes` on the admission path (an
+interest-driven, non-required reload is deferred rather than admitted past
+either cap), plus digest/backing/process-peak-memory retained-memory evidence.
+ENG-30 row 7 increment 15 (`docs/reports/G3.md` increment 34) makes checkpoint
+capture incremental: a per-brick revision cache reuses prior-encoded records
+for unchanged terrain, only re-capturing bricks dirtied since the last
+checkpoint. ENG-30 row 7 increment 14 (`docs/reports/G3.md` increment 35)
+mirrors increment 13's `max_dense_bytes` admission half on
+`ClientResidencyPass` for its single predicted player. ENG-30 row 7
+increment 16 (`docs/reports/G3.md` increment 36) audits the durable
+ack-before-evict requirement rather than assuming it unmet: the evict-time
+capture-then-evict boundary was already correct, but checkpoint capture was
+reading evicted-brick backing records into the durable checkpoint without
+verifying them against the retained digest — fixed by reusing the existing
+digest-verification machinery; the same unverified-read pattern on the
+lower-severity baseline/repair-patch path is flagged but not fixed. The
+`ResidencyController`/`ClientResidency` (T18) policy-engine merge remains the
+only item this contract's post-merge qualification named that is still
+unaddressed — an earlier coordinator review rejected literal class
+consolidation as the objective.
 
 ## Safe serve-loop integration (slice D)
 
@@ -213,6 +235,7 @@ cargo test -p spall_server --test residency_pass
 cargo test -p spall_server --test client_residency
 cargo xtask scenario --name t23-g3-residency
 cargo xtask scenario --name t23-g3-traversal
+cargo xtask scenario --name t23-g3-traversal-dense-cap
 cargo xtask scenario --name t23-g3
 cargo xtask scenario --name t23-g3 --loss-percent 3
 cargo xtask scenario --name t23-g3-impaired-join

@@ -3,6 +3,7 @@ name = "spall_physics"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+autobins = false
 
 [lints.clippy]
 # The feasibility harness has a few functions with many measured knobs.
@@ -20,3 +21,19 @@ spall_voxel = { workspace = true, features = ["oracle"] }
 [[bin]]
 name = "collision-bench"
 path = "src/bin/collision_bench.rs"
+
+[[bin]]
+name = "physics-transfer"
+path = "src/bin/physics_transfer.rs"
+
+[[bin]]
+name = "region-physics-bench"
+path = "src/bin/region_physics_bench.rs"
+
+[[bin]]
+name = "region-player-bench"
+path = "src/bin/region_player_bench.rs"
+
+[[bin]]
+name = "region-scale-bench"
+path = "src/bin/region_scale_bench.rs"

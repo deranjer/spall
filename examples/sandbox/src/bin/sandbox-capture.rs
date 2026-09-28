@@ -866,6 +866,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
     let server_cfg = ServeConfig {
         listen: "127.0.0.1:0".parse().expect("valid loopback addr"),
         scene: ServerScene::CrossBridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: DESTRUCTION_TICKS,
         quiescence_ticks: 0,
@@ -887,13 +888,18 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         seed: 0,
         catch_up_cap: spall_server::serve::DEFAULT_CATCH_UP_CAP,
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
+        capture_workers: spall_server::serve::default_capture_workers(),
         dev_unvalidated_actions: true,
         save_faults: None,
         await_body_settle: false,
         motion_interest: None,
         residency: None,
+        residency_disk_path: None,
         contact_damage: None,
         dormancy: None,
+        timing_window: None,
+        credential_registry_file: None,
+        custom_world: None,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 
@@ -950,6 +956,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         client_residency: None,
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: false,
     };
     let cutter_thread = std::thread::spawn(move || run_replication_client(cutter_cfg));
 
@@ -979,6 +986,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
             *replica_slot_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         })),
         interactive: None,
+        client_authoritative: false,
     };
     let observer_thread = std::thread::spawn(move || run_replication_client(observer_cfg));
 

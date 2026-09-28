@@ -11,16 +11,38 @@ use crate::collider::{Representation, build_collider};
 use crate::mass::BodyMassProperties;
 use crate::occupancy::OccupancyGrid;
 
-/// Opaque, stable identifier for a body in a [`PhysicsWorld`]. Never a Rapier
-/// handle; safe to store outside the adapter for the life of the world.
+/// Opaque, stable identifier for a body in a [`PhysicsWorld`]. The high 32 bits
+/// namespace bodies across coordinated physics regions; the low 32 bits are the
+/// body's stable slot within its region. Never a Rapier handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BodyId(u32);
+pub struct BodyId(u64);
 
 impl BodyId {
-    /// The raw index, for report keys only.
+    /// The region-local slot, for report keys only.
     pub fn index(self) -> u32 {
-        self.0
+        self.0 as u32
     }
+
+    /// The physics-region namespace used to route this id to its owner.
+    pub fn namespace(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+}
+
+impl From<&BodyId> for BodyId {
+    fn from(value: &BodyId) -> Self {
+        *value
+    }
+}
+
+fn entry_index<I: Into<BodyId>>(id: I, namespace: u32) -> usize {
+    let id = id.into();
+    assert_eq!(
+        id.namespace(),
+        namespace,
+        "body id belongs to another physics region"
+    );
+    id.index() as usize
 }
 
 /// Fixed simulation configuration.
@@ -189,6 +211,8 @@ struct Entry {
     /// survives a rebuild rather than needing the caller to reapply it every
     /// time. See that method's doc for what this actually does.
     query_only: bool,
+    /// Contact restitution retained across collider rebuilds and dormancy.
+    restitution: f32,
 }
 
 /// `solver_groups` for [`PhysicsWorld::set_query_only`]: membership *and*
@@ -248,6 +272,7 @@ fn principal_inertia(inertia_com_kg_m2: [[f32; 3]; 3]) -> [f32; 3] {
 
 /// A fixed-step rigid-body world over voxel colliders.
 pub struct PhysicsWorld {
+    id_namespace: u32,
     gravity: Vector,
     params: IntegrationParameters,
     pipeline: PhysicsPipeline,
@@ -268,9 +293,21 @@ pub struct PhysicsWorld {
     pending_removed: Vec<ColliderHandle>,
 }
 
+/// How close (metres) a dynamic body must be to the character's capsule to be
+/// carried along by a push even when the tick reported no contact.
+const CARRY_MARGIN_M: f32 = 0.05;
+/// Slowest horizontal character speed (m/s) that still carries bodies.
+const CARRY_MIN_SPEED_M_S: f32 = 0.1;
+
 impl PhysicsWorld {
     /// Creates an empty world.
     pub fn new(cfg: PhysicsConfig) -> Self {
+        Self::new_in_namespace(cfg, 0)
+    }
+
+    /// Creates an empty region-local world whose body IDs are disjoint from
+    /// worlds using another namespace. Namespace zero preserves `new` IDs.
+    pub fn new_in_namespace(cfg: PhysicsConfig, id_namespace: u32) -> Self {
         let mut params = IntegrationParameters {
             dt: cfg.dt_s,
             ..Default::default()
@@ -280,6 +317,7 @@ impl PhysicsWorld {
             params.max_ccd_substeps = 0;
         }
         Self {
+            id_namespace,
             gravity: Vector::new(
                 cfg.gravity_m_s2[0],
                 cfg.gravity_m_s2[1],
@@ -357,7 +395,7 @@ impl PhysicsWorld {
     pub fn add_body(&mut self, spec: BodySpec) -> BodyId {
         let (body, collider, offset) = self.insert_rapier_body(&spec);
 
-        let id = BodyId(self.entries.len() as u32);
+        let id = BodyId((u64::from(self.id_namespace) << 32) | self.entries.len() as u64);
         self.entries.push(Entry {
             body,
             collider,
@@ -369,6 +407,7 @@ impl PhysicsWorld {
             retired: false,
             dormant: false,
             query_only: false,
+            restitution: 0.0,
         });
         id
     }
@@ -384,18 +423,19 @@ impl PhysicsWorld {
         grid: &OccupancyGrid,
         rep: Representation,
     ) -> Duration {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         debug_assert!(!entry.retired, "rebuild_collider on a retired body");
         if entry.retired {
             return Duration::ZERO;
         }
-        let (cell_m, density, body, old_collider, mass_properties, query_only) = (
+        let (cell_m, density, body, old_collider, mass_properties, query_only, restitution) = (
             entry.cell_m,
             entry.density,
             entry.body,
             entry.collider,
             entry.mass_properties,
             entry.query_only,
+            entry.restitution,
         );
 
         let start = Instant::now();
@@ -419,6 +459,8 @@ impl PhysicsWorld {
         if query_only {
             collider.set_solver_groups(query_only_solver_groups());
         }
+        collider.set_restitution(restitution);
+        collider.set_restitution_combine_rule(CoefficientCombineRule::Max);
         let handle = self
             .colliders
             .insert_with_parent(collider, body, &mut self.bodies);
@@ -427,9 +469,9 @@ impl PhysicsWorld {
         }
         let total = start.elapsed();
 
-        self.entries[id.0 as usize].collider = handle;
-        self.entries[id.0 as usize].representation = rep;
-        self.entries[id.0 as usize].collider_offset_m = offset;
+        self.entries[entry_index(id, self.id_namespace)].collider = handle;
+        self.entries[entry_index(id, self.id_namespace)].representation = rep;
+        self.entries[entry_index(id, self.id_namespace)].collider_offset_m = offset;
         self.pending_removed.push(old_collider);
         self.pending_modified.push(handle);
         total
@@ -445,7 +487,7 @@ impl PhysicsWorld {
     /// its collider is already massless); otherwise the shape's own mass would
     /// be added on top of `props`.
     pub fn set_mass_properties(&mut self, id: BodyId, props: BodyMassProperties) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         debug_assert!(!entry.retired, "set_mass_properties on a retired body");
         if entry.retired {
             return;
@@ -462,6 +504,22 @@ impl PhysicsWorld {
         rb.recompute_mass_properties_from_colliders(&self.colliders);
     }
 
+    /// Sets contact restitution and retains it across geometry rebuilds and
+    /// dormancy. `Max` combination lets a deliberately bouncy body rebound
+    /// from ordinary zero-restitution terrain.
+    pub fn set_restitution(&mut self, id: BodyId, restitution: f32) {
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
+        if entry.retired {
+            return;
+        }
+        entry.restitution = restitution.clamp(0.0, 1.0);
+        if !entry.dormant {
+            let collider = &mut self.colliders[entry.collider];
+            collider.set_restitution(entry.restitution);
+            collider.set_restitution_combine_rule(CoefficientCombineRule::Max);
+        }
+    }
+
     /// Retires a body whose authoritative volume became empty (`ENG-56`): its
     /// Rapier rigid body and attached collider are removed from the simulation
     /// so it can no longer collide with, rest on, or be swept against by any
@@ -469,7 +527,7 @@ impl PhysicsWorld {
     /// are indices — removing one would shift every later id) and marked
     /// retired; callers must drop the handle. Idempotent.
     pub fn retire_body(&mut self, id: BodyId) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired {
             return;
         }
@@ -493,7 +551,7 @@ impl PhysicsWorld {
 
     /// Whether `id` has been retired by [`Self::retire_body`].
     pub fn is_retired(&self, id: BodyId) -> bool {
-        self.entries[id.0 as usize].retired
+        self.entries[entry_index(id, self.id_namespace)].retired
     }
 
     /// Deactivates a **dormant** body (T21): removes its Rapier rigid body and
@@ -504,7 +562,7 @@ impl PhysicsWorld {
     /// pose / velocity and passes them back on reactivation. Idempotent; a no-op
     /// on a retired body.
     pub fn deactivate_body(&mut self, id: BodyId) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired || entry.dormant {
             return;
         }
@@ -539,10 +597,11 @@ impl PhysicsWorld {
         linvel_m_s: [f32; 3],
         angvel_rad_s: [f32; 3],
     ) {
-        let entry = &self.entries[id.0 as usize];
+        let entry = &self.entries[entry_index(id, self.id_namespace)];
         if entry.retired || !entry.dormant {
             return;
         }
+        let restitution = entry.restitution;
         let spec = BodySpec {
             kind: BodyKind::Dynamic { ccd: false },
             representation: entry.representation,
@@ -554,18 +613,19 @@ impl PhysicsWorld {
             linvel_m_s,
         };
         let (body, collider, offset) = self.insert_rapier_body(&spec);
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         entry.body = body;
         entry.collider = collider;
         entry.collider_offset_m = offset;
         entry.dormant = false;
         self.set_body_pose(id, translation_m, rotation);
         self.set_body_velocity(id, linvel_m_s, angvel_rad_s);
+        self.set_restitution(id, restitution);
     }
 
     /// Whether `id` is currently dormant (deactivated by [`Self::deactivate_body`]).
     pub fn is_dormant(&self, id: BodyId) -> bool {
-        self.entries[id.0 as usize].dormant
+        self.entries[entry_index(id, self.id_namespace)].dormant
     }
 
     /// Bodies that are neither retired nor dormant — the set the solver actually
@@ -583,7 +643,7 @@ impl PhysicsWorld {
     /// nothing collides with the obsolete solid shape in the meantime. A no-op
     /// on a retired body.
     pub fn remove_collider(&mut self, id: BodyId) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired {
             return;
         }
@@ -594,6 +654,13 @@ impl PhysicsWorld {
         // dangling handle to the collider just removed.
         self.ccd_solver = CCDSolver::new();
         self.pending_removed.push(collider);
+    }
+
+    /// Whether `id` currently has an attached collider in Rapier.
+    pub fn has_collider(&self, id: BodyId) -> bool {
+        self.entries
+            .get(entry_index(id, self.id_namespace))
+            .is_some_and(|entry| !entry.retired && self.colliders.contains(entry.collider))
     }
 
     /// Excludes `id`'s collider from ever producing a rigid-body **solver**
@@ -616,7 +683,7 @@ impl PhysicsWorld {
     /// `id` reapplies it to the fresh collider automatically. A no-op on a
     /// retired body.
     pub fn set_query_only(&mut self, id: BodyId) {
-        let entry = &mut self.entries[id.0 as usize];
+        let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         if entry.retired {
             return;
         }
@@ -627,30 +694,59 @@ impl PhysicsWorld {
         }
     }
 
-    /// Refreshes the broad-phase for every collider added, rebuilt, or
-    /// removed since the last call to this or [`Self::step`] — **without**
+    /// Refreshes the broad-phase spatial index for every collider added or
+    /// rebuilt since the last call to this or [`Self::step`], for
+    /// **queries only** (`sweep_character`/`cast_shape`/...) — without
     /// stepping the dynamics pipeline: no gravity or velocity integration, no
-    /// contact resolution, for *any* body in this world, including ones
-    /// wholly unrelated to what changed. [`Self::step`] already refreshes the
-    /// broad-phase as part of its own full pipeline step, so a caller that
-    /// steps this world's simulation every tick regardless (the normal case)
-    /// never needs this. It exists for a caller that adds/rebuilds/removes
-    /// colliders on a world it does **not** own the tick loop for —
-    /// [`CharacterQueryCache`](crate::query_cache::CharacterQueryCache),
+    /// contact resolution, for *any* body in this world. [`Self::step`]
+    /// already refreshes the broad-phase as part of its own full pipeline
+    /// step, so a caller that steps this world's simulation every tick
+    /// regardless (the normal case) never needs this. It exists for a caller
+    /// that adds/rebuilds colliders on a world it does **not** own the tick
+    /// loop for — [`CharacterQueryCache`](crate::query_cache::CharacterQueryCache),
     /// which must never advance a simulation another caller is driving.
+    ///
+    /// Uses [`BroadPhaseBvh::set_aabb`] per modified collider, **not**
+    /// [`BroadPhaseBvh::update`]: `update` is the same call [`Self::step`]
+    /// uses to detect newly-overlapping pairs and emit `AddPair` — and
+    /// Rapier permanently remembers, per pair, that it already announced one
+    /// ("no need to re-send an `AddPair` event... if no `RemovePair`
+    /// happened since", `BroadPhaseBvh::update`'s own doc). Calling `update`
+    /// from here — as this used to — consumes that one-time announcement
+    /// for any dynamic body's pair that happens to be pending, with no
+    /// narrow-phase registration ever created for it: `step`'s *own* later
+    /// `update` call sees the pair as already-announced and never re-emits
+    /// it, so that pair's contacts are never generated again for the rest of
+    /// the simulation, however many times `step` runs afterwards. Confirmed
+    /// with an isolated repro (`.local/analysis/pr109-probe`): a dynamic
+    /// cube resting on a fixed one falls straight through it if a single
+    /// `sync_queries` call happens before the first `step`. `set_aabb`
+    /// refits the tree immediately (so queries see the new shape/position
+    /// right away) but explicitly defers pair evaluation "to the next
+    /// broad-phase update" (its own doc) — i.e. to `step`'s real one, which
+    /// still runs the full detect-and-announce logic exactly once, correctly.
+    /// A collider in `pending_removed` needs no action here: `remove_collider`/
+    /// `retire_body` already removed it from `self.colliders` before pushing
+    /// it there, so a query pipeline built from `self.colliders` naturally
+    /// filters it out via the lookup miss regardless of the tree's own leaf
+    /// cleanup timing, and `step`'s removal handling runs on Rapier's native
+    /// dirty flags next time regardless of what this does.
     pub fn sync_queries(&mut self) {
         if self.pending_modified.is_empty() && self.pending_removed.is_empty() {
             return;
         }
-        let mut events = Vec::new();
-        self.broad_phase.update(
-            &self.params,
-            &self.colliders,
-            &self.bodies,
-            &self.pending_modified,
-            &self.pending_removed,
-            &mut events,
-        );
+        // `set_body_pose` updates the rigid body immediately, but attached
+        // collider world poses are normally propagated by `step`. Query-only
+        // mirrors do not step, so do that narrow propagation here before
+        // computing their new AABBs.
+        self.bodies
+            .propagate_modified_body_positions_to_colliders(&mut self.colliders);
+        for &handle in &self.pending_modified {
+            if let Some(collider) = self.colliders.get(handle) {
+                let aabb = collider.compute_aabb();
+                self.broad_phase.set_aabb(&self.params, handle, aabb);
+            }
+        }
         self.pending_modified.clear();
         self.pending_removed.clear();
     }
@@ -759,8 +855,8 @@ impl PhysicsWorld {
     ) -> crate::character::CharacterMove {
         let handles: Vec<ColliderHandle> = exclude
             .iter()
-            .filter(|id| !self.entries[id.0 as usize].retired)
-            .map(|id| self.entries[id.0 as usize].collider)
+            .filter(|id| !self.entries[entry_index(*id, self.id_namespace)].retired)
+            .map(|id| self.entries[entry_index(id, self.id_namespace)].collider)
             .collect();
         self.sweep_character_impl(
             params,
@@ -770,6 +866,188 @@ impl PhysicsWorld {
             &handles,
             |_| {},
         )
+    }
+
+    /// Authoritative character sweep that also transfers momentum into any
+    /// dynamic rigid bodies the capsule contacts. The capsule itself remains
+    /// kinematic, but Rapier's character impulse approximation treats it as a
+    /// body of `params.mass_kg`, so a many-voxel body accelerates less than a
+    /// small one under the same player movement.
+    ///
+    /// This is intentionally separate from [`Self::sweep_character_excluding`]:
+    /// prediction clients use query-only replica colliders and must never
+    /// become an authority for rigid-body impulses.
+    pub fn sweep_character_pushing_excluding(
+        &mut self,
+        params: crate::character::CharacterParams,
+        position_m: [f64; 3],
+        desired_translation_m: [f32; 3],
+        dt_s: f32,
+        exclude: &[BodyId],
+    ) -> crate::character::CharacterMove {
+        let handles: Vec<ColliderHandle> = exclude
+            .iter()
+            .filter(|id| !self.entries[entry_index(*id, self.id_namespace)].retired)
+            .map(|id| self.entries[entry_index(id, self.id_namespace)].collider)
+            .collect();
+        let controller = crate::character::controller();
+        let shape = crate::character::capsule(params);
+        let centre = params.centre_offset_m();
+        let feet = Vector::new(
+            position_m[0] as f32,
+            position_m[1] as f32,
+            position_m[2] as f32,
+        );
+        let pos = Pose::from_translation(feet + Vector::new(0.0, centre, 0.0));
+        let excluded_predicate =
+            |handle: ColliderHandle, _collider: &Collider| !handles.contains(&handle);
+        let filter = if handles.is_empty() {
+            QueryFilter::default()
+        } else {
+            QueryFilter::default().predicate(&excluded_predicate)
+        };
+        let desired = Vector::new(
+            desired_translation_m[0],
+            desired_translation_m[1],
+            desired_translation_m[2],
+        );
+        let mut collisions = Vec::new();
+        let moved = {
+            let queries = self.broad_phase.as_query_pipeline(
+                self.narrow_phase.query_dispatcher(),
+                &self.bodies,
+                &self.colliders,
+                filter,
+            );
+            controller.move_shape(dt_s, &queries, &shape, &pos, desired, |collision| {
+                collisions.push(collision)
+            })
+        };
+        // Rapier's impulse solver keeps one manifold buffer across every
+        // dynamic collider the capsule overlaps, but parry's
+        // `contact_manifolds` may clear that buffer, after which Rapier
+        // slices it from a stale index and panics ("range start index N out
+        // of range for slice of length 0") as soon as the capsule touches a
+        // second dynamic collider (e.g. two plinko balls at once). Solve one
+        // dynamic collider per call so the buffer never spans colliders.
+        let mut touched: Vec<ColliderHandle> = Vec::new();
+        {
+            let queries = self.broad_phase.as_query_pipeline(
+                self.narrow_phase.query_dispatcher(),
+                &self.bodies,
+                &self.colliders,
+                QueryFilter::default(),
+            );
+            for collision in &collisions {
+                let aabb = shape.compute_aabb(&collision.character_pos).loosened(0.5);
+                for (handle, collider) in queries.intersect_aabb_conservative(aabb) {
+                    let dynamic = collider
+                        .parent()
+                        .and_then(|parent| self.bodies.get(parent))
+                        .is_some_and(|body| body.is_dynamic());
+                    if dynamic && !handles.contains(&handle) && !touched.contains(&handle) {
+                        touched.push(handle);
+                    }
+                }
+            }
+        }
+        // The impulse is sized from the character's mass, so a heavy
+        // character launches a body faster than it is walking; the body then
+        // separates, friction slows it, and the character catches up and
+        // kicks it again -- visible as a body jumping in increments. Cap the
+        // horizontal speed a push can add at the character's own.
+        let push_velocity = Vector::new(desired.x / dt_s, 0.0, desired.z / dt_s);
+        let push_speed = push_velocity.length();
+        for handle in touched {
+            let body_handle = self.colliders.get(handle).and_then(|c| c.parent());
+            let along_before = body_handle
+                .and_then(|b| self.bodies.get(b))
+                .map(|rb| rb.linvel().dot(push_velocity) / push_speed.max(f32::MIN_POSITIVE));
+            let only = move |candidate: ColliderHandle, _collider: &Collider| candidate == handle;
+            let mut queries = self.broad_phase.as_query_pipeline_mut(
+                self.narrow_phase.query_dispatcher(),
+                &mut self.bodies,
+                &mut self.colliders,
+                QueryFilter::default().predicate(&only),
+            );
+            controller.solve_character_collision_impulses(
+                dt_s,
+                &mut queries,
+                &shape,
+                params.mass_kg.max(f32::MIN_POSITIVE),
+                &collisions,
+            );
+            if push_speed > 1.0e-3
+                && let (Some(b), Some(before)) = (body_handle, along_before)
+                && let Some(rb) = self.bodies.get_mut(b)
+            {
+                let dir = push_velocity / push_speed;
+                let velocity = rb.linvel();
+                let along = velocity.dot(dir);
+                let limit = push_speed.max(before);
+                if along > limit {
+                    rb.set_linvel(velocity - dir * (along - limit), true);
+                }
+            }
+        }
+        // The controller stops the character a skin's width short of a body,
+        // so on some ticks it reports no collision at all: no impulse, the
+        // body slows against friction, and the next tick kicks it again --
+        // the push alternates on and off. Carry every dynamic body that is
+        // near and ahead of the character at the character's own speed
+        // whether or not this tick registered a contact.
+        if push_speed > CARRY_MIN_SPEED_M_S {
+            let end = Pose::from_translation(pos.translation + moved.translation);
+            let dir = push_velocity / push_speed;
+            let candidates: Vec<(ColliderHandle, RigidBodyHandle)> = {
+                let queries = self.broad_phase.as_query_pipeline(
+                    self.narrow_phase.query_dispatcher(),
+                    &self.bodies,
+                    &self.colliders,
+                    QueryFilter::default(),
+                );
+                let aabb = shape.compute_aabb(&end).loosened(CARRY_MARGIN_M);
+                queries
+                    .intersect_aabb_conservative(aabb)
+                    .filter(|(handle, _)| !handles.contains(handle))
+                    .filter_map(|(handle, collider)| {
+                        let body = collider.parent()?;
+                        self.bodies
+                            .get(body)
+                            .is_some_and(|rb| rb.is_dynamic())
+                            .then_some((handle, body))
+                    })
+                    .collect()
+            };
+            for (handle, body) in candidates {
+                let collider = &self.colliders[handle];
+                let ahead = (collider.position().translation - end.translation).dot(dir) > 0.0;
+                let near = rapier3d::parry::query::distance(
+                    &end,
+                    &shape,
+                    collider.position(),
+                    collider.shape(),
+                )
+                .is_ok_and(|gap| gap <= CARRY_MARGIN_M);
+                if !(ahead && near) {
+                    continue;
+                }
+                let rb = &mut self.bodies[body];
+                let velocity = rb.linvel();
+                let along = velocity.dot(dir);
+                if along < push_speed {
+                    rb.set_linvel(velocity + dir * (push_speed - along), true);
+                }
+            }
+        }
+        crate::character::CharacterMove {
+            translation_m: [
+                moved.translation.x,
+                moved.translation.y,
+                moved.translation.z,
+            ],
+            grounded: moved.grounded,
+        }
     }
 
     fn sweep_character_impl(
@@ -833,7 +1111,7 @@ impl PhysicsWorld {
 
     /// Current representation of a body.
     pub fn representation(&self, id: BodyId) -> Representation {
-        self.entries[id.0 as usize].representation
+        self.entries[entry_index(id, self.id_namespace)].representation
     }
 
     /// Kinematic snapshot of a body. A retired body (its volume became empty) or
@@ -841,7 +1119,7 @@ impl PhysicsWorld {
     /// left; it reports an all-zero, non-sleeping state and the caller is
     /// expected to hold the authoritative pose itself.
     pub fn body_state(&self, id: BodyId) -> BodyState {
-        let entry = &self.entries[id.0 as usize];
+        let entry = &self.entries[entry_index(id, self.id_namespace)];
         debug_assert!(!entry.retired, "body_state on a retired body");
         debug_assert!(!entry.dormant, "body_state on a dormant body");
         if entry.retired || entry.dormant {
@@ -870,6 +1148,49 @@ impl PhysicsWorld {
                 .map(|p| p.mass_kg)
                 .unwrap_or_else(|| rb.mass()),
         }
+    }
+
+    /// Diagnostic (wake-burst attribution): for each id in `ids`, the *other dynamic*
+    /// bodies it currently has an active contact manifold with, as
+    /// `(queried, partner)` pairs. Read-only; builds
+    /// a handle -> id map per call, so call it only for bursts.
+    pub fn touching_dynamic_bodies(&self, ids: &[BodyId]) -> Vec<(BodyId, BodyId)> {
+        let by_handle: std::collections::HashMap<RigidBodyHandle, BodyId> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.retired && !e.dormant)
+            .map(|(i, e)| (e.body, BodyId(i as u32)))
+            .collect();
+        let mut out = Vec::new();
+        for &id in ids {
+            let entry = &self.entries[id.0 as usize];
+            if entry.retired || entry.dormant {
+                continue;
+            }
+            for &c in self.bodies[entry.body].colliders() {
+                for pair in self.narrow_phase.contact_pairs_with(c) {
+                    if !pair.has_any_active_contact() {
+                        continue;
+                    }
+                    let other = if pair.collider1 == c {
+                        pair.collider2
+                    } else {
+                        pair.collider1
+                    };
+                    let Some(parent) = self.colliders.get(other).and_then(|o| o.parent()) else {
+                        continue;
+                    };
+                    if !self.bodies[parent].is_dynamic() {
+                        continue;
+                    }
+                    if let Some(&pid) = by_handle.get(&parent) {
+                        out.push((id, pid));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Number of narrow-phase contact pairs currently tracked.
@@ -905,7 +1226,7 @@ impl PhysicsWorld {
         self.entries
             .iter()
             .position(|e| !e.retired && e.body == handle)
-            .map(|i| BodyId(i as u32))
+            .map(|i| BodyId((u64::from(self.id_namespace) << 32) | i as u64))
     }
 
     /// Every contact pair with a non-zero solved normal impulse this step, as
@@ -952,8 +1273,11 @@ impl PhysicsWorld {
             // expressed relative to that body's centre of mass, in its local
             // frame; lift both to world space (world COM + body rotation · point)
             // and average — a stable brush centre for the hit.
-            let rb1 = &self.bodies[rb1];
-            let rb2 = &self.bodies[rb2];
+            // A pair can outlive a body removed since the last step (a retired debris body):
+            // skip it instead of indexing a stale handle.
+            let (Some(rb1), Some(rb2)) = (self.bodies.get(rb1), self.bodies.get(rb2)) else {
+                continue;
+            };
             let (com1, rot1) = (rb1.center_of_mass(), *rb1.rotation());
             let (com2, rot2) = (rb2.center_of_mass(), *rb2.rotation());
             let mut point_sum = [0.0_f64; 3];
@@ -1001,7 +1325,8 @@ impl PhysicsWorld {
     /// split child at its parent's transform so world geometry is unchanged at
     /// the split instant.
     pub fn set_body_pose(&mut self, id: BodyId, translation_m: [f32; 3], rotation: [f32; 4]) {
-        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        let entry = &self.entries[entry_index(id, self.id_namespace)];
+        let rb = &mut self.bodies[entry.body];
         rb.set_translation(
             Vector::new(translation_m[0], translation_m[1], translation_m[2]),
             true,
@@ -1010,6 +1335,10 @@ impl PhysicsWorld {
             Rotation::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]),
             true,
         );
+        // A query-only mirror (for example, client-predicted collision against
+        // replicated debris) may move without ever stepping this PhysicsWorld.
+        // Mark its collider so `sync_queries` refits the broad-phase AABB.
+        self.pending_modified.push(entry.collider);
     }
 
     /// Applies a linear impulse (N·s) to a body at its centre of mass and wakes
@@ -1017,7 +1346,7 @@ impl PhysicsWorld {
     /// impulse or an impact from an adjacent edit — for the sleep/wake
     /// feasibility scenario. No-op for `Fixed` bodies.
     pub fn apply_impulse(&mut self, id: BodyId, impulse_n_s: [f32; 3]) {
-        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_impulse(
             Vector::new(impulse_n_s[0], impulse_n_s[1], impulse_n_s[2]),
             true,
@@ -1029,7 +1358,7 @@ impl PhysicsWorld {
     /// body's installed inertia tensor — the direct motion check for
     /// mixed-material inertia. No-op for `Fixed` bodies.
     pub fn apply_torque_impulse(&mut self, id: BodyId, torque_impulse_n_m_s: [f32; 3]) {
-        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_torque_impulse(
             Vector::new(
                 torque_impulse_n_m_s[0],
@@ -1051,7 +1380,7 @@ impl PhysicsWorld {
         impulse_n_s: [f32; 3],
         point_world_m: [f32; 3],
     ) {
-        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.apply_impulse_at_point(
             Vector::new(impulse_n_s[0], impulse_n_s[1], impulse_n_s[2]),
             Vector::new(point_world_m[0], point_world_m[1], point_world_m[2]),
@@ -1062,7 +1391,7 @@ impl PhysicsWorld {
     /// Sets a body's linear and angular velocity, m/s and rad/s. Used to hand a
     /// split child its inherited velocity.
     pub fn set_body_velocity(&mut self, id: BodyId, linvel_m_s: [f32; 3], angvel_rad_s: [f32; 3]) {
-        let rb = &mut self.bodies[self.entries[id.0 as usize].body];
+        let rb = &mut self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         rb.set_linvel(
             Vector::new(linvel_m_s[0], linvel_m_s[1], linvel_m_s[2]),
             true,
@@ -1078,7 +1407,7 @@ impl PhysicsWorld {
     /// [`Self::derived_mass_properties`]'s grid-local centre of mass to get the
     /// body-local centre of mass (`ENG-55`).
     pub fn collider_offset_m(&self, id: BodyId) -> [f32; 3] {
-        self.entries[id.0 as usize].collider_offset_m
+        self.entries[entry_index(id, self.id_namespace)].collider_offset_m
     }
 
     /// A body's authoritative mass properties: `(mass_kg, local centre of mass in
@@ -1090,7 +1419,7 @@ impl PhysicsWorld {
     /// `(0, 0, 0)` corner at the origin); [`Self::collider_offset_m`] shifts it
     /// to the body frame.
     pub fn derived_mass_properties(&self, id: BodyId) -> (f32, [f32; 3], [f32; 3]) {
-        let entry = &self.entries[id.0 as usize];
+        let entry = &self.entries[entry_index(id, self.id_namespace)];
         if let Some(p) = entry.mass_properties {
             return (
                 p.mass_kg,
@@ -1115,7 +1444,7 @@ impl PhysicsWorld {
     /// installed override are folded together — so tests can prove the fine-grid
     /// properties reached the solver, not just this adapter's record of them.
     pub fn live_body_mass_properties(&self, id: BodyId) -> (f32, [f32; 3], [f32; 3]) {
-        let rb = &self.bodies[self.entries[id.0 as usize].body];
+        let rb = &self.bodies[self.entries[entry_index(id, self.id_namespace)].body];
         let mp = &rb.mass_properties().local_mprops;
         let com = mp.local_com;
         let pi = mp.principal_inertia();
@@ -1163,6 +1492,187 @@ mod tests {
         ))
         .unwrap();
         OccupancyGrid::from_region(&v, GlobalCell::new(0, 0, 0), GlobalCell::new(7, 3, 3)).unwrap()
+    }
+
+    fn pushed_cube_speed(density_kg_m3: f64) -> (f32, f32) {
+        let id = VolumeId::new(10).unwrap();
+        let mut volume = Volume::new(id, CellSizeCode::Quarter);
+        volume
+            .apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(3, 3, 3),
+                fixtures::STONE,
+            ))
+            .unwrap();
+        let grid = OccupancyGrid::from_volume(&volume).unwrap().unwrap();
+        let props = analytic_mass_properties(&grid, CELL_M, |_| density_kg_m3).to_body_properties();
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        let body = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::NativeVoxels,
+            grid,
+            cell_m: CELL_M as f32,
+            density_kg_m3: density_kg_m3 as f32,
+            mass_properties: Some(props),
+            translation_m: [0.5, 0.0, 0.0],
+            linvel_m_s: [0.0; 3],
+        });
+        world.step();
+        world.sweep_character_pushing_excluding(
+            crate::character::CharacterParams::DEFAULT,
+            [0.0, 0.0, 0.5],
+            [0.75, 0.0, 0.0],
+            1.0 / 60.0,
+            &[],
+        );
+        let state = world.body_state(body);
+        (state.linvel_m_s[0], state.mass_kg)
+    }
+
+    /// Speed given to a zero-gravity 1 m cube at `cube_x` (its origin; the cube
+    /// spans `+1 m` in x) by one 0.075 m walking step along +x from x = 0.
+    /// Returns `(speed_along_x, speed_total)`.
+    fn carried_cube_speed(cube_x: f32, cube_z: f32) -> (f32, f32) {
+        let id = VolumeId::new(12).unwrap();
+        let mut volume = Volume::new(id, CellSizeCode::Quarter);
+        volume
+            .apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(3, 3, 3),
+                fixtures::STONE,
+            ))
+            .unwrap();
+        let grid = OccupancyGrid::from_volume(&volume).unwrap().unwrap();
+        let props = analytic_mass_properties(&grid, CELL_M, |_| 2_000.0).to_body_properties();
+        let mut world = PhysicsWorld::new(PhysicsConfig {
+            gravity_m_s2: [0.0; 3],
+            ..PhysicsConfig::default()
+        });
+        let body = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::MergedCuboids,
+            grid,
+            cell_m: CELL_M as f32,
+            density_kg_m3: 2_000.0,
+            mass_properties: Some(props),
+            translation_m: [cube_x, 0.0, cube_z],
+            linvel_m_s: [0.0; 3],
+        });
+        world.step();
+        world.sweep_character_pushing_excluding(
+            crate::character::CharacterParams::DEFAULT,
+            [0.0, 0.0, 0.5],
+            [0.075, 0.0, 0.0],
+            1.0 / 60.0,
+            &[],
+        );
+        let v = world.body_state(body).linvel_m_s;
+        (v[0], (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+    }
+
+    /// Audit of the "carry" helper (bodies near and ahead of a walking
+    /// character are lifted to its speed even without a registered contact):
+    /// it must never launch a body that is out of reach, behind, or faster
+    /// than the character itself walks.
+    #[test]
+    fn carry_helper_never_launches_out_of_reach_or_faster_than_the_walker() {
+        const WALK: f32 = crate::character::tuning::WALK_SPEED_M_S;
+        // Capsule radius 0.3 at x = 0.075: front at 0.375. Cube x-extent 1 m.
+        // Well ahead (gap > margin): untouched.
+        let (far, _) = carried_cube_speed(0.6, 0.0);
+        assert!(far.abs() < 1e-4, "out-of-reach cube launched: {far}");
+        // Beside the walker (1 m off to the side, far beyond any margin).
+        let (side, total) = carried_cube_speed(0.0, 1.5);
+        assert!(total < 1e-4, "cube beside the walker launched: {side}");
+        // Behind the walker.
+        let (behind, total) = carried_cube_speed(-1.6, 0.0);
+        assert!(total < 1e-4, "cube behind the walker launched: {behind}");
+        // Touching / within the margin: carried, but never past walking speed.
+        let (near, _) = carried_cube_speed(0.4, 0.0);
+        assert!(near > 0.0, "the near cube should be pushed along");
+        assert!(
+            near <= WALK + 1e-3,
+            "carried faster than the walker: {near}"
+        );
+    }
+
+    #[test]
+    fn character_push_uses_fine_voxel_mass() {
+        let (small_speed, small_mass) = pushed_cube_speed(20.0);
+        let (large_speed, large_mass) = pushed_cube_speed(2_000.0);
+        assert!(
+            (small_mass - 20.0).abs() < 1.0e-3,
+            "small mass={small_mass}"
+        );
+        assert!(
+            (large_mass - 2_000.0).abs() < 1.0e-2,
+            "large mass={large_mass}"
+        );
+        assert!(small_speed > 0.0, "the player did not push the small cube");
+        assert!(
+            small_speed > large_speed * 5.0,
+            "voxel mass should resist the same push: small={small_speed}, large={large_speed}"
+        );
+    }
+
+    #[test]
+    fn high_restitution_body_visibly_rebounds_from_zero_restitution_terrain() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let floor_volume = crate::fixtures::floor_slab(VolumeId::new(11).unwrap(), 2, 2, 4);
+        let floor_grid = OccupancyGrid::from_volume(&floor_volume).unwrap().unwrap();
+        world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: floor_grid,
+            cell_m: CELL_M as f32,
+            density_kg_m3: 1_000.0,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+
+        let id = VolumeId::new(12).unwrap();
+        let mut cube = Volume::new(id, CellSizeCode::Quarter);
+        cube.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(1, 1, 1),
+            fixtures::STONE,
+        ))
+        .unwrap();
+        let grid = OccupancyGrid::from_volume(&cube).unwrap().unwrap();
+        let props = analytic_mass_properties(&grid, CELL_M, |_| 2_000.0).to_body_properties();
+        let body = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::NativeVoxels,
+            grid,
+            cell_m: CELL_M as f32,
+            density_kg_m3: 2_000.0,
+            mass_properties: Some(props),
+            translation_m: [8.0, 5.0, 8.0],
+            linvel_m_s: [0.0; 3],
+        });
+        world.set_restitution(body, 0.72);
+
+        let mut fell = false;
+        let mut rebound_speed = 0.0_f32;
+        for _ in 0..180 {
+            world.step();
+            let vy = world.body_state(body).linvel_m_s[1];
+            fell |= vy < -1.0;
+            if fell {
+                rebound_speed = rebound_speed.max(vy);
+            }
+        }
+        assert!(
+            rebound_speed > 1.0,
+            "expected a visible rebound, max upward speed was {rebound_speed} m/s"
+        );
     }
 
     fn gravity_free() -> PhysicsWorld {
@@ -1253,6 +1763,131 @@ mod tests {
             world.max_penetration_m() < 0.1,
             "resting body did not sink into the floor ({} m)",
             world.max_penetration_m()
+        );
+    }
+
+    /// PR #109 review finding: [`PhysicsWorld::sync_queries`] used to call
+    /// [`rapier3d::geometry::BroadPhaseBvh::update`] directly, which Rapier
+    /// permanently remembers as "this pair was announced" — so a single
+    /// `sync_queries` call before a pair's very first real [`PhysicsWorld::step`]
+    /// silently and permanently starved that pair of contacts, for the rest
+    /// of the simulation, however many times `step` ran afterwards. This is
+    /// exactly [`CharacterQueryCache`](crate::query_cache::CharacterQueryCache)'s
+    /// real call pattern: it shares this `PhysicsWorld` with a simulation it
+    /// does not own the tick loop for, and calls `sync_queries` (never
+    /// `step`) after every window rebuild.
+    #[test]
+    fn sync_queries_before_the_first_step_does_not_starve_a_dynamic_body_of_contacts() {
+        fn unit_cube_body(world: &mut PhysicsWorld, kind: BodyKind, y: f32) -> BodyId {
+            world.add_body(BodySpec {
+                kind,
+                representation: Representation::MergedCuboids,
+                grid: OccupancyGrid::from_solid_mask(
+                    GlobalCell::new(0, 0, 0),
+                    [1, 1, 1],
+                    vec![true],
+                    vec![MaterialId(1)],
+                )
+                .unwrap(),
+                cell_m: 1.0,
+                density_kg_m3: 1.0,
+                mass_properties: None,
+                translation_m: [0.0, y, 0.0],
+                linvel_m_s: [0.0; 3],
+            })
+        }
+
+        let mut without_sync = PhysicsWorld::new(PhysicsConfig::default());
+        unit_cube_body(&mut without_sync, BodyKind::Fixed, 0.0);
+        let dynamic_no_sync =
+            unit_cube_body(&mut without_sync, BodyKind::Dynamic { ccd: false }, 1.0);
+        for _ in 0..60 {
+            without_sync.step();
+        }
+        let baseline = without_sync.body_state(dynamic_no_sync);
+        assert!(
+            baseline.translation_m[1] > 0.9,
+            "baseline (no sync_queries) should rest on the floor, got y = {}",
+            baseline.translation_m[1]
+        );
+
+        let mut with_sync = PhysicsWorld::new(PhysicsConfig::default());
+        unit_cube_body(&mut with_sync, BodyKind::Fixed, 0.0);
+        let dynamic = unit_cube_body(&mut with_sync, BodyKind::Dynamic { ccd: false }, 1.0);
+        with_sync.sync_queries();
+        for _ in 0..60 {
+            with_sync.step();
+        }
+        let st = with_sync.body_state(dynamic);
+        assert!(
+            st.translation_m[1] > 0.9,
+            "a sync_queries call before the first step must not stop the pair from ever \
+             contacting — expected the body to rest at y > 0.9 like the no-sync baseline \
+             ({}), got y = {}",
+            baseline.translation_m[1],
+            st.translation_m[1]
+        );
+        assert!(
+            with_sync.contact_pair_count() >= 1,
+            "expected at least one live contact pair after settling, found none"
+        );
+    }
+
+    /// Same regression, but exercising [`CharacterQueryCache`]'s actual usage
+    /// pattern: a collider *replacement* ([`PhysicsWorld::rebuild_collider`])
+    /// followed by `sync_queries`, on a `PhysicsWorld` a real dynamic body is
+    /// also resting in — not just a freshly-added collider.
+    #[test]
+    fn sync_queries_after_collider_replacement_does_not_starve_a_dynamic_body_of_contacts() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [1, 1, 1],
+            vec![true],
+            vec![MaterialId(1)],
+        )
+        .unwrap();
+        let floor = world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: grid.clone(),
+            cell_m: 1.0,
+            density_kg_m3: 1.0,
+            mass_properties: None,
+            translation_m: [0.0, 0.0, 0.0],
+            linvel_m_s: [0.0; 3],
+        });
+        let dynamic = world.add_body(BodySpec {
+            kind: BodyKind::Dynamic { ccd: false },
+            representation: Representation::MergedCuboids,
+            grid: grid.clone(),
+            cell_m: 1.0,
+            density_kg_m3: 1.0,
+            mass_properties: None,
+            translation_m: [0.0, 1.0, 0.0],
+            linvel_m_s: [0.0; 3],
+        });
+
+        // Rebuild the floor's collider (a no-op geometry change) and sync
+        // queries against it, exactly like `CharacterQueryCache::rebuild`
+        // does for its window collider — before the dynamic body's own pair
+        // has ever gone through a real `step`.
+        world.rebuild_collider(floor, &grid, Representation::MergedCuboids);
+        world.sync_queries();
+
+        for _ in 0..60 {
+            world.step();
+        }
+        let st = world.body_state(dynamic);
+        assert!(
+            st.translation_m[1] > 0.9,
+            "a collider-replacement + sync_queries call must not stop the dynamic body's \
+             pair from ever contacting — got y = {}",
+            st.translation_m[1]
+        );
+        assert!(
+            world.contact_pair_count() >= 1,
+            "expected at least one live contact pair after settling, found none"
         );
     }
 

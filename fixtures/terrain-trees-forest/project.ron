@@ -1,0 +1,56 @@
+(
+    format_version: 1,
+    name: "Terrain Forest",
+    material_mapping: {
+        "dirt": 6,
+        "foliage.oak": 3,
+        "grass": 5,
+        "sandstone": 4,
+        "stone.granite": 1,
+        "wood.oak": 2,
+    },
+    asset_database: (
+        format_version: 1,
+        next_asset_id: 6,
+        assets: {
+            (1): (
+                id: (1),
+                name: "Terrain Palm Tree",
+                kind: Voxel,
+                storage: "assets\\palm_tree.spvox",
+                authoring_bounds: None,
+            ),
+            (2): (
+                id: (2),
+                name: "Terrain Weeping Willow",
+                kind: Voxel,
+                storage: "assets\\weeping_willow.spvox",
+                authoring_bounds: None,
+            ),
+            (3): (
+                id: (3),
+                name: "Terrain Palm Tree 2",
+                kind: Voxel,
+                storage: "assets\\palm_tree_2.spvox",
+                authoring_bounds: None,
+            ),
+            (4): (
+                id: (4),
+                name: "Terrain Weeping Willow 2",
+                kind: Voxel,
+                storage: "assets\\weeping_willow_2.spvox",
+                authoring_bounds: None,
+            ),
+            (5): (
+                id: (5),
+                name: "Scene Voxels",
+                kind: Voxel,
+                storage: "assets\\scene_voxels.spvox",
+                authoring_bounds: None,
+            ),
+        },
+    ),
+    scenes: {
+        "Main": "scenes/main.ron",
+    },
+)

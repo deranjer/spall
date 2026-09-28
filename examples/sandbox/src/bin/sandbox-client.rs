@@ -1,9 +1,10 @@
 use clap::Parser;
 use spall_client::{
     BaselineScene, ClientConfig, ClientNetConfig, MovementStep, ScriptTarget, ScriptedAction,
-    cut_request, run_replication_client,
+    tool_request,
 };
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
+use spall_protocol::ActionKind;
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 
 #[derive(Debug, Parser)]
@@ -12,6 +13,10 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
     about = "Spall sandbox render-window / replication client"
 )]
 struct Args {
+    /// Open the local interactive MAC water inspection viewer. This private
+    /// debug simulation is separate from the authoritative game tick.
+    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive"])]
+    grid_fluid_demo: bool,
     /// T00 offline render host (no transport).
     #[arg(long)]
     offline: bool,
@@ -34,6 +39,23 @@ struct Args {
     /// `--move` if both are given.
     #[arg(long)]
     interactive: bool,
+    /// Lighting environment for `--interactive`: studio, daylight, overcast,
+    /// sunset or night. Defaults to daylight. The editor saves the choice in
+    /// the scene; `cargo xtask play` forwards it here.
+    #[arg(long)]
+    environment: Option<String>,
+    /// Versioned game asset manifest required when the server serves custom assets.
+    #[arg(long)]
+    content_manifest: Option<PathBuf>,
+    /// Request the current authoritative player inventory over the control stream.
+    #[arg(long)]
+    inspect_inventory: bool,
+    /// Craft once: RECIPE_ID:BATCH_COUNT (use --inventory-revision from the latest inventory response).
+    #[arg(long, value_parser = parse_craft)]
+    craft: Option<CraftCommand>,
+    /// Expected inventory revision for --craft; stale revisions are rejected with a refreshed inventory.
+    #[arg(long)]
+    inventory_revision: Option<u64>,
     /// File holding the server certificate fingerprint (hex).
     #[arg(long)]
     server_fingerprint: Option<PathBuf>,
@@ -42,9 +64,19 @@ struct Args {
     join_token_file: Option<PathBuf>,
     /// Scripted cut: `TICK:X,Y,Z:RADIUS` in the target volume's cell
     /// coordinates, optionally `:body` to aim at the detached body instead of
-    /// terrain. Repeatable.
+    /// terrain. Repeatable. The selected `--tool` determines the operation.
     #[arg(long = "cut", value_parser = parse_cut)]
     cuts: Vec<Cut>,
+    /// Server-approved sandbox tool for scripted actions.
+    #[arg(long, value_enum, default_value_t = SandboxTool::Dig)]
+    tool: SandboxTool,
+    /// T23 / G3 row 13: a JSON array of `{"tick", "cell": [x,y,z], "radius",
+    /// "target"}` (same fields as `--cut`, `target` optional/`"terrain"` by
+    /// default) — for a sustained script too long to fit as individual
+    /// `--cut` arguments on one process command line. Appended after any
+    /// `--cut` entries.
+    #[arg(long)]
+    cuts_file: Option<PathBuf>,
     /// T19 scripted movement leg: `FROM:TO:MX,MY,MZ:BUTTONS` — hold the
     /// (clamped `-1..=1`) movement axes and button bitset from server tick
     /// `FROM` up to `TO`. The player walks along `+X` (button 1 = jump).
@@ -83,9 +115,49 @@ struct Args {
     /// as the player returns. The committed world / agreed hash is unchanged.
     #[arg(long, default_value_t = 0)]
     residency_budget_bricks: usize,
+    /// Refuse a segmented late-join baseline whose manifest declares more decoded bytes than this
+    /// (checked before any segment is decoded).
+    #[arg(long)]
+    baseline_staging_budget_bytes: Option<u64>,
     /// Chebyshev brick radius kept resident around the predicted player.
     #[arg(long, default_value_t = 2)]
     residency_radius_bricks: i64,
+    /// T23 / G3 row 7 increment 14: hard ceiling on resident terrain dense
+    /// bytes, enforced the same way as `--residency-budget-bricks` -- an
+    /// interest-driven (box-driven) reload back into the tracked box is
+    /// deferred rather than admitted past it. Only meaningful with
+    /// `--residency-budget-bricks > 0`. Absent (the default) disables the cap,
+    /// matching every prior run's exact behavior.
+    #[arg(long)]
+    residency_budget_dense_bytes: Option<u64>,
+    /// **Testing only.** Gives this client runtime authority over its player
+    /// and detached-body physics: it ignores server pose corrections, steps
+    /// dynamic bodies locally, transfers player push impulses, and drives the
+    /// playground emitters from its own clock. Replicated topology still
+    /// supplies the terrain/body voxel shapes. Only meaningful for a local,
+    /// single-player debug session (e.g. `cargo xtask play`), never over a
+    /// real network or with other players.
+    #[arg(long)]
+    client_authoritative: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum SandboxTool {
+    Dig,
+    PlaceStone,
+    PlaceWood,
+    PlaceDirt,
+}
+
+impl SandboxTool {
+    fn wire(self) -> (u16, ActionKind) {
+        match self {
+            Self::Dig => (sandbox::game::tool_ids::DIG, ActionKind::Cut),
+            Self::PlaceStone => (sandbox::game::tool_ids::PLACE_STONE, ActionKind::Place),
+            Self::PlaceWood => (sandbox::game::tool_ids::PLACE_WOOD, ActionKind::Place),
+            Self::PlaceDirt => (sandbox::game::tool_ids::PLACE_DIRT, ActionKind::Place),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +174,27 @@ struct MoveLeg {
     to: u64,
     movement: [f32; 3],
     buttons: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CraftCommand {
+    recipe_id: u16,
+    batch_count: u32,
+}
+
+fn parse_craft(value: &str) -> Result<CraftCommand, String> {
+    let (recipe, batch) = value
+        .split_once(':')
+        .ok_or("expected RECIPE_ID:BATCH_COUNT")?;
+    let recipe_id = recipe.parse::<u16>().map_err(|_| "invalid recipe ID")?;
+    let batch_count = batch.parse::<u32>().map_err(|_| "invalid craft batch")?;
+    if recipe_id == 0 || batch_count == 0 {
+        return Err("recipe ID and batch count must be nonzero".into());
+    }
+    Ok(CraftCommand {
+        recipe_id,
+        batch_count,
+    })
 }
 
 fn parse_move(s: &str) -> Result<MoveLeg, String> {
@@ -125,6 +218,62 @@ fn parse_move(s: &str) -> Result<MoveLeg, String> {
         movement: [m[0], m[1], m[2]],
         buttons,
     })
+}
+
+/// One `--cuts-file` entry — the same fields `parse_cut` reads off a `--cut`
+/// string, as JSON instead (see `Cut`).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CutFileEntry {
+    tick: u64,
+    cell: [i64; 3],
+    radius: i64,
+    #[serde(default)]
+    target: CutFileTarget,
+    /// With `"target": "body"`: aim at this raw entity id instead of the sole
+    /// detached body.
+    #[serde(default)]
+    entity: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CutFileTarget {
+    #[default]
+    Terrain,
+    Body,
+}
+
+/// Reads a `--cuts-file`'s JSON array into `Cut`s, or an empty vec + a
+/// printed warning if it can't be read/parsed — a malformed sustained-script
+/// file should not silently vanish into "the client just never edited".
+fn read_cuts_file(path: &std::path::Path) -> Vec<Cut> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("sandbox-client: --cuts-file {path:?}: {e}");
+            return Vec::new();
+        }
+    };
+    match serde_json::from_str::<Vec<CutFileEntry>>(&body) {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|e| Cut {
+                tick: e.tick,
+                cell: e.cell,
+                radius: e.radius,
+                target: match e.target {
+                    CutFileTarget::Terrain => ScriptTarget::Terrain,
+                    CutFileTarget::Body => e
+                        .entity
+                        .map_or(ScriptTarget::DetachedBody, ScriptTarget::Body),
+                },
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("sandbox-client: --cuts-file {path:?}: {e}");
+            Vec::new()
+        }
+    }
 }
 
 fn parse_cut(s: &str) -> Result<Cut, String> {
@@ -158,6 +307,20 @@ fn main() -> ExitCode {
     sandbox::init_tracing();
     let args = Args::parse();
 
+    if args.grid_fluid_demo {
+        return match spall_client::run_grid_fluid_demo_window() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error @ spall_client::ClientError::Gpu(_)) => {
+                eprintln!("sandbox-client: {error}");
+                ExitCode::from(3)
+            }
+            Err(error) => {
+                eprintln!("sandbox-client: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     if args.connect.is_some() && args.interactive {
         return run_interactive(args);
     }
@@ -190,6 +353,20 @@ fn main() -> ExitCode {
 }
 
 fn run_replication(args: Args) -> ExitCode {
+    let asset_hash = match load_asset_manifest_hash(args.content_manifest.as_deref()) {
+        Ok(hash) => hash,
+        Err(error) => {
+            eprintln!("sandbox-client: content manifest: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let progression = match make_progression_requests(&args) {
+        Ok(requests) => requests,
+        Err(error) => {
+            eprintln!("sandbox-client: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let connect_addr = args.connect.expect("checked by caller");
     let (Some(fp_file), Some(token_file)) = (args.server_fingerprint, args.join_token_file) else {
         eprintln!("sandbox-client: --connect requires --server-fingerprint and --join-token-file");
@@ -235,13 +412,24 @@ fn run_replication(args: Args) -> ExitCode {
     }
 
     let id_base = (args.client_index << 40) | 1;
-    let script: Vec<ScriptedAction> = args
-        .cuts
+    let (tool_id, action_kind) = args.tool.wire();
+    let mut all_cuts = args.cuts.clone();
+    if let Some(path) = &args.cuts_file {
+        all_cuts.extend(read_cuts_file(path));
+    }
+    let script: Vec<ScriptedAction> = all_cuts
         .iter()
         .enumerate()
         .map(|(i, c)| ScriptedAction {
             at_tick: c.tick,
-            request: cut_request(id_base + i as u64, i as u64, c.cell, c.radius),
+            request: tool_request(
+                tool_id,
+                action_kind,
+                id_base + i as u64,
+                i as u64,
+                c.cell,
+                c.radius,
+            ),
             target: c.target,
         })
         .collect();
@@ -276,12 +464,24 @@ fn run_replication(args: Args) -> ExitCode {
             spall_client::ClientResidencyLimits {
                 budget_bricks: args.residency_budget_bricks,
                 interest_radius_bricks: args.residency_radius_bricks,
+                max_dense_bytes: args.residency_budget_dense_bytes.unwrap_or(u64::MAX),
             },
+        ),
+        // Production clients always carry an explicit admission budget.
+        baseline_staging_budget_bytes: Some(
+            args.baseline_staging_budget_bytes
+                .unwrap_or(spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES),
         ),
         on_replica_ready: None,
         interactive: None,
+        client_authoritative: args.client_authoritative,
     };
-    match run_replication_client(config) {
+    match spall_client::run_replication_client_with_progression(
+        config,
+        sandbox::game::manifest(),
+        asset_hash,
+        progression,
+    ) {
         Ok(summary) => {
             println!(
                 "sandbox-client: {} applied={} motion={} body_disp={:.2}m body_cut={} repairs={} hash={}",
@@ -293,8 +493,24 @@ fn run_replication(args: Args) -> ExitCode {
                 summary.repair_requests_sent,
                 summary.final_world_hash
             );
+            for response in &summary.progression_responses {
+                println!(
+                    "sandbox-client progression: request={} result={:?} inventory_revision={} items={:?}",
+                    response.request_id,
+                    response.outcome,
+                    response.inventory_revision,
+                    response.inventory
+                );
+            }
             if summary.result == "passed" {
                 ExitCode::SUCCESS
+            } else if summary.result == "join-failed" {
+                // T23 / G3 row 10: a live late-join client the server gave up
+                // on mid-catch-up reports this from inside `run_replication_client`
+                // (unlike the pre-baseline handshake failure below, which
+                // returns `Err` instead) -- same bounded-failure contract, same
+                // distinct exit code.
+                ExitCode::from(4)
             } else {
                 ExitCode::from(1)
             }
@@ -341,6 +557,36 @@ fn run_replication(args: Args) -> ExitCode {
 /// driven by live keyboard/mouse input instead of a scripted `--move` path.
 /// Blocks until the window closes or the session ends on its own.
 fn run_interactive(args: Args) -> ExitCode {
+    let asset_hash = match load_asset_manifest_hash(args.content_manifest.as_deref()) {
+        Ok(hash) => hash,
+        Err(error) => {
+            eprintln!("sandbox-client: content manifest: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let progression = match make_progression_requests(&args) {
+        Ok(requests) => requests,
+        Err(error) => {
+            eprintln!("sandbox-client: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let environment = match args.environment.as_deref() {
+        None => spall_client::EnvironmentPreset::Daylight,
+        Some(key) => match spall_client::EnvironmentPreset::from_key(key) {
+            Some(preset) => preset,
+            None => {
+                eprintln!(
+                    "sandbox-client: unknown --environment `{key}` (expected one of: {})",
+                    spall_client::EnvironmentPreset::ALL
+                        .map(|p| p.key())
+                        .join(", ")
+                );
+                return ExitCode::from(2);
+            }
+        },
+    }
+    .environment();
     let connect_addr = args.connect.expect("checked by caller");
     let (Some(fp_file), Some(token_file)) = (args.server_fingerprint, args.join_token_file) else {
         eprintln!("sandbox-client: --connect requires --server-fingerprint and --join-token-file");
@@ -378,13 +624,21 @@ fn run_interactive(args: Args) -> ExitCode {
     }
 
     let id_base = (args.client_index << 40) | 1;
+    let (tool_id, action_kind) = args.tool.wire();
     let script: Vec<ScriptedAction> = args
         .cuts
         .iter()
         .enumerate()
         .map(|(i, c)| ScriptedAction {
             at_tick: c.tick,
-            request: cut_request(id_base + i as u64, i as u64, c.cell, c.radius),
+            request: tool_request(
+                tool_id,
+                action_kind,
+                id_base + i as u64,
+                i as u64,
+                c.cell,
+                c.radius,
+            ),
             target: c.target,
         })
         .collect();
@@ -406,10 +660,18 @@ fn run_interactive(args: Args) -> ExitCode {
         summary_json: None,
         transport: TransportConfig::default(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None, // set by `run_interactive_window` itself
+        client_authoritative: args.client_authoritative,
     };
-    match spall_client::run_interactive_window(config) {
+    match spall_client::run_interactive_window_with_environment(
+        config,
+        sandbox::game::manifest(),
+        asset_hash,
+        progression,
+        environment,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error @ spall_client::ClientError::Gpu(_)) => {
             eprintln!("sandbox-client: {error}");
@@ -420,4 +682,55 @@ fn run_interactive(args: Args) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn make_progression_requests(
+    args: &Args,
+) -> Result<Vec<spall_protocol::ProgressionRequest>, String> {
+    use spall_protocol::{ProgressionOperation as Operation, ProgressionRequest};
+    if args.craft.is_some() && args.inventory_revision.is_none() {
+        return Err(
+            "--craft requires --inventory-revision from the latest inventory response".into(),
+        );
+    }
+    if !args.inspect_inventory && args.craft.is_none() {
+        return Ok(Vec::new());
+    }
+    let base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos() as u64;
+    let revision = args.inventory_revision.unwrap_or(0);
+    let mut requests = Vec::new();
+    if args.inspect_inventory {
+        requests.push(ProgressionRequest {
+            request_id: base.max(1),
+            catalog_version: sandbox::game::RECIPE_CATALOG_VERSION,
+            expected_inventory_revision: revision,
+            operation: Operation::InspectInventory,
+        });
+    }
+    if let Some(craft) = args.craft {
+        requests.push(ProgressionRequest {
+            request_id: base.wrapping_add(requests.len() as u64 + 1).max(1),
+            catalog_version: sandbox::game::RECIPE_CATALOG_VERSION,
+            expected_inventory_revision: revision,
+            operation: Operation::Craft {
+                recipe_id: craft.recipe_id,
+                batch_count: craft.batch_count,
+            },
+        });
+    }
+    Ok(requests)
+}
+
+fn load_asset_manifest_hash(path: Option<&std::path::Path>) -> Result<Option<[u8; 32]>, String> {
+    let Some(path) = path else { return Ok(None) };
+    let store = sandbox::content::AssetStore::open(path).map_err(|error| error.to_string())?;
+    store.verify_all().map_err(|error| error.to_string())?;
+    store
+        .manifest()
+        .canonical_hash()
+        .map(Some)
+        .map_err(|error| error.to_string())
 }

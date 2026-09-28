@@ -1,0 +1,233 @@
+{
+  "name": "t23-g4-join-budget",
+  "description": "T23 / G4 row 11 join budget, worst-case-sized evidence. It runs the same eight-client g4-workload scene/population/cuts as t23-g4-workload: 256 active plus 4096 sleeping bodies (4352 total), two multi-region column cuts, a round-robin edit stream, and two blasts. Every client takes the real late-join baseline; client 7 alone is shaped to the exact G3 profile (1 MiB/s, 100 ms RTT, 20 ms jitter, 2% loss), while clients 0-6 use transparent proxies so the workload phase remains unshaped. A joining replica receives the dependency-complete baseline and then one current motion keyframe at the barrier; it must not receive the live 20 Hz motion feed before it confirms the baseline, because those supersedable datagrams can consume the shaped link and delay reliable baseline/control traffic. The harness measures client 7's actual compressed baseline bytes and connect-to-ready time and enforces <=16 MiB and <=30 s without reducing the workload. `restart_check` is intentionally omitted because t23-g4-workload already covers cold-restart recovery; this fixture isolates the shaped join measurement.",
+  "scene": "g4-workload",
+  "release_profile": true,
+  "server_ticks": 3000,
+  "quiescence_ticks": 2000,
+  "clients": 8,
+  "late_join_clients": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "late_join_connect_delay_ms": 200,
+  "minimum_transactions": 20,
+  "replay_check": true,
+  "join_budget": {
+    "client": 7,
+    "bandwidth_bytes_per_sec": 1048576,
+    "rtt_ms": 100,
+    "jitter_ms": 20,
+    "loss_percent": 2,
+    "max_baseline_compressed_bytes": 16777216,
+    "max_ready_ms": 30000
+  },
+  "cuts": [
+    {
+      "client": 0,
+      "at_tick": 200,
+      "cell": [
+        10,
+        6,
+        3
+      ],
+      "radius": 2
+    },
+    {
+      "client": 4,
+      "at_tick": 260,
+      "cell": [
+        82,
+        6,
+        75
+      ],
+      "radius": 2
+    },
+    {
+      "client": 0,
+      "at_tick": 320,
+      "cell": [
+        1,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 1,
+      "at_tick": 326,
+      "cell": [
+        2,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 2,
+      "at_tick": 332,
+      "cell": [
+        3,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 3,
+      "at_tick": 338,
+      "cell": [
+        4,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 4,
+      "at_tick": 344,
+      "cell": [
+        73,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 5,
+      "at_tick": 350,
+      "cell": [
+        74,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 6,
+      "at_tick": 356,
+      "cell": [
+        75,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 7,
+      "at_tick": 362,
+      "cell": [
+        76,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 0,
+      "at_tick": 368,
+      "cell": [
+        5,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 1,
+      "at_tick": 374,
+      "cell": [
+        6,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 2,
+      "at_tick": 380,
+      "cell": [
+        7,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 3,
+      "at_tick": 386,
+      "cell": [
+        8,
+        1,
+        6
+      ],
+      "radius": 1
+    },
+    {
+      "client": 4,
+      "at_tick": 392,
+      "cell": [
+        77,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 5,
+      "at_tick": 398,
+      "cell": [
+        78,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 6,
+      "at_tick": 404,
+      "cell": [
+        79,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 7,
+      "at_tick": 410,
+      "cell": [
+        80,
+        1,
+        78
+      ],
+      "radius": 1
+    },
+    {
+      "client": 0,
+      "at_tick": 500,
+      "cell": [
+        20,
+        12,
+        12
+      ],
+      "radius": 8
+    },
+    {
+      "client": 4,
+      "at_tick": 1100,
+      "cell": [
+        92,
+        12,
+        73
+      ],
+      "radius": 8
+    }
+  ]
+}
