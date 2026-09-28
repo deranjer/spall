@@ -42,6 +42,16 @@ pub struct PlayArgs {
     /// `--editor-scene` file, else daylight.
     #[arg(long)]
     environment: Option<String>,
+    /// Disable display vsync for a local rendering-throughput measurement.
+    #[arg(long)]
+    uncapped: bool,
+    /// Scripted screenshot tour forwarded to the client (see
+    /// `sandbox-client --shots`); the session ends after the last shot.
+    #[arg(long)]
+    shots: Option<String>,
+    /// Where `--shots` PNGs are written.
+    #[arg(long)]
+    shots_dir: Option<PathBuf>,
     /// Server tick budget, at the server's paced 60 Hz. Deliberately large —
     /// `--interactive` has no natural end (a person closes the window when
     /// done), unlike the scripted `session`/`scenario` harness this shares
@@ -144,6 +154,9 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         "--quiescence-ticks",
         "0",
         "--paced",
+        // A local play session is its own operator: the in-game admin menu
+        // may reset the world.
+        "--allow-admin-commands",
     ]);
     match &args.editor_scene {
         Some(path) => server_cmd.arg("--editor-scene").arg(path),
@@ -193,6 +206,19 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     if let Some(environment) = &environment {
         eprintln!("xtask play: environment={environment}");
         client_cmd.args(["--environment", environment]);
+    }
+    if args.uncapped {
+        client_cmd.arg("--uncapped");
+    }
+    if let Some(shots) = &args.shots {
+        client_cmd.args(["--shots", shots]);
+        let dir = args
+            .shots_dir
+            .clone()
+            .unwrap_or_else(|| output.join("shots"));
+        client_cmd
+            .arg("--shots-dir")
+            .arg(workspace_root().join(dir));
     }
     if needs_server_baseline {
         client_cmd.arg("--late-join");

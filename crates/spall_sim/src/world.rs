@@ -62,6 +62,8 @@ pub enum WorldError {
     ReplayPrecondition(String),
     #[error("journal replay result hash mismatch: {0}")]
     ReplayResultHash(String),
+    #[error("authoritative water initialization failed: {0}")]
+    WaterInitialization(String),
 }
 
 /// A detached body being reinstated from a persisted checkpoint record.
@@ -188,6 +190,20 @@ fn empty_evicted() -> &'static EvictedBricks {
     EMPTY.get_or_init(EvictedBricks::new)
 }
 
+/// Exact occupancy of the first resident brick that holds a solid cell, or
+/// `None` if the volume has none.
+fn first_solid_brick_grid(volume: &Volume) -> Result<Option<OccupancyGrid>, WorldError> {
+    for coord in volume.resident_brick_coords() {
+        let min = GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32);
+        let max = GlobalCell::new(min.x + 31, min.y + 31, min.z + 31);
+        let grid = OccupancyGrid::from_region(volume, min, max)?;
+        if grid.solid_count() > 0 {
+            return Ok(Some(grid));
+        }
+    }
+    Ok(None)
+}
+
 impl SimWorld {
     /// Builds a world from `setup` with per-brick terrain collision.
     pub fn new(setup: WorldSetup) -> Result<Self, WorldError> {
@@ -212,7 +228,16 @@ impl SimWorld {
         let mut registry = IdRegistry::new();
         let terrain_volume_id = registry.allocate_volume()?; // volume 1 == terrain
 
-        let grid = OccupancyGrid::from_volume(&setup.terrain)?.ok_or(WorldError::EmptyTerrain)?;
+        let grid = match mode {
+            // The fixed whole-terrain body is retired by
+            // `ensure_terrain_brick_colliders` below. Planning an exact collider
+            // for the entire terrain first would only cap terrain size (grid
+            // cells and the merged-cuboid budget), so the placeholder is the
+            // first solid brick's exact occupancy.
+            TerrainColliderMode::PerBrick => first_solid_brick_grid(&setup.terrain)?,
+            TerrainColliderMode::WholeTerrain => OccupancyGrid::from_volume(&setup.terrain)?,
+        }
+        .ok_or(WorldError::EmptyTerrain)?;
         let cell_m = setup.terrain.cell_size().metres() as f32;
         let mut plan = plan_collider(&grid)?;
         let (terrain_grid, terrain_translation) = physics_origin

@@ -46,6 +46,7 @@ pub mod intent;
 pub mod journal;
 pub mod player;
 pub mod playground;
+pub mod prof;
 pub mod region_coordinator;
 pub mod registry;
 pub mod replication;
@@ -53,6 +54,7 @@ pub mod schedule;
 pub mod sim;
 pub mod stage;
 pub mod transfer;
+pub mod water;
 pub mod world;
 
 /// Re-exported so game/example code names one `RequestId` type, not a copy.
@@ -93,6 +95,10 @@ pub use sim::{
 };
 pub use stage::{StageError, StageInput, StagedEdit, stage_edit};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
+pub use water::{
+    AuthoritativeWater, MAX_GATED_SOURCE_RATE, WaterError, WaterExecution, WaterFrame,
+    WaterSeedReport, WaterSetup, WaterTickMetrics,
+};
 pub use world::{RestoredBody, SimWorld, WorldError};
 pub use world::{
     WorldSetup, canonical_logical_volume_for, canonical_volume_for, solid_cells,

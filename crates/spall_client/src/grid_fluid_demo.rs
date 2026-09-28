@@ -302,6 +302,7 @@ impl GridFluidDemoApp {
                 "1 reservoirs · 2 canal · 3 breach · 4 basin · 5 tunnel · 6 level basin · C open · B breach · X close · Space pause · R reset · WASD/QE move · mouse look",
                 &status,
             )),
+            None,
         ) {
             self.fail(event_loop, error);
         }
@@ -332,6 +333,7 @@ impl ApplicationHandler for GridFluidDemoApp {
             window.clone(),
             EnvironmentPreset::Daylight.environment(),
             &materials,
+            false,
         ) {
             Ok(renderer) => {
                 self.window = Some(window);

@@ -8,6 +8,94 @@ fn put(asset: &mut VoxelAssetFile, x: i32, y: i32, z: i32, material: u16, tint: 
     asset.colors.insert(cell, tint);
 }
 
+/// Ensures every voxel in `asset` is six-face-connected back to the trunk
+/// base at (0, 0, 0). The engine's structural connectivity graph treats
+/// every solid voxel identically regardless of material (`docs/architecture.md`:
+/// "use six-face connectivity"; corner/edge contact does not create a bond),
+/// so a canopy authored with diagonal-only gaps between its voxels becomes
+/// dozens of genuinely disconnected "unsupported" fragments. That is not an
+/// engine bug, but it is a scene/content defect: a world placing many of
+/// these trees can accumulate thousands of pre-existing disconnected
+/// fragments that the very first terrain edit anywhere in that world then
+/// tries to detach all at once (see the valley-showcase giant-split
+/// rejection this was written to fix). This bridges each disconnected
+/// cluster to the trunk's component with a short straight run of its own
+/// nearest voxel's material/tint, rather than deleting any authored voxel.
+fn connect_foliage_to_trunk(asset: &mut VoxelAssetFile) {
+    use std::collections::{HashSet, VecDeque};
+    const ROOT: (i32, i32, i32) = (0, 0, 0);
+    const NEIGHBOURS: [(i32, i32, i32); 6] = [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ];
+    loop {
+        let cells: HashSet<(i32, i32, i32)> =
+            asset.voxels.keys().map(|c| (c.x, c.y, c.z)).collect();
+        if !cells.contains(&ROOT) {
+            return; // nothing to anchor to; the trunk base is always placed
+        }
+        let mut visited = HashSet::from([ROOT]);
+        let mut queue = VecDeque::from([ROOT]);
+        while let Some((x, y, z)) = queue.pop_front() {
+            for (dx, dy, dz) in NEIGHBOURS {
+                let n = (x + dx, y + dy, z + dz);
+                if cells.contains(&n) && visited.insert(n) {
+                    queue.push_back(n);
+                }
+            }
+        }
+        let mut nearest: Option<((i32, i32, i32), (i32, i32, i32), i32)> = None;
+        for &d in cells.difference(&visited) {
+            for &v in &visited {
+                let dist = (d.0 - v.0).abs() + (d.1 - v.1).abs() + (d.2 - v.2).abs();
+                if nearest.is_none_or(|(_, _, best)| dist < best) {
+                    nearest = Some((d, v, dist));
+                }
+            }
+        }
+        let Some((from, to, _)) = nearest else {
+            return; // every voxel reaches the trunk
+        };
+        let material = asset.voxels[&VoxelCoord {
+            x: from.0,
+            y: from.1,
+            z: from.2,
+        }];
+        let tint = asset
+            .colors
+            .get(&VoxelCoord {
+                x: from.0,
+                y: from.1,
+                z: from.2,
+            })
+            .copied();
+        // Walk one axis at a time from `from` toward `to`: only one
+        // coordinate changes per step, so every step is face-adjacent to
+        // the last.
+        let (mut x, mut y, mut z) = from;
+        while (x, y, z) != to {
+            if x != to.0 {
+                x += (to.0 - x).signum();
+            } else if y != to.1 {
+                y += (to.1 - y).signum();
+            } else {
+                z += (to.2 - z).signum();
+            }
+            let cell = VoxelCoord { x, y, z };
+            if !asset.voxels.contains_key(&cell) {
+                asset.voxels.insert(cell, material);
+                if let Some(tint) = tint {
+                    asset.colors.insert(cell, tint);
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = std::env::args_os()
         .nth(1)
@@ -136,10 +224,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn save_asset(
     model: &mut EditorModel,
-    asset: VoxelAssetFile,
+    mut asset: VoxelAssetFile,
     file_name: &str,
     position: [f32; 3],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    connect_foliage_to_trunk(&mut asset);
     let command = model.new_voxel_asset_command(asset.name.clone());
     let EditorCommand::CreateVoxelAsset { mut record, .. } = command else {
         unreachable!()

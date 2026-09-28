@@ -124,6 +124,8 @@ pub enum DomainError {
     WaterInSolid(GlobalCell),
     #[error("cell {0:?} is outside the fluid domain")]
     OutsideDomain(GlobalCell),
+    #[error("fluid domain dimensions must be multiples of the coarsening factor {factor}")]
+    UnalignedCoarsening { factor: u32 },
 }
 
 /// A complete, immutable solid mask captured from resident Spall voxel data.
@@ -189,6 +191,53 @@ impl SolidBoundary {
                 .index_of(parent)
                 .ok_or(DomainError::CoordinateOverflow)?;
             solid.push(self.solid[parent_index]);
+        }
+        Ok(Self { spec, solid })
+    }
+
+    /// Coarsen a voxel boundary by an integer factor, the inverse addressing of
+    /// [`Self::refined`]: coarse cell `origin + k` covers fine cells
+    /// `origin + k * factor ..= origin + k * factor + factor - 1` on each axis.
+    ///
+    /// A coarse cell is solid when at least half of its fine cells are solid.
+    /// A one-voxel wall inside a `2³` block fills exactly half of it, so thin
+    /// walls stay watertight at factor 2 while sloped banks are not thickened
+    /// by a whole coarse cell. Every axis must be a multiple of `factor`.
+    pub fn coarsened(&self, factor: u32) -> Result<Self, DomainError> {
+        if factor == 0 {
+            return Err(DomainError::EmptyAxis);
+        }
+        if factor == 1 {
+            return Ok(self.clone());
+        }
+        let fine = self.spec.dimensions();
+        if fine.iter().any(|axis| axis % factor != 0) {
+            return Err(DomainError::UnalignedCoarsening { factor });
+        }
+        let dimensions = fine.map(|axis| axis / factor);
+        let spec = DomainSpec::new(self.spec.origin(), dimensions, self.spec.cell_count())?;
+        let f = factor as usize;
+        let [nx, ny, _] = fine.map(|axis| axis as usize);
+        let threshold = (f * f * f).div_ceil(2);
+        let mut solid = Vec::with_capacity(spec.cell_count());
+        for index in 0..spec.cell_count() {
+            let coarse = spec.cell_at(index);
+            let base = [
+                (coarse.x - spec.origin().x) as usize * f,
+                (coarse.y - spec.origin().y) as usize * f,
+                (coarse.z - spec.origin().z) as usize * f,
+            ];
+            let mut count = 0;
+            for z in base[2]..base[2] + f {
+                for y in base[1]..base[1] + f {
+                    let row = nx * (y + ny * z);
+                    count += self.solid[row + base[0]..row + base[0] + f]
+                        .iter()
+                        .filter(|solid| **solid)
+                        .count();
+                }
+            }
+            solid.push(count >= threshold);
         }
         Ok(Self { spec, solid })
     }
@@ -372,6 +421,30 @@ mod tests {
         assert_eq!(
             water.add_water(GlobalCell::new(0, 0, 0), 0.3),
             Err(DomainError::InvalidWaterAmount)
+        );
+    }
+
+    #[test]
+    fn coarsening_keeps_one_voxel_walls_and_drops_isolated_voxels() {
+        let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [4, 2, 2], 16).unwrap();
+        let mut volume = air_volume_for(spec);
+        // A one-voxel wall at x = 1 fills half of the first 2³ block.
+        for y in 0..2 {
+            for z in 0..2 {
+                set_solid(&mut volume, GlobalCell::new(1, y, z), MaterialId(1));
+            }
+        }
+        // One stray voxel in the second block is not a barrier.
+        set_solid(&mut volume, GlobalCell::new(3, 1, 1), MaterialId(1));
+        let fine = SolidBoundary::capture(&volume, spec).unwrap();
+        let coarse = fine.coarsened(2).unwrap();
+        assert_eq!(coarse.spec().dimensions(), [2, 1, 1]);
+        assert_eq!(coarse.spec().origin(), spec.origin());
+        assert_eq!(coarse.is_solid(GlobalCell::new(0, 0, 0)), Some(true));
+        assert_eq!(coarse.is_solid(GlobalCell::new(1, 0, 0)), Some(false));
+        assert_eq!(
+            fine.coarsened(3).unwrap_err(),
+            DomainError::UnalignedCoarsening { factor: 3 }
         );
     }
 

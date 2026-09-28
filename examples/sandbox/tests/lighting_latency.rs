@@ -358,6 +358,7 @@ fn measure(stationary: bool) -> Stages {
         })),
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     };
     let observer = std::thread::spawn(move || {
         spall_client::run_replication_client_with_manifest(observer_cfg, game::manifest())
@@ -396,6 +397,7 @@ fn measure(stationary: bool) -> Stages {
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     };
     let actor = std::thread::spawn(move || {
         spall_client::run_replication_client_with_manifest(actor_cfg, game::manifest())

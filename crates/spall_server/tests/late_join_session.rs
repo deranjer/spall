@@ -81,6 +81,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         // Scripted fixture cuts hit arbitrary cells; use the ENG-47
         // dev-scenario path so this late-join plumbing test still runs.
         dev_unvalidated_actions: true,
+        admin_commands: false,
         save_faults: None,
         await_body_settle: false,
         motion_interest: None,
@@ -145,6 +146,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     };
     let early_thread = std::thread::spawn(move || run_replication_client(early_cfg));
 
@@ -175,6 +177,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     };
     let late = run_replication_client(late_cfg).expect("late-join client run");
     let early = early_thread

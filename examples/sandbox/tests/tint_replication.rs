@@ -136,6 +136,7 @@ fn client_config(
         })),
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     }
 }
 

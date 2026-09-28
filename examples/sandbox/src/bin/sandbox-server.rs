@@ -135,6 +135,10 @@ struct Args {
     /// Lets a fixture harness script arbitrary cuts. Never use on a shared host.
     #[arg(long, hide = true)]
     dev_unvalidated_actions: bool,
+    /// Development only: accept in-game admin commands (world reset) from any
+    /// authenticated client. `cargo xtask play` enables it for local sessions.
+    #[arg(long)]
+    allow_admin_commands: bool,
     /// ENG-61: keep stepping physics past edit-quiescence until every detached
     /// body is asleep (bounded by `--ticks`). Used by the `body-rest-on-structure`
     /// gate fixture so the run can show the detached beam actually come to rest.
@@ -550,6 +554,7 @@ fn run_serve(args: Args) -> ExitCode {
             .capture_workers
             .unwrap_or_else(spall_server::serve::default_capture_workers),
         dev_unvalidated_actions: args.dev_unvalidated_actions,
+        admin_commands: args.allow_admin_commands,
         save_faults: None,
         await_body_settle: args.await_body_settle,
         motion_interest,

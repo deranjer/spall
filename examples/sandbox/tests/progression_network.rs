@@ -227,6 +227,7 @@ fn client_config(
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     }
 }
 

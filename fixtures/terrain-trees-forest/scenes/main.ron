@@ -2,6 +2,7 @@
     format_version: 1,
     name: "Main",
     next_entity_id: 18,
+    environment: "studio",
     entities: {
         (1): (
             id: (1),

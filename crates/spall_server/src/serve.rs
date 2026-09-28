@@ -143,6 +143,12 @@ pub const INBOUND_CHANNEL_CAP: usize = 4096;
 /// burst can never prevent the drain loop from ending.
 pub const MAX_INBOUND_PER_TICK: usize = 1024;
 
+/// Server ticks between water keyframe sends (15 Hz at the 60 Hz tick).
+pub const WATER_KEYFRAME_INTERVAL_TICKS: u64 = 4;
+
+/// Server ticks between water status lines (10 s).
+pub const WATER_STATUS_INTERVAL_TICKS: u64 = 600;
+
 /// Most `ActionRequest`s one session may have admitted in one tick
 /// (`docs/architecture.md`: "Drain bounded input queues; validate client
 /// sequence numbers, permissions, and action limits"). Past this the request
@@ -255,6 +261,17 @@ pub enum Scene {
 pub struct CustomWorld {
     player_spawns: Vec<[f64; 3]>,
     build: Arc<dyn Fn() -> spall_sim::WorldSetup + Send + Sync>,
+    water: Option<spall_sim::WaterSetup>,
+    dam_gate: Option<DamGate>,
+}
+
+/// A scene-authored dam gate an admin can open or close at runtime: the cells
+/// it occupies while closed, and the material to restore them to on close. See
+/// [`spall_protocol::AdminCommand::SetDamGate`].
+#[derive(Clone, Debug)]
+pub struct DamGate {
+    pub cells: Vec<GlobalCell>,
+    pub closed_material: spall_core::MaterialId,
 }
 
 impl CustomWorld {
@@ -263,14 +280,41 @@ impl CustomWorld {
         player_spawns: Vec<[f64; 3]>,
         build: impl Fn() -> spall_sim::WorldSetup + Send + Sync + 'static,
     ) -> Self {
+        Self::new_with_water(player_spawns, None, build)
+    }
+
+    /// Creates a custom scene with an optional server-owned initial fluid state.
+    pub fn new_with_water(
+        player_spawns: Vec<[f64; 3]>,
+        water: Option<spall_sim::WaterSetup>,
+        build: impl Fn() -> spall_sim::WorldSetup + Send + Sync + 'static,
+    ) -> Self {
         Self {
             player_spawns,
             build: Arc::new(build),
+            water,
+            dam_gate: None,
         }
+    }
+
+    /// Declares a runtime-togglable dam gate for this scene (see
+    /// [`AdminCommand::SetDamGate`](spall_protocol::AdminCommand::SetDamGate)).
+    #[must_use]
+    pub fn with_dam_gate(mut self, gate: DamGate) -> Self {
+        self.dam_gate = Some(gate);
+        self
     }
 
     pub fn player_spawns(&self) -> &[[f64; 3]] {
         &self.player_spawns
+    }
+
+    pub fn water_setup(&self) -> Option<&spall_sim::WaterSetup> {
+        self.water.as_ref()
+    }
+
+    pub fn dam_gate(&self) -> Option<&DamGate> {
+        self.dam_gate.as_ref()
     }
 }
 
@@ -278,6 +322,7 @@ impl std::fmt::Debug for CustomWorld {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CustomWorld")
             .field("player_spawns", &self.player_spawns)
+            .field("dam_gate", &self.dam_gate)
             .finish_non_exhaustive()
     }
 }
@@ -403,6 +448,7 @@ impl Scene {
         setup.physics.disable_ccd = true;
         let mut sim_config = SimulationConfig::new(setup);
         sim_config.terrain_collider_mode = mode;
+        sim_config.water = custom.and_then(CustomWorld::water_setup).cloned();
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
         if matches!(self, Scene::G4Workload) {
             // Row 12: 256 active (64 near the west cluster's first spawn) +
@@ -494,6 +540,11 @@ pub struct ServeConfig {
     /// that no real aim ray would produce. Never enable it on a shared host —
     /// with it on, any authenticated peer can edit any cell of any body.
     pub dev_unvalidated_actions: bool,
+    /// **Development only.** Accept `AdminRequest`s (world reset) from any
+    /// authenticated session. Off by default; a reset is still refused when the
+    /// world is persisted or residency-managed, since neither can be rebuilt
+    /// from the scene without discarding durable state.
+    pub admin_commands: bool,
     /// Test-only. A fault plan armed on the world [`Writer`] *after* initial
     /// recovery / first checkpoint, so an injected disk fault lands on a
     /// periodic or clean-shutdown durable write. `None` in production.
@@ -625,6 +676,7 @@ impl ServeConfig {
             max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
             capture_workers: default_capture_workers(),
             dev_unvalidated_actions: false,
+            admin_commands: false,
             save_faults: None,
             await_body_settle: false,
             motion_interest: None,
@@ -699,6 +751,11 @@ pub struct ServeSummary {
     /// ENG-48: `RepairRequest`s dropped because their session exceeded
     /// [`MAX_REPAIRS_PER_CLIENT_PER_TICK`] this tick.
     pub inbound_repairs_throttled: u64,
+    /// ENG-105: water keyframes queued to clients (one per session per new
+    /// frame, at most every [`WATER_KEYFRAME_INTERVAL_TICKS`]).
+    pub water_keyframes_sent: u64,
+    /// Admin world resets performed.
+    pub world_resets: u64,
     /// T20: motion snapshots actually sent this run, summed over every client
     /// and batch. With `motion_interest` unset this is `batches * bodies *
     /// clients`; with it set, interest-culled and cadence-deferred snapshots are
@@ -1246,6 +1303,9 @@ enum Inbound {
     /// A `BaselineAck`: the sentinel (`transfer_id == 0`) asks for a late-join
     /// baseline; a real id confirms one is installed.
     Baseline(SessionId, BaselineAck),
+    /// A development admin command (world reset); gated by
+    /// [`ServeConfig::admin_commands`].
+    Admin(SessionId, spall_protocol::AdminRequest),
     Gone(SessionId),
 }
 
@@ -1356,7 +1416,12 @@ enum Outbound {
     Transaction(Arc<TopologyTransaction>),
     Status(Arc<ActionStatus>),
     Progression(Arc<spall_protocol::ProgressionResponse>),
+    Admin(Arc<spall_protocol::AdminStatus>),
     Motion(Arc<Vec<MotionSnapshot>>),
+    /// ENG-105: one water keyframe's chunks. Lossy like motion — only the
+    /// newest unsent keyframe is kept — but written on the reliable control
+    /// stream because a keyframe is far larger than a datagram.
+    Water(Arc<Vec<spall_protocol::WaterSnapshot>>),
     /// A baseline transfer: `BaselineBegin` on control, parts on a bulk stream,
     /// `BaselineEnd` on control. Carries the whole world for a first late join,
     /// or one brick for a hash repair — the client decides replace vs. merge
@@ -1430,6 +1495,7 @@ struct OutboundQueue {
     reliable: VecDeque<Outbound>,
     reliable_bytes: usize,
     motion: Option<Arc<Vec<MotionSnapshot>>>,
+    water: Option<Arc<Vec<spall_protocol::WaterSnapshot>>>,
     /// Set once a reliable push blew the bound. The writer flushes what is
     /// already queued, says goodbye, and exits.
     overflowed: bool,
@@ -1447,6 +1513,10 @@ impl OutboundQueue {
             // Lossy: keep only the newest unsent batch.
             Outbound::Motion(snaps) => {
                 self.motion = Some(snaps);
+                Ok(())
+            }
+            Outbound::Water(frame) => {
+                self.water = Some(frame);
                 Ok(())
             }
             // The shutdown marker always goes through — it ends the stream.
@@ -1498,8 +1568,9 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
         }
         Outbound::Status(_) => 96,
         Outbound::Progression(reply) => 64 + reply.inventory.len() * 8,
+        Outbound::Admin(status) => 64 + status.message.len(),
         Outbound::Baseline(t) => 64 + t.payload_bytes(),
-        Outbound::Motion(_) | Outbound::Shutdown(_) => 0,
+        Outbound::Motion(_) | Outbound::Water(_) | Outbound::Shutdown(_) => 0,
     }
 }
 
@@ -1507,12 +1578,13 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
 struct OutboundBatch {
     reliable: Vec<Outbound>,
     motion: Option<Arc<Vec<MotionSnapshot>>>,
+    water: Option<Arc<Vec<spall_protocol::WaterSnapshot>>>,
     overflowed: bool,
 }
 
 impl OutboundBatch {
     fn is_empty(&self) -> bool {
-        self.reliable.is_empty() && self.motion.is_none()
+        self.reliable.is_empty() && self.motion.is_none() && self.water.is_none()
     }
 }
 
@@ -1560,6 +1632,7 @@ impl OutboundHandle {
         OutboundBatch {
             reliable: q.reliable.drain(..).collect(),
             motion: q.motion.take(),
+            water: q.water.take(),
             overflowed: q.overflowed,
         }
     }
@@ -1866,6 +1939,11 @@ async fn serve_async(
     let max_join_retries = config.max_join_retries;
     let capture_workers = config.capture_workers.max(1);
     let dev_unvalidated_actions = config.dev_unvalidated_actions;
+    let admin_commands = config.admin_commands;
+    // A world reset rebuilds from the scene; startup-only game content cannot
+    // be reinstalled, so its presence refuses the reset instead.
+    let reset_materials = materials.clone();
+    let startup_game_setup = game_setup.is_some();
     let action_catalog = tool_catalog;
     let world_materials = materials;
     let residency_limits = config.residency;
@@ -1998,18 +2076,8 @@ async fn serve_async(
         // dormant body, so every currently-dormant entity is exactly this
         // population, found by a fresh scan rather than threading a
         // `Vec<EntityId>` all the way through `setup_persistence`.
-        let mut playground_drops = matches!(scene, Scene::Playground).then(|| {
-            let pools = spall_sim::pending_drop_pools(sim.world());
-            const SHOWCASE_INTERVAL_TICKS: u64 = 300; // 5 s at 60 Hz
-            const PLINKO_INTERVAL_TICKS: u64 = 60; // 1 s at 60 Hz
-            (
-                spall_sim::DropSchedule::new(pools.showcase, SHOWCASE_INTERVAL_TICKS)
-                    .at_height(7.0),
-                spall_sim::DropSchedule::new(pools.plinko, PLINKO_INTERVAL_TICKS)
-                    .at_height(10.5)
-                    .with_restitution(spall_sim::PLINKO_RESTITUTION),
-            )
-        });
+        let mut playground_drops =
+            matches!(scene, Scene::Playground).then(|| playground_drop_schedules(&sim));
 
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
@@ -2041,6 +2109,20 @@ async fn serve_async(
 
         let mut pacer = crate::pacing::TickPacer::new(tick_dt, std::time::Instant::now());
         let mut pending_player_inputs = PlayerInputSchedule::default();
+        // ENG-105: the water frame each session was last sent, so a session
+        // that becomes live later still receives the current frame.
+        let mut water_sent: HashMap<u64, u64> = HashMap::new();
+        let mut water_keyframe: Option<(u64, Arc<Vec<spall_protocol::WaterSnapshot>>)> = None;
+        let mut water_keyframes_sent = 0u64;
+        let mut pending_admin: Vec<(SessionId, spall_protocol::AdminRequest)> = Vec::new();
+        // A dam-gate edit only reports `Queued` immediately; its real
+        // outcome (committed, or rejected — e.g. the terrain-size "giant
+        // split" limit) resolves a few ticks later. This maps the edit's own
+        // `RequestId` back to the admin session/request to correct with a
+        // follow-up `AdminStatus` once it resolves, so a silent later
+        // rejection is never mistaken for success.
+        let mut pending_gate_admin: HashMap<u64, (SessionId, RequestId)> = HashMap::new();
+        let mut world_resets = 0u64;
         for _ in 0..max_ticks {
             let started = std::time::Instant::now();
             // ENG-48: drain a bounded slice of what the clients have sent since
@@ -2271,12 +2353,194 @@ async fn serve_async(
                         saw_client_work = true;
                         lj.on_baseline_ack(session, ack, &sim, &clients_for_sim, &mut motion);
                     }
+                    Inbound::Admin(session, req) => {
+                        saw_client_work = true;
+                        if !lj.session_expired(session) {
+                            pending_admin.push((session, req));
+                        }
+                    }
                     Inbound::Gone(session) => {
                         pending_player_inputs.remove_session(session);
                         lj.on_gone(session);
                         player_principals.remove(&session.raw());
+                        water_sent.remove(&session.raw());
                     }
                 }
+            }
+
+            // Admin commands run between ticks, before this tick's inputs.
+            for (session, req) in std::mem::take(&mut pending_admin) {
+                let status = match req.command {
+                    spall_protocol::AdminCommand::ResetWorld => {
+                        let refusal = if !admin_commands {
+                            Some("admin commands are disabled on this server")
+                        } else if pipeline.is_some() {
+                            Some("world reset is unavailable for a persisted world")
+                        } else if residency.is_some() {
+                            Some("world reset is unavailable while residency eviction is enabled")
+                        } else if startup_game_setup {
+                            Some(
+                                "world reset is unavailable: startup game content cannot be reinstalled",
+                            )
+                        } else if contact_damage_policy.is_some() || dormancy_policy.is_some() {
+                            Some(
+                                "world reset is unavailable with contact damage or dormancy passes enabled",
+                            )
+                        } else {
+                            None
+                        };
+                        match refusal {
+                            Some(reason) => spall_protocol::AdminStatus {
+                                request_id: req.request_id,
+                                accepted: false,
+                                message: reason.into(),
+                            },
+                            None => {
+                                let started = std::time::Instant::now();
+                                let fresh = scene.simulation_with_materials(
+                                    terrain_collider_mode,
+                                    reset_materials.clone(),
+                                    custom_world.as_ref(),
+                                );
+                                if let Err(e) = sim.replace_world(fresh) {
+                                    return SimResult::error(
+                                        format!("world reset failed: {e}"),
+                                        ticks_run,
+                                    );
+                                }
+                                let spawns = custom_world.as_ref().map_or_else(
+                                    || scene.player_spawns(),
+                                    CustomWorld::player_spawns,
+                                );
+                                if !spawns.is_empty() {
+                                    for session in lj.sessions().collect::<Vec<_>>() {
+                                        let slot = session.slot().0 as usize;
+                                        let spawn = spawns[slot.min(spawns.len() - 1)];
+                                        sim.add_player(session_player_entity(session), spawn);
+                                    }
+                                }
+                                // Everything below described bodies or edits of the
+                                // replaced world.
+                                submitted_at.clear();
+                                submitted_by.clear();
+                                client_repl.clear();
+                                prev_body_y.clear();
+                                body_stable_ticks = 0;
+                                water_sent.clear();
+                                water_keyframe = None;
+                                if let Some(drops) = playground_drops.as_mut() {
+                                    *drops = playground_drop_schedules(&sim);
+                                }
+                                match lj.reset_world(&sim, &clients_for_sim, &mut motion) {
+                                    Ok(clients) => {
+                                        world_resets += 1;
+                                        tracing::info!(
+                                            clients,
+                                            elapsed_ms = started.elapsed().as_millis() as u64,
+                                            "admin world reset"
+                                        );
+                                        spall_protocol::AdminStatus {
+                                            request_id: req.request_id,
+                                            accepted: true,
+                                            message: format!(
+                                                "world reset in {} ms",
+                                                started.elapsed().as_millis()
+                                            ),
+                                        }
+                                    }
+                                    Err(e) => {
+                                        return SimResult::error(
+                                            format!("world reset baseline capture failed: {e}"),
+                                            ticks_run,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    spall_protocol::AdminCommand::SetWaterSpring { rate } => {
+                        let has_gated_spring = custom_world
+                            .as_ref()
+                            .and_then(CustomWorld::water_setup)
+                            .is_some_and(|w| w.gated_sources.iter().any(|tier| !tier.is_empty()));
+                        if !admin_commands {
+                            spall_protocol::AdminStatus {
+                                request_id: req.request_id,
+                                accepted: false,
+                                message: "admin commands are disabled on this server".into(),
+                            }
+                        } else if !has_gated_spring {
+                            spall_protocol::AdminStatus {
+                                request_id: req.request_id,
+                                accepted: false,
+                                message: "this scene authored no gated water spring".into(),
+                            }
+                        } else if rate > spall_sim::MAX_GATED_SOURCE_RATE {
+                            spall_protocol::AdminStatus {
+                                request_id: req.request_id,
+                                accepted: false,
+                                message: format!(
+                                    "water spring rate must be 0..={}",
+                                    spall_sim::MAX_GATED_SOURCE_RATE
+                                ),
+                            }
+                        } else {
+                            sim.set_water_spring_rate(rate);
+                            spall_protocol::AdminStatus {
+                                request_id: req.request_id,
+                                accepted: true,
+                                message: if rate == 0 {
+                                    "water spring off".to_string()
+                                } else {
+                                    format!("water spring rate {rate}")
+                                },
+                            }
+                        }
+                    }
+                    spall_protocol::AdminCommand::SetDamGate { open } => {
+                        let gate = custom_world.as_ref().and_then(CustomWorld::dam_gate);
+                        if !admin_commands {
+                            spall_protocol::AdminStatus {
+                                request_id: req.request_id,
+                                accepted: false,
+                                message: "admin commands are disabled on this server".into(),
+                            }
+                        } else if let Some(gate) = gate {
+                            match sim.set_dam_gate(&gate.cells, open, gate.closed_material) {
+                                Ok(edit_statuses) => {
+                                    for edit_status in &edit_statuses {
+                                        pending_gate_admin.insert(
+                                            edit_status.request_id.0,
+                                            (session, req.request_id),
+                                        );
+                                    }
+                                    spall_protocol::AdminStatus {
+                                        request_id: req.request_id,
+                                        accepted: true,
+                                        message: format!(
+                                            "dam gate {} ({} piece{}; queued, watch for follow-up status)",
+                                            if open { "opening" } else { "closing" },
+                                            edit_statuses.len(),
+                                            if edit_statuses.len() == 1 { "" } else { "s" }
+                                        ),
+                                    }
+                                }
+                                Err(e) => spall_protocol::AdminStatus {
+                                    request_id: req.request_id,
+                                    accepted: false,
+                                    message: format!("dam gate edit refused: {e}"),
+                                },
+                            }
+                        } else {
+                            spall_protocol::AdminStatus {
+                                request_id: req.request_id,
+                                accepted: false,
+                                message: "this scene authored no dam gate".into(),
+                            }
+                        }
+                    }
+                };
+                send_to(&clients_for_sim, session, Outbound::Admin(Arc::new(status)));
             }
 
             lj.publish_ready_captures(&clients_for_sim);
@@ -2292,6 +2556,73 @@ async fn serve_async(
             };
             ticks_run += 1;
             let tick = sim.current_tick();
+            // Correct an earlier "queued" dam-gate admin reply once its edit
+            // actually resolves — committed or (today, on this scene's giant
+            // terrain) rejected — so a silent later failure is never mistaken
+            // for the immediate "accepted" ack.
+            if !pending_gate_admin.is_empty() {
+                for (request_id, _) in &report.committed {
+                    if let Some((gate_session, admin_request_id)) =
+                        pending_gate_admin.remove(&request_id.0)
+                    {
+                        send_to(
+                            &clients_for_sim,
+                            gate_session,
+                            Outbound::Admin(Arc::new(spall_protocol::AdminStatus {
+                                request_id: admin_request_id,
+                                accepted: true,
+                                message: "dam gate edit committed".into(),
+                            })),
+                        );
+                    }
+                }
+                for (request_id, reason) in &report.rejected {
+                    if let Some((gate_session, admin_request_id)) =
+                        pending_gate_admin.remove(&request_id.0)
+                    {
+                        send_to(
+                            &clients_for_sim,
+                            gate_session,
+                            Outbound::Admin(Arc::new(spall_protocol::AdminStatus {
+                                request_id: admin_request_id,
+                                accepted: false,
+                                message: format!("dam gate edit rejected: {reason}"),
+                            })),
+                        );
+                    }
+                }
+            }
+            // ENG-105: a periodic water line, so an operator can see whether
+            // the fluid worker keeps up with real time.
+            if tick.get() % WATER_STATUS_INTERVAL_TICKS == 0
+                && let (Some(water), Some(metrics)) = (sim.water(), report.water.as_ref())
+            {
+                let frame = water.frame();
+                tracing::info!(
+                    frame = frame.seq,
+                    fluid_time_s = frame.fluid_time_s,
+                    skipped_steps = metrics.skipped_ticks,
+                    skipped_s = metrics.skipped_duration.as_secs_f64(),
+                    last_step_ms = metrics.step_duration.as_secs_f64() * 1e3,
+                    volume_m3 = frame.volume_m3,
+                    springs_m3 = frame.spring_added_m3,
+                    drains_m3 = frame.drain_removed_m3,
+                    outflow_m3 = frame.open_outflow_m3,
+                    "water status"
+                );
+                eprintln!(
+                    "sandbox-server: water frame {} | fluid {:.1} s | skipped {} steps ({:.1} s) | last step {:.1} ms | {:.0} m³ (+{:.0} springs, -{:.0} drains, -{:.0} spilled)",
+                    frame.seq,
+                    frame.fluid_time_s,
+                    metrics.skipped_ticks,
+                    metrics.skipped_duration.as_secs_f64(),
+                    metrics.step_duration.as_secs_f64() * 1e3,
+                    frame.volume_m3,
+                    frame.spring_added_m3,
+                    frame.drain_removed_m3,
+                    frame.open_outflow_m3,
+                );
+            }
 
             // T21 / ENG-28 increment 4 (3c): opt-in contact damage + region
             // dormancy, run every tick right after the commit they react to.
@@ -2492,6 +2823,38 @@ async fn serve_async(
             };
             for (session, req) in repairs {
                 lj.answer_repair(session, &req, &sim, &clients_for_sim);
+            }
+
+            // ENG-105 increment 2: presentation water keyframes at 15 Hz to
+            // live sessions only (a joining client gets its first keyframe
+            // after its baseline barrier). Each session is sent each frame at
+            // most once; an unchanged frame is not resent.
+            if tick.get() % WATER_KEYFRAME_INTERVAL_TICKS == 0 {
+                let newest = sim.water().map(|water| water.frame().seq);
+                if newest.is_some() && water_keyframe.as_ref().map(|(seq, _)| *seq) != newest {
+                    match water_keyframe_for(&sim) {
+                        Some(Ok(keyframe)) => water_keyframe = Some(keyframe),
+                        Some(Err(e)) => {
+                            return SimResult::error(
+                                format!("water keyframe could not be encoded: {e}"),
+                                ticks_run,
+                            );
+                        }
+                        None => {}
+                    }
+                }
+                if let Some((seq, chunks)) = &water_keyframe {
+                    for session in lj.live_sessions().collect::<Vec<_>>() {
+                        if water_sent.insert(session.raw(), *seq) != Some(*seq) {
+                            water_keyframes_sent += 1;
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Water(Arc::clone(chunks)),
+                            );
+                        }
+                    }
+                }
             }
 
             // ENG-50: queue immutable records to the bounded off-thread writer.
@@ -2852,6 +3215,8 @@ async fn serve_async(
             baseline_bytes_sent: lj.baseline_bytes,
             actions_throttled,
             repairs_throttled,
+            water_keyframes_sent,
+            world_resets,
             motion_snapshots_sent: motion_egress.snapshots_sent,
             motion_snapshots_interest_culled: motion_egress.interest_culled,
             motion_snapshots_budget_deferred: motion_egress.budget_deferred,
@@ -2978,6 +3343,8 @@ async fn serve_async(
         baseline_bytes_sent: sim_result.baseline_bytes_sent,
         inbound_actions_throttled: sim_result.actions_throttled,
         inbound_repairs_throttled: sim_result.repairs_throttled,
+        water_keyframes_sent: sim_result.water_keyframes_sent,
+        world_resets: sim_result.world_resets,
         motion_snapshots_sent: sim_result.motion_snapshots_sent,
         motion_snapshots_interest_culled: sim_result.motion_snapshots_interest_culled,
         motion_snapshots_budget_deferred: sim_result.motion_snapshots_budget_deferred,
@@ -3180,6 +3547,8 @@ struct SimResult {
     baseline_bytes_sent: u64,
     actions_throttled: u64,
     repairs_throttled: u64,
+    water_keyframes_sent: u64,
+    world_resets: u64,
     motion_snapshots_sent: u64,
     motion_snapshots_interest_culled: u64,
     motion_snapshots_budget_deferred: u64,
@@ -3234,6 +3603,8 @@ impl SimResult {
             baseline_bytes_sent: 0,
             actions_throttled: 0,
             repairs_throttled: 0,
+            water_keyframes_sent: 0,
+            world_resets: 0,
             motion_snapshots_sent: 0,
             motion_snapshots_interest_culled: 0,
             motion_snapshots_budget_deferred: 0,
@@ -3427,6 +3798,50 @@ impl LateJoin {
         // rejected after the link is gone.
         self.links.remove(&session.raw());
         self.pending_captures.remove(&session.raw());
+    }
+
+    /// Every connected session, live or joining.
+    fn sessions(&self) -> impl Iterator<Item = SessionId> + '_ {
+        self.links.values().map(|link| link.session)
+    }
+
+    /// Admin world reset: `sim` already holds the rebuilt world. Every
+    /// connected client — live or mid-join — gets one full baseline flagged
+    /// with [`spall_protocol::WORLD_RESET_TRANSFER_ID_BIT`], which its replica
+    /// installs as a replacement, followed by a motion keyframe. In-flight join
+    /// captures described the old world and are abandoned; their clients take
+    /// the reset baseline as their join baseline. Returns the clients reset.
+    fn reset_world(
+        &mut self,
+        sim: &Simulation,
+        clients: &ClientMap,
+        motion: &mut MotionPublisher,
+    ) -> Result<usize, baseline::BaselineError> {
+        self.cached_baseline = None;
+        self.pending_captures.clear();
+        let base_id = self.next_id();
+        let transfer = baseline::transfer_from_snapshot(
+            baseline::snapshot_world(sim, self.backing_ref()),
+            TransferId(base_id.0 | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT),
+            InterestEpoch(1),
+        )?;
+        let keyframe = Arc::new(motion.full_snapshots(sim.world(), sim.current_tick()));
+        let sessions: Vec<SessionId> = self.sessions().collect();
+        for session in &sessions {
+            let id = self.next_id();
+            let transfer = transfer.reissue(TransferId(
+                id.0 | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT,
+            ));
+            self.baseline_bytes += transfer.payload_bytes() as u64;
+            send_to(clients, *session, Outbound::Baseline(Arc::new(transfer)));
+            if !keyframe.is_empty() {
+                send_to(clients, *session, Outbound::Motion(Arc::clone(&keyframe)));
+            }
+            if let Some(link) = self.links.get_mut(&session.raw()) {
+                link.phase = Phase::Live;
+            }
+        }
+        Ok(sessions.len())
     }
 
     /// Every connected client currently in normal (`Live`) replication. A client
@@ -4260,6 +4675,40 @@ fn dispatch_motion_by_interest(
     }
 }
 
+/// The playground's two timed debris emitters over `sim`'s dormant pools.
+fn playground_drop_schedules(
+    sim: &Simulation,
+) -> (spall_sim::DropSchedule, spall_sim::DropSchedule) {
+    let pools = spall_sim::pending_drop_pools(sim.world());
+    const SHOWCASE_INTERVAL_TICKS: u64 = 300; // 5 s at 60 Hz
+    const PLINKO_INTERVAL_TICKS: u64 = 60; // 1 s at 60 Hz
+    (
+        spall_sim::DropSchedule::new(pools.showcase, SHOWCASE_INTERVAL_TICKS).at_height(7.0),
+        spall_sim::DropSchedule::new(pools.plinko, PLINKO_INTERVAL_TICKS)
+            .at_height(10.5)
+            .with_restitution(spall_sim::PLINKO_RESTITUTION),
+    )
+}
+
+/// Builds one keyframe's chunks from the simulation's newest water frame.
+fn water_keyframe_for(
+    sim: &Simulation,
+) -> Option<Result<(u64, Arc<Vec<spall_protocol::WaterSnapshot>>), spall_protocol::WaterCodecError>>
+{
+    let frame = sim.water()?.frame();
+    Some(
+        spall_protocol::encode_water_keyframe(
+            sim.current_tick(),
+            frame.seq,
+            frame.origin,
+            frame.dimensions,
+            frame.coarsen,
+            &frame.fractions,
+        )
+        .map(|chunks| (frame.seq, Arc::new(chunks))),
+    )
+}
+
 /// Sends a single shared, supersedable motion batch to the supplied sessions.
 /// The caller chooses those sessions from [`LateJoin::live_sessions`] so a
 /// joining replica cannot consume link capacity before its baseline barrier.
@@ -4475,6 +4924,12 @@ async fn serve_conn(
                             break;
                         }
                     }
+                    Ok(Some(WireRecord::AdminRequest(req))) => {
+                        match inbound.try_send(Inbound::Admin(session, req)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => break,
                 }
@@ -4539,9 +4994,14 @@ async fn serve_conn(
                         .send_record(WireRecord::ProgressionResponse((*reply).clone()))
                         .await
                         .is_ok(),
+                    Outbound::Admin(status) => conn
+                        .send_record(WireRecord::AdminStatus((*status).clone()))
+                        .await
+                        .is_ok(),
                     Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
-                    // Motion is never queued as reliable; ignore defensively.
-                    Outbound::Motion(_) => true,
+                    // Motion and water are never queued as reliable; ignore
+                    // defensively.
+                    Outbound::Motion(_) | Outbound::Water(_) => true,
                     Outbound::Shutdown(reason) => {
                         let _ = conn.say_bye(reason).await;
                         false
@@ -4557,6 +5017,20 @@ async fn serve_conn(
                         break 'writer;
                     }
                     motion_seq += 1;
+                }
+            }
+            if let Some(frame) = batch.water {
+                // Chunks of one keyframe go back to back on the ordered
+                // control stream, so the client never sees them interleaved
+                // with another keyframe.
+                for chunk in frame.iter() {
+                    if let Err(error) = conn
+                        .send_record(WireRecord::WaterSnapshot(chunk.clone()))
+                        .await
+                    {
+                        tracing::error!(%error, "water keyframe could not be sent; closing client stream");
+                        break 'writer;
+                    }
                 }
             }
             if batch.overflowed {

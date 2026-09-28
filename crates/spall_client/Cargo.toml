@@ -23,6 +23,7 @@ winit.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
 pollster = "0.4.0"
+image.workspace = true
 yakui.workspace = true
 yakui-wgpu.workspace = true
 yakui-winit.workspace = true

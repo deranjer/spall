@@ -1,0 +1,628 @@
+(
+    format_version: 1,
+    name: "Main",
+    next_entity_id: 63,
+    environment: "daylight",
+    entities: {
+        (1): (
+            id: (1),
+            name: "Scene Voxels",
+            transform: (
+                translation: (0.0, 0.0, 0.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((1)),
+        ),
+        (2): (
+            id: (2),
+            name: "Dam and spillway",
+            transform: (
+                translation: (0.0, 0.0, 0.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((2)),
+        ),
+        (3): (
+            id: (3),
+            name: "Timber bridge",
+            transform: (
+                translation: (0.0, 0.0, 0.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((3)),
+        ),
+        (4): (
+            id: (4),
+            name: "Beach palm 0",
+            transform: (
+                translation: (35.377045, 4.5, 64.06823),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((4)),
+        ),
+        (5): (
+            id: (5),
+            name: "River willow 1",
+            transform: (
+                translation: (22.544796, 5.75, 49.875),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((5)),
+        ),
+        (6): (
+            id: (6),
+            name: "River willow 2",
+            transform: (
+                translation: (31.356682, 4.5, 53.125),
+                rotation_degrees: (0.0, 270.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (7): (
+            id: (7),
+            name: "River willow 3",
+            transform: (
+                translation: (19.46544, 6.75, 19.875),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((5)),
+        ),
+        (8): (
+            id: (8),
+            name: "River willow 4",
+            transform: (
+                translation: (38.40724, 6.75, 27.125),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (9): (
+            id: (9),
+            name: "River willow 5",
+            transform: (
+                translation: (17.528513, 6.75, 31.125),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((5)),
+        ),
+        (10): (
+            id: (10),
+            name: "Hill tree 6",
+            transform: (
+                translation: (2.944108, 16.0, 5.300437),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (11): (
+            id: (11),
+            name: "Hill tree 7",
+            transform: (
+                translation: (13.200608, 14.25, 6.9911976),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (12): (
+            id: (12),
+            name: "Hill tree 8",
+            transform: (
+                translation: (46.52839, 15.75, 5.476831),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (13): (
+            id: (13),
+            name: "Hill tree 9",
+            transform: (
+                translation: (54.775158, 16.0, 7.501642),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (14): (
+            id: (14),
+            name: "Hill tree 10",
+            transform: (
+                translation: (2.4674163, 13.25, 15.267969),
+                rotation_degrees: (0.0, 270.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (15): (
+            id: (15),
+            name: "Hill tree 11",
+            transform: (
+                translation: (12.742964, 11.25, 12.516645),
+                rotation_degrees: (0.0, 270.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((5)),
+        ),
+        (16): (
+            id: (16),
+            name: "Hill tree 12",
+            transform: (
+                translation: (48.432224, 11.0, 15.882725),
+                rotation_degrees: (0.0, 270.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (17): (
+            id: (17),
+            name: "Hill tree 13",
+            transform: (
+                translation: (52.541237, 12.5, 13.774115),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (18): (
+            id: (18),
+            name: "Hill tree 14",
+            transform: (
+                translation: (4.8103437, 13.0, 22.813105),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (19): (
+            id: (19),
+            name: "Hill tree 15",
+            transform: (
+                translation: (9.226064, 12.25, 21.161224),
+                rotation_degrees: (0.0, 270.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (20): (
+            id: (20),
+            name: "Hill tree 16",
+            transform: (
+                translation: (41.672356, 8.25, 20.701504),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (21): (
+            id: (21),
+            name: "Hill tree 17",
+            transform: (
+                translation: (49.240585, 11.25, 22.282274),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (22): (
+            id: (22),
+            name: "Hill tree 18",
+            transform: (
+                translation: (3.1924639, 13.0, 28.367981),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((4)),
+        ),
+        (23): (
+            id: (23),
+            name: "Hill tree 19",
+            transform: (
+                translation: (9.725213, 11.5, 28.206358),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((5)),
+        ),
+        (24): (
+            id: (24),
+            name: "Hill tree 20",
+            transform: (
+                translation: (47.956627, 11.5, 30.293365),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (25): (
+            id: (25),
+            name: "Hill tree 21",
+            transform: (
+                translation: (54.041073, 13.25, 28.788155),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (26): (
+            id: (26),
+            name: "Hill tree 22",
+            transform: (
+                translation: (48.20572, 12.0, 39.564716),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((4)),
+        ),
+        (27): (
+            id: (27),
+            name: "Hill tree 23",
+            transform: (
+                translation: (2.8693962, 12.25, 44.253185),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (28): (
+            id: (28),
+            name: "Hill tree 24",
+            transform: (
+                translation: (12.762491, 9.25, 45.413967),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((5)),
+        ),
+        (29): (
+            id: (29),
+            name: "Hill tree 25",
+            transform: (
+                translation: (39.342304, 8.25, 44.67574),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (30): (
+            id: (30),
+            name: "Hill tree 26",
+            transform: (
+                translation: (47.1421, 11.0, 44.90963),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((5)),
+        ),
+        (31): (
+            id: (31),
+            name: "Hill tree 27",
+            transform: (
+                translation: (53.223255, 12.75, 44.53072),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (32): (
+            id: (32),
+            name: "Hill tree 28",
+            transform: (
+                translation: (5.448781, 11.25, 52.253593),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (33): (
+            id: (33),
+            name: "Hill tree 29",
+            transform: (
+                translation: (12.197114, 9.5, 52.942688),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (34): (
+            id: (34),
+            name: "Hill tree 30",
+            transform: (
+                translation: (41.87256, 8.5, 55.166298),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((5)),
+        ),
+        (35): (
+            id: (35),
+            name: "Hill tree 31",
+            transform: (
+                translation: (49.178753, 11.0, 54.340233),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (36): (
+            id: (36),
+            name: "Hill tree 32",
+            transform: (
+                translation: (4.0960994, 12.0, 61.223125),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((4)),
+        ),
+        (37): (
+            id: (37),
+            name: "Hill tree 33",
+            transform: (
+                translation: (10.458257, 10.75, 62.13842),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (38): (
+            id: (38),
+            name: "Hill tree 34",
+            transform: (
+                translation: (16.976427, 7.25, 62.178337),
+                rotation_degrees: (0.0, 270.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (39): (
+            id: (39),
+            name: "Hill tree 35",
+            transform: (
+                translation: (45.635918, 10.0, 61.84258),
+                rotation_degrees: (0.0, 270.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((4)),
+        ),
+        (40): (
+            id: (40),
+            name: "Hill tree 36",
+            transform: (
+                translation: (54.100586, 12.0, 60.451508),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (41): (
+            id: (41),
+            name: "Hill tree 37",
+            transform: (
+                translation: (4.067294, 12.0, 69.59084),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (42): (
+            id: (42),
+            name: "Hill tree 38",
+            transform: (
+                translation: (12.425877, 10.0, 69.99771),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (43): (
+            id: (43),
+            name: "Hill tree 39",
+            transform: (
+                translation: (48.48392, 10.75, 70.45066),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((4)),
+        ),
+        (44): (
+            id: (44),
+            name: "Hill tree 40",
+            transform: (
+                translation: (4.7767777, 12.0, 78.040474),
+                rotation_degrees: (0.0, 270.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (45): (
+            id: (45),
+            name: "Hill tree 41",
+            transform: (
+                translation: (10.934705, 10.5, 77.01696),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((5)),
+        ),
+        (46): (
+            id: (46),
+            name: "Hill tree 42",
+            transform: (
+                translation: (48.62998, 11.0, 76.635056),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (47): (
+            id: (47),
+            name: "Hill tree 43",
+            transform: (
+                translation: (53.893547, 12.0, 77.049126),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (48): (
+            id: (48),
+            name: "Hill tree 44",
+            transform: (
+                translation: (3.101215, 12.0, 85.502846),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((6)),
+        ),
+        (49): (
+            id: (49),
+            name: "Hill tree 45",
+            transform: (
+                translation: (10.527655, 10.5, 84.47311),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((4)),
+        ),
+        (50): (
+            id: (50),
+            name: "Hill tree 46",
+            transform: (
+                translation: (42.105164, 9.25, 83.77491),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((4)),
+        ),
+        (51): (
+            id: (51),
+            name: "Hill tree 47",
+            transform: (
+                translation: (54.867256, 12.5, 83.12482),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((7)),
+        ),
+        (52): (
+            id: (52),
+            name: "House (sealed)",
+            transform: (
+                translation: (25.0, 5.0, 74.5),
+                rotation_degrees: (0.0, 90.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((8)),
+        ),
+        (53): (
+            id: (53),
+            name: "House (doorway)",
+            transform: (
+                translation: (31.5, 5.0, 81.0),
+                rotation_degrees: (0.0, 270.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((9)),
+        ),
+        (54): (
+            id: (54),
+            name: "House (roofless)",
+            transform: (
+                translation: (31.5, 5.0, 87.5),
+                rotation_degrees: (0.0, 180.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((10)),
+        ),
+        (55): (
+            id: (55),
+            name: "Lamp post 0",
+            transform: (
+                translation: (21.78215, 5.75, 44.6),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((11)),
+        ),
+        (56): (
+            id: (56),
+            name: "Lamp post 2",
+            transform: (
+                translation: (24.0, 5.25, 72.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((11)),
+        ),
+        (57): (
+            id: (57),
+            name: "Lamp post 3",
+            transform: (
+                translation: (32.5, 5.25, 72.0),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((11)),
+        ),
+        (58): (
+            id: (58),
+            name: "Lamp post 4",
+            transform: (
+                translation: (22.433908, 4.5, 67.68207),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((11)),
+        ),
+        (59): (
+            id: (59),
+            name: "Lamp post 6",
+            transform: (
+                translation: (22.266468, 5.75, 50.167656),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((11)),
+        ),
+        (60): (
+            id: (60),
+            name: "Lamp post 7",
+            transform: (
+                translation: (22.43717, 5.75, 41.252922),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((11)),
+        ),
+        (61): (
+            id: (61),
+            name: "Lamp post 8",
+            transform: (
+                translation: (37.14167, 5.25, 53.35649),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((11)),
+        ),
+        (62): (
+            id: (62),
+            name: "Lamp post 9",
+            transform: (
+                translation: (36.835533, 4.5, 61.83417),
+                rotation_degrees: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            voxel_asset: Some((11)),
+        ),
+    },
+)

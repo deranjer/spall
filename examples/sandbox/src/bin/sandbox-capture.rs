@@ -890,6 +890,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
         capture_workers: spall_server::serve::default_capture_workers(),
         dev_unvalidated_actions: true,
+        admin_commands: false,
         save_faults: None,
         await_body_settle: false,
         motion_interest: None,
@@ -957,6 +958,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     };
     let cutter_thread = std::thread::spawn(move || run_replication_client(cutter_cfg));
 
@@ -987,6 +989,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         })),
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     };
     let observer_thread = std::thread::spawn(move || run_replication_client(observer_cfg));
 

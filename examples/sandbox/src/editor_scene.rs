@@ -17,8 +17,9 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use spall_core::{CellSizeCode, GlobalCell, MaterialId, VolumeId};
+use spall_fluid::DomainSpec;
 use spall_server::CustomWorld;
-use spall_sim::WorldSetup;
+use spall_sim::{WaterSetup, WorldSetup};
 use spall_structure::AnchorPlane;
 use spall_voxel::EditPlan;
 use thiserror::Error;
@@ -29,11 +30,54 @@ use crate::game::materials;
 /// Resident air kept beyond the solid bounds. Character queries build a
 /// +-16-cell window around the feet, and any cell in it that was never made
 /// resident degrades that query (see `spall_voxel::fixtures::playground_scene`).
-const AIR_MARGIN_XZ: i64 = 24;
-const AIR_BELOW: i64 = 20;
+/// The whole envelope is also the terrain body's collider region, whose
+/// occupancy is capped at 2^23 cells, so it is kept no wider than that window
+/// and only a thin layer is kept under the scene's bedrock.
+const AIR_MARGIN_XZ: i64 = 16;
+const AIR_BELOW: i64 = 4;
 const AIR_ABOVE: i64 = 24;
 /// Refuses a single placement larger than this many target cells.
 const MAX_PLACED_CELLS: i64 = 16_000_000;
+const WATER_SOURCE_MATERIAL: MaterialId = MaterialId(u16::MAX);
+/// A spring: water cells refilled every fluid step.
+const WATER_SPRING_MATERIAL: MaterialId = MaterialId(u16::MAX - 1);
+/// A drain: water cells emptied every fluid step.
+const WATER_DRAIN_MATERIAL: MaterialId = MaterialId(u16::MAX - 2);
+/// An authored player start; never solid.
+const SPAWN_MARKER_MATERIAL: MaterialId = MaterialId(u16::MAX - 3);
+/// A gated spring at rate 1 (the default "on" speed): like
+/// [`WATER_SPRING_MATERIAL`], but only refilled while an admin has selected
+/// this rate or higher (off by default) — see
+/// [`spall_protocol::AdminCommand::SetWaterSpring`].
+const WATER_GATED_SPRING_MATERIAL: MaterialId = MaterialId(u16::MAX - 4);
+/// A gated spring at rate 2 (a bigger, additional footprint — faster fill).
+const WATER_GATED_SPRING_FAST_MATERIAL: MaterialId = MaterialId(u16::MAX - 7);
+/// A gated spring at rate 3 (the biggest footprint — fastest fill).
+const WATER_GATED_SPRING_MAX_MATERIAL: MaterialId = MaterialId(u16::MAX - 8);
+/// A basin hint: extends the fluid domain over the marked footprint (so a
+/// gated spring has somewhere to fill) without seeding it with water. Never a
+/// solid runtime material, like the other water sentinels.
+const WATER_BASIN_MATERIAL: MaterialId = MaterialId(u16::MAX - 5);
+/// A dam-gate marker: authored solid (its runtime material becomes
+/// `closed_material`, normally stone), but its cells are also handed to
+/// [`spall_server::CustomWorld::with_dam_gate`] so an admin can cut them open
+/// or refill them at runtime — see
+/// [`spall_protocol::AdminCommand::SetDamGate`].
+const DAM_GATE_MARKER_MATERIAL: MaterialId = MaterialId(u16::MAX - 6);
+/// Voxel cells in the fluid domain before coarsening.
+const MAX_SCENE_WATER_CELLS: usize = 4_000_000;
+/// Scene water is solved on 0.5 m cells (2³ voxels): a valley-sized domain at
+/// voxel resolution is far over the solver's per-tick budget.
+const WATER_COARSEN: u32 = 2;
+/// Fixed fluid step on the server's water worker (20 Hz): a valley domain
+/// costs ~15-20 ms per step on 16 threads, and this leaves the host room to
+/// run the server tick and a local client beside it.
+const WATER_STEP_S: f64 = 1.0 / 20.0;
+/// Open space kept around authored water inside the fluid domain, in voxels:
+/// sideways room to spread, and air above the highest surface.
+const WATER_MARGIN_XZ: i64 = 4;
+const WATER_MARGIN_ABOVE: i64 = 4;
+const WATER_MARGIN_BELOW: i64 = 2;
 const RUNTIME_CELL_M: f32 = 0.25;
 /// Editor translations are stored in metres.
 const MAX_PLAYER_SPAWNS: usize = 4;
@@ -109,9 +153,25 @@ pub fn material_mapping() -> BTreeMap<String, MaterialId> {
         ("wood.oak", materials::WOOD),
         ("foliage.oak", MaterialId(18)),
         ("sandstone", MaterialId(13)),
+        ("slate", MaterialId(14)),
+        ("loam", MaterialId(11)),
         ("grass", MaterialId(10)),
         ("dirt", materials::DIRT),
         ("emissive.lamp", materials::LAMP),
+        // Sentinels consumed by `load`: authored water seeds the server fluid
+        // region (springs and drains keep streams running) and never becomes
+        // a solid runtime material.
+        ("water", WATER_SOURCE_MATERIAL),
+        ("water.source", WATER_SPRING_MATERIAL),
+        ("water.source.gated", WATER_GATED_SPRING_MATERIAL),
+        ("water.source.gated.fast", WATER_GATED_SPRING_FAST_MATERIAL),
+        ("water.source.gated.max", WATER_GATED_SPRING_MAX_MATERIAL),
+        ("water.sink", WATER_DRAIN_MATERIAL),
+        ("water.basin", WATER_BASIN_MATERIAL),
+        // Sentinel: an authored player start (feet at the cell's floor).
+        ("player.spawn", SPAWN_MARKER_MATERIAL),
+        // Sentinel: solid until an admin opens it (see `DAM_GATE_MARKER_MATERIAL`).
+        ("dam.gate", DAM_GATE_MARKER_MATERIAL),
     ]
     .into_iter()
     .map(|(key, id)| (key.to_owned(), id))
@@ -125,6 +185,10 @@ pub struct LoadedScene {
     min: [i64; 3],
     max: [i64; 3],
     pub player_spawns: Vec<[f64; 3]>,
+    water: Option<WaterSetup>,
+    /// Cells marked `dam.gate`, still solid in `cells`; handed to
+    /// [`spall_server::CustomWorld::with_dam_gate`] so an admin can open them.
+    dam_gate_cells: Vec<GlobalCell>,
 }
 
 impl LoadedScene {
@@ -134,6 +198,17 @@ impl LoadedScene {
 
     pub fn bounds(&self) -> ([i64; 3], [i64; 3]) {
         (self.min, self.max)
+    }
+
+    pub fn water_setup(&self) -> Option<&WaterSetup> {
+        self.water.as_ref()
+    }
+
+    /// Cells marked `dam.gate`, closed (solid) in the scene's own terrain
+    /// until an admin opens them — see [`Self::into_custom_world`]. Empty
+    /// when the scene authored no gate.
+    pub fn dam_gate_cells(&self) -> &[GlobalCell] {
+        &self.dam_gate_cells
     }
 
     /// Builds the terrain, materials and physics config for this scene.
@@ -177,8 +252,18 @@ impl LoadedScene {
     /// Packages the scene for [`spall_server::ServeConfig::custom_world`].
     pub fn into_custom_world(self) -> CustomWorld {
         let spawns = self.player_spawns.clone();
+        let water = self.water.clone();
+        let gate_cells = self.dam_gate_cells.clone();
         let scene = Arc::new(self);
-        CustomWorld::new(spawns, move || scene.world_setup())
+        let custom = CustomWorld::new_with_water(spawns, water, move || scene.world_setup());
+        if gate_cells.is_empty() {
+            custom
+        } else {
+            custom.with_dam_gate(spall_server::DamGate {
+                cells: gate_cells,
+                closed_material: crate::game::materials::STONE,
+            })
+        }
     }
 }
 
@@ -253,6 +338,28 @@ pub fn load(path: &Path) -> Result<LoadedScene, EditorSceneError> {
         };
         place(asset, entity, &mut cells)?;
     }
+    let water_cells = take_marked(&mut cells, WATER_SOURCE_MATERIAL);
+    let spring_cells = take_marked(&mut cells, WATER_SPRING_MATERIAL);
+    let gated_spring_cells = take_marked(&mut cells, WATER_GATED_SPRING_MATERIAL);
+    let gated_spring_fast_cells = take_marked(&mut cells, WATER_GATED_SPRING_FAST_MATERIAL);
+    let gated_spring_max_cells = take_marked(&mut cells, WATER_GATED_SPRING_MAX_MATERIAL);
+    let drain_cells = take_marked(&mut cells, WATER_DRAIN_MATERIAL);
+    let basin_cells = take_marked(&mut cells, WATER_BASIN_MATERIAL);
+    let spawn_markers = take_marked(&mut cells, SPAWN_MARKER_MATERIAL);
+    // The dam gate stays solid (closed by default) unlike the sentinels above:
+    // record its cells for the admin toggle, then recolor them to ordinary
+    // stone so they render and collide like the rest of the wall.
+    let dam_gate_cells: Vec<GlobalCell> = cells
+        .iter()
+        .filter_map(|(&(z, y, x), &material)| {
+            (material == DAM_GATE_MARKER_MATERIAL).then_some(GlobalCell::new(x, y, z))
+        })
+        .collect();
+    for material in cells.values_mut() {
+        if *material == DAM_GATE_MARKER_MATERIAL {
+            *material = crate::game::materials::STONE;
+        }
+    }
     let (min, max) = cells
         .keys()
         .fold(None, |acc: Option<([i64; 3], [i64; 3])>, &(z, y, x)| {
@@ -266,13 +373,122 @@ pub fn load(path: &Path) -> Result<LoadedScene, EditorSceneError> {
             })
         })
         .ok_or(EditorSceneError::Empty)?;
-    let player_spawns = find_spawns(&cells, min, max)?;
+    let player_spawns = if spawn_markers.is_empty() {
+        let wet: std::collections::BTreeSet<(i64, i64, i64)> = water_cells
+            .iter()
+            .chain(&spring_cells)
+            .chain(&gated_spring_cells)
+            .chain(&gated_spring_fast_cells)
+            .chain(&gated_spring_max_cells)
+            .chain(&basin_cells)
+            .map(|c| (c.x, c.y, c.z))
+            .collect();
+        find_spawns(&cells, &wet, min, max)?
+    } else {
+        marker_spawns(spawn_markers)
+    };
+    let water = water_setup(
+        &water_cells,
+        spring_cells,
+        [
+            gated_spring_cells,
+            gated_spring_fast_cells,
+            gated_spring_max_cells,
+        ],
+        drain_cells,
+        &basin_cells,
+        &dam_gate_cells,
+        min,
+        max,
+    )?;
     Ok(LoadedScene {
         cells,
         min,
         max,
         player_spawns,
+        water,
+        dam_gate_cells,
     })
+}
+
+/// Removes every cell of a sentinel material, returning their positions.
+fn take_marked(
+    cells: &mut BTreeMap<(i64, i64, i64), MaterialId>,
+    marker: MaterialId,
+) -> Vec<GlobalCell> {
+    let marked = cells
+        .iter()
+        .filter_map(|(&(z, y, x), &material)| {
+            (material == marker).then_some(GlobalCell::new(x, y, z))
+        })
+        .collect();
+    cells.retain(|_, material| *material != marker);
+    marked
+}
+
+/// The server fluid region for a scene's authored water: the bounding box of
+/// its water, springs, drains, and basin hints plus margins, kept inside the
+/// resident air envelope and snapped outward to whole 0.5 m fluid cells.
+fn water_setup(
+    water: &[GlobalCell],
+    springs: Vec<GlobalCell>,
+    gated_springs: [Vec<GlobalCell>; 3],
+    drains: Vec<GlobalCell>,
+    basin: &[GlobalCell],
+    // A `dam.gate` marker's cells never carry water themselves (they start
+    // solid), but the domain still needs to cover them with the usual
+    // margins: an admin-opened gate must always fall well inside the fluid
+    // domain, not near-miss its edge because the gate's placement and this
+    // domain's bounding box were computed independently.
+    gate: &[GlobalCell],
+    min: [i64; 3],
+    max: [i64; 3],
+) -> Result<Option<WaterSetup>, EditorSceneError> {
+    if water.is_empty() && springs.is_empty() && gated_springs.iter().all(Vec::is_empty) {
+        return Ok(None);
+    }
+    let all = || {
+        water
+            .iter()
+            .chain(&springs)
+            .chain(gated_springs.iter().flatten())
+            .chain(&drains)
+            .chain(basin)
+            .chain(gate)
+    };
+    let lo_of = |axis: fn(&GlobalCell) -> i64| all().map(axis).min().expect("non-empty");
+    let hi_of = |axis: fn(&GlobalCell) -> i64| all().map(axis).max().expect("non-empty");
+    let c = i64::from(WATER_COARSEN);
+    let snap_down = |v: i64| v.div_euclid(c) * c;
+    let snap_up = |v: i64| (v + c).div_euclid(c) * c; // exclusive end
+    let lo = [
+        snap_down((lo_of(|p| p.x) - WATER_MARGIN_XZ).max(min[0] - AIR_MARGIN_XZ)),
+        snap_down((lo_of(|p| p.y) - WATER_MARGIN_BELOW).max(min[1] - AIR_BELOW)),
+        snap_down((lo_of(|p| p.z) - WATER_MARGIN_XZ).max(min[2] - AIR_MARGIN_XZ)),
+    ];
+    let hi = [
+        snap_up((hi_of(|p| p.x) + WATER_MARGIN_XZ).min(max[0] + AIR_MARGIN_XZ - c)),
+        snap_up((hi_of(|p| p.y) + WATER_MARGIN_ABOVE).min(max[1] + AIR_ABOVE - c)),
+        snap_up((hi_of(|p| p.z) + WATER_MARGIN_XZ).min(max[2] + AIR_MARGIN_XZ - c)),
+    ];
+    let domain_error = |message: String| EditorSceneError::Asset {
+        asset: "water domain".into(),
+        message,
+    };
+    let dimensions = [0, 1, 2].map(|a| (hi[a] - lo[a]) as u32);
+    let domain = DomainSpec::new(
+        GlobalCell::new(lo[0], lo[1], lo[2]),
+        dimensions,
+        MAX_SCENE_WATER_CELLS,
+    )
+    .map_err(|error| domain_error(error.to_string()))?;
+    let mut setup = WaterSetup::new(domain, water.iter().map(|cell| (*cell, 1.0)).collect())
+        .with_coarsening(WATER_COARSEN)
+        .on_worker(WATER_STEP_S);
+    setup.sources = springs;
+    setup.gated_sources = gated_springs;
+    setup.sinks = drains;
+    Ok(Some(setup))
 }
 
 fn load_asset(
@@ -409,11 +625,29 @@ fn place(
     Ok(())
 }
 
+/// Authored `player.spawn` cells, in scene order, feet on each cell's floor.
+fn marker_spawns(mut markers: Vec<GlobalCell>) -> Vec<[f64; 3]> {
+    markers.sort_by_key(|c| (c.z, c.x, c.y));
+    let m = f64::from(RUNTIME_CELL_M);
+    markers
+        .into_iter()
+        .take(MAX_PLAYER_SPAWNS)
+        .map(|c| {
+            [
+                (c.x as f64 + 0.5) * m,
+                c.y as f64 * m,
+                (c.z as f64 + 0.5) * m,
+            ]
+        })
+        .collect()
+}
+
 /// Picks up to [`MAX_PLAYER_SPAWNS`] standing spots on the scene's surface,
 /// nearest the horizontal centre first, each with clear headroom and spaced
 /// apart. The surface is the highest solid cell of a column; feet rest on it.
 fn find_spawns(
     cells: &BTreeMap<(i64, i64, i64), MaterialId>,
+    wet: &std::collections::BTreeSet<(i64, i64, i64)>,
     min: [i64; 3],
     max: [i64; 3],
 ) -> Result<Vec<[f64; 3]>, EditorSceneError> {
@@ -437,6 +671,8 @@ fn find_spawns(
                 let column_top = top.get(&(x + dx, z + dz)).copied();
                 column_top.is_some_and(|t| (t - y).abs() <= 1)
                     && (y + 1..=y + SPAWN_HEADROOM_CELLS).all(|yy| !solid(x + dx, yy, z + dz))
+                    // Never spawn on a riverbed or lake floor.
+                    && (y + 1..=y + SPAWN_HEADROOM_CELLS).all(|yy| !wet.contains(&(x + dx, yy, z + dz)))
             })
         });
         let spaced = spawns
@@ -519,7 +755,7 @@ mod tests {
         }
         // A canopy directly over the centre blocks that column's headroom.
         cells.insert((10, 5, 10), materials::WOOD);
-        let spawns = find_spawns(&cells, [0, 0, 0], [20, 5, 20]).unwrap();
+        let spawns = find_spawns(&cells, &Default::default(), [0, 0, 0], [20, 5, 20]).unwrap();
         let blocked = spawns
             .iter()
             .any(|s| (s[0] - 2.625).abs() < 0.5 && (s[2] - 2.625).abs() < 0.5);

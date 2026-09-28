@@ -75,6 +75,7 @@ fn base_config(
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
         capture_workers: spall_server::serve::default_capture_workers(),
         dev_unvalidated_actions: true,
+        admin_commands: false,
         save_faults: None,
         await_body_settle: false,
         motion_interest: Some(motion_interest),
@@ -116,6 +117,7 @@ fn column_cut_client(
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     }
 }
 

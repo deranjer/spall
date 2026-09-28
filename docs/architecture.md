@@ -14,7 +14,7 @@ spall_mesh    -> spall_voxel, spall_jobs        surface generation, no GPU
 spall_structure -> spall_voxel, spall_jobs      connectivity, support, split plans
 spall_physics -> spall_voxel                    Rapier adapter, collision builds
 spall_fluid  -> spall_core, spall_voxel          CPU fluid state and solid-boundary snapshots
-spall_sim     -> spall_structure, spall_physics, spall_jobs, spall_protocol   authoritative state and tick order
+spall_sim     -> spall_structure, spall_physics, spall_fluid, spall_jobs, spall_protocol   authoritative state and tick order
 spall_protocol -> spall_core                   explicit DTOs and codecs only
 spall_net     -> spall_protocol                 Quinn transport adapter (Tokio; T09)
 spall_store   -> spall_protocol                 checkpoint/journal bytes and indexes
@@ -34,16 +34,21 @@ staggered face velocities, fractional water volume with geometric (PLIC)
 conservative transport, a variable-density pressure projection with a
 multigrid preconditioner, and isothermal compressible sealed air. A Salva
 particle backend was evaluated and removed. Evidence is in
-[`docs/reports/ENG-103.md`](reports/ENG-103.md). The solver is not yet
-advanced by the authoritative `spall_sim` tick, coupled to Rapier, replicated,
-or persisted; that integration is ENG-105. Rapier remains the sole rigid-body
-solver.
+[`docs/reports/ENG-103.md`](reports/ENG-103.md). ENG-105 increment 1 now lets
+`spall_sim::Simulation` own one fully resident, bounded `MacGridWorld` when a
+scene supplies `WaterSetup`. A committed terrain edit refreshes the fluid
+boundary with conservative displacement before the fixed 60 Hz water step;
+Rapier remains the sole rigid-body solver and water does not yet displace or
+push dynamic bodies. Stability-budget overflow skips that fluid step and is
+reported in water tick metrics without changing server dt. Network snapshots,
+late-join repair, and canonical persistence remain ENG-105 follow-up increments.
 
 ENG-104 adds a local-only client presentation path to `spall_fluid` for the
 interactive feasibility playground. That explicit `sandbox-client --grid-fluid-demo`
 mode owns and advances its own grid fixture for visual experimentation; normal
-networked clients do not advance or claim authority over fluid state. Gameplay
-authority, replication, and recovery remain future work.
+networked clients do not advance or claim authority over fluid state. Server
+water authority is separate from that local playground; client presentation,
+replication, and recovery remain future work.
 
 Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
 in-process `cargo xtask net-check` transport harness. Add `games/survival` only
