@@ -10,6 +10,7 @@ postcard.workspace = true
 serde.workspace = true
 spall_core.workspace = true
 thiserror.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

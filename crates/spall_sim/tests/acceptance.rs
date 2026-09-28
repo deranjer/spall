@@ -12,9 +12,12 @@
 use glam::{DQuat, DVec3};
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
 use spall_core::{CELLS_PER_BRICK, EntityId, GlobalCell, LocalCell, MaterialId, SphereBrush};
-use spall_protocol::RequestId;
+use spall_physics::{OccupancyGrid, analytic_mass_properties};
+use spall_protocol::{ActionOutcome, RequestId};
 use spall_sim::fixtures::{self, STONE};
-use spall_sim::{BodyPose, EditIntent, EditTarget, ExplosionImpulse, Simulation, SimulationConfig};
+use spall_sim::{
+    BodyPose, EditIntent, EditTarget, ExplosionImpulse, MemoryBacking, Simulation, SimulationConfig,
+};
 use spall_structure::AnchorPlane;
 use spall_structure::oracle::dense_support;
 use spall_voxel::{EditPlan, Sample, Volume};
@@ -74,6 +77,26 @@ fn journalled(sim: &Simulation, entity: EntityId) -> spall_protocol::MotionSnaps
 
 fn run(sim: &mut Simulation, ticks: u32) -> Vec<spall_sim::TickReport> {
     sim.run_until_idle(ticks).expect("ticks")
+}
+
+/// Sorted principal-inertia relative error between an installed triple and an
+/// analytic tensor's diagonal (the fixture tensors here are axis-aligned).
+fn principal_inertia_rel_error(
+    installed: [f32; 3],
+    analytic: &spall_physics::MassProperties,
+) -> f64 {
+    let mut got = [
+        f64::from(installed[0]),
+        f64::from(installed[1]),
+        f64::from(installed[2]),
+    ];
+    let mut want = analytic.principal_diagonal();
+    got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    want.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let scale = want.iter().cloned().fold(1e-9_f64, f64::max);
+    (0..3)
+        .map(|i| (got[i] - want[i]).abs() / scale)
+        .fold(0.0_f64, f64::max)
 }
 
 // --- conservation, no split -------------------------------------------------
@@ -446,16 +469,21 @@ fn no_second_impulse_on_retry() {
     );
     assert_eq!(sim.world().body_count(), 1, "one child, created once");
 
-    // Re-submitting the same request id is a rejected no-op (idempotent).
-    assert!(matches!(
+    // Re-submitting the same request id is a committed no-op: it replays the
+    // original status rather than turning a reliable retry into a rejection.
+    assert_eq!(
         sim.submit(EditIntent::cut(
             split,
             actor(),
             EditTarget::Terrain,
             brush_cell(10, 4, 1, 2)
-        )),
-        Err(spall_sim::IntentError::DuplicateRequest(_))
-    ));
+        ))
+        .unwrap()
+        .outcome,
+        ActionOutcome::Committed {
+            transaction: sim.committed(split).unwrap().transaction,
+        }
+    );
 
     // The child's journalled launch speed reflects one impulse, not two.
     let child_entity = *sim.committed(split).unwrap().children.first().unwrap();
@@ -550,6 +578,143 @@ fn conflicting_cuts_converge() {
 // --- repeatedly contested region is serialized ---------------------
 
 #[test]
+fn a_mixed_density_split_installs_fine_grid_mass_properties_into_the_body() {
+    // T08 + ENG-41: a commit that detaches a multi-material component must give
+    // the new physics body the mass / COM / inertia of its fine material grid,
+    // independent of the collision shape — not a uniform-density approximation
+    // that leaves the COM at the geometric centre.
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+
+    // Spawn the tadpole body clear of the terrain so nothing else touches it.
+    let spawn_pose = BodyPose::new(DQuat::IDENTITY, [0.0, 20.0, 0.0]);
+    let parent = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::mixed_material_split_body(),
+            spawn_pose,
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    let parent_phys = sim.world().body(parent).unwrap().phys;
+
+    // Cut the one-cell bridge (body-local coordinates).
+    let req = RequestId(41);
+    sim.submit(EditIntent::cut(
+        req,
+        actor(),
+        EditTarget::Body(parent),
+        brush_cell(7, 2, 2, 1),
+    ))
+    .unwrap();
+    run(&mut sim, 12);
+    assert!(sim.committed(req).is_some(), "the bridge cut commits");
+    assert_eq!(sim.world().body_count(), 2, "the fused block detaches");
+
+    let child_entity = *sim
+        .committed(req)
+        .unwrap()
+        .children
+        .first()
+        .expect("one detached child");
+
+    // --- the detached child: exact fine-grid mass properties ------------------
+    let (child_phys, child_grid, cell_m) = {
+        let child = sim.world().body(child_entity).expect("child body");
+        let grid = OccupancyGrid::from_volume(&child.volume).unwrap().unwrap();
+        (child.phys, grid, child.volume.cell_size().metres())
+    };
+    let analytic = analytic_mass_properties(&child_grid, cell_m, |m| sim.world().density(m));
+    let geometric_centre_x = f64::from(child_grid.dims()[0]) * cell_m / 2.0;
+    assert!(
+        analytic.com_m[0] < geometric_centre_x - 0.10,
+        "the analytic COM is genuinely off-centre ({} vs geom {geometric_centre_x})",
+        analytic.com_m[0]
+    );
+
+    let (mass, com, inertia) = sim.world().physics().derived_mass_properties(child_phys);
+    let (live_mass, live_com, live_inertia) =
+        sim.world().physics().live_body_mass_properties(child_phys);
+
+    let mass_rel = ((analytic.mass_kg - f64::from(mass)) / analytic.mass_kg).abs();
+    let live_mass_rel = ((analytic.mass_kg - f64::from(live_mass)) / analytic.mass_kg).abs();
+    assert!(
+        mass_rel < 1e-4,
+        "child mass {mass} vs analytic {}",
+        analytic.mass_kg
+    );
+    assert!(
+        live_mass_rel < 1e-4,
+        "live Rapier body mass {live_mass} vs analytic {}",
+        analytic.mass_kg
+    );
+
+    // `derived_mass_properties` reports the grid-local COM; the live Rapier body
+    // carries it in the body frame, i.e. shifted by the ENG-55 grid-origin
+    // collider offset. Both must sit off the geometric centre, toward the stone.
+    let child_offset = sim.world().physics().collider_offset_m(child_phys);
+    for (label, cx, expected, geom) in [
+        ("adapter", com[0], analytic.com_m[0], geometric_centre_x),
+        (
+            "live body",
+            live_com[0],
+            analytic.com_m[0] + f64::from(child_offset[0]),
+            geometric_centre_x + f64::from(child_offset[0]),
+        ),
+    ] {
+        assert!(
+            (f64::from(cx) - expected).abs() < 2e-3,
+            "{label} COM_x {cx} vs expected {expected}"
+        );
+        assert!(
+            f64::from(cx) < geom - 0.05,
+            "{label} COM_x {cx} tracks the density shift, not the centroid {geom}"
+        );
+    }
+
+    assert!(
+        principal_inertia_rel_error(inertia, &analytic) < 5e-3,
+        "child principal inertia {inertia:?} vs analytic {:?}",
+        analytic.principal_diagonal()
+    );
+    assert!(principal_inertia_rel_error(live_inertia, &analytic) < 5e-3);
+
+    // --- the retained parent: mass reinstalled from its post-cut geometry -----
+    let (parent_grid, parent_cell_m) = {
+        let p = sim.world().body(parent).expect("parent body");
+        (
+            OccupancyGrid::from_volume(&p.volume).unwrap().unwrap(),
+            p.volume.cell_size().metres(),
+        )
+    };
+    let parent_analytic =
+        analytic_mass_properties(&parent_grid, parent_cell_m, |m| sim.world().density(m));
+    let (parent_mass, _, _) = sim.world().physics().derived_mass_properties(parent_phys);
+    assert!(
+        ((parent_analytic.mass_kg - f64::from(parent_mass)) / parent_analytic.mass_kg).abs() < 1e-4,
+        "parent mass {parent_mass} tracks its reduced post-cut geometry {}",
+        parent_analytic.mass_kg
+    );
+
+    // --- motion: the child integrates as a finite free rigid body ------------
+    let y_before = sim.world().body(child_entity).unwrap().pose.translation_m[1];
+    run(&mut sim, 15);
+    let child = sim.world().body(child_entity).unwrap();
+    assert!(
+        child.pose.translation_m.iter().all(|v| v.is_finite())
+            && child.linvel_m_s.iter().all(|v| v.is_finite()),
+        "child stays finite under gravity"
+    );
+    assert!(
+        child.pose.translation_m[1] < y_before,
+        "child falls under gravity ({y_before} -> {})",
+        child.pose.translation_m[1]
+    );
+}
+
+#[test]
 fn a_repeatedly_contested_region_is_serialized_and_still_makes_progress() {
     let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
     let ids: Vec<RequestId> = (1..=5).map(RequestId).collect();
@@ -591,4 +756,261 @@ fn a_repeatedly_contested_region_is_serialized_and_still_makes_progress() {
         5,
         "five distinct transactions, none applied twice"
     );
+}
+
+/// ENG-77: a global topology epoch is still authoritative, but a burst of
+/// independently-targeted structural edits must not be reduced to one commit
+/// per server tick.  The second staged result is stale after the first split;
+/// the pipeline rebases it in a bounded same-tick round and commits it in
+/// request order.
+#[test]
+fn independent_topology_edits_rebase_within_one_tick() {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    let east = spall_voxel::fixtures::SEPARATED_REGIONS_EAST_OFFSET;
+    let west = RequestId(1);
+    let east_request = RequestId(2);
+
+    sim.submit(EditIntent::cut(
+        west,
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10, 6, 3, 2),
+    ))
+    .unwrap();
+    sim.submit(EditIntent::cut(
+        east_request,
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10 + east.x, 6 + east.y, 3 + east.z, 2),
+    ))
+    .unwrap();
+
+    let report = sim.tick().unwrap();
+    assert_eq!(report.committed.len(), 2, "both edits commit in one tick");
+    assert_eq!(report.committed[0].0, west, "request order is preserved");
+    assert_eq!(
+        report.committed[1].0, east_request,
+        "request order is preserved"
+    );
+    assert!(
+        report.retried.contains(&east_request),
+        "the second edit was explicitly rebased after the global epoch advanced"
+    );
+    assert_eq!(
+        report.pending_after, 0,
+        "the bounded rebase drained the burst"
+    );
+    assert_eq!(
+        sim.world().body_count(),
+        2,
+        "both beams detached exactly once"
+    );
+}
+
+/// ENG-77: the bounded rebase loop must stop after four same-tick rebase
+/// rounds. Six independent body splits provide more stale work than the bound,
+/// so one request remains queued for the following tick rather than turning a
+/// single server tick into an unbounded commit loop.
+#[test]
+fn a_topology_burst_beyond_four_rebases_remains_bounded() {
+    let mut setup = fixtures::flat_terrain_setup();
+    setup.anchor = AnchorPlane::at(-100_000);
+    let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
+    let mut bodies = Vec::new();
+    for i in 0..6 {
+        bodies.push(
+            sim.world_mut()
+                .spawn_body(
+                    fixtures::dumbbell(4, 3),
+                    BodyPose::new(DQuat::IDENTITY, [5.0 + i as f64 * 12.0, 8.0, 5.0]),
+                    [0.0; 3],
+                    [0.0; 3],
+                    2600.0,
+                    0,
+                )
+                .unwrap(),
+        );
+    }
+    for (i, body) in bodies.iter().copied().enumerate() {
+        sim.submit(EditIntent::cut(
+            RequestId(i as u64 + 1),
+            actor(),
+            EditTarget::Body(body),
+            brush_cell(5, 2, 2, 2),
+        ))
+        .unwrap();
+    }
+
+    let report = sim.tick().unwrap();
+    assert_eq!(
+        report.committed.len(),
+        3,
+        "the bounded loop makes finite progress"
+    );
+    assert_eq!(
+        report.retried.len(),
+        12,
+        "four same-tick rebase rounds are attempted"
+    );
+    assert_eq!(
+        report.pending_after, 3,
+        "the remaining burst waits for the next tick"
+    );
+    assert_eq!(
+        sim.world().body_count(),
+        9,
+        "three splits replace three parents with six children"
+    );
+    assert!(!sim.is_idle(), "the bounded burst leaves queued retries");
+
+    for _ in 0..12 {
+        if sim.is_idle() {
+            break;
+        }
+        sim.tick().unwrap();
+    }
+    assert!(sim.is_idle(), "the bounded retries eventually drain");
+    for request in 1..=6 {
+        assert!(
+            sim.committed(RequestId(request)).is_some(),
+            "request {request} must commit exactly once"
+        );
+    }
+    assert_eq!(sim.world().body_count(), 12);
+}
+
+/// ENG-77: once a contested region crosses the serialization threshold during
+/// a rebase, its retry is deferred for the next tick while an independent
+/// region continues to make progress in the current tick.
+#[test]
+fn serialization_threshold_defers_same_region_retry_within_tick() {
+    let mut config = SimulationConfig::new(fixtures::separated_regions_setup());
+    config.serialize_threshold = 2;
+    let mut sim = Simulation::new(config).unwrap();
+    let east = spall_voxel::fixtures::SEPARATED_REGIONS_EAST_OFFSET;
+
+    sim.submit(EditIntent::cut(
+        RequestId(1),
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10, 6, 3, 2),
+    ))
+    .unwrap();
+    sim.submit(EditIntent::cut(
+        RequestId(2),
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10 + east.x, 6 + east.y, 3 + east.z, 2),
+    ))
+    .unwrap();
+    for (request, x) in [(RequestId(3), 11), (RequestId(4), 12)] {
+        sim.submit(EditIntent::cut(
+            request,
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(x, 6, 3, 2),
+        ))
+        .unwrap();
+    }
+
+    let report = sim.tick().unwrap();
+    assert_eq!(report.committed.len(), 2, "independent work still commits");
+    assert!(report.committed.iter().any(|(id, _)| *id == RequestId(1)));
+    assert!(report.committed.iter().any(|(id, _)| *id == RequestId(2)));
+    assert_eq!(
+        report.serialized_regions.len(),
+        1,
+        "region crossed the threshold"
+    );
+    assert!(report.retried.contains(&RequestId(3)));
+    assert!(report.retried.contains(&RequestId(4)));
+    assert_eq!(
+        report.pending_after, 2,
+        "serialized retry waits for next tick"
+    );
+
+    let next = sim.tick().unwrap();
+    assert_eq!(next.committed.len(), 1);
+    assert!(sim.committed(RequestId(3)).is_some());
+    assert!(sim.committed(RequestId(4)).is_none());
+    let final_tick = sim.tick().unwrap();
+    assert_eq!(final_tick.committed.len(), 1);
+    assert!(sim.committed(RequestId(4)).is_some());
+    assert!(sim.is_idle());
+}
+
+/// ENG-77: an evicted-geometry retry must remain next-tick work even when an
+/// unrelated staged result becomes stale and triggers an in-tick rebase.
+#[test]
+fn reload_retry_does_not_reenter_a_same_tick_rebase_round() {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::cross_brick_bridged_setup())).unwrap();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
+    sim.world_mut().set_backing(std::sync::Arc::new(backing));
+    let victim = spall_core::BrickCoord::new(1, 0, 0);
+    assert!(sim.world_mut().evict_brick(terrain, victim).unwrap());
+
+    // Keep the two body splits independent of the evicted terrain edit while
+    // sharing the same global topology epoch.
+    let body_a = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::dumbbell(4, 3),
+            BodyPose::new(DQuat::IDENTITY, [5.0, 8.0, 5.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    let body_b = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::dumbbell(4, 3),
+            BodyPose::new(DQuat::IDENTITY, [20.0, 8.0, 5.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    let reload_request = EditIntent::cut(
+        RequestId(1),
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(31, 4, 1, 2),
+    );
+    let body_a_request = EditIntent::cut(
+        RequestId(2),
+        actor(),
+        EditTarget::Body(body_a),
+        brush_cell(5, 2, 2, 2),
+    );
+    let body_b_request = EditIntent::cut(
+        RequestId(3),
+        actor(),
+        EditTarget::Body(body_b),
+        brush_cell(5, 2, 2, 2),
+    );
+    sim.submit(reload_request).unwrap();
+    sim.submit(body_a_request).unwrap();
+    sim.submit(body_b_request).unwrap();
+
+    let report = sim.tick().unwrap();
+    assert_eq!(report.committed.len(), 2, "both body edits can progress");
+    assert_eq!(
+        report.pending_after, 1,
+        "reload retry is deferred to next tick"
+    );
+    assert!(sim.committed(RequestId(1)).is_none());
+
+    let next = sim.tick().unwrap();
+    assert_eq!(
+        next.committed.len(),
+        1,
+        "reloaded edit commits on the next tick"
+    );
+    assert!(sim.committed(RequestId(1)).is_some());
 }

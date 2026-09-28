@@ -96,6 +96,13 @@ pub struct Body {
     /// Angular velocity, rad/s.
     pub angvel_rad_s: [f64; 3],
     pub sleeping: bool,
+    /// `true` while the body is **dormant** (T21): a settled body whose whole
+    /// interaction region went quiet, with its physics rigid body / collider
+    /// deactivated to save step cost. The authoritative volume, pose, velocity,
+    /// and damage are unchanged and still checkpointed; a dormant body always
+    /// reads `sleeping = true`. Reactivated before any edit or nearby
+    /// interaction (`docs/architecture.md`). Never terrain.
+    pub dormant: bool,
     /// Bumped on every collider rebuild; replication and persistence compare it.
     pub collider_revision: u64,
     /// Integer downsample factor the current collider was built at (`1` = exact,
@@ -112,6 +119,26 @@ impl Body {
     /// The volume's cell size.
     pub fn cell_size(&self) -> CellSizeCode {
         self.volume.cell_size()
+    }
+
+    /// A world-space bounding sphere enclosing the body's collider region, for
+    /// the coarse proximity tests the T21 dormancy policy runs. Cheap and
+    /// rotation-invariant (it grows a little under rotation rather than tracking
+    /// the exact hull).
+    pub fn world_bounding_sphere(&self) -> ([f64; 3], f64) {
+        let (lo, hi) = self.collider_region;
+        let cs = self.cell_size();
+        let centre_cells = DVec3::new(
+            (lo.x + hi.x) as f64 * 0.5 + 0.5,
+            (lo.y + hi.y) as f64 * 0.5 + 0.5,
+            (lo.z + hi.z) as f64 * 0.5 + 0.5,
+        );
+        let centre = self.pose.local_cell_to_world_m(centre_cells, cs).to_array();
+        let ex = ((hi.x - lo.x) as f64 * 0.5 + 0.5).max(0.5);
+        let ey = ((hi.y - lo.y) as f64 * 0.5 + 0.5).max(0.5);
+        let ez = ((hi.z - lo.z) as f64 * 0.5 + 0.5).max(0.5);
+        let radius = (ex * ex + ey * ey + ez * ez).sqrt() * cs.metres();
+        (centre, radius)
     }
 
     /// `true` if `cell` lies within the collider region box.

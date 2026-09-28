@@ -6,6 +6,19 @@ The versions and license strings below were verified from the locked registry
 manifests. Cargo may select compatible patch releases only by updating
 `Cargo.lock`; this record names the releases actually locked now.
 
+## ENG-103 — bounded fluid feasibility (verified 2026-09-27)
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by |
+| --- | ---: | --- | --- | --- |
+| rayon | 1.12.0 (vendored path `vendor/parallel/rayon-1.12.0`, with rayon-core 1.13.0) | default features; global pool, size from `RAYON_NUM_THREADS` or core count | `MIT OR Apache-2.0` | Data-parallel loops inside one MAC step: velocity advection, PLIC plane reconstruction, and face-flux assembly. Each element writes only its own slot and ordered `collect` keeps serial order, so results are bit-identical for any thread count. Pressure CG and the multigrid smoother stay serial because thread dispatch cost more than the work at scale 2. |
+
+The vendored crates (`rayon`, `rayon-core`, `crossbeam-deque`, `crossbeam-epoch`) live in the top-level `vendor/` directory, which the workspace lists in `exclude`. Cargo makes a path dependency an implicit workspace member when it sits inside a member's directory, and it ignores `exclude` there. Under `crates/spall_fluid/vendor` they were linted as Spall code, and `--all-features` enabled rayon-core's unsupported `web_spin_lock` (and, while vendored, Salva's mutually exclusive `dim2`/`f64`). Do not move them back under a member.
+
+The Salva 0.10.0 DFSPH particle backend was evaluated in ENG-103 and removed
+after the two-phase MAC grid was selected (roof-containment and cost gates
+failed; see `docs/reports/ENG-103.md`). The vendored `salva3d` copy and its
+`fnv`, `generational-arena`, and `itertools` 0.14 dependencies left the lock.
+
 ## T00 — build and process harness (verified 2026-09-06)
 
 | Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T00 |
@@ -18,7 +31,8 @@ manifests. Cargo may select compatible patch releases only by updating
 | thiserror | 2.0.20 | default features | `MIT OR Apache-2.0` | typed host/harness errors |
 | tracing | 0.1.44 | default features | `MIT` | sandbox process diagnostics |
 | tracing-subscriber | 0.3.23 | `env-filter`; default features | `MIT` | `RUST_LOG` subscriber |
-| wgpu | 24.0.5 | default features | `MIT OR Apache-2.0` | clear-only native surface render |
+| wgpu | 30.0.1 | default features | `MIT OR Apache-2.0` | renderer, native surface and GPU captures |
+| naga | 30.0.1 | WGSL input, SPIR-V output | `MIT OR Apache-2.0` | direct shader validation and SPIR-V probe |
 | winit | 0.30.13 | default features | `Apache-2.0` | native window, resize, close event loop |
 
 Only the client package imports wgpu/winit. `sandbox-client` requires the
@@ -26,6 +40,33 @@ Only the client package imports wgpu/winit. `sandbox-client` requires the
 package's active graph GPU/window-free. The server currently records the
 requested listen address but deliberately does not bind it: QUIC transport,
 authentication, and multiplayer start in T09.
+
+## ENG-74 — editor MVP (verified 2026-09-19)
+
+The editor is a leaf workspace package (`tools/spall_editor`). Its Yakui integration shares the device and queue selected by `spall_render::RenderContext` for the presentation surface; no Spall runtime crate imports Yakui or editor document types. The scene viewport is drawn by `spall_render::ViewportRenderer` (shadow, HDR opaque and tone-map passes) into a texture that Yakui composites; the editor meshes the composed scene on the CPU (`scene_mesh`) and uses the workspace `glam` for camera and picking math.
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by ENG-74 |
+| --- | ---: | --- | --- | --- |
+| yakui, yakui-wgpu, yakui-winit | 0.3.0 (Git `d4cba2dabc2a201162ed105cf547ca95a26c44f3`) | workspace Git revision | `MIT OR Apache-2.0` | editor widgets, in-frame client HUD, native input and compositing |
+| ron | 0.10.1 | default features | `MIT OR Apache-2.0` | versioned human-readable project, scene and voxel documents |
+
+## ENG-89 — renderer and HUD migration (verified 2026-09-23)
+
+The workspace now resolves wgpu and Naga to 30.0.1 and all three Yakui crates
+to 0.3.0 from one Git revision
+(`d4cba2dabc2a201162ed105cf547ca95a26c44f3`). `cargo tree -d` shows the
+matching renderer versions. Both the editor and interactive client use Yakui
+with their existing window, device, queue, surface, and frame. The editor no
+longer uses egui.
+
+## ENG-90 — editor Yakui migration
+
+The editor uses the workspace-pinned Yakui, Yakui-wgpu, and Yakui-winit
+revision. Document changes still run through `EditorCommand` and `UndoStack`;
+native input and UI rendering share the editor's winit window and Spall render
+device/queue. The asset workspace displays occupied SPVOX cells as a colored
+X/Z layer preview selected by the Y coordinate; the visual grid is capped at
+32×32 cells per layer.
 
 ## T01 — IDs, schemas, canonical encoding (verified 2026-09-06)
 
@@ -175,6 +216,30 @@ Transitive crates newly locked by `image` with only the `png` feature:
 `pxfm 0.1.30` (`miniz_oxide` is already present via wgpu) — all
 `MIT`/`MIT OR Apache-2.0`/`Zlib`.
 
+## T12 — material and direct-light pipeline (verified 2026-09-08)
+
+No new dependency or Cargo feature is introduced. The cascaded shadow maps,
+linear `Rgba16Float` target, comparison sampling, timestamp queries, GGX
+shading, and tone-map pass all use the pinned `wgpu 24.0.5`; material/cascade
+uniforms reuse `bytemuck 1.25.2` and camera math reuses `glam 0.33.6`.
+The server dependency graph remains GPU-free.
+
+### ENG-60 — Vulkan crash diagnosis (verified 2026-09-08)
+
+One crate is added to `spall_render`'s **`[dev-dependencies]` only**, used solely
+by the `vulkan_shadow_probe` example that reproduces and isolates the Vulkan
+pipeline-compile crash (`docs/reports/ENG-60.md`). It does not enter any library,
+binary, or the default test graph.
+
+| Dev dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by |
+| --- | ---: | --- | --- | --- |
+| naga | 24.0.0 | `wgsl-in`, `spv-out` | `MIT OR Apache-2.0` | `vulkan_shadow_probe spirv`: dump the SPIR-V naga hands the driver |
+
+`naga 24.0.0` is the exact version `wgpu 24.0.5` already locks transitively, so
+no new crate version is introduced — only the `wgsl-in` / `spv-out` features are
+newly built. The probe's optional `RUST_LOG=wgpu_hal=trace` output needs a `log`
+subscriber on the caller's path; none is vendored.
+
 ## T06 — editable voxel collision feasibility (verified 2026-09-07)
 
 `spall_physics` adds the physics solver named in `README.md`. It is the only
@@ -311,6 +376,20 @@ baseline is built straight from `SimWorld`, not from a `Checkpoint`, so the
 transfer path has no SQLite dependency. `spall_client::net` reuses the
 already-present `spall_net` bulk-stream API. `tools/xtask` and `examples/sandbox`
 add no dependency (new CLI flags only). `Cargo.lock` is unchanged.
+
+## T18 — streamed voxel and body residency (verified 2026-09-09)
+
+**No new external dependency.** The shared cache/hysteresis/collision policy is
+implemented inside `spall_voxel`; `spall_server` reuses its existing
+`spall_sim`, `spall_store`, and `spall_structure` edges for durable eviction
+and dependency loading, and `spall_client` already depends on `spall_voxel`.
+`Cargo.lock` is unchanged.
+
+## Editor file pickers (verified 2026-09-26)
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by |
+| --- | ---: | --- | --- | --- |
+| rfd | 0.17.2 | default features | `MIT` | native open-folder, open-file and save-file dialogs in `tools/spall_editor` (project open/new, `.spvox` import/export) |
 
 ## Verified Windows prerequisites
 

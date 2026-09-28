@@ -14,14 +14,15 @@
 //! [`spall_protocol::MotionSnapshot`] keyframe per body (`docs/protocol.md`
 //! step 4).
 
-use spall_core::{BrickCoord, CELLS_PER_BRICK, JournalSeq, LocalCell, Revision, Tick};
+use spall_core::{BrickCoord, CELLS_PER_BRICK, JournalSeq, LocalCell, Revision, Tick, VolumeId};
 use spall_protocol::{
     BaselineBegin, BaselineBrick, BaselineCells, BaselineEnd, BaselineOwner, BaselinePart,
     BaselineRegion, BaselineVolume, BaselineWorld, Hash32, InterestEpoch, RepairKey, RepairRequest,
     TransferId, limits,
 };
-use spall_sim::{Body, Simulation};
-use spall_voxel::BrickSnapshot;
+use spall_sim::{Body, BrickBacking, Simulation};
+use spall_voxel::{Brick, BrickSnapshot, DigestError, EvictedBricks};
+use std::sync::Arc;
 
 /// World/content schema versions stamped into a `BaselineBegin`. These mirror
 /// the T10 bridge session's fixed values; real negotiation is a later task.
@@ -33,16 +34,62 @@ pub const BASELINE_CONTENT_VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 pub struct BaselineTransfer {
     pub begin: BaselineBegin,
-    pub parts: Vec<BaselinePart>,
+    pub parts: Arc<[BaselinePart]>,
     pub end: BaselineEnd,
     /// The decoded payload, retained for server-side assertions / metrics.
-    pub world: BaselineWorld,
+    pub world: Arc<BaselineWorld>,
+}
+
+/// Immutable, copy-on-write geometry handed from the authoritative tick to a
+/// background baseline encoder. It deliberately contains no runtime physics or
+/// ECS handles.
+#[derive(Debug, Clone)]
+pub struct BaselineSnapshot {
+    pub checkpoint_tick: u64,
+    pub journal_cursor: JournalSeq,
+    volumes: Vec<BaselineSnapshotVolume>,
+}
+
+#[derive(Debug, Clone)]
+struct BaselineSnapshotVolume {
+    volume_id: spall_core::VolumeId,
+    cell_size_code: u8,
+    owner: BaselineOwner,
+    bounds: Option<[[i64; 3]; 2]>,
+    bricks: Vec<(BrickCoord, BrickSnapshot)>,
 }
 
 impl BaselineTransfer {
     /// Total bulk payload bytes (excludes the small control markers).
     pub fn payload_bytes(&self) -> usize {
         self.parts.iter().map(|p| p.payload.len()).sum()
+    }
+
+    /// Reissues immutable baseline geometry under a fresh transfer id. The
+    /// snapshot's cursor remains its honest capture cursor; the receiver drains
+    /// all later topology records before it is promoted to live replication.
+    /// This prevents a burst of simultaneous joiners from repeatedly blocking
+    /// the authoritative tick thread serializing identical topology.
+    pub fn reissue(&self, transfer_id: TransferId) -> Self {
+        let mut begin = self.begin.clone();
+        begin.transfer_id = transfer_id;
+        let mut end = self.end;
+        end.transfer_id = transfer_id;
+        let parts = self
+            .parts
+            .iter()
+            .cloned()
+            .map(|mut part| {
+                part.transfer_id = transfer_id;
+                part
+            })
+            .collect();
+        Self {
+            begin,
+            parts,
+            end,
+            world: Arc::clone(&self.world),
+        }
     }
 }
 
@@ -59,13 +106,142 @@ pub enum BaselineError {
 }
 
 /// Snapshots `sim`'s live world into an immutable [`BaselineWorld`] coherent
-/// with the current tick.
+/// with the current tick. Equivalent to [`logical_world_baseline`] with no
+/// backing — valid only while nothing is evicted.
 pub fn world_baseline(sim: &Simulation) -> BaselineWorld {
+    logical_world_baseline(sim, None)
+}
+
+/// Captures a stable, cheap copy-on-write view at a tick boundary. Expanding
+/// snapshots into protocol cell vectors and compressing them is intentionally
+/// deferred to [`transfer_from_snapshot`], which may run on a worker.
+///
+/// T23 / G3 row 7 follow-up: over the **logical** brick set, exactly like
+/// [`logical_world_baseline`] — a resident brick is snapshotted directly, an
+/// evicted one is read from `backing` and wrapped as an equivalent
+/// [`BrickSnapshot`]. Before this, a currently-evicted terrain brick made this
+/// panic (`background snapshots require resident geometry`): the periodic
+/// checkpoint path used to paper over it by reloading every evicted brick
+/// back into the live world before every checkpoint, which incidentally also
+/// made most background baseline captures land on a fully-resident tick; once
+/// that reload was replaced with bounded capture (this same follow-up),
+/// evictions persist for the whole run and this path panicked for real.
+/// Panics if a volume has evicted bricks and `backing` is `None` or cannot
+/// supply one — a partial baseline is never emitted, same contract as
+/// `baseline_volume`.
+pub fn snapshot_world(sim: &Simulation, backing: Option<&dyn BrickBacking>) -> BaselineSnapshot {
     let world = sim.world();
-    let mut volumes = vec![baseline_volume(world.terrain(), BaselineOwner::Terrain)];
+    let mut volumes = Vec::with_capacity(world.body_count() + 1);
+    let mut push = |body: &Body, owner| {
+        let volume = &body.volume;
+        let mut bricks = spall_voxel::logical_bricks(volume, world.evicted(volume.id()))
+            .expect("baseline snapshot logical invariant")
+            .into_iter()
+            .map(|logical| {
+                let coord = logical.coord;
+                if let Ok(Some(snap)) = volume.snapshot_brick(coord) {
+                    return (coord, snap);
+                }
+                // Evicted: its cells come from the durable backing (same
+                // fallback `baseline_volume` uses for the synchronous path).
+                let backing =
+                    backing.expect("a background baseline snapshot over evicted geometry needs a durable backing");
+                let brick = verified_backing_brick(
+                    world.evicted(volume.id()),
+                    volume.id(),
+                    coord,
+                    backing,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "background baseline snapshot: durable brick {coord:?} of volume {} {error}",
+                        volume.id()
+                    )
+                });
+                (coord, brick.snapshot())
+            })
+            .collect::<Vec<_>>();
+        bricks.sort_by_key(|(coord, _)| (coord.z, coord.y, coord.x));
+        volumes.push(BaselineSnapshotVolume {
+            volume_id: volume.id(),
+            cell_size_code: volume.cell_size().to_u8(),
+            owner,
+            bounds: volume
+                .bounds()
+                .map(|b| [[b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z]]),
+            bricks,
+        });
+    };
+    push(world.terrain(), BaselineOwner::Terrain);
+    for body in world.bodies() {
+        push(body, BaselineOwner::Body(body.entity.expect("body entity")));
+    }
+    volumes.sort_by_key(|volume| volume.volume_id.get());
+    BaselineSnapshot {
+        checkpoint_tick: sim.current_tick().get(),
+        journal_cursor: JournalSeq(sim.journal_cursor()),
+        volumes,
+    }
+}
+
+/// Expands an immutable tick-boundary snapshot and packages it for one client.
+pub fn transfer_from_snapshot(
+    snapshot: BaselineSnapshot,
+    transfer_id: TransferId,
+    interest_epoch: InterestEpoch,
+) -> Result<BaselineTransfer, BaselineError> {
+    let world = BaselineWorld {
+        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+        checkpoint_tick: snapshot.checkpoint_tick,
+        volumes: snapshot
+            .volumes
+            .into_iter()
+            .map(|volume| BaselineVolume {
+                volume_id: volume.volume_id,
+                cell_size_code: volume.cell_size_code,
+                owner: volume.owner,
+                bounds: volume.bounds,
+                bricks: volume
+                    .bricks
+                    .into_iter()
+                    .map(|(coord, snap)| BaselineBrick {
+                        coord: [coord.x, coord.y, coord.z],
+                        revision: snap.revision().get(),
+                        edited: snap.is_edited(),
+                        cells: cells_of(&snap),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    transfer_from_world(world, transfer_id, interest_epoch, snapshot.journal_cursor)
+}
+
+/// [`world_baseline`] over the **logical** brick set: every resident brick plus,
+/// for each brick this server has evicted, its durable geometry from `backing`.
+/// A late joiner therefore receives a complete world regardless of the server's
+/// cache contents. Panics if a volume has evicted bricks and `backing` is
+/// `None` or cannot supply one — a partial baseline is never emitted
+/// (`docs/reports/G3-residency-hash.md` lifecycle).
+pub fn logical_world_baseline(
+    sim: &Simulation,
+    backing: Option<&dyn BrickBacking>,
+) -> BaselineWorld {
+    let world = sim.world();
+    let mut volumes = vec![baseline_volume(
+        world.terrain(),
+        BaselineOwner::Terrain,
+        world.evicted(world.terrain().volume_id),
+        backing,
+    )];
     for body in world.bodies() {
         let entity = body.entity.expect("a detached body carries an entity id");
-        volumes.push(baseline_volume(body, BaselineOwner::Body(entity)));
+        volumes.push(baseline_volume(
+            body,
+            BaselineOwner::Body(entity),
+            world.evicted(body.volume_id),
+            backing,
+        ));
     }
     volumes.sort_by_key(|v| v.volume_id.get());
     BaselineWorld {
@@ -85,8 +261,20 @@ pub fn capture_transfer(
     interest_epoch: InterestEpoch,
     journal_cursor: JournalSeq,
 ) -> Result<BaselineTransfer, BaselineError> {
+    logical_capture_transfer(sim, None, transfer_id, interest_epoch, journal_cursor)
+}
+
+/// [`capture_transfer`] over the logical brick set — pulls evicted bricks from
+/// `backing` so the transfer is complete even when this server has evictions.
+pub fn logical_capture_transfer(
+    sim: &Simulation,
+    backing: Option<&dyn BrickBacking>,
+    transfer_id: TransferId,
+    interest_epoch: InterestEpoch,
+    journal_cursor: JournalSeq,
+) -> Result<BaselineTransfer, BaselineError> {
     transfer_from_world(
-        world_baseline(sim),
+        logical_world_baseline(sim, backing),
         transfer_id,
         interest_epoch,
         journal_cursor,
@@ -101,15 +289,27 @@ pub fn transfer_from_world(
     interest_epoch: InterestEpoch,
     journal_cursor: JournalSeq,
 ) -> Result<BaselineTransfer, BaselineError> {
-    let payload = world.encode();
-
-    if payload.len() > limits::MAX_ASSEMBLED_TRANSFER {
+    // `docs/protocol.md` late-join step 2: "sending compressed, hashed
+    // baseline parts on bulk streams". The size cap applies to the
+    // *decompressed* canonical payload (the same ceiling
+    // `BaselineWorld::decode_compressed` enforces on the receiving end), so a
+    // bigger world still needs region splitting (T18) regardless of how well
+    // it compresses.
+    let raw = world.encode();
+    if raw.len() > limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED {
         return Err(BaselineError::TooLarge {
-            bytes: payload.len(),
-            cap: limits::MAX_ASSEMBLED_TRANSFER,
+            bytes: raw.len(),
+            cap: limits::MAX_ASSEMBLED_TRANSFER_DECOMPRESSED,
         });
     }
-    let parts = chunk_payload(&payload, transfer_id);
+    let assembled_hash = Hash32::of(&raw);
+    // `BaselineWorld::encode_compressed` re-encodes internally rather than
+    // reusing `raw` — an acceptable one-time cost for a per-join capture, and
+    // it keeps the zstd dependency centralized in `spall_protocol` alongside
+    // `decode_compressed`.
+    let payload = world.encode_compressed();
+
+    let parts: Arc<[BaselinePart]> = chunk_payload(&payload, transfer_id).into();
     if parts.len() > limits::MAX_BASELINE_PARTS {
         return Err(BaselineError::TooManyParts {
             parts: parts.len(),
@@ -119,7 +319,6 @@ pub fn transfer_from_world(
     // At least one part always: an empty world is not a valid late-join target.
     debug_assert!(!parts.is_empty());
 
-    let assembled_hash = Hash32::of(&payload);
     let regions: Vec<BaselineRegion> = world.volumes.iter().filter_map(region_of).collect();
 
     let begin = BaselineBegin {
@@ -142,7 +341,7 @@ pub fn transfer_from_world(
         begin,
         parts,
         end,
-        world,
+        world: Arc::new(world),
     })
 }
 
@@ -162,8 +361,8 @@ pub fn chunk_payload(payload: &[u8], transfer_id: TransferId) -> Vec<BaselinePar
     parts
 }
 
-/// Reassembles and decodes a received part list (client side helper; also used
-/// by the server-side round-trip test).
+/// Reassembles, decompresses, and decodes a received part list (client side
+/// helper; also used by the server-side round-trip test).
 pub fn assemble(
     parts: &[BaselinePart],
 ) -> Result<BaselineWorld, spall_protocol::BaselineDecodeError> {
@@ -171,7 +370,7 @@ pub fn assemble(
     for part in parts {
         bytes.extend_from_slice(&part.payload);
     }
-    BaselineWorld::decode(&bytes)
+    BaselineWorld::decode_compressed(&bytes)
 }
 
 /// A targeted baseline patch for one diverged brick — the authoritative answer
@@ -180,15 +379,45 @@ pub fn assemble(
 /// `CellRun` replay cannot (`docs/protocol.md`: "hash repairs"). `None` for a
 /// body repair or a brick the world does not hold.
 pub fn brick_repair_patch(sim: &Simulation, request: &RepairRequest) -> Option<BaselineWorld> {
+    logical_brick_repair_patch(sim, request, None)
+}
+
+/// [`brick_repair_patch`] that can also patch a brick this server has evicted,
+/// pulling its cells from `backing`.
+pub fn logical_brick_repair_patch(
+    sim: &Simulation,
+    request: &RepairRequest,
+    backing: Option<&dyn BrickBacking>,
+) -> Option<BaselineWorld> {
     let RepairKey::Brick { volume, coord } = request.key else {
         return None;
     };
     let world = sim.world();
     let vol = world.volume_ref(volume)?;
-    let snap = vol.snapshot_brick(coord).ok().flatten()?;
     let owner = match world.volume_body(volume)?.entity {
         Some(entity) => BaselineOwner::Body(entity),
         None => BaselineOwner::Terrain,
+    };
+    let brick = if let Ok(Some(snap)) = vol.snapshot_brick(coord) {
+        BaselineBrick {
+            coord: [coord.x, coord.y, coord.z],
+            revision: snap.revision().get(),
+            edited: snap.is_edited(),
+            cells: cells_of(&snap),
+        }
+    } else if world.evicted(volume).contains(coord) {
+        let brick = match verified_backing_brick(world.evicted(volume), volume, coord, backing?) {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        BaselineBrick {
+            coord: [coord.x, coord.y, coord.z],
+            revision: brick.revision().get(),
+            edited: brick.is_edited(),
+            cells: cells_of(&brick.snapshot()),
+        }
+    } else {
+        return None;
     };
     let bv = BaselineVolume {
         volume_id: volume,
@@ -197,12 +426,7 @@ pub fn brick_repair_patch(sim: &Simulation, request: &RepairRequest) -> Option<B
         bounds: vol
             .bounds()
             .map(|b| [[b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z]]),
-        bricks: vec![BaselineBrick {
-            coord: [coord.x, coord.y, coord.z],
-            revision: snap.revision().get(),
-            edited: snap.is_edited(),
-            cells: cells_of(&snap),
-        }],
+        bricks: vec![brick],
     };
     Some(BaselineWorld {
         schema: spall_protocol::BASELINE_WORLD_SCHEMA,
@@ -211,19 +435,42 @@ pub fn brick_repair_patch(sim: &Simulation, request: &RepairRequest) -> Option<B
     })
 }
 
-fn baseline_volume(body: &Body, owner: BaselineOwner) -> BaselineVolume {
+fn baseline_volume(
+    body: &Body,
+    owner: BaselineOwner,
+    evicted: &EvictedBricks,
+    backing: Option<&dyn BrickBacking>,
+) -> BaselineVolume {
     let v = &body.volume;
-    let mut bricks: Vec<BaselineBrick> = v
-        .resident_brick_coords()
+    let mut bricks: Vec<BaselineBrick> = spall_voxel::logical_bricks(v, evicted)
+        .expect("logical volume: resident/evicted digest invariant holds")
         .into_iter()
-        .filter_map(|coord| {
-            let snap = v.snapshot_brick(coord).ok().flatten()?;
-            Some(BaselineBrick {
+        .map(|lb| {
+            let coord = lb.coord;
+            if let Ok(Some(snap)) = v.snapshot_brick(coord) {
+                return BaselineBrick {
+                    coord: [coord.x, coord.y, coord.z],
+                    revision: snap.revision().get(),
+                    edited: snap.is_edited(),
+                    cells: cells_of(&snap),
+                };
+            }
+            // Evicted: its cells come from the durable backing.
+            let backing =
+                backing.expect("a baseline over evicted geometry needs a durable backing");
+            let brick =
+                verified_backing_brick(evicted, v.id(), coord, backing).unwrap_or_else(|error| {
+                    panic!(
+                        "baseline: durable brick {coord:?} of volume {} {error}",
+                        v.id()
+                    )
+                });
+            BaselineBrick {
                 coord: [coord.x, coord.y, coord.z],
-                revision: snap.revision().get(),
-                edited: snap.is_edited(),
-                cells: cells_of(&snap),
-            })
+                revision: brick.revision().get(),
+                edited: brick.is_edited(),
+                cells: cells_of(&brick.snapshot()),
+            }
         })
         .collect();
     bricks.sort_by_key(|b| (b.coord[2], b.coord[1], b.coord[0]));
@@ -236,6 +483,41 @@ fn baseline_volume(body: &Body, owner: BaselineOwner) -> BaselineVolume {
             .map(|b| [[b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z]]),
         bricks,
     }
+}
+
+#[derive(Debug)]
+enum VerifiedBackingError {
+    Unavailable,
+    Digest(DigestError),
+}
+
+impl std::fmt::Display for VerifiedBackingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("is unavailable"),
+            Self::Digest(error) => write!(f, "does not match its retained digest: {error}"),
+        }
+    }
+}
+
+fn verified_backing_brick(
+    evicted: &EvictedBricks,
+    volume: VolumeId,
+    coord: BrickCoord,
+    backing: &dyn BrickBacking,
+) -> Result<Brick, VerifiedBackingError> {
+    let brick = match backing.load(volume, coord) {
+        spall_sim::BackingBrick::Loaded(brick) => brick,
+        spall_sim::BackingBrick::KnownEmpty { revision, edited } => {
+            let air = vec![spall_core::MaterialId::AIR; CELLS_PER_BRICK];
+            Brick::restored(&air, revision, edited)
+        }
+        spall_sim::BackingBrick::Unavailable => return Err(VerifiedBackingError::Unavailable),
+    };
+    evicted
+        .verify_candidate(coord, &brick)
+        .map_err(VerifiedBackingError::Digest)
+        .map(|()| brick)
 }
 
 fn cells_of(snap: &BrickSnapshot) -> BaselineCells {
@@ -330,9 +612,50 @@ mod tests {
 
         // Reassembly reproduces the captured world exactly.
         let rebuilt = assemble(&transfer.parts).unwrap();
-        assert_eq!(rebuilt, transfer.world);
+        assert_eq!(rebuilt, *transfer.world);
         assert_eq!(rebuilt.volumes.len(), sim.world().body_count() + 1);
         assert_eq!(Hash32::of(&rebuilt.encode()), transfer.end.assembled_hash);
+    }
+
+    #[test]
+    fn immutable_snapshot_encodes_the_same_baseline_as_the_live_tick() {
+        let sim = spall_sim::Simulation::new(spall_sim::SimulationConfig::new(
+            spall_sim::fixtures::bridged_terrain_setup(),
+        ))
+        .unwrap();
+        let live = capture_transfer(&sim, TransferId(11), InterestEpoch(1), JournalSeq(0)).unwrap();
+        let detached =
+            transfer_from_snapshot(snapshot_world(&sim, None), TransferId(12), InterestEpoch(1))
+                .unwrap();
+        assert_eq!(*live.world, *detached.world);
+        assert_eq!(live.begin.journal_cursor, detached.begin.journal_cursor);
+    }
+
+    /// T23 / G3 row 11: the wire payload a late-join transfer actually ships
+    /// (`transfer.payload_bytes()`, what the join-budget measurement reports as
+    /// "compressed baseline size") must genuinely be smaller than the raw
+    /// postcard encoding, not merely carry the label — `docs/protocol.md`
+    /// requires "compressed, hashed baseline parts on bulk streams".
+    #[test]
+    fn a_capture_of_a_realistic_resident_world_is_meaningfully_compressed_over_the_wire() {
+        let sim = Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup()))
+            .expect("separated-regions scene is valid");
+        let world = world_baseline(&sim);
+        let raw = world.encode();
+
+        let transfer =
+            capture_transfer(&sim, TransferId(1), InterestEpoch(1), JournalSeq(0)).unwrap();
+        assert!(
+            transfer.payload_bytes() < raw.len(),
+            "compressed {} bytes should be smaller than raw {} bytes for a realistic \
+             resident-terrain baseline",
+            transfer.payload_bytes(),
+            raw.len()
+        );
+
+        // Reassembly (decompress + decode) still recovers the exact world.
+        let rebuilt = assemble(&transfer.parts).unwrap();
+        assert_eq!(rebuilt, world);
     }
 
     #[test]

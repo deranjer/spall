@@ -21,24 +21,34 @@
 //!   previous checkpoint as a fallback.
 //! * [`fault`] — controlled [`CrashPoint`]s and disk-error injection for the
 //!   persistence crash tests.
+//! * [`residency_store`] — a separate, non-authoritative on-disk brick cache
+//!   for the T23/G3 residency subsystem (row 7 item 2). Deliberately outside
+//!   the versioned save schema above; see its module docs for why.
 
 pub mod brick;
 pub mod db;
 pub mod dto;
 pub mod fault;
+pub mod inject;
 pub mod metrics;
 pub mod recover;
+pub mod residency_store;
 mod schema;
 
 pub use brick::{BrickCodecError, DENSE_CELL_BYTES, decode_cells, encode_cells};
 pub use db::{DEFAULT_MAX_BATCH_RECORDS, WalCheckpoint, Writer};
 pub use dto::{
     BrickPayload, Checkpoint, DtoError, JournalPayload, JournalRecord, MAX_STORED_BRICK_BYTES,
-    STORE_SCHEMA_VERSION, StoredBody, StoredBodyKind, StoredBrick, StoredPose, StoredWorldMeta,
+    OutboxRecord, STORE_SCHEMA_VERSION, StoredBody, StoredBodyKind, StoredBrick, StoredPose,
+    StoredWorldMeta,
 };
 pub use fault::{CrashPoint, FaultPlan};
 pub use metrics::WriteMetrics;
-pub use recover::{CorruptionReport, Recovery, recover, recover_conn};
+pub use recover::{
+    CorruptionReport, RecoverBase, Recovery, recover, recover_conn, recover_conn_from,
+    recover_from_base,
+};
+pub use residency_store::{ResidencyRecord, ResidencyStore};
 
 /// Anything that can go wrong opening, writing, or recovering a world database.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +81,8 @@ pub enum StoreError {
     JournalGap { expected: u64, got: u64 },
     #[error("journal batch of {pending} records exceeds the {cap} cap")]
     QueueFull { pending: usize, cap: usize },
+    #[error("outbox event refers to journal sequence {0} absent from this topology batch")]
+    OutboxJournalMismatch(u64),
 
     #[error("writer stopped after an earlier failure: {0}")]
     Poisoned(String),

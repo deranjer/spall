@@ -16,11 +16,12 @@ use spall_core::{
 use crate::canonical::Hash32;
 use crate::limits::{
     self, MAX_BASELINE_PARTS, MAX_BASELINE_REGIONS, MAX_BULK_PART, MAX_CELL_RUN_LEN,
-    MAX_REDUNDANT_INPUTS, MAX_TRANSACTION_OPS, MAX_TRANSACTION_REFS, SizeLimitError,
+    MAX_REDUNDANT_INPUTS, MAX_SPLIT_BASELINE_BLOB, MAX_TRANSACTION_OPS, MAX_TRANSACTION_REFS,
+    SizeLimitError,
 };
 
 /// Schema version stamped into every encoded record header.
-pub const WIRE_SCHEMA_VERSION: u16 = 1;
+pub const WIRE_SCHEMA_VERSION: u16 = 3;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,6 +39,8 @@ pub enum WireTag {
     RepairRequest = 10,
     DurableThrough = 11,
     Handshake = 12,
+    ProgressionRequest = 13,
+    ProgressionResponse = 14,
 }
 
 impl WireTag {
@@ -55,12 +58,120 @@ impl WireTag {
             10 => Self::RepairRequest,
             11 => Self::DurableThrough,
             12 => Self::Handshake,
+            13 => Self::ProgressionRequest,
+            14 => Self::ProgressionResponse,
             _ => return None,
         })
     }
 
     pub const fn to_u16(self) -> u16 {
         self as u16
+    }
+}
+
+/// Game progression operation requested over the authenticated control stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProgressionOperation {
+    InspectInventory,
+    Craft { recipe_id: u16, batch_count: u32 },
+}
+
+/// A player's request against a versioned game recipe catalog and inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressionRequest {
+    pub request_id: u64,
+    pub catalog_version: u32,
+    pub expected_inventory_revision: u64,
+    pub operation: ProgressionOperation,
+}
+
+impl Record for ProgressionRequest {
+    const TAG: WireTag = WireTag::ProgressionRequest;
+    fn validate(&self) -> Result<(), RecordError> {
+        if self.request_id == 0 {
+            return Err(RecordError::Inconsistent(
+                "progression request ID must be nonzero",
+            ));
+        }
+        match self.operation {
+            ProgressionOperation::InspectInventory => {}
+            ProgressionOperation::Craft {
+                recipe_id,
+                batch_count,
+            } if recipe_id != 0 && batch_count != 0 => {}
+            ProgressionOperation::Craft { .. } => {
+                return Err(RecordError::Inconsistent(
+                    "craft recipe and batch must be nonzero",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stable rejection categories; detailed game-specific prose stays server-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProgressionRejectCode {
+    CatalogVersion,
+    InventoryRevision,
+    UnknownRecipe,
+    ZeroBatch,
+    InsufficientItems,
+    Overflow,
+    Unavailable,
+    /// The bounded progression work queue is full. Retry the same request ID.
+    RetryableCapacity,
+}
+
+/// Compact, explicit inventory entry; numeric IDs are game-owned stable IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryEntry {
+    pub item_id: u16,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProgressionOutcome {
+    Inventory,
+    Crafted,
+    Rejected(ProgressionRejectCode),
+}
+
+/// Authoritative result always includes the complete current inventory, even
+/// for a rejected optimistic request, so clients can repair stale views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressionResponse {
+    pub request_id: u64,
+    pub catalog_version: u32,
+    pub inventory_revision: u64,
+    pub outcome: ProgressionOutcome,
+    pub inventory: Vec<InventoryEntry>,
+}
+
+impl Record for ProgressionResponse {
+    const TAG: WireTag = WireTag::ProgressionResponse;
+    fn validate(&self) -> Result<(), RecordError> {
+        if self.request_id == 0 || self.catalog_version == 0 {
+            return Err(RecordError::Inconsistent(
+                "progression response identity must be nonzero",
+            ));
+        }
+        if self.inventory.len() > 256 {
+            return Err(RecordError::OutOfRange {
+                field: "ProgressionResponse.inventory",
+                detail: "more than 256 stacks",
+            });
+        }
+        let mut previous = 0;
+        for entry in &self.inventory {
+            if entry.item_id == 0 || entry.count == 0 || entry.item_id <= previous {
+                return Err(RecordError::Inconsistent(
+                    "inventory entries must have positive counts and sorted unique IDs",
+                ));
+            }
+            previous = entry.item_id;
+        }
+        Ok(())
     }
 }
 
@@ -161,9 +272,16 @@ fn unit_axis(v: &[f32; 3], field: &'static str) -> Result<(), RecordError> {
 // --- InputFrame -------------------------------------------------------------
 
 /// One redundant copy of a recent input, carried inside [`InputFrame`].
+///
+/// Carries its own `intended_tick` (not just the enclosing frame's) so that
+/// recovering it from a later datagram -- the case this redundancy exists
+/// for, a dropped primary frame -- can still schedule it against the tick it
+/// was tagged for instead of applying it immediately on whatever tick is
+/// next.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RecentInput {
     pub input_seq: InputSeq,
+    pub intended_tick: Tick,
     pub movement: [f32; 3],
     pub view_dir: [f32; 3],
     pub buttons: u32,
@@ -292,6 +410,11 @@ pub struct VolumeHash {
     pub hash: Hash32,
 }
 
+/// Set on a bulk split's `transfer_id` (T17 increment 2) so it can never
+/// collide with a late-join / repair transfer id (which are small, allocated by
+/// the server's own counter). The low 63 bits are the split's `TransactionId`.
+pub const SPLIT_BULK_TRANSFER_ID_BIT: u64 = 1 << 63;
+
 /// One ordered operation inside a transaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TopologyOp {
@@ -315,6 +438,54 @@ pub enum TopologyOp {
         child: VolumeId,
         child_entity: EntityId,
     },
+    /// A split whose child geometry is too large to encode as inline
+    /// [`TopologyOp::CellRun`]s (T17): `blob` is the zstd-compressed postcard of
+    /// a [`crate::baseline::BaselineVolume`] holding the whole child volume, at
+    /// its authoritative brick revisions. Replaces the `SplitOff` marker **and**
+    /// its child-fill runs. Bounded by
+    /// [`crate::limits::MAX_SPLIT_BASELINE_BLOB`].
+    SplitOffBaseline {
+        source: VolumeId,
+        child: VolumeId,
+        child_entity: EntityId,
+        blob: Vec<u8>,
+    },
+    /// The source side of an oversized split (T17): `blob` is the
+    /// zstd-compressed postcard of a [`crate::baseline::BaselineVolume`] holding
+    /// the source volume's post-cut **affected** bricks, at their authoritative
+    /// revisions. Replaces the inline source-removal `CellRun`s.
+    SourcePatchBaseline { source: VolumeId, blob: Vec<u8> },
+    /// A split whose geometry is too large even for a compressed inline blob
+    /// (T17 increment 2 / ENG-64): a *marker only*. The child volume travels
+    /// out of band — as a [`crate::baseline::BaselineWorld`] on a bulk stream to
+    /// replicas, and as a journal `TopologyBulkSplit` payload to disk — keyed by
+    /// `transfer_id` (the [`crate::BaselineBegin::transfer_id`] of that
+    /// transfer). The replica **holds** this transaction until the matching
+    /// blob assembles.
+    SplitOffBulkBaseline {
+        source: VolumeId,
+        child: VolumeId,
+        child_entity: EntityId,
+        transfer_id: u64,
+    },
+    /// The source side of a bulk-delivered oversized split (T17 increment 2): a
+    /// marker. The source volume's post-cut affected bricks are in the same
+    /// out-of-band [`crate::baseline::BaselineWorld`] as the
+    /// [`TopologyOp::SplitOffBulkBaseline`] children, under the same
+    /// `transfer_id`.
+    SourcePatchBulkBaseline { source: VolumeId, transfer_id: u64 },
+}
+
+impl TopologyOp {
+    /// The bulk-baseline `transfer_id` this op references, if any (T17
+    /// increment 2). Every op of one bulk-delivered split carries the same id.
+    pub fn bulk_transfer_id(&self) -> Option<u64> {
+        match self {
+            TopologyOp::SplitOffBulkBaseline { transfer_id, .. }
+            | TopologyOp::SourcePatchBulkBaseline { transfer_id, .. } => Some(*transfer_id),
+            _ => None,
+        }
+    }
 }
 
 /// `TopologyTransaction`: the authoritative record of one committed edit.
@@ -383,6 +554,19 @@ impl Record for TopologyTransaction {
                     detail: "run length must be 1..=MAX_CELL_RUN_LEN",
                 });
             }
+            let blob = match op {
+                TopologyOp::SplitOffBaseline { blob, .. }
+                | TopologyOp::SourcePatchBaseline { blob, .. } => Some(blob),
+                _ => None,
+            };
+            if let Some(blob) = blob
+                && (blob.is_empty() || blob.len() > MAX_SPLIT_BASELINE_BLOB)
+            {
+                return Err(RecordError::OutOfRange {
+                    field: "TopologyOp split baseline blob",
+                    detail: "blob length must be 1..=MAX_SPLIT_BASELINE_BLOB",
+                });
+            }
         }
         Ok(())
     }
@@ -397,7 +581,26 @@ impl TopologyTransaction {
             let material = match op {
                 TopologyOp::IntegerBrush { material, .. } => *material,
                 TopologyOp::CellRun { material, .. } => *material,
-                TopologyOp::SplitOff { .. } => continue,
+                // Markers carry no geometry inline: the bulk `BaselineWorld` is
+                // material-checked where it decodes.
+                TopologyOp::SplitOff { .. }
+                | TopologyOp::SplitOffBulkBaseline { .. }
+                | TopologyOp::SourcePatchBulkBaseline { .. } => continue,
+                // A split baseline blob carries whole bricks: decode it and
+                // check every material it names against the manifest.
+                TopologyOp::SplitOffBaseline { blob, .. }
+                | TopologyOp::SourcePatchBaseline { blob, .. } => {
+                    let volume =
+                        crate::baseline::BaselineVolume::decode_compressed(blob).map_err(|_| {
+                            RecordError::Inconsistent("split baseline op blob failed to decode")
+                        })?;
+                    for id in volume.material_ids() {
+                        if !id.is_air() && !manifest.contains(id) {
+                            return Err(RecordError::UnknownMaterial(id.raw()));
+                        }
+                    }
+                    continue;
+                }
             };
             if !material.is_air() && !manifest.contains(material) {
                 return Err(RecordError::UnknownMaterial(material.raw()));
@@ -625,6 +828,7 @@ mod tests {
     fn input_frame_rejects_too_many_redundant_and_bad_axes() {
         let base = RecentInput {
             input_seq: InputSeq(1),
+            intended_tick: Tick(100),
             movement: [0.0; 3],
             view_dir: [0.0, 0.0, 1.0],
             buttons: 0,
@@ -770,6 +974,171 @@ mod tests {
             crate::decode_topology(&bytes, &manifest),
             Err(crate::CodecError::Invalid(RecordError::UnknownMaterial(9)))
         ));
+    }
+
+    #[test]
+    fn split_baseline_ops_round_trip_and_validate() {
+        use crate::baseline::{BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume};
+        use spall_core::{CELLS_PER_BRICK, MaterialDef, MaterialFlags, RenderProps, SimProps};
+
+        let stone = MaterialDef {
+            id: MaterialId(1),
+            name: "stone".into(),
+            render: RenderProps {
+                albedo: [0.5; 3],
+                roughness: 0.9,
+                metalness: 0.0,
+                emissive: [0.0; 3],
+            },
+            sim: SimProps {
+                density_kg_m3: 2600.0,
+                friction: 0.8,
+                restitution: 0.0,
+                hardness: 4.0,
+                bond_strength: 12.0,
+                flags: MaterialFlags(MaterialFlags::COLLIDES.0 | MaterialFlags::STRUCTURAL.0),
+            },
+        };
+        let air = MaterialDef {
+            id: MaterialId::AIR,
+            name: "air".into(),
+            render: RenderProps {
+                albedo: [0.0; 3],
+                roughness: 1.0,
+                metalness: 0.0,
+                emissive: [0.0; 3],
+            },
+            sim: SimProps {
+                density_kg_m3: 0.0,
+                friction: 0.0,
+                restitution: 0.0,
+                hardness: 0.0,
+                bond_strength: 0.0,
+                flags: MaterialFlags::NONE,
+            },
+        };
+        let manifest = MaterialManifest::validated(vec![air, stone]).unwrap();
+
+        let child_blob = |material: u16| {
+            BaselineVolume {
+                volume_id: VolumeId::new(2).unwrap(),
+                cell_size_code: 2,
+                owner: BaselineOwner::Body(EntityId::new(5).unwrap()),
+                bounds: Some([[0, 0, 0], [0, 0, 0]]),
+                bricks: vec![BaselineBrick {
+                    coord: [0, 0, 0],
+                    revision: 2,
+                    edited: true,
+                    cells: BaselineCells::Dense({
+                        let mut c = vec![0u16; CELLS_PER_BRICK];
+                        c[0] = material;
+                        c
+                    }),
+                }],
+            }
+            .encode_compressed()
+        };
+
+        let mut tx = TopologyTransaction {
+            transaction_id: TransactionId::new(1).unwrap(),
+            server_tick: Tick(9),
+            control_seq: ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![
+                TopologyOp::IntegerBrush {
+                    volume: VolumeId::new(1).unwrap(),
+                    brush: SphereBrush::new(BrushPoint::from_cells(0, 0, 0).unwrap(), 256).unwrap(),
+                    material: MaterialId::AIR,
+                },
+                TopologyOp::SplitOffBaseline {
+                    source: VolumeId::new(1).unwrap(),
+                    child: VolumeId::new(2).unwrap(),
+                    child_entity: EntityId::new(5).unwrap(),
+                    blob: child_blob(1),
+                },
+                TopologyOp::SourcePatchBaseline {
+                    source: VolumeId::new(1).unwrap(),
+                    blob: child_blob(1),
+                },
+            ],
+            result_hashes: vec![],
+        };
+
+        // Wire round-trip through the control codec.
+        assert!(tx.validate_against(&manifest).is_ok());
+        let bytes = crate::encode_control(&tx).unwrap();
+        assert_eq!(
+            crate::decode_topology(&bytes, &manifest).unwrap(),
+            tx,
+            "SplitOffBaseline / SourcePatchBaseline survive the wire"
+        );
+
+        // An unknown material *inside* the blob is caught by validate_against.
+        tx.ops[1] = TopologyOp::SplitOffBaseline {
+            source: VolumeId::new(1).unwrap(),
+            child: VolumeId::new(2).unwrap(),
+            child_entity: EntityId::new(5).unwrap(),
+            blob: child_blob(9),
+        };
+        assert_eq!(
+            tx.validate_against(&manifest),
+            Err(RecordError::UnknownMaterial(9))
+        );
+
+        // An empty blob is rejected by the structural validate().
+        tx.ops[1] = TopologyOp::SplitOffBaseline {
+            source: VolumeId::new(1).unwrap(),
+            child: VolumeId::new(2).unwrap(),
+            child_entity: EntityId::new(5).unwrap(),
+            blob: Vec::new(),
+        };
+        assert!(matches!(tx.validate(), Err(RecordError::OutOfRange { .. })));
+    }
+
+    #[test]
+    fn bulk_split_marker_ops_round_trip_and_carry_one_transfer_id() {
+        let tid = 42 | SPLIT_BULK_TRANSFER_ID_BIT;
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(42).unwrap(),
+            server_tick: Tick(9),
+            control_seq: ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![
+                TopologyOp::IntegerBrush {
+                    volume: VolumeId::new(1).unwrap(),
+                    brush: SphereBrush::new(BrushPoint::from_cells(0, 0, 0).unwrap(), 8).unwrap(),
+                    material: MaterialId::AIR,
+                },
+                TopologyOp::SplitOffBulkBaseline {
+                    source: VolumeId::new(1).unwrap(),
+                    child: VolumeId::new(2).unwrap(),
+                    child_entity: EntityId::new(5).unwrap(),
+                    transfer_id: tid,
+                },
+                TopologyOp::SourcePatchBulkBaseline {
+                    source: VolumeId::new(1).unwrap(),
+                    transfer_id: tid,
+                },
+            ],
+            result_hashes: vec![],
+        };
+        assert!(tx.validate().is_ok());
+        let bytes = crate::encode_control(&tx).unwrap();
+        assert_eq!(
+            crate::decode_control::<TopologyTransaction>(&bytes).unwrap(),
+            tx
+        );
+
+        let ids: std::collections::BTreeSet<u64> =
+            tx.ops.iter().filter_map(|o| o.bulk_transfer_id()).collect();
+        assert_eq!(ids, std::collections::BTreeSet::from([tid]));
+        assert_ne!(tid & SPLIT_BULK_TRANSFER_ID_BIT, 0);
     }
 
     #[test]

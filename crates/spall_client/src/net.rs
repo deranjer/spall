@@ -15,6 +15,7 @@
 //! or an idle-grace timeout elapses, and reports the replica's final topology
 //! hash so a harness can compare it against the server's.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,18 +25,71 @@ use std::time::Duration;
 use serde::Serialize;
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
 use spall_core::{
-    JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole, SphereBrush, VolumeId,
+    EntityId, JsonlError, JsonlLog, PlayerInput, ProcessEvent, ProcessRecord, ProcessRole,
+    SphereBrush, Tick, VolumeId,
 };
 use spall_net::{
     Connection, DatagramRecord, Fingerprint, JoinToken, TransportConfig, TransportError,
     WireRecord, connect,
 };
+use spall_physics::{CharacterParams, CharacterState};
 use spall_protocol::{
-    ActionKind, ActionRequest, AlgorithmVersions, BaselineAck, BaselineWorld, ClaimedTarget,
-    Handshake, Hash32, InputSeq, NegotiatedLimits, PROTOCOL_VERSION, RequestId, TransferId,
+    ActionKind, ActionOutcome, ActionRequest, AlgorithmVersions, BaselineAck, BaselineWorld,
+    ClaimedTarget, Handshake, Hash32, InputFrame, InputSeq, MotionSnapshot, NegotiatedLimits,
+    PROTOCOL_VERSION, ProgressionRequest, ProgressionResponse, RecentInput, RepairKey, RequestId,
+    TransferId, session_player_entity,
 };
 
+use crate::interactive::{InteractiveSession, InteractiveView};
+use crate::predict::{
+    BodyMotion, ClientBodyCollision, ClientPhysics, PlayerMovementSummary, PredictedPlayer,
+    WindowStats,
+};
 use crate::replica::{ApplyOutcome, ReplicaConfig, ReplicaWorld};
+use crate::residency::ClientResidencyPass;
+use crate::tick_accumulator::TickAccumulator;
+
+/// One leg of a scripted movement path: hold `input` from tick `from` up to (not
+/// including) tick `to`.
+#[derive(Debug, Clone, Copy)]
+pub struct MovementStep {
+    pub from_tick: u64,
+    pub to_tick: u64,
+    pub movement: [f32; 3],
+    pub view_dir: [f32; 3],
+    pub buttons: u32,
+}
+
+impl MovementStep {
+    fn input(&self) -> PlayerInput {
+        PlayerInput {
+            movement: self.movement,
+            view_dir: self.view_dir,
+            buttons: self.buttons,
+        }
+    }
+}
+
+/// The scripted input for an observed server tick: the last step whose window
+/// contains it, else neutral (so a silent tail after the script lets the
+/// server's 250 ms held-input timeout fire).
+fn scripted_input(script: &[MovementStep], tick: u64) -> PlayerInput {
+    script
+        .iter()
+        .rev()
+        .find(|s| tick >= s.from_tick && tick < s.to_tick)
+        .map(MovementStep::input)
+        .unwrap_or(PlayerInput::NEUTRAL)
+}
+
+/// The last tick any step covers — the client keeps predicting a little past it
+/// with neutral input to prove it comes to rest.
+fn script_end_tick(script: &[MovementStep]) -> u64 {
+    script.iter().map(|s| s.to_tick).max().unwrap_or(0)
+}
+
+/// Client prediction timestep — the fixed 60 Hz server tick.
+const MOVEMENT_DT_S: f32 = 1.0 / 60.0;
 
 /// `BaselineAck.transfer_id` a late-join replica sends to request a baseline
 /// (mirrors `spall_server::serve::BASELINE_REQUEST_SENTINEL`).
@@ -48,17 +102,49 @@ pub const T10_WORLD_ID: u128 = 0x5A11_0000_0000_7010;
 /// The T10 terrain volume id (`spall_sim` allocates volume 1 for terrain).
 pub const TERRAIN_VOLUME: u64 = 1;
 
+/// What a [`ScriptedAction`] aims at. `Terrain` uses the request verbatim;
+/// `DetachedBody` rewrites `claimed_target` to the sole live detached body at
+/// fire time (its entity id is not known when the script is built).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScriptTarget {
+    #[default]
+    Terrain,
+    DetachedBody,
+}
+
 /// One scripted tool use.
 #[derive(Debug, Clone)]
 pub struct ScriptedAction {
     /// Fire once the observed server tick is at least this.
     pub at_tick: u64,
     pub request: ActionRequest,
+    /// Retarget the request at the detached body before sending it.
+    pub target: ScriptTarget,
 }
 
 /// A `Cut` request with a sphere brush centred on `(cell_x, cell_y, cell_z)` in
 /// the terrain volume's local cell space.
 pub fn cut_request(
+    request_id: u64,
+    input_seq: u64,
+    cell: [i64; 3],
+    radius_cells: i64,
+) -> ActionRequest {
+    tool_request(
+        0,
+        ActionKind::Cut,
+        request_id,
+        input_seq,
+        cell,
+        radius_cells,
+    )
+}
+
+/// A request for a game-selected, server-approved tool. The server resolves
+/// the tool ID to its own operation and validates the aim and brush claims.
+pub fn tool_request(
+    tool: u16,
+    action: ActionKind,
     request_id: u64,
     input_seq: u64,
     cell: [i64; 3],
@@ -77,8 +163,8 @@ pub fn cut_request(
     ActionRequest {
         request_id: RequestId(request_id),
         input_seq: InputSeq(input_seq),
-        action: ActionKind::Cut,
-        tool: 0,
+        action,
+        tool,
         aim_origin_m: [0.0, 1.0, 0.0],
         aim_dir: [0.0, 0.0, 1.0],
         claimed_target: ClaimedTarget::Terrain,
@@ -86,18 +172,100 @@ pub fn cut_request(
     }
 }
 
+/// Which fixed baseline scene a live (non-late-join) replica installs. Must
+/// match the scene the server is running or the topology hashes never converge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BaselineScene {
+    /// [`spall_voxel::fixtures::bridge_scene`] — single brick.
+    #[default]
+    BridgeCut,
+    /// [`spall_voxel::fixtures::cross_brick_bridge_scene`] — column + beam cross
+    /// the `x = 32` brick boundary.
+    CrossBridgeCut,
+    /// [`spall_voxel::fixtures::checkerboard_split_scene`] — a fragmented block
+    /// whose detach overflows the inline `CellRun` budget (T17 / ENG-64).
+    CheckerboardSplit,
+    /// [`spall_voxel::fixtures::bulk_split_scene`] — a block whose detach
+    /// overflows even the inline op-blob cap (T17 increment 2 / ENG-64).
+    BulkSplit,
+    /// [`spall_voxel::fixtures::separated_regions_scene`] — two independent
+    /// collapsible structures in one bounded world (T23 / G3). Also the
+    /// terrain for the T23 / G4 `g4-workload` scene: the workload's debris
+    /// bodies are added to the server's `SimWorld` after construction, so a
+    /// live (non-late-join) replica's baseline is terrain-only — it never
+    /// carries the pre-existing bodies. See `docs/reports/G3.md`.
+    SeparatedRegions,
+    /// Full-envelope separated regions joined by a causeway (T23 / G3 row 2).
+    SeparatedRegionsFar,
+    /// [`spall_voxel::fixtures::walk_arena`] — the flat 30 m movement lane
+    /// (T19 / T23 row 8b). A stationary client on this scene installs it as a
+    /// fixed baseline; a mover pulls it over a transfer.
+    Walk,
+    /// [`spall_voxel::fixtures::g1_full_envelope_scene`] — the full G1 gate
+    /// envelope (T11a / ENG-62). Terrain-only: the "moving hollow test
+    /// volume" body is added to the server's `SimWorld` after construction,
+    /// same as `g4-workload`'s debris — a live replica's baseline never
+    /// carries it.
+    G1FullEnvelope,
+}
+
+impl BaselineScene {
+    /// Parses the harness `--scene` value; `None` for an unknown name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "bridge-cut" | "bridgecut" | "bridge" => Some(Self::BridgeCut),
+            "cross-bridge-cut" | "cross-brick-bridge" | "crossbridgecut" => {
+                Some(Self::CrossBridgeCut)
+            }
+            "checkerboard-split" | "oversized-split" => Some(Self::CheckerboardSplit),
+            "bulk-split" | "giant-split" => Some(Self::BulkSplit),
+            "separated-regions" | "t23-g3" | "g3" => Some(Self::SeparatedRegions),
+            "g4-workload" | "t23-g4" | "g4" => Some(Self::SeparatedRegions),
+            "separated-regions-far" | "t23-g3-full-envelope" | "g3-far" => {
+                Some(Self::SeparatedRegionsFar)
+            }
+            "walk" | "walk-arena" | "player-movement" => Some(Self::Walk),
+            "g1-full-envelope" | "g1-full-workload" | "g1" => Some(Self::G1FullEnvelope),
+            _ => None,
+        }
+    }
+
+    fn baseline(self, id: VolumeId) -> spall_voxel::Volume {
+        match self {
+            Self::BridgeCut => spall_voxel::fixtures::bridge_scene(id),
+            Self::CrossBridgeCut => spall_voxel::fixtures::cross_brick_bridge_scene(id),
+            Self::CheckerboardSplit => spall_voxel::fixtures::checkerboard_split_scene(id),
+            Self::BulkSplit => spall_voxel::fixtures::bulk_split_scene(id),
+            Self::SeparatedRegions => spall_voxel::fixtures::separated_regions_scene(id),
+            Self::SeparatedRegionsFar => {
+                spall_voxel::fixtures::separated_regions_full_envelope_scene(id)
+            }
+            Self::Walk => spall_voxel::fixtures::walk_arena(id),
+            Self::G1FullEnvelope => spall_voxel::fixtures::g1_full_envelope_scene(id),
+        }
+    }
+}
+
 /// Inputs to [`run_replication_client`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientNetConfig {
     /// Server (or UDP proxy) address to send packets to.
     pub connect_addr: SocketAddr,
     pub server_fingerprint: Fingerprint,
     pub join_token: JoinToken,
     pub script: Vec<ScriptedAction>,
+    /// T19: a scripted movement path for this client's player capsule. When
+    /// non-empty the client pulls a baseline (any scene), predicts capsule
+    /// movement locally, sends `InputFrame` datagrams, and reconciles against
+    /// the server's player snapshots.
+    pub movement_script: Vec<MovementStep>,
     /// T17: request a full late-join baseline over a bulk transfer instead of
     /// installing the fixed `bridge_scene`. The replica reaches the server's
     /// current topology hash with no edit replay from world creation.
     pub late_join: bool,
+    /// Fixed baseline a live replica installs (ignored when `late_join`). Must
+    /// match the server's `--scene`.
+    pub baseline_scene: BaselineScene,
     /// Stop once the observed server tick reaches this (0 = only stop on close).
     pub run_ticks: u64,
     /// Stop after this long with no new record once at least one has arrived.
@@ -107,9 +275,64 @@ pub struct ClientNetConfig {
     pub log_json: PathBuf,
     pub summary_json: Option<PathBuf>,
     pub transport: TransportConfig,
+    /// T23 / G3 row 7 slice E2: client-side terrain residency. `None` (the
+    /// default) keeps the replica fully resident — every prior run is
+    /// byte-unchanged. `Some` runs [`ClientResidencyPass`] in the mover loop:
+    /// it evicts terrain outside a brick box around the predicted player
+    /// capsule and pulls bricks back with `RepairRequest`s as the player
+    /// returns. Needs a `movement_script` (no mover, no pass).
+    pub client_residency: Option<ClientResidencyLimits>,
+    /// T11a / ENG-62 increment 3: called once, right after the replica's
+    /// initial baseline is installed (late-join) or the fixed scene is set
+    /// (a live client), with a shared handle to the live
+    /// [`crate::replica::ReplicaWorld`]. Lets a caller (e.g. a graphical
+    /// capture harness) poll the replica's real, network-replicated state on
+    /// its own schedule — independent of this client's own script/receive
+    /// loop — instead of driving an authoritative [`spall_sim::Simulation`]
+    /// directly. `None` (the default) changes nothing about the client's
+    /// behaviour.
+    pub on_replica_ready: Option<ReplicaReadyHook>,
+    /// Interactive follow-up (T19): live keyboard/mouse-driven input instead
+    /// of `movement_script` — set by `spall_client::window::run_interactive_window`,
+    /// not normally constructed directly. Implies a baseline pull and a
+    /// predicted player exactly like a non-empty `movement_script`, but reads
+    /// `InteractiveSession::input` every mover tick instead of the scripted
+    /// table, publishes the predicted pose into `InteractiveSession::view`,
+    /// and never auto-stops on a script end tick. `None` (every existing
+    /// scripted/headless run) is byte-for-byte unchanged.
+    pub interactive: Option<Arc<InteractiveSession>>,
+    /// **Testing only.** Makes the local player and detached bodies authoritative
+    /// for runtime physics. Server motion still arrives as a shadow simulation,
+    /// but does not correct player/body poses; replicated topology remains the
+    /// source of voxel shapes. `false` leaves normal behavior unchanged.
+    pub client_authoritative: bool,
+}
+
+/// A shared handle to the live replica, and a callback invoked with it — see
+/// [`ClientNetConfig::on_replica_ready`].
+pub type ReplicaReadyHook = Arc<dyn Fn(Arc<Mutex<ReplicaWorld>>) + Send + Sync>;
+
+/// Client terrain-residency limits (slice E2).
+#[derive(Debug, Clone, Copy)]
+pub struct ClientResidencyLimits {
+    /// Resident-terrain-brick ceiling; the pass never forces it below the
+    /// interest box (eviction is unconditional by box), but an
+    /// interest-driven reload back into the box is deferred rather than
+    /// admitted once this would be exceeded (T23 / G3 row 7 increment 14).
+    pub budget_bricks: usize,
+    /// Chebyshev brick radius kept resident around the predicted player.
+    pub interest_radius_bricks: i64,
+    /// T23 / G3 row 7 increment 14: hard ceiling on resident terrain dense
+    /// bytes, enforced the same way as `budget_bricks` — mirrors the server's
+    /// `ResidencyLimits::max_dense_bytes` (increment 13) for this single
+    /// predicted player's terrain. `u64::MAX` disables the cap while still
+    /// enforcing `budget_bricks` — the historical default.
+    pub max_dense_bytes: u64,
 }
 
 /// Machine-readable result of a client run.
+///
+/// v5 adds authoritative progression request responses.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientSummary {
     pub version: u32,
@@ -119,7 +342,12 @@ pub struct ClientSummary {
     pub repair_requests_sent: u64,
     pub transactions_rejected: u64,
     pub motion_snapshots: u64,
+    /// Motion datagrams delivered out of `snapshot_seq` order — non-zero only
+    /// when the transport (a lossy/jittered proxy) actually reordered them.
+    pub motion_snapshots_out_of_order: u64,
     pub actions_sent: u64,
+    /// Authoritative progression replies received on the control stream.
+    pub progression_responses: Vec<ProgressionResponse>,
     pub last_server_tick: u64,
     pub final_world_hash: String,
     pub total_solid_cells: u64,
@@ -130,6 +358,83 @@ pub struct ClientSummary {
     pub baseline_bricks: u64,
     /// T17: hash-repair baseline patches applied mid-session.
     pub repairs_applied: u64,
+    /// Farthest a replicated body moved from its first observed pose, metres.
+    /// A body that only ever reported a stationary snapshot reads `0.0`.
+    pub max_body_displacement_m: f64,
+    /// A `DetachedBody`-targeted scripted cut was sent and the body it named
+    /// lost solid cells afterwards (the body cut committed).
+    pub body_cut_committed: bool,
+    /// T19: prediction / reconciliation result for a scripted player, if this
+    /// client ran a `movement_script`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub movement: Option<PlayerMovementSummary>,
+    /// Per-reconcile / per-input-change timeline of a scripted player, for
+    /// diagnosing prediction lead and stop/reverse behaviour. Bounded; empty
+    /// unless this client ran a `movement_script`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub movement_trace: Option<MovementTrace>,
+    /// T23 / G3 row 7 slice E2: terrain bricks this client evicted around its
+    /// predicted player, and reload `RepairRequest`s it sent as the player
+    /// returned. Both `0` unless `client_residency` was set.
+    #[serde(default)]
+    pub client_residency_evictions: u64,
+    #[serde(default)]
+    pub client_residency_reloads_requested: u64,
+    #[serde(default)]
+    pub client_residency_reloads_completed: u64,
+    #[serde(default)]
+    pub client_residency_budget_miss_steps: u64,
+    /// T23 / G3 row 7 increment 14: desired (box-driven) reload requests
+    /// skipped because admitting them would have exceeded the brick or
+    /// dense-byte cap. `0` unless `client_residency` is set with a cap tight
+    /// enough to bind.
+    #[serde(default)]
+    pub client_residency_admission_deferred_total: u64,
+    /// Transactions that first gapped on a brick this client had evicted.
+    #[serde(default)]
+    pub client_residency_evicted_transaction_gaps: u64,
+    /// T23 / G3 row 11 join budget: compressed bytes of the installed
+    /// late-join / full-baseline transfer (`BaselineBegin.total_bytes`, the
+    /// same bytes shipped on the wire). `0` unless a baseline was pulled.
+    #[serde(default)]
+    pub late_join_baseline_compressed_bytes: u64,
+    /// Wall-clock milliseconds from connect (start of the QUIC handshake) to
+    /// the baseline being received, decompressed, decoded, verified, and
+    /// installed. `0` unless a baseline was pulled.
+    #[serde(default)]
+    pub late_join_baseline_install_ms: u64,
+    /// Wall-clock milliseconds from connect to "ready": baseline installed
+    /// and, if it carried any bodies, the first post-baseline motion keyframe
+    /// observed (`docs/protocol.md` late-join step 4 — the catch-up queue has
+    /// drained and the client is promoted to live replication). `0` unless a
+    /// baseline was pulled.
+    #[serde(default)]
+    pub late_join_ready_ms: u64,
+    /// Whether `late_join_ready_ms` reflects an actually-observed motion
+    /// keyframe (`true`) rather than a bounded wait that timed out without
+    /// one (`false`). Always `true` when the baseline carried no bodies, and
+    /// meaningless (`false`) when no baseline was pulled.
+    #[serde(default)]
+    pub late_join_ready_confirmed: bool,
+    /// A mid-session `BaselineBegin` (hash-repair patch or split-bulk
+    /// transfer) whose body failed to arrive intact — dropped rather than
+    /// treated as fatal (see the control reader). Non-zero under loss is
+    /// expected; what matters is that reloads still complete (see
+    /// `client_residency_reloads_completed`) despite it.
+    #[serde(default)]
+    pub baseline_transfer_failures: u64,
+    /// A sent `ActionRequest` the server declined to admit or stage
+    /// (`ActionOutcome::Rejected`) — the scripted-action retrier only retries
+    /// a `"throttled"` reason, so anything else is a lost scripted action.
+    /// `0` unless the server actually rejected one.
+    #[serde(default)]
+    pub action_requests_rejected: u64,
+    /// The distinct `ActionOutcome::Rejected` reasons observed, most recent
+    /// last (bounded — see `Counters::action_reject_reasons`). Diagnostic:
+    /// tells you *why* `action_requests_rejected` is non-zero without a
+    /// separate server-side log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub action_reject_reasons: Vec<String>,
 }
 
 /// Anything that stops a client run before it can report.
@@ -149,17 +454,62 @@ pub enum ClientNetError {
 
 /// Connects, replicates, scripts, and reports. Builds its own Tokio runtime.
 pub fn run_replication_client(config: ClientNetConfig) -> Result<ClientSummary, ClientNetError> {
+    run_replication_client_with_manifest(config, spall_sim::fixtures::stone_manifest())
+}
+
+/// Connects using the provided game's material manifest for handshake
+/// compatibility. The client never grants authority by supplying this data.
+pub fn run_replication_client_with_manifest(
+    config: ClientNetConfig,
+    materials: spall_core::MaterialManifest,
+) -> Result<ClientSummary, ClientNetError> {
+    run_replication_client_with_game_content(config, materials, None)
+}
+
+/// Connects using material and optional game-asset manifests for handshake compatibility.
+pub fn run_replication_client_with_game_content(
+    config: ClientNetConfig,
+    materials: spall_core::MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+) -> Result<ClientSummary, ClientNetError> {
+    run_replication_client_with_progression(config, materials, asset_manifest_hash, Vec::new())
+}
+
+/// Connects with optional asset compatibility and sends authenticated game
+/// progression requests over the reliable control stream.
+pub fn run_replication_client_with_progression(
+    config: ClientNetConfig,
+    materials: spall_core::MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+    progression_requests: Vec<ProgressionRequest>,
+) -> Result<ClientSummary, ClientNetError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| ClientNetError::Runtime(e.to_string()))?;
-    runtime.block_on(run_async(config))
+    runtime.block_on(run_async(
+        config,
+        materials,
+        asset_manifest_hash,
+        progression_requests,
+    ))
 }
 
-fn client_handshake() -> Handshake {
+fn client_handshake(
+    materials: &spall_core::MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+) -> Handshake {
     Handshake {
         protocol_version: PROTOCOL_VERSION,
-        content_manifest_hash: Hash32::of(T10_CONTENT_TAG),
+        content_manifest_hash: asset_manifest_hash.map_or_else(
+            || spall_protocol::content_manifest_hash(materials),
+            |hash| {
+                spall_protocol::content_manifest_hash_with_assets(
+                    materials,
+                    spall_protocol::Hash32(hash),
+                )
+            },
+        ),
         world_id: spall_core::WorldId::from_u128(T10_WORLD_ID),
         generator_version: 1,
         algorithms: AlgorithmVersions {
@@ -181,25 +531,353 @@ struct Counters {
     repairs: AtomicU64,
     rejected: AtomicU64,
     motion: AtomicU64,
+    /// Motion datagrams that arrived carrying a `snapshot_seq` lower than one
+    /// already delivered — proof the transport reordered snapshot datagrams
+    /// (the server assigns a strictly increasing per-publisher `snapshot_seq`).
+    motion_reordered: AtomicU64,
+    /// Highest `snapshot_seq` observed so far, for the reorder check above.
+    motion_seq_hwm: AtomicU64,
     actions: AtomicU64,
     last_tick: AtomicU64,
     /// Hash-repair baseline patches applied mid-session (T17).
     patches: AtomicU64,
+    /// Giant bulk-split `BaselineWorld`s received and applied mid-session
+    /// (T17 increment 2).
+    bulk_splits: AtomicU64,
     /// Resident bricks in the installed late-join baseline (T17).
     baseline_bricks: AtomicU64,
+    /// Entity id (+1, so `0` means "never fired") a `DetachedBody` scripted cut
+    /// was aimed at, and that body's solid-cell count captured just before the
+    /// cut was sent. Together they let the run confirm the body cut committed.
+    body_cut_entity_plus1: AtomicU64,
+    body_cut_pre_cells: AtomicU64,
+    /// T23 / G3 row 7 slice E2: terrain bricks this replica evicted around the
+    /// predicted player, and `RepairRequest`s it sent to pull evicted bricks
+    /// back as the player returned. Both `0` unless `client_residency` is set.
+    residency_evictions: AtomicU64,
+    residency_reloads_requested: AtomicU64,
+    residency_reloads_completed: AtomicU64,
+    residency_budget_miss_steps: AtomicU64,
+    /// T23 / G3 row 7 increment 14: see
+    /// `ClientSummary::client_residency_admission_deferred_total`.
+    residency_admission_deferred: AtomicU64,
+    residency_evicted_transaction_gaps: AtomicU64,
+    /// T23 / G3 row 11: compressed bytes of the installed late-join baseline
+    /// transfer (`BaselineBegin.total_bytes`, the same bytes shipped on the
+    /// wire) and wall-clock milliseconds from connect to baseline-installed /
+    /// to "ready". All `0` unless `late_join` is set.
+    late_join_baseline_compressed_bytes: AtomicU64,
+    late_join_baseline_install_ms: AtomicU64,
+    late_join_ready_ms: AtomicU64,
+    /// `1` once the installed baseline is confirmed caught up: either it
+    /// carried no bodies (nothing to wait for) or the first post-baseline
+    /// motion keyframe (`docs/protocol.md` late-join step 4) was actually
+    /// observed rather than the bounded wait timing out.
+    late_join_ready_confirmed: AtomicU64,
+    /// `1` when the installed baseline carries at least one body volume, so
+    /// "ready" waits for a motion keyframe before it is declared.
+    late_join_has_bodies: AtomicU64,
+    /// A sent `ActionRequest` that came back `ActionOutcome::Rejected` for any
+    /// reason (the retrier only resends a `"throttled"` one).
+    action_rejected: AtomicU64,
+    /// Bounded log of `action_rejected` reasons, most recent last (see
+    /// `MAX_RECORDED_ACTION_REJECT_REASONS`). Diagnostic only — never read to
+    /// drive behavior.
+    action_reject_reasons: std::sync::Mutex<Vec<String>>,
+    /// A `BaselineBegin` (a mid-session hash-repair patch, or split-bulk
+    /// transfer) whose body failed to arrive intact — the bulk stream, the
+    /// decode, or the `BaselineEnd` hash check. Under loss this is expected
+    /// occasionally; the requester (residency pass or gapped-transaction
+    /// retry) already re-requests on its own schedule, so this is dropped and
+    /// counted rather than treated as fatal.
+    baseline_transfer_failures: AtomicU64,
+    /// T23 / G3 row 10: the `Bye` reason the control reader saw when its
+    /// record loop ended, if the peer said goodbye rather than the stream
+    /// just closing. Set at most once (the control reader breaks right
+    /// after). `Some(Connection::BYE_REASON_CATCH_UP_EXHAUSTED)` is a
+    /// server-initiated bounded give-up on this join, not an ordinary end of
+    /// session -- the summary must not report "passed" on the strength of a
+    /// baseline installed before that happened.
+    disconnect_reason: std::sync::Mutex<Option<String>>,
+}
+
+/// Cap on `Counters::action_reject_reasons` — a diagnostic log, not something
+/// that should grow unbounded if a script somehow floods rejections.
+const MAX_RECORDED_ACTION_REJECT_REASONS: usize = 8;
+
+/// The `CharacterState` carried by a player [`MotionSnapshot`]. Orientation is
+/// discarded (players walk upright); `grounded` / `jump_held_last` are not on
+/// the wire and the next reconcile / step re-derives them.
+fn state_from_snapshot(snap: &MotionSnapshot) -> CharacterState {
+    CharacterState {
+        position_m: snap.pose.translation_m,
+        velocity_m_s: snap.linear_velocity,
+        grounded: snap.linear_velocity[1].abs() < 0.6,
+        jump_held_last: false,
+    }
+}
+
+/// Most rows kept per trace list.
+const MAX_TRACE_ROWS: usize = 16_384;
+
+/// One reconcile against an authoritative snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconcileTraceRow {
+    pub wall_ms: u64,
+    pub server_tick: u64,
+    /// Highest input sequence the server had accepted at that snapshot.
+    pub acked_input: u64,
+    /// Predicted ticks the snapshot's tick had not yet covered (the lead, and
+    /// the number of steps replayed).
+    pub lead_ticks: usize,
+    /// The controller's target for `lead_ticks`, and its timeline rate.
+    pub target_lead_ticks: f64,
+    pub timeline_rate: f64,
+    pub grounded: bool,
+    pub authoritative_pos_m: [f64; 3],
+    pub authoritative_vel_m_s: [f32; 3],
+    pub predicted_before_pos_m: [f64; 3],
+    pub predicted_after_pos_m: [f64; 3],
+    /// Distance the predicted position moved because of this reconcile, and the
+    /// horizontal component of that move along the last commanded direction
+    /// (negative = the correction pulled the player backwards).
+    pub shift_m: f64,
+    pub shift_along_input_m: f64,
+    /// Input being sent when this reconcile ran.
+    pub current_movement: [f32; 3],
+}
+
+/// One change of the sampled movement input.
+#[derive(Debug, Clone, Serialize)]
+pub struct InputTraceRow {
+    pub wall_ms: u64,
+    pub input_seq: u64,
+    pub movement: [f32; 3],
+    pub server_tick_seen: u64,
+    pub predicted_pos_m: [f64; 3],
+}
+
+/// One box as seen at a predicted tick, in the three places it exists on the
+/// client: the pose prediction collides with, the pose drawn, and the newest
+/// authoritative snapshot it came from.
+#[derive(Debug, Clone, Serialize)]
+pub struct BodyTick {
+    pub entity: u64,
+    /// The mirrored pose the character sweep for this tick collided with.
+    pub collision_pos_m: [f64; 3],
+    /// The pose the renderer would draw at this instant.
+    pub displayed_pos_m: [f64; 3],
+    /// Newest snapshot's tick and pose (the authoritative box).
+    pub snapshot_tick: u64,
+    pub snapshot_pos_m: [f64; 3],
+    pub snapshot_vel_m_s: [f32; 3],
+}
+
+/// One predicted tick, recorded by the mover right after the local step.
+#[derive(Debug, Clone, Serialize)]
+pub struct TickTraceRow {
+    pub wall_ms: u64,
+    /// The tick the step just simulated.
+    pub tick: u64,
+    pub predicted_pos_m: [f64; 3],
+    pub predicted_vel_m_s: [f32; 3],
+    pub grounded: bool,
+    pub movement: [f32; 3],
+    pub bodies: Vec<BodyTick>,
+}
+
+/// A body's mirrored pose jumping when a fresh snapshot replaces the
+/// extrapolation it was following.
+#[derive(Debug, Clone, Serialize)]
+pub struct BodyJumpRow {
+    pub wall_ms: u64,
+    pub entity: u64,
+    pub snapshot_tick: u64,
+    /// Distance between where the previous snapshot's constant-velocity
+    /// extrapolation put the body at `snapshot_tick` and where the new
+    /// snapshot says it is.
+    pub extrapolation_error_m: f64,
+    pub speed_m_s: f32,
+}
+
+/// The recorded timeline of one scripted run.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MovementTrace {
+    pub reconciles: Vec<ReconcileTraceRow>,
+    pub input_changes: Vec<InputTraceRow>,
+    pub ticks: Vec<TickTraceRow>,
+    pub body_jumps: Vec<BodyJumpRow>,
+}
+
+/// T19 predicted-player state shared by the mover and motion tasks. The mover
+/// owns terrain rebuilds and prediction ticks; the motion task only reconciles.
+struct Predictor {
+    entity: EntityId,
+    params: CharacterParams,
+    phys: ClientPhysics,
+    player: Option<PredictedPlayer>,
+    terrain_hash: Option<Hash32>,
+    input_seq: u64,
+    recent: std::collections::VecDeque<RecentInput>,
+    /// The server tick observed on the *first* authoritative snapshot for this
+    /// player (when `player` is first created). Movement-script windows are
+    /// authored relative to "ticks since this client's player went live", not
+    /// the server's absolute tick — under a fast/clean join the two coincide,
+    /// but an impaired transport can stretch the join handshake (baseline
+    /// transfer, its confirming ack, and the resulting keyframe snapshot — each
+    /// its own round trip) well past the tick the script expects to start at.
+    /// Anchoring on this snapshot rather than on when the baseline *transfer*
+    /// finished is what actually matters: the player has no authoritative state
+    /// (and the mover sends nothing) until it arrives, so it is the true
+    /// "tick zero" for the script.
+    script_origin_tick: Option<u64>,
+    /// Testing-only client authority: the terrain the fixed-rate physics
+    /// thread ticks the local player against, so the player's push impulses
+    /// land in the same step as the body integration (see that thread).
+    local_terrain: Option<spall_voxel::Volume>,
+    /// Steers the prediction timeline's rate so its lead over the server stays
+    /// bounded (see [`crate::tick_accumulator::LeadController`]).
+    lead: crate::tick_accumulator::LeadController,
+    /// Every replicated body's newest motion (geometry stripped), as of the
+    /// mover's last pass; what a reconcile replays against.
+    bodies_motion: Vec<ClientBodyCollision>,
+    /// Recorded only for scripted movement (`Some`).
+    trace: Option<MovementTrace>,
+    trace_started: std::time::Instant,
+    last_traced_movement: Option<[f32; 3]>,
+    current_movement: [f32; 3],
+}
+
+impl Predictor {
+    fn new(entity: EntityId, client_authoritative: bool) -> Self {
+        let mut phys = ClientPhysics::new();
+        phys.set_client_authoritative(client_authoritative);
+        Self {
+            entity,
+            params: CharacterParams::DEFAULT,
+            phys,
+            player: None,
+            terrain_hash: None,
+            input_seq: 0,
+            recent: std::collections::VecDeque::new(),
+            script_origin_tick: None,
+            local_terrain: None,
+            lead: crate::tick_accumulator::LeadController::default(),
+            bodies_motion: Vec::new(),
+            trace: None,
+            trace_started: std::time::Instant::now(),
+            last_traced_movement: None,
+            current_movement: [0.0; 3],
+        }
+    }
+
+    fn trace_reconcile(
+        &mut self,
+        outcome: &crate::predict::ReconcileOutcome,
+        authoritative: CharacterState,
+        acked: InputSeq,
+        now: std::time::Instant,
+    ) {
+        let Some(trace) = &mut self.trace else { return };
+        if trace.reconciles.len() >= MAX_TRACE_ROWS {
+            return;
+        }
+        let (before, after) = (outcome.predicted_before, outcome.predicted_after);
+        let d = [
+            after.position_m[0] - before.position_m[0],
+            after.position_m[2] - before.position_m[2],
+        ];
+        let m = self.current_movement;
+        let norm = f64::from(m[0]).hypot(f64::from(m[2]));
+        let along = if norm > 1e-6 {
+            (d[0] * f64::from(m[0]) + d[1] * f64::from(m[2])) / norm
+        } else {
+            0.0
+        };
+        trace.reconciles.push(ReconcileTraceRow {
+            wall_ms: now.duration_since(self.trace_started).as_millis() as u64,
+            server_tick: outcome.server_tick.0,
+            acked_input: acked.0,
+            lead_ticks: outcome.records_replayed,
+            target_lead_ticks: self.lead.target_lead_ticks(),
+            timeline_rate: self.lead.rate(),
+            grounded: authoritative.grounded,
+            authoritative_pos_m: authoritative.position_m,
+            authoritative_vel_m_s: authoritative.velocity_m_s,
+            predicted_before_pos_m: before.position_m,
+            predicted_after_pos_m: after.position_m,
+            shift_m: before.distance_m(&after),
+            shift_along_input_m: along,
+            current_movement: m,
+        });
+    }
+
+    fn trace_input(&mut self, seq: u64, movement: [f32; 3], server_tick: u64, pos: [f64; 3]) {
+        self.current_movement = movement;
+        let Some(trace) = &mut self.trace else { return };
+        if self.last_traced_movement == Some(movement)
+            || trace.input_changes.len() >= MAX_TRACE_ROWS
+        {
+            return;
+        }
+        self.last_traced_movement = Some(movement);
+        trace.input_changes.push(InputTraceRow {
+            wall_ms: self.trace_started.elapsed().as_millis() as u64,
+            input_seq: seq,
+            movement,
+            server_tick_seen: server_tick,
+            predicted_pos_m: pos,
+        });
+    }
+
+    /// Feeds a reconcile's lead and the transport's RTT estimate to the lead
+    /// controller. Application acknowledgement time is unsuitable here because
+    /// input may intentionally wait for its scheduled server tick.
+    fn observe_reconcile(&mut self, lead_ticks: usize, transport_rtt: Duration) {
+        self.lead.observe_rtt(transport_rtt);
+        self.lead.observe_lead(lead_ticks);
+    }
+}
+
+/// One mover tick's snapshot of `PredictedPlayer`'s correction counters,
+/// published into `InteractiveView` for the interactive HUD (see ENG-69's
+/// round-6/7 investigation into corrections firing even while standing
+/// still) — a named struct rather than growing `MoverTickOutcome`'s tuple
+/// past readability.
+#[derive(Debug, Clone, Copy, Default)]
+struct CorrectionStats {
+    corrections: u64,
+    max_correction_m: f64,
+    idle_corrections: u64,
+    max_idle_correction_m: f64,
+    max_vertical_correction_m: f64,
+    max_horizontal_correction_m: f64,
+    /// `PredictedPlayer::unmatched_reconciles` / `max_unmatched_displacement_m`
+    /// (ENG-69 round 21) — reconcile calls with no comparison at all, and
+    /// the largest actual position jump one of them produced. Surfaced
+    /// separately from `corrections` precisely so the HUD's "+N corrections"
+    /// line can never read as "nothing happened" when a large, uncounted
+    /// resync did.
+    unmatched_reconciles: u64,
+    max_unmatched_displacement_m: f64,
 }
 
 /// Receives one baseline transfer whose `BaselineBegin` has already been read:
 /// accepts the bulk stream, reassembles + decodes the payload, then consumes
 /// records until `BaselineEnd`. Returns the decoded world, or `None` on any
 /// transport / decode failure.
+///
+/// T23 / G4: the reassembled bytes are the server's zstd-compressed payload
+/// (`spall_server::baseline::transfer_from_world`), so this decompresses
+/// before decoding — `end.assembled_hash` below is still checked against the
+/// canonical **uncompressed** re-encoding, independent of the compressor.
 async fn receive_baseline_body(conn: &Connection) -> Option<BaselineWorld> {
     let parts = conn.accept_bulk().await.ok()?.collect_parts().await.ok()?;
     let mut bytes = Vec::new();
     for part in &parts {
         bytes.extend_from_slice(&part.payload);
     }
-    let world = BaselineWorld::decode(&bytes).ok()?;
+    let world = BaselineWorld::decode_compressed(&bytes).ok()?;
     // Drain until BaselineEnd (nothing else is interleaved for this client
     // while a transfer is in flight — the server writes it as one unit).
     loop {
@@ -216,11 +894,36 @@ async fn receive_baseline_body(conn: &Connection) -> Option<BaselineWorld> {
     }
 }
 
+/// Forwards one [`ApplyOutcome`] from the control reader: counts a publish,
+/// sends each `RepairRequest` of a `NeedsRepair`, counts a rejection. A
+/// `Duplicate` or an `AwaitingBulkSplit` hold needs nothing — the blob's
+/// `BaselineBegin` will retry it.
+async fn forward_outcome(conn: &Connection, counters: &Counters, outcome: ApplyOutcome) {
+    match outcome {
+        ApplyOutcome::Published { .. } => {
+            counters.applied.fetch_add(1, Ordering::Relaxed);
+        }
+        ApplyOutcome::NeedsRepair(reqs) => {
+            for req in reqs {
+                let _ = conn.send_record(WireRecord::RepairRequest(req)).await;
+                counters.repairs.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        ApplyOutcome::Rejected { .. } => {
+            counters.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        ApplyOutcome::Duplicate | ApplyOutcome::AwaitingBulkSplit { .. } => {}
+    }
+}
+
 /// The initial late-join handshake: ask for a baseline, install it, confirm it.
+/// `connect_at` is the wall-clock reference point ("late-join connect") the
+/// T23 / G3 row 11 join-budget timings are measured from.
 async fn perform_late_join(
     conn: &Connection,
     replica: &Mutex<ReplicaWorld>,
     counters: &Counters,
+    connect_at: std::time::Instant,
 ) -> Result<(), ClientNetError> {
     conn.send_record(WireRecord::BaselineAck(BaselineAck {
         transfer_id: BASELINE_REQUEST_SENTINEL,
@@ -235,10 +938,15 @@ async fn perform_late_join(
         match conn.recv_record().await {
             Ok(Some(WireRecord::BaselineBegin(b))) => break b,
             Ok(Some(_)) => continue,
-            Ok(None) | Err(_) => {
+            Ok(None) => {
                 return Err(ClientNetError::Baseline(
                     "connection closed before the baseline arrived".into(),
                 ));
+            }
+            Err(e) => {
+                return Err(ClientNetError::Baseline(format!(
+                    "connection closed before the baseline arrived: {e}"
+                )));
             }
         }
     };
@@ -247,6 +955,18 @@ async fn perform_late_join(
             "transfer failed to assemble / verify".into(),
         ));
     };
+    // T23 / G3 row 11: the wire bytes actually shipped (compressed) and the
+    // wall-clock cost of getting the baseline received + decompressed +
+    // decoded + verified, before the (comparatively cheap) local install.
+    counters
+        .late_join_baseline_compressed_bytes
+        .store(begin.total_bytes, Ordering::Relaxed);
+    counters
+        .late_join_baseline_install_ms
+        .store(connect_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+    counters
+        .late_join_has_bodies
+        .store(u64::from(world.volumes.len() > 1), Ordering::Relaxed);
 
     {
         let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
@@ -271,7 +991,17 @@ async fn perform_late_join(
     Ok(())
 }
 
-async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetError> {
+async fn run_async(
+    config: ClientNetConfig,
+    materials: spall_core::MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+    progression_requests: Vec<ProgressionRequest>,
+) -> Result<ClientSummary, ClientNetError> {
+    // T23 / G3 row 11: the join-budget wall-clock reference point ("late-join
+    // connect"). Deliberately taken before the QUIC handshake — under the
+    // imposed network profile that handshake is itself part of the cost a
+    // late-joining player actually experiences.
+    let session_start = std::time::Instant::now();
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -283,7 +1013,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         config.connect_addr,
         config.server_fingerprint,
         config.join_token,
-        client_handshake(),
+        client_handshake(&materials, asset_manifest_hash),
         config.transport,
     )
     .await
@@ -303,27 +1033,64 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         ProcessRole::Client,
         Some(format!("session={}", conn.session())),
     ))?;
+    for request in progression_requests {
+        conn.send_record(WireRecord::ProgressionRequest(request))
+            .await
+            .map_err(ClientNetError::Transport)?;
+    }
 
-    let replica = Arc::new(Mutex::new(if config.late_join {
+    // T23 / G3 row 11: start the heartbeat/idle-watchdog task now, before any
+    // late-join wait -- not after one. `perform_late_join` below can
+    // legitimately block for tens of seconds (a dependency-complete baseline
+    // capture under real server-side CPU contention); until this task exists,
+    // nothing on this connection ever sends the peer an application
+    // `Heartbeat`, so the *server's* `since_last_control_seen` watchdog sees a
+    // silent connection and — correctly, given what it can observe — closes it
+    // as idle once a slow capture crosses `idle_timeout`. Spawning `run_liveness`
+    // immediately after the connection is authenticated keeps heartbeats
+    // flowing through the whole session, late-join wait included.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let liveness = tokio::spawn(conn.clone().run_liveness(stop_rx.clone()));
+
+    // A movement client pulls a baseline like a late joiner so it works with any
+    // scene the server runs (T19 uses the `walk` arena). An interactive
+    // client always predicts a player too, exactly like a non-empty
+    // `movement_script`.
+    let want_baseline =
+        config.late_join || !config.movement_script.is_empty() || config.interactive.is_some();
+
+    let replica = Arc::new(Mutex::new(if want_baseline {
         ReplicaWorld::empty(ReplicaConfig::default())
     } else {
         ReplicaWorld::from_baseline(
-            spall_voxel::fixtures::bridge_scene(VolumeId::new(TERRAIN_VOLUME).unwrap()),
+            config
+                .baseline_scene
+                .baseline(VolumeId::new(TERRAIN_VOLUME).unwrap()),
             ReplicaConfig::default(),
         )
     }));
     let counters = Arc::new(Counters::default());
+    let progression_responses = Arc::new(Mutex::new(Vec::new()));
+
+    // The window reads live terrain straight off the replica for its debug
+    // draw; publish the handle once, up front, rather than threading it
+    // through every later closure.
+    if let Some(session) = &config.interactive {
+        let _ = session.replica.set(replica.clone());
+    }
 
     // T17: pull a full baseline over a bulk transfer before touching the
     // replication stream, so the replica starts at the server's current
     // topology with no edit replay from world creation.
-    if config.late_join {
-        if let Err(e) = perform_late_join(&conn, &replica, &counters).await {
+    if want_baseline {
+        if let Err(e) = perform_late_join(&conn, &replica, &counters, session_start).await {
             log.write(&ProcessRecord::new(
                 ProcessEvent::Failed,
                 ProcessRole::Client,
                 Some(format!("late join failed: {e}")),
             ))?;
+            let _ = stop_tx.send(true);
+            liveness.abort();
             let _ = conn.say_bye("late join failed").await;
             conn.close("late join failed");
             return Err(e);
@@ -338,15 +1105,42 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         ))?;
     }
 
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    // T11a / ENG-62 increment 3: hand the caller the live replica now that its
+    // initial state is installed. The hook runs synchronously on this task but
+    // must not block — it is expected to spawn its own thread/task and return.
+    if let Some(hook) = &config.on_replica_ready {
+        hook(replica.clone());
+    }
 
-    let liveness = tokio::spawn(conn.clone().run_liveness(stop_rx.clone()));
+    // T19: a scripted-movement (or interactively-played) client predicts its
+    // own player capsule.
+    let predictor =
+        (!config.movement_script.is_empty() || config.interactive.is_some()).then(|| {
+            let mut predictor = Predictor::new(
+                session_player_entity(conn.session()),
+                config.client_authoritative,
+            );
+            if !config.movement_script.is_empty() {
+                predictor.trace = Some(MovementTrace::default());
+            }
+            Arc::new(Mutex::new(predictor))
+        });
+
+    // Bounded resend of `ActionRequest`s the server throttled (its per-tick
+    // admission quota was exceeded — an explicitly retryable rejection). The
+    // scripter records each request it sends; the control reader forwards
+    // throttled request ids here; the retrier re-sends, capped per request.
+    let sent_actions: Arc<Mutex<HashMap<u64, (WireRecord, u8)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (throttle_tx, mut throttle_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
 
     // Control reader: apply transactions, answer repair gaps.
     let control = {
         let conn = conn.clone();
         let replica = replica.clone();
         let counters = counters.clone();
+        let throttle_tx = throttle_tx.clone();
+        let progression_responses = progression_responses.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_record().await {
@@ -354,46 +1148,169 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         counters
                             .last_tick
                             .fetch_max(tx.server_tick.get(), Ordering::Relaxed);
-                        let outcome = {
+                        // ENG-49: a `Published` transaction can be the missing
+                        // predecessor another held transaction was gapped on, so
+                        // retry the pending set behind it. Every resulting
+                        // outcome is forwarded through one path.
+                        let mut outcomes = Vec::new();
+                        {
                             let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.apply_transaction(&tx)
-                        };
-                        match outcome {
-                            ApplyOutcome::Published { .. } => {
-                                counters.applied.fetch_add(1, Ordering::Relaxed);
+                            let primary = guard.apply_transaction(&tx);
+                            if let ApplyOutcome::NeedsRepair(reqs) = &primary
+                                && reqs.iter().any(|req| match req.key {
+                                    RepairKey::Brick { volume, coord } => {
+                                        guard.evicted(volume).contains(coord)
+                                    }
+                                    _ => false,
+                                })
+                            {
+                                counters
+                                    .residency_evicted_transaction_gaps
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
-                            ApplyOutcome::NeedsRepair(reqs) => {
-                                for req in reqs {
-                                    let _ = conn.send_record(WireRecord::RepairRequest(req)).await;
-                                    counters.repairs.fetch_add(1, Ordering::Relaxed);
+                            let publish = matches!(primary, ApplyOutcome::Published { .. });
+                            outcomes.push(primary);
+                            if publish {
+                                for (_, o) in guard.retry_pending_repair_txns() {
+                                    outcomes.push(o);
                                 }
                             }
-                            ApplyOutcome::Rejected { .. } => {
-                                counters.rejected.fetch_add(1, Ordering::Relaxed);
-                            }
-                            ApplyOutcome::Duplicate => {}
+                        }
+                        for outcome in outcomes {
+                            forward_outcome(&conn, &counters, outcome).await;
                         }
                     }
-                    Ok(Some(WireRecord::BaselineBegin(_))) => {
-                        // A mid-session hash-repair patch: one-brick baseline
-                        // transfer, merged into the live replica.
+                    Ok(Some(WireRecord::BaselineBegin(begin))) => {
+                        // T17 increment 2: a `transfer_id` with the reserved high
+                        // bit is a giant bulk split's `BaselineWorld` — hand it
+                        // to the replica and retry the marker transaction held on
+                        // it. Otherwise it is a mid-session hash-repair patch
+                        // (one-brick baseline), merged into the live replica,
+                        // after which every `before`-gapped held transaction is
+                        // retried (ENG-49).
+                        let is_split =
+                            begin.transfer_id.0 & spall_protocol::SPLIT_BULK_TRANSFER_ID_BIT != 0;
+                        // A `None` here is *this one transfer* failing to
+                        // arrive intact (the bulk stream, the decode, or the
+                        // `BaselineEnd` hash check) — expected occasionally
+                        // under loss, and not fatal to the connection: the
+                        // requester (the residency pass's cooldown, or a
+                        // gapped transaction's own retry) re-requests on its
+                        // own schedule regardless. Tearing down the whole
+                        // control-record loop over one failed transfer used
+                        // to leave every *later* repair response unread too
+                        // — including ones for a request sent well after
+                        // this failure — turning one dropped patch into a
+                        // permanently stuck reload.
                         match receive_baseline_body(&conn).await {
-                            Some(patch) => {
-                                let applied = {
+                            Some(world) if is_split => {
+                                let retried = {
                                     let mut guard =
                                         replica.lock().unwrap_or_else(|e| e.into_inner());
-                                    guard.apply_baseline_patch(&patch).is_ok()
+                                    guard.provide_bulk_split_world(begin.transfer_id.0, world)
+                                };
+                                counters.bulk_splits.fetch_add(1, Ordering::Relaxed);
+                                for (_, outcome) in retried {
+                                    forward_outcome(&conn, &counters, outcome).await;
+                                }
+                            }
+                            Some(patch) => {
+                                let (applied, retried) = {
+                                    let mut guard =
+                                        replica.lock().unwrap_or_else(|e| e.into_inner());
+                                    if guard.apply_baseline_patch(&patch).is_ok() {
+                                        (true, guard.retry_pending_repair_txns())
+                                    } else {
+                                        (false, Vec::new())
+                                    }
                                 };
                                 if applied {
                                     counters.patches.fetch_add(1, Ordering::Relaxed);
                                 }
+                                for (_, outcome) in retried {
+                                    forward_outcome(&conn, &counters, outcome).await;
+                                }
                             }
-                            None => break,
+                            None => {
+                                counters
+                                    .baseline_transfer_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
-                    Ok(Some(WireRecord::ActionStatus(_))) => {}
+                    Ok(Some(WireRecord::ActionStatus(st))) => {
+                        if let ActionOutcome::Rejected { reason } = &st.outcome {
+                            if reason.starts_with("throttled") {
+                                let _ = throttle_tx.send(st.request_id.0);
+                            } else {
+                                // Anything other than "throttled" is not
+                                // retried (see the retrier below) — record it
+                                // so a lost scripted action is visible in the
+                                // summary instead of silently vanishing.
+                                counters.action_rejected.fetch_add(1, Ordering::Relaxed);
+                                let mut reasons = counters
+                                    .action_reject_reasons
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if reasons.len() >= MAX_RECORDED_ACTION_REJECT_REASONS {
+                                    reasons.remove(0);
+                                }
+                                reasons.push(reason.clone());
+                            }
+                        }
+                    }
+                    Ok(Some(WireRecord::ProgressionResponse(response))) => {
+                        progression_responses
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(response);
+                    }
                     Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => break,
+                    Ok(None) => {
+                        // T23 / G3 row 10: distinguish a peer `Bye` (which
+                        // carries a reason) from the stream simply closing --
+                        // a server-initiated catch-up-exhaustion give-up must
+                        // not be read as an ordinary end of session.
+                        if let Some(reason) = conn.bye_reason() {
+                            *counters
+                                .disconnect_reason
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(reason);
+                        }
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
+    // Retrier: re-send a throttled `ActionRequest` after a short back-off, at
+    // most a few times per request, so a scripted gate action still lands under
+    // an impaired transport that bunches retransmits into one server tick.
+    let retrier = {
+        let conn = conn.clone();
+        let sent_actions = sent_actions.clone();
+        let stop_rx = stop_rx.clone();
+        tokio::spawn(async move {
+            const MAX_ACTION_RETRIES: u8 = 4;
+            while let Some(id) = throttle_rx.recv().await {
+                if *stop_rx.borrow() {
+                    break;
+                }
+                let record = {
+                    let mut g = sent_actions.lock().unwrap_or_else(|e| e.into_inner());
+                    match g.get_mut(&id) {
+                        Some((rec, tries)) if *tries < MAX_ACTION_RETRIES => {
+                            *tries += 1;
+                            Some(rec.clone())
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(rec) = record {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    let _ = conn.send_record(rec).await;
                 }
             }
         })
@@ -404,6 +1321,9 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         let conn = conn.clone();
         let replica = replica.clone();
         let counters = counters.clone();
+        let predictor = predictor.clone();
+        let interactive = config.interactive.clone();
+        let client_authoritative = config.client_authoritative;
         tokio::spawn(async move {
             loop {
                 match conn.recv_datagram().await {
@@ -411,6 +1331,86 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         counters
                             .last_tick
                             .fetch_max(snap.server_tick.get(), Ordering::Relaxed);
+                        // T19: a snapshot for our own player entity reconciles
+                        // the predictor rather than entering the body replica.
+                        if let Some(pred) = &predictor {
+                            // Locked (and dropped) before `pred`'s own lock below,
+                            // matching the mover loop's lock ordering
+                            // (`replica` then `pred`) to avoid a cross-task
+                            // deadlock risk.
+                            let terrain_volume = {
+                                let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                                guard.terrain_volume().cloned()
+                            };
+                            let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
+                            let p: &mut Predictor = &mut guard;
+                            if snap.body == p.entity {
+                                let st = state_from_snapshot(&snap);
+                                match &mut p.player {
+                                    None => {
+                                        let mut player =
+                                            PredictedPlayer::new(p.params, st, snap.server_tick);
+                                        player.client_authoritative = client_authoritative;
+                                        p.player = Some(player);
+                                        p.script_origin_tick.get_or_insert(snap.server_tick.get());
+                                    }
+                                    // The live HUD path only needs `PredictedPlayer`'s own
+                                    // running counters, read separately below; the returned
+                                    // per-event `CorrectionEvent` instead goes to
+                                    // `CorrectionLog` (ENG-69 round 10/11 — see its own doc)
+                                    // when this is an interactive session, for post-hoc
+                                    // analysis of a real hands-on run.
+                                    //
+                                    // `terrain_volume` is `None` only before the replica
+                                    // has any terrain object at all — skipping
+                                    // reconciliation this one time is the same as any
+                                    // other not-ready tick, not a hard failure.
+                                    Some(pl) => {
+                                        if !client_authoritative
+                                            && let Some(volume) = &terrain_volume
+                                        {
+                                            let outcome = pl.reconcile_with_bodies(
+                                                &mut p.phys,
+                                                volume,
+                                                st,
+                                                snap.acked_input,
+                                                snap.server_tick,
+                                                Some(&p.bodies_motion),
+                                            );
+                                            // Logged unconditionally, not only
+                                            // when `outcome.comparison` is
+                                            // `Some` (ENG-69 round 21): a
+                                            // silent full resync — every
+                                            // record dropped, no comparison
+                                            // possible — is exactly the case
+                                            // that must never read as "zero
+                                            // corrections".
+                                            let now = std::time::Instant::now();
+                                            p.observe_reconcile(
+                                                outcome.records_replayed,
+                                                conn.rtt(),
+                                            );
+                                            p.trace_reconcile(&outcome, st, snap.acked_input, now);
+                                            if let Some(session) = &interactive
+                                                && let Some(log) = &session.corrections
+                                            {
+                                                log.record(&outcome);
+                                            }
+                                        }
+                                    }
+                                }
+                                counters.motion.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+
+                        // A strictly-decreasing per-publisher `snapshot_seq`
+                        // means this datagram overtook a newer one in transit.
+                        let seq = snap.snapshot_seq.0;
+                        let prev_hwm = counters.motion_seq_hwm.fetch_max(seq, Ordering::Relaxed);
+                        if seq < prev_hwm {
+                            counters.motion_reordered.fetch_add(1, Ordering::Relaxed);
+                        }
                         let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
                         guard.ingest_snapshot(&snap);
                         drop(guard);
@@ -423,6 +1423,571 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         })
     };
 
+    // T23 / G3 row 11: for a late joiner, wait (bounded) for the "ready"
+    // signal `docs/protocol.md` late-join step 4 describes — the current
+    // motion keyframe the server sends once the catch-up queue has drained
+    // and the client is promoted to live replication. A baseline with no
+    // bodies has nothing to wait for and is ready immediately. This bounds
+    // the extra wait at a few RTTs even under the imposed loss/latency
+    // profile (a dropped keyframe is followed by the next 20 Hz batch).
+    if config.late_join {
+        let expects_motion = counters.late_join_has_bodies.load(Ordering::Relaxed) != 0;
+        let mut confirmed = !expects_motion;
+        if expects_motion {
+            const READY_POLL: Duration = Duration::from_millis(10);
+            const READY_TIMEOUT: Duration = Duration::from_secs(5);
+            let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+            loop {
+                if counters.motion.load(Ordering::Relaxed) > 0 {
+                    confirmed = true;
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline || *stop_rx.borrow() {
+                    break;
+                }
+                tokio::time::sleep(READY_POLL).await;
+            }
+        }
+        counters.late_join_ready_ms.store(
+            session_start.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        counters
+            .late_join_ready_confirmed
+            .store(u64::from(confirmed), Ordering::Relaxed);
+    }
+
+    // T19 mover: every ~16 ms sample the scripted input for the observed tick,
+    // predict the capsule locally, and send an `InputFrame` datagram with up to
+    // three recent copies for loss recovery. It also rebuilds the predicted
+    // terrain collider (and rebases prediction) when the replica terrain hash
+    // changes — a committed edit near the player.
+    //
+    // Testing-only client authority: rigid-body physics runs on its own
+    // fixed-rate thread instead of inside the mover loop below. That loop's
+    // per-iteration cost (terrain/body clones, a coarse sleep) is neither
+    // constant nor small, so stepping there made bodies advance in bursts and
+    // fall behind wall-clock time. The thread publishes two consecutive states
+    // per step so the renderer can interpolate at display rate.
+    if config.client_authoritative
+        && let (Some(pred), Some(session)) = (predictor.clone(), config.interactive.clone())
+    {
+        let stop_rx = stop_rx.clone();
+        let _ = std::thread::Builder::new()
+            .name("spall-client-physics".into())
+            .spawn(move || {
+                use crate::interactive::LocalBodyPoses;
+                // Fail loudly: a panic here would otherwise leave the window
+                // running with every locally simulated body silently frozen.
+                struct ExitOnPanic;
+                impl Drop for ExitOnPanic {
+                    fn drop(&mut self) {
+                        if std::thread::panicking() {
+                            eprintln!("spall-client-physics panicked; exiting");
+                            std::process::exit(101);
+                        }
+                    }
+                }
+                let _exit_on_panic = ExitOnPanic;
+                let step = Duration::from_secs_f32(MOVEMENT_DT_S);
+                let mut next = std::time::Instant::now();
+                let mut prev = std::collections::BTreeMap::new();
+                loop {
+                    if *stop_rx.borrow() || session.stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let now = std::time::Instant::now();
+                    if now < next {
+                        std::thread::sleep((next - now).min(Duration::from_millis(1)));
+                        continue;
+                    }
+                    // Fixed-step catch-up; a long stall drops the backlog
+                    // rather than spiralling.
+                    if now.duration_since(next) > step * 8 {
+                        next = now;
+                    }
+                    next += step;
+                    let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
+                    if !guard.phys.has_terrain() {
+                        continue;
+                    }
+                    // Tick the player (and its push impulses) exactly once per
+                    // body step. Ticking from the async mover loop instead
+                    // gave a step 0 or 2 pushes depending on where its
+                    // sleep landed, which shows as ball speed snapping.
+                    let p: &mut Predictor = &mut guard;
+                    let mut player_state = None;
+                    if let (Some(pl), Some(volume)) = (&mut p.player, &p.local_terrain)
+                        && p.phys.covers(pl.predicted().position_m)
+                    {
+                        let input = session.input.snapshot();
+                        pl.tick(
+                            &mut p.phys,
+                            volume,
+                            input,
+                            InputSeq(p.input_seq),
+                            MOVEMENT_DT_S,
+                        );
+                        player_state = Some(pl.predicted());
+                    }
+                    p.phys.step_client_authority();
+                    let curr = p.phys.local_body_states();
+                    drop(guard);
+                    if let Some(predicted) = player_state
+                        && let Some(view) = session
+                            .view
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_mut()
+                    {
+                        view.predicted = predicted;
+                        view.published_at = std::time::Instant::now();
+                    }
+                    *session
+                        .local_body_poses
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(LocalBodyPoses {
+                        prev: std::mem::replace(&mut prev, curr.clone()),
+                        curr,
+                        curr_at: std::time::Instant::now(),
+                        step,
+                    });
+                }
+            });
+    }
+
+    let mover = predictor.clone().map(|pred| {
+        let conn = conn.clone();
+        let replica = replica.clone();
+        let counters = counters.clone();
+        let script = config.movement_script.clone();
+        let session = conn.session();
+        let stop_rx = stop_rx.clone();
+        let client_residency = config.client_residency;
+        let interactive = config.interactive.clone();
+        let client_authoritative = config.client_authoritative;
+        tokio::spawn(async move {
+            let end_tick = script_end_tick(&script);
+            // Slice E2: a scripted mover optionally evicts terrain outside a
+            // brick box around its predicted player and pulls it back with
+            // `RepairRequest`s as the player returns.
+            let mut residency = client_residency.map(|l| {
+                ClientResidencyPass::new(
+                    l.budget_bricks,
+                    l.interest_radius_bricks,
+                    l.max_dense_bytes,
+                )
+            });
+            // A residency gap deliberately holds prediction over unknown
+            // ground.  Script legs describe controlled movement, so advancing
+            // their clock during that hold would consume the outbound leg
+            // without ever sending an input frame.
+            let mut active_script_tick = 0_u64;
+            let mut last_active_server_tick = None;
+            // ENG-69, PR #109 review: this loop's own per-iteration cost
+            // (the terrain-hash/clone work below, plus the unconditional
+            // 16ms sleep at its end) is not a fixed 16ms — it varies with
+            // scene size — so real time between iterations can cover more
+            // than one `MOVEMENT_DT_S`-wide tick. Calling `PredictedPlayer::
+            // tick` exactly once per iteration regardless silently starved
+            // `Record::tick`'s tagging scheme (`predict.rs`) of the "local
+            // tick count tracks real elapsed ticks" correspondence it needs
+            // — confirmed against a real interactive session's own
+            // correction log (844 of 844 reconciles unmatched,
+            // `records_replayed` pinned at 0 the entire session). See
+            // `crate::tick_accumulator` for the fix.
+            let mut tick_accumulator = TickAccumulator::new(Duration::from_secs_f32(MOVEMENT_DT_S));
+            let mut last_tick_accumulator_at = std::time::Instant::now();
+            // Geometry changes rarely; motion snapshots do not. Remember the
+            // last topology version so ordinary 60 Hz pose refreshes do not
+            // clone every replicated voxel volume under the replica lock.
+            let mut body_collision_versions = HashMap::<u64, u64>::new();
+            let trace_bodies = !script.is_empty();
+            loop {
+                if *stop_rx.borrow() {
+                    return;
+                }
+                let now = std::time::Instant::now();
+                // The timeline rate comes from the lead controller (1.0 until
+                // a reconcile has reported a lead); read under a brief lock.
+                let timeline_rate = pred.lock().unwrap_or_else(|e| e.into_inner()).lead.rate();
+                let ticks_to_run = tick_accumulator
+                    .advance_scaled(now.duration_since(last_tick_accumulator_at), timeline_rate);
+                last_tick_accumulator_at = now;
+                let tick = counters.last_tick.load(Ordering::Relaxed);
+
+                // Rebuild the collider if the terrain changed near us. Kept as
+                // two separate bindings, not one `Option<(Hash32, Volume)>`
+                // (as before ENG-69 round 18): `terrain_volume` needs to stay
+                // borrowable both for the dirty-check block below *and* for
+                // every `pl.tick` call afterward, which now also needs a
+                // fresh `&Volume` each tick for its own window cache.
+                let (terrain_hash, terrain_volume, body_collisions, traced_samplers) = {
+                    let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                    // Scripted runs only: what the renderer would draw, for the
+                    // trace (see `BodyTick`).
+                    let traced_samplers: Option<(f64, Vec<(u64, crate::replica::BodySampler)>)> =
+                        trace_bodies.then(|| {
+                            let render_tick = guard.render_tick(now);
+                            let samplers = guard
+                                .body_volumes()
+                                .filter_map(|(entity, _)| {
+                                    Some((entity.get(), guard.body_sampler(entity)?))
+                                })
+                                .collect();
+                            (render_tick, samplers)
+                        });
+                    let mut bodies = Vec::new();
+                    let mut live = std::collections::HashSet::new();
+                    for (entity, volume_id) in guard.body_volumes() {
+                        let Some(volume) = guard.volume(volume_id) else {
+                            continue;
+                        };
+                        let Some(latest) = guard.latest_motion(entity) else {
+                            continue;
+                        };
+                        let raw_entity = entity.get();
+                        let topology_version = volume.next_revision().get();
+                        live.insert(raw_entity);
+                        let changed = body_collision_versions.get(&raw_entity).copied()
+                            != Some(topology_version);
+                        bodies.push(ClientBodyCollision {
+                            entity,
+                            topology_version,
+                            volume: changed.then(|| volume.clone()),
+                            pose: latest.pose,
+                            motion: BodyMotion {
+                                snapshot_tick: latest.server_tick,
+                                linear_velocity_m_s: latest.linear_velocity_m_s,
+                                angular_velocity_rad_s: latest.angular_velocity_rad_s,
+                                sleeping: latest.sleeping,
+                            },
+                        });
+                        body_collision_versions.insert(raw_entity, topology_version);
+                    }
+                    body_collision_versions.retain(|entity, _| live.contains(entity));
+                    (
+                        guard.terrain_resident_hash(),
+                        guard.terrain_volume().cloned(),
+                        bodies,
+                        traced_samplers,
+                    )
+                };
+                // All predictor-lock work happens in this non-async block, which
+                // returns the datagram to send (and the predicted feet position
+                // for the residency pass) once the guard is dropped.
+                type MoverTickOutcome = (
+                    Option<InputFrame>,
+                    Option<[f64; 3]>,
+                    Option<u64>,
+                    Option<CharacterState>,
+                    Option<CorrectionStats>,
+                    WindowStats,
+                );
+                let (frame, feet, script_tick, predicted_state, correction_stats, window_stats): MoverTickOutcome = {
+                    let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
+                    let p: &mut Predictor = &mut guard;
+                    // Bodies are advanced to the tick each predicted step
+                    // simulates (below and in `reconcile_with_bodies`); this
+                    // first sync installs new bodies / topology changes and
+                    // parks everything at the next predicted tick.
+                    let next_tick = p.player.as_ref().map(|pl| pl.next_tick().0 as f64);
+                    p.phys.sync_bodies_at(&body_collisions, next_tick);
+                    if let Some(trace) = &mut p.trace {
+                        let wall_ms = p.trace_started.elapsed().as_millis() as u64;
+                        for new in &body_collisions {
+                            let Some(old) = p.bodies_motion.iter().find(|b| b.entity == new.entity)
+                            else {
+                                continue;
+                            };
+                            if old.motion.snapshot_tick == new.motion.snapshot_tick
+                                || trace.body_jumps.len() >= MAX_TRACE_ROWS
+                            {
+                                continue;
+                            }
+                            let expected = old.pose_at(new.motion.snapshot_tick as f64);
+                            let error = expected
+                                .translation_m
+                                .iter()
+                                .zip(new.pose.translation_m)
+                                .map(|(a, b)| (a - b) * (a - b))
+                                .sum::<f64>()
+                                .sqrt();
+                            let v = new.motion.linear_velocity_m_s;
+                            trace.body_jumps.push(BodyJumpRow {
+                                wall_ms,
+                                entity: new.entity.get(),
+                                snapshot_tick: new.motion.snapshot_tick,
+                                extrapolation_error_m: error,
+                                speed_m_s: (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt(),
+                            });
+                        }
+                    }
+                    // Reconciles (on the motion task) replay against the same
+                    // set; keep it without the geometry, which `phys` now holds.
+                    p.bodies_motion = body_collisions
+                        .iter()
+                        .map(|b| ClientBodyCollision {
+                            volume: None,
+                            ..b.clone()
+                        })
+                        .collect();
+                    if let (Some(hash), Some(volume)) = (terrain_hash, &terrain_volume)
+                        && p.terrain_hash != Some(hash)
+                    {
+                        p.phys.set_terrain(volume);
+                        let first = p.terrain_hash.is_none();
+                        p.terrain_hash = Some(hash);
+                        if client_authoritative {
+                            p.local_terrain = Some(volume.clone());
+                        }
+                        if !client_authoritative
+                            && !first
+                            && let Some(pl) = &mut p.player
+                        {
+                            pl.invalidate();
+                        }
+                    }
+
+                    // Beyond simply having *a* collider, prediction needs it to
+                    // actually cover where the player is standing
+                    // (`ClientPhysics::covers`): the collider body survives a
+                    // residency gap (`set_terrain` keeps it, empty, for a later
+                    // refill), so `has_terrain` alone stays true while a reload
+                    // a lossy repair round trip hasn't delivered yet leaves the
+                    // player over unknown ground. Predicting through that as if
+                    // it were confirmed air is exactly what turns one delayed
+                    // reload into an unbounded free-fall; holding here instead
+                    // means the predicted tick simply resumes once the brick
+                    // lands, the same way it already pauses before the player
+                    // exists.
+                    let ready = p
+                        .player
+                        .as_ref()
+                        .is_some_and(|pl| p.phys.covers(pl.predicted().position_m));
+
+                    // Start only once the player is live, then advance only
+                    // when an input is actually predicted and sent.  This
+                    // pauses an authored leg through a known residency hold.
+                    let script_tick = p.script_origin_tick.map(|_| active_script_tick);
+
+                    let frame = if ready && p.phys.has_terrain() {
+                        let input = match &interactive {
+                            Some(session) => session.input.snapshot(),
+                            None => scripted_input(&script, script_tick.unwrap_or(0)),
+                        };
+                        p.input_seq += 1;
+                        let seq = InputSeq(p.input_seq);
+                        let predicted_pos = p
+                            .player
+                            .as_ref()
+                            .map_or([0.0; 3], |pl| pl.predicted().position_m);
+                        p.trace_input(seq.0, input.movement, tick, predicted_pos);
+                        let intended_tick = p
+                            .player
+                            .as_ref()
+                            .map_or(Tick(tick + 1), PredictedPlayer::next_tick);
+                        // Client authority: the physics thread ticks the
+                        // player in lockstep with body stepping instead.
+                        if !client_authoritative
+                            && let Some(pl) = &mut p.player
+                            && let Some(volume) = &terrain_volume
+                        {
+                            // Catch local prediction up to however many real
+                            // ticks elapsed since the last iteration (see
+                            // `tick_accumulator` above) — usually 1, more
+                            // when this loop's own per-iteration cost ran
+                            // long. The same sampled `input`/`seq` covers
+                            // every tick in the burst, exactly like ordinary
+                            // held-input reuse already does.
+                            let allowed_ticks = crate::tick_accumulator::cap_prediction_ticks(
+                                ticks_to_run,
+                                pl.next_tick().0,
+                                tick,
+                                p.lead.max_lead_ticks(),
+                            );
+                            for _ in 0..allowed_ticks {
+                                p.phys.sync_bodies_at(
+                                    &p.bodies_motion,
+                                    Some(pl.next_tick().0 as f64),
+                                );
+                                pl.tick(&mut p.phys, volume, input, seq, MOVEMENT_DT_S);
+                                if p.trace.is_some() {
+                                    let simulated = pl.next_tick().0 - 1;
+                                    let st = pl.predicted();
+                                    let bodies = p
+                                        .bodies_motion
+                                        .iter()
+                                        .map(|b| {
+                                            let collision = b.pose_at(simulated as f64);
+                                            let displayed = traced_samplers
+                                                .as_ref()
+                                                .and_then(|(tick, samplers)| {
+                                                    let (_, s) = samplers
+                                                        .iter()
+                                                        .find(|(e, _)| *e == b.entity.get())?;
+                                                    s.presented(*tick, Some(st.position_m))
+                                                })
+                                                .unwrap_or(collision);
+                                            BodyTick {
+                                                entity: b.entity.get(),
+                                                collision_pos_m: collision.translation_m,
+                                                displayed_pos_m: displayed.translation_m,
+                                                snapshot_tick: b.motion.snapshot_tick,
+                                                snapshot_pos_m: b.pose.translation_m,
+                                                snapshot_vel_m_s: b.motion.linear_velocity_m_s,
+                                            }
+                                        })
+                                        .collect();
+                                    let wall_ms = p.trace_started.elapsed().as_millis() as u64;
+                                    let movement = p.current_movement;
+                                    if let Some(trace) = &mut p.trace
+                                        && trace.ticks.len() < MAX_TRACE_ROWS * 4
+                                    {
+                                        trace.ticks.push(TickTraceRow {
+                                            wall_ms,
+                                            tick: simulated,
+                                            predicted_pos_m: st.position_m,
+                                            predicted_vel_m_s: st.velocity_m_s,
+                                            grounded: st.grounded,
+                                            movement,
+                                            bodies,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        // Preserve the script's server-tick cadence. The
+                        // mover itself samples more often than snapshots can
+                        // advance, so incrementing once per loop makes an
+                        // impaired client cover several scripted ticks per
+                        // authoritative tick.  Resetting this reference while
+                        // held intentionally discards the unknown-ground gap.
+                        let prior = last_active_server_tick.replace(tick);
+                        if let Some(prior) = prior {
+                            active_script_tick =
+                                active_script_tick.saturating_add(tick.saturating_sub(prior));
+                        }
+
+                        let recent: Vec<RecentInput> =
+                            p.recent.iter().rev().take(3).copied().collect();
+                        p.recent.push_back(RecentInput {
+                            input_seq: seq,
+                            intended_tick,
+                            movement: input.movement,
+                            view_dir: input.view_dir,
+                            buttons: input.buttons,
+                        });
+                        while p.recent.len() > 3 {
+                            p.recent.pop_front();
+                        }
+                        Some(InputFrame {
+                            session,
+                            player: p.entity,
+                            input_seq: seq,
+                            // Tag the first local prediction step this frame
+                            // will drive (captured before catch-up). The latest
+                            // motion snapshot can be several ticks behind this
+                            // independently paced predictor.
+                            intended_tick,
+                            movement: input.movement,
+                            view_dir: input.view_dir,
+                            buttons: input.buttons,
+                            recent,
+                        })
+                    } else {
+                        last_active_server_tick = None;
+                        None
+                    };
+                    let predicted_state = p.player.as_ref().map(PredictedPlayer::predicted);
+                    let feet = predicted_state.map(|st| st.position_m);
+                    let correction_stats = p.player.as_ref().map(|pl| CorrectionStats {
+                        corrections: pl.corrections,
+                        max_correction_m: pl.max_correction_m,
+                        idle_corrections: pl.idle_corrections,
+                        max_idle_correction_m: pl.max_idle_correction_m,
+                        max_vertical_correction_m: pl.max_vertical_correction_m,
+                        max_horizontal_correction_m: pl.max_horizontal_correction_m,
+                        unmatched_reconciles: pl.unmatched_reconciles,
+                        max_unmatched_displacement_m: pl.max_unmatched_displacement_m,
+                    });
+                    let window_stats = p.phys.window_stats();
+                    (
+                        frame,
+                        feet,
+                        script_tick,
+                        predicted_state,
+                        correction_stats,
+                        window_stats,
+                    )
+                };
+                if let Some(frame) = frame {
+                    let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
+                }
+                if let (Some(session), Some(predicted)) = (&interactive, predicted_state) {
+                    let stats = correction_stats.unwrap_or_default();
+                    let mut slot = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                    // Client authority: the physics thread owns the pose and
+                    // its timestamp (one sample per fixed step); overwriting
+                    // them here would inject irregular samples into the
+                    // camera's interpolation.
+                    let (predicted, published_at) = match *slot {
+                        Some(old) if client_authoritative => (old.predicted, old.published_at),
+                        _ => (predicted, std::time::Instant::now()),
+                    };
+                    *slot = Some(InteractiveView {
+                            predicted,
+                            server_tick: tick,
+                            published_at,
+                            corrections: stats.corrections,
+                            max_correction_m: stats.max_correction_m,
+                            idle_corrections: stats.idle_corrections,
+                            max_idle_correction_m: stats.max_idle_correction_m,
+                            max_vertical_correction_m: stats.max_vertical_correction_m,
+                            max_horizontal_correction_m: stats.max_horizontal_correction_m,
+                            unmatched_reconciles: stats.unmatched_reconciles,
+                            max_unmatched_displacement_m: stats.max_unmatched_displacement_m,
+                            window_stats,
+                        });
+                }
+                // Slice E2: evict / request-reload terrain around the player.
+                if let (Some(pass), Some(feet)) = (residency.as_mut(), feet) {
+                    let reqs = {
+                        let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                        pass.step(&mut guard, feet)
+                    };
+                    counters
+                        .residency_evictions
+                        .store(pass.evictions_total(), Ordering::Relaxed);
+                    counters
+                        .residency_reloads_requested
+                        .store(pass.reloads_requested_total(), Ordering::Relaxed);
+                    counters
+                        .residency_reloads_completed
+                        .store(pass.reloads_completed_total(), Ordering::Relaxed);
+                    counters
+                        .residency_budget_miss_steps
+                        .store(pass.budget_miss_steps_total(), Ordering::Relaxed);
+                    counters
+                        .residency_admission_deferred
+                        .store(pass.admission_deferred_total(), Ordering::Relaxed);
+                    for req in reqs {
+                        let _ = conn.send_record(WireRecord::RepairRequest(req)).await;
+                    }
+                }
+
+                // Stop predicting a while after the script ends (the neutral
+                // tail proves the player settles). `script_tick` advances only
+                // while controlled input is sent, so an unknown-ground hold
+                // cannot silently consume this neutral tail.
+                if end_tick > 0 && script_tick.is_some_and(|t| t > end_tick + 360) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(16)).await;
+            }
+        })
+    });
+
     // Scripter: fire each action once the observed server tick reaches its
     // `at_tick`, or — since a client with no visible bodies sees no motion and
     // therefore no tick — once the equivalent wall-clock delay from connect has
@@ -430,6 +1995,8 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let scripter = {
         let conn = conn.clone();
         let counters = counters.clone();
+        let replica = replica.clone();
+        let sent_actions = sent_actions.clone();
         let mut script = config.script.clone();
         script.sort_by_key(|a| a.at_tick);
         let stop_rx = stop_rx.clone();
@@ -448,12 +2015,54 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-                if conn
-                    .send_record(WireRecord::ActionRequest(action.request))
-                    .await
-                    .is_ok()
-                {
+
+                let mut request = action.request.clone();
+                if action.target == ScriptTarget::DetachedBody {
+                    // Aim at the sole detached body. It only exists once an
+                    // earlier cut has detached it, so wait a bounded while for
+                    // it to appear; skip the action if it never does.
+                    let body_deadline = deadline + Duration::from_secs(3);
+                    let target = loop {
+                        if *stop_rx.borrow() {
+                            return;
+                        }
+                        let found = {
+                            let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                            guard
+                                .body_ids()
+                                .next()
+                                .map(|e| (e, guard.body_solid_cells(e)))
+                        };
+                        if let Some((entity, cells)) = found {
+                            break Some((entity, cells.unwrap_or(0)));
+                        }
+                        if tokio::time::Instant::now() >= body_deadline {
+                            break None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    };
+                    let Some((entity, pre_cells)) = target else {
+                        continue;
+                    };
+                    request.claimed_target = ClaimedTarget::Body(entity);
+                    counters
+                        .body_cut_entity_plus1
+                        .store(entity.get() + 1, Ordering::Relaxed);
+                    counters
+                        .body_cut_pre_cells
+                        .store(pre_cells, Ordering::Relaxed);
+                }
+
+                let request_id = request.request_id.0;
+                let record = WireRecord::ActionRequest(request);
+                if conn.send_record(record.clone()).await.is_ok() {
                     counters.actions.fetch_add(1, Ordering::Relaxed);
+                    // Keep the exact record (a body cut carries its retargeted
+                    // `claimed_target`) so the retrier can resend it verbatim.
+                    sent_actions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(request_id, (record, 0));
                 }
             }
         })
@@ -464,6 +2073,7 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
     let done = {
         let counters = counters.clone();
         let run_ticks = config.run_ticks;
+        let interactive = config.interactive.clone();
         async move {
             tokio::select! {
                 _ = async { let _ = control.await; let _ = motion.await; } => {}
@@ -477,34 +2087,116 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }, if run_ticks > 0 => {}
+                // The window's close handler sets this so an interactive
+                // session disconnects promptly instead of riding out
+                // `overall_timeout`.
+                _ = async {
+                    loop {
+                        if interactive.as_ref().is_some_and(|s| s.stop.load(Ordering::Relaxed)) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }, if interactive.is_some() => {}
             }
         }
     };
     let _ = tokio::time::timeout(config.overall_timeout, done).await;
     let _ = stop_tx.send(true);
     scripter.abort();
+    if let Some(m) = mover {
+        m.abort();
+    }
+    retrier.abort();
     liveness.abort();
 
     let _ = conn.say_bye("client complete").await;
     conn.close("client complete");
     let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
 
+    // T19 movement summary: a scripted player is at rest (grounded, low speed)
+    // once its script has ended and the held-input timeout has fired. Checked
+    // against the *authoritative* state, not the predicted one: prediction
+    // only advances while `ClientPhysics::covers` holds (see the mover loop),
+    // so it can still be legitimately frozen mid-settle if the run ends
+    // during a stall waiting on a lossy repair round trip near the very end
+    // of the script — the authoritative state keeps updating from every
+    // snapshot regardless, so it is the one that actually answers "has the
+    // real player come to rest".
+    let movement = predictor.as_ref().and_then(|pred| {
+        let p = pred.lock().unwrap_or_else(|e| e.into_inner());
+        p.player.as_ref().map(|pl| {
+            let s = pl.authoritative();
+            let at_rest =
+                s.grounded && s.velocity_m_s[0].abs() < 0.5 && s.velocity_m_s[2].abs() < 0.5;
+            pl.summary(at_rest)
+        })
+    });
+
+    let movement_trace = predictor
+        .as_ref()
+        .and_then(|pred| pred.lock().unwrap_or_else(|e| e.into_inner()).trace.take());
+
     let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
     let last_tick = counters.last_tick.load(Ordering::Relaxed);
     let applied = counters.applied.load(Ordering::Relaxed);
     let baseline_bricks = counters.baseline_bricks.load(Ordering::Relaxed);
     // A plain late joiner that catches up entirely from the baseline (no cuts
-    // after it joined) still passes; a live client must have applied something.
-    let progressed = applied > 0 || (config.late_join && baseline_bricks > 0);
+    // after it joined) still passes; a live client must have applied something,
+    // and a scripted mover must have produced a movement summary with no hover.
+    let movement_ok = match &movement {
+        Some(m) => !m.hovered_after_floor_removal && m.ticks > 0,
+        None => true,
+    };
+    let progressed = movement.is_some() && movement_ok
+        || applied > 0
+        || (config.late_join && baseline_bricks > 0);
+    // T23 / G3 row 10: a late joiner the server gave up on mid-catch-up (its
+    // queue kept overflowing past `max_join_retries`) is a bounded, explicit
+    // join failure -- even though it installed a first baseline and so would
+    // otherwise satisfy `progressed` above with a now-stale, non-converged
+    // hash. Only `late_join` clients get this override: a live client that
+    // was never joining has nothing to be exhausted.
+    let catch_up_exhausted = config.late_join
+        && counters
+            .disconnect_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+            == Some(Connection::BYE_REASON_CATCH_UP_EXHAUSTED);
+    let max_body_displacement_m = guard.max_body_displacement_m();
+    let body_cut_committed = match counters.body_cut_entity_plus1.load(Ordering::Relaxed) {
+        0 => false,
+        raw => {
+            let entity = EntityId::new(raw - 1).expect("stored a valid entity id");
+            let pre = counters.body_cut_pre_cells.load(Ordering::Relaxed);
+            match guard.body_solid_cells(entity) {
+                Some(post) => post < pre,
+                None => pre > 0,
+            }
+        }
+    };
     let summary = ClientSummary {
-        version: 1,
-        result: if progressed { "passed" } else { "failed" }.to_string(),
+        version: 5,
+        result: if catch_up_exhausted {
+            "join-failed"
+        } else if progressed && movement_ok {
+            "passed"
+        } else {
+            "failed"
+        }
+        .to_string(),
         connected: true,
         transactions_applied: applied,
         repair_requests_sent: counters.repairs.load(Ordering::Relaxed),
         transactions_rejected: counters.rejected.load(Ordering::Relaxed),
         motion_snapshots: counters.motion.load(Ordering::Relaxed),
+        motion_snapshots_out_of_order: counters.motion_reordered.load(Ordering::Relaxed),
         actions_sent: counters.actions.load(Ordering::Relaxed),
+        progression_responses: progression_responses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
         last_server_tick: last_tick,
         final_world_hash: guard.world_hash().to_string(),
         total_solid_cells: guard.total_solid_cells(),
@@ -512,6 +2204,41 @@ async fn run_async(config: ClientNetConfig) -> Result<ClientSummary, ClientNetEr
         late_join: config.late_join,
         baseline_bricks,
         repairs_applied: counters.patches.load(Ordering::Relaxed),
+        max_body_displacement_m,
+        body_cut_committed,
+        movement,
+        movement_trace,
+        client_residency_evictions: counters.residency_evictions.load(Ordering::Relaxed),
+        client_residency_reloads_requested: counters
+            .residency_reloads_requested
+            .load(Ordering::Relaxed),
+        client_residency_reloads_completed: counters
+            .residency_reloads_completed
+            .load(Ordering::Relaxed),
+        action_requests_rejected: counters.action_rejected.load(Ordering::Relaxed),
+        action_reject_reasons: counters
+            .action_reject_reasons
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        client_residency_budget_miss_steps: counters
+            .residency_budget_miss_steps
+            .load(Ordering::Relaxed),
+        client_residency_admission_deferred_total: counters
+            .residency_admission_deferred
+            .load(Ordering::Relaxed),
+        client_residency_evicted_transaction_gaps: counters
+            .residency_evicted_transaction_gaps
+            .load(Ordering::Relaxed),
+        late_join_baseline_compressed_bytes: counters
+            .late_join_baseline_compressed_bytes
+            .load(Ordering::Relaxed),
+        late_join_baseline_install_ms: counters
+            .late_join_baseline_install_ms
+            .load(Ordering::Relaxed),
+        late_join_ready_ms: counters.late_join_ready_ms.load(Ordering::Relaxed),
+        late_join_ready_confirmed: counters.late_join_ready_confirmed.load(Ordering::Relaxed) != 0,
+        baseline_transfer_failures: counters.baseline_transfer_failures.load(Ordering::Relaxed),
     };
     drop(guard);
 

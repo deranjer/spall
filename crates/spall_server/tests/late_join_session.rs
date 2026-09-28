@@ -12,9 +12,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use spall_client::{ClientNetConfig, ScriptedAction, cut_request, run_replication_client};
+use spall_client::{
+    BaselineScene, ClientNetConfig, ScriptedAction, cut_request, run_replication_client,
+};
 use spall_net::{Fingerprint, JoinToken, TransportConfig};
-use spall_server::serve::{DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES};
+use spall_server::serve::{
+    DEFAULT_CATCH_UP_CAP, DEFAULT_MAX_JOIN_RETRIES, default_capture_workers,
+};
 use spall_server::{Scene, ServeConfig, serve};
 
 fn unique_dir(tag: &str) -> PathBuf {
@@ -55,6 +59,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
     let server_cfg = ServeConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         scene: Scene::BridgeCut,
+        terrain_collider_mode: spall_sim::world::TerrainColliderMode::PerBrick,
         join_token: token,
         max_ticks: 1_500,
         quiescence_ticks: 60,
@@ -72,6 +77,20 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         seed: 0,
         catch_up_cap: DEFAULT_CATCH_UP_CAP,
         max_join_retries: DEFAULT_MAX_JOIN_RETRIES,
+        capture_workers: default_capture_workers(),
+        // Scripted fixture cuts hit arbitrary cells; use the ENG-47
+        // dev-scenario path so this late-join plumbing test still runs.
+        dev_unvalidated_actions: true,
+        save_faults: None,
+        await_body_settle: false,
+        motion_interest: None,
+        residency: None,
+        residency_disk_path: None,
+        contact_damage: None,
+        dormancy: None,
+        timing_window: None,
+        credential_registry_file: None,
+        custom_world: None,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 
@@ -90,31 +109,42 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
             ScriptedAction {
                 at_tick: 4,
                 request: cut_request(1, 0, [10, 4, 1], 2),
+                target: spall_client::ScriptTarget::Terrain,
             },
             ScriptedAction {
                 at_tick: 20,
                 request: cut_request(2, 1, [3, 1, 1], 1),
+                target: spall_client::ScriptTarget::Terrain,
             },
             ScriptedAction {
                 at_tick: 40,
                 request: cut_request(3, 2, [5, 1, 1], 1),
+                target: spall_client::ScriptTarget::Terrain,
             },
             ScriptedAction {
                 at_tick: 60,
                 request: cut_request(4, 3, [7, 1, 1], 1),
+                target: spall_client::ScriptTarget::Terrain,
             },
             ScriptedAction {
                 at_tick: 80,
                 request: cut_request(5, 4, [9, 1, 1], 1),
+                target: spall_client::ScriptTarget::Terrain,
             },
         ],
+        movement_script: Vec::new(),
         late_join: false,
+        baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 0,
         idle_grace: Duration::from_millis(800),
         overall_timeout: Duration::from_secs(35),
         log_json: dir.join("early.jsonl"),
         summary_json: Some(dir.join("early.summary.json")),
         transport: TransportConfig::for_tests(),
+        client_residency: None,
+        on_replica_ready: None,
+        interactive: None,
+        client_authoritative: false,
     };
     let early_thread = std::thread::spawn(move || run_replication_client(early_cfg));
 
@@ -130,14 +160,21 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         script: vec![ScriptedAction {
             at_tick: 70,
             request: cut_request(1_000, 0, [12, 1, 1], 1),
+            target: spall_client::ScriptTarget::Terrain,
         }],
+        movement_script: Vec::new(),
         late_join: true,
+        baseline_scene: BaselineScene::BridgeCut,
         run_ticks: 0,
         idle_grace: Duration::from_millis(800),
         overall_timeout: Duration::from_secs(35),
         log_json: dir.join("late.jsonl"),
         summary_json: Some(dir.join("late.summary.json")),
         transport: TransportConfig::for_tests(),
+        client_residency: None,
+        on_replica_ready: None,
+        interactive: None,
+        client_authoritative: false,
     };
     let late = run_replication_client(late_cfg).expect("late-join client run");
     let early = early_thread

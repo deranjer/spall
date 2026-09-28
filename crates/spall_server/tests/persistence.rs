@@ -7,13 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use glam::{DQuat, DVec3};
 use spall_core::units::{BRUSH_UNIT, BrushPoint};
-use spall_core::{GlobalCell, SphereBrush};
+use spall_core::{CellSizeCode, GlobalCell, SphereBrush, VolumeId};
 use spall_physics::PhysicsConfig;
 use spall_protocol::RequestId;
 use spall_server::persist::{self, PersistConfig};
 use spall_sim::{BodyPose, EditIntent, EditTarget, Simulation, SimulationConfig, fixtures};
 use spall_store::Writer;
 use spall_structure::AnchorPlane;
+use spall_voxel::{EditPlan, Volume};
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -575,6 +576,210 @@ fn a_journal_transaction_with_a_stale_algorithm_version_is_rejected() {
     }
 }
 
+// --- ENG-39: resume simulation time at the durable journal suffix -------
+
+/// Highest tick any durable record in a recovery carries (checkpoint tick
+/// included).
+fn max_durable_tick(recovery: &spall_store::Recovery) -> u64 {
+    recovery
+        .journal
+        .iter()
+        .map(|r| r.tick)
+        .max()
+        .unwrap_or(0)
+        .max(recovery.checkpoint.tick)
+}
+
+#[test]
+fn review_replay_must_advance_tick_past_durable_suffix() {
+    // The issue repro: checkpoint at tick 0, a column cut that becomes durable
+    // at a much later tick, journal appended, then restore. Resuming at the old
+    // checkpoint tick would let the next committed event be stamped *before* the
+    // already-durable transaction.
+    let s = Scratch::new("resume_tick");
+
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(10, 4, 1, 2),
+        ))
+        .unwrap();
+        sim.run_until_idle(16).unwrap();
+        assert_eq!(sim.world().body_count(), 1, "beam detached");
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].tick > 0,
+            "the durable transaction is at a tick strictly after the checkpoint"
+        );
+        w.append_journal(&records).unwrap();
+    }
+
+    let recovery = spall_store::recover(s.db()).unwrap();
+    let durable_tick = max_durable_tick(&recovery);
+    assert!(durable_tick > 0);
+
+    let (mut restored, _seq) = persist::restore(
+        &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .unwrap();
+
+    // Simulation time resumes at the durable suffix, not the checkpoint tick.
+    assert!(
+        restored.current_tick().get() >= durable_tick,
+        "restored at tick {} but the durable suffix reaches tick {durable_tick}",
+        restored.current_tick().get()
+    );
+
+    // The first post-recovery committed event is strictly newer than every
+    // durable record — tick / interpolation / checkpoint ordering hold.
+    restored
+        .submit(EditIntent::cut(
+            RequestId(2),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(6, 4, 1, 1),
+        ))
+        .unwrap();
+    restored.run_until_idle(16).unwrap();
+    let committed = restored
+        .committed(RequestId(2))
+        .expect("fresh cut commits after recovery");
+    assert!(
+        committed.topology.server_tick.get() > durable_tick,
+        "post-recovery transaction stamped at tick {} — not strictly after the \
+         durable suffix tick {durable_tick}",
+        committed.topology.server_tick.get()
+    );
+}
+
+#[test]
+fn checkpoint_plus_topology_and_pose_suffix_survives_a_second_restart() {
+    // A durable suffix that ends with a pose batch at a tick later than the
+    // topology transaction: recovery must resume past the *pose* tick, and that
+    // resumed time must itself survive a second save + restart.
+    let s = Scratch::new("second_restart");
+
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let topo_records = {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(10, 4, 1, 2),
+        ))
+        .unwrap();
+        sim.run_until_idle(16).unwrap();
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1);
+        let topo_tick = records[0].tick;
+        let pose_tick = topo_tick + 5;
+
+        // topology record, then a later pose batch (empty snapshots is a valid
+        // no-op payload — this test exercises the tick-ordering / resume path).
+        let mut suffix = records.clone();
+        suffix.push(spall_store::JournalRecord {
+            seq: records[0].seq + 1,
+            tick: pose_tick,
+            payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+        });
+        w.append_journal(&suffix).unwrap();
+        records
+    };
+
+    let recovery = spall_store::recover(s.db()).unwrap();
+    assert_eq!(recovery.journal.len(), 2);
+    let durable_tick = max_durable_tick(&recovery);
+    assert_eq!(
+        durable_tick,
+        topo_records[0].tick + 5,
+        "the pose batch is newest"
+    );
+
+    let (first, _) = persist::restore(
+        &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
+        fixtures::stone_manifest(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        first.current_tick().get() >= durable_tick,
+        "first restart resumed at tick {}, behind the durable suffix tick {durable_tick}",
+        first.current_tick().get()
+    );
+    let first_tick = first.current_tick();
+    let first_hash = first.world().world_hash();
+
+    // Second save + restart: checkpoint the recovered sim to a fresh database,
+    // recover, restore again. The resumed tick and world must round-trip.
+    let s2 = Scratch::new("second_restart_b");
+    publish(&s2.db(), &persist::capture(&first, &cfg(), 0).unwrap());
+    drop(first);
+    let (second, second_seq) = recover_restore(&s2.db());
+    assert_eq!(second_seq, 0);
+    assert_eq!(
+        second.current_tick(),
+        first_tick,
+        "the durable-suffix tick survived a second save/restart"
+    );
+    assert_eq!(second.world().world_hash(), first_hash);
+}
+
+#[test]
+fn review_restore_rejects_a_tick_regression_in_the_durable_suffix() {
+    let s = Scratch::new("tick_regression");
+    let sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        // Two pose batches whose ticks go backwards — an inconsistent suffix.
+        w.append_journal(&[
+            spall_store::JournalRecord {
+                seq: 1,
+                tick: 40,
+                payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+            },
+            spall_store::JournalRecord {
+                seq: 2,
+                tick: 9,
+                payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
+            },
+        ])
+        .unwrap();
+    }
+    let recovery = spall_store::recover(s.db()).unwrap();
+    match restore_err(&recovery, &cfg()) {
+        persist::PersistError::JournalTickRegression {
+            seq: 2,
+            tick: 9,
+            durable: 40,
+        } => {}
+        other => panic!("expected JournalTickRegression, got {other:?}"),
+    }
+}
+
 // --- ENG-36: fail closed on a reported-corrupt recovery -----------------
 
 #[test]
@@ -605,21 +810,75 @@ fn review_restore_must_require_choice_after_corruption() {
     );
 }
 
-// --- ENG-39: resume time past the durable journal suffix ----------------
+// -------------------------------------------------------------------------
+// ENG-38: a journalled split must reconstruct its children with the live
+// physical mass / centre of mass / inertia, the *source* volume's cell size,
+// and every participant's pose — geometry-hash parity is not enough.
+// -------------------------------------------------------------------------
 
+/// `entity id -> (mass_kg, local COM, principal inertia)` for every body.
+fn mass_props_by_entity(
+    sim: &Simulation,
+) -> std::collections::BTreeMap<u64, (f32, [f32; 3], [f32; 3])> {
+    sim.world()
+        .bodies()
+        .map(|b| {
+            (
+                b.entity.unwrap().get(),
+                sim.world().physics().derived_mass_properties(b.phys),
+            )
+        })
+        .collect()
+}
+
+/// A body-local dumbbell built at the fine `Sixteenth` cell size (the terrain
+/// fixtures are all `Quarter`), so a replay that wrongly used the terrain cell
+/// size would misplace ~64x the mass.
+fn sixteenth_dumbbell(sz: i64, gap: i64) -> impl FnOnce(VolumeId) -> Volume {
+    let stone = spall_core::MaterialId(1);
+    move |id| {
+        let mut v = Volume::new(id, CellSizeCode::Sixteenth);
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(sz - 1, sz - 1, sz - 1),
+            stone,
+        ))
+        .unwrap();
+        let rx = sz + gap;
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(rx, 0, 0),
+            GlobalCell::new(rx + sz - 1, sz - 1, sz - 1),
+            stone,
+        ))
+        .unwrap();
+        let mid = sz / 2;
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(sz, mid, mid),
+            GlobalCell::new(rx - 1, mid, mid),
+            stone,
+        ))
+        .unwrap();
+        v
+    }
+}
+
+/// Probe `review_replayed_child_must_preserve_mass`: checkpoint the bridge,
+/// durably journal the column cut, restore checkpoint + journal, and compare
+/// the recovered beam's actual Rapier mass properties against the live ones.
 #[test]
-fn review_replay_must_advance_tick_past_durable_suffix() {
-    let s = Scratch::new("resume_tick");
+fn review_replayed_child_must_preserve_mass() {
+    let s = Scratch::new("eng38_terrain_mass");
+
     let mut sim =
         Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
     {
         let mut w = Writer::open(s.db()).unwrap();
         w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
             .unwrap();
-        // Advance well past the checkpoint tick, then commit a topology edit.
-        for _ in 0..15 {
-            sim.tick().unwrap();
-        }
+
         sim.submit(EditIntent::cut(
             RequestId(1),
             actor(),
@@ -628,126 +887,358 @@ fn review_replay_must_advance_tick_past_durable_suffix() {
         ))
         .unwrap();
         sim.run_until_idle(16).unwrap();
-        w.append_journal(&persist::journal_records(sim.journal().entries()).unwrap())
-            .unwrap();
+        assert_eq!(sim.world().body_count(), 1, "the beam detached");
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1, "one split transaction journalled");
+        w.append_journal(&records).unwrap();
     }
 
-    let recovery = spall_store::recover(s.db()).unwrap();
-    let durable_tick = recovery.journal.last().unwrap().tick;
-    assert!(durable_tick >= 16, "the cut committed well past tick 0");
+    let (restored, _) = recover_restore(&s.db());
+
+    let live = sim.world().bodies().next().unwrap();
+    let got = restored.world().bodies().next().unwrap();
+    let (want_mass, want_com, want_inertia) =
+        sim.world().physics().derived_mass_properties(live.phys);
+    let (got_mass, got_com, got_inertia) =
+        restored.world().physics().derived_mass_properties(got.phys);
+
+    assert!(
+        want_mass > 1000.0,
+        "sanity: a stone beam is heavy ({want_mass} kg) — not the ~1 kg the density=1.0 bug produced"
+    );
+    assert!(
+        (want_mass - got_mass).abs() < 0.01,
+        "replayed body mass: expected {want_mass} kg, got {got_mass} kg"
+    );
+    for i in 0..3 {
+        assert!(
+            (want_com[i] - got_com[i]).abs() < 1e-3,
+            "COM axis {i}: expected {}, got {}",
+            want_com[i],
+            got_com[i]
+        );
+        let denom = want_inertia[i].abs().max(1e-6);
+        assert!(
+            (want_inertia[i] - got_inertia[i]).abs() / denom < 1e-3,
+            "principal inertia axis {i}: expected {}, got {}",
+            want_inertia[i],
+            got_inertia[i]
+        );
+    }
+}
+
+/// A rotated, airborne dumbbell that keeps moving between the checkpoint and
+/// the cut: the replay must fold every participant — including the surviving
+/// parent — to the split frame, not leave the parent stranded at the
+/// checkpoint frame while the child sits at the split frame.
+#[test]
+fn rotated_body_to_body_split_replay_preserves_mass_and_parent_frame() {
+    let s = Scratch::new("eng38_body_split");
+
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    let parent = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::dumbbell(4, 3),
+            BodyPose::new(fixtures::oblique_spin(), [3.0, 8.0, 3.0]),
+            [0.2, 0.0, 0.0],
+            [0.0, 0.3, 0.0],
+            2600.0,
+            1,
+        )
+        .unwrap();
+    let checkpoint_pose = sim.world().body(parent).unwrap().pose;
+
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+
+        // Fall + spin so the body's frame diverges from the checkpoint frame.
+        for _ in 0..12 {
+            sim.step_physics_only();
+        }
+        let moved = sim.world().body(parent).unwrap().pose;
+        assert!(
+            (DVec3::from_array(moved.translation_m)
+                - DVec3::from_array(checkpoint_pose.translation_m))
+            .length()
+                > 1e-3,
+            "the body moved between checkpoint and cut"
+        );
+
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Body(parent),
+            brush_cell(5, 2, 2, 1),
+        ))
+        .unwrap();
+        sim.run_until_idle(24).unwrap();
+        assert_eq!(sim.world().body_count(), 2, "the dumbbell fractured");
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1, "one split transaction journalled");
+        w.append_journal(&records).unwrap();
+    }
+
+    let live = mass_props_by_entity(&sim);
+    let (restored, _) = recover_restore(&s.db());
+    let got = mass_props_by_entity(&restored);
+
+    assert_eq!(
+        got.keys().collect::<Vec<_>>(),
+        live.keys().collect::<Vec<_>>(),
+        "the same body ids recovered"
+    );
+    for (entity, (want_mass, _, _)) in &live {
+        let (got_mass, _, _) = got[entity];
+        assert!(
+            *want_mass > 100.0,
+            "body {entity} is stone, not density=1.0"
+        );
+        assert!(
+            (want_mass - got_mass).abs() < 0.01,
+            "body {entity}: mass expected {want_mass} kg, got {got_mass} kg"
+        );
+    }
+
+    // The parent participant was carried to the split frame: off the
+    // checkpoint pose, and sharing the split-instant rotation with the child
+    // (a child reproduces the parent transform exactly at the cut).
+    let rp = restored.world().body(parent).unwrap();
+    assert!(
+        (DVec3::from_array(rp.pose.translation_m)
+            - DVec3::from_array(checkpoint_pose.translation_m))
+        .length()
+            > 1e-3,
+        "restored parent advanced past the checkpoint frame, not stranded at it"
+    );
+    let child = restored
+        .world()
+        .bodies()
+        .find(|b| b.entity.unwrap().get() != parent.get())
+        .expect("a detached child exists");
+    let (a, b) = (rp.pose.rotation, child.pose.rotation);
+    let dot = (a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w).abs();
+    assert!(
+        dot > 1.0 - 1e-6,
+        "restored parent + child share the split-instant rotation (dot={dot})"
+    );
+}
+
+/// A body cut at a finer cell size than the terrain: the recovered children
+/// must keep the source cell size and therefore the correct mass — a replay
+/// that reached for `terrain_cell_size` would be ~64x off.
+#[test]
+fn detail_cell_body_split_replay_uses_the_source_cell_size() {
+    let s = Scratch::new("eng38_detail");
+
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    let parent = sim
+        .world_mut()
+        .spawn_body(
+            sixteenth_dumbbell(4, 3),
+            BodyPose::new(DQuat::IDENTITY, [2.0, 6.0, 2.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            1,
+        )
+        .unwrap();
+    assert_ne!(
+        sim.world().body(parent).unwrap().cell_size(),
+        sim.world().terrain().cell_size(),
+        "the body is finer than the terrain"
+    );
+
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Body(parent),
+            brush_cell(5, 2, 2, 1),
+        ))
+        .unwrap();
+        sim.run_until_idle(24).unwrap();
+        assert_eq!(
+            sim.world().body_count(),
+            2,
+            "the detail-cell dumbbell fractured"
+        );
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        w.append_journal(&records).unwrap();
+    }
+
+    let live = mass_props_by_entity(&sim);
+    let (restored, _) = recover_restore(&s.db());
+    let got = mass_props_by_entity(&restored);
+
+    for (entity, (want_mass, _, _)) in &live {
+        let (got_mass, _, _) = got[entity];
+        assert!(
+            (want_mass - got_mass).abs() < 0.01,
+            "detail-cell body {entity}: expected {want_mass} kg, got {got_mass} kg \
+             (a terrain-cell-size child would be ~64x heavier)"
+        );
+    }
+    for b in restored.world().bodies() {
+        assert_eq!(
+            b.cell_size(),
+            CellSizeCode::Sixteenth,
+            "recovered body {} kept the source cell size",
+            b.entity.unwrap().get()
+        );
+    }
+}
+
+/// ENG-56: a dynamic body whose last cell is cut away is retired atomically with
+/// the commit — and a checkpoint + journal-suffix recovery must reach the same
+/// state, with no resurrected empty body.
+#[test]
+fn an_emptied_body_stays_retired_across_save_and_restart() {
+    let s = Scratch::new("eng56_retire");
+
+    let mut sim = Simulation::new(SimulationConfig::new(fixtures::flat_terrain_setup())).unwrap();
+    // A one-cell dynamic body resting on the floor, live at checkpoint time.
+    let body = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::solid_block(1),
+            BodyPose::new(DQuat::IDENTITY, [4.0, 0.5, 4.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    for _ in 0..60 {
+        sim.step_physics_only();
+    }
+
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+        assert_eq!(sim.world().body_count(), 1, "the body is in the checkpoint");
+
+        sim.submit(EditIntent::cut(
+            RequestId(1),
+            actor(),
+            EditTarget::Body(body),
+            brush_cell(0, 0, 0, 1),
+        ))
+        .unwrap();
+        sim.run_until_idle(12).unwrap();
+        assert!(
+            sim.committed(RequestId(1)).is_some(),
+            "the emptying cut commits"
+        );
+        assert_eq!(
+            sim.world().body_count(),
+            0,
+            "the live world retired the emptied body"
+        );
+
+        let records = persist::journal_records(sim.journal().entries()).unwrap();
+        assert_eq!(records.len(), 1, "one emptying transaction journalled");
+        w.append_journal(&records).unwrap();
+    }
+
+    let want_hash = sim.world().world_hash();
 
     let (restored, _) = recover_restore(&s.db());
+    assert_eq!(
+        restored.world().body_count(),
+        0,
+        "recovery replays the emptying transaction and the body stays retired"
+    );
     assert!(
-        restored.current_tick().get() >= durable_tick,
-        "recovered tick {} precedes the durable transaction at tick {durable_tick}",
-        restored.current_tick().get()
+        restored.world().bodies().next().is_none(),
+        "no resurrected empty body after restart"
+    );
+    assert_eq!(
+        restored.world().world_hash(),
+        want_hash,
+        "recovered geometry matches the live world after the retirement"
+    );
+}
+
+// --- ENG-95: appearance-only manifest migration ---------------------------
+
+fn recoloured(manifest: &spall_core::MaterialManifest) -> spall_core::MaterialManifest {
+    let entries = manifest
+        .entries()
+        .iter()
+        .cloned()
+        .map(|mut def| {
+            def.render.albedo = def.render.albedo.map(|c| c * 0.25);
+            def
+        })
+        .collect();
+    spall_core::MaterialManifest::validated(entries).unwrap()
+}
+
+#[test]
+fn a_world_saved_under_a_superseded_manifest_restores_and_is_restamped() {
+    let s = Scratch::new("supersede");
+    let sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
+    let old = fixtures::stone_manifest();
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
+            .unwrap();
+    }
+    let recovery = spall_store::recover(s.db()).unwrap();
+    let new = recoloured(&old).superseding_appearance(&old).unwrap();
+
+    let (restored, _) = persist::restore(
+        &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
+        new.clone(),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    )
+    .expect("an appearance-only successor restores the old world");
+    // The next checkpoint carries the new manifest's hash, ending the
+    // dependence on the predecessor.
+    let cp = persist::capture(&restored, &cfg(), 0).unwrap();
+    assert_eq!(
+        cp.meta.material_manifest_hash,
+        spall_protocol::content_manifest_hash(&new).0
+    );
+    assert_ne!(
+        cp.meta.material_manifest_hash,
+        spall_protocol::content_manifest_hash(&old).0
     );
 }
 
 #[test]
-fn a_pose_only_suffix_also_advances_the_resume_tick() {
-    let s = Scratch::new("resume_pose");
+fn an_unrelated_recolour_is_still_rejected_without_the_supersession_declaration() {
+    let s = Scratch::new("no-supersede");
     let sim = Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
     {
         let mut w = Writer::open(s.db()).unwrap();
         w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
             .unwrap();
-        w.append_journal(&[
-            spall_store::JournalRecord {
-                seq: 1,
-                tick: 40,
-                payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
-            },
-            spall_store::JournalRecord {
-                seq: 2,
-                tick: 55,
-                payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
-            },
-        ])
-        .unwrap();
     }
-    let (restored, seq) = recover_restore(&s.db());
-    assert_eq!(seq, 2);
-    assert!(restored.current_tick().get() >= 55);
-}
-
-#[test]
-fn a_second_save_and_restart_keeps_simulation_time_monotone() {
-    let s1 = Scratch::new("restart_1");
-    let mut sim =
-        Simulation::new(SimulationConfig::new(fixtures::bridged_terrain_setup())).unwrap();
-    {
-        let mut w = Writer::open(s1.db()).unwrap();
-        w.publish_checkpoint(&persist::capture(&sim, &cfg(), 0).unwrap())
-            .unwrap();
-        for _ in 0..12 {
-            sim.tick().unwrap();
-        }
-        sim.submit(EditIntent::cut(
-            RequestId(1),
-            actor(),
-            EditTarget::Terrain,
-            brush_cell(10, 4, 1, 2),
-        ))
-        .unwrap();
-        sim.run_until_idle(16).unwrap();
-        w.append_journal(&persist::journal_records(sim.journal().entries()).unwrap())
-            .unwrap();
-    }
-
-    let (mut restored, seq1) = recover_restore(&s1.db());
-    let t1 = restored.current_tick().get();
-    assert!(t1 >= 12);
-
-    // A fresh edit after the first restart commits and time moves strictly on.
-    restored
-        .submit(EditIntent::cut(
-            RequestId(2),
-            actor(),
-            EditTarget::Terrain,
-            brush_cell(6, 4, 1, 1),
-        ))
-        .unwrap();
-    restored.run_until_idle(16).unwrap();
-    assert!(restored.committed(RequestId(2)).is_some());
-    assert!(restored.current_tick().get() > t1);
-
-    // Second save/restart from the restarted simulation.
-    let s2 = Scratch::new("restart_2");
-    {
-        let mut w = Writer::open(s2.db()).unwrap();
-        w.publish_checkpoint(&persist::capture(&restored, &cfg(), seq1).unwrap())
-            .unwrap();
-    }
-    let (restored2, _) = recover_restore(&s2.db());
-    assert_eq!(
-        restored2.current_tick().get(),
-        restored.current_tick().get(),
-        "the second restart resumes at the same simulation time"
-    );
-}
-
-#[test]
-fn an_out_of_order_journal_tick_is_rejected() {
-    let s = Scratch::new("tick_regression");
-    let mut recovery = recovery_for_meta_tests(&s);
-    let cursor = recovery.checkpoint.journal_cursor;
-    recovery.journal.push(spall_store::JournalRecord {
-        seq: cursor + 1,
-        tick: 30,
-        payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
-    });
-    recovery.journal.push(spall_store::JournalRecord {
-        seq: cursor + 2,
-        tick: 10,
-        payload: spall_store::JournalPayload::PoseBatch { snapshots: vec![] },
-    });
-    match restore_err(&recovery, &cfg()) {
-        persist::PersistError::JournalTickRegression {
-            found: 10,
-            previous: 30,
-            ..
-        } => {}
-        other => panic!("expected JournalTickRegression, got {other:?}"),
+    let recovery = spall_store::recover(s.db()).unwrap();
+    match persist::restore(
+        &recovery,
+        &cfg(),
+        persist::RecoveryChoice::RequireClean,
+        recoloured(&fixtures::stone_manifest()),
+        AnchorPlane::at(0),
+        PhysicsConfig::default(),
+    ) {
+        Err(persist::PersistError::ManifestMismatch { .. }) => {}
+        other => panic!("expected ManifestMismatch, got {:?}", other.map(|_| ())),
     }
 }

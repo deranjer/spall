@@ -63,7 +63,11 @@ impl Default for TransportConfig {
             limits: TransportLimits::default(),
             handshake_timeout: Duration::from_secs(5),
             heartbeat_interval: Duration::from_millis(500),
-            idle_timeout: Duration::from_secs(10),
+            // A dependency-complete baseline may require a bounded, CPU-heavy
+            // capture before its first bulk byte is available. Thirty seconds
+            // keeps that legitimate server-side work below the liveness limit
+            // while retaining a finite disconnect bound for stalled peers.
+            idle_timeout: Duration::from_secs(30),
             keep_alive_interval: Duration::from_secs(2),
             max_pending_authentications: 32,
             max_connections: 128,

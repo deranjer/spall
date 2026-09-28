@@ -24,6 +24,12 @@ pub enum Representation {
     NativeVoxels,
     /// A compound of greedily merged cuboids.
     MergedCuboids,
+    /// A rounded convex hull of the solid cell centres, inflated by half a
+    /// cell. Only valid for (near-)convex bodies such as balls: it trades
+    /// exact voxel occupancy for smooth contact, so a body rolls and is pushed
+    /// without catching on cube edges. Falls back to
+    /// [`Representation::NativeVoxels`] when the hull is degenerate.
+    SmoothConvex,
 }
 
 impl Representation {
@@ -32,7 +38,42 @@ impl Representation {
         match self {
             Self::NativeVoxels => "native_voxels",
             Self::MergedCuboids => "merged_cuboids",
+            Self::SmoothConvex => "smooth_convex",
         }
+    }
+}
+
+/// Above this many merged boxes, a [`Representation::MergedCuboids`] compound
+/// costs more to build/rebuild than the single [`Representation::NativeVoxels`]
+/// shape covering the identical solid set — the budget every
+/// collider-representation policy in this codebase must use to choose between
+/// them for a *given* occupancy grid (`spall_sim::collider::plan_collider` on
+/// the server, [`choose_representation`] here for anyone else building a
+/// same-geometry collider, e.g. `spall_client::predict::ClientPhysics`).
+///
+/// Client and server **must** pick the same representation for what is meant
+/// to be the same terrain: `MergedCuboids`' internal box seams can deflect a
+/// sliding kinematic character sideways at a seam where a single
+/// `NativeVoxels` shape (parry suppresses internal-edge contacts between
+/// adjacent voxels) would not — so two sides disagreeing on representation
+/// alone can produce a small, spurious, purely-horizontal client/server
+/// position disagreement even at a dead stop (ENG-69 round 7's own
+/// investigation, before this constant existed, found exactly that
+/// signature: near-zero vertical error, a bounded ~0.15 m horizontal one).
+pub const MERGED_CUBOID_PRIMITIVE_BUDGET: usize = 4096;
+
+/// The representation [`MERGED_CUBOID_PRIMITIVE_BUDGET`] selects for `grid`:
+/// [`Representation::MergedCuboids`] while its greedy decomposition
+/// (`crate::merge::greedy_boxes`) stays within budget, else the exact
+/// [`Representation::NativeVoxels`] fallback. Deterministic: the same
+/// occupancy always yields the same choice. Every caller that needs its
+/// collider to match another side's build of the *same* logical geometry
+/// should go through this rather than hardcoding one representation.
+pub fn choose_representation(grid: &OccupancyGrid) -> Representation {
+    if greedy_boxes(grid).len() <= MERGED_CUBOID_PRIMITIVE_BUDGET {
+        Representation::MergedCuboids
+    } else {
+        Representation::NativeVoxels
     }
 }
 
@@ -42,31 +83,76 @@ pub struct ColliderBuild {
     pub collider: Collider,
     /// Primitive count: `1` for the voxel shape, or the number of merged boxes.
     pub primitives: usize,
-    /// Wall-clock time spent constructing the shape.
+    /// Wall-clock time for the **complete** occupancy → collider construction:
+    /// the native solid-index extraction (and its allocation) or the greedy box
+    /// decomposition and every per-part shape allocation, *plus* the final
+    /// Rapier shape wrapping. This is the figure the feasibility report and
+    /// `docs/collision-decision.md` cite as build / rebuild cost — it is not a
+    /// wrap-only measurement.
     pub build: Duration,
+    /// The sub-interval of [`Self::build`] spent only inside the final Rapier
+    /// shape construction (`ColliderBuilder::voxels` / `::compound`). Retained as
+    /// a component timing so the wrapping cost stays visible next to the total.
+    pub wrap: Duration,
     /// Rough resident size of the shape's geometry, bytes. An estimate for the
     /// feasibility report, not an allocator measurement.
     pub est_bytes: usize,
 }
 
 /// Builds a collider for `grid` (cell edge `cell_m` metres) in `rep`. The shape
-/// is placed so grid cell `(0, 0, 0)`'s corner is the body-local origin.
+/// is placed so grid cell `(0, 0, 0)`'s corner is the shape-local origin;
+/// [`crate::world::PhysicsWorld`] then offsets the attached collider by
+/// `grid.origin() * cell_m` so the occupancy lands at the authoritative cells.
 pub fn build_collider(grid: &OccupancyGrid, cell_m: f32, rep: Representation) -> ColliderBuild {
     match rep {
         Representation::NativeVoxels => build_native(grid, cell_m),
         Representation::MergedCuboids => build_compound(grid, cell_m),
+        Representation::SmoothConvex => build_smooth_convex(grid, cell_m),
+    }
+}
+
+fn build_smooth_convex(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
+    let start = Instant::now();
+    let points: Vec<Vector> = grid
+        .solid_indices()
+        .into_iter()
+        .map(|[x, y, z]| {
+            Vector::new(
+                (x as f32 + 0.5) * cell_m,
+                (y as f32 + 0.5) * cell_m,
+                (z as f32 + 0.5) * cell_m,
+            )
+        })
+        .collect();
+    let Some(shape) = SharedShape::round_convex_hull(&points, cell_m * 0.5) else {
+        return build_native(grid, cell_m);
+    };
+    let wrap_start = Instant::now();
+    let collider = ColliderBuilder::new(shape).build();
+    let wrap = wrap_start.elapsed();
+    ColliderBuild {
+        collider,
+        primitives: 1,
+        build: start.elapsed(),
+        wrap,
+        est_bytes: points.len() * 12 + 512,
     }
 }
 
 fn build_native(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
+    // The timer starts before the solid-index extraction: pulling every solid
+    // cell out of the dense grid and allocating the index vector is part of the
+    // occupancy → collider work, not setup that can be excluded.
+    let start = Instant::now();
     let indices: Vec<IVector> = grid
         .solid_indices()
         .into_iter()
         .map(|[x, y, z]| IVector::new(x, y, z))
         .collect();
 
-    let start = Instant::now();
+    let wrap_start = Instant::now();
     let collider = ColliderBuilder::voxels(Vector::splat(cell_m), &indices).build();
+    let wrap = wrap_start.elapsed();
     let build = start.elapsed();
 
     // parry stores per-voxel state (occupancy + face flags) plus a spatial
@@ -78,11 +164,16 @@ fn build_native(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
         collider,
         primitives: 1,
         build,
+        wrap,
         est_bytes,
     }
 }
 
 fn build_compound(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
+    // The timer covers the whole decomposition: the greedy box merge over the
+    // grid (the potentially dominant 128³ scan for a large body) and every
+    // per-part cuboid/isometry allocation, then the Rapier compound wrapping.
+    let start = Instant::now();
     let boxes = greedy_boxes(grid);
     let parts: Vec<(Pose, SharedShape)> = boxes
         .iter()
@@ -106,8 +197,9 @@ fn build_compound(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
         .collect();
     let primitives = parts.len();
 
-    let start = Instant::now();
+    let wrap_start = Instant::now();
     let collider = ColliderBuilder::compound(parts).build();
+    let wrap = wrap_start.elapsed();
     let build = start.elapsed();
 
     // Per part: an isometry (~28 B) + a cuboid half-extents vector (12 B) + the
@@ -118,6 +210,7 @@ fn build_compound(grid: &OccupancyGrid, cell_m: f32) -> ColliderBuild {
         collider,
         primitives,
         build,
+        wrap,
         est_bytes,
     }
 }
@@ -136,6 +229,76 @@ mod tests {
     fn hollow_grid() -> OccupancyGrid {
         let v = fixtures::hollow_tower(vid(1));
         OccupancyGrid::from_volume(&v).unwrap().unwrap()
+    }
+
+    #[test]
+    fn build_time_covers_decomposition_not_just_the_rapier_wrap() {
+        let grid = hollow_grid();
+        for rep in [Representation::NativeVoxels, Representation::MergedCuboids] {
+            let built = build_collider(&grid, 0.25, rep);
+            // The complete build must include, and so be at least as large as,
+            // the wrap-only component it contains.
+            assert!(
+                built.build >= built.wrap,
+                "{}: complete build {:?} < wrap-only {:?}",
+                rep.label(),
+                built.build,
+                built.wrap
+            );
+            assert!(
+                built.build.as_nanos() > 0,
+                "{}: zero build time",
+                rep.label()
+            );
+        }
+    }
+
+    #[test]
+    fn choose_representation_stays_under_budget_as_merged_cuboids() {
+        // A hollow shell merges to a small handful of boxes — nowhere near
+        // MERGED_CUBOID_PRIMITIVE_BUDGET.
+        let grid = hollow_grid();
+        assert!(greedy_boxes(&grid).len() <= MERGED_CUBOID_PRIMITIVE_BUDGET);
+        assert_eq!(choose_representation(&grid), Representation::MergedCuboids);
+    }
+
+    #[test]
+    fn choose_representation_falls_back_to_native_over_budget() {
+        // ENG-69 round 7: this is the exact policy `spall_client::predict::
+        // ClientPhysics` must mirror rather than hardcoding one
+        // representation — a 3-D checkerboard cannot merge any two adjacent
+        // solid cells (`spall_mesh`'s own checkerboard fixture tests the
+        // same shape), so it produces one box per solid cell and cheaply
+        // crosses the budget without a huge fixture.
+        use spall_core::{GlobalCell, MaterialId};
+        let dim = 24u32;
+        let cells = (dim * dim * dim) as usize;
+        let mut solid = vec![false; cells];
+        let mut material = vec![MaterialId::AIR; cells];
+        for z in 0..dim {
+            for y in 0..dim {
+                for x in 0..dim {
+                    if (x + y + z) % 2 == 0 {
+                        let idx = (x + dim * (y + dim * z)) as usize;
+                        solid[idx] = true;
+                        material[idx] = fixtures::STONE;
+                    }
+                }
+            }
+        }
+        let grid = OccupancyGrid::from_solid_mask(
+            GlobalCell::new(0, 0, 0),
+            [dim, dim, dim],
+            solid,
+            material,
+        )
+        .expect("valid grid");
+        let boxes = greedy_boxes(&grid).len();
+        assert!(
+            boxes > MERGED_CUBOID_PRIMITIVE_BUDGET,
+            "checkerboard only produced {boxes} boxes — fixture needs a bigger `dim`"
+        );
+        assert_eq!(choose_representation(&grid), Representation::NativeVoxels);
     }
 
     #[test]

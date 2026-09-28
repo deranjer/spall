@@ -1,0 +1,18 @@
+[package]
+name = "spall_fluid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rayon = { path = "../../vendor/parallel/rayon-1.12.0", version = "=1.12.0" }
+spall_core.workspace = true
+spall_voxel.workspace = true
+thiserror.workspace = true
+
+[features]
+allocation-diagnostics = []
+
+[[bin]]
+name = "grid-fluid-scenario"
+path = "src/bin/grid_fluid_scenario.rs"

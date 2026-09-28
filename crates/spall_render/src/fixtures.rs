@@ -1,0 +1,731 @@
+//! Small deterministic T13 colored-room fixtures.
+
+use glam::{IVec3, Mat4, Vec3};
+use spall_mesh::{Mesh, MeshStats, MeshStrategy, Vertex};
+
+use crate::camera::Camera;
+use crate::capture::LightingStep;
+use crate::indirect::{LightingRegion, LightingUpdate, LightingVolume};
+use crate::scene::{Scene, SceneItem, default_materials};
+
+/// The single represented `0.5 m` occluder column shared by
+/// [`emitter_occlusion_scenes`] and [`rapid_destruction`], in world metres.
+pub const OCCLUDER_MIN_M: Vec3 = Vec3::new(2.0, 0.0, -6.0);
+pub const OCCLUDER_MAX_M: Vec3 = Vec3::new(2.5, 5.0, -2.0);
+
+/// The receiver-wall shell shared by [`emitter_occlusion_scenes`],
+/// [`rapid_destruction`], and [`moving_body_overlap`], in world metres.
+pub const RECEIVER_MIN_M: Vec3 = Vec3::new(-6.0, 0.0, -6.0);
+pub const RECEIVER_MAX_M: Vec3 = Vec3::new(6.0, 5.0, -5.5);
+
+#[derive(Debug, Clone, Copy)]
+pub struct LightingFixtureMetrics {
+    pub open_probe_luminance: f32,
+    pub closed_probe_luminance: f32,
+    /// Residual emitter contribution behind one represented 0.5 m wall,
+    /// divided by the unobstructed emitter contribution.
+    pub thin_wall_leakage_ratio: f32,
+}
+
+pub struct LightingFixture {
+    pub name: &'static str,
+    pub scene: Scene,
+    pub mesh_stats: MeshStats,
+    pub metrics: LightingFixtureMetrics,
+}
+
+pub fn colored_rooms(aspect: f32) -> Vec<LightingFixture> {
+    let materials = default_materials();
+    let (open_volume, closed_volume) = room_volumes();
+    let open_probe = open_volume.probe_radiance(Vec3::new(0.0, 2.0, 0.0), &materials);
+    let closed_probe = closed_volume.probe_radiance(Vec3::new(0.0, 2.0, 0.0), &materials);
+    let metrics = LightingFixtureMetrics {
+        open_probe_luminance: luminance(open_probe),
+        closed_probe_luminance: luminance(closed_probe),
+        thin_wall_leakage_ratio: thin_wall_leakage(&materials),
+    };
+
+    vec![
+        room_fixture("colored_room_open", false, aspect, open_volume, metrics),
+        room_fixture("colored_room_closed", true, aspect, closed_volume, metrics),
+    ]
+}
+
+/// Three scenes that share one non-emissive receiver wall, camera, and
+/// `128^3` cache. They differ only in the emissive term of the represented
+/// panel and in one represented `0.5 m` occluder, so a rendered
+/// `DebugView::IndirectOnly` capture isolates transported emitter radiance on
+/// a non-emissive receiver — and its leakage past the wall — entirely through
+/// the GPU trace, GPU denoise, and surface-sample path rather than the CPU
+/// probe copy.
+pub struct EmitterOcclusionScenes {
+    /// Emitter represented, no occluder: the receiver band sees the panel.
+    pub lit: Scene,
+    /// Emitter represented, one `0.5 m` wall cell column between panel and band.
+    pub occluded: Scene,
+    /// Panel cells set to plain stone: the sky/ambient floor with no transport.
+    pub dark: Scene,
+    /// Fractional image-x span `[x0, x1)` that views only receiver wall the
+    /// occluder shadows (left of the panel and of the occluder column).
+    pub receiver_band: [f32; 2],
+}
+
+pub fn emitter_occlusion_scenes(aspect: f32) -> EmitterOcclusionScenes {
+    let origin = Vec3::splat(-32.0);
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.5, 4.0),
+        yaw: 0.0,
+        pitch: 0.0,
+        aspect,
+        fov_y: 55_f32.to_radians(),
+        z_near: 0.1,
+        z_far: 40.0,
+    };
+
+    let mut receiver = Mesh::default();
+    quad(
+        &mut receiver,
+        [
+            Vec3::new(-6.0, 0.0, -5.75),
+            Vec3::new(6.0, 0.0, -5.75),
+            Vec3::new(6.0, 5.0, -5.75),
+            Vec3::new(-6.0, 5.0, -5.75),
+        ],
+        Vec3::Z,
+        1,
+    );
+    let mut panel = Mesh::default();
+    quad(
+        &mut panel,
+        [
+            Vec3::new(5.5, 1.0, -6.0),
+            Vec3::new(5.5, 1.0, -4.0),
+            Vec3::new(5.5, 4.0, -4.0),
+            Vec3::new(5.5, 4.0, -6.0),
+        ],
+        -Vec3::X,
+        10,
+    );
+
+    let volume = |panel_material: u32, occluder: bool| {
+        let mut v = LightingVolume::empty(origin);
+        // Receiver wall shell, one cache cell thick behind the raster quad.
+        fill_world_box(&mut v, RECEIVER_MIN_M, RECEIVER_MAX_M, 1);
+        // Emitter panel on the far +X side, outside the measured band.
+        fill_world_box(
+            &mut v,
+            Vec3::new(5.5, 1.0, -6.0),
+            Vec3::new(6.0, 4.0, -4.0),
+            panel_material,
+        );
+        if occluder {
+            // One represented 0.5 m wall between the panel and the band.
+            fill_world_box(&mut v, OCCLUDER_MIN_M, OCCLUDER_MAX_M, 1);
+        }
+        v
+    };
+
+    let build = |lighting: LightingVolume| {
+        let mut scene = Scene::new(camera)
+            .with_item(SceneItem::new("receiver", receiver.clone(), Mat4::IDENTITY))
+            .with_item(SceneItem::new("panel", panel.clone(), Mat4::IDENTITY))
+            .with_lighting(lighting);
+        scene.materials = default_materials();
+        scene.clear = [0.003, 0.004, 0.008, 1.0];
+        scene
+    };
+
+    EmitterOcclusionScenes {
+        lit: build(volume(10, false)),
+        occluded: build(volume(10, true)),
+        dark: build(volume(1, false)),
+        receiver_band: [0.10, 0.42],
+    }
+}
+
+/// The T14 "rapid destruction" case: the occluded emitter scene plus the
+/// [`LightingUpdate`] that removes the represented `0.5 m` occluder column. A
+/// `capture_lighting_sequence` run applying `remove_occluder` must brighten the
+/// shadowed `receiver_band`.
+pub struct RapidDestruction {
+    pub scene: Scene,
+    pub remove_occluder: LightingUpdate,
+    pub receiver_band: [f32; 2],
+}
+
+pub fn rapid_destruction(aspect: f32) -> RapidDestruction {
+    let scenes = emitter_occlusion_scenes(aspect);
+    RapidDestruction {
+        scene: scenes.occluded,
+        remove_occluder: LightingUpdate::new().dirty_bound(OCCLUDER_MIN_M, OCCLUDER_MAX_M),
+        receiver_band: scenes.receiver_band,
+    }
+}
+
+/// The T14 "moving body" case: a lighting-cache box occluder that starts in the
+/// emitter -> receiver light path (so `receiver_band` is shadowed), then moves
+/// fully out of the path and back in. A `capture_lighting_sequence` run over
+/// `steps` must show the shadowed band recover with no ghost when the body
+/// leaves, and the shadow re-form when it returns — while the receiver wall the
+/// body swept past is never erased.
+pub struct MovingBodyOverlap {
+    pub scene: Scene,
+    pub steps: Vec<LightingStep>,
+    pub receiver_band: [f32; 2],
+    /// A world point behind the in-path box whose `+x` fixed probe ray is
+    /// occluded by the box before it can reach the emitter.
+    pub probe_behind: Vec3,
+}
+
+pub fn moving_body_overlap(aspect: f32) -> MovingBodyOverlap {
+    let scenes = emitter_occlusion_scenes(aspect);
+    let receiver = LightingRegion {
+        min_m: RECEIVER_MIN_M,
+        max_m: RECEIVER_MAX_M,
+        material: 1,
+    };
+    let in_path = (OCCLUDER_MIN_M, OCCLUDER_MAX_M);
+    // Far to the -X side, well clear of the emitter -> receiver path but still
+    // inside the 64 m cache.
+    let clear = (Vec3::new(-12.0, 0.0, -6.0), Vec3::new(-11.5, 5.0, -2.0));
+
+    MovingBodyOverlap {
+        // `occluded` already has the box (== the occluder column) in the path.
+        scene: scenes.occluded,
+        steps: vec![
+            LightingStep::edit(
+                "body clears the light path",
+                LightingUpdate::moving_box(in_path, clear, 1, &[receiver]),
+            ),
+            LightingStep::edit(
+                "body returns to the light path",
+                LightingUpdate::moving_box(clear, in_path, 1, &[receiver]),
+            ),
+        ],
+        receiver_band: scenes.receiver_band,
+        probe_behind: Vec3::new(0.0, 2.5, -5.0),
+    }
+}
+
+/// The T14 moving-camera case: a static lit room viewed from a panning camera.
+/// The lighting cache is world-anchored, so camera motion must not shift or
+/// smear the accumulated lighting — a temporal run should match a
+/// no-accumulation run frame for frame.
+pub struct PanningCamera {
+    pub scene: Scene,
+    pub steps: Vec<LightingStep>,
+    pub band: [f32; 2],
+}
+
+pub fn panning_camera(aspect: f32) -> PanningCamera {
+    let mut rooms = colored_rooms(aspect);
+    let open = rooms
+        .drain(..)
+        .find(|room| room.name == "colored_room_open")
+        .expect("colored_room_open fixture");
+    let base = open.scene.camera;
+    let yawed = |yaw: f32| Camera { yaw, ..base };
+
+    PanningCamera {
+        scene: open.scene,
+        steps: vec![
+            LightingStep::view("pan left", yawed(-0.18)),
+            LightingStep::view("pan right", yawed(0.18)),
+            LightingStep::view("recentre", yawed(0.0)),
+        ],
+        band: [0.30, 0.70],
+    }
+}
+
+/// The G2 "daylight terrain" case (T15 / ENG-22 increment 4): an open, sun-lit
+/// exterior — a stepped stone ground and three pillars under the default sun,
+/// with a bright sky clear colour. No enclosure, so the indirect term is a
+/// single sky/ground bounce, in deliberate contrast to the enclosed rooms.
+pub struct DaylightTerrainScene {
+    pub scene: Scene,
+    /// A fractional image-x band over sunlit open ground.
+    pub lit_band: [f32; 2],
+    /// A fractional image-x band that a pillar's cast shadow crosses.
+    pub shadow_band: [f32; 2],
+}
+
+/// Add an axis-aligned box (six quads, outward normals) to `mesh`.
+fn prism(mesh: &mut Mesh, min: Vec3, max: Vec3, material: u32) {
+    let (a, b) = (min, max);
+    // top / bottom
+    quad(
+        mesh,
+        [
+            Vec3::new(a.x, b.y, a.z),
+            Vec3::new(a.x, b.y, b.z),
+            Vec3::new(b.x, b.y, b.z),
+            Vec3::new(b.x, b.y, a.z),
+        ],
+        Vec3::Y,
+        material,
+    );
+    quad(
+        mesh,
+        [
+            Vec3::new(a.x, a.y, a.z),
+            Vec3::new(b.x, a.y, a.z),
+            Vec3::new(b.x, a.y, b.z),
+            Vec3::new(a.x, a.y, b.z),
+        ],
+        -Vec3::Y,
+        material,
+    );
+    // +x / -x
+    quad(
+        mesh,
+        [
+            Vec3::new(b.x, a.y, a.z),
+            Vec3::new(b.x, b.y, a.z),
+            Vec3::new(b.x, b.y, b.z),
+            Vec3::new(b.x, a.y, b.z),
+        ],
+        Vec3::X,
+        material,
+    );
+    quad(
+        mesh,
+        [
+            Vec3::new(a.x, a.y, b.z),
+            Vec3::new(a.x, b.y, b.z),
+            Vec3::new(a.x, b.y, a.z),
+            Vec3::new(a.x, a.y, a.z),
+        ],
+        -Vec3::X,
+        material,
+    );
+    // +z / -z
+    quad(
+        mesh,
+        [
+            Vec3::new(a.x, a.y, b.z),
+            Vec3::new(b.x, a.y, b.z),
+            Vec3::new(b.x, b.y, b.z),
+            Vec3::new(a.x, b.y, b.z),
+        ],
+        Vec3::Z,
+        material,
+    );
+    quad(
+        mesh,
+        [
+            Vec3::new(b.x, a.y, a.z),
+            Vec3::new(a.x, a.y, a.z),
+            Vec3::new(a.x, b.y, a.z),
+            Vec3::new(b.x, b.y, a.z),
+        ],
+        -Vec3::Z,
+        material,
+    );
+}
+
+pub fn daylight_terrain_scene(aspect: f32) -> DaylightTerrainScene {
+    let origin = Vec3::splat(-32.0);
+
+    // A stepped ground: four 8 m-deep terraces rising toward -x, plus three
+    // pillars whose long shadows rake across the flat front terrace.
+    let steps: [(f32, f32, f32); 4] = [
+        (8.0, 16.0, 0.0),
+        (0.0, 8.0, 0.6),
+        (-8.0, 0.0, 1.2),
+        (-16.0, -8.0, 1.8),
+    ];
+    // Tall pillars on the front (flat) terrace; the low sun rakes their
+    // shadows across the open ground.
+    let pillars: [(f32, f32); 4] = [(2.0, -2.0), (10.0, 4.0), (5.0, 9.0), (12.0, -6.0)];
+
+    let mut mesh = Mesh::default();
+    let mut volume = LightingVolume::empty(origin);
+    for (x0, x1, top) in steps {
+        prism(
+            &mut mesh,
+            Vec3::new(x0, top - 1.0, -16.0),
+            Vec3::new(x1, top, 16.0),
+            1,
+        );
+        fill_world_box(
+            &mut volume,
+            Vec3::new(x0, top - 1.0, -16.0),
+            Vec3::new(x1, top, 16.0),
+            1,
+        );
+    }
+    for (px, pz) in pillars {
+        let min = Vec3::new(px - 1.0, 0.0, pz - 1.0);
+        let max = Vec3::new(px + 1.0, 9.0, pz + 1.0);
+        prism(&mut mesh, min, max, 1);
+        fill_world_box(&mut volume, min, max, 1);
+    }
+
+    let camera = Camera {
+        aspect,
+        fov_y: 55_f32.to_radians(),
+        z_near: 0.1,
+        z_far: 120.0,
+        ..Default::default()
+    };
+
+    let mut scene = Scene::new(camera)
+        .with_item(SceneItem::new("terrain", mesh, Mat4::IDENTITY))
+        .with_lighting(volume);
+    scene.materials = default_materials();
+    // Daytime sky (linear).
+    scene.clear = [0.30, 0.44, 0.66, 1.0];
+    // Frame from the shadow side (opposite the sun) so the pillars' long cast
+    // shadows rake across the open ground toward the camera.
+    scene.frame_all(Vec3::new(-0.55, 0.5, -1.0));
+
+    DaylightTerrainScene {
+        scene,
+        lit_band: [0.20, 0.45],
+        shadow_band: [0.55, 0.85],
+    }
+}
+
+fn room_fixture(
+    name: &'static str,
+    closed: bool,
+    aspect: f32,
+    lighting: LightingVolume,
+    metrics: LightingFixtureMetrics,
+) -> LightingFixture {
+    let mesh = room_mesh(closed);
+    let stats = MeshStats {
+        strategy: MeshStrategy::Greedy,
+        quad_count: mesh.indices.len() / 6,
+        vertex_count: mesh.vertices.len(),
+        triangle_count: mesh.indices.len() / 3,
+        surface_area_m2: if closed { 176.0 } else { 112.0 },
+        exposed_unit_faces: 0,
+        unresolved_halo_faces: 0,
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.0, 3.2),
+        yaw: 0.0,
+        pitch: -0.03,
+        aspect,
+        fov_y: 65_f32.to_radians(),
+        z_near: 0.1,
+        z_far: 20.0,
+    };
+    let mut scene = Scene::new(camera)
+        .with_item(SceneItem::new(name, mesh, Mat4::IDENTITY))
+        .with_lighting(lighting);
+    scene.materials = default_materials();
+    scene.clear = [0.003, 0.004, 0.008, 1.0];
+    LightingFixture {
+        name,
+        scene,
+        mesh_stats: stats,
+        metrics,
+    }
+}
+
+fn room_volumes() -> (LightingVolume, LightingVolume) {
+    let origin = Vec3::splat(-32.0);
+    let mut open = LightingVolume::empty(origin);
+    fill_room(&mut open, false);
+    let mut closed = LightingVolume::empty(origin);
+    fill_room(&mut closed, true);
+    (open, closed)
+}
+
+fn fill_room(volume: &mut LightingVolume, closed: bool) {
+    // 8 x 4 x 8 metre room; one clipmap cell (0.5 m) per wall.
+    fill_world_box(
+        volume,
+        Vec3::new(-4.0, -0.5, -4.0),
+        Vec3::new(4.0, 0.0, 4.0),
+        1,
+    );
+    fill_world_box(
+        volume,
+        Vec3::new(-4.0, 0.0, -4.0),
+        Vec3::new(-3.5, 4.0, 4.0),
+        8,
+    );
+    fill_world_box(
+        volume,
+        Vec3::new(3.5, 0.0, -4.0),
+        Vec3::new(4.0, 4.0, 4.0),
+        9,
+    );
+    fill_world_box(
+        volume,
+        Vec3::new(-4.0, 0.0, -4.0),
+        Vec3::new(4.0, 4.0, -3.5),
+        1,
+    );
+    fill_world_box(
+        volume,
+        Vec3::new(-1.0, 1.0, -3.5),
+        Vec3::new(1.0, 3.0, -3.0),
+        10,
+    );
+    if closed {
+        fill_world_box(
+            volume,
+            Vec3::new(-4.0, 4.0, -4.0),
+            Vec3::new(4.0, 4.5, 4.0),
+            1,
+        );
+        fill_world_box(
+            volume,
+            Vec3::new(-4.0, 0.0, 3.5),
+            Vec3::new(4.0, 4.0, 4.0),
+            1,
+        );
+    }
+}
+
+fn fill_world_box(volume: &mut LightingVolume, min: Vec3, max: Vec3, material: u32) {
+    let lo = volume.world_to_cell(min);
+    let hi = volume.world_to_cell(max - Vec3::splat(1.0e-4)) + IVec3::ONE;
+    volume.fill_box(lo, hi, material);
+}
+
+fn room_mesh(closed: bool) -> Mesh {
+    let mut mesh = Mesh::default();
+    quad(
+        &mut mesh,
+        [
+            Vec3::new(-4.0, 0.0, -4.0),
+            Vec3::new(-4.0, 0.0, 4.0),
+            Vec3::new(4.0, 0.0, 4.0),
+            Vec3::new(4.0, 0.0, -4.0),
+        ],
+        Vec3::Y,
+        1,
+    );
+    quad(
+        &mut mesh,
+        [
+            Vec3::new(-4.0, 0.0, -4.0),
+            Vec3::new(4.0, 0.0, -4.0),
+            Vec3::new(4.0, 4.0, -4.0),
+            Vec3::new(-4.0, 4.0, -4.0),
+        ],
+        Vec3::Z,
+        1,
+    );
+    quad(
+        &mut mesh,
+        [
+            Vec3::new(-4.0, 0.0, 4.0),
+            Vec3::new(-4.0, 0.0, -4.0),
+            Vec3::new(-4.0, 4.0, -4.0),
+            Vec3::new(-4.0, 4.0, 4.0),
+        ],
+        Vec3::X,
+        8,
+    );
+    quad(
+        &mut mesh,
+        [
+            Vec3::new(4.0, 0.0, -4.0),
+            Vec3::new(4.0, 0.0, 4.0),
+            Vec3::new(4.0, 4.0, 4.0),
+            Vec3::new(4.0, 4.0, -4.0),
+        ],
+        -Vec3::X,
+        9,
+    );
+    quad(
+        &mut mesh,
+        [
+            Vec3::new(-1.0, 1.0, -3.98),
+            Vec3::new(1.0, 1.0, -3.98),
+            Vec3::new(1.0, 3.0, -3.98),
+            Vec3::new(-1.0, 3.0, -3.98),
+        ],
+        Vec3::Z,
+        10,
+    );
+    if closed {
+        quad(
+            &mut mesh,
+            [
+                Vec3::new(-4.0, 4.0, 4.0),
+                Vec3::new(-4.0, 4.0, -4.0),
+                Vec3::new(4.0, 4.0, -4.0),
+                Vec3::new(4.0, 4.0, 4.0),
+            ],
+            -Vec3::Y,
+            1,
+        );
+    }
+    mesh
+}
+
+fn quad(mesh: &mut Mesh, points: [Vec3; 4], normal: Vec3, material: u32) {
+    let base = mesh.vertices.len() as u32;
+    for (i, point) in points.into_iter().enumerate() {
+        mesh.vertices.push(Vertex {
+            position: point.to_array(),
+            normal: normal.to_array(),
+            material,
+            ao: 1.0,
+            local_uv: match i {
+                0 => [0.0, 0.0],
+                1 => [1.0, 0.0],
+                2 => [1.0, 1.0],
+                _ => [0.0, 1.0],
+            },
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn luminance(rgb: Vec3) -> f32 {
+    rgb.dot(Vec3::new(0.2126, 0.7152, 0.0722))
+}
+
+fn thin_wall_leakage(materials: &[crate::scene::Material]) -> f32 {
+    let origin = Vec3::splat(-32.0);
+    let mut unblocked = LightingVolume::empty(origin);
+    fill_world_box(
+        &mut unblocked,
+        Vec3::new(3.5, 0.5, -1.0),
+        Vec3::new(4.0, 3.5, 1.0),
+        10,
+    );
+    let mut blocked = unblocked.clone();
+    fill_world_box(
+        &mut blocked,
+        Vec3::new(1.5, 0.0, -2.0),
+        Vec3::new(2.0, 4.0, 2.0),
+        1,
+    );
+    let mut baseline = LightingVolume::empty(origin);
+    fill_world_box(
+        &mut baseline,
+        Vec3::new(3.5, 0.5, -1.0),
+        Vec3::new(4.0, 3.5, 1.0),
+        1,
+    );
+    let point = Vec3::new(0.0, 2.0, 0.0);
+    let direct = (luminance(unblocked.probe_radiance(point, materials))
+        - luminance(baseline.probe_radiance(point, materials)))
+    .max(1.0e-6);
+    let leaked = (luminance(blocked.probe_radiance(point, materials))
+        - luminance(baseline.probe_radiance(point, materials)))
+    .max(0.0);
+    (leaked / direct).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_measures_closed_room_and_thin_wall_behavior() {
+        let fixtures = colored_rooms(16.0 / 9.0);
+        let metrics = fixtures[0].metrics;
+        assert!(metrics.closed_probe_luminance < metrics.open_probe_luminance);
+        assert!(
+            metrics.thin_wall_leakage_ratio <= 0.05,
+            "leak={}",
+            metrics.thin_wall_leakage_ratio
+        );
+        assert_eq!(
+            fixtures[0].scene.lighting.as_ref().unwrap().cells().len(),
+            128usize.pow(3)
+        );
+    }
+
+    #[test]
+    fn rapid_destruction_removes_the_occluder_and_reexposes_the_shadow() {
+        let rd = rapid_destruction(16.0 / 9.0);
+        let materials = default_materials();
+        let mut volume = rd.scene.lighting.as_ref().unwrap().clone();
+
+        // A point in front of the receiver wall whose +x fixed ray is blocked by
+        // the occluder column before it can reach the emitter panel.
+        let probe = Vec3::new(0.0, 2.5, -5.0);
+        let before = luminance(volume.probe_radiance(probe, &materials));
+
+        let changed = volume.apply_update(&rd.remove_occluder);
+        assert!(changed > 0, "the occluder column should have been cleared");
+        let after = luminance(volume.probe_radiance(probe, &materials));
+
+        assert!(
+            after > before + 0.05,
+            "removing the occluder did not re-expose the emitter: {before} -> {after}"
+        );
+        // Only the occluder column's cells (0.5 m x 5 m x 4 m = 1 x 10 x 8
+        // cache cells) are dirty.
+        assert!(
+            volume.dirty_len() <= 80,
+            "dirtied too much: {}",
+            volume.dirty_len()
+        );
+    }
+
+    #[test]
+    fn moving_body_overlap_tracks_the_shadow_and_keeps_the_receiver_wall() {
+        let mbo = moving_body_overlap(16.0 / 9.0);
+        let materials = default_materials();
+        let mut volume = mbo.scene.lighting.as_ref().unwrap().clone();
+        let probe = mbo.probe_behind;
+        let dim = crate::indirect::LIGHT_VOLUME_DIM as i32;
+        let flat = |v: &LightingVolume, world: Vec3| -> usize {
+            let c = v.world_to_cell(world);
+            (c.x + dim * (c.y + dim * c.z)) as usize
+        };
+        // A receiver-wall cell the in-path box overlaps in Z.
+        let swept_wall = Vec3::new(2.2, 2.0, -5.9);
+
+        let with_body = luminance(volume.probe_radiance(probe, &materials));
+
+        volume.apply_update(&mbo.steps[0].update);
+        let cleared = luminance(volume.probe_radiance(probe, &materials));
+        assert!(
+            cleared > with_body + 0.05,
+            "no ghost: shadowed probe did not recover when the body left: {with_body} -> {cleared}"
+        );
+        assert_eq!(
+            volume.cells()[flat(&volume, swept_wall)],
+            1,
+            "the receiver wall the body swept past was erased"
+        );
+
+        volume.apply_update(&mbo.steps[1].update);
+        let returned = luminance(volume.probe_radiance(probe, &materials));
+        assert!(
+            returned < cleared - 0.05,
+            "shadow did not re-form when the body returned: {cleared} -> {returned}"
+        );
+        assert!(
+            (returned - with_body).abs() < 0.02,
+            "returned state drifted from the original: {with_body} vs {returned}"
+        );
+    }
+
+    #[test]
+    fn daylight_terrain_is_open_lit_and_shadow_casting() {
+        let t = daylight_terrain_scene(16.0 / 9.0);
+        assert!(!t.scene.items[0].mesh.vertices.is_empty());
+        let volume = t.scene.lighting.as_ref().expect("terrain lighting volume");
+        assert_eq!(volume.cells().len(), 128usize.pow(3));
+
+        // A pillar occupies solid cells; the sky straight above it is open air,
+        // so the scene is an exterior, not an enclosure.
+        let pillar = Vec3::new(2.0, 3.0, -2.0);
+        let sky = Vec3::new(2.0, 20.0, -2.0);
+        let at = |w: Vec3| {
+            let c = volume.world_to_cell(w);
+            volume.cells()[(c.x + 128 * (c.y + 128 * c.z)) as usize]
+        };
+        assert_eq!(at(pillar), 1, "pillar is solid");
+        assert_eq!(at(sky), 0, "open sky above the pillar");
+
+        // A bright daytime sky clear, unlike the near-black interior fixtures.
+        assert!(t.scene.clear[2] > 0.3, "sky clear: {:?}", t.scene.clear);
+        assert_ne!(t.lit_band, t.shadow_band);
+    }
+}

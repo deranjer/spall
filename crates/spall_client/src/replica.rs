@@ -23,16 +23,17 @@
 //! held for a body the replica has not created yet, and stale or
 //! too-new-topology snapshots wait or are dropped.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Instant;
 
 use spall_core::{
     BrickCoord, CellSizeCode, EntityId, GlobalCell, MaterialId, Pose, Revision, TransactionId,
     VolumeId,
 };
 use spall_protocol::{
-    CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, Hash32, MotionSnapshot,
-    Record, RepairKey, RepairRequest, SequenceGate, TopologyOp, TopologyTransaction,
-    canonical_topology_hash,
+    BaselineBrick, BaselineCells, BaselineVolume, CanonicalBrick, CanonicalLayer, CanonicalOwner,
+    CanonicalVolume, Hash32, MotionSnapshot, Record, RepairKey, RepairRequest, SequenceGate,
+    TopologyOp, TopologyTransaction, canonical_topology_hash,
 };
 use spall_voxel::{Brick, BrickHash, EditPlan, Volume};
 
@@ -53,6 +54,16 @@ pub struct ReplicaConfig {
     pub max_extrapolation_s: f64,
     /// Fixed server tick rate, for tick↔time conversion.
     pub server_tick_hz: f64,
+    /// ENG-49: how many `before`-gapped transactions are held awaiting a repair
+    /// patch before the oldest is evicted (the server re-delivers it on the
+    /// control stream, or a fresher baseline supersedes it). Bounds retained
+    /// memory. `docs/protocol.md`: "Retain the previous consistent replica
+    /// while dependencies [...] are pending."
+    pub max_pending_repair_txns: usize,
+    /// ENG-49: a brick repair key that has been requested is not re-requested
+    /// for this many observed server ticks (`docs/protocol.md`: a `before` gap
+    /// "raises a rate-limited `RepairRequest`").
+    pub repair_request_cooldown_ticks: u64,
 }
 
 impl Default for ReplicaConfig {
@@ -62,6 +73,8 @@ impl Default for ReplicaConfig {
             interpolation_delay_s: 0.1,
             max_extrapolation_s: 0.1,
             server_tick_hz: 60.0,
+            max_pending_repair_txns: 64,
+            repair_request_cooldown_ticks: 30,
         }
     }
 }
@@ -82,6 +95,11 @@ pub enum ApplyOutcome {
     /// A `before` revision did not match; nothing was applied. The caller should
     /// send these rate-limited and wait for repair, not replay.
     NeedsRepair(Vec<RepairRequest>),
+    /// T17 increment 2: a giant split whose geometry (`transfer_id`) has not yet
+    /// arrived on a bulk stream. The transaction is held; nothing was applied.
+    /// The caller does nothing — [`ReplicaWorld::provide_bulk_split_world`]
+    /// retries it once the blob assembles.
+    AwaitingBulkSplit { transfer_id: u64 },
     /// The candidate failed to build or its result hash did not match. The live
     /// replica is unchanged.
     Rejected { reason: String },
@@ -111,11 +129,18 @@ impl From<&MotionSnapshot> for MotionState {
     }
 }
 
-/// Interpolation history for one replicated body: the two most recent accepted
-/// states.
-#[derive(Debug, Clone, Copy, Default)]
+/// States retained per body for interpolation. At the 20 Hz publish rate
+/// (3 server ticks apart) this covers well over the 100 ms render delay plus
+/// jitter, so the delayed target time always has a bracketing pair.
+const MOTION_HISTORY: usize = 8;
+
+/// Interpolation history for one replicated body: the most recent accepted
+/// states (oldest first), plus the first state ever accepted so a caller can
+/// measure how far the body has actually travelled.
+#[derive(Debug, Clone, Default)]
 pub struct MotionTrack {
-    prev: Option<MotionState>,
+    first: Option<MotionState>,
+    history: VecDeque<MotionState>,
     latest: Option<MotionState>,
 }
 
@@ -124,15 +149,174 @@ impl MotionTrack {
         match self.latest {
             Some(cur) if state.server_tick <= cur.server_tick => {}
             _ => {
-                self.prev = self.latest;
+                if self.first.is_none() {
+                    self.first = Some(state);
+                }
+                if self.history.len() == MOTION_HISTORY {
+                    self.history.pop_front();
+                }
+                self.history.push_back(state);
                 self.latest = Some(state);
             }
         }
     }
 
+    /// Pose at fractional server tick `target`: interpolated between the two
+    /// accepted states bracketing it, held at the oldest retained state if
+    /// `target` precedes them all, and extrapolated up to `max_extra_ticks`
+    /// past the newest.
+    fn sample(&self, target: f64, max_extra_ticks: f64) -> Option<Pose> {
+        let latest = self.latest?;
+        let idx = self
+            .history
+            .iter()
+            .position(|s| s.server_tick as f64 > target);
+        let (a, b) = match idx {
+            // Every state is at or before `target`: extrapolate off the newest pair.
+            None => match self
+                .history
+                .len()
+                .checked_sub(2)
+                .and_then(|i| self.history.get(i))
+            {
+                Some(&prev) => (prev, latest),
+                None => return Some(latest.pose),
+            },
+            Some(0) => return Some(self.history[0].pose),
+            Some(i) => (self.history[i - 1], self.history[i]),
+        };
+        let span = (b.server_tick - a.server_tick) as f64;
+        let t = ((target - a.server_tick as f64) / span).clamp(0.0, 1.0 + max_extra_ticks / span);
+        Some(lerp_pose(&a.pose, &b.pose, t))
+    }
+
     /// The newest accepted server tick, if any.
     pub fn latest_tick(&self) -> Option<u64> {
         self.latest.map(|s| s.server_tick)
+    }
+
+    /// Straight-line distance (metres) between the first and newest accepted
+    /// body positions. `0.0` until at least one state has been seen — a body
+    /// that only ever reports one stationary pose therefore measures `0.0`.
+    fn displacement_from_start_m(&self) -> f64 {
+        match (self.first, self.latest) {
+            (Some(a), Some(b)) => {
+                let (p, q) = (a.pose.translation_m, b.pose.translation_m);
+                let dx = q[0] - p[0];
+                let dy = q[1] - p[1];
+                let dz = q[2] - p[2];
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            }
+            _ => 0.0,
+        }
+    }
+}
+
+/// Owned copy of one body's motion history plus the sampling parameters, see
+/// [`ReplicaWorld::body_sampler`].
+#[derive(Debug, Clone)]
+pub struct BodySampler {
+    track: MotionTrack,
+    delay_ticks: f64,
+    max_extra_ticks: f64,
+    hz: f64,
+}
+
+impl BodySampler {
+    /// Server ticks per second, for advancing a sampled `render_tick`.
+    pub fn hz(&self) -> f64 {
+        self.hz
+    }
+
+    /// Whether the newest snapshot says the body is awake and moving.
+    pub fn is_moving(&self) -> bool {
+        self.track.latest.is_some_and(|s| {
+            !s.sleeping && s.linear_velocity.iter().map(|v| v * v).sum::<f32>() > 0.0025
+        })
+    }
+
+    /// Age (server ticks) of the newest snapshot at `render_tick`.
+    pub fn latest_age_ticks(&self, render_tick: f64) -> Option<f64> {
+        Some(render_tick - self.track.latest?.server_tick as f64)
+    }
+
+    /// Same result as [`ReplicaWorld::presented_pose`] at `render_tick`.
+    pub fn presented(&self, render_tick: f64, focus_m: Option<[f64; 3]>) -> Option<Pose> {
+        let delayed = self
+            .track
+            .sample(render_tick - self.delay_ticks, self.max_extra_ticks)?;
+        let Some(focus) = focus_m else {
+            return Some(delayed);
+        };
+        let latest = self.track.latest?;
+        let present = advance_pose(
+            &latest.pose,
+            latest.linear_velocity,
+            latest.angular_velocity,
+            latest.sleeping,
+            (render_tick - latest.server_tick as f64).clamp(0.0, self.max_extra_ticks),
+            self.hz,
+        );
+        let d = present
+            .translation_m
+            .iter()
+            .zip(focus)
+            .map(|(p, f)| (p - f) * (p - f))
+            .sum::<f64>()
+            .sqrt();
+        let x = ((d - ReplicaWorld::PRESENT_FULL_WITHIN_M)
+            / (ReplicaWorld::PRESENT_NONE_BEYOND_M - ReplicaWorld::PRESENT_FULL_WITHIN_M))
+            .clamp(0.0, 1.0);
+        let smooth = x * x * (3.0 - 2.0 * x);
+        Some(lerp_pose(&present, &delayed, smooth))
+    }
+}
+
+/// A body's newest snapshot, see [`ReplicaWorld::latest_motion`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LatestMotion {
+    pub pose: Pose,
+    pub server_tick: u64,
+    pub linear_velocity_m_s: [f32; 3],
+    pub angular_velocity_rad_s: [f32; 3],
+    pub sleeping: bool,
+}
+
+/// Free-running render clock in fractional server ticks. It advances with wall
+/// time and is slewed (a few percent of real time) toward "newest received tick
+/// plus half a snapshot interval", so per-packet arrival jitter averages out
+/// instead of showing up as motion stutter. It is never allowed to run backwards
+/// and only snaps when it is wildly off (join, stall, or reconnect).
+#[derive(Debug, Clone, Copy, Default)]
+struct RenderClock {
+    last: Option<Instant>,
+    ticks: f64,
+}
+
+impl RenderClock {
+    /// Half of the default 3-tick publish interval: the average age of the
+    /// newest snapshot at an arbitrary instant.
+    const TARGET_LEAD_TICKS: f64 = 1.5;
+    const MAX_SLEW: f64 = 0.05;
+    const SNAP_ERROR_TICKS: f64 = 12.0;
+
+    fn advance(&mut self, now: Instant, newest_tick: u64, hz: f64) -> f64 {
+        let target = newest_tick as f64 + Self::TARGET_LEAD_TICKS;
+        let Some(last) = self.last else {
+            self.last = Some(now);
+            self.ticks = target;
+            return self.ticks;
+        };
+        let dt_ticks = now.saturating_duration_since(last).as_secs_f64() * hz;
+        self.last = Some(last.max(now));
+        let error = target - (self.ticks + dt_ticks);
+        if error.abs() > Self::SNAP_ERROR_TICKS {
+            self.ticks = target;
+        } else {
+            let slew = (error * 0.1).clamp(-Self::MAX_SLEW, Self::MAX_SLEW) * dt_ticks;
+            self.ticks += dt_ticks + slew;
+        }
+        self.ticks
     }
 }
 
@@ -160,8 +344,34 @@ pub struct ReplicaWorld {
     /// Newest held snapshot for a body that does not exist yet: entity → (snap,
     /// server tick it was received at).
     pending_snapshots: BTreeMap<u64, (MotionSnapshot, u64)>,
+    /// ENG-49: committed transactions whose `before` revisions did not match
+    /// live state, held (keyed by `TransactionId`) for retry once a repair
+    /// patch or the missing predecessor lands. A `before` gap must never
+    /// silently drop a committed transaction's ops. Bounded by
+    /// `config.max_pending_repair_txns`.
+    pending_repair_txns: BTreeMap<u64, TopologyTransaction>,
+    /// T17 increment 2: a giant-split marker transaction held (keyed by its
+    /// `transfer_id`) until the out-of-band `BaselineWorld` for that
+    /// `transfer_id` arrives on a bulk stream. Bounded by
+    /// `config.max_pending_repair_txns`.
+    pending_bulk_split_txns: BTreeMap<u64, TopologyTransaction>,
+    /// T17 increment 2: an assembled bulk-split `BaselineWorld` waiting for its
+    /// marker transaction (or retained briefly after applying it), keyed by
+    /// `transfer_id`.
+    bulk_split_worlds: BTreeMap<u64, spall_protocol::baseline::BaselineWorld>,
+    /// ENG-49: brick repair keys already asked about and not yet resolved →
+    /// the `now_tick` the `RepairRequest` was emitted, so an identical gap
+    /// inside `config.repair_request_cooldown_ticks` is not re-requested.
+    repair_requests_inflight: BTreeMap<(u64, i64, i64, i64), u64>,
     /// Highest server tick the client has observed on any record.
     now_tick: u64,
+    /// Continuously advancing render time; see [`ReplicaWorld::render_tick`].
+    render_clock: RenderClock,
+    /// T23 / G3 row 7, slice B: per-volume digests of bricks evicted from this
+    /// replica's cache. Empty by default (client eviction is off until a later
+    /// slice), so `world_hash` / transaction validation are byte-identical to
+    /// today. Keyed by raw volume id. See `docs/reports/G3-residency-hash.md`.
+    evicted: BTreeMap<u64, spall_voxel::EvictedBricks>,
 }
 
 impl ReplicaWorld {
@@ -186,7 +396,13 @@ impl ReplicaWorld {
             applied_tx: BTreeSet::new(),
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
+            pending_repair_txns: BTreeMap::new(),
+            pending_bulk_split_txns: BTreeMap::new(),
+            bulk_split_worlds: BTreeMap::new(),
+            repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
+            render_clock: RenderClock::default(),
+            evicted: BTreeMap::new(),
         }
     }
 
@@ -206,7 +422,13 @@ impl ReplicaWorld {
             applied_tx: BTreeSet::new(),
             control_gate: SequenceGate::new(),
             pending_snapshots: BTreeMap::new(),
+            pending_repair_txns: BTreeMap::new(),
+            pending_bulk_split_txns: BTreeMap::new(),
+            bulk_split_worlds: BTreeMap::new(),
+            repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
+            render_clock: RenderClock::default(),
+            evicted: BTreeMap::new(),
         }
     }
 
@@ -316,6 +538,15 @@ impl ReplicaWorld {
         self.applied_tx = BTreeSet::new();
         self.control_gate = SequenceGate::new();
         self.pending_snapshots = BTreeMap::new();
+        // A fresh baseline supersedes any transaction that was held pending a
+        // repair or a bulk-split blob against the old world.
+        self.pending_repair_txns = BTreeMap::new();
+        self.pending_bulk_split_txns = BTreeMap::new();
+        self.bulk_split_worlds = BTreeMap::new();
+        self.repair_requests_inflight = BTreeMap::new();
+        // A full baseline replaces the whole logical state, digest namespace
+        // included (G3-residency-hash.md lifecycle).
+        self.evicted = BTreeMap::new();
         self.now_tick = world.checkpoint_tick;
         Ok(())
     }
@@ -336,11 +567,22 @@ impl ReplicaWorld {
         use spall_protocol::BaselineCells;
 
         world.validate().map_err(|e| e.to_string())?;
+
+        // ENG-49: stage every brick into a clone of each named volume and swap
+        // the clones in only once the whole patch has built. A patch that fails
+        // part-way (unknown volume, malformed brick, out-of-bounds coord) never
+        // half-replaces live state — the repair either restores exact parity or
+        // changes nothing.
+        let mut staged: BTreeMap<u64, Volume> = BTreeMap::new();
         for bv in &world.volumes {
             let vid = bv.volume_id;
-            let volume = self.volumes.get_mut(&vid.get()).ok_or_else(|| {
-                format!("repair patch names volume {vid} the replica does not hold")
-            })?;
+            if let std::collections::btree_map::Entry::Vacant(slot) = staged.entry(vid.get()) {
+                let base = self.volumes.get(&vid.get()).cloned().ok_or_else(|| {
+                    format!("repair patch names volume {vid} the replica does not hold")
+                })?;
+                slot.insert(base);
+            }
+            let volume = staged.get_mut(&vid.get()).expect("just staged");
             for bb in &bv.bricks {
                 let cells: Vec<MaterialId> = match &bb.cells {
                     BaselineCells::Uniform(id) => {
@@ -362,7 +604,103 @@ impl ReplicaWorld {
                     .map_err(|e| format!("repair brick insert into {vid} failed: {e}"))?;
             }
         }
+
+        for (vid, volume) in staged {
+            self.volumes.insert(vid, volume);
+        }
+        // T23 / G3 row 7, slice E: a repair patch is authoritative for every
+        // brick it carries. If this replica had evicted one of them (digest
+        // retained), the patch supersedes that digest — drop it so the reloaded
+        // brick counts as resident, not double-counted through `logical_bricks`.
+        for bv in &world.volumes {
+            if let Some(ev) = self.evicted.get_mut(&bv.volume_id.get())
+                && let Some(v) = self.volumes.get(&bv.volume_id.get())
+            {
+                ev.drop_resident(v);
+            }
+        }
+        // These repair keys are now resolved; a later gap on the same brick may
+        // request again immediately.
+        for bv in &world.volumes {
+            for bb in &bv.bricks {
+                self.repair_requests_inflight.remove(&(
+                    bv.volume_id.get(),
+                    bb.coord[0],
+                    bb.coord[1],
+                    bb.coord[2],
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Re-applies every transaction held pending a repair (see
+    /// [`ApplyOutcome::NeedsRepair`]) whose `before` revisions now match live
+    /// state. Call after [`Self::apply_baseline_patch`] or after delivering a
+    /// missing predecessor transaction. Returns one `(TransactionId,
+    /// ApplyOutcome)` per retried transaction so the caller can forward any
+    /// fresh [`RepairRequest`]s and update its counters. A transaction that
+    /// still gaps stays held (bounded); one that publishes, duplicates, or
+    /// rejects is dropped from the pending set.
+    pub fn retry_pending_repair_txns(&mut self) -> Vec<(TransactionId, ApplyOutcome)> {
+        let ids: Vec<u64> = self.pending_repair_txns.keys().copied().collect();
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(tx) = self.pending_repair_txns.get(&id).cloned() else {
+                continue;
+            };
+            let tid = tx.transaction_id;
+            let outcome = self.apply_transaction(&tx);
+            if !matches!(outcome, ApplyOutcome::NeedsRepair(_)) {
+                self.pending_repair_txns.remove(&id);
+            }
+            out.push((tid, outcome));
+        }
+        out
+    }
+
+    /// Transactions currently held awaiting a repair patch (diagnostics).
+    pub fn pending_repair_txn_count(&self) -> usize {
+        self.pending_repair_txns.len()
+    }
+
+    /// T17 increment 2: hand the replica the assembled out-of-band
+    /// [`spall_protocol::baseline::BaselineWorld`] for a giant split's
+    /// `transfer_id`, then retry the marker transaction that was held on it.
+    /// Returns the retry outcome (empty if none was held).
+    pub fn provide_bulk_split_world(
+        &mut self,
+        transfer_id: u64,
+        world: spall_protocol::baseline::BaselineWorld,
+    ) -> Vec<(TransactionId, ApplyOutcome)> {
+        self.bulk_split_worlds.insert(transfer_id, world);
+        let Some(tx) = self.pending_bulk_split_txns.get(&transfer_id).cloned() else {
+            return Vec::new();
+        };
+        let tid = tx.transaction_id;
+        let outcome = self.apply_transaction(&tx);
+        if !matches!(outcome, ApplyOutcome::AwaitingBulkSplit { .. }) {
+            self.pending_bulk_split_txns.remove(&transfer_id);
+        }
+        vec![(tid, outcome)]
+    }
+
+    /// Giant-split marker transactions currently held awaiting their bulk blob
+    /// (diagnostics).
+    pub fn pending_bulk_split_txn_count(&self) -> usize {
+        self.pending_bulk_split_txns.len()
+    }
+
+    /// Holds a giant-split marker transaction keyed by `transfer_id`, bounded
+    /// like the repair-hold set.
+    fn retain_pending_bulk_split_txn(&mut self, transfer_id: u64, tx: TopologyTransaction) {
+        self.pending_bulk_split_txns.insert(transfer_id, tx);
+        while self.pending_bulk_split_txns.len() > self.config.max_pending_repair_txns {
+            let Some((&oldest, _)) = self.pending_bulk_split_txns.iter().next() else {
+                break;
+            };
+            self.pending_bulk_split_txns.remove(&oldest);
+        }
     }
 
     /// Adds a body that exists in the baseline scene.
@@ -387,7 +725,7 @@ impl ReplicaWorld {
         let volumes: Vec<CanonicalVolume> = self
             .volumes
             .values()
-            .map(|v| canonical_volume(v, self.owner[&v.id().get()]))
+            .map(|v| canonical_logical_volume(v, self.evicted(v.id()), self.owner[&v.id().get()]))
             .collect();
         canonical_topology_hash(&volumes)
     }
@@ -395,9 +733,102 @@ impl ReplicaWorld {
     /// The canonical hash of one volume.
     pub fn volume_hash(&self, volume: VolumeId) -> Option<Hash32> {
         let v = self.volumes.get(&volume.get())?;
-        Some(canonical_topology_hash(&[canonical_volume(
+        Some(canonical_topology_hash(&[canonical_logical_volume(
             v,
+            self.evicted(volume),
             self.owner[&volume.get()],
+        )]))
+    }
+
+    /// The terrain volume id.
+    pub fn terrain_volume_id(&self) -> VolumeId {
+        self.terrain_id
+    }
+
+    /// The newest server tick this replica has observed, from either a
+    /// committed transaction or a motion snapshot — whichever arrived last.
+    /// `0` before anything has been applied. Unlike
+    /// [`Self::latest_motion_tick`] (per body), this is replica-wide: a
+    /// caller polling for "has the replica caught up to tick N yet" (e.g. a
+    /// graphical capture harness deciding when to render) does not need to
+    /// pick one body to watch.
+    pub fn now_tick(&self) -> u64 {
+        self.now_tick
+    }
+
+    /// Fractional server tick to hand [`Self::interpolated_pose`] for a frame
+    /// drawn at `now`. Unlike [`Self::now_tick`] (which only moves when a
+    /// snapshot lands, so sampling it makes bodies advance in snapshot-sized
+    /// steps), this runs continuously at the server tick rate and is only
+    /// slewed gently toward the observed stream, so motion stays smooth
+    /// between and across snapshot arrivals.
+    pub fn render_tick(&mut self, now: Instant) -> f64 {
+        self.render_clock
+            .advance(now, self.now_tick, self.config.server_tick_hz)
+    }
+
+    /// The live terrain volume, for building a client-side collision world (T19
+    /// prediction). `None` before a baseline is installed.
+    pub fn terrain_volume(&self) -> Option<&Volume> {
+        self.volumes.get(&self.terrain_id.get())
+    }
+
+    /// Any live volume by stable id. Streamed client caches use this to account
+    /// resident bricks without reaching into replica internals.
+    pub fn volume(&self, volume: VolumeId) -> Option<&Volume> {
+        self.volumes.get(&volume.get())
+    }
+
+    /// Stable `(entity, volume)` ownership pairs for complete-body residency.
+    pub fn body_volumes(&self) -> impl Iterator<Item = (EntityId, VolumeId)> + '_ {
+        self.bodies.values().map(|b| (b.entity, b.volume_id))
+    }
+
+    /// Evicts one client brick, retaining its `(revision, content_hash)` digest
+    /// so `world_hash` / transaction validation still see it. Authoritative
+    /// transactions that later *edit* it take the existing bounded
+    /// repair/baseline path; absence is not air.
+    pub fn evict_brick(&mut self, volume: VolumeId, coord: BrickCoord) -> bool {
+        let Some(v) = self.volumes.get_mut(&volume.get()) else {
+            return false;
+        };
+        let Ok(digest) = spall_voxel::BrickDigest::capture(v, coord) else {
+            return false; // not resident
+        };
+        if self
+            .evicted
+            .entry(volume.get())
+            .or_default()
+            .record(coord, digest)
+            .is_err()
+        {
+            return false;
+        }
+        v.evict_brick(coord);
+        true
+    }
+
+    /// Retained evicted-brick digests for `volume` (empty by default).
+    pub fn evicted(&self, volume: VolumeId) -> &spall_voxel::EvictedBricks {
+        self.evicted
+            .get(&volume.get())
+            .unwrap_or_else(|| empty_evicted())
+    }
+
+    /// The canonical hash of the terrain volume — a cheap dirty check for
+    /// rebuilding the predicted-movement collider after an edit.
+    pub fn terrain_hash(&self) -> Option<Hash32> {
+        self.volume_hash(self.terrain_id)
+    }
+
+    /// Canonical hash of the terrain bricks that are resident *right now*.
+    /// Unlike [`Self::terrain_hash`], this intentionally changes on cache
+    /// eviction/reload and is used only to invalidate derived client collision.
+    pub fn terrain_resident_hash(&self) -> Option<Hash32> {
+        let volume = self.volume(self.terrain_id)?;
+        let owner = *self.owner.get(&self.terrain_id.get())?;
+        Some(canonical_topology_hash(&[canonical_resident_volume(
+            volume, owner,
         )]))
     }
 
@@ -421,6 +852,25 @@ impl ReplicaWorld {
         self.volumes.values().map(solid_cells).sum()
     }
 
+    /// Solid cells in the volume owned by `entity`, or `None` if that body is
+    /// not resident. Used to confirm a body-targeted cut actually removed
+    /// material from the body it claimed.
+    pub fn body_solid_cells(&self, entity: EntityId) -> Option<u64> {
+        let vol = self.volume_of_entity.get(&entity.get())?;
+        self.volumes.get(vol).map(solid_cells)
+    }
+
+    /// Largest straight-line distance (metres) any replicated body has moved
+    /// from its first observed position to its most recent one. `0.0` when no
+    /// body has produced two distinct poses — a body that only ever reports a
+    /// stationary snapshot does not count as motion.
+    pub fn max_body_displacement_m(&self) -> f64 {
+        self.bodies
+            .values()
+            .map(|b| b.track.displacement_from_start_m())
+            .fold(0.0_f64, f64::max)
+    }
+
     // --- transaction application --------------------------------------------
 
     /// Applies one committed transaction. See [`ApplyOutcome`].
@@ -442,35 +892,74 @@ impl ReplicaWorld {
             };
         }
 
+        // T17 increment 2: a giant-split marker transaction carries no geometry
+        // inline — its child volumes and source patch are in an out-of-band
+        // `BaselineWorld` delivered on a bulk stream under `transfer_id`. Hold
+        // the whole transaction until that blob has assembled.
+        if let Some(transfer_id) = tx.ops.iter().find_map(|op| op.bulk_transfer_id())
+            && !self.bulk_split_worlds.contains_key(&transfer_id)
+        {
+            self.retain_pending_bulk_split_txn(transfer_id, tx.clone());
+            return ApplyOutcome::AwaitingBulkSplit { transfer_id };
+        }
+
         // 1. Every `before` revision must match the live replica exactly. A
         //    `before` entry of `Revision::ZERO` means the brick was absent
         //    server-side, so an absent replica brick is a match.
         let mut repairs = Vec::new();
+        let mut ahead = false;
+        let mut exact = 0usize;
         for br in &tx.before {
             let current = self
                 .volumes
                 .get(&br.volume.get())
                 .and_then(|v| v.brick_revision(br.coord).ok().flatten());
-            let matches = match (current, br.revision) {
-                (None, Revision::ZERO) => true,
-                (Some(have), want) => have == want,
-                _ => false,
-            };
-            if !matches {
-                repairs.push(RepairRequest {
-                    key: RepairKey::Brick {
-                        volume: br.volume,
-                        coord: br.coord,
-                    },
-                    expected_revision: br.revision,
-                    current_revision: current.unwrap_or(Revision::ZERO),
-                    expected_hash: Hash32::ZERO,
-                    current_hash: self.volume_hash(br.volume).unwrap_or(Hash32::ZERO),
-                });
+            let have = current.unwrap_or(Revision::ZERO);
+            if have == br.revision {
+                exact += 1;
+                continue; // exact match (incl. absent == Revision::ZERO)
             }
+            if have > br.revision {
+                // ENG-49: the replica is already *past* this transaction on
+                // this brick — a later baseline / repair patch moved it
+                // forward. Replaying the transaction's ops would double-apply.
+                ahead = true;
+                continue;
+            }
+            repairs.push(RepairRequest {
+                key: RepairKey::Brick {
+                    volume: br.volume,
+                    coord: br.coord,
+                },
+                expected_revision: br.revision,
+                current_revision: have,
+                expected_hash: Hash32::ZERO,
+                current_hash: self.volume_hash(br.volume).unwrap_or(Hash32::ZERO),
+            });
+        }
+        if ahead && exact == 0 && repairs.is_empty() {
+            // Every brick this transaction references is *strictly past* it — a
+            // later baseline / repair patch already incorporated the whole
+            // transaction. Record it applied and drop any pending hold so the
+            // replica does not loop re-requesting a repair it cannot use.
+            self.applied_tx.insert(tx.transaction_id.get());
+            self.pending_repair_txns.remove(&tx.transaction_id.get());
+            return ApplyOutcome::Duplicate;
         }
         if !repairs.is_empty() {
-            return ApplyOutcome::NeedsRepair(repairs);
+            // ENG-49: hold the whole transaction for retry once the gap is
+            // healed — a `before` mismatch must never drop a committed
+            // transaction's ops (a multi-brick edit whose other bricks matched
+            // would otherwise be lost). And rate-limit the outbound
+            // `RepairRequest`s: a key already asked about within the cooldown is
+            // not re-requested (`docs/protocol.md`: a `before` gap "raises a
+            // rate-limited `RepairRequest`").
+            self.retain_pending_repair_txn(tx.clone());
+            let fresh: Vec<RepairRequest> = repairs
+                .into_iter()
+                .filter(|r| self.should_request_repair(&r.key))
+                .collect();
+            return ApplyOutcome::NeedsRepair(fresh);
         }
 
         // 2. Replay every op into an isolated candidate.
@@ -484,7 +973,12 @@ impl ReplicaWorld {
         };
         let mut candidate: BTreeMap<u64, Volume> = self.volumes.clone();
         let mut new_owner: Vec<(VolumeId, EntityId)> = Vec::new();
-        if let Err(reason) = replay_ops(&tx.ops, &mut candidate, &mut new_owner, cell_size) {
+        let bulk = tx
+            .ops
+            .iter()
+            .find_map(|op| op.bulk_transfer_id())
+            .and_then(|tid| self.bulk_split_worlds.get(&tid));
+        if let Err(reason) = replay_ops(&tx.ops, &mut candidate, &mut new_owner, cell_size, bulk) {
             return ApplyOutcome::Rejected { reason };
         }
 
@@ -506,7 +1000,17 @@ impl ReplicaWorld {
                     reason: format!("result hash names missing volume {}", vh.volume),
                 };
             };
-            if canonical_topology_hash(&[canonical_volume(v, owner)]) != vh.hash {
+            // Over the logical brick set: an untouched brick this replica has
+            // evicted still contributes its retained digest, so a server /
+            // client cache-placement difference does not fail validation. The
+            // replay above never wrote an evicted brick (a `before` naming one
+            // takes the repair path first).
+            if canonical_topology_hash(&[canonical_logical_volume(
+                v,
+                self.evicted(vh.volume),
+                owner,
+            )]) != vh.hash
+            {
                 return ApplyOutcome::Rejected {
                     reason: format!("result hash mismatch for volume {}", vh.volume),
                 };
@@ -515,6 +1019,15 @@ impl ReplicaWorld {
 
         // 4. Commit the candidate. Nothing above mutated live state.
         self.volumes = candidate;
+        // slice E: a committed op that wrote into a brick this replica had
+        // evicted (its `before` gap was healed by a repair patch just before
+        // this retry) makes that brick resident again — its retained digest is
+        // superseded by the committed geometry.
+        for (vid, ev) in self.evicted.iter_mut() {
+            if let Some(v) = self.volumes.get(vid) {
+                ev.drop_resident(v);
+            }
+        }
         for (vid, entity) in &new_owner {
             self.owner.insert(vid.get(), CanonicalOwner::Body(*entity));
             self.volume_of_entity.insert(entity.get(), vid.get());
@@ -528,6 +1041,24 @@ impl ReplicaWorld {
             );
         }
         self.applied_tx.insert(tx.transaction_id.get());
+
+        // ENG-49: this transaction is applied — drop it from the pending-repair
+        // hold and clear any repair keys its `before` bricks were blocked on so
+        // a genuine later gap on the same brick can re-request at once.
+        self.pending_repair_txns.remove(&tx.transaction_id.get());
+        // T17 increment 2: release the giant-split hold and its (large) blob.
+        if let Some(tid) = tx.ops.iter().find_map(|op| op.bulk_transfer_id()) {
+            self.pending_bulk_split_txns.remove(&tid);
+            self.bulk_split_worlds.remove(&tid);
+        }
+        for br in &tx.before {
+            self.repair_requests_inflight.remove(&(
+                br.volume.get(),
+                br.coord.x,
+                br.coord.y,
+                br.coord.z,
+            ));
+        }
 
         // 5. Retire any body (including the source) that this left with no
         //    solid cell — a late motion packet can never bring it back.
@@ -620,25 +1151,62 @@ impl ReplicaWorld {
     /// `max_extrapolation_s`, then holds. `None` if the body has no state yet.
     pub fn interpolated_pose(&self, entity: EntityId, render_tick: f64) -> Option<Pose> {
         let track = &self.bodies.get(&entity.get())?.track;
-        let latest = track.latest?;
         let delay_ticks = self.config.interpolation_delay_s * self.config.server_tick_hz;
-        let target = render_tick - delay_ticks;
-
-        let Some(prev) = track.prev else {
-            return Some(latest.pose);
-        };
-        let (a, b) = if prev.server_tick <= latest.server_tick {
-            (prev, latest)
-        } else {
-            (latest, prev)
-        };
-        if b.server_tick == a.server_tick {
-            return Some(b.pose);
-        }
-        let span = (b.server_tick - a.server_tick) as f64;
         let max_extra = self.config.max_extrapolation_s * self.config.server_tick_hz;
-        let t = ((target - a.server_tick as f64) / span).clamp(0.0, 1.0 + max_extra / span);
-        Some(lerp_pose(&a.pose, &b.pose, t))
+        track.sample(render_tick - delay_ticks, max_extra)
+    }
+
+    /// Bodies within this distance of the player are drawn at the server's
+    /// *present* estimate, fully.
+    pub const PRESENT_FULL_WITHIN_M: f64 = 2.0;
+    /// Beyond this distance bodies are drawn `interpolation_delay_s` in the past.
+    pub const PRESENT_NONE_BEYOND_M: f64 = 5.0;
+
+    /// Pose to draw `entity` at. Far from `focus_m` (the player's predicted
+    /// feet) this is the smooth, render-delayed [`Self::interpolated_pose`].
+    /// The character, though, collides with bodies at their *present* poses
+    /// (the server sweeps it against them as they are now), and a body the
+    /// player is pushing at walking speed is ~0.5 m ahead of where a 100 ms
+    /// delayed draw shows it: the player stops against nothing visible. So
+    /// inside [`Self::PRESENT_FULL_WITHIN_M`] the newest snapshot is advanced
+    /// to `render_tick` along its own velocity instead, cross-faded to the
+    /// delayed pose out to [`Self::PRESENT_NONE_BEYOND_M`].
+    pub fn presented_pose(
+        &self,
+        entity: EntityId,
+        render_tick: f64,
+        focus_m: Option<[f64; 3]>,
+    ) -> Option<Pose> {
+        self.body_sampler(entity)?.presented(render_tick, focus_m)
+    }
+
+    /// A self-contained copy of what [`Self::presented_pose`] reads for
+    /// `entity`, so a caller can drop the replica lock and still pose the body
+    /// at any later `render_tick` (the renderer re-poses at each frame's own
+    /// timestamp instead of reusing a worker's stale sample).
+    pub fn body_sampler(&self, entity: EntityId) -> Option<BodySampler> {
+        let track = self.bodies.get(&entity.get())?.track.clone();
+        track.latest?;
+        Some(BodySampler {
+            track,
+            delay_ticks: self.config.interpolation_delay_s * self.config.server_tick_hz,
+            max_extra_ticks: self.config.max_extrapolation_s * self.config.server_tick_hz,
+            hz: self.config.server_tick_hz,
+        })
+    }
+
+    /// The newest snapshot for `entity`, with the velocities needed to advance
+    /// it to any nearby server tick (character prediction collides with bodies
+    /// at the tick it is simulating, not at the 100 ms render-delayed pose).
+    pub(crate) fn latest_motion(&self, entity: EntityId) -> Option<LatestMotion> {
+        let latest = self.bodies.get(&entity.get())?.track.latest?;
+        Some(LatestMotion {
+            pose: latest.pose,
+            server_tick: latest.server_tick,
+            linear_velocity_m_s: latest.linear_velocity,
+            angular_velocity_rad_s: latest.angular_velocity,
+            sleeping: latest.sleeping,
+        })
     }
 
     /// The newest raw motion state's server tick for `entity`.
@@ -651,6 +1219,41 @@ impl ReplicaWorld {
         let window = self.config.pending_snapshot_ticks;
         self.pending_snapshots
             .retain(|_, (_, received)| now.saturating_sub(*received) <= window);
+    }
+
+    /// ENG-49: holds `tx` for retry once its `before` gap is repaired, keyed by
+    /// id so a re-sent transaction does not stack. Past
+    /// `config.max_pending_repair_txns` the lowest-id (oldest) hold is evicted;
+    /// the server re-delivers it on the control stream or a fresher baseline
+    /// covers it.
+    fn retain_pending_repair_txn(&mut self, tx: TopologyTransaction) {
+        self.pending_repair_txns.insert(tx.transaction_id.get(), tx);
+        while self.pending_repair_txns.len() > self.config.max_pending_repair_txns {
+            let Some((&oldest, _)) = self.pending_repair_txns.iter().next() else {
+                break;
+            };
+            self.pending_repair_txns.remove(&oldest);
+        }
+    }
+
+    /// ENG-49: `true` if a `RepairRequest` for `key` should be emitted now —
+    /// i.e. it is not already in flight, or its cooldown has elapsed. Records
+    /// the emission tick as a side effect when it returns `true`.
+    fn should_request_repair(&mut self, key: &RepairKey) -> bool {
+        let RepairKey::Brick { volume, coord } = key else {
+            return true;
+        };
+        let k = (volume.get(), coord.x, coord.y, coord.z);
+        let due = match self.repair_requests_inflight.get(&k) {
+            Some(&sent) => {
+                self.now_tick.saturating_sub(sent) >= self.config.repair_request_cooldown_ticks
+            }
+            None => true,
+        };
+        if due {
+            self.repair_requests_inflight.insert(k, self.now_tick);
+        }
+        due
     }
 }
 
@@ -674,7 +1277,14 @@ fn replay_ops(
     candidate: &mut BTreeMap<u64, Volume>,
     new_owner: &mut Vec<(VolumeId, EntityId)>,
     cell_size: CellSizeCode,
+    bulk: Option<&spall_protocol::baseline::BaselineWorld>,
 ) -> Result<(), String> {
+    // T17 increment 2: the out-of-band `BaselineVolume` for one volume of a
+    // giant bulk split.
+    let bulk_volume = |id: VolumeId| -> Result<&BaselineVolume, String> {
+        bulk.and_then(|w| w.volumes.iter().find(|v| v.volume_id == id))
+            .ok_or_else(|| format!("bulk split baseline is missing volume {id}"))
+    };
     let mut pending: Option<PendingGroup> = None;
 
     for op in ops {
@@ -730,9 +1340,82 @@ fn replay_ops(
                         .push((GlobalCell::new(x, start.y, start.z), *material));
                 }
             }
+            // T17: an oversized split's child geometry arrives as a compressed
+            // `BaselineVolume` — inline (increment 1) or from the out-of-band
+            // bulk world (increment 2). Rebuild the child volume from it — same
+            // shape (bounded, authoritative revisions) as the `SplitOff` path.
+            TopologyOp::SplitOffBaseline {
+                child,
+                child_entity,
+                blob,
+                ..
+            } => {
+                flush(pending.take(), candidate, cell_size)?;
+                let bv = BaselineVolume::decode_compressed(blob)
+                    .map_err(|e| format!("split baseline blob for volume {child}: {e}"))?;
+                install_split_child(candidate, new_owner, *child, *child_entity, &bv)?;
+            }
+            TopologyOp::SplitOffBulkBaseline {
+                child,
+                child_entity,
+                ..
+            } => {
+                flush(pending.take(), candidate, cell_size)?;
+                let bv = bulk_volume(*child)?;
+                install_split_child(candidate, new_owner, *child, *child_entity, bv)?;
+            }
+            // T17: the source side of an oversized split — overwrite the named
+            // source bricks in the candidate with their post-cut state.
+            TopologyOp::SourcePatchBaseline { source, blob } => {
+                flush(pending.take(), candidate, cell_size)?;
+                let bv = BaselineVolume::decode_compressed(blob)
+                    .map_err(|e| format!("source patch baseline blob for volume {source}: {e}"))?;
+                patch_split_source(candidate, *source, &bv)?;
+            }
+            TopologyOp::SourcePatchBulkBaseline { source, .. } => {
+                flush(pending.take(), candidate, cell_size)?;
+                let bv = bulk_volume(*source)?;
+                patch_split_source(candidate, *source, bv)?;
+            }
         }
     }
     flush(pending.take(), candidate, cell_size)
+}
+
+/// Insert a split child `Volume` (rebuilt from a `BaselineVolume`) into the
+/// candidate and register its new owner.
+fn install_split_child(
+    candidate: &mut BTreeMap<u64, Volume>,
+    new_owner: &mut Vec<(VolumeId, EntityId)>,
+    child: VolumeId,
+    child_entity: EntityId,
+    bv: &BaselineVolume,
+) -> Result<(), String> {
+    let child_volume = volume_from_baseline_volume(bv)?;
+    new_owner.push((child, child_entity));
+    candidate.insert(child.get(), child_volume);
+    Ok(())
+}
+
+/// Overwrite a split source's affected bricks in the candidate from a
+/// `BaselineVolume`.
+fn patch_split_source(
+    candidate: &mut BTreeMap<u64, Volume>,
+    source: VolumeId,
+    bv: &BaselineVolume,
+) -> Result<(), String> {
+    let volume = candidate
+        .get_mut(&source.get())
+        .ok_or_else(|| format!("source patch targets unknown volume {source}"))?;
+    for bb in &bv.bricks {
+        volume
+            .insert_brick(
+                BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                baseline_brick(bb)?,
+            )
+            .map_err(|e| format!("source patch brick insert failed: {e}"))?;
+    }
+    Ok(())
 }
 
 fn flush(
@@ -799,25 +1482,116 @@ fn apply_writes(
         .map_err(|e| format!("cell run replay failed: {e}"))
 }
 
-// --- canonical form (mirrors spall_sim::world::SimWorld::canonical_volume) ---
+/// One [`BaselineBrick`] as a `spall_voxel::Brick` at its authoritative revision.
+/// Shared by the late-join install, the hash-repair patch, and the T17
+/// `SplitOffBaseline` / `SourcePatchBaseline` op replay.
+fn baseline_brick(bb: &BaselineBrick) -> Result<Brick, String> {
+    let cells: Vec<MaterialId> = match &bb.cells {
+        BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
+        BaselineCells::Dense(raw) => {
+            if raw.len() != spall_core::CELLS_PER_BRICK {
+                return Err(format!(
+                    "baseline brick has {} cells, expected {}",
+                    raw.len(),
+                    spall_core::CELLS_PER_BRICK
+                ));
+            }
+            raw.iter().copied().map(MaterialId).collect()
+        }
+    };
+    Ok(Brick::restored(&cells, Revision(bb.revision), bb.edited))
+}
 
-fn canonical_volume(v: &Volume, owner: CanonicalOwner) -> CanonicalVolume {
-    let mut bricks = Vec::new();
-    for coord in v.resident_brick_coords() {
-        let snap = v
-            .snapshot_brick(coord)
-            .ok()
-            .flatten()
-            .expect("coord came from the resident set");
-        bricks.push(CanonicalBrick {
+/// Rebuild a whole `Volume` from a decoded [`BaselineVolume`] — the T17
+/// `SplitOffBaseline` child. Bounded to the recorded brick bounds, every brick
+/// at its authoritative revision, so the canonical hash matches the server.
+fn volume_from_baseline_volume(bv: &BaselineVolume) -> Result<Volume, String> {
+    let cs = CellSizeCode::from_u8(bv.cell_size_code).ok_or_else(|| {
+        format!(
+            "split baseline unknown cell-size code {}",
+            bv.cell_size_code
+        )
+    })?;
+    let mut volume = match bv.bounds {
+        Some([mn, mx]) => {
+            let bb = spall_voxel::BrickBounds::new(
+                BrickCoord::new(mn[0], mn[1], mn[2]),
+                BrickCoord::new(mx[0], mx[1], mx[2]),
+            )
+            .ok_or("split baseline volume has inverted bounds")?;
+            Volume::bounded(bv.volume_id, cs, bb)
+        }
+        None => Volume::new(bv.volume_id, cs),
+    };
+    for bb in &bv.bricks {
+        volume
+            .insert_brick(
+                BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                baseline_brick(bb)?,
+            )
+            .map_err(|e| format!("split baseline brick insert failed: {e}"))?;
+    }
+    Ok(volume)
+}
+
+// --- canonical form (mirrors spall_sim::world canonical_volume adapters) ---
+
+/// A shared empty digest set for [`ReplicaWorld::evicted`].
+fn empty_evicted() -> &'static spall_voxel::EvictedBricks {
+    static EMPTY: std::sync::OnceLock<spall_voxel::EvictedBricks> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(spall_voxel::EvictedBricks::new)
+}
+
+/// The canonical `spall.topology.v1` record for `v` over its **logical** brick
+/// set: `v`'s resident bricks plus `evicted`'s retained digests, each key once,
+/// canonical `(z, y, x)` order. Byte-identical to a resident-only walk when
+/// `evicted` is empty, and to the pre-eviction full volume for any subset of
+/// clean bricks moved into it — so `world_hash` never moves when cache contents
+/// differ. Mirrors `spall_sim::canonical_logical_volume_for`.
+fn canonical_logical_volume(
+    v: &Volume,
+    evicted: &spall_voxel::EvictedBricks,
+    owner: CanonicalOwner,
+) -> CanonicalVolume {
+    let bricks = spall_voxel::logical_bricks(v, evicted)
+        .expect("logical volume: resident/evicted digest invariant holds")
+        .into_iter()
+        .map(|b| CanonicalBrick {
+            coord: b.coord,
+            revision: b.revision,
+            layers: vec![CanonicalLayer {
+                kind: MATERIAL_LAYER_KIND,
+                bytes: BrickHash::to_bytes(b.content_hash).to_vec(),
+            }],
+        })
+        .collect();
+    CanonicalVolume {
+        volume_id: v.id(),
+        cell_size: v.cell_size(),
+        owner,
+        bricks,
+    }
+}
+
+fn canonical_resident_volume(v: &Volume, owner: CanonicalOwner) -> CanonicalVolume {
+    let bricks = v
+        .resident_brick_coords()
+        .into_iter()
+        .filter_map(|coord| {
+            v.snapshot_brick(coord)
+                .ok()
+                .flatten()
+                .map(|snap| (coord, snap))
+        })
+        .map(|(coord, snap)| CanonicalBrick {
             coord,
             revision: snap.revision(),
             layers: vec![CanonicalLayer {
                 kind: MATERIAL_LAYER_KIND,
                 bytes: BrickHash::to_bytes(snap.content_hash()).to_vec(),
             }],
-        });
-    }
+        })
+        .collect();
     CanonicalVolume {
         volume_id: v.id(),
         cell_size: v.cell_size(),
@@ -850,6 +1624,57 @@ fn lerp_pose(a: &Pose, b: &Pose, t: f64) -> Pose {
     let mut out = *b;
     for i in 0..3 {
         out.translation_m[i] = a.translation_m[i] + (b.translation_m[i] - a.translation_m[i]) * t;
+    }
+    out.rotation = nlerp_rotation(&a.rotation, &b.rotation, t).unwrap_or(b.rotation);
+    out
+}
+
+/// Shortest-arc normalised lerp between two orientations. `None` if either is
+/// degenerate (the caller keeps the newer one).
+fn nlerp_rotation(
+    a: &spall_core::QuantizedQuat,
+    b: &spall_core::QuantizedQuat,
+    t: f64,
+) -> Option<spall_core::QuantizedQuat> {
+    let [ax, ay, az, aw] = a.to_unit().ok()?;
+    let [bx, by, bz, bw] = b.to_unit().ok()?;
+    let qa = glam::Quat::from_xyzw(ax, ay, az, aw);
+    let mut qb = glam::Quat::from_xyzw(bx, by, bz, bw);
+    if qa.dot(qb) < 0.0 {
+        qb = -qb;
+    }
+    let q = qa.lerp(qb, t as f32).normalize();
+    spall_core::QuantizedQuat::from_unit(q.x, q.y, q.z, q.w).ok()
+}
+
+/// `pose` advanced by `ticks` server ticks (either sign) along constant linear
+/// and angular velocity; a sleeping body does not move. No contact response:
+/// callers bound `ticks` themselves.
+pub(crate) fn advance_pose(
+    pose: &Pose,
+    linear_velocity_m_s: [f32; 3],
+    angular_velocity_rad_s: [f32; 3],
+    sleeping: bool,
+    ticks: f64,
+    server_tick_hz: f64,
+) -> Pose {
+    if sleeping {
+        return *pose;
+    }
+    let dt = ticks / server_tick_hz;
+    let mut out = *pose;
+    for (t, v) in out.translation_m.iter_mut().zip(linear_velocity_m_s) {
+        *t += f64::from(v) * dt;
+    }
+    let w = glam::Vec3::from_array(angular_velocity_rad_s);
+    if w.length_squared() > 1.0e-12
+        && let Ok([x, y, z, wq]) = pose.rotation.to_unit()
+    {
+        let q = (glam::Quat::from_scaled_axis(w * dt as f32) * glam::Quat::from_xyzw(x, y, z, wq))
+            .normalize();
+        if let Ok(rotation) = spall_core::QuantizedQuat::from_unit(q.x, q.y, q.z, q.w) {
+            out.rotation = rotation;
+        }
     }
     out
 }
@@ -906,6 +1731,86 @@ mod tests {
             other => panic!("expected NeedsRepair, got {other:?}"),
         }
         assert_eq!(replica.world_hash(), before_hash, "state untouched");
+        // ENG-49: the gapped transaction is held for retry, not dropped.
+        assert_eq!(replica.pending_repair_txn_count(), 1);
+    }
+
+    #[test]
+    fn a_repeated_gap_is_rate_limited_and_the_transaction_is_deduped() {
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(4).unwrap(),
+            server_tick: spall_core::Tick(1),
+            control_seq: spall_protocol::ControlSeq(1),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![spall_protocol::BrickRevision {
+                volume: VolumeId::new(1).unwrap(),
+                coord: BrickCoord::new(0, 0, 0),
+                revision: Revision(999),
+            }],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: VolumeId::new(1).unwrap(),
+                start: GlobalCell::new(0, 0, 0),
+                len: 1,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![],
+        };
+
+        // First delivery asks for the repair.
+        match replica.apply_transaction(&tx) {
+            ApplyOutcome::NeedsRepair(reqs) => assert_eq!(reqs.len(), 1),
+            other => panic!("expected NeedsRepair, got {other:?}"),
+        }
+        // A re-delivery inside the cooldown holds the transaction again but
+        // emits no fresh RepairRequest — the key is already in flight.
+        match replica.apply_transaction(&tx) {
+            ApplyOutcome::NeedsRepair(reqs) => {
+                assert!(reqs.is_empty(), "the repeated gap is rate-limited")
+            }
+            other => panic!("expected NeedsRepair, got {other:?}"),
+        }
+        // The transaction is held exactly once, not stacked per delivery.
+        assert_eq!(replica.pending_repair_txn_count(), 1);
+    }
+
+    #[test]
+    fn the_pending_repair_hold_is_bounded() {
+        let cfg = ReplicaConfig {
+            max_pending_repair_txns: 3,
+            ..ReplicaConfig::default()
+        };
+        let mut replica = ReplicaWorld::from_baseline(terrain(), cfg);
+        for id in 1..=10u64 {
+            let tx = TopologyTransaction {
+                transaction_id: TransactionId::new(id).unwrap(),
+                server_tick: spall_core::Tick(id),
+                control_seq: spall_protocol::ControlSeq(id),
+                algorithm_version: 1,
+                dependencies: vec![],
+                before: vec![spall_protocol::BrickRevision {
+                    volume: VolumeId::new(1).unwrap(),
+                    coord: BrickCoord::new(0, 0, 0),
+                    revision: Revision(999),
+                }],
+                after: vec![],
+                ops: vec![TopologyOp::CellRun {
+                    volume: VolumeId::new(1).unwrap(),
+                    start: GlobalCell::new(0, 0, 0),
+                    len: 1,
+                    material: MaterialId::AIR,
+                }],
+                result_hashes: vec![],
+            };
+            let _ = replica.apply_transaction(&tx);
+        }
+        assert_eq!(
+            replica.pending_repair_txn_count(),
+            3,
+            "the retained-transaction set never grows past its bound"
+        );
     }
 
     #[test]
@@ -971,6 +1876,151 @@ mod tests {
             before,
             "failed candidate did not leak"
         );
+    }
+
+    fn moving_replica(ticks: &[(u64, f64)], vx: f32) -> (ReplicaWorld, EntityId) {
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        let body = EntityId::new(42).unwrap();
+        replica.install_body(body, {
+            let mut v = Volume::new(VolumeId::new(9).unwrap(), CellSizeCode::Quarter);
+            v.apply_edit(&EditPlan::filled_box(
+                VolumeId::new(9).unwrap(),
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(0, 0, 0),
+                MaterialId(1),
+            ))
+            .unwrap();
+            v
+        });
+        for &(tick, x) in ticks {
+            replica.ingest_snapshot(&MotionSnapshot {
+                server_tick: spall_core::Tick(tick),
+                snapshot_seq: spall_protocol::SnapshotSeq(tick),
+                acked_input: spall_protocol::InputSeq(0),
+                body,
+                topology_revision: Revision(0),
+                pose: Pose {
+                    translation_m: [x, 0.0, 0.0],
+                    rotation: spall_core::QuantizedQuat::from_unit(0.0, 0.0, 0.0, 1.0).unwrap(),
+                },
+                linear_velocity: [vx, 0.0, 0.0],
+                angular_velocity: [0.0; 3],
+                sleeping: false,
+            });
+        }
+        (replica, body)
+    }
+
+    #[test]
+    fn interpolation_is_continuous_at_the_normal_snapshot_spacing() {
+        // 20 Hz snapshots (3 server ticks apart), 1 unit per tick, and the
+        // default 6-tick render delay: the delayed target sits before the two
+        // newest states, so it must come from older retained history rather
+        // than clamping to the older of the newest pair.
+        let (replica, body) = moving_replica(&[(0, 0.0), (3, 3.0), (6, 6.0), (9, 9.0)], 60.0);
+        let x = |tick: f64| replica.interpolated_pose(body, tick).unwrap().translation_m[0];
+        assert!((x(9.0) - 3.0).abs() < 1e-9);
+        assert!((x(10.0) - 4.0).abs() < 1e-9);
+        assert!((x(10.5) - 4.5).abs() < 1e-9);
+        // Before all retained history: held at the oldest state.
+        assert_eq!(x(2.0), 0.0);
+    }
+
+    #[test]
+    fn body_rotation_is_interpolated_not_stepped() {
+        let q = |angle: f32| {
+            spall_core::QuantizedQuat::from_unit((angle / 2.0).sin(), 0.0, 0.0, (angle / 2.0).cos())
+                .unwrap()
+        };
+        let a = Pose {
+            translation_m: [0.0; 3],
+            rotation: q(0.0),
+        };
+        let b = Pose {
+            translation_m: [1.0, 0.0, 0.0],
+            rotation: q(1.0),
+        };
+        let mid = lerp_pose(&a, &b, 0.5);
+        let [x, _, _, w] = mid.rotation.to_unit().unwrap();
+        assert!(
+            (2.0 * x.atan2(w) - 0.5).abs() < 1e-2,
+            "half way is half the angle"
+        );
+        assert!((mid.translation_m[0] - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bodies_near_the_player_are_drawn_at_the_present_far_ones_delayed() {
+        // 60 units/s along x; snapshots at ticks 0..9 (x = tick).
+        let (replica, body) = moving_replica(&[(0, 0.0), (3, 3.0), (6, 6.0), (9, 9.0)], 60.0);
+        let render_tick = 10.0; // delayed target is tick 4 (x = 4); present is x = 10
+        let x = |focus: [f64; 3]| {
+            replica
+                .presented_pose(body, render_tick, Some(focus))
+                .unwrap()
+                .translation_m[0]
+        };
+        let delayed = replica
+            .interpolated_pose(body, render_tick)
+            .unwrap()
+            .translation_m[0];
+        assert!((delayed - 4.0).abs() < 1e-9);
+        assert!(
+            (x([10.0, 0.0, 0.0]) - 10.0).abs() < 1e-4,
+            "player at the body: present pose"
+        );
+        assert!(
+            (x([100.0, 0.0, 0.0]) - delayed).abs() < 1e-9,
+            "far away: delayed pose"
+        );
+        let mid = x([10.0 + 3.5, 0.0, 0.0]);
+        assert!(delayed < mid && mid < 10.0, "cross-faded in between: {mid}");
+        assert_eq!(
+            replica.presented_pose(body, render_tick, None).unwrap(),
+            replica.interpolated_pose(body, render_tick).unwrap()
+        );
+    }
+
+    /// The renderer re-poses a body at every frame's own render tick from a
+    /// sampler copied out of the replica once; that must agree with asking the
+    /// replica directly, and must advance every frame (no held poses) even
+    /// though the copy is only refreshed when a worker pass runs.
+    #[test]
+    fn body_sampler_poses_at_each_frame_time_like_the_replica() {
+        let (replica, body) = moving_replica(&[(0, 0.0), (3, 3.0), (6, 6.0), (9, 9.0)], 60.0);
+        let sampler = replica.body_sampler(body).unwrap();
+        let focus = Some([10.0, 0.0, 0.0]);
+        let mut prev = f64::MIN;
+        // 240 Hz "frames" between 10.0 and 12.0 server ticks, all off one copy.
+        for i in 0..=480 {
+            let tick = 10.0 + f64::from(i) / 240.0;
+            let mine = sampler.presented(tick, focus).unwrap();
+            assert_eq!(mine, replica.presented_pose(body, tick, focus).unwrap());
+            assert!(
+                mine.translation_m[0] > prev,
+                "pose held or went backwards at tick {tick}"
+            );
+            prev = mine.translation_m[0];
+        }
+        assert!(sampler.is_moving());
+        assert!((sampler.latest_age_ticks(10.5).unwrap() - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn render_clock_is_continuous_and_never_runs_backwards() {
+        let mut clock = RenderClock::default();
+        let t0 = Instant::now();
+        let mut prev = clock.advance(t0, 30, 60.0);
+        for frame in 1..=120u64 {
+            // Snapshots land every 3 ticks, so `newest` is a staircase.
+            let elapsed_ticks = frame as f64 * (60.0 / 120.0);
+            let newest = 30 + (elapsed_ticks as u64 / 3) * 3;
+            let now = t0 + std::time::Duration::from_secs_f64(frame as f64 / 120.0);
+            let cur = clock.advance(now, newest, 60.0);
+            assert!(cur > prev, "clock must advance every frame");
+            assert!(cur - prev < 1.0, "no snapshot-sized jump: {}", cur - prev);
+            prev = cur;
+        }
     }
 
     #[test]

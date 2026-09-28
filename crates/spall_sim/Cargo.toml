@@ -29,6 +29,7 @@ scenario = ["dep:serde", "dep:serde_json"]
 [dev-dependencies]
 glam = { workspace = true }
 spall_core = { workspace = true }
+spall_physics = { workspace = true }
 spall_protocol = { workspace = true }
 spall_structure = { workspace = true, features = ["oracle"] }
 spall_voxel = { workspace = true, features = ["oracle"] }
@@ -37,3 +38,11 @@ spall_voxel = { workspace = true, features = ["oracle"] }
 name = "sim-scenario"
 path = "src/bin/sim_scenario.rs"
 required-features = ["scenario"]
+
+[[bin]]
+name = "region-origin-bench"
+path = "src/bin/region_origin_bench.rs"
+
+[[bin]]
+name = "region-coordination-bench"
+path = "src/bin/region_coordination_bench.rs"
