@@ -804,6 +804,16 @@ the tick-0 baseline reproduces the same hash — dormancy is not journalled, onl
 the two topology transactions are). See
 `docs/reports/ENG-28-increment-4-sleep-wake.md` for measured evidence.
 
+### Authenticated progression integration
+
+`cargo test -p sandbox --all-features --test progression_network` starts the
+real sandbox server and clients over QUIC. It verifies two-player inventory
+isolation, duplicate craft replay, stale-revision rejection, disconnect before
+a delayed durable reply, reconnect with the same request ID, server restart,
+inventory recovery, token rotation with a stable PlayerId, immediate revocation,
+and token redaction in logs. This is a focused progression acceptance test,
+not a substitute for the eight-client G4 soak.
+
 ### G5 — larger world
 
 Define actual radius, height, concurrent active regions, topology metadata size, and persistent debris envelope from G4 measurements. Demonstrate multiple physics origins with widely separated players and approach/merge tests. Measure generation, streaming/LOD seams, far graph traversal, and long-session storage growth. Do not publish an infinite-world claim or a maximum player count based on extrapolation alone.

@@ -503,6 +503,9 @@ pub struct ServeConfig {
     /// are excluded; measured ticks include ingress through replication and
     /// residency, ending immediately before pacing sleep.
     pub timing_window: Option<TimingWindow>,
+    /// Optional credential registry path polled for atomic rotation/revocation
+    /// updates. Only used by player-credential authentication.
+    pub credential_registry_file: Option<PathBuf>,
 }
 
 /// A bounded, explicit server timing window. The server records at most
@@ -582,6 +585,7 @@ impl ServeConfig {
             contact_damage: None,
             dormancy: None,
             timing_window: None,
+            credential_registry_file: None,
         }
     }
 }
@@ -825,6 +829,8 @@ pub enum ServeError {
     Io(#[from] std::io::Error),
     #[error("tokio runtime: {0}")]
     Runtime(String),
+    #[error("invalid server configuration: {0}")]
+    Configuration(String),
 }
 
 /// Runs the networked host to completion and returns its summary. Builds its own
@@ -1194,6 +1200,105 @@ enum Inbound {
     Gone(SessionId),
 }
 
+struct ProgressionWork {
+    session: SessionId,
+    player_id: Option<spall_protocol::PlayerId>,
+    request: spall_protocol::ProgressionRequest,
+}
+
+struct ProgressionDone {
+    session: SessionId,
+    response: spall_protocol::ProgressionResponse,
+}
+
+struct ProgressionWorker {
+    submit: std::sync::mpsc::SyncSender<ProgressionWork>,
+    completed: std::sync::mpsc::Receiver<ProgressionDone>,
+}
+
+struct CommittedEditWork {
+    session: SessionId,
+    player_id: Option<spall_protocol::PlayerId>,
+    request_id: RequestId,
+    removed: std::collections::BTreeMap<spall_core::MaterialId, u64>,
+}
+struct CommittedEditWorker {
+    submit: std::sync::mpsc::SyncSender<CommittedEditWork>,
+}
+
+impl CommittedEditWorker {
+    fn spawn(mut handler: CommittedEditHandler) -> Self {
+        let (submit, work) = std::sync::mpsc::sync_channel::<CommittedEditWork>(64);
+        std::thread::Builder::new()
+            .name("spall-committed-game-events".into())
+            .spawn(move || {
+                while let Ok(work) = work.recv() {
+                    handler(work.session, work.player_id, work.request_id, &work.removed);
+                }
+            })
+            .expect("committed-edit worker thread must start");
+        Self { submit }
+    }
+}
+
+struct OutboxWork(spall_store::OutboxRecord);
+struct OutboxDone {
+    event_id: [u8; 32],
+    result: Result<(), String>,
+}
+struct OutboxWorker {
+    submit: std::sync::mpsc::SyncSender<OutboxWork>,
+    completed: std::sync::mpsc::Receiver<OutboxDone>,
+}
+
+impl OutboxWorker {
+    fn spawn(mut processor: OutboxProcessor) -> Self {
+        let (submit, work) = std::sync::mpsc::sync_channel::<OutboxWork>(1);
+        let (done_tx, completed) = std::sync::mpsc::sync_channel::<OutboxDone>(1);
+        std::thread::Builder::new()
+            .name("spall-game-outbox".into())
+            .spawn(move || {
+                while let Ok(OutboxWork(event)) = work.recv() {
+                    let done = OutboxDone {
+                        event_id: event.event_id,
+                        result: processor(&event),
+                    };
+                    if done_tx.send(done).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("outbox worker thread must start");
+        Self { submit, completed }
+    }
+}
+
+impl ProgressionWorker {
+    fn spawn(mut handler: ProgressionHandler) -> Self {
+        const CAPACITY: usize = 64;
+        let (submit, work) = std::sync::mpsc::sync_channel::<ProgressionWork>(CAPACITY);
+        let (done_tx, completed) = std::sync::mpsc::sync_channel::<ProgressionDone>(CAPACITY);
+        std::thread::Builder::new()
+            .name("spall-progression-requests".into())
+            .spawn(move || {
+                while let Ok(work) = work.recv() {
+                    let response = handler(work.session, work.player_id, work.request);
+                    if done_tx
+                        .send(ProgressionDone {
+                            session: work.session,
+                            response,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("progression worker thread must start");
+        Self { submit, completed }
+    }
+}
+
 /// One message from the sim bridge to a client's writer task. Repair replies and
 /// baseline transfers are already routed to one client's queue, so they need no
 /// session tag here.
@@ -1435,8 +1540,8 @@ async fn serve_async(
         spall_sim::ContactDamageMaterialProfile,
     )>,
     asset_manifest_hash: Option<spall_protocol::Hash32>,
-    mut commit_handler: Option<CommittedEditHandler>,
-    mut progression_handler: Option<ProgressionHandler>,
+    commit_handler: Option<CommittedEditHandler>,
+    progression_handler: Option<ProgressionHandler>,
     player_credentials: Option<Vec<spall_net::PlayerCredential>>,
     mut outbox_encoder: Option<CommittedEditOutboxEncoder>,
     outbox_processor: Option<OutboxProcessor>,
@@ -1462,6 +1567,12 @@ async fn serve_async(
     }
 
     let handshake = server_handshake(&materials, asset_manifest_hash);
+    let credential_registry_file = config.credential_registry_file.clone();
+    if credential_registry_file.is_some() && player_credentials.is_none() {
+        return Err(ServeError::Configuration(
+            "credential registry reload requires player-credential authentication".into(),
+        ));
+    }
     let server = Arc::new(if let Some(credentials) = player_credentials {
         NetServer::bind_with_player_credentials(
             config.listen,
@@ -1516,6 +1627,81 @@ async fn serve_async(
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
+
+    // Reload credentials atomically from the operator-managed registry. A
+    // malformed or unreadable update fails closed by revoking the whole live
+    // registry; no token bytes or file contents enter logs.
+    if let Some(path) = credential_registry_file {
+        let server_for_reload = server.clone();
+        let conns_for_reload = conns.clone();
+        let mut stop_for_reload = stop_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut previous_content: Option<Vec<u8>> = None;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = stop_for_reload.changed() => {
+                        if changed.is_err() || *stop_for_reload.borrow() { break; }
+                    }
+                }
+                let reload_path = path.clone();
+                let loaded =
+                    tokio::task::spawn_blocking(move || match std::fs::read(&reload_path) {
+                        Ok(bytes) => match parse_player_credentials(&bytes) {
+                            Ok(credentials) => (bytes, credentials, None),
+                            Err(error) => (bytes, Vec::new(), Some(error)),
+                        },
+                        Err(error) => (
+                            b"<unreadable>".to_vec(),
+                            Vec::new(),
+                            Some(format!("credential registry could not be read: {error}")),
+                        ),
+                    })
+                    .await;
+                let (content, credentials, invalid) = match loaded {
+                    Ok(value) => value,
+                    Err(_) => {
+                        tracing::error!(
+                            "credential registry reload worker failed; credentials unchanged"
+                        );
+                        continue;
+                    }
+                };
+                if previous_content.as_ref() == Some(&content) {
+                    continue;
+                }
+                let accepted_count = credentials.len();
+                let replacement = if invalid.is_some() {
+                    Vec::new()
+                } else {
+                    credentials
+                };
+                if let Err(error) = server_for_reload.replace_player_credentials(replacement) {
+                    tracing::error!(error = %error, "credential registry rejected; revoking all credentials");
+                    let _ = server_for_reload.replace_player_credentials(Vec::new());
+                }
+                previous_content = Some(content);
+                // Authentication state is deliberately not introspectable by
+                // token. Close live sessions on any rotation so a credential
+                // removed from the file loses its existing session at once.
+                let live = conns_for_reload
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                for connection in live.values() {
+                    connection.close("player credentials changed");
+                }
+                if let Some(reason) = invalid {
+                    tracing::error!(reason = %reason, "credential registry invalid; all player credentials revoked");
+                } else {
+                    tracing::info!(
+                        credential_count = accepted_count,
+                        "player credential registry reloaded; active sessions closed"
+                    );
+                }
+            }
+        });
+    }
 
     // Accept loop.
     let accept = {
@@ -1633,6 +1819,12 @@ async fn serve_async(
         generator_version: 1,
     };
 
+    // Progression callbacks may touch the game's SQLite store. Keep their
+    // bounded FIFO off the simulation thread; one worker preserves per-player
+    // request ordering and returns replies only after the callback completes.
+    let progression_worker = progression_handler.map(ProgressionWorker::spawn);
+    let committed_edit_worker = commit_handler.map(CommittedEditWorker::spawn);
+
     let sim_join = tokio::task::spawn_blocking(move || -> SimResult {
         // Open the world database (T16). If it already holds a checkpoint,
         // recover from it; otherwise start the built-in scene and publish an
@@ -1646,7 +1838,7 @@ async fn serve_async(
             mut pipeline,
             mut journalled_through,
             mut checkpoints_published,
-            mut outbox_processor,
+            outbox_processor,
         } = match setup_persistence_with_game_content(
             save.as_deref(),
             scene,
@@ -1662,9 +1854,13 @@ async fn serve_async(
                 return SimResult::error(format!("persistence setup failed: {e}"), 0);
             }
         };
+        let progression_worker = progression_worker;
+        let committed_edit_worker = committed_edit_worker;
+        let outbox_worker = outbox_processor.map(OutboxWorker::spawn);
         let mut journal_records_written: u64 = 0;
         let mut pending_outbox = Vec::<spall_store::OutboxRecord>::new();
         let mut waiting_outbox = std::collections::VecDeque::<spall_store::OutboxRecord>::new();
+        let mut outbox_inflight = None;
 
         // T23 / G3 row 7, slice D: default-off residency pass. `None` -> the
         // world stays fully resident and every counter below is `0`.
@@ -1794,6 +1990,19 @@ async fn serve_async(
             let mut actions_admitted: HashMap<u64, u32> = HashMap::new();
             let mut repairs_admitted: HashMap<u64, u32> = HashMap::new();
             let mut progression_admitted: HashMap<u64, u32> = HashMap::new();
+            if let Some(worker) = progression_worker.as_ref() {
+                for _ in 0..64 {
+                    match worker.completed.try_recv() {
+                        Ok(done) => send_to(
+                            &clients_for_sim,
+                            done.session,
+                            Outbound::Progression(Arc::new(done.response)),
+                        ),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
             let mut drained = 0usize;
             while drained < MAX_INBOUND_PER_TICK {
                 let Ok(msg) = inbound_rx.try_recv() else {
@@ -1954,38 +2163,30 @@ async fn serve_async(
                             session.raw(),
                             MAX_PROGRESSION_PER_CLIENT_PER_TICK,
                         );
-                        let response = if admitted
-                            && let Some(handler) = progression_handler.as_mut()
-                        {
-                            handler(session, player_principals.get(&session.raw()).copied(), req)
-                        } else if let Some(handler) = progression_handler.as_mut() {
-                            let mut snapshot_request = req;
-                            snapshot_request.operation =
-                                spall_protocol::ProgressionOperation::InspectInventory;
-                            // Use a reserved ID so the game handler can return a snapshot
-                            // without consuming or caching the rejected request's ID.
-                            snapshot_request.request_id = 0;
-                            let mut response = handler(
-                                session,
-                                player_principals.get(&session.raw()).copied(),
-                                snapshot_request,
-                            );
-                            response.request_id = req.request_id;
-                            response.outcome = spall_protocol::ProgressionOutcome::Rejected(
-                                spall_protocol::ProgressionRejectCode::Unavailable,
-                            );
-                            response
-                        } else {
-                            progression_rejected(
+                        let queued = admitted
+                            && progression_worker.as_ref().is_some_and(|worker| {
+                                worker
+                                    .submit
+                                    .try_send(ProgressionWork {
+                                        session,
+                                        player_id: player_principals.get(&session.raw()).copied(),
+                                        request: req.clone(),
+                                    })
+                                    .is_ok()
+                            });
+                        if !queued {
+                            // The queue is bounded. This retryable response is
+                            // immediate and does not perform a fallback read.
+                            let response = progression_rejected(
                                 &req,
-                                spall_protocol::ProgressionRejectCode::Unavailable,
-                            )
-                        };
-                        send_to(
-                            &clients_for_sim,
-                            session,
-                            Outbound::Progression(Arc::new(response)),
-                        );
+                                spall_protocol::ProgressionRejectCode::RetryableCapacity,
+                            );
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Progression(Arc::new(response)),
+                            );
+                        }
                     }
                     Inbound::Repair(session, req) => {
                         saw_client_work = true;
@@ -2092,8 +2293,27 @@ async fn serve_async(
                     });
                     if let Some(event) = encoded.filter(|_| pipeline.is_some()) {
                         pending_outbox.push(event);
-                    } else if let Some(handler) = commit_handler.as_mut() {
-                        handler(session, player_id, *rid, &committed.removed_materials);
+                    } else if let Some(worker) = committed_edit_worker.as_ref() {
+                        match worker.submit.try_send(CommittedEditWork {
+                            session,
+                            player_id,
+                            request_id: *rid,
+                            removed: committed.removed_materials.clone(),
+                        }) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                return SimResult::error(
+                                    "committed progression queue is full; server stopped with the award pending only in ephemeral memory".into(),
+                                    ticks_run,
+                                );
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                return SimResult::error(
+                                    "committed progression worker stopped".into(),
+                                    ticks_run,
+                                );
+                            }
+                        }
                     }
                 }
                 // T17 increment 2: a giant split ships its geometry out of band
@@ -2233,19 +2453,53 @@ async fn serve_async(
                 waiting_outbox.extend(records);
                 let durable = pipe.durable_seq();
                 let mut acknowledged = Vec::new();
-                while waiting_outbox
-                    .front()
-                    .is_some_and(|event| event.journal_seq <= durable)
-                {
-                    let event = waiting_outbox.pop_front().expect("front checked");
-                    if let Some(processor) = outbox_processor.as_mut() {
-                        if let Err(error) = processor(&event) {
-                            return SimResult::error(
-                                format!("harvest outbox delivery failed: {error}"),
-                                ticks_run,
-                            );
+                if let Some(worker) = outbox_worker.as_ref() {
+                    match worker.completed.try_recv() {
+                        Ok(done) => {
+                            if outbox_inflight != Some(done.event_id) {
+                                return SimResult::error(
+                                    "outbox completion did not match the in-flight event".into(),
+                                    ticks_run,
+                                );
+                            }
+                            if let Err(error) = done.result {
+                                return SimResult::error(
+                                    format!("harvest outbox delivery failed: {error}"),
+                                    ticks_run,
+                                );
+                            }
+                            let Some(event) = waiting_outbox.pop_front() else {
+                                return SimResult::error(
+                                    "outbox completion has no retained event".into(),
+                                    ticks_run,
+                                );
+                            };
+                            if event.event_id != done.event_id {
+                                return SimResult::error(
+                                    "outbox completion order changed".into(),
+                                    ticks_run,
+                                );
+                            }
+                            acknowledged.push(done.event_id);
+                            outbox_inflight = None;
                         }
-                        acknowledged.push(event.event_id);
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return SimResult::error("outbox worker stopped".into(), ticks_run);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                    if outbox_inflight.is_none()
+                        && let Some(event) = waiting_outbox
+                            .front()
+                            .filter(|event| event.journal_seq <= durable)
+                    {
+                        match worker.submit.try_send(OutboxWork(event.clone())) {
+                            Ok(()) => outbox_inflight = Some(event.event_id),
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                return SimResult::error("outbox worker stopped".into(), ticks_run);
+                            }
+                        }
                     }
                 }
                 if let Err(e) = pipe.submit_acknowledge_outbox(acknowledged) {
@@ -2405,17 +2659,41 @@ async fn serve_async(
                     shutdown_error = Some(format!("final journal durability wait failed: {error}"));
                 } else {
                     let mut acknowledged = Vec::new();
-                    while let Some(event) = waiting_outbox.pop_front() {
-                        if let Some(processor) = outbox_processor.as_mut() {
-                            match processor(&event) {
-                                Ok(()) => acknowledged.push(event.event_id),
-                                Err(error) => {
+                    if let Some(worker) = outbox_worker.as_ref() {
+                        while let Some(event) = waiting_outbox.front() {
+                            if outbox_inflight.is_none() {
+                                if let Err(error) = worker.submit.send(OutboxWork(event.clone())) {
                                     shutdown_error = Some(format!(
-                                        "final harvest outbox delivery failed: {error}"
+                                        "final harvest outbox submission failed: {error}"
                                     ));
                                     break;
                                 }
+                                outbox_inflight = Some(event.event_id);
                             }
+                            let done = match worker.completed.recv() {
+                                Ok(done) => done,
+                                Err(error) => {
+                                    shutdown_error = Some(format!(
+                                        "final harvest outbox completion failed: {error}"
+                                    ));
+                                    break;
+                                }
+                            };
+                            if outbox_inflight != Some(done.event_id)
+                                || event.event_id != done.event_id
+                            {
+                                shutdown_error =
+                                    Some("final harvest outbox completion mismatch".into());
+                                break;
+                            }
+                            if let Err(error) = done.result {
+                                shutdown_error =
+                                    Some(format!("final harvest outbox delivery failed: {error}"));
+                                break;
+                            }
+                            waiting_outbox.pop_front();
+                            outbox_inflight = None;
+                            acknowledged.push(done.event_id);
                         }
                     }
                     if shutdown_error.is_none() {
@@ -3978,6 +4256,50 @@ fn progression_rejected(
     }
 }
 
+fn parse_player_credentials(bytes: &[u8]) -> Result<Vec<spall_net::PlayerCredential>, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "credential registry is not valid UTF-8".to_string())?;
+    let mut credentials = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let player_text = fields.next();
+        let token_text = fields.next();
+        if fields.next().is_some() {
+            return Err(format!(
+                "credential registry line {} has extra fields",
+                line_index + 1
+            ));
+        }
+        let (Some(player_text), Some(token_text)) = (player_text, token_text) else {
+            return Err(format!(
+                "credential registry line {} is incomplete",
+                line_index + 1
+            ));
+        };
+        let player_id = spall_protocol::PlayerId::from_hex(player_text).ok_or_else(|| {
+            format!(
+                "credential registry line {} has invalid player ID",
+                line_index + 1
+            )
+        })?;
+        let token = spall_net::JoinToken::from_hex(token_text).ok_or_else(|| {
+            format!(
+                "credential registry line {} has invalid token",
+                line_index + 1
+            )
+        })?;
+        credentials.push(spall_net::PlayerCredential { player_id, token });
+        if credentials.len() > 4096 {
+            return Err("credential registry exceeds the 4096-entry limit".into());
+        }
+    }
+    Ok(credentials)
+}
+
 /// Returns a replayable status only for an action that passed authoritative
 /// validation and was admitted to the simulation. Pre-admission validation and
 /// rate-limit refusals intentionally are not held here: no edit was staged, so
@@ -4201,6 +4523,95 @@ async fn serve_conn(
 mod tests {
     use super::*;
     use spall_store::{JournalPayload, JournalRecord};
+
+    #[test]
+    fn player_credential_registry_parser_never_echoes_tokens() {
+        let player_id = "11".repeat(16);
+        let token = "a5".repeat(32);
+        let content = format!("# operator registry\n{player_id} {token}\n");
+        let credentials = parse_player_credentials(content.as_bytes()).unwrap();
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].player_id.to_hex(), player_id);
+        assert!(!format!("{:?}", credentials[0]).contains(&token));
+
+        let bad_token = "z1".repeat(32);
+        let malformed = format!("{player_id} {bad_token}");
+        let error = parse_player_credentials(malformed.as_bytes()).unwrap_err();
+        assert!(!error.contains(&bad_token));
+    }
+
+    #[test]
+    fn progression_queue_is_bounded_and_returns_in_serial_order() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = ProgressionWorker::spawn(Box::new(move |_session, _, request| {
+            if request.request_id == 1 {
+                let _ = started_tx.send(());
+                std::thread::sleep(std::time::Duration::from_millis(75));
+            }
+            spall_protocol::ProgressionResponse {
+                request_id: request.request_id,
+                catalog_version: 1,
+                inventory_revision: request.request_id,
+                outcome: spall_protocol::ProgressionOutcome::Inventory,
+                inventory: Vec::new(),
+            }
+        }));
+        let session = sess(1, 1);
+        let started = std::time::Instant::now();
+        worker
+            .submit
+            .try_send(ProgressionWork {
+                session,
+                player_id: None,
+                request: spall_protocol::ProgressionRequest {
+                    request_id: 1,
+                    catalog_version: 1,
+                    expected_inventory_revision: 0,
+                    operation: spall_protocol::ProgressionOperation::InspectInventory,
+                },
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        for request_id in 2..=65 {
+            worker
+                .submit
+                .try_send(ProgressionWork {
+                    session,
+                    player_id: None,
+                    request: spall_protocol::ProgressionRequest {
+                        request_id,
+                        catalog_version: 1,
+                        expected_inventory_revision: 0,
+                        operation: spall_protocol::ProgressionOperation::InspectInventory,
+                    },
+                })
+                .expect("one active and 64 queued requests fit");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert!(matches!(
+            worker.submit.try_send(ProgressionWork {
+                session,
+                player_id: None,
+                request: spall_protocol::ProgressionRequest {
+                    request_id: 66,
+                    catalog_version: 1,
+                    expected_inventory_revision: 0,
+                    operation: spall_protocol::ProgressionOperation::InspectInventory,
+                },
+            }),
+            Err(std::sync::mpsc::TrySendError::Full(_))
+        ));
+        for expected in 1..=65 {
+            let done = worker
+                .completed
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(done.session, session);
+            assert_eq!(done.response.request_id, expected);
+        }
+    }
 
     fn empty_clients() -> ClientMap {
         Arc::new(Mutex::new(HashMap::new()))

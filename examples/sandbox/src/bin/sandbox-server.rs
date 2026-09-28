@@ -540,6 +540,7 @@ fn run_serve(args: Args) -> ExitCode {
             .then_some(sandbox::game::contact_damage_config()),
         dormancy,
         timing_window,
+        credential_registry_file: args.player_credentials_file.clone(),
     };
     tracing::info!(
         damage_rules_version = sandbox::game::DAMAGE_RULES_VERSION,

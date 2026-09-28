@@ -189,7 +189,7 @@ impl DevIdentity {
         self.cert_der.as_ref()
     }
 
-    /// Builds the QUIC server configuration: this identity, ALPN `spall/2`,
+    /// Builds the QUIC server configuration: this identity, ALPN `spall/3`,
     /// TLS 1.3 only, and the transport timers from `cfg`.
     pub fn server_config(&self, cfg: &TransportConfig) -> Result<quinn::ServerConfig> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
