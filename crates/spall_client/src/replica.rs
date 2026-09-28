@@ -372,6 +372,185 @@ pub struct ReplicaWorld {
     /// slice), so `world_hash` / transaction validation are byte-identical to
     /// today. Keyed by raw volume id. See `docs/reports/G3-residency-hash.md`.
     evicted: BTreeMap<u64, spall_voxel::EvictedBricks>,
+    /// Monotonic local generation of the *resident terrain view*. This is a
+    /// derived-cache invalidation token, not protocol state: it changes only
+    /// after an atomic mutation that can change terrain geometry available to
+    /// client collision (baseline install/patch, published terrain transaction,
+    /// eviction, or reload). Motion-only records and body-only edits leave it
+    /// alone.
+    terrain_generation: u64,
+}
+
+/// A baseline being built off to the side while its segments arrive (`docs/protocol.md` late-join
+/// step 3). Nothing here is visible to prediction or rendering; [`ReplicaWorld::install_staged`]
+/// swaps it in atomically once the transfer is verified complete. Its memory is the world itself
+/// (class D in `docs/reports/large-world-baseline-design.md`): the caller budgets it before the
+/// first brick is staged.
+pub struct StagedBaseline {
+    checkpoint_tick: u64,
+    volumes: BTreeMap<u64, Volume>,
+    owner: BTreeMap<u64, CanonicalOwner>,
+    bodies: BTreeMap<u64, ReplicaBody>,
+    volume_of_entity: BTreeMap<u64, u64>,
+    terrain_id: Option<VolumeId>,
+    /// The volume currently open (header seen, `last` not yet).
+    open: Option<u64>,
+    bricks: u64,
+}
+
+impl StagedBaseline {
+    pub fn new(checkpoint_tick: u64) -> Self {
+        Self {
+            checkpoint_tick,
+            volumes: BTreeMap::new(),
+            owner: BTreeMap::new(),
+            bodies: BTreeMap::new(),
+            volume_of_entity: BTreeMap::new(),
+            terrain_id: None,
+            open: None,
+            bricks: 0,
+        }
+    }
+
+    /// Bricks staged so far.
+    pub fn brick_count(&self) -> u64 {
+        self.bricks
+    }
+
+    /// Volumes staged so far.
+    pub fn volume_count(&self) -> usize {
+        self.volumes.len()
+    }
+
+    /// Bodies staged so far (every non-terrain volume).
+    pub fn body_count(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Opens a volume from its header. It must not already exist and no other volume may be open.
+    pub fn open_volume(
+        &mut self,
+        vid: VolumeId,
+        header: &spall_protocol::segment::VolumeHeader,
+    ) -> Result<(), String> {
+        use spall_protocol::BaselineOwner;
+        if let Some(open) = self.open {
+            return Err(format!("volume {open} still open when {vid} began"));
+        }
+        if self.volumes.contains_key(&vid.get()) {
+            return Err(format!("baseline volume {vid} appears twice"));
+        }
+        let cs = CellSizeCode::from_u8(header.cell_size_code).ok_or_else(|| {
+            format!(
+                "baseline volume {vid} has unknown cell-size code {}",
+                header.cell_size_code
+            )
+        })?;
+        let volume = match header.bounds {
+            Some([mn, mx]) => {
+                let bb = spall_voxel::BrickBounds::new(
+                    BrickCoord::new(mn[0], mn[1], mn[2]),
+                    BrickCoord::new(mx[0], mx[1], mx[2]),
+                )
+                .ok_or_else(|| format!("baseline volume {vid} has inverted bounds"))?;
+                Volume::bounded(vid, cs, bb)
+            }
+            None => Volume::new(vid, cs),
+        };
+        match header.owner {
+            BaselineOwner::Terrain => {
+                if self.terrain_id.is_some() {
+                    return Err("baseline has a second terrain volume".to_string());
+                }
+                self.owner.insert(vid.get(), CanonicalOwner::Terrain);
+                self.terrain_id = Some(vid);
+            }
+            BaselineOwner::Body(entity) => {
+                if self.volume_of_entity.contains_key(&entity.get()) {
+                    return Err(format!("baseline entity {entity} owns two volumes"));
+                }
+                self.owner.insert(vid.get(), CanonicalOwner::Body(entity));
+                self.volume_of_entity.insert(entity.get(), vid.get());
+                self.bodies.insert(
+                    entity.get(),
+                    ReplicaBody {
+                        entity,
+                        volume_id: vid,
+                        track: MotionTrack::default(),
+                    },
+                );
+            }
+        }
+        self.volumes.insert(vid.get(), volume);
+        self.open = Some(vid.get());
+        Ok(())
+    }
+
+    /// Stages one brick into the open volume `vid`.
+    pub fn insert_brick(
+        &mut self,
+        vid: VolumeId,
+        bb: &spall_protocol::BaselineBrick,
+    ) -> Result<(), String> {
+        use spall_protocol::BaselineCells;
+        if self.open != Some(vid.get()) {
+            return Err(format!(
+                "brick for volume {vid}, which is not the open volume"
+            ));
+        }
+        let cells: Vec<MaterialId> = match &bb.cells {
+            BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
+            BaselineCells::Dense(raw) => {
+                if raw.len() != spall_core::CELLS_PER_BRICK {
+                    return Err(format!(
+                        "baseline brick in {vid} has {} cells, expected {}",
+                        raw.len(),
+                        spall_core::CELLS_PER_BRICK
+                    ));
+                }
+                raw.iter().copied().map(MaterialId).collect()
+            }
+        };
+        let brick = Brick::restored(&cells, Revision(bb.revision), bb.edited);
+        self.volumes
+            .get_mut(&vid.get())
+            .expect("open volume is staged")
+            .insert_brick(
+                BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
+                brick,
+            )
+            .map_err(|e| format!("baseline brick insert into {vid} failed: {e}"))?;
+        self.bricks += 1;
+        Ok(())
+    }
+
+    /// Closes the open volume `vid`.
+    pub fn close_volume(&mut self, vid: VolumeId) {
+        if self.open == Some(vid.get()) {
+            self.open = None;
+        }
+    }
+
+    /// Stages one segment. Structural validation (order, contiguity, completeness) belongs to the
+    /// `SequenceValidator`; this builds the volumes and fails on anything the voxel layer refuses
+    /// (bounds, cell-size, duplicate coordinates).
+    pub fn add_segment(
+        &mut self,
+        seg: &spall_protocol::segment::BaselineSegment,
+    ) -> Result<(), String> {
+        for v in &seg.volumes {
+            if let Some(h) = &v.header {
+                self.open_volume(v.volume_id, h)?;
+            }
+            for b in &v.bricks {
+                self.insert_brick(v.volume_id, b)?;
+            }
+            if v.last {
+                self.close_volume(v.volume_id);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ReplicaWorld {
@@ -403,6 +582,7 @@ impl ReplicaWorld {
             now_tick: 0,
             render_clock: RenderClock::default(),
             evicted: BTreeMap::new(),
+            terrain_generation: 1,
         }
     }
 
@@ -429,6 +609,7 @@ impl ReplicaWorld {
             now_tick: 0,
             render_clock: RenderClock::default(),
             evicted: BTreeMap::new(),
+            terrain_generation: 0,
         }
     }
 
@@ -454,86 +635,47 @@ impl ReplicaWorld {
         &mut self,
         world: &spall_protocol::BaselineWorld,
     ) -> Result<(), String> {
-        use spall_protocol::{BaselineCells, BaselineOwner};
-
         world.validate().map_err(|e| e.to_string())?;
-
-        let mut volumes = BTreeMap::new();
-        let mut owner = BTreeMap::new();
-        let mut bodies = BTreeMap::new();
-        let mut volume_of_entity = BTreeMap::new();
-        let mut terrain_id = None;
-
+        let mut staged = StagedBaseline::new(world.checkpoint_tick);
         for bv in &world.volumes {
-            let vid = bv.volume_id;
-            let cs = CellSizeCode::from_u8(bv.cell_size_code).ok_or_else(|| {
-                format!(
-                    "baseline volume {vid} has unknown cell-size code {}",
-                    bv.cell_size_code
-                )
-            })?;
-            let mut volume = match bv.bounds {
-                Some([mn, mx]) => {
-                    let bb = spall_voxel::BrickBounds::new(
-                        BrickCoord::new(mn[0], mn[1], mn[2]),
-                        BrickCoord::new(mx[0], mx[1], mx[2]),
-                    )
-                    .ok_or_else(|| format!("baseline volume {vid} has inverted bounds"))?;
-                    Volume::bounded(vid, cs, bb)
-                }
-                None => Volume::new(vid, cs),
+            let header = spall_protocol::segment::VolumeHeader {
+                cell_size_code: bv.cell_size_code,
+                owner: bv.owner,
+                bounds: bv.bounds,
             };
+            staged.open_volume(bv.volume_id, &header)?;
             for bb in &bv.bricks {
-                let cells: Vec<MaterialId> = match &bb.cells {
-                    BaselineCells::Uniform(id) => {
-                        vec![MaterialId(*id); spall_core::CELLS_PER_BRICK]
-                    }
-                    BaselineCells::Dense(raw) => {
-                        if raw.len() != spall_core::CELLS_PER_BRICK {
-                            return Err(format!(
-                                "baseline brick in {vid} has {} cells, expected {}",
-                                raw.len(),
-                                spall_core::CELLS_PER_BRICK
-                            ));
-                        }
-                        raw.iter().copied().map(MaterialId).collect()
-                    }
-                };
-                let brick = Brick::restored(&cells, Revision(bb.revision), bb.edited);
-                volume
-                    .insert_brick(
-                        BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]),
-                        brick,
-                    )
-                    .map_err(|e| format!("baseline brick insert into {vid} failed: {e}"))?;
+                staged.insert_brick(bv.volume_id, bb)?;
             }
-            match bv.owner {
-                BaselineOwner::Terrain => {
-                    owner.insert(vid.get(), CanonicalOwner::Terrain);
-                    terrain_id = Some(vid);
-                }
-                BaselineOwner::Body(entity) => {
-                    owner.insert(vid.get(), CanonicalOwner::Body(entity));
-                    volume_of_entity.insert(entity.get(), vid.get());
-                    bodies.insert(
-                        entity.get(),
-                        ReplicaBody {
-                            entity,
-                            volume_id: vid,
-                            track: MotionTrack::default(),
-                        },
-                    );
-                }
-            }
-            volumes.insert(vid.get(), volume);
+            staged.close_volume(bv.volume_id);
         }
-        let terrain_id = terrain_id.ok_or("baseline has no terrain volume")?;
+        self.install_staged(staged)
+    }
 
+    /// Decoded bytes the replica's terrain and bodies hold, counting every resident brick as a
+    /// dense one (conservative). Used to admit a replacement baseline, which coexists with the
+    /// current world until the atomic swap.
+    pub fn decoded_bytes_estimate(&self) -> u64 {
+        self.volumes
+            .values()
+            .map(|v| v.resident_brick_count() as u64)
+            .sum::<u64>()
+            * spall_protocol::segment::DENSE_BRICK_DECODED_COST as u64
+    }
+
+    /// Installs a fully staged baseline atomically: the same swap `install_baseline_world`
+    /// performs, for a world built segment by segment. The previous state is untouched until this
+    /// call, and a staged world with no terrain or an open volume is refused.
+    pub fn install_staged(&mut self, staged: StagedBaseline) -> Result<(), String> {
+        let terrain_id = staged.terrain_id.ok_or("baseline has no terrain volume")?;
+        if let Some(open) = staged.open {
+            return Err(format!("baseline volume {open} was left open"));
+        }
         self.terrain_id = terrain_id;
-        self.volumes = volumes;
-        self.owner = owner;
-        self.bodies = bodies;
-        self.volume_of_entity = volume_of_entity;
+        self.volumes = staged.volumes;
+        self.owner = staged.owner;
+        self.bodies = staged.bodies;
+        self.volume_of_entity = staged.volume_of_entity;
         self.tombstoned = BTreeSet::new();
         self.applied_tx = BTreeSet::new();
         self.control_gate = SequenceGate::new();
@@ -547,7 +689,8 @@ impl ReplicaWorld {
         // A full baseline replaces the whole logical state, digest namespace
         // included (G3-residency-hash.md lifecycle).
         self.evicted = BTreeMap::new();
-        self.now_tick = world.checkpoint_tick;
+        self.now_tick = staged.checkpoint_tick;
+        self.bump_terrain_generation();
         Ok(())
     }
 
@@ -573,6 +716,7 @@ impl ReplicaWorld {
         // part-way (unknown volume, malformed brick, out-of-bounds coord) never
         // half-replaces live state — the repair either restores exact parity or
         // changes nothing.
+        let terrain_touched = world.volumes.iter().any(|v| v.volume_id == self.terrain_id);
         let mut staged: BTreeMap<u64, Volume> = BTreeMap::new();
         for bv in &world.volumes {
             let vid = bv.volume_id;
@@ -630,6 +774,9 @@ impl ReplicaWorld {
                     bb.coord[2],
                 ));
             }
+        }
+        if terrain_touched {
+            self.bump_terrain_generation();
         }
         Ok(())
     }
@@ -773,6 +920,15 @@ impl ReplicaWorld {
         self.volumes.get(&self.terrain_id.get())
     }
 
+    /// Cheap invalidation token for a cached immutable terrain clone.
+    pub fn terrain_generation(&self) -> u64 {
+        self.terrain_generation
+    }
+
+    fn bump_terrain_generation(&mut self) {
+        self.terrain_generation = self.terrain_generation.wrapping_add(1).max(1);
+    }
+
     /// Any live volume by stable id. Streamed client caches use this to account
     /// resident bricks without reaching into replica internals.
     pub fn volume(&self, volume: VolumeId) -> Option<&Volume> {
@@ -805,6 +961,9 @@ impl ReplicaWorld {
             return false;
         }
         v.evict_brick(coord);
+        if volume == self.terrain_id {
+            self.bump_terrain_generation();
+        }
         true
     }
 
@@ -1018,6 +1177,10 @@ impl ReplicaWorld {
         }
 
         // 4. Commit the candidate. Nothing above mutated live state.
+        let terrain_touched = tx
+            .ops
+            .iter()
+            .any(|op| topology_op_touches_volume(op, self.terrain_id));
         self.volumes = candidate;
         // slice E: a committed op that wrote into a brick this replica had
         // evicted (its `before` gap was healed by a repair patch just before
@@ -1041,6 +1204,9 @@ impl ReplicaWorld {
             );
         }
         self.applied_tx.insert(tx.transaction_id.get());
+        if terrain_touched {
+            self.bump_terrain_generation();
+        }
 
         // ENG-49: this transaction is applied — drop it from the pending-repair
         // hold and clear any repair keys its `before` bricks were blocked on so
@@ -1258,6 +1424,21 @@ impl ReplicaWorld {
 }
 
 // --- op replay --------------------------------------------------------------
+
+fn topology_op_touches_volume(op: &TopologyOp, volume: VolumeId) -> bool {
+    match op {
+        TopologyOp::IntegerBrush { volume: v, .. } | TopologyOp::CellRun { volume: v, .. } => {
+            *v == volume
+        }
+        TopologyOp::SplitOff { source, child, .. }
+        | TopologyOp::SplitOffBaseline { source, child, .. }
+        | TopologyOp::SplitOffBulkBaseline { source, child, .. } => {
+            *source == volume || *child == volume
+        }
+        TopologyOp::SourcePatchBaseline { source, .. }
+        | TopologyOp::SourcePatchBulkBaseline { source, .. } => *source == volume,
+    }
+}
 
 /// A batch of same-volume writes not yet applied.
 struct PendingGroup {
@@ -1682,7 +1863,8 @@ pub(crate) fn advance_pose(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spall_core::CellSizeCode;
+    use spall_core::{CellSizeCode, Tick};
+    use spall_protocol::InputSeq;
     use spall_voxel::EditPlan;
 
     fn terrain() -> Volume {
@@ -2139,6 +2321,110 @@ mod tests {
             replica.apply_transaction(&tx),
             ApplyOutcome::Published { .. }
         ));
+    }
+
+    #[test]
+    fn terrain_generation_tracks_only_published_resident_terrain_mutations() {
+        use spall_protocol::{
+            BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume, BaselineWorld,
+        };
+
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        let initial = replica.terrain_generation();
+
+        // Body-only installation and motion do not invalidate terrain-derived
+        // collision.
+        let body = EntityId::new(44).unwrap();
+        let mut body_volume = Volume::new(VolumeId::new(44).unwrap(), CellSizeCode::Quarter);
+        body_volume
+            .apply_edit(&EditPlan::filled_box(
+                body_volume.id(),
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(0, 0, 0),
+                MaterialId(1),
+            ))
+            .unwrap();
+        replica.install_body(body, body_volume);
+        let snap = MotionSnapshot {
+            server_tick: Tick(2),
+            snapshot_seq: spall_protocol::SnapshotSeq(1),
+            acked_input: InputSeq(0),
+            body,
+            topology_revision: Revision(1),
+            pose: Pose {
+                translation_m: [1.0, 2.0, 3.0],
+                rotation: spall_core::QuantizedQuat::from_unit(0.0, 0.0, 0.0, 1.0).unwrap(),
+            },
+            linear_velocity: [0.0; 3],
+            angular_velocity: [0.0; 3],
+            sleeping: false,
+        };
+        replica.ingest_snapshot(&snap);
+        assert_eq!(replica.terrain_generation(), initial);
+
+        let terrain_id = replica.terrain_volume_id();
+        assert!(replica.evict_brick(terrain_id, BrickCoord::new(0, 0, 0)));
+        let evicted = replica.terrain_generation();
+        assert!(evicted > initial);
+
+        let mut cells = vec![MaterialId::AIR.0; spall_core::CELLS_PER_BRICK];
+        cells[..10].fill(MaterialId(1).0);
+        let patch = BaselineWorld {
+            schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+            checkpoint_tick: 3,
+            volumes: vec![BaselineVolume {
+                volume_id: terrain_id,
+                cell_size_code: CellSizeCode::Quarter.to_u8(),
+                owner: BaselineOwner::Terrain,
+                bounds: None,
+                bricks: vec![BaselineBrick {
+                    coord: [0, 0, 0],
+                    revision: 1,
+                    edited: true,
+                    cells: BaselineCells::Dense(cells),
+                }],
+            }],
+        };
+        replica.apply_baseline_patch(&patch).unwrap();
+        let repaired = replica.terrain_generation();
+        assert!(repaired > evicted);
+
+        let tx = TopologyTransaction {
+            transaction_id: TransactionId::new(991).unwrap(),
+            server_tick: Tick(4),
+            control_seq: spall_protocol::ControlSeq(2),
+            algorithm_version: 1,
+            dependencies: vec![],
+            before: vec![],
+            after: vec![],
+            ops: vec![TopologyOp::CellRun {
+                volume: terrain_id,
+                start: GlobalCell::new(0, 0, 0),
+                len: 1,
+                material: MaterialId::AIR,
+            }],
+            result_hashes: vec![],
+        };
+        assert!(matches!(
+            replica.apply_transaction(&tx),
+            ApplyOutcome::Published { .. }
+        ));
+        assert!(replica.terrain_generation() > repaired);
+
+        let before_rejected = replica.terrain_generation();
+        let mut invalid = tx;
+        invalid.transaction_id = TransactionId::new(992).unwrap();
+        invalid.ops = vec![TopologyOp::CellRun {
+            volume: terrain_id,
+            start: GlobalCell::new(0, 0, 0),
+            len: 0,
+            material: MaterialId::AIR,
+        }];
+        assert!(matches!(
+            replica.apply_transaction(&invalid),
+            ApplyOutcome::Rejected { .. }
+        ));
+        assert_eq!(replica.terrain_generation(), before_rejected);
     }
 
     #[test]

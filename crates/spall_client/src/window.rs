@@ -631,6 +631,10 @@ impl Hud {
         max_horizontal_correction_m: f64,
         unmatched_total: u64,
         max_unmatched_displacement_m: f64,
+        prediction_steps: u64,
+        prediction_elapsed_ms: u64,
+        prediction_max_backlog_steps: u64,
+        prediction_dropped_steps: u64,
         window_stats_total: crate::predict::WindowStats,
     ) -> String {
         let elapsed = self
@@ -682,11 +686,17 @@ impl Hud {
             .terrain_fallbacks
             .saturating_sub(self.last_window_stats.terrain_fallbacks);
         self.last_window_stats = window_stats_total;
+        let prediction_hz = if prediction_elapsed_ms == 0 {
+            0.0
+        } else {
+            prediction_steps as f64 * 1_000.0 / prediction_elapsed_ms as f64
+        };
         format!(
             "{fps:.0} fps | frame {:.1} ms (avg) / {max_frame_ms:.1} ms (max) | HUD CPU {avg_hud_cpu_ms:.3} ms (avg) / {max_hud_cpu_ms:.3} ms (max), GPU {hud_gpu_report} | buffer upload {max_buffer_upload_ms:.1} ms (max) | \
              rebuild {:.1} ms ({} instances) | server tick {server_tick} | \
              +{new_corrections} corrections ({new_idle} idle) (lifetime max {max_correction_m:.3} m idle {max_idle_correction_m:.3} m vert {max_vertical_correction_m:.3} m horiz {max_horizontal_correction_m:.3} m) | \
              +{new_unmatched} unmatched (lifetime max displacement {max_unmatched_displacement_m:.3} m) | \
+             prediction {prediction_hz:.1} Hz, backlog max {prediction_max_backlog_steps}, dropped {prediction_dropped_steps} | \
              window cache: {new_window_sweeps} sweeps ({new_window_rebuilds} rebuilt), {new_terrain_fallbacks} terrain fallbacks",
             self.frame_ms_ema, self.last_rebuild_ms, self.last_rebuild_instances,
         )
@@ -1098,6 +1108,11 @@ impl ApplicationHandler for InteractiveApp {
                     let max_unmatched_displacement_m =
                         view.map_or(0.0, |v| v.max_unmatched_displacement_m);
                     let window_stats = view.map_or_else(Default::default, |v| v.window_stats);
+                    let prediction_steps = view.map_or(0, |v| v.prediction_steps);
+                    let prediction_elapsed_ms = view.map_or(0, |v| v.prediction_elapsed_ms);
+                    let prediction_max_backlog_steps =
+                        view.map_or(0, |v| v.prediction_max_backlog_steps);
+                    let prediction_dropped_steps = view.map_or(0, |v| v.prediction_dropped_steps);
                     let line = self.hud.report(
                         now,
                         server_tick,
@@ -1109,6 +1124,10 @@ impl ApplicationHandler for InteractiveApp {
                         max_horizontal_correction_m,
                         unmatched_reconciles,
                         max_unmatched_displacement_m,
+                        prediction_steps,
+                        prediction_elapsed_ms,
+                        prediction_max_backlog_steps,
+                        prediction_dropped_steps,
                         window_stats,
                     );
                     let line = format!("{line} | {}", self.pose_stats.take_report());

@@ -229,6 +229,25 @@ prediction/reconciliation acceptance is CPU tests: `cargo test -p spall_physics
 character::`, `-p spall_sim --test player_movement`, and `-p spall_client --test
 prediction` (predictor vs. a live `spall_sim::Simulation` through an injected
 100 ms link — convergence, floor-removal-no-hover, lost-button-release).
+ENG-69 adds interactive window input and deadline-based prediction timing. The
+mover uses a resident-terrain mutation generation instead of hashing and cloning
+the full terrain every iteration, and bounded four-step catch-up instead of a
+fixed sleep after work. `ClientSummary` version 4 reports completed prediction
+steps / elapsed time, catch-up / dropped / maximum backlog, terrain clone and
+collider-refresh time, and prediction-step mean/max inputs; movement summaries
+report unconditional mean/max pre/post-reconcile displacement and the count over
+1 cm. `cargo test -p spall_client --test prediction_timing -- --nocapture`
+models the captured 825-server-tick / 318-client-step failure over 13.75 s with
+six 100 ms mover stalls, 50 ms delayed snapshots, direction changes, and a
+neutral tail. Measured CPU result: 812 local steps (59.05 Hz), 275 reconciles,
+0.008270 m median / 0.072685 m p95 / 0.150239 m maximum pre/post displacement;
+the pure scheduler fixture reaches 819 steps (59.56 Hz), drops 6 old deadlines,
+and never sees a due batch above 5. A real two-client QUIC `player-movement` run
+measured 427 steps in 7.117–7.120 s (59.97–60.00 Hz), 0 dropped, maximum backlog
+1–2, 9–22 us total terrain-clone time across two generations, and 0.007908–
+0.008916 m mean unconditional reconcile displacement. These are measured
+headless timing/correctness results; hands-on visual acceptance remains unrun.
+Full moving-body crush outcomes remain follow-up.
 ENG-69 adds the separate live-input path: `sandbox-client --connect
 --interactive` runs the same network prediction/reconciliation session in a
 winit window, reading WASD, Space, and mouse look from the local window. Its
@@ -358,7 +377,9 @@ cargo xtask scenario --name giant-split --loss-percent 0 --output .local/runs/gi
 
 # T19: one `walk` server + two scripted player capsules that predict movement,
 # send InputFrame datagrams, and reconcile against the server's player snapshots.
-# Passes on bounded corrections, ground contact, travel distance, and no hover.
+# Passes on bounded corrections, ground contact, travel distance, no hover, and
+# writes prediction throughput/backlog/stage timing plus unconditional reconcile
+# displacement to each client summary.
 cargo xtask scenario --name player-movement --loss-percent 0 --output .local/runs/player-movement
 
 # ENG-69 manual interactive launcher. Requires a desktop, so it is not an
@@ -787,6 +808,11 @@ join-budget or full-envelope requirements.
 
 ### G4 — eight-client engine slice
 
+ENG-76 proximity-index measurements and their workload limits are recorded in
+[the takeover report](reports/ENG-76-proximity-index.md). The old worker lane
+with falling out-of-world bodies is diagnostic only. Its passing timings do
+not replace the integrated workload, physics budget, or 30-minute soak.
+
 See the [ENG-30 post-merge review](reviews/2026-09-10-eng-30-post-merge.md) for
 current evidence qualifications: live retry-exhaustion remains untested by the
 after-shutdown join fixture; increment 12 now enforces residency/traversal
@@ -795,6 +821,18 @@ backing/full-reload checkpoint path does not establish the frozen durable
 residency or total-memory requirements.
 
 Run for two measured minutes after 30 seconds warmup; also run a 30-minute reduced-telemetry soak. Eight players in both clustered and separated arrangements, 256 active nontrivial voxel bodies server-wide, at least 64 nearby to one observer, and an accumulated population of 4,096 sleeping persistent bodies. Drive 10 ordinary edits/s total and one 4 m diameter blast every 10 seconds. Include one 64-brick connected collapse. Geometry fixtures must specify occupied cells and collider complexity, not only body count.
+
+**Evidence status (2026-09-20, `docs/reports/G3.md` increment 38).** The integrated
+fixture (`g4-integrated-{clustered,separated}`), a declared ordinary-edit mix (1
+terrain dig : 9 body edits), and fail-closed telemetry (`tools/xtask/src/g4.rs`) are
+in; measured-versus-target is tabulated there. Not met on the loaded reference
+machine: tick p95/p99 and physics p95, the 30-minute soak (did not complete), and G2
+GPU p95 (14.8 ms). Met on final runs: per-client steady egress, memory, body
+populations, baseline pacing/concurrency, join readiness under 30 s, and replica
+convergence under both impairment envelopes. This document names no numeric bound for
+the stress envelope's "bounded degradation/recovery"; none has been adopted, and the
+stress lane is recorded as measured-but-unaccepted. Client frame time from the
+networked harness is *unavailable*; GPU/visual evidence is separately open.
 
 Targets on the recorded reference hardware:
 

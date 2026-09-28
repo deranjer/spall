@@ -11,5 +11,6 @@ serde.workspace = true
 serde_json.workspace = true
 spall_core = { path = "../../crates/spall_core" }
 spall_net = { path = "../../crates/spall_net" }
+spall_voxel = { path = "../../crates/spall_voxel" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }

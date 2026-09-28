@@ -3101,6 +3101,7 @@ name = "spall_server"
 version = "0.1.0"
 dependencies = [
  "glam 0.33.6",
+ "postcard",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4344,6 +4345,7 @@ dependencies = [
  "serde_json",
  "spall_core",
  "spall_net",
+ "spall_voxel",
  "thiserror 2.0.20",
  "tokio",
 ]

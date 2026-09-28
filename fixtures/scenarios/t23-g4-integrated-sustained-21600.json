@@ -1,0 +1,53 @@
+{
+  "name": "t23-g4-integrated-sustained-21600",
+  "description": "PREDECLARED BOUNDED HORIZON for the single-vs-brick-collider comparison (ENG-30 / T23, 2026-09-21): the soak's unchanged workload (10 edits/s, terrain:body 1:9, one blast per 10 s, eight clients, dormancy on) cut to 1,800 warmup + 21,600 measured server ticks (6 simulated minutes), long enough to reach the sustained awake-rubble growth regime (the 30-minute soak showed it from ~tick 9,000; the in-process runs by tick 21,600). Not a gate lane; thresholds are the soak's and are not relaxed. Run alternately with the -bricks variant, performance runs only (no diagnostics, no overlapping work).",
+  "scene": "g4-integrated-separated",
+  "release_profile": true,
+  "server_ticks": 23820,
+  "quiescence_ticks": 1200,
+  "clients": 8,
+  "late_join_clients": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "late_join_connect_delay_ms": 200,
+  "minimum_transactions": 3636,
+  "replay_check": true,
+  "restart_check": true,
+  "dormancy": true,
+  "cuts": [],
+  "sustained_edits": {
+    "start_tick": 1800,
+    "small_rate_per_sec": 10.0,
+    "blast_interval_sec": 10.0,
+    "trailing_buffer_ticks": 300,
+    "mode": "g4_bodies",
+    "ordinary_offset_ticks": 120,
+    "giant_at_offset_ticks": 60,
+    "terrain_edit_every": 10
+  },
+  "motion_interest": {
+    "near_m": 12.0,
+    "far_m": 24.0,
+    "far_interval": 4,
+    "client_budget_bytes": 6000
+  },
+  "baseline_rate_limit_bytes_per_sec": 1048576,
+  "server_timing": {
+    "warmup_ticks": 1800,
+    "measured_ticks": 21600,
+    "max_samples": 21600
+  },
+  "g4_telemetry": {
+    "min_rubble_fraction": 0.8,
+    "warmup_ticks": 1800,
+    "measured_ticks": 21600,
+    "baseline_rate_cap_bytes_per_sec": 1048576
+  }
+}
