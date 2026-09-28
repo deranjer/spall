@@ -293,7 +293,16 @@ pub struct MotionPublisher {
     /// Server ticks between published batches (`60 / 20 = 3`).
     interval_ticks: u64,
     next_seq: u64,
+    /// Bodies whose *resting* pose has already been published. A dormant or
+    /// asleep body is re-published only on a resync keyframe, not every batch
+    /// (`docs/protocol.md`: sleeping bodies at a reduced cadence): T23 / G4
+    /// measured 4,096 resting bodies costing one client `4.5 MB/s` when they
+    /// were re-sent at 20 Hz.
+    rest_published: std::collections::HashSet<u64>,
 }
+
+/// Ticks between full resync batches that re-publish resting bodies (5 s).
+pub const REST_RESYNC_TICKS: u64 = 300;
 
 impl MotionPublisher {
     /// `server_tick_hz` and `snapshot_hz` come from the negotiated
@@ -304,6 +313,7 @@ impl MotionPublisher {
         Self {
             interval_ticks: hz.div_ceil(snap).max(1),
             next_seq: 0,
+            rest_published: std::collections::HashSet::new(),
         }
     }
 
@@ -319,9 +329,29 @@ impl MotionPublisher {
     /// the last input sequence the server integrated for that player — the
     /// client uses it to drop acknowledged inputs and replay the rest.
     pub fn snapshots(&mut self, world: &SimWorld, tick: Tick) -> Vec<MotionSnapshot> {
+        self.build(world, tick, false)
+    }
+
+    /// Every body's current snapshot, resting or not (a joiner's keyframe).
+    pub fn full_snapshots(&mut self, world: &SimWorld, tick: Tick) -> Vec<MotionSnapshot> {
+        self.build(world, tick, true)
+    }
+
+    fn build(&mut self, world: &SimWorld, tick: Tick, full: bool) -> Vec<MotionSnapshot> {
         let mut out = Vec::with_capacity(world.body_count() + world.player_count());
+        let resync = full || tick.get() % REST_RESYNC_TICKS < self.interval_ticks;
+        let mut resting_now = std::collections::HashSet::new();
         for body in world.bodies() {
             let Some(entity) = body.entity else { continue };
+            if body.dormant || body.sleeping {
+                resting_now.insert(entity.get());
+                // First resting pose goes out; then only on a resync batch.
+                if !self.rest_published.insert(entity.get()) && !resync {
+                    continue;
+                }
+            } else {
+                self.rest_published.remove(&entity.get());
+            }
             let seq = self.next_seq;
             self.next_seq += 1;
             out.push(MotionSnapshot {
@@ -335,6 +365,12 @@ impl MotionPublisher {
                 angular_velocity: body.angvel_rad_s.map(|v| v as f32),
                 sleeping: body.sleeping,
             });
+        }
+
+        // A resync batch also forgets bodies that no longer exist or woke, so the
+        // set cannot grow with retired bodies.
+        if resync {
+            self.rest_published = resting_now;
         }
 
         let terrain_rev = latest_revision(world, world.terrain_volume_id());

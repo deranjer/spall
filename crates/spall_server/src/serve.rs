@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::action_catalog::ToolCatalog;
 use crate::replication::{BodyDigest, ClientReplication, InterestSet, MotionBudget};
 use glam::DVec3;
 use serde::Serialize;
@@ -34,16 +35,17 @@ use spall_net::{
 use spall_physics::PhysicsConfig;
 use spall_protocol::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, AlgorithmVersions, BaselineAck,
-    ClaimedTarget, Handshake, Hash32, InputFrame, InterestEpoch, MotionSnapshot, NegotiatedLimits,
+    ClaimedTarget, Handshake, InputFrame, InterestEpoch, MotionSnapshot, NegotiatedLimits,
     PROTOCOL_VERSION, RepairRequest, RequestId, SessionId, SlotId, TopologyTransaction, TransferId,
     frame_input, recent_input, session_player_entity,
 };
 use spall_sim::fixtures::{
     G4_WORKLOAD_SPAWNS, SEPARATED_REGION_FAR_SPAWNS, SEPARATED_REGION_SPAWNS, WALK_ARENA_SPAWNS,
 };
+use spall_sim::world::TerrainColliderMode;
 use spall_sim::{
     Body, EditIntent, EditKind, EditTarget, MotionPublisher, SimWorld, Simulation,
-    SimulationConfig, action_statuses, fixtures,
+    SimulationConfig, action_statuses,
 };
 use spall_store::Writer;
 use spall_structure::AnchorPlane;
@@ -52,6 +54,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::baseline::{self, BaselineTransfer};
 use crate::commit_latency::{self, CommitLatency};
+use crate::input_schedule::PlayerInputSchedule;
 use crate::persist::{self, PersistConfig};
 use crate::persist_pipeline::{PersistPipeline, PipelineConfig};
 
@@ -151,6 +154,7 @@ pub const MAX_ACTIONS_PER_CLIENT_PER_TICK: u32 = 4;
 /// (`docs/protocol.md`: `RepairRequest` is "rate-limited"). Surplus is dropped;
 /// the replica re-requests, itself rate-limited (ENG-49).
 pub const MAX_REPAIRS_PER_CLIENT_PER_TICK: u32 = 8;
+pub const MAX_PROGRESSION_PER_CLIENT_PER_TICK: u32 = 8;
 
 /// Most reliable messages (committed topology, `ActionStatus`, baseline
 /// transfers) that may sit unsent in one client's outbound queue before that
@@ -227,6 +231,55 @@ pub enum Scene {
     /// column-and-beam in the player lane. See
     /// [`spall_sim::fixtures::sleep_wake_setup`].
     SleepWake,
+    /// Not a gate scene: a hands-on playground (plaza, stairs, maze, jump
+    /// course) with a live debris spawner, for `cargo xtask play --scene
+    /// playground`. See [`spall_sim::fixtures::playground_setup`] /
+    /// [`spall_sim::playground`].
+    Playground,
+    /// Not a gate scene: [`Scene::Walk`]'s arena with one dynamic 0.75 m box
+    /// resting in the player lane, for the headless prediction/push repro
+    /// (`crates/spall_server/tests/prediction_timeline.rs`). See
+    /// [`spall_sim::spawn_push_test_box`].
+    PushTest,
+    /// A game-supplied world (see [`CustomWorld`] and
+    /// [`ServeConfig::custom_world`]), e.g. a scene authored in the editor.
+    /// Never selected by name; the host must supply the world.
+    Custom,
+}
+
+/// A game-supplied world for [`Scene::Custom`]: a terrain/material/physics
+/// setup builder plus the feet positions (metres) for connecting players,
+/// indexed by connection slot. The builder runs once on the authoritative
+/// simulation thread when a new world is created.
+#[derive(Clone)]
+pub struct CustomWorld {
+    player_spawns: Vec<[f64; 3]>,
+    build: Arc<dyn Fn() -> spall_sim::WorldSetup + Send + Sync>,
+}
+
+impl CustomWorld {
+    /// `player_spawns` must be non-empty: every connection gets a capsule.
+    pub fn new(
+        player_spawns: Vec<[f64; 3]>,
+        build: impl Fn() -> spall_sim::WorldSetup + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            player_spawns,
+            build: Arc::new(build),
+        }
+    }
+
+    pub fn player_spawns(&self) -> &[[f64; 3]] {
+        &self.player_spawns
+    }
+}
+
+impl std::fmt::Debug for CustomWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomWorld")
+            .field("player_spawns", &self.player_spawns)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Scene {
@@ -248,6 +301,9 @@ impl Scene {
             }
             "g1-full-envelope" | "g1-full-workload" | "g1" => Some(Scene::G1FullEnvelope),
             "sleep-wake" | "sleepwake" | "t21-sleep-wake" => Some(Scene::SleepWake),
+            "playground" | "play" | "sandbox-playground" => Some(Scene::Playground),
+            "push-test" | "pushtest" => Some(Scene::PushTest),
+            // `Scene::Custom` is host-supplied and never parsed from a name.
             _ => None,
         }
     }
@@ -265,6 +321,9 @@ impl Scene {
             Scene::SeparatedRegionsFar => "separated-regions-far",
             Scene::G1FullEnvelope => "g1-full-envelope",
             Scene::SleepWake => "sleep-wake",
+            Scene::Playground => "playground",
+            Scene::PushTest => "push-test",
+            Scene::Custom => "custom",
         }
     }
 
@@ -278,6 +337,9 @@ impl Scene {
                 | Scene::SeparatedRegionsFar
                 | Scene::G1FullEnvelope
                 | Scene::SleepWake
+                | Scene::Playground
+                | Scene::PushTest
+                | Scene::Custom
         )
     }
 
@@ -291,11 +353,28 @@ impl Scene {
             Scene::SeparatedRegionsFar => &SEPARATED_REGION_FAR_SPAWNS,
             Scene::G1FullEnvelope => &spall_sim::fixtures::G1_WORKLOAD_SPAWNS,
             Scene::SleepWake => &WALK_ARENA_SPAWNS,
+            Scene::Playground => &spall_sim::fixtures::PLAYGROUND_SPAWNS,
+            Scene::PushTest => &WALK_ARENA_SPAWNS,
             _ => &[],
         }
     }
 
+    #[cfg(test)]
     fn simulation(self) -> Simulation {
+        self.simulation_with_terrain_collider_mode(TerrainColliderMode::PerBrick)
+    }
+
+    #[cfg(test)]
+    fn simulation_with_terrain_collider_mode(self, mode: TerrainColliderMode) -> Simulation {
+        self.simulation_with_materials(mode, spall_sim::fixtures::stone_manifest(), None)
+    }
+
+    fn simulation_with_materials(
+        self,
+        mode: TerrainColliderMode,
+        materials: spall_core::MaterialManifest,
+        custom: Option<&CustomWorld>,
+    ) -> Simulation {
         let mut setup = match self {
             Scene::BridgeCut => spall_sim::fixtures::bridged_terrain_setup(),
             Scene::CrossBridgeCut => spall_sim::fixtures::cross_brick_bridged_setup(),
@@ -309,7 +388,12 @@ impl Scene {
             }
             Scene::G1FullEnvelope => spall_sim::fixtures::g1_full_envelope_setup(),
             Scene::SleepWake => spall_sim::fixtures::sleep_wake_setup(),
+            Scene::Playground => spall_sim::fixtures::playground_setup(),
+            Scene::PushTest => spall_sim::fixtures::walk_arena_setup(),
+            // `serve` rejects a `Custom` scene without a world before this runs.
+            Scene::Custom => (custom.expect("Scene::Custom requires a CustomWorld").build)(),
         };
+        setup.materials = materials;
         // No detached body in these scenes enables per-body CCD, and the serve
         // loop rebuilds the terrain collider on every committed cut. Rapier's
         // CCD broad-phase BVH can keep a stale proxy for the just-removed
@@ -317,8 +401,9 @@ impl Scene {
         // is still settling (repro: `cargo xtask scenario --name
         // g1-networked-destruction`). Skip the CCD pass — a no-op here.
         setup.physics.disable_ccd = true;
-        let mut sim =
-            Simulation::new(SimulationConfig::new(setup)).expect("built-in scene is valid");
+        let mut sim_config = SimulationConfig::new(setup);
+        sim_config.terrain_collider_mode = mode;
+        let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
         if matches!(self, Scene::G4Workload) {
             // Row 12: 256 active (64 near the west cluster's first spawn) +
             // 4096 sleeping debris bodies, built once at scene-construction
@@ -331,6 +416,21 @@ impl Scene {
             spall_sim::fixtures::spawn_g1_hollow_test_volume(sim.world_mut())
                 .expect("hollow test volume spawns");
         }
+        if matches!(self, Scene::PushTest) {
+            spall_sim::spawn_push_test_box(sim.world_mut());
+        }
+        if matches!(self, Scene::Playground) {
+            // Not a gate scene: the interactive playground's debris pile,
+            // built once at scene-construction time for the same reason
+            // G4Workload's and G1FullEnvelope's populations are — a body
+            // `spawn_body` creates bypasses the commit pipeline, so it must
+            // exist before any client's baseline pull to ever be seen (see
+            // `spall_sim::playground`'s module doc).
+            spall_sim::populate_playground_debris(
+                sim.world_mut(),
+                &spall_sim::playground_drop_zones(),
+            );
+        }
         sim
     }
 }
@@ -340,6 +440,9 @@ impl Scene {
 pub struct ServeConfig {
     pub listen: SocketAddr,
     pub scene: Scene,
+    /// Derived terrain collision mode. Per-brick is the adopted default;
+    /// whole-terrain is available for controlled legacy comparisons.
+    pub terrain_collider_mode: TerrainColliderMode,
     pub join_token: JoinToken,
     /// Hard cap on server ticks for this run.
     pub max_ticks: u64,
@@ -441,6 +544,27 @@ pub struct ServeConfig {
     /// [`Self::await_body_settle`]'s `max_penetration_m`) must keep this off,
     /// which is why it defaults to `None` for every existing gate fixture.
     pub dormancy: Option<spall_sim::DormancyConfig>,
+    /// Optional bounded timing window for the owning server tick. Warmup ticks
+    /// are excluded; measured ticks include ingress through replication and
+    /// residency, ending immediately before pacing sleep.
+    pub timing_window: Option<TimingWindow>,
+    /// Optional credential registry path polled for atomic rotation/revocation
+    /// updates. Only used by player-credential authentication.
+    pub credential_registry_file: Option<PathBuf>,
+    /// The world and player spawns for [`Scene::Custom`]; ignored for every
+    /// other scene. `serve` fails fast if `scene` is `Custom` and this is `None`.
+    pub custom_world: Option<CustomWorld>,
+}
+
+/// A bounded, explicit server timing window. The server records at most
+/// `max_samples` observations while still reporting whether the requested
+/// measured tick window completed. A caller that wants acceptance evidence
+/// should set `max_samples >= measured_ticks`.
+#[derive(Debug, Clone, Copy)]
+pub struct TimingWindow {
+    pub warmup_ticks: u64,
+    pub measured_ticks: u64,
+    pub max_samples: usize,
 }
 
 /// T20 per-client interest + motion bandwidth policy for a [`serve`] run.
@@ -481,6 +605,7 @@ impl ServeConfig {
         Self {
             listen,
             scene,
+            terrain_collider_mode: TerrainColliderMode::PerBrick,
             join_token: token,
             max_ticks: 1_200,
             quiescence_ticks: 45,
@@ -507,6 +632,9 @@ impl ServeConfig {
             residency_disk_path: None,
             contact_damage: None,
             dormancy: None,
+            timing_window: None,
+            credential_registry_file: None,
+            custom_world: None,
         }
     }
 }
@@ -706,6 +834,22 @@ pub struct ServeSummary {
     /// direct evidence that checkpoint capture is incremental rather than a
     /// full walk with a cache wrapped around it. `0` when residency is off.
     pub residency_checkpoint_bricks_logical_total: u64,
+    /// T23 / G4: owning server tick busy-time percentiles, excluding the
+    /// configured warmup window and pacing sleep. Zero samples means no timing
+    /// window was configured or the run ended before it completed.
+    pub tick_busy_p95_ms: f64,
+    pub tick_busy_p99_ms: f64,
+    pub tick_busy_max_ms: f64,
+    pub tick_busy_samples: u64,
+    pub tick_busy_window_complete: bool,
+    /// T23 / G4: physics-step duration percentiles. This measures
+    /// `world.step_physics` and body-pose extraction; player sweep/advance is
+    /// reported in the owning tick busy time, not this physics field.
+    pub physics_p95_ms: f64,
+    pub physics_p99_ms: f64,
+    pub physics_max_ms: f64,
+    pub physics_samples: u64,
+    pub physics_window_complete: bool,
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -734,22 +878,344 @@ pub enum ServeError {
     Io(#[from] std::io::Error),
     #[error("tokio runtime: {0}")]
     Runtime(String),
+    #[error("invalid server configuration: {0}")]
+    Configuration(String),
 }
 
 /// Runs the networked host to completion and returns its summary. Builds its own
 /// current-thread-free multi-thread Tokio runtime.
 pub fn serve(config: ServeConfig) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content(
+        config,
+        ToolCatalog::default(),
+        spall_sim::fixtures::stone_manifest(),
+    )
+}
+
+/// Runs the networked host with a game-owned, versioned action catalog.
+/// Engine callers can continue using [`serve`] for the legacy built-in rules.
+pub fn serve_with_catalog(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content(config, tool_catalog, spall_sim::fixtures::stone_manifest())
+}
+
+/// Runs the networked host with game-owned authoritative tools and material
+/// definitions. The manifest is used for world creation, save recovery, and
+/// handshake compatibility checks.
+pub fn serve_with_game_content(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        None,
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// A callback for game-owned entities that belong in a newly-created world.
+/// It runs on the authoritative simulation thread before the initial
+/// checkpoint is published; it is not run when an existing save is restored.
+pub type InitialGameWorldSetup =
+    Box<dyn FnOnce(&mut Simulation) -> Result<(), String> + Send + 'static>;
+
+/// Game-owned observer invoked on the authoritative thread only after a
+/// client edit commits. Material counts describe cells actually removed by
+/// that committed cut, sampled from the validated pre-edit snapshot.
+pub type CommittedEditHandler = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            RequestId,
+            &std::collections::BTreeMap<spall_core::MaterialId, u64>,
+        ) + Send
+        + 'static,
+>;
+/// Converts a committed harvest to opaque, versioned game bytes. The stable
+/// identity and journal cursor are supplied by the server for durable replay.
+pub type CommittedEditOutboxEncoder = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            RequestId,
+            spall_core::JournalSeq,
+            &std::collections::BTreeMap<spall_core::MaterialId, u64>,
+        ) -> Option<spall_store::OutboxRecord>
+        + Send
+        + 'static,
+>;
+/// Applies one durable game event idempotently to the game's progression store.
+pub type OutboxProcessor =
+    Box<dyn FnMut(&spall_store::OutboxRecord) -> Result<(), String> + Send + 'static>;
+pub type ProgressionHandler = Box<
+    dyn FnMut(
+            SessionId,
+            Option<spall_protocol::PlayerId>,
+            spall_protocol::ProgressionRequest,
+        ) -> spall_protocol::ProgressionResponse
+        + Send
+        + 'static,
+>;
+
+/// Runs the host with game content and an optional initial-world setup hook.
+/// The hook runs only when creating a new world, before its initial durable
+/// checkpoint, so restored saves never receive duplicate starter entities.
+pub fn serve_with_game_content_and_setup(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    setup: impl FnOnce(&mut Simulation) -> Result<(), String> + Send + 'static,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        Some(Box::new(setup)),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Runs the host with game content, optional new-world setup, and material
+/// profiles for the opt-in authoritative contact-damage pass.
+pub fn serve_with_game_content_and_policies(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Same as `serve_with_game_content_and_policies`, with a game asset manifest
+/// included in the exact client/server handshake content hash.
+pub fn serve_with_game_content_and_asset_manifest(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: spall_protocol::Hash32,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        Some(asset_manifest_hash),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Game-owned callback for post-commit material rewards, with the optional
+/// asset manifest included in handshake compatibility.
+pub fn serve_with_game_content_and_commit_handler(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Host with both post-commit harvest and authenticated progression handlers.
+pub fn serve_with_game_content_and_handlers(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        None,
+        None,
+        None,
+    )
+}
+
+/// Same as [`serve_with_game_content_and_handlers`], but authenticates clients
+/// using server-provisioned credentials, each bound to a stable `PlayerId`.
+/// The shared development join token in `ServeConfig` is ignored on this path.
+pub fn serve_with_game_content_and_player_credentials(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+    credentials: Vec<spall_net::PlayerCredential>,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        Some(credentials),
+        None,
+        None,
+    )
+}
+
+/// Credential-authenticated host whose harvest events are transactionally
+/// coupled to the world journal and replayed through the game's idempotent
+/// outbox processor after restart.
+pub fn serve_with_game_content_and_player_credentials_and_outbox(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    setup: Option<InitialGameWorldSetup>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: CommittedEditHandler,
+    progression_handler: ProgressionHandler,
+    credentials: Vec<spall_net::PlayerCredential>,
+    encoder: CommittedEditOutboxEncoder,
+    processor: OutboxProcessor,
+) -> Result<ServeSummary, ServeError> {
+    serve_with_game_content_and_optional_setup(
+        config,
+        tool_catalog,
+        materials,
+        setup,
+        profiles,
+        asset_manifest_hash,
+        Some(commit_handler),
+        Some(progression_handler),
+        Some(credentials),
+        Some(encoder),
+        Some(processor),
+    )
+}
+
+fn serve_with_game_content_and_optional_setup(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    game_setup: Option<InitialGameWorldSetup>,
+    damage_profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: Option<CommittedEditHandler>,
+    progression_handler: Option<ProgressionHandler>,
+    player_credentials: Option<Vec<spall_net::PlayerCredential>>,
+    outbox_encoder: Option<CommittedEditOutboxEncoder>,
+    outbox_processor: Option<OutboxProcessor>,
+) -> Result<ServeSummary, ServeError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| ServeError::Runtime(e.to_string()))?;
-    runtime.block_on(serve_async(config))
+    runtime.block_on(serve_async(
+        config,
+        tool_catalog,
+        materials,
+        game_setup,
+        damage_profiles,
+        asset_manifest_hash,
+        commit_handler,
+        progression_handler,
+        player_credentials,
+        outbox_encoder,
+        outbox_processor,
+    ))
 }
 
-fn server_handshake() -> Handshake {
+fn server_handshake(
+    materials: &spall_core::MaterialManifest,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+) -> Handshake {
     Handshake {
         protocol_version: PROTOCOL_VERSION,
-        content_manifest_hash: Hash32::of(T10_CONTENT_TAG),
+        content_manifest_hash: asset_manifest_hash.map_or_else(
+            || spall_protocol::content_manifest_hash(materials),
+            |asset_hash| spall_protocol::content_manifest_hash_with_assets(materials, asset_hash),
+        ),
         world_id: spall_core::WorldId::from_u128(T10_WORLD_ID),
         generator_version: 1,
         algorithms: AlgorithmVersions {
@@ -768,10 +1234,11 @@ fn server_handshake() -> Handshake {
 /// One reliable/repair message from a client to the sim bridge.
 #[derive(Debug)]
 enum Inbound {
-    /// A connection was accepted; the sim loop learns its session (and, from the
-    /// generation, whether it supersedes an earlier one on the same slot).
-    Joined(SessionId),
+    /// A connection was accepted; the sim loop learns its session and any
+    /// server-authenticated stable player principal.
+    Joined(SessionId, Option<spall_protocol::PlayerId>),
     Action(SessionId, ActionRequest),
+    Progression(SessionId, spall_protocol::ProgressionRequest),
     Repair(SessionId, RepairRequest),
     /// T19: a player movement input frame (datagram). At most one is applied per
     /// player per tick; redundant `recent` copies recover a dropped frame.
@@ -782,6 +1249,105 @@ enum Inbound {
     Gone(SessionId),
 }
 
+struct ProgressionWork {
+    session: SessionId,
+    player_id: Option<spall_protocol::PlayerId>,
+    request: spall_protocol::ProgressionRequest,
+}
+
+struct ProgressionDone {
+    session: SessionId,
+    response: spall_protocol::ProgressionResponse,
+}
+
+struct ProgressionWorker {
+    submit: std::sync::mpsc::SyncSender<ProgressionWork>,
+    completed: std::sync::mpsc::Receiver<ProgressionDone>,
+}
+
+struct CommittedEditWork {
+    session: SessionId,
+    player_id: Option<spall_protocol::PlayerId>,
+    request_id: RequestId,
+    removed: std::collections::BTreeMap<spall_core::MaterialId, u64>,
+}
+struct CommittedEditWorker {
+    submit: std::sync::mpsc::SyncSender<CommittedEditWork>,
+}
+
+impl CommittedEditWorker {
+    fn spawn(mut handler: CommittedEditHandler) -> Self {
+        let (submit, work) = std::sync::mpsc::sync_channel::<CommittedEditWork>(64);
+        std::thread::Builder::new()
+            .name("spall-committed-game-events".into())
+            .spawn(move || {
+                while let Ok(work) = work.recv() {
+                    handler(work.session, work.player_id, work.request_id, &work.removed);
+                }
+            })
+            .expect("committed-edit worker thread must start");
+        Self { submit }
+    }
+}
+
+struct OutboxWork(spall_store::OutboxRecord);
+struct OutboxDone {
+    event_id: [u8; 32],
+    result: Result<(), String>,
+}
+struct OutboxWorker {
+    submit: std::sync::mpsc::SyncSender<OutboxWork>,
+    completed: std::sync::mpsc::Receiver<OutboxDone>,
+}
+
+impl OutboxWorker {
+    fn spawn(mut processor: OutboxProcessor) -> Self {
+        let (submit, work) = std::sync::mpsc::sync_channel::<OutboxWork>(1);
+        let (done_tx, completed) = std::sync::mpsc::sync_channel::<OutboxDone>(1);
+        std::thread::Builder::new()
+            .name("spall-game-outbox".into())
+            .spawn(move || {
+                while let Ok(OutboxWork(event)) = work.recv() {
+                    let done = OutboxDone {
+                        event_id: event.event_id,
+                        result: processor(&event),
+                    };
+                    if done_tx.send(done).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("outbox worker thread must start");
+        Self { submit, completed }
+    }
+}
+
+impl ProgressionWorker {
+    fn spawn(mut handler: ProgressionHandler) -> Self {
+        const CAPACITY: usize = 64;
+        let (submit, work) = std::sync::mpsc::sync_channel::<ProgressionWork>(CAPACITY);
+        let (done_tx, completed) = std::sync::mpsc::sync_channel::<ProgressionDone>(CAPACITY);
+        std::thread::Builder::new()
+            .name("spall-progression-requests".into())
+            .spawn(move || {
+                while let Ok(work) = work.recv() {
+                    let response = handler(work.session, work.player_id, work.request);
+                    if done_tx
+                        .send(ProgressionDone {
+                            session: work.session,
+                            response,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("progression worker thread must start");
+        Self { submit, completed }
+    }
+}
+
 /// One message from the sim bridge to a client's writer task. Repair replies and
 /// baseline transfers are already routed to one client's queue, so they need no
 /// session tag here.
@@ -789,6 +1355,7 @@ enum Inbound {
 enum Outbound {
     Transaction(Arc<TopologyTransaction>),
     Status(Arc<ActionStatus>),
+    Progression(Arc<spall_protocol::ProgressionResponse>),
     Motion(Arc<Vec<MotionSnapshot>>),
     /// A baseline transfer: `BaselineBegin` on control, parts on a bulk stream,
     /// `BaselineEnd` on control. Carries the whole world for a first late join,
@@ -799,6 +1366,50 @@ enum Outbound {
     /// catch-up-exhaustion give-up carries a reason distinct from an ordinary
     /// end of session, so the client can tell the two apart on the wire).
     Shutdown(&'static str),
+}
+
+/// Admission control for live connections. The cap counts connections that are
+/// live *now*: a slot is released when the connection's task ends, however it
+/// ends. (It used to count every connection ever accepted, so a server that had
+/// admitted `max_clients` sessions over its life refused every later join
+/// forever, however many had since left.)
+struct AdmissionGate {
+    max: usize,
+    live: std::sync::atomic::AtomicUsize,
+    refused: std::sync::atomic::AtomicU64,
+}
+
+/// One admitted connection's slot; dropping it frees the slot.
+struct AdmissionSlot(Arc<AdmissionGate>);
+
+impl AdmissionGate {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max,
+            live: std::sync::atomic::AtomicUsize::new(0),
+            refused: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// `Some(slot)` if fewer than `max` connections are live; otherwise counts a
+    /// refusal and returns `None`.
+    fn try_admit(self: &Arc<Self>) -> Option<AdmissionSlot> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.live.load(Relaxed) >= self.max {
+            self.refused.fetch_add(1, Relaxed);
+            return None;
+        }
+        self.live.fetch_add(1, Relaxed);
+        Some(AdmissionSlot(Arc::clone(self)))
+    }
+}
+
+impl Drop for AdmissionSlot {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
@@ -886,6 +1497,7 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
                 + tx.result_hashes.len() * 40
         }
         Outbound::Status(_) => 96,
+        Outbound::Progression(reply) => 64 + reply.inventory.len() * 8,
         Outbound::Baseline(t) => 64 + t.payload_bytes(),
         Outbound::Motion(_) | Outbound::Shutdown(_) => 0,
     }
@@ -941,6 +1553,10 @@ impl OutboundHandle {
     /// Takes everything queued in one pass.
     fn take(&self) -> OutboundBatch {
         let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        // The writer now owns everything queued: reset the byte count with the
+        // queue, or the cap would count every reliable byte ever sent on this
+        // connection rather than what is waiting.
+        q.reliable_bytes = 0;
         OutboundBatch {
             reliable: q.reliable.drain(..).collect(),
             motion: q.motion.take(),
@@ -963,7 +1579,33 @@ impl OutboundHandle {
     }
 }
 
-async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
+async fn serve_async(
+    config: ServeConfig,
+    tool_catalog: ToolCatalog,
+    materials: spall_core::MaterialManifest,
+    game_setup: Option<InitialGameWorldSetup>,
+    damage_profiles: Vec<(
+        spall_core::MaterialId,
+        spall_sim::ContactDamageMaterialProfile,
+    )>,
+    asset_manifest_hash: Option<spall_protocol::Hash32>,
+    commit_handler: Option<CommittedEditHandler>,
+    progression_handler: Option<ProgressionHandler>,
+    player_credentials: Option<Vec<spall_net::PlayerCredential>>,
+    mut outbox_encoder: Option<CommittedEditOutboxEncoder>,
+    outbox_processor: Option<OutboxProcessor>,
+) -> Result<ServeSummary, ServeError> {
+    if matches!(config.scene, Scene::Custom)
+        && config
+            .custom_world
+            .as_ref()
+            .is_none_or(|world| world.player_spawns().is_empty())
+    {
+        return Err(ServeError::Configuration(
+            "Scene::Custom requires ServeConfig::custom_world with at least one player spawn"
+                .into(),
+        ));
+    }
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -984,16 +1626,32 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         std::fs::rename(&tmp, path)?;
     }
 
-    let server = Arc::new(
+    let handshake = server_handshake(&materials, asset_manifest_hash);
+    let credential_registry_file = config.credential_registry_file.clone();
+    if credential_registry_file.is_some() && player_credentials.is_none() {
+        return Err(ServeError::Configuration(
+            "credential registry reload requires player-credential authentication".into(),
+        ));
+    }
+    let server = Arc::new(if let Some(credentials) = player_credentials {
+        NetServer::bind_with_player_credentials(
+            config.listen,
+            &identity,
+            credentials,
+            handshake,
+            config.transport,
+        )
+        .await?
+    } else {
         NetServer::bind(
             config.listen,
             &identity,
             config.join_token,
-            server_handshake(),
+            handshake,
             config.transport,
         )
-        .await?,
-    );
+        .await?
+    });
     let bound = server.local_addr()?;
     if let Some(path) = &config.addr_out {
         if let Some(parent) = path.parent() {
@@ -1010,6 +1668,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         ProcessRole::Server,
         Some(format!("bound={bound}")),
     ))?;
+    tracing::info!(
+        action_catalog_version = tool_catalog.version(),
+        "loaded authoritative action catalog"
+    );
 
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
     // T20 egress accounting: live connection handles (for a final stats read at
@@ -1026,6 +1688,81 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
 
+    // Reload credentials atomically from the operator-managed registry. A
+    // malformed or unreadable update fails closed by revoking the whole live
+    // registry; no token bytes or file contents enter logs.
+    if let Some(path) = credential_registry_file {
+        let server_for_reload = server.clone();
+        let conns_for_reload = conns.clone();
+        let mut stop_for_reload = stop_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut previous_content: Option<Vec<u8>> = None;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = stop_for_reload.changed() => {
+                        if changed.is_err() || *stop_for_reload.borrow() { break; }
+                    }
+                }
+                let reload_path = path.clone();
+                let loaded =
+                    tokio::task::spawn_blocking(move || match std::fs::read(&reload_path) {
+                        Ok(bytes) => match parse_player_credentials(&bytes) {
+                            Ok(credentials) => (bytes, credentials, None),
+                            Err(error) => (bytes, Vec::new(), Some(error)),
+                        },
+                        Err(error) => (
+                            b"<unreadable>".to_vec(),
+                            Vec::new(),
+                            Some(format!("credential registry could not be read: {error}")),
+                        ),
+                    })
+                    .await;
+                let (content, credentials, invalid) = match loaded {
+                    Ok(value) => value,
+                    Err(_) => {
+                        tracing::error!(
+                            "credential registry reload worker failed; credentials unchanged"
+                        );
+                        continue;
+                    }
+                };
+                if previous_content.as_ref() == Some(&content) {
+                    continue;
+                }
+                let accepted_count = credentials.len();
+                let replacement = if invalid.is_some() {
+                    Vec::new()
+                } else {
+                    credentials
+                };
+                if let Err(error) = server_for_reload.replace_player_credentials(replacement) {
+                    tracing::error!(error = %error, "credential registry rejected; revoking all credentials");
+                    let _ = server_for_reload.replace_player_credentials(Vec::new());
+                }
+                previous_content = Some(content);
+                // Authentication state is deliberately not introspectable by
+                // token. Close live sessions on any rotation so a credential
+                // removed from the file loses its existing session at once.
+                let live = conns_for_reload
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                for connection in live.values() {
+                    connection.close("player credentials changed");
+                }
+                if let Some(reason) = invalid {
+                    tracing::error!(reason = %reason, "credential registry invalid; all player credentials revoked");
+                } else {
+                    tracing::info!(
+                        credential_count = accepted_count,
+                        "player credential registry reloaded; active sessions closed"
+                    );
+                }
+            }
+        });
+    }
+
     // Accept loop.
     let accept = {
         let server = server.clone();
@@ -1034,7 +1771,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         let egress_closed = egress_closed.clone();
         let inbound_tx = inbound_tx.clone();
         let stop_rx = stop_rx.clone();
-        let max_clients = config.max_clients;
+        let admission = AdmissionGate::new(config.max_clients);
         tokio::spawn(async move {
             let mut connected = 0usize;
             loop {
@@ -1052,10 +1789,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         continue;
                     }
                 };
-                if connected >= max_clients {
+                let Some(slot) = admission.try_admit() else {
                     conn.close("server at capacity");
                     continue;
-                }
+                };
                 connected += 1;
                 let _ = count_tx.send(connected);
                 let handle = OutboundHandle::new();
@@ -1075,6 +1812,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                     conns.clone(),
                     egress_closed.clone(),
                     stop_rx.clone(),
+                    slot,
                 ));
             }
         })
@@ -1118,6 +1856,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let await_body_settle = config.await_body_settle;
     let motion_interest = config.motion_interest;
     let scene = config.scene;
+    let custom_world = config.custom_world.clone();
+    let terrain_collider_mode = config.terrain_collider_mode;
     let clients_for_sim = clients.clone();
     let save = config.save.clone();
     let save_faults = config.save_faults.clone();
@@ -1126,15 +1866,25 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
     let max_join_retries = config.max_join_retries;
     let capture_workers = config.capture_workers.max(1);
     let dev_unvalidated_actions = config.dev_unvalidated_actions;
+    let action_catalog = tool_catalog;
+    let world_materials = materials;
     let residency_limits = config.residency;
     let residency_disk_path = config.residency_disk_path.clone();
     let contact_damage_cfg = config.contact_damage;
+    let contact_damage_profiles = damage_profiles;
     let dormancy_cfg = config.dormancy;
+    let timing_window = config.timing_window;
     let persist_cfg = PersistConfig {
         world_id: T10_WORLD_ID,
         seed: config.seed,
         generator_version: 1,
     };
+
+    // Progression callbacks may touch the game's SQLite store. Keep their
+    // bounded FIFO off the simulation thread; one worker preserves per-player
+    // request ordering and returns replies only after the callback completes.
+    let progression_worker = progression_handler.map(ProgressionWorker::spawn);
+    let committed_edit_worker = commit_handler.map(CommittedEditWorker::spawn);
 
     let sim_join = tokio::task::spawn_blocking(move || -> SimResult {
         // Open the world database (T16). If it already holds a checkpoint,
@@ -1149,13 +1899,30 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             mut pipeline,
             mut journalled_through,
             mut checkpoints_published,
-        } = match setup_persistence(save.as_deref(), scene, &persist_cfg, save_faults) {
+            outbox_processor,
+        } = match setup_persistence_with_game_content(
+            save.as_deref(),
+            scene,
+            custom_world.as_ref(),
+            &persist_cfg,
+            save_faults,
+            terrain_collider_mode,
+            world_materials,
+            game_setup,
+            outbox_processor,
+        ) {
             Ok(parts) => parts,
             Err(e) => {
                 return SimResult::error(format!("persistence setup failed: {e}"), 0);
             }
         };
+        let progression_worker = progression_worker;
+        let committed_edit_worker = committed_edit_worker;
+        let outbox_worker = outbox_processor.map(OutboxWorker::spawn);
         let mut journal_records_written: u64 = 0;
+        let mut pending_outbox = Vec::<spall_store::OutboxRecord>::new();
+        let mut waiting_outbox = std::collections::VecDeque::<spall_store::OutboxRecord>::new();
+        let mut outbox_inflight = None;
 
         // T23 / G3 row 7, slice D: default-off residency pass. `None` -> the
         // world stays fully resident and every counter below is `0`.
@@ -1206,18 +1973,43 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // The session that staged each still-pending request, so the tick-report
         // outcome (`action_statuses`) can be routed back to only that client
         // instead of every connected client.
-        let mut submitted_by: HashMap<RequestId, SessionId> = HashMap::new();
+        let mut submitted_by: HashMap<RequestId, (SessionId, Option<spall_protocol::PlayerId>)> =
+            HashMap::new();
+        let mut player_principals: HashMap<u64, spall_protocol::PlayerId> = HashMap::new();
         let mut commit_latency = CommitLatency::default();
 
         // T21 / ENG-28 increment 4 (3c): default-off passes. `None` -> every
         // counter below stays `0` and neither pass is ever called, so an
         // ordinary run is byte-identical to before this increment.
-        let mut contact_damage_policy = contact_damage_cfg.map(spall_sim::ContactDamagePolicy::new);
+        let mut contact_damage_policy = contact_damage_cfg.map(|cfg| {
+            spall_sim::ContactDamagePolicy::with_material_profiles(cfg, contact_damage_profiles)
+        });
         let mut dormancy_policy = dormancy_cfg.map(spall_sim::DormancyPolicy::new);
         let mut contact_damage_cuts_submitted = 0u64;
         let mut contact_damage_cuts_rejected = 0u64;
         let mut dormancy_deactivations_total = 0u64;
         let mut dormancy_reactivations_total = 0u64;
+        let mut timing = timing_window.map(TimingCollector::new);
+
+        // Not a gate pass: the interactive playground's timed debris drops
+        // (`cargo xtask play --scene playground`). `populate_playground_debris`
+        // (called earlier, in `Scene::simulation`) already spawned every
+        // debris body dormant; nothing else in this scene ever creates a
+        // dormant body, so every currently-dormant entity is exactly this
+        // population, found by a fresh scan rather than threading a
+        // `Vec<EntityId>` all the way through `setup_persistence`.
+        let mut playground_drops = matches!(scene, Scene::Playground).then(|| {
+            let pools = spall_sim::pending_drop_pools(sim.world());
+            const SHOWCASE_INTERVAL_TICKS: u64 = 300; // 5 s at 60 Hz
+            const PLINKO_INTERVAL_TICKS: u64 = 60; // 1 s at 60 Hz
+            (
+                spall_sim::DropSchedule::new(pools.showcase, SHOWCASE_INTERVAL_TICKS)
+                    .at_height(7.0),
+                spall_sim::DropSchedule::new(pools.plinko, PLINKO_INTERVAL_TICKS)
+                    .at_height(10.5)
+                    .with_restitution(spall_sim::PLINKO_RESTITUTION),
+            )
+        });
 
         let mut idle_streak = 0u64;
         let mut ticks_run = 0u64;
@@ -1247,9 +2039,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // backing.
         lj.backing = residency.as_ref().map(|p| p.backing());
 
+        let mut pacer = crate::pacing::TickPacer::new(tick_dt, std::time::Instant::now());
+        let mut pending_player_inputs = PlayerInputSchedule::default();
         for _ in 0..max_ticks {
             let started = std::time::Instant::now();
-
             // ENG-48: drain a bounded slice of what the clients have sent since
             // the last tick, with a per-session admission quota so one flooding
             // client can neither stall this loop nor starve the others. The
@@ -1258,6 +2051,20 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             let mut saw_client_work = false;
             let mut actions_admitted: HashMap<u64, u32> = HashMap::new();
             let mut repairs_admitted: HashMap<u64, u32> = HashMap::new();
+            let mut progression_admitted: HashMap<u64, u32> = HashMap::new();
+            if let Some(worker) = progression_worker.as_ref() {
+                for _ in 0..64 {
+                    match worker.completed.try_recv() {
+                        Ok(done) => send_to(
+                            &clients_for_sim,
+                            done.session,
+                            Outbound::Progression(Arc::new(done.response)),
+                        ),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
             let mut drained = 0usize;
             while drained < MAX_INBOUND_PER_TICK {
                 let Ok(msg) = inbound_rx.try_recv() else {
@@ -1265,11 +2072,22 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 };
                 drained += 1;
                 match msg {
-                    Inbound::Joined(session) => {
+                    Inbound::Joined(session, player_id) => {
                         lj.on_joined(session);
+                        if let Some(player_id) = player_id {
+                            player_principals.insert(session.raw(), player_id);
+                        } else {
+                            player_principals.remove(&session.raw());
+                        }
+                        // Player identity is slot-stable across reconnects;
+                        // no input scheduled by the old generation may leak
+                        // into the replacement session.
+                        pending_player_inputs.remove_slot(session.slot().0);
                         // T19: give this connection an authoritative player
                         // capsule on a player scene (respawn on reconnect).
-                        let spawns = scene.player_spawns();
+                        let spawns = custom_world
+                            .as_ref()
+                            .map_or_else(|| scene.player_spawns(), CustomWorld::player_spawns);
                         if !spawns.is_empty() {
                             let slot = session.slot().0 as usize;
                             let spawn = spawns[slot.min(spawns.len() - 1)];
@@ -1288,14 +2106,39 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             continue;
                         }
                         let entity = session_player_entity(session);
-                        // Apply the redundant recent copies oldest-first, then
-                        // the current frame. `set_player_input` drops any that
-                        // are not newer than what the server already has, so a
-                        // single surviving datagram recovers a dropped frame.
+                        // Recover unseen redundant copies through the same
+                        // admission rule as the primary input below. A copy
+                        // carries its own intended_tick, so recovering one
+                        // that was dropped as a primary datagram still lands
+                        // on the tick it was tagged for -- applying it
+                        // immediately here would reproduce the whole-tick
+                        // edge snap this scheduling exists to remove, in
+                        // exactly the case (a dropped datagram) the
+                        // redundancy is for.
                         for r in frame.recent.iter().rev() {
-                            sim.set_player_input(entity, recent_input(r), r.input_seq);
+                            if let Some(input) = pending_player_inputs.admit(
+                                session,
+                                entity,
+                                recent_input(r),
+                                r.input_seq,
+                                r.intended_tick,
+                                sim.current_tick(),
+                                sim.player_acked_input(entity),
+                            ) {
+                                sim.set_player_input(entity, input, r.input_seq);
+                            }
                         }
-                        sim.set_player_input(entity, frame_input(&frame), frame.input_seq);
+                        if let Some(input) = pending_player_inputs.admit(
+                            session,
+                            entity,
+                            frame_input(&frame),
+                            frame.input_seq,
+                            frame.intended_tick,
+                            sim.current_tick(),
+                            sim.player_acked_input(entity),
+                        ) {
+                            sim.set_player_input(entity, input, frame.input_seq);
+                        }
                     }
                     Inbound::Action(session, req) => {
                         saw_client_work = true;
@@ -1339,7 +2182,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             dev_intent_from_request(session, &req)
                                 .ok_or(ActionReject::Unsupported("unsupported target"))
                         } else {
-                            resolve_intent(sim.world(), session, &req)
+                            resolve_intent_with_catalog(sim.world(), session, &req, &action_catalog)
                         };
                         match resolved {
                             Ok(intent) => match sim.submit(intent) {
@@ -1347,7 +2190,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                                     submitted_at
                                         .entry(req.request_id)
                                         .or_insert_with(std::time::Instant::now);
-                                    submitted_by.entry(req.request_id).or_insert(session);
+                                    submitted_by.entry(req.request_id).or_insert((
+                                        session,
+                                        player_principals.get(&session.raw()).copied(),
+                                    ));
                                     actions_staged += 1;
                                     send_to(
                                         &clients_for_sim,
@@ -1371,6 +2217,41 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                             }
                         }
                     }
+                    Inbound::Progression(session, req) => {
+                        saw_client_work = true;
+                        if lj.session_expired(session) {
+                            continue;
+                        }
+                        let admitted = admit(
+                            &mut progression_admitted,
+                            session.raw(),
+                            MAX_PROGRESSION_PER_CLIENT_PER_TICK,
+                        );
+                        let queued = admitted
+                            && progression_worker.as_ref().is_some_and(|worker| {
+                                worker
+                                    .submit
+                                    .try_send(ProgressionWork {
+                                        session,
+                                        player_id: player_principals.get(&session.raw()).copied(),
+                                        request: req.clone(),
+                                    })
+                                    .is_ok()
+                            });
+                        if !queued {
+                            // The queue is bounded. This retryable response is
+                            // immediate and does not perform a fallback read.
+                            let response = progression_rejected(
+                                &req,
+                                spall_protocol::ProgressionRejectCode::RetryableCapacity,
+                            );
+                            send_to(
+                                &clients_for_sim,
+                                session,
+                                Outbound::Progression(Arc::new(response)),
+                            );
+                        }
+                    }
                     Inbound::Repair(session, req) => {
                         saw_client_work = true;
                         if lj.session_expired(session) {
@@ -1390,11 +2271,21 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         saw_client_work = true;
                         lj.on_baseline_ack(session, ack, &sim, &clients_for_sim, &mut motion);
                     }
-                    Inbound::Gone(session) => lj.on_gone(session),
+                    Inbound::Gone(session) => {
+                        pending_player_inputs.remove_session(session);
+                        lj.on_gone(session);
+                        player_principals.remove(&session.raw());
+                    }
                 }
             }
 
             lj.publish_ready_captures(&clients_for_sim);
+            let next_tick = spall_core::Tick(sim.current_tick().0.saturating_add(1));
+            for input in pending_player_inputs.take_due(next_tick) {
+                if !lj.session_expired(input.session) {
+                    sim.set_player_input(input.entity, input.input, input.seq);
+                }
+            }
             let report = match sim.tick() {
                 Ok(r) => r,
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
@@ -1417,6 +2308,10 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 let dp = sim.apply_dormancy(policy, &report);
                 dormancy_deactivations_total += dp.deactivate.len() as u64;
                 dormancy_reactivations_total += dp.reactivate.len() as u64;
+            }
+            if let Some((showcase, plinko)) = playground_drops.as_mut() {
+                showcase.tick(sim.world_mut(), tick.get());
+                plinko.tick(sim.world_mut(), tick.get());
             }
 
             // ENG-61: fold this tick into the "bodies holding still" window.
@@ -1448,6 +2343,43 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
 
             for (rid, committed) in &report.committed {
                 committed_total += 1;
+                if !committed.removed_materials.is_empty()
+                    && let Some((session, player_id)) = submitted_by.get(rid).copied()
+                {
+                    let encoded = outbox_encoder.as_mut().and_then(|encoder| {
+                        encoder(
+                            session,
+                            player_id,
+                            *rid,
+                            committed.journal_seq,
+                            &committed.removed_materials,
+                        )
+                    });
+                    if let Some(event) = encoded.filter(|_| pipeline.is_some()) {
+                        pending_outbox.push(event);
+                    } else if let Some(worker) = committed_edit_worker.as_ref() {
+                        match worker.submit.try_send(CommittedEditWork {
+                            session,
+                            player_id,
+                            request_id: *rid,
+                            removed: committed.removed_materials.clone(),
+                        }) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                return SimResult::error(
+                                    "committed progression queue is full; server stopped with the award pending only in ephemeral memory".into(),
+                                    ticks_run,
+                                );
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                return SimResult::error(
+                                    "committed progression worker stopped".into(),
+                                    ticks_run,
+                                );
+                            }
+                        }
+                    }
+                }
                 // T17 increment 2: a giant split ships its geometry out of band
                 // as a `BaselineTransfer`, keyed to the transaction by
                 // `transfer_id` (= the split's `TransactionId` | high bit).
@@ -1504,7 +2436,7 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 // shouldn't be one) falls back to the old broadcast so a status
                 // is never silently dropped.
                 match submitted_by.remove(&status.request_id) {
-                    Some(session) => send_to(
+                    Some((session, _player_id)) => send_to(
                         &clients_for_sim,
                         session,
                         Outbound::Status(Arc::new(status)),
@@ -1578,8 +2510,64 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                         return SimResult::error(format!("journal encode failed: {e}"), ticks_run);
                     }
                 };
-                if let Err(e) = pipe.submit_journal(batch) {
+                let records = std::mem::take(&mut pending_outbox);
+                if let Err(e) = pipe.submit_journal_with_outbox(batch, records.clone()) {
                     return SimResult::error(format!("persistence: {e}"), ticks_run);
+                }
+                waiting_outbox.extend(records);
+                let durable = pipe.durable_seq();
+                let mut acknowledged = Vec::new();
+                if let Some(worker) = outbox_worker.as_ref() {
+                    match worker.completed.try_recv() {
+                        Ok(done) => {
+                            if outbox_inflight != Some(done.event_id) {
+                                return SimResult::error(
+                                    "outbox completion did not match the in-flight event".into(),
+                                    ticks_run,
+                                );
+                            }
+                            if let Err(error) = done.result {
+                                return SimResult::error(
+                                    format!("harvest outbox delivery failed: {error}"),
+                                    ticks_run,
+                                );
+                            }
+                            let Some(event) = waiting_outbox.pop_front() else {
+                                return SimResult::error(
+                                    "outbox completion has no retained event".into(),
+                                    ticks_run,
+                                );
+                            };
+                            if event.event_id != done.event_id {
+                                return SimResult::error(
+                                    "outbox completion order changed".into(),
+                                    ticks_run,
+                                );
+                            }
+                            acknowledged.push(done.event_id);
+                            outbox_inflight = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return SimResult::error("outbox worker stopped".into(), ticks_run);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                    if outbox_inflight.is_none()
+                        && let Some(event) = waiting_outbox
+                            .front()
+                            .filter(|event| event.journal_seq <= durable)
+                    {
+                        match worker.submit.try_send(OutboxWork(event.clone())) {
+                            Ok(()) => outbox_inflight = Some(event.event_id),
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                return SimResult::error("outbox worker stopped".into(), ticks_run);
+                            }
+                        }
+                    }
+                }
+                if let Err(e) = pipe.submit_acknowledge_outbox(acknowledged) {
+                    return SimResult::error(format!("outbox acknowledgement: {e}"), ticks_run);
                 }
 
                 // A checkpoint's journal cursor is `journalled_through`: the FIFO
@@ -1649,6 +2637,15 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 pass.run(sim.world_mut(), &player_feet, &pending_edit_bricks);
             }
 
+            // G4 timing ends after all owning-thread work for this tick,
+            // including replication, persistence submission, and residency,
+            // but before the optional pacing sleep below. Warmup is explicit;
+            // a short run therefore remains visibly incomplete instead of
+            // turning absent measurements into a pass.
+            if let Some(stats) = &mut timing {
+                stats.record(ticks_run, started.elapsed(), report.physics_duration);
+            }
+
             // Quiesce only after the pipeline is drained *and* no client has
             // sent anything for `quiescence` ticks — a late scripted action from
             // one client keeps the run alive for the others. A client still
@@ -1677,8 +2674,23 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
                 }
             }
 
-            if paced && let Some(rem) = tick_dt.checked_sub(started.elapsed()) {
-                std::thread::sleep(rem);
+            if paced {
+                // Absolute deadlines, not `tick_dt - work`: a relative sleep
+                // drifted the server to ~58.8 Hz under Windows sleep overshoot.
+                let now = std::time::Instant::now();
+                if let Some(rem) = pacer.finish_tick(now) {
+                    std::thread::sleep(rem);
+                }
+                if pacer.ticks().is_multiple_of(600) {
+                    tracing::info!(
+                        target: "spall_server::pacing",
+                        ticks = pacer.ticks(),
+                        achieved_hz = pacer.achieved_hz(std::time::Instant::now()),
+                        max_lag_ms = pacer.max_lag().as_secs_f64() * 1e3,
+                        resyncs = pacer.resyncs(),
+                        "tick pacing"
+                    );
+                }
             }
         }
 
@@ -1701,7 +2713,61 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             let final_tick = sim.current_tick().get();
             let tail = tick_journal_batch(&mut sim, &mut journalled_through, None, final_tick)
                 .unwrap_or_default();
-            let _ = pipe.submit_journal(tail);
+            let tail_events = std::mem::take(&mut pending_outbox);
+            if let Err(error) = pipe.submit_journal_with_outbox(tail, tail_events.clone()) {
+                shutdown_error = Some(format!("final journal/outbox submission failed: {error}"));
+            }
+            waiting_outbox.extend(tail_events);
+            if shutdown_error.is_none() {
+                if let Err(error) = pipe.wait_durable_through(journalled_through) {
+                    shutdown_error = Some(format!("final journal durability wait failed: {error}"));
+                } else {
+                    let mut acknowledged = Vec::new();
+                    if let Some(worker) = outbox_worker.as_ref() {
+                        while let Some(event) = waiting_outbox.front() {
+                            if outbox_inflight.is_none() {
+                                if let Err(error) = worker.submit.send(OutboxWork(event.clone())) {
+                                    shutdown_error = Some(format!(
+                                        "final harvest outbox submission failed: {error}"
+                                    ));
+                                    break;
+                                }
+                                outbox_inflight = Some(event.event_id);
+                            }
+                            let done = match worker.completed.recv() {
+                                Ok(done) => done,
+                                Err(error) => {
+                                    shutdown_error = Some(format!(
+                                        "final harvest outbox completion failed: {error}"
+                                    ));
+                                    break;
+                                }
+                            };
+                            if outbox_inflight != Some(done.event_id)
+                                || event.event_id != done.event_id
+                            {
+                                shutdown_error =
+                                    Some("final harvest outbox completion mismatch".into());
+                                break;
+                            }
+                            if let Err(error) = done.result {
+                                shutdown_error =
+                                    Some(format!("final harvest outbox delivery failed: {error}"));
+                                break;
+                            }
+                            waiting_outbox.pop_front();
+                            outbox_inflight = None;
+                            acknowledged.push(done.event_id);
+                        }
+                    }
+                    if shutdown_error.is_none() {
+                        if let Err(error) = pipe.submit_acknowledge_outbox(acknowledged) {
+                            shutdown_error =
+                                Some(format!("final outbox acknowledgement failed: {error}"));
+                        }
+                    }
+                }
+            }
             // T23 / G3 row 7 follow-up: the shutdown snapshot folds evicted
             // terrain in from the durable backing the same way the periodic
             // checkpoints above do now, instead of reloading it into the live
@@ -1723,10 +2789,12 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             // The final drain covers the journal tail, the final checkpoint, and
             // the retain pass; attribute any failure to that shutdown flush so a
             // stranded save is never reported as a pass.
-            shutdown_error = outcome
-                .status
-                .error
-                .map(|e| format!("final checkpoint/flush failed: {e}"));
+            shutdown_error = shutdown_error.or_else(|| {
+                outcome
+                    .status
+                    .error
+                    .map(|e| format!("final checkpoint/flush failed: {e}"))
+            });
             tracing::info!(
                 durable_seq = outcome.status.durable_seq,
                 journal_records = outcome.status.journal_records,
@@ -1799,6 +2867,11 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             contact_damage_cuts_rejected,
             dormancy_deactivations_total,
             dormancy_reactivations_total,
+            // An opt-in timing window leaves no samples when it is not
+            // configured; expose the same zeroed report as an ordinary run.
+            timing: timing
+                .map(|stats| stats.finish(ticks_run))
+                .unwrap_or_default(),
         }
     });
 
@@ -1876,7 +2949,8 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         // residency_checkpoint_bricks_captured_total and
         // residency_checkpoint_bricks_logical_total (incremental checkpoint
         // capture evidence).
-        version: 8,
+        // v9: T23 / G4 bounded owning-tick and physics timing telemetry.
+        version: 9,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -1981,6 +3055,16 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
             .residency
             .map(|r| r.checkpoint_bricks_logical_total)
             .unwrap_or(0),
+        tick_busy_p95_ms: sim_result.timing.tick_busy_p95_ms,
+        tick_busy_p99_ms: sim_result.timing.tick_busy_p99_ms,
+        tick_busy_max_ms: sim_result.timing.tick_busy_max_ms,
+        tick_busy_samples: sim_result.timing.tick_busy_samples,
+        tick_busy_window_complete: sim_result.timing.window_complete,
+        physics_p95_ms: sim_result.timing.physics_p95_ms,
+        physics_p99_ms: sim_result.timing.physics_p99_ms,
+        physics_max_ms: sim_result.timing.physics_max_ms,
+        physics_samples: sim_result.timing.physics_samples,
+        physics_window_complete: sim_result.timing.window_complete,
     };
     if let Some(path) = &config.summary_json {
         if let Some(parent) = path.parent() {
@@ -1995,6 +3079,79 @@ async fn serve_async(config: ServeConfig) -> Result<ServeSummary, ServeError> {
         return Err(ServeError::Runtime(err));
     }
     Ok(summary)
+}
+
+#[derive(Debug, Clone, Default)]
+struct TimingReport {
+    tick_busy_p95_ms: f64,
+    tick_busy_p99_ms: f64,
+    tick_busy_max_ms: f64,
+    tick_busy_samples: u64,
+    physics_p95_ms: f64,
+    physics_p99_ms: f64,
+    physics_max_ms: f64,
+    physics_samples: u64,
+    window_complete: bool,
+}
+
+struct TimingCollector {
+    window: TimingWindow,
+    tick_busy_ms: Vec<f64>,
+    physics_ms: Vec<f64>,
+}
+
+impl TimingCollector {
+    fn new(window: TimingWindow) -> Self {
+        Self {
+            window,
+            tick_busy_ms: Vec::with_capacity(window.max_samples),
+            physics_ms: Vec::with_capacity(window.max_samples),
+        }
+    }
+
+    fn record(&mut self, tick: u64, busy: Duration, physics: Duration) {
+        let measured_end = self
+            .window
+            .warmup_ticks
+            .saturating_add(self.window.measured_ticks);
+        if tick <= self.window.warmup_ticks || tick > measured_end {
+            return;
+        }
+        if self.tick_busy_ms.len() < self.window.max_samples {
+            self.tick_busy_ms.push(busy.as_secs_f64() * 1_000.0);
+            self.physics_ms.push(physics.as_secs_f64() * 1_000.0);
+        }
+    }
+
+    fn finish(self, ticks_run: u64) -> TimingReport {
+        let window_end = self
+            .window
+            .warmup_ticks
+            .saturating_add(self.window.measured_ticks);
+        TimingReport {
+            tick_busy_p95_ms: percentile(&self.tick_busy_ms, 0.95),
+            tick_busy_p99_ms: percentile(&self.tick_busy_ms, 0.99),
+            tick_busy_max_ms: self.tick_busy_ms.iter().copied().fold(0.0, f64::max),
+            tick_busy_samples: self.tick_busy_ms.len() as u64,
+            physics_p95_ms: percentile(&self.physics_ms, 0.95),
+            physics_p99_ms: percentile(&self.physics_ms, 0.99),
+            physics_max_ms: self.physics_ms.iter().copied().fold(0.0, f64::max),
+            physics_samples: self.physics_ms.len() as u64,
+            window_complete: self.window.measured_ticks > 0 && ticks_run >= window_end,
+        }
+    }
+}
+
+fn percentile(samples: &[f64], fraction: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = (fraction * sorted.len() as f64)
+        .ceil()
+        .clamp(1.0, sorted.len() as f64) as usize;
+    sorted[rank - 1]
 }
 
 struct SimResult {
@@ -2046,6 +3203,7 @@ struct SimResult {
     contact_damage_cuts_rejected: u64,
     dormancy_deactivations_total: u64,
     dormancy_reactivations_total: u64,
+    timing: TimingReport,
 }
 
 impl SimResult {
@@ -2091,6 +3249,7 @@ impl SimResult {
             contact_damage_cuts_rejected: 0,
             dormancy_deactivations_total: 0,
             dormancy_reactivations_total: 0,
+            timing: TimingReport::default(),
         }
     }
 }
@@ -2390,7 +3549,7 @@ impl LateJoin {
             }
         }
         // A current motion keyframe for every body (`docs/protocol.md` step 4).
-        let keyframe = motion.snapshots(sim.world(), sim.current_tick());
+        let keyframe = motion.full_snapshots(sim.world(), sim.current_tick());
         if !keyframe.is_empty() {
             send_to(clients, session, Outbound::Motion(Arc::new(keyframe)));
         }
@@ -2581,6 +3740,7 @@ struct Persistence {
     pipeline: Option<PersistPipeline>,
     journalled_through: u64,
     checkpoints_published: u64,
+    outbox_processor: Option<OutboxProcessor>,
 }
 
 /// Opens the world database, recovering from it when it already holds a
@@ -2596,37 +3756,91 @@ struct Persistence {
 /// exist but do not decode, aborts startup without touching the file — losing
 /// durable records requires an explicit operator choice
 /// ([`persist::RecoveryChoice`]), not an automatic resume or reinitialisation.
+#[cfg(test)]
 fn setup_persistence(
     save: Option<&std::path::Path>,
     scene: Scene,
     cfg: &PersistConfig,
     save_faults: Option<spall_store::FaultPlan>,
 ) -> Result<Persistence, String> {
+    setup_persistence_with_terrain_collider_mode(
+        save,
+        scene,
+        cfg,
+        save_faults,
+        TerrainColliderMode::PerBrick,
+    )
+}
+
+#[cfg(test)]
+fn setup_persistence_with_terrain_collider_mode(
+    save: Option<&std::path::Path>,
+    scene: Scene,
+    cfg: &PersistConfig,
+    save_faults: Option<spall_store::FaultPlan>,
+    terrain_collider_mode: TerrainColliderMode,
+) -> Result<Persistence, String> {
+    setup_persistence_with_game_content(
+        save,
+        scene,
+        None,
+        cfg,
+        save_faults,
+        terrain_collider_mode,
+        spall_sim::fixtures::stone_manifest(),
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_persistence_with_game_content(
+    save: Option<&std::path::Path>,
+    scene: Scene,
+    custom_world: Option<&CustomWorld>,
+    cfg: &PersistConfig,
+    save_faults: Option<spall_store::FaultPlan>,
+    terrain_collider_mode: TerrainColliderMode,
+    materials: spall_core::MaterialManifest,
+    mut game_setup: Option<InitialGameWorldSetup>,
+    mut outbox_processor: Option<OutboxProcessor>,
+) -> Result<Persistence, String> {
     let Some(path) = save else {
+        let mut sim =
+            scene.simulation_with_materials(terrain_collider_mode, materials, custom_world);
+        if let Some(setup) = game_setup.take() {
+            setup(&mut sim)?;
+        }
         return Ok(Persistence {
-            sim: scene.simulation(),
+            sim,
             pipeline: None,
             journalled_through: 0,
             checkpoints_published: 0,
+            outbox_processor,
         });
     };
     let mut writer = Writer::open(path).map_err(|e| e.to_string())?;
     let (sim, journalled_through, checkpoints_published) = match writer.recover() {
         Ok(recovery) => {
-            let (sim, seq) = persist::restore(
+            let (sim, seq) = persist::restore_with_terrain_collider_mode(
                 &recovery,
                 cfg,
                 persist::RecoveryChoice::RequireClean,
-                fixtures::stone_manifest(),
+                materials.clone(),
                 AnchorPlane::at(0),
                 PhysicsConfig::default(),
+                terrain_collider_mode,
             )
             .map_err(|e| e.to_string())?;
             (sim, seq, 0)
         }
         // A genuinely new/empty database: seed it with the built-in scene.
         Err(spall_store::StoreError::NoCheckpoint) => {
-            let sim = scene.simulation();
+            let mut sim =
+                scene.simulation_with_materials(terrain_collider_mode, materials, custom_world);
+            if let Some(setup) = game_setup.take() {
+                setup(&mut sim)?;
+            }
             let checkpoint = persist::capture(&sim, cfg, 0).map_err(|e| e.to_string())?;
             writer
                 .publish_checkpoint(&checkpoint)
@@ -2649,12 +3863,26 @@ fn setup_persistence(
     if let Some(faults) = save_faults {
         writer.set_faults(faults);
     }
+    if let Some(processor) = outbox_processor.as_mut() {
+        loop {
+            let events = writer.pending_outbox(256).map_err(|e| e.to_string())?;
+            if events.is_empty() {
+                break;
+            }
+            for event in &events {
+                processor(event)?;
+            }
+            let ids: Vec<_> = events.iter().map(|event| event.event_id).collect();
+            writer.acknowledge_outbox(&ids).map_err(|e| e.to_string())?;
+        }
+    }
     let pipeline = PersistPipeline::spawn(writer, PipelineConfig::default());
     Ok(Persistence {
         sim,
         pipeline: Some(pipeline),
         journalled_through,
         checkpoints_published,
+        outbox_processor,
     })
 }
 
@@ -2712,40 +3940,6 @@ fn dev_intent_from_request(session: SessionId, req: &ActionRequest) -> Option<Ed
 }
 
 // --- ENG-47: server-side action-claim validation -------------------------------
-
-/// A server-approved tool. On the wire `ActionRequest::tool` is an opaque `u16`;
-/// the server — not the client — decides what each id may do, how big a brush it
-/// may request, and how far its aim reaches. Unknown ids are refused. Real
-/// per-role tool grants are a later task; this is the minimum "action limits are
-/// resolved on the server" (`docs/architecture.md` Editing).
-#[derive(Debug, Clone, Copy)]
-struct ToolSpec {
-    /// The edit this tool performs on a validated hit.
-    kind: EditKind,
-    /// Largest brush radius this tool may request, in whole cells.
-    max_radius_cells: i64,
-    /// Farthest the aim ray may travel to a solid authoritative hit, in metres.
-    reach_m: f64,
-}
-
-/// The built-in T10 tool catalog.
-fn tool_spec(tool: u16) -> Option<ToolSpec> {
-    match tool {
-        // 0 — short-range cutter.
-        0 => Some(ToolSpec {
-            kind: EditKind::Cut,
-            max_radius_cells: 8,
-            reach_m: 12.0,
-        }),
-        // 1 — short-range stone placer.
-        1 => Some(ToolSpec {
-            kind: EditKind::Place(spall_voxel::fixtures::STONE),
-            max_radius_cells: 4,
-            reach_m: 8.0,
-        }),
-        _ => None,
-    }
-}
 
 /// Why an [`ActionRequest`] was refused before it could become an [`EditIntent`].
 /// The `&'static str` variants keep the `ActionStatus` reason strings stable.
@@ -2848,12 +4042,24 @@ fn target_matches(claimed: ClaimedTarget, struck: EditTarget) -> bool {
 /// exists; the aim ray hits solid authoritative geometry within reach; and the
 /// struck volume matches `claimed_target`. The `session` is already known-live
 /// (the caller rejects a superseded generation first).
+#[cfg(test)]
 fn resolve_intent(
     world: &SimWorld,
     session: SessionId,
     req: &ActionRequest,
 ) -> Result<EditIntent, ActionReject> {
-    let spec = tool_spec(req.tool).ok_or(ActionReject::UnknownTool(req.tool))?;
+    resolve_intent_with_catalog(world, session, req, &ToolCatalog::default())
+}
+
+fn resolve_intent_with_catalog(
+    world: &SimWorld,
+    session: SessionId,
+    req: &ActionRequest,
+    catalog: &ToolCatalog,
+) -> Result<EditIntent, ActionReject> {
+    let spec = catalog
+        .get(req.tool)
+        .ok_or(ActionReject::UnknownTool(req.tool))?;
 
     let action_fits = matches!(
         (req.action, spec.kind),
@@ -2861,6 +4067,13 @@ fn resolve_intent(
     );
     if !action_fits {
         return Err(ActionReject::ToolActionMismatch);
+    }
+    if let EditKind::Place(material) = spec.kind
+        && world.materials().get(material).is_none()
+    {
+        return Err(ActionReject::Unsupported(
+            "tool material is absent from the authoritative world manifest",
+        ));
     }
 
     let max_units = spec.max_radius_cells.saturating_mul(BRUSH_UNIT);
@@ -3099,6 +4312,63 @@ fn reject(clients: &ClientMap, session: SessionId, request: RequestId, reason: &
     );
 }
 
+fn progression_rejected(
+    request: &spall_protocol::ProgressionRequest,
+    code: spall_protocol::ProgressionRejectCode,
+) -> spall_protocol::ProgressionResponse {
+    spall_protocol::ProgressionResponse {
+        request_id: request.request_id,
+        catalog_version: request.catalog_version.max(1),
+        inventory_revision: request.expected_inventory_revision,
+        outcome: spall_protocol::ProgressionOutcome::Rejected(code),
+        inventory: Vec::new(),
+    }
+}
+
+fn parse_player_credentials(bytes: &[u8]) -> Result<Vec<spall_net::PlayerCredential>, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "credential registry is not valid UTF-8".to_string())?;
+    let mut credentials = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let player_text = fields.next();
+        let token_text = fields.next();
+        if fields.next().is_some() {
+            return Err(format!(
+                "credential registry line {} has extra fields",
+                line_index + 1
+            ));
+        }
+        let (Some(player_text), Some(token_text)) = (player_text, token_text) else {
+            return Err(format!(
+                "credential registry line {} is incomplete",
+                line_index + 1
+            ));
+        };
+        let player_id = spall_protocol::PlayerId::from_hex(player_text).ok_or_else(|| {
+            format!(
+                "credential registry line {} has invalid player ID",
+                line_index + 1
+            )
+        })?;
+        let token = spall_net::JoinToken::from_hex(token_text).ok_or_else(|| {
+            format!(
+                "credential registry line {} has invalid token",
+                line_index + 1
+            )
+        })?;
+        credentials.push(spall_net::PlayerCredential { player_id, token });
+        if credentials.len() > 4096 {
+            return Err("credential registry exceeds the 4096-entry limit".into());
+        }
+    }
+    Ok(credentials)
+}
+
 /// Returns a replayable status only for an action that passed authoritative
 /// validation and was admitted to the simulation. Pre-admission validation and
 /// rate-limit refusals intentionally are not held here: no edit was staged, so
@@ -3149,6 +4419,7 @@ async fn wait_true(mut rx: watch::Receiver<bool>) {
 
 /// One client connection: a reader that forwards records to the bridge and a
 /// writer that drains this client's outbound queue.
+#[allow(clippy::too_many_arguments)]
 async fn serve_conn(
     conn: Arc<Connection>,
     inbound: mpsc::Sender<Inbound>,
@@ -3157,13 +4428,16 @@ async fn serve_conn(
     conns: Arc<Mutex<HashMap<u64, Arc<Connection>>>>,
     egress_closed: Arc<Mutex<HashMap<u64, (u64, u64)>>>,
     stop: watch::Receiver<bool>,
+    _slot: AdmissionSlot,
 ) {
     debug_assert_eq!(conn.role(), Role::Server);
     let session = conn.session();
 
     // Announce the join in order so the sim loop can supersede an earlier
     // session on the same slot (reconnect) and drive a late-join baseline.
-    let _ = inbound.send(Inbound::Joined(session)).await;
+    let _ = inbound
+        .send(Inbound::Joined(session, conn.player_id()))
+        .await;
 
     let liveness = tokio::spawn(conn.clone().run_liveness(stop.clone()));
 
@@ -3180,6 +4454,12 @@ async fn serve_conn(
                     // stays far under the cap.
                     Ok(Some(WireRecord::ActionRequest(req))) => {
                         match inbound.try_send(Inbound::Action(session, req)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                    Ok(Some(WireRecord::ProgressionRequest(req))) => {
+                        match inbound.try_send(Inbound::Progression(session, req)) {
                             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                             Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
@@ -3235,12 +4515,28 @@ async fn serve_conn(
             }
             for msg in batch.reliable {
                 let ok = match msg {
-                    Outbound::Transaction(tx) => conn
-                        .send_record(WireRecord::TopologyTransaction((*tx).clone()))
-                        .await
-                        .is_ok(),
+                    Outbound::Transaction(tx) => {
+                        let sent = conn
+                            .send_record(WireRecord::TopologyTransaction((*tx).clone()))
+                            .await;
+                        if let Err(error) = &sent {
+                            // Never a silent disconnect: an encode failure here
+                            // (e.g. a record over the control limit) ends this
+                            // client's stream, so say why.
+                            tracing::error!(
+                                transaction = tx.transaction_id.get(),
+                                %error,
+                                "topology transaction could not be sent; closing client stream"
+                            );
+                        }
+                        sent.is_ok()
+                    }
                     Outbound::Status(s) => conn
                         .send_record(WireRecord::ActionStatus((*s).clone()))
+                        .await
+                        .is_ok(),
+                    Outbound::Progression(reply) => conn
+                        .send_record(WireRecord::ProgressionResponse((*reply).clone()))
                         .await
                         .is_ok(),
                     Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
@@ -3308,6 +4604,95 @@ async fn serve_conn(
 mod tests {
     use super::*;
     use spall_store::{JournalPayload, JournalRecord};
+
+    #[test]
+    fn player_credential_registry_parser_never_echoes_tokens() {
+        let player_id = "11".repeat(16);
+        let token = "a5".repeat(32);
+        let content = format!("# operator registry\n{player_id} {token}\n");
+        let credentials = parse_player_credentials(content.as_bytes()).unwrap();
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].player_id.to_hex(), player_id);
+        assert!(!format!("{:?}", credentials[0]).contains(&token));
+
+        let bad_token = "z1".repeat(32);
+        let malformed = format!("{player_id} {bad_token}");
+        let error = parse_player_credentials(malformed.as_bytes()).unwrap_err();
+        assert!(!error.contains(&bad_token));
+    }
+
+    #[test]
+    fn progression_queue_is_bounded_and_returns_in_serial_order() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = ProgressionWorker::spawn(Box::new(move |_session, _, request| {
+            if request.request_id == 1 {
+                let _ = started_tx.send(());
+                std::thread::sleep(std::time::Duration::from_millis(75));
+            }
+            spall_protocol::ProgressionResponse {
+                request_id: request.request_id,
+                catalog_version: 1,
+                inventory_revision: request.request_id,
+                outcome: spall_protocol::ProgressionOutcome::Inventory,
+                inventory: Vec::new(),
+            }
+        }));
+        let session = sess(1, 1);
+        let started = std::time::Instant::now();
+        worker
+            .submit
+            .try_send(ProgressionWork {
+                session,
+                player_id: None,
+                request: spall_protocol::ProgressionRequest {
+                    request_id: 1,
+                    catalog_version: 1,
+                    expected_inventory_revision: 0,
+                    operation: spall_protocol::ProgressionOperation::InspectInventory,
+                },
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        for request_id in 2..=65 {
+            worker
+                .submit
+                .try_send(ProgressionWork {
+                    session,
+                    player_id: None,
+                    request: spall_protocol::ProgressionRequest {
+                        request_id,
+                        catalog_version: 1,
+                        expected_inventory_revision: 0,
+                        operation: spall_protocol::ProgressionOperation::InspectInventory,
+                    },
+                })
+                .expect("one active and 64 queued requests fit");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert!(matches!(
+            worker.submit.try_send(ProgressionWork {
+                session,
+                player_id: None,
+                request: spall_protocol::ProgressionRequest {
+                    request_id: 66,
+                    catalog_version: 1,
+                    expected_inventory_revision: 0,
+                    operation: spall_protocol::ProgressionOperation::InspectInventory,
+                },
+            }),
+            Err(std::sync::mpsc::TrySendError::Full(_))
+        ));
+        for expected in 1..=65 {
+            let done = worker
+                .completed
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(done.session, session);
+            assert_eq!(done.response.request_id, expected);
+        }
+    }
 
     fn empty_clients() -> ClientMap {
         Arc::new(Mutex::new(HashMap::new()))
@@ -3791,7 +5176,7 @@ mod tests {
             joiner,
             BaselineAck {
                 transfer_id: BASELINE_REQUEST_SENTINEL,
-                verified_manifest_hash: Hash32::ZERO,
+                verified_manifest_hash: spall_protocol::Hash32::ZERO,
                 installed_cursor: spall_core::JournalSeq(0),
             },
             &sim,
@@ -3854,7 +5239,7 @@ mod tests {
             joiner,
             BaselineAck {
                 transfer_id: BASELINE_REQUEST_SENTINEL,
-                verified_manifest_hash: Hash32::ZERO,
+                verified_manifest_hash: spall_protocol::Hash32::ZERO,
                 installed_cursor: spall_core::JournalSeq(0),
             },
             &sim,
@@ -4032,6 +5417,52 @@ mod tests {
         );
     }
 
+    /// Regression: the byte cap used to count every reliable byte ever queued on
+    /// the connection (`take` never reset it), so any long-lived client was
+    /// eventually disconnected however promptly its writer drained.
+    #[test]
+    fn a_draining_writer_never_trips_the_byte_cap() {
+        let h = OutboundHandle::new();
+        let per_msg = reliable_msg_bytes(&empty_tx());
+        let rounds = MAX_RELIABLE_BACKLOG_BYTES / per_msg * 3;
+        for i in 0..rounds {
+            assert!(
+                h.push(empty_tx()).is_ok(),
+                "push {i} refused by a drained queue"
+            );
+            assert_eq!(h.take().reliable.len(), 1);
+            assert_eq!(
+                h.reliable_bytes(),
+                0,
+                "take hands the writer the whole queue"
+            );
+        }
+    }
+
+    /// Regression: admission counted connections ever accepted, so after
+    /// `max_clients` lifetime sessions every later join was refused forever.
+    #[test]
+    fn admission_counts_live_connections_and_frees_slots() {
+        let gate = AdmissionGate::new(2);
+        let a = gate.try_admit().expect("first");
+        let b = gate.try_admit().expect("second");
+        assert!(
+            gate.try_admit().is_none(),
+            "third refused while two are live"
+        );
+        assert_eq!(gate.refused.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(a);
+        let c = gate
+            .try_admit()
+            .expect("a slot freed by a departed connection");
+        assert!(gate.try_admit().is_none());
+        drop((b, c));
+        // Far more sessions than `max` over the gate's life still admit.
+        for _ in 0..50 {
+            let _s = gate.try_admit().expect("no permanent lockout");
+        }
+    }
+
     #[test]
     fn unsent_motion_is_superseded_not_accumulated() {
         let sim = bridge_after_cut();
@@ -4114,6 +5545,56 @@ mod tests {
         assert_eq!(other_ok, MAX_ACTIONS_PER_CLIENT_PER_TICK);
     }
 
+    #[test]
+    fn timing_window_excludes_warmup_and_reports_nearest_rank_percentiles() {
+        let mut timing = TimingCollector::new(TimingWindow {
+            warmup_ticks: 2,
+            measured_ticks: 4,
+            max_samples: 4,
+        });
+
+        // Warmup is deliberately expensive but must not contaminate the gate
+        // measurement. The six measured ticks are 1..=4 ms for tick time and
+        // 10..=40 ms for physics; the collector should retain only ticks 3..6.
+        timing.record(1, Duration::from_millis(100), Duration::from_millis(100));
+        timing.record(2, Duration::from_millis(99), Duration::from_millis(99));
+        for tick in 3..=6 {
+            timing.record(
+                tick,
+                Duration::from_millis(tick - 2),
+                Duration::from_millis((tick - 2) * 10),
+            );
+        }
+
+        let report = timing.finish(6);
+        assert_eq!(report.tick_busy_samples, 4);
+        assert_eq!(report.physics_samples, 4);
+        assert_eq!(report.tick_busy_p95_ms, 4.0);
+        assert_eq!(report.tick_busy_p99_ms, 4.0);
+        assert_eq!(report.physics_p95_ms, 40.0);
+        assert_eq!(report.physics_p99_ms, 40.0);
+        assert_eq!(report.tick_busy_max_ms, 4.0);
+        assert_eq!(report.physics_max_ms, 40.0);
+        assert!(report.window_complete);
+    }
+
+    #[test]
+    fn timing_window_is_fail_closed_when_the_requested_window_is_incomplete() {
+        let mut timing = TimingCollector::new(TimingWindow {
+            warmup_ticks: 1,
+            measured_ticks: 3,
+            max_samples: 3,
+        });
+        timing.record(2, Duration::from_millis(1), Duration::from_millis(1));
+        timing.record(3, Duration::from_millis(1), Duration::from_millis(1));
+
+        let report = timing.finish(3);
+        assert_eq!(report.tick_busy_samples, 2);
+        assert_eq!(report.physics_samples, 2);
+        assert!(!report.window_complete);
+        assert_eq!(report.tick_busy_p95_ms, 1.0);
+    }
+
     // --- ENG-36: recovery must fail closed on corruption -------------------
 
     fn persist_cfg() -> PersistConfig {
@@ -4158,6 +5639,40 @@ mod tests {
         );
         drop(pipeline);
         assert_eq!(checkpoint_row_count(&db), 1);
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn recovery_rebuilds_the_selected_terrain_collision_without_changing_world_hash() {
+        let db = scratch_db("terrain_collider_mode");
+        let original = setup_persistence_with_terrain_collider_mode(
+            Some(&db),
+            Scene::BridgeCut,
+            &persist_cfg(),
+            None,
+            TerrainColliderMode::WholeTerrain,
+        )
+        .unwrap();
+        assert!(!original.sim.world().terrain_brick_colliders_enabled());
+        let hash = original.sim.world().world_hash();
+        drop(original);
+
+        let restored = setup_persistence_with_terrain_collider_mode(
+            Some(&db),
+            Scene::BridgeCut,
+            &persist_cfg(),
+            None,
+            TerrainColliderMode::PerBrick,
+        )
+        .unwrap();
+        assert!(restored.sim.world().terrain_brick_colliders_enabled());
+        restored
+            .sim
+            .world()
+            .validate_terrain_brick_colliders()
+            .unwrap();
+        assert_eq!(restored.sim.world().world_hash(), hash);
+        drop(restored);
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 

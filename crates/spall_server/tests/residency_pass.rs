@@ -20,6 +20,14 @@ const SCRIPT: &[(u64, [i64; 3], i64)] = &[
     (90, [90, 1, 75], 1),
 ];
 
+// A static supported floor patch used only by the checkpoint and dense-cap
+// fault-injection cases. The east-collapse beam is intentionally still active
+// and correctly pins its own terrain brick after the collision lifecycle fix;
+// targeting this quiet brick keeps the backing/admission assertions independent
+// of that active-body swept-collision policy.
+const CHECKPOINT_CELL: [i64; 3] = [44, 1, 70];
+const CHECKPOINT_BRICK: BrickCoord = BrickCoord::new(1, 0, 2);
+
 fn cut(req: u64, cell: [i64; 3], radius: i64) -> EditIntent {
     let h = BRUSH_UNIT / 2;
     let brush = SphereBrush::new(
@@ -43,6 +51,55 @@ fn sim() -> Simulation {
     let mut setup = fixtures::separated_regions_setup();
     setup.physics.disable_ccd = true;
     Simulation::new(SimulationConfig::new(setup)).unwrap()
+}
+
+fn checkpoint_sim() -> Simulation {
+    let mut setup = fixtures::separated_regions_setup();
+    let terrain = setup.terrain.id();
+    setup
+        .terrain
+        .apply_edit(&spall_voxel::EditPlan::filled_box(
+            terrain,
+            GlobalCell::new(32, 0, 64),
+            GlobalCell::new(55, 3, 79),
+            spall_core::MaterialId(1),
+        ))
+        .unwrap();
+    Simulation::new(SimulationConfig::new(setup)).unwrap()
+}
+
+fn run_checkpoint_script(
+    sim: &mut Simulation,
+    mut pass: Option<&mut ResidencyPass>,
+    player_feet: &[(u64, [f64; 3])],
+) {
+    let terrain = sim.world().terrain_volume_id();
+    for tick in 1..=20 {
+        if tick == 2 {
+            sim.submit(cut(1, CHECKPOINT_CELL, 1)).unwrap();
+        }
+        let report = sim.tick().unwrap();
+        if let Some(pass) = pass.as_deref_mut() {
+            for (_, done) in &report.committed {
+                let touched: Vec<BrickCoord> = done
+                    .topology
+                    .after
+                    .iter()
+                    .filter(|br| br.volume == terrain)
+                    .map(|br| br.coord)
+                    .collect();
+                pass.on_commit(sim.world(), touched);
+            }
+            pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+            pass.run(sim.world_mut(), player_feet, &Default::default());
+        }
+    }
+}
+
+fn run_checkpoint_without_residency() -> (Hash32, u64) {
+    let mut sim = checkpoint_sim();
+    run_checkpoint_script(&mut sim, None, &[]);
+    (sim.world().world_hash(), sim.world().total_solid_cells())
 }
 
 /// Committed `result_hashes`, in commit order, as `(volume raw, hash)` rows.
@@ -334,7 +391,7 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
         generator_version: 1,
     };
 
-    let mut sim = sim();
+    let mut sim = checkpoint_sim();
     let terrain = sim.world().terrain_volume_id();
     let backing = Arc::new(MemoryBacking::default());
     let mut pass = ResidencyPass::install_with_backing(
@@ -342,38 +399,20 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
         ResidencyLimits {
             budget_bricks: 4,
             max_dense_bytes: u64::MAX,
-            interest_radius_bricks: 1,
+            interest_radius_bricks: 0,
         },
         backing.clone(),
     );
-    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+    // Keep the interest centre between the structures with radius zero. The
+    // edited quiet patch is outside interest; active-body sweeps in the east
+    // collapse remain free to pin the beam's own brick.
+    let player_feet = [(1u64, [12.0_f64, 1.0, 12.0])];
+    run_checkpoint_script(&mut sim, Some(&mut pass), &player_feet);
 
-    let mut next = 0usize;
-    for tick in 1..=180u64 {
-        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
-            let (_, cell, r) = SCRIPT[next];
-            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
-            next += 1;
-        }
-        let report = sim.tick().unwrap();
-        for (_, done) in &report.committed {
-            let touched: Vec<BrickCoord> = done
-                .topology
-                .after
-                .iter()
-                .filter(|br| br.volume == terrain)
-                .map(|br| br.coord)
-                .collect();
-            pass.on_commit(sim.world(), touched);
-        }
-        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
-        pass.run(sim.world_mut(), &player_feet, &Default::default());
-    }
-
-    let evicted_coord = GlobalCell::new(82, 6, 75).split().0;
+    let evicted_coord = CHECKPOINT_BRICK;
     assert!(
         sim.world().evicted(terrain).contains(evicted_coord),
-        "the edited east brick must be evicted by end of run, or this test proves nothing"
+        "the edited quiet brick must be evicted by end of run, or this test proves nothing"
     );
     backing.mark_unavailable(terrain, evicted_coord);
 
@@ -390,85 +429,23 @@ fn capture_checkpoint_fails_closed_on_a_missing_durable_record() {
     );
 }
 
-/// Incremental capture may reuse a previously verified record when an evicted
-/// brick's revision is unchanged.  A later backing mutation must not turn that
-/// cache hit into a read or make the checkpoint silently adopt the bad record.
-#[test]
-fn capture_checkpoint_reuses_cached_evicted_record_without_reading_backing() {
-    use spall_server::persist::PersistConfig;
-
-    let cfg = PersistConfig {
-        world_id: 0x5A11_0000_0000_C0DE,
-        seed: 11,
-        generator_version: 1,
-    };
-    let mut sim = sim();
-    let terrain = sim.world().terrain_volume_id();
-    let backing = Arc::new(MemoryBacking::default());
-    let mut pass = ResidencyPass::install_with_backing(
-        sim.world_mut(),
-        ResidencyLimits {
-            budget_bricks: 4,
-            max_dense_bytes: u64::MAX,
-            interest_radius_bricks: 1,
-        },
-        backing.clone(),
-    );
-    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
-    let cached_coord = GlobalCell::new(82, 6, 75).split().0;
-
-    for _ in 1..=6u64 {
-        sim.tick().unwrap();
-        pass.run(sim.world_mut(), &player_feet, &Default::default());
-    }
-    let retained = sim
-        .world()
-        .evicted(terrain)
-        .get(cached_coord)
-        .expect("the untouched east brick must be evicted");
-
-    // Corrupt the backing after install.  The unchanged revision should select
-    // the install-time checkpoint_cache entry and never inspect this record.
-    backing.insert(
-        terrain,
-        cached_coord,
-        spall_voxel::Brick::uniform(
-            spall_core::MaterialId(1),
-            spall_core::Revision(retained.revision.get() + 1000),
-        ),
-    );
-    let checkpoint = pass
-        .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
-        .expect("an unchanged brick should reuse its verified cached record");
-    let stored = checkpoint
-        .bricks
-        .iter()
-        .find(|brick| {
-            brick.volume_id == terrain.get()
-                && brick.coord == [cached_coord.x, cached_coord.y, cached_coord.z]
-        })
-        .expect("the checkpoint must still include the cached logical brick");
-    assert_eq!(
-        stored.revision,
-        retained.revision.get(),
-        "cached capture must preserve the retained revision despite backing drift"
-    );
-}
-
-/// T23 / G3 row 7 increment 16 (durable exact-revision backing
-/// acknowledgement, audit + fix). The audit found `capture_checkpoint`
-/// trusted whatever the backing offered for an evicted brick without
-/// checking it against the retained `(revision, content_hash)` digest --
-/// unlike `SimWorld::reload_brick`, which validates a backing candidate with
-/// `EvictedBricks::verify_candidate` before ever publishing it. This is the
-/// fault-injection test that falsifies durability directly: it forges a
-/// backing record for an evicted coord that disagrees with the digest the
-/// eviction actually retained (the exact shape a disk backing's
-/// `synchronous=NORMAL` write rolled back by an OS/power crash, or any other
-/// silent divergence, would produce) and confirms `capture_checkpoint` now
-/// fails closed instead of writing the mismatched bytes into a checkpoint
-/// that `Writer::publish_checkpoint` would then durably (`synchronous=FULL`)
-/// commit under the *correct* recorded `world_hash`.
+/// T23 / G3 row 7 — 2026-09-18 acceptance audit. Increment 16 added this
+/// exact fault-injection test and the verification call it exercises, but
+/// increment 15's incremental-capture rewrite (landed the same day, on the
+/// other side of a merge) reintroduced the unverified read on the
+/// cache-**miss** path without this test noticing: it originally picked
+/// `evicted(...).iter().next()` — the lexicographically-first evicted coord —
+/// which, for this fixture's script, happened to be a brick nothing ever
+/// edited. Its digest revision therefore still equalled the revision cached
+/// at install. The east collapse also creates an awake detached body whose
+/// swept collision footprint correctly pins the east brick with the fixed
+/// collider path. This test uses a small edited floor patch in quiet brick
+/// `(1, 0, 2)`, outside both player interest and the east body's sweep, so the
+/// actual cache-miss backing read remains under test.
+///
+/// The audit's second half — proving reuse of an *unchanged* cached record
+/// stays safe — is the companion test immediately below,
+/// `capture_checkpoint_reuses_a_cached_record_for_an_unedited_evicted_brick_without_touching_the_backing`.
 #[test]
 fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_retained_digest() {
     use spall_server::persist::{self, PersistConfig};
@@ -479,7 +456,7 @@ fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_r
         generator_version: 1,
     };
 
-    let mut sim = sim();
+    let mut sim = checkpoint_sim();
     let terrain = sim.world().terrain_volume_id();
     let backing = Arc::new(MemoryBacking::default());
     let mut pass = ResidencyPass::install_with_backing(
@@ -487,45 +464,28 @@ fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_r
         ResidencyLimits {
             budget_bricks: 4,
             max_dense_bytes: u64::MAX,
-            interest_radius_bricks: 1,
+            interest_radius_bricks: 0,
         },
         backing.clone(),
     );
     let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+    run_checkpoint_script(&mut sim, Some(&mut pass), &player_feet);
 
-    let mut next = 0usize;
-    for tick in 1..=180u64 {
-        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
-            let (_, cell, r) = SCRIPT[next];
-            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
-            next += 1;
-        }
-        let report = sim.tick().unwrap();
-        for (_, done) in &report.committed {
-            let touched: Vec<BrickCoord> = done
-                .topology
-                .after
-                .iter()
-                .filter(|br| br.volume == terrain)
-                .map(|br| br.coord)
-                .collect();
-            pass.on_commit(sim.world(), touched);
-        }
-        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
-        pass.run(sim.world_mut(), &player_feet, &Default::default());
-    }
-
-    // The east region is edited by SCRIPT, so its retained revision differs
-    // from the install-time checkpoint cache and forces the cache-miss backing
-    // path under test.  Picking the first evicted brick could accidentally pick
-    // an untouched cache hit, in which case corrupting its backing is correctly
-    // ignored by incremental capture.
-    let evicted_coord = GlobalCell::new(82, 6, 75).split().0;
+    let evicted_coord = CHECKPOINT_BRICK;
     let retained_digest = sim
         .world()
         .evicted(terrain)
-        .get(evicted_coord)
-        .expect("the edited east brick must still be evicted");
+        .iter()
+        .find(|(coord, _)| *coord == evicted_coord)
+        .map(|(_, digest)| digest)
+        .expect("the edited quiet brick must still be evicted");
+    assert!(
+        retained_digest.revision.get() > 1,
+        "the picked coord must actually have been edited (and therefore differ from its \
+         install-time cache seed) or this checkpoint call would take the cache-hit branch \
+         and never read the forged backing record at all -- got revision {:?} for {evicted_coord:?}",
+        retained_digest.revision
+    );
 
     // Overwrite the backing's record for this exact coord with real-looking
     // geometry at a revision the retained digest never agreed to -- a stand-in
@@ -557,6 +517,113 @@ fn capture_checkpoint_fails_closed_on_a_backing_record_that_disagrees_with_the_r
                 && *backing_revision == retained_digest.revision.get() + 1000
         ),
         "expected EvictedBrickDigestMismatch naming the exact brick and both revisions, got {err:?}"
+    );
+}
+
+/// T23 / G3 row 7 — 2026-09-18 acceptance audit, second half: a checkpoint
+/// re-capture that reuses an unchanged brick's cached record must not merely
+/// *happen* to skip a bad backing read (the way the neighbouring test's
+/// original, since-fixed coordinate pick accidentally did) -- it must be
+/// provably safe to do so. Takes one real checkpoint (verifying and caching
+/// every currently-evicted brick, edited or not), then makes one of those
+/// coords' backing record `Unavailable` before a second, otherwise-identical
+/// checkpoint call (no ticks, no edits, no eviction/reload in between, so
+/// every digest revision is exactly what the first call already cached) --
+/// the strongest possible proof that a no-op re-capture reuses the cache
+/// rather than reading backing at all: reading it would fail closed (see
+/// `capture_checkpoint_fails_closed_on_a_missing_durable_record`), so success
+/// here is only possible via the cached record, not a fresh read.
+#[test]
+fn capture_checkpoint_reuses_a_cached_record_for_an_unedited_evicted_brick_without_touching_the_backing()
+ {
+    use spall_server::persist::PersistConfig;
+
+    let cfg = PersistConfig {
+        world_id: 0x5A11_0000_0000_CACE,
+        seed: 11,
+        generator_version: 1,
+    };
+
+    let mut sim = sim();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = Arc::new(MemoryBacking::default());
+    let mut pass = ResidencyPass::install_with_backing(
+        sim.world_mut(),
+        ResidencyLimits {
+            budget_bricks: 4,
+            max_dense_bytes: u64::MAX,
+            interest_radius_bricks: 1,
+        },
+        backing.clone(),
+    );
+    let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])];
+
+    let mut next = 0usize;
+    for tick in 1..=180u64 {
+        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
+            let (_, cell, r) = SCRIPT[next];
+            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
+            next += 1;
+        }
+        let report = sim.tick().unwrap();
+        for (_, done) in &report.committed {
+            let touched: Vec<BrickCoord> = done
+                .topology
+                .after
+                .iter()
+                .filter(|br| br.volume == terrain)
+                .map(|br| br.coord)
+                .collect();
+            pass.on_commit(sim.world(), touched);
+        }
+        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
+        pass.run(sim.world_mut(), &player_feet, &Default::default());
+    }
+
+    // Any evicted coord works here (edited or not): nothing ticks between the
+    // two `capture_checkpoint` calls below, so whichever revision the first
+    // call verifies and caches is still exactly current for the second --
+    // guaranteeing a cache hit regardless of this brick's edit history.
+    let (evicted_coord, digest) = sim
+        .world()
+        .evicted(terrain)
+        .iter()
+        .next()
+        .expect("the run must still have evicted terrain, or this test proves nothing");
+
+    pass.capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect("first checkpoint establishes a verified cache entry for every evicted brick");
+    let captured_after_first = pass.stats().checkpoint_bricks_captured_total;
+
+    // The backing no longer has a usable record for this coord at all -- a
+    // fresh read would fail closed (`EvictedBrickUnavailable`), so this
+    // second call succeeding is possible only if it never reads backing for
+    // this coord.
+    backing.mark_unavailable(terrain, evicted_coord);
+
+    let checkpoint = pass
+        .capture_checkpoint(&sim, &cfg, sim.journal_cursor())
+        .expect(
+            "a second checkpoint with nothing changed must reuse every cached record, \
+             including this one, without touching the now-unavailable backing",
+        );
+    let captured_after_second = pass.stats().checkpoint_bricks_captured_total;
+    assert_eq!(
+        captured_after_second, captured_after_first,
+        "nothing changed between the two calls, so nothing should have been re-captured"
+    );
+    let stored = checkpoint
+        .bricks
+        .iter()
+        .find(|b| {
+            b.volume_id == terrain.get()
+                && b.coord == [evicted_coord.x, evicted_coord.y, evicted_coord.z]
+        })
+        .expect("the reused brick is still present in the checkpoint's complete logical set");
+    assert_eq!(
+        stored.revision,
+        digest.revision.get(),
+        "the reused cached record still reports the correct retained revision"
     );
 }
 
@@ -955,53 +1022,30 @@ fn a_players_swept_path_pins_a_brick_it_crosses_even_past_the_settle_window() {
 /// completely unaffected by whether that brick happens to be resident.
 #[test]
 fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budget() {
-    let (off_hash, off_solid, _) = run_without_residency();
+    let (off_hash, off_solid) = run_checkpoint_without_residency();
 
-    let mut sim = sim();
+    let mut sim = checkpoint_sim();
     let terrain = sim.world().terrain_volume_id();
     let mut pass = ResidencyPass::install(
         sim.world_mut(),
         ResidencyLimits {
             budget_bricks: 100,
             max_dense_bytes: u64::MAX,
-            interest_radius_bricks: 1,
+            interest_radius_bricks: 0,
         },
     );
     let player_feet = [(1u64, [1.0_f64, 1.0, 1.0])]; // stationary west
-    let east = GlobalCell::new(82, 6, 75).split().0;
-
-    // Run the full script so the east cut actually materialises east's brick
-    // as `Dense`, then let ordinary west-only-interest hysteresis evict it.
-    let mut next = 0usize;
-    for tick in 1..=180u64 {
-        while next < SCRIPT.len() && SCRIPT[next].0 == tick {
-            let (_, cell, r) = SCRIPT[next];
-            sim.submit(cut(next as u64 + 1, cell, r)).unwrap();
-            next += 1;
-        }
-        let report = sim.tick().unwrap();
-        for (_, done) in &report.committed {
-            let touched: Vec<BrickCoord> = done
-                .topology
-                .after
-                .iter()
-                .filter(|br| br.volume == terrain)
-                .map(|br| br.coord)
-                .collect();
-            pass.on_commit(sim.world(), touched);
-        }
-        pass.note_pipeline_reloads(report.reloaded_bricks.iter().copied());
-        pass.run(sim.world_mut(), &player_feet, &Default::default());
-    }
+    let target = CHECKPOINT_BRICK;
+    run_checkpoint_script(&mut sim, Some(&mut pass), &player_feet);
     assert!(
-        sim.world().evicted(terrain).contains(east),
-        "east must be evicted by the end of the run, or this test proves nothing"
+        sim.world().evicted(terrain).contains(target),
+        "the edited quiet brick must be evicted by the end of the run, or this test proves nothing"
     );
     assert_eq!(sim.world().world_hash(), off_hash);
     assert_eq!(sim.world().total_solid_cells(), off_solid);
 
     // Tighten the dense-byte cap to exactly the current resident total --
-    // zero headroom for east's dense brick to come back -- and give a small
+    // zero headroom for the quiet dense brick to come back -- and give a small
     // interest radius, matching an ordinary walking approach rather than a
     // teleport (a single large jump would swept-pin the whole path as
     // *required*, which must never be admission-limited -- see
@@ -1012,10 +1056,10 @@ fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budg
     limits.interest_radius_bricks = 1;
     pass.set_limits(limits);
 
-    // Walk a second player toward (but not physically into) east's own brick
+    // Walk a second player toward (but not physically into) the quiet brick
     // in small steps, stopping one brick short -- close enough for ordinary
-    // proximity `interest` (radius 1) to *want* east back, but never crossing
-    // into it, so the swept-collision path never itself needs to treat east
+    // proximity `interest` (radius 1) to *want* it back, but never crossing
+    // into it, so the swept-collision path never itself needs to treat it
     // as *required* (that is
     // `a_players_swept_path_pins_a_brick_it_crosses_even_past_the_settle_window`'s
     // job; this test isolates the plain interest-driven admission path). A
@@ -1025,7 +1069,7 @@ fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budg
     let west_player = 1u64;
     let walker = 2u64;
     let west = [1.0_f64, 1.0, 1.0];
-    let goal = [12.5_f64, 1.5, 18.75]; // one brick short of east, in range
+    let goal = [12.5_f64, 1.5, 12.5]; // one brick short of the target, in range
     let steps = 40;
     let mut deferred = 0u64;
     for i in 1..=steps {
@@ -1047,7 +1091,7 @@ fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budg
         "the tight dense-byte cap must have deferred at least one admission"
     );
     assert!(
-        sim.world().evicted(terrain).contains(east),
+        sim.world().evicted(terrain).contains(target),
         "a deferred reload must leave the brick evicted, not admit it over budget"
     );
     // Logical topology is completely unaffected by residency placement.
@@ -1063,7 +1107,7 @@ fn a_tight_dense_byte_cap_defers_a_desired_reload_instead_of_admitting_over_budg
         &Default::default(),
     );
     assert!(
-        !sim.world().evicted(terrain).contains(east),
+        !sim.world().evicted(terrain).contains(target),
         "once the cap has headroom, the previously deferred reload must succeed"
     );
 }

@@ -13,7 +13,7 @@ use spall_structure::{
     AnchorPlane, CancelToken, ComponentMembership, ConservationLedger, Interrupted, ResidencyMode,
     SearchBudget, StructureIndex, SupportReport,
 };
-use spall_voxel::{BrickState, EditError, EditOutcome, EditPlan, EvictedBricks, Volume};
+use spall_voxel::{BrickState, EditError, EditOutcome, EditPlan, EvictedBricks, Sample, Volume};
 
 use crate::intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse};
 
@@ -97,6 +97,10 @@ pub struct StagedEdit {
     pub ledger: ConservationLedger,
     /// Solid cells in the target volume before the edit.
     pub pre_solid: u64,
+    /// Material counts removed by a validated cut. These are calculated from
+    /// the immutable pre-edit snapshot and travel with the staged result; a
+    /// server game hook may award drops only after this edit commits.
+    pub removed_materials: std::collections::BTreeMap<spall_core::MaterialId, u64>,
 }
 
 impl StagedEdit {
@@ -138,6 +142,19 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
     let plan = EditPlan::sphere(input.volume_id, input.brush, input.kind.write_material());
     if plan.writes.is_empty() {
         return Err(StageError::EmptyBrush);
+    }
+
+    let mut removed_materials = std::collections::BTreeMap::new();
+    if input.kind == EditKind::Cut {
+        for write in &plan.writes {
+            if let Sample::Filled(material) = input
+                .volume
+                .sample(write.cell)
+                .map_err(|_| StageError::OutOfBounds(write.cell.split().0))?
+            {
+                *removed_materials.entry(material).or_default() += 1;
+            }
+        }
     }
 
     let cancel = CancelToken::new();
@@ -258,6 +275,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         memberships,
         ledger,
         pre_solid,
+        removed_materials,
     })
 }
 

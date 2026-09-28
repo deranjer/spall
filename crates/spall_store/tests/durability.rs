@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use spall_core::{EntityId, GlobalCell, MaterialId, Tick, TransactionId, VolumeId};
 use spall_protocol::{ControlSeq, TopologyOp, TopologyTransaction};
 use spall_store::{
-    BrickPayload, Checkpoint, CrashPoint, FaultPlan, JournalPayload, JournalRecord,
+    BrickPayload, Checkpoint, CrashPoint, FaultPlan, JournalPayload, JournalRecord, OutboxRecord,
     STORE_SCHEMA_VERSION, StoreError, StoredBrick, StoredWorldMeta, Writer, decode_cells,
     encode_cells, recover,
 };
@@ -260,6 +260,39 @@ fn crash_before_journal_commit_loses_the_batch_cleanly() {
     let mut w = Writer::open(s.db()).unwrap();
     assert_eq!(w.journal_max_seq().unwrap(), 0);
     w.append_journal(&[pose_batch(1, 1)]).unwrap();
+}
+
+#[test]
+fn harvest_outbox_and_world_journal_share_one_crash_boundary() {
+    let s = Scratch::new("harvest_outbox_atomic");
+    let event = OutboxRecord {
+        event_id: [42; 32],
+        journal_seq: 1,
+        payload: b"versioned harvest reward".to_vec(),
+    };
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        w.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+        w.set_faults(FaultPlan::crash(CrashPoint::BeforeJournalCommit));
+        assert!(matches!(
+            w.append_journal_with_outbox(&[split_record(1, 1)], std::slice::from_ref(&event)),
+            Err(StoreError::CrashInjected(CrashPoint::BeforeJournalCommit))
+        ));
+    }
+    {
+        let mut w = Writer::open(s.db()).unwrap();
+        assert!(w.pending_outbox(8).unwrap().is_empty());
+        assert_eq!(recover(s.db()).unwrap().durable_through, 0);
+        w.append_journal_with_outbox(&[split_record(1, 1)], std::slice::from_ref(&event))
+            .unwrap();
+        assert_eq!(w.pending_outbox(8).unwrap(), vec![event.clone()]);
+        // Crash after the destination transaction but before ack: delivery is
+        // at-least-once and retains the same stable event identity on replay.
+        assert_eq!(w.pending_outbox(8).unwrap(), vec![event.clone()]);
+        w.acknowledge_outbox(&[event.event_id]).unwrap();
+        assert!(w.pending_outbox(8).unwrap().is_empty());
+        assert_eq!(recover(s.db()).unwrap().durable_through, 1);
+    }
 }
 
 #[test]

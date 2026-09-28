@@ -408,6 +408,28 @@ pub fn restore(
     anchor: AnchorPlane,
     physics: PhysicsConfig,
 ) -> Result<(Simulation, u64), PersistError> {
+    restore_with_terrain_collider_mode(
+        recovery,
+        cfg,
+        choice,
+        materials,
+        anchor,
+        physics,
+        spall_sim::world::TerrainColliderMode::PerBrick,
+    )
+}
+
+/// Recovery with an explicit derived collision mode. The mode is not stored:
+/// collision is rebuilt from the durable voxel volume on every restart.
+pub fn restore_with_terrain_collider_mode(
+    recovery: &Recovery,
+    cfg: &PersistConfig,
+    choice: RecoveryChoice,
+    materials: MaterialManifest,
+    anchor: AnchorPlane,
+    physics: PhysicsConfig,
+    terrain_collider_mode: spall_sim::world::TerrainColliderMode,
+) -> Result<(Simulation, u64), PersistError> {
     let cp = &recovery.checkpoint;
 
     // Fail closed on a reported-corrupt recovery before anything is rebuilt.
@@ -432,7 +454,14 @@ pub fn restore(
     validate_world_meta(&cp.meta, cfg)?;
 
     let runtime_hash = content_manifest_hash(&materials).0;
-    if runtime_hash != cp.meta.material_manifest_hash {
+    // A world saved under a manifest this one supersedes by appearance alone
+    // (`MaterialManifest::superseding_appearance`) restores normally; its next
+    // checkpoint records this manifest's hash.
+    let saved_under_predecessor = materials
+        .appearance_predecessors()
+        .iter()
+        .any(|previous| content_manifest_hash(previous).0 == cp.meta.material_manifest_hash);
+    if runtime_hash != cp.meta.material_manifest_hash && !saved_under_predecessor {
         return Err(PersistError::ManifestMismatch {
             checkpoint: hex32(&cp.meta.material_manifest_hash),
             runtime: hex32(&runtime_hash),
@@ -453,13 +482,16 @@ pub fn restore(
         &cp.bricks,
     )?;
 
-    let mut world = SimWorld::new(WorldSetup {
-        terrain: terrain_vol,
-        terrain_collider_region: region_from(terrain_sb.collider_region),
-        materials,
-        anchor,
-        physics,
-    })?;
+    let mut world = SimWorld::new_with_terrain_collider_mode(
+        WorldSetup {
+            terrain: terrain_vol,
+            terrain_collider_region: region_from(terrain_sb.collider_region),
+            materials,
+            anchor,
+            physics,
+        },
+        terrain_collider_mode,
+    )?;
 
     for sb in cp
         .bodies
@@ -625,10 +657,19 @@ pub fn replay_from_base_builtin(
     db_path: &std::path::Path,
     cfg: &PersistConfig,
 ) -> Result<(Simulation, u64), PersistError> {
+    replay_from_base_with_manifest(db_path, cfg, spall_sim::fixtures::stone_manifest())
+}
+
+/// Replays a save against the selected game's validated content manifest.
+pub fn replay_from_base_with_manifest(
+    db_path: &std::path::Path,
+    cfg: &PersistConfig,
+    materials: MaterialManifest,
+) -> Result<(Simulation, u64), PersistError> {
     replay_from_base(
         db_path,
         cfg,
-        spall_sim::fixtures::stone_manifest(),
+        materials,
         AnchorPlane::at(0),
         PhysicsConfig::default(),
     )

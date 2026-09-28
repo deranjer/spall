@@ -1,0 +1,28 @@
+[package]
+name = "spall_editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "spall-editor"
+path = "src/main.rs"
+
+[dependencies]
+blake3.workspace = true
+glam.workspace = true
+yakui.workspace = true
+yakui-wgpu.workspace = true
+yakui-winit.workspace = true
+ron.workspace = true
+serde.workspace = true
+spall_render.workspace = true
+spall_voxel.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+zstd.workspace = true
+rfd = "0.17.2"
+
+[dev-dependencies]
+image.workspace = true

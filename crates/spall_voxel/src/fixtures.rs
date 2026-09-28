@@ -807,6 +807,237 @@ pub fn digest_hex(volume: &Volume) -> String {
     digest(volume).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// --- playground (interactive `cargo xtask play --scene playground`) ------
+//
+// Not a T23/G4 gate fixture (no pinned digest, deliberately -- this scene is
+// meant to keep changing as it gets played with). Built for a hands-on feel
+// for movement, jumping, and destruction that a headless CPU test can't give
+// -- see `spall_sim::fixtures::playground_setup` for the paired `WorldSetup`
+// and `spall_sim::playground` for the live debris-spawner pass. Paints with
+// the material ids `spall_sim::fixtures::playground_manifest` defines colour
+// for (`10`-`14`) -- **not** this module's own grey `STONE`/`DIRT` (`1`/`2`),
+// which that manifest has no entries for.
+
+/// [`playground_scene`]'s material ids -- paired one-for-one with
+/// `spall_sim::fixtures::playground_manifest`'s `PLAYGROUND_*` constants
+/// (duplicated here rather than imported: `spall_voxel` does not, and
+/// should not, depend on `spall_sim`).
+const PLAYGROUND_GRASS: MaterialId = MaterialId(10);
+const PLAYGROUND_LOAM: MaterialId = MaterialId(11);
+const PLAYGROUND_BRICK: MaterialId = MaterialId(12);
+const PLAYGROUND_SANDSTONE: MaterialId = MaterialId(13);
+const PLAYGROUND_SLATE: MaterialId = MaterialId(14);
+
+/// A large flat plaza, a staircase up to a lookout platform, a zigzag maze
+/// corridor, and a row of jump platforms with steadily increasing gaps --
+/// four connected areas in one volume, in that order along `+x`/`+z`, sized
+/// for a real hands-on feel (T19 movement, jumping, and -- via
+/// `spall_sim::playground`'s spawner -- watching debris pile up), not CPU-CI
+/// cheapness. Deterministic and RNG-free like every other fixture in this
+/// module; only the separate live spawner pass is randomized.
+///
+/// - **Plaza**: `x [0,127]`, `z [0,127]`, `y [0,3]` (`32 x 32 m`, top surface
+///   `y = 1.0 m`) -- grass, with a `4 m` loam checkerboard on the top layer.
+///   Player spawns here.
+/// - **Stairs**: `x [128,207]`, `z [52,75]` -- ten `2 m`-deep, `0.5 m`-tall
+///   brick steps climbing to `y = 5.0 m`.
+/// - **Lookout**: `x [208,239]`, `z [52,75]`, same height as the top step --
+///   a flat brick landing.
+/// - **Maze**: `x [0,127]`, `z [128,255]` (`32 x 32 m`) -- a sandstone floor
+///   under six `2.5 m`-tall zigzag walls forcing a back-and-forth path.
+/// - **Jump course**: `x [52,75]`, `z [256,~380]` -- six `3 x 3 m` slate
+///   platforms (`1 m` tall) with gaps growing from `1 m` to `3.5 m`.
+/// - **Plinko**: beside the player spawn at `x [21,28]`, `z [20,22]`, with
+///   staggered slate bumpers and a catch basin for the one-second emitter.
+/// - **Tower**: `x [24,28]`, `z [4,8]` (metres), `10 m` tall -- a brick
+///   landmark on the plaza, clear of the spawn point.
+///
+/// One resident air envelope covers the whole combined footprint, written
+/// first (as every other fixture here does) so the solid writes below win.
+pub fn playground_scene(id: VolumeId) -> Volume {
+    let mut v = Volume::new(id, CellSizeCode::Quarter);
+
+    // Resident air over the whole combined footprint, high enough to clear
+    // the stairs/lookout (`y = 5.0 m`) with real headroom for jumping and
+    // for the debris spawner to drop things from `~3x` player height.
+    //
+    // `y` padded to `[-20, 50]`, not `[0, 30]`: `spall_physics::query_cache`'s
+    // `CharacterQueryCache` builds a `+-4 m` (16-cell) window around a
+    // character's *feet* on every movement query, so a player standing at
+    // `y = 1.0 m` (cell 4) queries cells down to `y = -12` and one standing
+    // on the lookout (`y ~= 4.75 m`, cell 19) queries up to `y = 35` --
+    // outside `[0, 30]` on both ends. Any query cell that was never made
+    // resident is `ExtractError::Unresident`, which the whole window falls
+    // back from -- not a graceful degradation: the fallback sweeps the
+    // *whole* resident terrain as one `MergedCuboids` collider, which is
+    // measurably worse (real, felt jitter whenever a sweep grazes one of its
+    // box seams -- `spall_physics::query_cache`'s own module doc) and far
+    // more expensive per query than the small window it replaces. A hands-on
+    // `cargo xtask play --scene playground --late-join` session found
+    // exactly this: `window cache: 0 sweeps ... N terrain fallbacks` on
+    // every reported line -- the window never once built successfully.
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, -20, 0),
+        GlobalCell::new(239, 50, 383),
+        MaterialId::AIR,
+    ))
+    .expect("playground air envelope");
+
+    // Plaza: grass slab, then a loam checkerboard on the top cell layer
+    // (`y = 3`) in 4 m tiles.
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 0),
+        GlobalCell::new(127, 3, 127),
+        PLAYGROUND_GRASS,
+    ))
+    .expect("playground plaza floor");
+    const TILE: i64 = 16; // 4 m
+    for tx in 0..(128 / TILE) {
+        for tz in 0..(128 / TILE) {
+            if (tx + tz) % 2 == 1 {
+                v.apply_edit(&EditPlan::filled_box(
+                    id,
+                    GlobalCell::new(tx * TILE, 3, tz * TILE),
+                    GlobalCell::new(tx * TILE + TILE - 1, 3, tz * TILE + TILE - 1),
+                    PLAYGROUND_LOAM,
+                ))
+                .expect("playground plaza checkerboard tile");
+            }
+        }
+    }
+
+    // Stairs: ten steps, each 8 cells (2 m) deep along x, 2 cells (0.5 m)
+    // taller than the last.
+    const STEP_DEPTH: i64 = 8;
+    const STEP_RISE: i64 = 2;
+    const STEP_COUNT: i64 = 10;
+    const STAIR_Z: (i64, i64) = (52, 75);
+    for step in 0..STEP_COUNT {
+        let x0 = 128 + step * STEP_DEPTH;
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(x0, 0, STAIR_Z.0),
+            GlobalCell::new(x0 + STEP_DEPTH - 1, step * STEP_RISE + 1, STAIR_Z.1),
+            PLAYGROUND_BRICK,
+        ))
+        .expect("playground stair step");
+    }
+    // Lookout landing at the top step's height.
+    let top_y = (STEP_COUNT - 1) * STEP_RISE + 1;
+    let landing_x0 = 128 + STEP_COUNT * STEP_DEPTH;
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(landing_x0, 0, STAIR_Z.0),
+        GlobalCell::new(landing_x0 + 31, top_y, STAIR_Z.1),
+        PLAYGROUND_BRICK,
+    ))
+    .expect("playground lookout landing");
+
+    // Maze: a sandstone floor, then six zigzag walls alternating which side
+    // is open so the only way through is back and forth across the width.
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(0, 0, 128),
+        GlobalCell::new(127, 3, 255),
+        PLAYGROUND_SANDSTONE,
+    ))
+    .expect("playground maze floor");
+    const WALL_COUNT: i64 = 6;
+    const WALL_SPACING: i64 = 16; // 4 m
+    const WALL_THICKNESS: i64 = 2; // 0.5 m
+    const WALL_TOP_Y: i64 = 9; // 2.5 m
+    const GAP: i64 = 16; // 4 m opening
+    for wall in 0..WALL_COUNT {
+        let z0 = 128 + WALL_SPACING + wall * WALL_SPACING;
+        let (x0, x1) = if wall % 2 == 0 {
+            (0, 127 - GAP) // opening on the east side
+        } else {
+            (GAP, 127) // opening on the west side
+        };
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(x0, 0, z0),
+            GlobalCell::new(x1, WALL_TOP_Y, z0 + WALL_THICKNESS - 1),
+            PLAYGROUND_SANDSTONE,
+        ))
+        .expect("playground maze wall");
+    }
+
+    // Jump course: platforms with a steadily growing gap between them.
+    const PLATFORM_SIZE: i64 = 12; // 3 m
+    const PLATFORM_X: (i64, i64) = (52, 63); // 3 m wide, aligned with the stairs
+    let mut z = 256 + WALL_SPACING;
+    for i in 0..6i64 {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(PLATFORM_X.0, 0, z),
+            GlobalCell::new(PLATFORM_X.1, 3, z + PLATFORM_SIZE - 1),
+            PLAYGROUND_SLATE,
+        ))
+        .expect("playground jump platform");
+        z += PLATFORM_SIZE;
+        let gap = 4 + i * 2; // 1.0 m, 1.5 m, 2.0 m, ... 3.5 m
+        z += gap;
+    }
+
+    // Spawn-side Plinko board. Each bumper spans the narrow z lane, so the
+    // falling 0.5 m cubes cannot miss by drifting in depth; staggered rows
+    // force alternating x deflections. Side rails and the low catch basin keep
+    // released bodies nearby so the player can push the resulting pile.
+    const PLINKO_Z: (i64, i64) = (82, 87); // 20.5..22.0 m
+    for (x0, x1) in [(84, 87), (112, 115)] {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(x0, 4, PLINKO_Z.0),
+            GlobalCell::new(x1, 37, PLINKO_Z.1),
+            PLAYGROUND_SLATE,
+        ))
+        .expect("playground Plinko side rail");
+    }
+    let rows = [
+        (31, [90, 98, 106]),
+        (25, [86, 94, 102]),
+        (19, [90, 98, 106]),
+        (13, [86, 94, 102]),
+    ];
+    for (y0, xs) in rows {
+        for x0 in xs {
+            v.apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(x0, y0, PLINKO_Z.0),
+                GlobalCell::new(x0 + 2, y0 + 1, PLINKO_Z.1),
+                PLAYGROUND_SLATE,
+            ))
+            .expect("playground Plinko bumper");
+        }
+    }
+    for (x0, x1) in [(84, 91), (108, 115)] {
+        v.apply_edit(&EditPlan::filled_box(
+            id,
+            GlobalCell::new(x0, 4, PLINKO_Z.0),
+            GlobalCell::new(x1, 7, PLINKO_Z.1),
+            PLAYGROUND_SLATE,
+        ))
+        .expect("playground Plinko catch basin");
+    }
+
+    // A large tall tower on the plaza, well clear of the spawn point
+    // (`PLAYGROUND_SPAWNS`, `x/z ~= 16-18 m`) and everything else -- a
+    // landmark, a line-of-sight blocker, and something to climb/jump around.
+    // `4 x 4 m` footprint, `10 m` tall.
+    v.apply_edit(&EditPlan::filled_box(
+        id,
+        GlobalCell::new(96, 0, 16),
+        GlobalCell::new(111, 39, 31),
+        PLAYGROUND_BRICK,
+    ))
+    .expect("playground tower");
+
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

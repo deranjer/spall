@@ -628,17 +628,19 @@ impl ResidencyPass {
                             });
                         }
                     };
-                    // A cache miss must validate the backing record against the
-                    // retained digest before allowing its encoded bytes into a
-                    // checkpoint.  Incremental cache hits intentionally skip
-                    // this read: their previously encoded record is already the
-                    // verified value for the same retained revision.
-                    if world
-                        .evicted(self.terrain)
-                        .verify_candidate(coord, &brick)
-                        .is_err()
+                    // T23 / G3 row 7 increment 15 regressed increment 16's
+                    // durable exact-revision backing ack: this cache-miss
+                    // path (a brick never captured before, or captured at an
+                    // older revision) reads a fresh candidate from the
+                    // backing and must verify it against the retained digest
+                    // before trusting it, exactly like increment 16's
+                    // now-deleted check. Restored here so a stale/wrong
+                    // backing record fails the capture closed instead of
+                    // silently entering the durable checkpoint.
+                    let offered = spall_voxel::logical::BrickDigest::capture_brick(&brick);
+                    if offered.revision != digest.revision
+                        || offered.content_hash != digest.content_hash
                     {
-                        let offered = spall_voxel::BrickDigest::capture_brick(&brick);
                         return Err(PersistError::EvictedBrickDigestMismatch {
                             volume: self.terrain.get(),
                             coord: [coord.x, coord.y, coord.z],

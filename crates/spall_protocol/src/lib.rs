@@ -36,7 +36,7 @@ pub use baseline::{
 };
 pub use canonical::{
     CanonicalBrick, CanonicalLayer, CanonicalOwner, CanonicalVolume, CanonicalWriter, Hash32,
-    canonical_topology_hash, content_manifest_hash,
+    canonical_topology_hash, content_manifest_hash, content_manifest_hash_with_assets,
 };
 pub use codec::{
     CodecError, decode_bulk, decode_control, decode_datagram, decode_topology, encode_bulk,
@@ -50,11 +50,13 @@ pub use limits::SizeLimitError;
 pub use records::{
     ActionKind, ActionOutcome, ActionRequest, ActionStatus, BaselineAck, BaselineBegin,
     BaselineEnd, BaselinePart, BaselineRegion, BrickRevision, ClaimedTarget, ControlSeq,
-    DurableThrough, InputFrame, InputSeq, InterestEpoch, MotionSnapshot, RecentInput, Record,
-    RecordError, RepairKey, RepairRequest, RequestId, SPLIT_BULK_TRANSFER_ID_BIT, SnapshotSeq,
-    TopologyOp, TopologyTransaction, TransferId, VolumeHash, WIRE_SCHEMA_VERSION, WireTag,
+    DurableThrough, InputFrame, InputSeq, InterestEpoch, InventoryEntry, MotionSnapshot,
+    ProgressionOperation, ProgressionOutcome, ProgressionRejectCode, ProgressionRequest,
+    ProgressionResponse, RecentInput, Record, RecordError, RepairKey, RepairRequest, RequestId,
+    SPLIT_BULK_TRANSFER_ID_BIT, SnapshotSeq, TopologyOp, TopologyTransaction, TransferId,
+    VolumeHash, WIRE_SCHEMA_VERSION, WireTag,
 };
 pub use session::{
-    GenerationExhausted, SeqVerdict, SequenceGate, SessionId, SessionRegistry, SlotId,
+    GenerationExhausted, PlayerId, SeqVerdict, SequenceGate, SessionId, SessionRegistry, SlotId,
     StaleSession, StreamKind, StreamSeq,
 };

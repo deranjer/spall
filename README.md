@@ -4,6 +4,8 @@ Planning baseline: 2026-09-06. T00 implements the Rust workspace, headless serve
 
 Run `cargo xtask check` for formatting, lint, and tests; `cargo xtask smoke` for a bounded server lifecycle; or `cargo xtask smoke --graphical` to include real window presentation and resize. Run the window directly with `cargo run -p sandbox --features client --bin sandbox-client -- --offline`.
 
+The editor MVP is a separate leaf package: run `cargo run -p spall_editor`. It creates versioned RON project/scene documents and canonical `.spvox` voxel assets, and never adds egui to the game runtime dependency graph.
+
 Build a custom engine for one survival/building game: Minecraft/Vintage Story-style world interaction, detailed voxel materials and Teardown-inspired lighting, **full-world destruction and multiplayer from the foundation**. No editor, menus, or UI framework is required. A render window, direct controls, command-line tools, and automated scenarios are required.
 
 User requirements are full-world destruction and multiplayer. The remaining numbers below are proposed engineering defaults, not confirmed product requirements or measured performance.
@@ -55,6 +57,14 @@ Quinn exposes both streams and unreliable unordered datagrams, matching the prop
 7. **No silent correctness tradeoffs under load.** Queue/rate-limit expensive actions and expose overload metrics. Do not delete gameplay debris, classify unknown support as permanent support, or drop topology events to hit a frame-rate target.
 
 All numbers, including voxel sizes, player count, and world size, become frozen compatibility choices only after the feasibility gates. Changing cell size later needs a new world format or explicit conversion.
+
+Current provisional collision choice (ENG-80, 2026-09-23): resident terrain
+uses one derived fixed collider per solid brick by default; the authoritative
+voxel volume and server ownership are unchanged. The user accepted this for
+the main engine loop with good-enough performance for now. A whole-terrain
+comparison mode remains available, and timing/churn follow-up is low priority
+and non-blocking (ENG-87); this decision does not claim the G4 timing targets
+passed.
 
 ## What full-world destruction means
 

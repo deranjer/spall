@@ -23,7 +23,8 @@
 //! held for a body the replica has not created yet, and stale or
 //! too-new-topology snapshots wait or are dropped.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Instant;
 
 use spall_core::{
     BrickCoord, CellSizeCode, EntityId, GlobalCell, MaterialId, Pose, Revision, TransactionId,
@@ -128,13 +129,18 @@ impl From<&MotionSnapshot> for MotionState {
     }
 }
 
-/// Interpolation history for one replicated body: the two most recent accepted
-/// states, plus the first state ever accepted so a caller can measure how far
-/// the body has actually travelled.
-#[derive(Debug, Clone, Copy, Default)]
+/// States retained per body for interpolation. At the 20 Hz publish rate
+/// (3 server ticks apart) this covers well over the 100 ms render delay plus
+/// jitter, so the delayed target time always has a bracketing pair.
+const MOTION_HISTORY: usize = 8;
+
+/// Interpolation history for one replicated body: the most recent accepted
+/// states (oldest first), plus the first state ever accepted so a caller can
+/// measure how far the body has actually travelled.
+#[derive(Debug, Clone, Default)]
 pub struct MotionTrack {
     first: Option<MotionState>,
-    prev: Option<MotionState>,
+    history: VecDeque<MotionState>,
     latest: Option<MotionState>,
 }
 
@@ -146,10 +152,42 @@ impl MotionTrack {
                 if self.first.is_none() {
                     self.first = Some(state);
                 }
-                self.prev = self.latest;
+                if self.history.len() == MOTION_HISTORY {
+                    self.history.pop_front();
+                }
+                self.history.push_back(state);
                 self.latest = Some(state);
             }
         }
+    }
+
+    /// Pose at fractional server tick `target`: interpolated between the two
+    /// accepted states bracketing it, held at the oldest retained state if
+    /// `target` precedes them all, and extrapolated up to `max_extra_ticks`
+    /// past the newest.
+    fn sample(&self, target: f64, max_extra_ticks: f64) -> Option<Pose> {
+        let latest = self.latest?;
+        let idx = self
+            .history
+            .iter()
+            .position(|s| s.server_tick as f64 > target);
+        let (a, b) = match idx {
+            // Every state is at or before `target`: extrapolate off the newest pair.
+            None => match self
+                .history
+                .len()
+                .checked_sub(2)
+                .and_then(|i| self.history.get(i))
+            {
+                Some(&prev) => (prev, latest),
+                None => return Some(latest.pose),
+            },
+            Some(0) => return Some(self.history[0].pose),
+            Some(i) => (self.history[i - 1], self.history[i]),
+        };
+        let span = (b.server_tick - a.server_tick) as f64;
+        let t = ((target - a.server_tick as f64) / span).clamp(0.0, 1.0 + max_extra_ticks / span);
+        Some(lerp_pose(&a.pose, &b.pose, t))
     }
 
     /// The newest accepted server tick, if any.
@@ -171,6 +209,114 @@ impl MotionTrack {
             }
             _ => 0.0,
         }
+    }
+}
+
+/// Owned copy of one body's motion history plus the sampling parameters, see
+/// [`ReplicaWorld::body_sampler`].
+#[derive(Debug, Clone)]
+pub struct BodySampler {
+    track: MotionTrack,
+    delay_ticks: f64,
+    max_extra_ticks: f64,
+    hz: f64,
+}
+
+impl BodySampler {
+    /// Server ticks per second, for advancing a sampled `render_tick`.
+    pub fn hz(&self) -> f64 {
+        self.hz
+    }
+
+    /// Whether the newest snapshot says the body is awake and moving.
+    pub fn is_moving(&self) -> bool {
+        self.track.latest.is_some_and(|s| {
+            !s.sleeping && s.linear_velocity.iter().map(|v| v * v).sum::<f32>() > 0.0025
+        })
+    }
+
+    /// Age (server ticks) of the newest snapshot at `render_tick`.
+    pub fn latest_age_ticks(&self, render_tick: f64) -> Option<f64> {
+        Some(render_tick - self.track.latest?.server_tick as f64)
+    }
+
+    /// Same result as [`ReplicaWorld::presented_pose`] at `render_tick`.
+    pub fn presented(&self, render_tick: f64, focus_m: Option<[f64; 3]>) -> Option<Pose> {
+        let delayed = self
+            .track
+            .sample(render_tick - self.delay_ticks, self.max_extra_ticks)?;
+        let Some(focus) = focus_m else {
+            return Some(delayed);
+        };
+        let latest = self.track.latest?;
+        let present = advance_pose(
+            &latest.pose,
+            latest.linear_velocity,
+            latest.angular_velocity,
+            latest.sleeping,
+            (render_tick - latest.server_tick as f64).clamp(0.0, self.max_extra_ticks),
+            self.hz,
+        );
+        let d = present
+            .translation_m
+            .iter()
+            .zip(focus)
+            .map(|(p, f)| (p - f) * (p - f))
+            .sum::<f64>()
+            .sqrt();
+        let x = ((d - ReplicaWorld::PRESENT_FULL_WITHIN_M)
+            / (ReplicaWorld::PRESENT_NONE_BEYOND_M - ReplicaWorld::PRESENT_FULL_WITHIN_M))
+            .clamp(0.0, 1.0);
+        let smooth = x * x * (3.0 - 2.0 * x);
+        Some(lerp_pose(&present, &delayed, smooth))
+    }
+}
+
+/// A body's newest snapshot, see [`ReplicaWorld::latest_motion`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LatestMotion {
+    pub pose: Pose,
+    pub server_tick: u64,
+    pub linear_velocity_m_s: [f32; 3],
+    pub angular_velocity_rad_s: [f32; 3],
+    pub sleeping: bool,
+}
+
+/// Free-running render clock in fractional server ticks. It advances with wall
+/// time and is slewed (a few percent of real time) toward "newest received tick
+/// plus half a snapshot interval", so per-packet arrival jitter averages out
+/// instead of showing up as motion stutter. It is never allowed to run backwards
+/// and only snaps when it is wildly off (join, stall, or reconnect).
+#[derive(Debug, Clone, Copy, Default)]
+struct RenderClock {
+    last: Option<Instant>,
+    ticks: f64,
+}
+
+impl RenderClock {
+    /// Half of the default 3-tick publish interval: the average age of the
+    /// newest snapshot at an arbitrary instant.
+    const TARGET_LEAD_TICKS: f64 = 1.5;
+    const MAX_SLEW: f64 = 0.05;
+    const SNAP_ERROR_TICKS: f64 = 12.0;
+
+    fn advance(&mut self, now: Instant, newest_tick: u64, hz: f64) -> f64 {
+        let target = newest_tick as f64 + Self::TARGET_LEAD_TICKS;
+        let Some(last) = self.last else {
+            self.last = Some(now);
+            self.ticks = target;
+            return self.ticks;
+        };
+        let dt_ticks = now.saturating_duration_since(last).as_secs_f64() * hz;
+        self.last = Some(last.max(now));
+        let error = target - (self.ticks + dt_ticks);
+        if error.abs() > Self::SNAP_ERROR_TICKS {
+            self.ticks = target;
+        } else {
+            let slew = (error * 0.1).clamp(-Self::MAX_SLEW, Self::MAX_SLEW) * dt_ticks;
+            self.ticks += dt_ticks + slew;
+        }
+        self.ticks
     }
 }
 
@@ -219,6 +365,8 @@ pub struct ReplicaWorld {
     repair_requests_inflight: BTreeMap<(u64, i64, i64, i64), u64>,
     /// Highest server tick the client has observed on any record.
     now_tick: u64,
+    /// Continuously advancing render time; see [`ReplicaWorld::render_tick`].
+    render_clock: RenderClock,
     /// T23 / G3 row 7, slice B: per-volume digests of bricks evicted from this
     /// replica's cache. Empty by default (client eviction is off until a later
     /// slice), so `world_hash` / transaction validation are byte-identical to
@@ -253,6 +401,7 @@ impl ReplicaWorld {
             bulk_split_worlds: BTreeMap::new(),
             repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
+            render_clock: RenderClock::default(),
             evicted: BTreeMap::new(),
         }
     }
@@ -278,6 +427,7 @@ impl ReplicaWorld {
             bulk_split_worlds: BTreeMap::new(),
             repair_requests_inflight: BTreeMap::new(),
             now_tick: 0,
+            render_clock: RenderClock::default(),
             evicted: BTreeMap::new(),
         }
     }
@@ -604,6 +754,17 @@ impl ReplicaWorld {
     /// pick one body to watch.
     pub fn now_tick(&self) -> u64 {
         self.now_tick
+    }
+
+    /// Fractional server tick to hand [`Self::interpolated_pose`] for a frame
+    /// drawn at `now`. Unlike [`Self::now_tick`] (which only moves when a
+    /// snapshot lands, so sampling it makes bodies advance in snapshot-sized
+    /// steps), this runs continuously at the server tick rate and is only
+    /// slewed gently toward the observed stream, so motion stays smooth
+    /// between and across snapshot arrivals.
+    pub fn render_tick(&mut self, now: Instant) -> f64 {
+        self.render_clock
+            .advance(now, self.now_tick, self.config.server_tick_hz)
     }
 
     /// The live terrain volume, for building a client-side collision world (T19
@@ -990,25 +1151,62 @@ impl ReplicaWorld {
     /// `max_extrapolation_s`, then holds. `None` if the body has no state yet.
     pub fn interpolated_pose(&self, entity: EntityId, render_tick: f64) -> Option<Pose> {
         let track = &self.bodies.get(&entity.get())?.track;
-        let latest = track.latest?;
         let delay_ticks = self.config.interpolation_delay_s * self.config.server_tick_hz;
-        let target = render_tick - delay_ticks;
-
-        let Some(prev) = track.prev else {
-            return Some(latest.pose);
-        };
-        let (a, b) = if prev.server_tick <= latest.server_tick {
-            (prev, latest)
-        } else {
-            (latest, prev)
-        };
-        if b.server_tick == a.server_tick {
-            return Some(b.pose);
-        }
-        let span = (b.server_tick - a.server_tick) as f64;
         let max_extra = self.config.max_extrapolation_s * self.config.server_tick_hz;
-        let t = ((target - a.server_tick as f64) / span).clamp(0.0, 1.0 + max_extra / span);
-        Some(lerp_pose(&a.pose, &b.pose, t))
+        track.sample(render_tick - delay_ticks, max_extra)
+    }
+
+    /// Bodies within this distance of the player are drawn at the server's
+    /// *present* estimate, fully.
+    pub const PRESENT_FULL_WITHIN_M: f64 = 2.0;
+    /// Beyond this distance bodies are drawn `interpolation_delay_s` in the past.
+    pub const PRESENT_NONE_BEYOND_M: f64 = 5.0;
+
+    /// Pose to draw `entity` at. Far from `focus_m` (the player's predicted
+    /// feet) this is the smooth, render-delayed [`Self::interpolated_pose`].
+    /// The character, though, collides with bodies at their *present* poses
+    /// (the server sweeps it against them as they are now), and a body the
+    /// player is pushing at walking speed is ~0.5 m ahead of where a 100 ms
+    /// delayed draw shows it: the player stops against nothing visible. So
+    /// inside [`Self::PRESENT_FULL_WITHIN_M`] the newest snapshot is advanced
+    /// to `render_tick` along its own velocity instead, cross-faded to the
+    /// delayed pose out to [`Self::PRESENT_NONE_BEYOND_M`].
+    pub fn presented_pose(
+        &self,
+        entity: EntityId,
+        render_tick: f64,
+        focus_m: Option<[f64; 3]>,
+    ) -> Option<Pose> {
+        self.body_sampler(entity)?.presented(render_tick, focus_m)
+    }
+
+    /// A self-contained copy of what [`Self::presented_pose`] reads for
+    /// `entity`, so a caller can drop the replica lock and still pose the body
+    /// at any later `render_tick` (the renderer re-poses at each frame's own
+    /// timestamp instead of reusing a worker's stale sample).
+    pub fn body_sampler(&self, entity: EntityId) -> Option<BodySampler> {
+        let track = self.bodies.get(&entity.get())?.track.clone();
+        track.latest?;
+        Some(BodySampler {
+            track,
+            delay_ticks: self.config.interpolation_delay_s * self.config.server_tick_hz,
+            max_extra_ticks: self.config.max_extrapolation_s * self.config.server_tick_hz,
+            hz: self.config.server_tick_hz,
+        })
+    }
+
+    /// The newest snapshot for `entity`, with the velocities needed to advance
+    /// it to any nearby server tick (character prediction collides with bodies
+    /// at the tick it is simulating, not at the 100 ms render-delayed pose).
+    pub(crate) fn latest_motion(&self, entity: EntityId) -> Option<LatestMotion> {
+        let latest = self.bodies.get(&entity.get())?.track.latest?;
+        Some(LatestMotion {
+            pose: latest.pose,
+            server_tick: latest.server_tick,
+            linear_velocity_m_s: latest.linear_velocity,
+            angular_velocity_rad_s: latest.angular_velocity,
+            sleeping: latest.sleeping,
+        })
     }
 
     /// The newest raw motion state's server tick for `entity`.
@@ -1427,6 +1625,57 @@ fn lerp_pose(a: &Pose, b: &Pose, t: f64) -> Pose {
     for i in 0..3 {
         out.translation_m[i] = a.translation_m[i] + (b.translation_m[i] - a.translation_m[i]) * t;
     }
+    out.rotation = nlerp_rotation(&a.rotation, &b.rotation, t).unwrap_or(b.rotation);
+    out
+}
+
+/// Shortest-arc normalised lerp between two orientations. `None` if either is
+/// degenerate (the caller keeps the newer one).
+fn nlerp_rotation(
+    a: &spall_core::QuantizedQuat,
+    b: &spall_core::QuantizedQuat,
+    t: f64,
+) -> Option<spall_core::QuantizedQuat> {
+    let [ax, ay, az, aw] = a.to_unit().ok()?;
+    let [bx, by, bz, bw] = b.to_unit().ok()?;
+    let qa = glam::Quat::from_xyzw(ax, ay, az, aw);
+    let mut qb = glam::Quat::from_xyzw(bx, by, bz, bw);
+    if qa.dot(qb) < 0.0 {
+        qb = -qb;
+    }
+    let q = qa.lerp(qb, t as f32).normalize();
+    spall_core::QuantizedQuat::from_unit(q.x, q.y, q.z, q.w).ok()
+}
+
+/// `pose` advanced by `ticks` server ticks (either sign) along constant linear
+/// and angular velocity; a sleeping body does not move. No contact response:
+/// callers bound `ticks` themselves.
+pub(crate) fn advance_pose(
+    pose: &Pose,
+    linear_velocity_m_s: [f32; 3],
+    angular_velocity_rad_s: [f32; 3],
+    sleeping: bool,
+    ticks: f64,
+    server_tick_hz: f64,
+) -> Pose {
+    if sleeping {
+        return *pose;
+    }
+    let dt = ticks / server_tick_hz;
+    let mut out = *pose;
+    for (t, v) in out.translation_m.iter_mut().zip(linear_velocity_m_s) {
+        *t += f64::from(v) * dt;
+    }
+    let w = glam::Vec3::from_array(angular_velocity_rad_s);
+    if w.length_squared() > 1.0e-12
+        && let Ok([x, y, z, wq]) = pose.rotation.to_unit()
+    {
+        let q = (glam::Quat::from_scaled_axis(w * dt as f32) * glam::Quat::from_xyzw(x, y, z, wq))
+            .normalize();
+        if let Ok(rotation) = spall_core::QuantizedQuat::from_unit(q.x, q.y, q.z, q.w) {
+            out.rotation = rotation;
+        }
+    }
     out
 }
 
@@ -1627,6 +1876,151 @@ mod tests {
             before,
             "failed candidate did not leak"
         );
+    }
+
+    fn moving_replica(ticks: &[(u64, f64)], vx: f32) -> (ReplicaWorld, EntityId) {
+        let mut replica = ReplicaWorld::from_baseline(terrain(), ReplicaConfig::default());
+        let body = EntityId::new(42).unwrap();
+        replica.install_body(body, {
+            let mut v = Volume::new(VolumeId::new(9).unwrap(), CellSizeCode::Quarter);
+            v.apply_edit(&EditPlan::filled_box(
+                VolumeId::new(9).unwrap(),
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(0, 0, 0),
+                MaterialId(1),
+            ))
+            .unwrap();
+            v
+        });
+        for &(tick, x) in ticks {
+            replica.ingest_snapshot(&MotionSnapshot {
+                server_tick: spall_core::Tick(tick),
+                snapshot_seq: spall_protocol::SnapshotSeq(tick),
+                acked_input: spall_protocol::InputSeq(0),
+                body,
+                topology_revision: Revision(0),
+                pose: Pose {
+                    translation_m: [x, 0.0, 0.0],
+                    rotation: spall_core::QuantizedQuat::from_unit(0.0, 0.0, 0.0, 1.0).unwrap(),
+                },
+                linear_velocity: [vx, 0.0, 0.0],
+                angular_velocity: [0.0; 3],
+                sleeping: false,
+            });
+        }
+        (replica, body)
+    }
+
+    #[test]
+    fn interpolation_is_continuous_at_the_normal_snapshot_spacing() {
+        // 20 Hz snapshots (3 server ticks apart), 1 unit per tick, and the
+        // default 6-tick render delay: the delayed target sits before the two
+        // newest states, so it must come from older retained history rather
+        // than clamping to the older of the newest pair.
+        let (replica, body) = moving_replica(&[(0, 0.0), (3, 3.0), (6, 6.0), (9, 9.0)], 60.0);
+        let x = |tick: f64| replica.interpolated_pose(body, tick).unwrap().translation_m[0];
+        assert!((x(9.0) - 3.0).abs() < 1e-9);
+        assert!((x(10.0) - 4.0).abs() < 1e-9);
+        assert!((x(10.5) - 4.5).abs() < 1e-9);
+        // Before all retained history: held at the oldest state.
+        assert_eq!(x(2.0), 0.0);
+    }
+
+    #[test]
+    fn body_rotation_is_interpolated_not_stepped() {
+        let q = |angle: f32| {
+            spall_core::QuantizedQuat::from_unit((angle / 2.0).sin(), 0.0, 0.0, (angle / 2.0).cos())
+                .unwrap()
+        };
+        let a = Pose {
+            translation_m: [0.0; 3],
+            rotation: q(0.0),
+        };
+        let b = Pose {
+            translation_m: [1.0, 0.0, 0.0],
+            rotation: q(1.0),
+        };
+        let mid = lerp_pose(&a, &b, 0.5);
+        let [x, _, _, w] = mid.rotation.to_unit().unwrap();
+        assert!(
+            (2.0 * x.atan2(w) - 0.5).abs() < 1e-2,
+            "half way is half the angle"
+        );
+        assert!((mid.translation_m[0] - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bodies_near_the_player_are_drawn_at_the_present_far_ones_delayed() {
+        // 60 units/s along x; snapshots at ticks 0..9 (x = tick).
+        let (replica, body) = moving_replica(&[(0, 0.0), (3, 3.0), (6, 6.0), (9, 9.0)], 60.0);
+        let render_tick = 10.0; // delayed target is tick 4 (x = 4); present is x = 10
+        let x = |focus: [f64; 3]| {
+            replica
+                .presented_pose(body, render_tick, Some(focus))
+                .unwrap()
+                .translation_m[0]
+        };
+        let delayed = replica
+            .interpolated_pose(body, render_tick)
+            .unwrap()
+            .translation_m[0];
+        assert!((delayed - 4.0).abs() < 1e-9);
+        assert!(
+            (x([10.0, 0.0, 0.0]) - 10.0).abs() < 1e-4,
+            "player at the body: present pose"
+        );
+        assert!(
+            (x([100.0, 0.0, 0.0]) - delayed).abs() < 1e-9,
+            "far away: delayed pose"
+        );
+        let mid = x([10.0 + 3.5, 0.0, 0.0]);
+        assert!(delayed < mid && mid < 10.0, "cross-faded in between: {mid}");
+        assert_eq!(
+            replica.presented_pose(body, render_tick, None).unwrap(),
+            replica.interpolated_pose(body, render_tick).unwrap()
+        );
+    }
+
+    /// The renderer re-poses a body at every frame's own render tick from a
+    /// sampler copied out of the replica once; that must agree with asking the
+    /// replica directly, and must advance every frame (no held poses) even
+    /// though the copy is only refreshed when a worker pass runs.
+    #[test]
+    fn body_sampler_poses_at_each_frame_time_like_the_replica() {
+        let (replica, body) = moving_replica(&[(0, 0.0), (3, 3.0), (6, 6.0), (9, 9.0)], 60.0);
+        let sampler = replica.body_sampler(body).unwrap();
+        let focus = Some([10.0, 0.0, 0.0]);
+        let mut prev = f64::MIN;
+        // 240 Hz "frames" between 10.0 and 12.0 server ticks, all off one copy.
+        for i in 0..=480 {
+            let tick = 10.0 + f64::from(i) / 240.0;
+            let mine = sampler.presented(tick, focus).unwrap();
+            assert_eq!(mine, replica.presented_pose(body, tick, focus).unwrap());
+            assert!(
+                mine.translation_m[0] > prev,
+                "pose held or went backwards at tick {tick}"
+            );
+            prev = mine.translation_m[0];
+        }
+        assert!(sampler.is_moving());
+        assert!((sampler.latest_age_ticks(10.5).unwrap() - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn render_clock_is_continuous_and_never_runs_backwards() {
+        let mut clock = RenderClock::default();
+        let t0 = Instant::now();
+        let mut prev = clock.advance(t0, 30, 60.0);
+        for frame in 1..=120u64 {
+            // Snapshots land every 3 ticks, so `newest` is a staircase.
+            let elapsed_ticks = frame as f64 * (60.0 / 120.0);
+            let newest = 30 + (elapsed_ticks as u64 / 3) * 3;
+            let now = t0 + std::time::Duration::from_secs_f64(frame as f64 / 120.0);
+            let cur = clock.advance(now, newest, 60.0);
+            assert!(cur > prev, "clock must advance every frame");
+            assert!(cur - prev < 1.0, "no snapshot-sized jump: {}", cur - prev);
+            prev = cur;
+        }
     }
 
     #[test]

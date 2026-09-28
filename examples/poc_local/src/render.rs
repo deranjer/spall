@@ -209,7 +209,9 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(window: Arc<Window>, instances: &[Instance]) -> Result<Self, String> {
-        let instance = wgpu::Instance::default();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
+            Box::new(window.clone()),
+        ));
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| e.to_string())?;
@@ -217,22 +219,21 @@ impl Renderer {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
+            ..Default::default()
         }))
-        .ok_or("no compatible GPU adapter")?;
+        .map_err(|error| error.to_string())?;
         let info = adapter.get_info();
         eprintln!(
             "poc-local: adapter {} | backend {:?} | driver {} {}",
             info.name, info.backend, info.driver, info.driver_info
         );
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("poc-local-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("poc-local-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            ..Default::default()
+        }))
         .map_err(|e| e.to_string())?;
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
@@ -250,6 +251,7 @@ impl Renderer {
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: capabilities.alpha_modes[0],
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 1,
         };
@@ -292,8 +294,8 @@ impl Renderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("poc-local-pipeline-layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
@@ -333,7 +335,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[vertex_layout, instance_layout],
+                buffers: &[Some(vertex_layout), Some(instance_layout)],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -354,8 +356,8 @@ impl Renderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -363,7 +365,7 @@ impl Renderer {
                 count: SAMPLE_COUNT,
                 ..Default::default()
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -422,13 +424,22 @@ impl Renderer {
 
     pub fn render(&mut self, eye: Vec3, look_dir: Vec3) -> Result<(), String> {
         let surface_texture = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                drop(t);
                 self.surface.configure(&self.device, &self.surface_config);
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(error) => return Err(error.to_string()),
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err("surface acquisition validation error".into());
+            }
         };
         let view = surface_texture
             .texture
@@ -465,6 +476,7 @@ impl Renderer {
                         }),
                         store: wgpu::StoreOp::Discard,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
@@ -476,6 +488,7 @@ impl Renderer {
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
@@ -492,8 +505,10 @@ impl Renderer {
         // Blocking here until the GPU has actually finished this frame's
         // work forces one submission in flight at a time, matching true
         // vsync cadence instead of bursting ahead of it.
-        let _ = self.device.poll(wgpu::Maintain::Wait);
-        surface_texture.present();
+        self.device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| error.to_string())?;
+        self.queue.present(surface_texture);
         Ok(())
     }
 }

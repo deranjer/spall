@@ -15,7 +15,9 @@ use spall_core::{CELLS_PER_BRICK, EntityId, GlobalCell, LocalCell, MaterialId, S
 use spall_physics::{OccupancyGrid, analytic_mass_properties};
 use spall_protocol::{ActionOutcome, RequestId};
 use spall_sim::fixtures::{self, STONE};
-use spall_sim::{BodyPose, EditIntent, EditTarget, ExplosionImpulse, Simulation, SimulationConfig};
+use spall_sim::{
+    BodyPose, EditIntent, EditTarget, ExplosionImpulse, MemoryBacking, Simulation, SimulationConfig,
+};
 use spall_structure::AnchorPlane;
 use spall_structure::oracle::dense_support;
 use spall_voxel::{EditPlan, Sample, Volume};
@@ -754,4 +756,261 @@ fn a_repeatedly_contested_region_is_serialized_and_still_makes_progress() {
         5,
         "five distinct transactions, none applied twice"
     );
+}
+
+/// ENG-77: a global topology epoch is still authoritative, but a burst of
+/// independently-targeted structural edits must not be reduced to one commit
+/// per server tick.  The second staged result is stale after the first split;
+/// the pipeline rebases it in a bounded same-tick round and commits it in
+/// request order.
+#[test]
+fn independent_topology_edits_rebase_within_one_tick() {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::separated_regions_setup())).unwrap();
+    let east = spall_voxel::fixtures::SEPARATED_REGIONS_EAST_OFFSET;
+    let west = RequestId(1);
+    let east_request = RequestId(2);
+
+    sim.submit(EditIntent::cut(
+        west,
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10, 6, 3, 2),
+    ))
+    .unwrap();
+    sim.submit(EditIntent::cut(
+        east_request,
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10 + east.x, 6 + east.y, 3 + east.z, 2),
+    ))
+    .unwrap();
+
+    let report = sim.tick().unwrap();
+    assert_eq!(report.committed.len(), 2, "both edits commit in one tick");
+    assert_eq!(report.committed[0].0, west, "request order is preserved");
+    assert_eq!(
+        report.committed[1].0, east_request,
+        "request order is preserved"
+    );
+    assert!(
+        report.retried.contains(&east_request),
+        "the second edit was explicitly rebased after the global epoch advanced"
+    );
+    assert_eq!(
+        report.pending_after, 0,
+        "the bounded rebase drained the burst"
+    );
+    assert_eq!(
+        sim.world().body_count(),
+        2,
+        "both beams detached exactly once"
+    );
+}
+
+/// ENG-77: the bounded rebase loop must stop after four same-tick rebase
+/// rounds. Six independent body splits provide more stale work than the bound,
+/// so one request remains queued for the following tick rather than turning a
+/// single server tick into an unbounded commit loop.
+#[test]
+fn a_topology_burst_beyond_four_rebases_remains_bounded() {
+    let mut setup = fixtures::flat_terrain_setup();
+    setup.anchor = AnchorPlane::at(-100_000);
+    let mut sim = Simulation::new(SimulationConfig::new(setup)).unwrap();
+    let mut bodies = Vec::new();
+    for i in 0..6 {
+        bodies.push(
+            sim.world_mut()
+                .spawn_body(
+                    fixtures::dumbbell(4, 3),
+                    BodyPose::new(DQuat::IDENTITY, [5.0 + i as f64 * 12.0, 8.0, 5.0]),
+                    [0.0; 3],
+                    [0.0; 3],
+                    2600.0,
+                    0,
+                )
+                .unwrap(),
+        );
+    }
+    for (i, body) in bodies.iter().copied().enumerate() {
+        sim.submit(EditIntent::cut(
+            RequestId(i as u64 + 1),
+            actor(),
+            EditTarget::Body(body),
+            brush_cell(5, 2, 2, 2),
+        ))
+        .unwrap();
+    }
+
+    let report = sim.tick().unwrap();
+    assert_eq!(
+        report.committed.len(),
+        3,
+        "the bounded loop makes finite progress"
+    );
+    assert_eq!(
+        report.retried.len(),
+        12,
+        "four same-tick rebase rounds are attempted"
+    );
+    assert_eq!(
+        report.pending_after, 3,
+        "the remaining burst waits for the next tick"
+    );
+    assert_eq!(
+        sim.world().body_count(),
+        9,
+        "three splits replace three parents with six children"
+    );
+    assert!(!sim.is_idle(), "the bounded burst leaves queued retries");
+
+    for _ in 0..12 {
+        if sim.is_idle() {
+            break;
+        }
+        sim.tick().unwrap();
+    }
+    assert!(sim.is_idle(), "the bounded retries eventually drain");
+    for request in 1..=6 {
+        assert!(
+            sim.committed(RequestId(request)).is_some(),
+            "request {request} must commit exactly once"
+        );
+    }
+    assert_eq!(sim.world().body_count(), 12);
+}
+
+/// ENG-77: once a contested region crosses the serialization threshold during
+/// a rebase, its retry is deferred for the next tick while an independent
+/// region continues to make progress in the current tick.
+#[test]
+fn serialization_threshold_defers_same_region_retry_within_tick() {
+    let mut config = SimulationConfig::new(fixtures::separated_regions_setup());
+    config.serialize_threshold = 2;
+    let mut sim = Simulation::new(config).unwrap();
+    let east = spall_voxel::fixtures::SEPARATED_REGIONS_EAST_OFFSET;
+
+    sim.submit(EditIntent::cut(
+        RequestId(1),
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10, 6, 3, 2),
+    ))
+    .unwrap();
+    sim.submit(EditIntent::cut(
+        RequestId(2),
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(10 + east.x, 6 + east.y, 3 + east.z, 2),
+    ))
+    .unwrap();
+    for (request, x) in [(RequestId(3), 11), (RequestId(4), 12)] {
+        sim.submit(EditIntent::cut(
+            request,
+            actor(),
+            EditTarget::Terrain,
+            brush_cell(x, 6, 3, 2),
+        ))
+        .unwrap();
+    }
+
+    let report = sim.tick().unwrap();
+    assert_eq!(report.committed.len(), 2, "independent work still commits");
+    assert!(report.committed.iter().any(|(id, _)| *id == RequestId(1)));
+    assert!(report.committed.iter().any(|(id, _)| *id == RequestId(2)));
+    assert_eq!(
+        report.serialized_regions.len(),
+        1,
+        "region crossed the threshold"
+    );
+    assert!(report.retried.contains(&RequestId(3)));
+    assert!(report.retried.contains(&RequestId(4)));
+    assert_eq!(
+        report.pending_after, 2,
+        "serialized retry waits for next tick"
+    );
+
+    let next = sim.tick().unwrap();
+    assert_eq!(next.committed.len(), 1);
+    assert!(sim.committed(RequestId(3)).is_some());
+    assert!(sim.committed(RequestId(4)).is_none());
+    let final_tick = sim.tick().unwrap();
+    assert_eq!(final_tick.committed.len(), 1);
+    assert!(sim.committed(RequestId(4)).is_some());
+    assert!(sim.is_idle());
+}
+
+/// ENG-77: an evicted-geometry retry must remain next-tick work even when an
+/// unrelated staged result becomes stale and triggers an in-tick rebase.
+#[test]
+fn reload_retry_does_not_reenter_a_same_tick_rebase_round() {
+    let mut sim =
+        Simulation::new(SimulationConfig::new(fixtures::cross_brick_bridged_setup())).unwrap();
+    let terrain = sim.world().terrain_volume_id();
+    let backing = MemoryBacking::from_volume(&sim.world().terrain().volume);
+    sim.world_mut().set_backing(std::sync::Arc::new(backing));
+    let victim = spall_core::BrickCoord::new(1, 0, 0);
+    assert!(sim.world_mut().evict_brick(terrain, victim).unwrap());
+
+    // Keep the two body splits independent of the evicted terrain edit while
+    // sharing the same global topology epoch.
+    let body_a = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::dumbbell(4, 3),
+            BodyPose::new(DQuat::IDENTITY, [5.0, 8.0, 5.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    let body_b = sim
+        .world_mut()
+        .spawn_body(
+            fixtures::dumbbell(4, 3),
+            BodyPose::new(DQuat::IDENTITY, [20.0, 8.0, 5.0]),
+            [0.0; 3],
+            [0.0; 3],
+            2600.0,
+            0,
+        )
+        .unwrap();
+    let reload_request = EditIntent::cut(
+        RequestId(1),
+        actor(),
+        EditTarget::Terrain,
+        brush_cell(31, 4, 1, 2),
+    );
+    let body_a_request = EditIntent::cut(
+        RequestId(2),
+        actor(),
+        EditTarget::Body(body_a),
+        brush_cell(5, 2, 2, 2),
+    );
+    let body_b_request = EditIntent::cut(
+        RequestId(3),
+        actor(),
+        EditTarget::Body(body_b),
+        brush_cell(5, 2, 2, 2),
+    );
+    sim.submit(reload_request).unwrap();
+    sim.submit(body_a_request).unwrap();
+    sim.submit(body_b_request).unwrap();
+
+    let report = sim.tick().unwrap();
+    assert_eq!(report.committed.len(), 2, "both body edits can progress");
+    assert_eq!(
+        report.pending_after, 1,
+        "reload retry is deferred to next tick"
+    );
+    assert!(sim.committed(RequestId(1)).is_none());
+
+    let next = sim.tick().unwrap();
+    assert_eq!(
+        next.committed.len(),
+        1,
+        "reloaded edit commits on the next tick"
+    );
+    assert!(sim.committed(RequestId(1)).is_some());
 }

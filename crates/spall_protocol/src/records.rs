@@ -21,7 +21,7 @@ use crate::limits::{
 };
 
 /// Schema version stamped into every encoded record header.
-pub const WIRE_SCHEMA_VERSION: u16 = 1;
+pub const WIRE_SCHEMA_VERSION: u16 = 3;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,6 +39,8 @@ pub enum WireTag {
     RepairRequest = 10,
     DurableThrough = 11,
     Handshake = 12,
+    ProgressionRequest = 13,
+    ProgressionResponse = 14,
 }
 
 impl WireTag {
@@ -56,12 +58,120 @@ impl WireTag {
             10 => Self::RepairRequest,
             11 => Self::DurableThrough,
             12 => Self::Handshake,
+            13 => Self::ProgressionRequest,
+            14 => Self::ProgressionResponse,
             _ => return None,
         })
     }
 
     pub const fn to_u16(self) -> u16 {
         self as u16
+    }
+}
+
+/// Game progression operation requested over the authenticated control stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProgressionOperation {
+    InspectInventory,
+    Craft { recipe_id: u16, batch_count: u32 },
+}
+
+/// A player's request against a versioned game recipe catalog and inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressionRequest {
+    pub request_id: u64,
+    pub catalog_version: u32,
+    pub expected_inventory_revision: u64,
+    pub operation: ProgressionOperation,
+}
+
+impl Record for ProgressionRequest {
+    const TAG: WireTag = WireTag::ProgressionRequest;
+    fn validate(&self) -> Result<(), RecordError> {
+        if self.request_id == 0 {
+            return Err(RecordError::Inconsistent(
+                "progression request ID must be nonzero",
+            ));
+        }
+        match self.operation {
+            ProgressionOperation::InspectInventory => {}
+            ProgressionOperation::Craft {
+                recipe_id,
+                batch_count,
+            } if recipe_id != 0 && batch_count != 0 => {}
+            ProgressionOperation::Craft { .. } => {
+                return Err(RecordError::Inconsistent(
+                    "craft recipe and batch must be nonzero",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stable rejection categories; detailed game-specific prose stays server-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProgressionRejectCode {
+    CatalogVersion,
+    InventoryRevision,
+    UnknownRecipe,
+    ZeroBatch,
+    InsufficientItems,
+    Overflow,
+    Unavailable,
+    /// The bounded progression work queue is full. Retry the same request ID.
+    RetryableCapacity,
+}
+
+/// Compact, explicit inventory entry; numeric IDs are game-owned stable IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryEntry {
+    pub item_id: u16,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProgressionOutcome {
+    Inventory,
+    Crafted,
+    Rejected(ProgressionRejectCode),
+}
+
+/// Authoritative result always includes the complete current inventory, even
+/// for a rejected optimistic request, so clients can repair stale views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressionResponse {
+    pub request_id: u64,
+    pub catalog_version: u32,
+    pub inventory_revision: u64,
+    pub outcome: ProgressionOutcome,
+    pub inventory: Vec<InventoryEntry>,
+}
+
+impl Record for ProgressionResponse {
+    const TAG: WireTag = WireTag::ProgressionResponse;
+    fn validate(&self) -> Result<(), RecordError> {
+        if self.request_id == 0 || self.catalog_version == 0 {
+            return Err(RecordError::Inconsistent(
+                "progression response identity must be nonzero",
+            ));
+        }
+        if self.inventory.len() > 256 {
+            return Err(RecordError::OutOfRange {
+                field: "ProgressionResponse.inventory",
+                detail: "more than 256 stacks",
+            });
+        }
+        let mut previous = 0;
+        for entry in &self.inventory {
+            if entry.item_id == 0 || entry.count == 0 || entry.item_id <= previous {
+                return Err(RecordError::Inconsistent(
+                    "inventory entries must have positive counts and sorted unique IDs",
+                ));
+            }
+            previous = entry.item_id;
+        }
+        Ok(())
     }
 }
 
@@ -162,9 +272,16 @@ fn unit_axis(v: &[f32; 3], field: &'static str) -> Result<(), RecordError> {
 // --- InputFrame -------------------------------------------------------------
 
 /// One redundant copy of a recent input, carried inside [`InputFrame`].
+///
+/// Carries its own `intended_tick` (not just the enclosing frame's) so that
+/// recovering it from a later datagram -- the case this redundancy exists
+/// for, a dropped primary frame -- can still schedule it against the tick it
+/// was tagged for instead of applying it immediately on whatever tick is
+/// next.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RecentInput {
     pub input_seq: InputSeq,
+    pub intended_tick: Tick,
     pub movement: [f32; 3],
     pub view_dir: [f32; 3],
     pub buttons: u32,
@@ -711,6 +828,7 @@ mod tests {
     fn input_frame_rejects_too_many_redundant_and_bad_axes() {
         let base = RecentInput {
             input_seq: InputSeq(1),
+            intended_tick: Tick(100),
             movement: [0.0; 3],
             view_dir: [0.0, 0.0, 1.0],
             buttons: 0,

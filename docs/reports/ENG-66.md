@@ -1,23 +1,33 @@
-# ENG-66 — rapier3d version check for row 15 (T23 / G3)
+# ENG-66 — row 15 spawn-overlap correction (T23 / G3)
 
-Follow-up to T23 / G3 row 15 (first reported by PR #99, root-caused in PR #106
-/ `docs/reports/G3.md` increment 20): a freshly-created authoritative player
-capsule spawned within roughly the first few metres of a bounded volume's
-`x = 0` origin, near a floor plus a second, wide/thin *elevated* structure
-("beam"), does not respond to horizontal input for hundreds of ticks —
-`grounded` stays `true`, wish-velocity is computed correctly every tick, but
-`rapier3d::control::KinematicCharacterController::move_shape`'s returned
-translation is `[0, 0, 0]` indefinitely. Root-caused to `rapier3d` itself, not
-this codebase; mitigated (not fixed) by spawning at `x = 7 m` instead of
-`x = 1 m` (`fixtures::SEPARATED_REGION_FAR_SPAWNS`). ENG-66 was scoped to check
-whether a newer `rapier3d` release has since fixed it.
+## Correction (2026-09-23): not a Rapier defect
 
-**Outcome: no fix available. `rapier3d 0.35.3` — the version already pinned in
-the workspace `Cargo.toml` — is still the latest released version on
-crates.io as of this check (2026-09-17). No code or dependency changes were
-made. The regression test stays `#[ignore]`d, and
-`fixtures::SEPARATED_REGION_FAR_SPAWNS`'s `x = 7 m` mitigation stays in
-place.**
+The original isolated run used an invalid spawn at `[1, 1, 1]`. The floor top
+is `y = 1.0 m`; the raised beam's underside is `y = 2.5 m`; the default
+standing capsule is `1.8 m` tall, so it intersects the beam by `0.3 m`. The
+first sweep reports zero-time contacts from this initial overlap, and horizontal
+movement remains blocked. This is expected for an overlapping spawn and does
+not establish a Rapier character-controller defect.
+
+Keeping `x = 1 m` and moving only `z` to `1.6 m` clears the beam footprint.
+The new non-ignored physics regression moves more than 1 m over 200 ticks; the
+separated-region integration test confirms all four corrected spawn slots walk
+and remain grounded. Both separated-region spawn tables now use the clear lane.
+No Rapier version change is needed; `0.35.3` remains the latest release checked
+against the official [Rapier changelog](https://github.com/dimforge/rapier/blob/master/CHANGELOG.md).
+The remaining content below records the earlier investigation, whose
+conclusion that this was an upstream defect is superseded by this correction.
+
+## Original report (2026-09-17; conclusion superseded)
+
+The original ENG-66 pass checked whether a newer `rapier3d` release had fixed
+the freeze reported in PR #99 / G3 increment 20. It concluded the bug was
+upstream and that moving from `x = 1 m` to `x = 7 m` mitigated it. That
+conclusion was based on a capsule spawned intersecting the beam, as described
+in the correction above.
+
+**Version-check outcome at that time:** `rapier3d 0.35.3` was the latest
+released version on crates.io (2026-09-17). No dependency change was made.
 
 ## What was checked
 
@@ -99,7 +109,7 @@ edge. `Cargo.lock` has it locked with `parry3d 0.30.2` and `nalgebra 0.35.0`,
 the versions `rapier3d 0.35.3` itself requires. Since no newer release exists,
 none of this needed to be tested against a bump.
 
-## Regression evidence (current behaviour, unchanged)
+## Historical regression evidence (before the correction below)
 
 ```
 cargo test -p spall_physics --lib row15 -- --ignored --nocapture
@@ -116,40 +126,32 @@ test character::tests::row15_elevated_beam_near_origin_freezes_horizontal_moveme
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.80s
 ```
 
-Still fails exactly as `docs/reports/G3.md` increment 20 recorded — the
-defect is still present under `rapier3d 0.35.3`. No other checks
-(`cargo fmt`, `cargo clippy`, `cargo test --workspace`) were run because no
-dependency or code change was made; the full check suite from the ticket's
-suggested workflow only applies to the "a fix was found" branch, which did
-not occur here.
+This output was the evidence behind the now-superseded upstream-defect theory.
 
-## Recommendation
+## Current regression evidence
 
-- **No dependency bump.** There is nothing to bump to.
-- **Keep `fixtures::SEPARATED_REGION_FAR_SPAWNS`'s `x = 7 m` mitigation
-  exactly as-is.** No new evidence changes the `x >= ~6.5 m` empirical
-  threshold from increment 20.
-- **Keep the `#[ignore]`d regression test as the tripwire.** Re-run
-  `cargo test -p spall_physics --lib row15 -- --ignored --nocapture` the next
-  time a `rapier3d` bump is considered for any other reason (a future feature
-  or another bugfix pass) — if it ever starts passing, that is the signal to
-  drop `#[ignore]` and reconsider whether the spawn mitigation is still
-  needed.
-- **Filing upstream remains open, unstarted work**, not resolved by this
-  ticket. The isolated repro in `character.rs`'s doc comment is
-  ready to paste into a new `dimforge/rapier` issue whenever the coordinator
-  wants to spend that effort; nothing found here changes that recommendation
-  either way.
-- **Re-check periodically.** `rapier3d` shipped three patch releases
-  (`0.35.1`–`0.35.3`) in about three weeks around early-to-late August 2026,
-  so another point release is plausible on a similar cadence; a repeat of
-  this crates.io/CHANGELOG.md check costs a few minutes and needs no code
-  changes unless something relevant actually appears.
+`cargo test -p spall_physics --lib row15` passes with a valid near-origin
+spawn at `[1, 1, 1.6]`, clear of the beam footprint. The separated-region
+integration test verifies that every normal and full-envelope spawn slot walks
+more than 1 m over 30 ticks and remains grounded. The old `[1, 1, 1]` state
+intersects the beam by 0.3 m vertically; the reported freeze is therefore
+expected for an invalid overlapping spawn.
+
+`cargo xtask scenario --name t23-g3-full-envelope --timeout-ms 300000` also
+completed its traversal (slot 0 measured 118.89 m); each client reported the
+same final hash, and replay, cold-restart, and reconnect hash checks passed.
+The overall scenario remains **failed**: `body_settled` was false because the
+detached-body sleep predicate was false (measured final speed was `7.12e-6`
+m/s after 2,045 stable ticks). No gate or threshold was changed.
+
+## Historical recommendation, superseded by the correction above
+
+- No dependency change is required for this issue. The former `x = 7 m`
+  workaround rationale and ignored-failure-test recommendation are superseded
+  by the overlap diagnosis above.
 
 ## Checked-but-not-applicable
 
-Per the ticket's step 3 ("if no newer release exists... do not change any
-code or dependencies"), no edits were made to `Cargo.toml`, `Cargo.lock`, or
-any source file. `crates/spall_physics/src/character.rs`'s
-`row15_elevated_beam_near_origin_freezes_horizontal_movement` test keeps its
-`#[ignore]` attribute unchanged.
+This section records the dependency-only pass from 2026-09-17; the later
+correction above changed source, spawn fixtures, and tests without changing
+`Cargo.toml` or `Cargo.lock`.
