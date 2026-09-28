@@ -80,6 +80,11 @@ struct Args {
     /// `walk` (T19 player-movement arena — every client gets a predicted capsule).
     #[arg(long, default_value = "bridge-cut")]
     scene: String,
+    /// Play a scene authored in Spall Editor instead of a built-in `--scene`:
+    /// a project directory or a scene `.ron` inside one. Every client gets a
+    /// player capsule on the scene's surface. Placed assets become terrain.
+    #[arg(long, conflicts_with = "scene")]
+    editor_scene: Option<PathBuf>,
     /// Use the legacy whole-terrain collider for a controlled comparison.
     /// Per-brick terrain collision is the normal mode.
     #[arg(long)]
@@ -408,14 +413,37 @@ fn run_serve(args: Args) -> ExitCode {
         None
     };
 
-    let scene = match Scene::from_name(&args.scene) {
-        Some(s) => s,
-        None => {
-            eprintln!(
-                "sandbox-server: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, walk, checkerboard-split, bulk-split, separated-regions, g4-workload, separated-regions-far, g1-full-envelope, sleep-wake, or playground)",
-                args.scene
-            );
-            return ExitCode::from(2);
+    let mut custom_world = None;
+    let scene = if let Some(path) = &args.editor_scene {
+        match sandbox::editor_scene::load(path) {
+            Ok(loaded) => {
+                let (min, max) = loaded.bounds();
+                tracing::info!(
+                    scene = %path.display(),
+                    solid_cells = loaded.solid_cell_count(),
+                    min_cell = ?min,
+                    max_cell = ?max,
+                    player_spawns = ?loaded.player_spawns,
+                    "loaded editor scene"
+                );
+                custom_world = Some(loaded.into_custom_world());
+                Scene::Custom
+            }
+            Err(error) => {
+                eprintln!("sandbox-server: --editor-scene {path:?}: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        match Scene::from_name(&args.scene) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "sandbox-server: unknown --scene `{}` (expected bridge-cut, cross-bridge-cut, walk, checkerboard-split, bulk-split, separated-regions, g4-workload, separated-regions-far, g1-full-envelope, sleep-wake, or playground)",
+                    args.scene
+                );
+                return ExitCode::from(2);
+            }
         }
     };
 
@@ -541,6 +569,7 @@ fn run_serve(args: Args) -> ExitCode {
         dormancy,
         timing_window,
         credential_registry_file: args.player_credentials_file.clone(),
+        custom_world,
     };
     tracing::info!(
         damage_rules_version = sandbox::game::DAMAGE_RULES_VERSION,

@@ -15,15 +15,17 @@
 //! (rather than its current offscreen-capture use) is out of scope here and
 //! left to a follow-up increment.
 
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
-use glam::camera::rh;
-use spall_core::{BUTTON_JUMP, GlobalCell, MaterialId};
+use spall_core::{BUTTON_JUMP, GlobalCell};
 use spall_physics::CharacterParams;
+use spall_render::{
+    Camera, CubeInstance, DebugView, Environment, EnvironmentPreset, GameRenderer,
+    materials_from_manifest,
+};
 use spall_voxel::{Sample, Volume};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -57,13 +59,13 @@ const VIEW_HEIGHT_UP_M: f32 = 10.0;
 const VIEW_HEIGHT_DOWN_M: f32 = 8.0;
 /// Rebuild the instanced terrain draw once the player has moved this far
 /// (metres) from where it was last built, or the resident terrain changes.
-const REBUILD_DISTANCE_M: f64 = 1.0;
+pub const REBUILD_DISTANCE_M: f64 = 1.0;
 /// How often, at most, a *stationary* player re-requests a rebuild just to
 /// notice a terrain edit landing nearby (a moving player already re-requests
 /// every `REBUILD_DISTANCE_M`). This governs background-worker traffic, not
 /// frame time — see [`RebuildWorker`] — so it only needs to be "responsive
 /// enough for a person to notice", not "cheap".
-const TERRAIN_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
+pub const TERRAIN_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 const MAX_PITCH: f32 = 1.5;
@@ -96,13 +98,41 @@ pub fn run_interactive_window_with_game_content(
 
 /// Interactive client with optional authenticated progression requests.
 pub fn run_interactive_window_with_progression(
-    mut net_config: ClientNetConfig,
+    net_config: ClientNetConfig,
     materials: MaterialManifest,
     asset_manifest_hash: Option<[u8; 32]>,
     progression_requests: Vec<spall_protocol::ProgressionRequest>,
 ) -> Result<(), ClientError> {
+    run_interactive_window_with_environment(
+        net_config,
+        materials,
+        asset_manifest_hash,
+        progression_requests,
+        EnvironmentPreset::Daylight.environment(),
+    )
+}
+
+/// Interactive client lit by `environment` -- the same lighting model and
+/// numbers `spall_render` gives the editor's scene viewport, so a scene reads
+/// the same in both. The other `run_interactive_window_*` entry points use
+/// [`EnvironmentPreset::Daylight`].
+pub fn run_interactive_window_with_environment(
+    mut net_config: ClientNetConfig,
+    materials: MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+    progression_requests: Vec<spall_protocol::ProgressionRequest>,
+    environment: Environment,
+) -> Result<(), ClientError> {
     let session = InteractiveSession::new();
+    let net_config_streams_residency = net_config.client_residency.is_some();
     net_config.interactive = Some(session.clone());
+    // The render table comes from the same manifest the handshake validated,
+    // so colour, roughness, metalness and emission match the editor and the
+    // capture tools. One extra entry past the manifest ids draws debug
+    // overlays.
+    let mut render_materials = materials_from_manifest(&materials);
+    let debug_material = render_materials.len() as u32;
+    render_materials.push(spall_render::Material::new([0.02, 0.9, 0.9], 0.5, 0.0).emissive(2.0));
 
     // A user event (rather than a plain `()` event loop) so the network
     // thread ending — a failed connect, or the server closing the session —
@@ -115,7 +145,15 @@ pub fn run_interactive_window_with_progression(
     // Built before the network thread spawns: if this fails there is nothing
     // yet to clean up, whereas failing after would leak a running,
     // never-stopped network thread.
-    let mut app = InteractiveApp::new(session.clone())?;
+    let mut app = InteractiveApp::new(
+        session.clone(),
+        environment,
+        render_materials,
+        debug_material,
+        // Only a session that streams bricks can have an absent brick that
+        // is genuinely unknown; otherwise absent means empty.
+        !net_config_streams_residency,
+    )?;
 
     let net_thread = std::thread::Builder::new()
         .name("spall-client-net".into())
@@ -195,6 +233,23 @@ struct InteractiveApp {
     session: Arc<InteractiveSession>,
     window: Option<Arc<Window>>,
     renderer: Option<WorldRenderer>,
+    environment: Environment,
+    render_materials: Vec<spall_render::Material>,
+    /// Material index of the debug overlay colour (one past the manifest).
+    debug_material: u32,
+    /// True when the resident terrain instances must be re-uploaded (a
+    /// rebuild landed or `F1` toggled visibility).
+    terrain_dirty: bool,
+    /// The newest sky occupancy the rebuild worker produced, kept so `F5` can
+    /// switch visibility-aware skylight off and on without a rebuild.
+    last_sky: Option<spall_render::indirect::LightingVolume>,
+    /// A fresh `last_sky` (or an `F5` toggle) the renderer has not seen yet.
+    sky_dirty: bool,
+    /// `F5`: visibility-aware skylight (on) versus the legacy unconditional
+    /// hemispheric ambient (off).
+    sky_visibility_on: bool,
+    /// `F6`: the one-diffuse-bounce term (colour bleed, emissive light).
+    bounce_on: bool,
     held: HeldKeys,
     yaw: f32,
     pitch: f32,
@@ -271,43 +326,88 @@ struct RebuildWorker {
     in_flight: bool,
 }
 
-struct RebuildOutcome {
+pub struct RebuildOutcome {
+    pub center_m: [f64; 3],
+    pub instances: Vec<Instance>,
+    /// Sky occupancy built from the same volume snapshot as `instances`, or
+    /// `None` when it is identical to the last one sent (nothing to recompute).
+    pub sky: Option<spall_render::indirect::LightingVolume>,
+    pub sky_stats: crate::sky::SkyOccupancyStats,
+    pub elapsed: Duration,
+}
+
+/// One rebuild pass: terrain instances plus a sky occupancy grid (only when it
+/// actually changed) from `replica`'s current terrain volume around `center_m`.
+/// This is exactly what [`RebuildWorker`]'s background thread runs per request
+/// — extracted so latency instrumentation can time and drive the real pipeline
+/// stage by stage instead of re-implementing it. `sky_anchor` / `last_sky` carry
+/// state across calls, same as the worker's loop locals. Returns `None` only
+/// when the replica has no terrain yet.
+pub fn rebuild_pass(
+    replica: &Arc<Mutex<ReplicaWorld>>,
     center_m: [f64; 3],
-    instances: Vec<Instance>,
-    elapsed: Duration,
+    sky_anchor: &mut Option<[f64; 3]>,
+    last_sky: &mut Option<spall_render::indirect::LightingVolume>,
+    absent_is_open: bool,
+) -> Option<RebuildOutcome> {
+    let volume = replica
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .terrain_volume()
+        .cloned()?;
+    let start = Instant::now();
+    let instances = build_instances(&volume, center_m);
+    // Keep the cache where it is until the player has moved far enough to
+    // matter, so a stationary or slowly moving player produces an identical
+    // grid and no lighting recompute.
+    let sky_center = match *sky_anchor {
+        Some(anchor) if within_sky_anchor(anchor, center_m) => anchor,
+        _ => center_m,
+    };
+    *sky_anchor = Some(sky_center);
+    let (grid, sky_stats) = crate::sky::build_sky_occupancy(&volume, sky_center, absent_is_open);
+    let changed = last_sky
+        .as_ref()
+        .is_none_or(|last| last.origin() != grid.origin() || last.cells() != grid.cells());
+    let sky = changed.then(|| {
+        *last_sky = Some(grid.clone());
+        grid
+    });
+    Some(RebuildOutcome {
+        center_m,
+        instances,
+        sky,
+        sky_stats,
+        elapsed: start.elapsed(),
+    })
 }
 
 impl RebuildWorker {
     /// Spawns the worker thread. It exits on its own once `request_tx`'s
     /// last sender (owned by the `InteractiveApp` this returns into) drops —
     /// no explicit shutdown signal or join needed.
-    fn spawn(session: Arc<InteractiveSession>) -> Result<Self, ClientError> {
+    fn spawn(session: Arc<InteractiveSession>, absent_is_open: bool) -> Result<Self, ClientError> {
         let (request_tx, request_rx) = mpsc::channel::<[f64; 3]>();
         let (result_tx, result_rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("spall-client-rebuild".into())
             .spawn(move || {
+                let mut sky_anchor: Option<[f64; 3]> = None;
+                let mut last_sky: Option<spall_render::indirect::LightingVolume> = None;
                 for center_m in request_rx {
                     let Some(replica) = session.replica.get() else {
                         continue;
                     };
-                    let volume = replica
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .terrain_volume()
-                        .cloned();
-                    let Some(volume) = volume else { continue };
-                    let start = Instant::now();
-                    let instances = build_instances(&volume, center_m);
-                    let elapsed = start.elapsed();
-                    if result_tx
-                        .send(RebuildOutcome {
-                            center_m,
-                            instances,
-                            elapsed,
-                        })
-                        .is_err()
-                    {
+                    let Some(outcome) = rebuild_pass(
+                        replica,
+                        center_m,
+                        &mut sky_anchor,
+                        &mut last_sky,
+                        absent_is_open,
+                    ) else {
+                        continue;
+                    };
+                    if result_tx.send(outcome).is_err() {
                         return; // the window is gone
                     }
                 }
@@ -413,6 +513,7 @@ struct Hud {
     last_report_at: Option<Instant>,
     last_rebuild_ms: f32,
     last_rebuild_instances: usize,
+    last_sky_stats: crate::sky::SkyOccupancyStats,
     /// Worst single-frame total render time seen since the last report —
     /// see `record_frame`. Reset to `0.0` each time `report` runs.
     max_frame_ms: f32,
@@ -466,6 +567,18 @@ impl Hud {
         self.frames_since_report += 1;
         self.last_report_at
             .is_none_or(|t| now - t >= Self::REPORT_INTERVAL)
+    }
+
+    fn record_sky(&mut self, stats: crate::sky::SkyOccupancyStats) {
+        self.last_sky_stats = stats;
+    }
+
+    fn sky_report(&self) -> String {
+        let stats = self.last_sky_stats;
+        format!(
+            "sky occupancy {} resident / {} unknown bricks, {} solid cells",
+            stats.resident_bricks, stats.unknown_bricks, stats.solid_cells
+        )
     }
 
     fn record_rebuild(&mut self, elapsed: Duration, instance_count: usize) {
@@ -581,13 +694,27 @@ impl Hud {
 }
 
 impl InteractiveApp {
-    fn new(session: Arc<InteractiveSession>) -> Result<Self, ClientError> {
-        let rebuild = RebuildWorker::spawn(session.clone())?;
+    fn new(
+        session: Arc<InteractiveSession>,
+        environment: Environment,
+        render_materials: Vec<spall_render::Material>,
+        debug_material: u32,
+        absent_is_open: bool,
+    ) -> Result<Self, ClientError> {
+        let rebuild = RebuildWorker::spawn(session.clone(), absent_is_open)?;
         let body_worker = BodyWorker::spawn(session.clone())?;
         Ok(Self {
             session,
             window: None,
             renderer: None,
+            environment,
+            render_materials,
+            debug_material,
+            terrain_dirty: true,
+            last_sky: None,
+            sky_dirty: false,
+            sky_visibility_on: true,
+            bounce_on: true,
             held: HeldKeys::default(),
             // Face -Z at spawn, matching `PlayerInput::NEUTRAL`.
             yaw: 0.0,
@@ -665,7 +792,7 @@ impl ApplicationHandler for InteractiveApp {
             Ok(window) => Arc::new(window),
             Err(error) => return self.fail(event_loop, ClientError::Gpu(error.to_string())),
         };
-        match WorldRenderer::new(window.clone()) {
+        match WorldRenderer::new(window.clone(), self.environment, &self.render_materials) {
             Ok(renderer) => {
                 self.window = Some(window);
                 self.renderer = Some(renderer);
@@ -725,6 +852,7 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     KeyCode::F1 if held && !event.repeat => {
                         self.show_terrain = !self.show_terrain;
+                        self.terrain_dirty = true;
                         println!(
                             "spall-interactive: terrain instances {}",
                             if self.show_terrain { "ON" } else { "OFF" }
@@ -747,6 +875,40 @@ impl ApplicationHandler for InteractiveApp {
                         );
                         return;
                     }
+                    KeyCode::F5 if held && !event.repeat => {
+                        self.sky_visibility_on = !self.sky_visibility_on;
+                        self.sky_dirty = true;
+                        println!(
+                            "spall-interactive: visibility-aware skylight {}",
+                            if self.sky_visibility_on {
+                                "ON"
+                            } else {
+                                "OFF (legacy unconditional ambient)"
+                            }
+                        );
+                        return;
+                    }
+                    KeyCode::F6 if held && !event.repeat => {
+                        self.bounce_on = !self.bounce_on;
+                        if let Some(renderer) = &self.renderer {
+                            renderer
+                                .scene
+                                .set_bounce_enabled(&renderer.queue, self.bounce_on);
+                        }
+                        println!(
+                            "spall-interactive: diffuse bounce {}",
+                            if self.bounce_on { "ON" } else { "OFF" }
+                        );
+                        return;
+                    }
+                    KeyCode::F4 if held && !event.repeat => {
+                        if let Some(renderer) = &mut self.renderer {
+                            let view = next_debug_view(renderer.debug_view);
+                            renderer.debug_view = view;
+                            println!("spall-interactive: render view {}", view.stem());
+                        }
+                        return;
+                    }
                     _ => return,
                 }
                 self.publish_movement();
@@ -763,6 +925,12 @@ impl ApplicationHandler for InteractiveApp {
                         .record_rebuild(outcome.elapsed, outcome.instances.len());
                     self.last_built_pos = Some(outcome.center_m);
                     self.last_terrain_instances = outcome.instances;
+                    self.terrain_dirty = true;
+                    if let Some(sky) = outcome.sky {
+                        self.last_sky = Some(sky);
+                        self.sky_dirty = true;
+                    }
+                    self.hud.record_sky(outcome.sky_stats);
                     self.rebuild.in_flight = false;
                 }
 
@@ -797,36 +965,59 @@ impl ApplicationHandler for InteractiveApp {
                 // continuously; waiting on the terrain rebuild cadence to
                 // show that would make them look like they teleport between
                 // rebuilds instead of falling.
-                let mut combined = if self.show_terrain {
-                    self.last_terrain_instances.clone()
-                } else {
-                    Vec::new()
-                };
                 // Drain the body worker the same way as the terrain one
                 // above: never blocks, only the newest result matters.
                 while let Ok(draws) = self.body_worker.result_rx.try_recv() {
                     self.last_body_draws = draws;
                 }
-                if self.show_capsule
+                let overlay = if self.show_capsule
                     && let Some(v) = view
                 {
-                    const CAPSULE_DEBUG_COLOR: [f32; 3] = [0.1, 1.0, 1.0]; // bright cyan
-                    combined.extend(build_capsule_debug_instances(
-                        v.predicted.position_m,
-                        CAPSULE_DEBUG_COLOR,
-                    ));
-                }
-
+                    build_capsule_debug_instances(v.predicted.position_m, self.debug_material)
+                } else {
+                    Vec::new()
+                };
+                // Terrain lives in a resident GPU buffer and is re-uploaded
+                // only when a rebuild landed or its visibility toggled --
+                // not every frame. Bodies move continuously, so they are
+                // re-posed (into their own reused buffer) every frame.
+                let empty = Vec::new();
+                let terrain = if !self.terrain_dirty {
+                    None
+                } else if self.show_terrain {
+                    Some(&self.last_terrain_instances)
+                } else {
+                    Some(&empty)
+                };
+                let uploading_terrain = terrain.is_some();
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
-                let outcome = match renderer.begin_frame(Some(&combined)) {
+                if self.sky_dirty {
+                    let occupancy = self.last_sky.as_ref().filter(|_| self.sky_visibility_on);
+                    // Nothing to upload yet (no rebuild has landed) keeps the
+                    // dirty flag so the first occupancy is not lost.
+                    if occupancy.is_some() || !self.sky_visibility_on {
+                        renderer.scene.set_sky_occupancy(
+                            &renderer.device,
+                            &renderer.queue,
+                            occupancy,
+                        );
+                        self.sky_dirty = false;
+                    }
+                }
+                let outcome = match renderer.begin_frame(terrain.map(Vec::as_slice), &overlay) {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         self.fail(event_loop, error);
                         return;
                     }
                 };
+                // `begin_frame` uploaded the terrain before it could fail or
+                // skip, so the resident buffer is current either way.
+                if uploading_terrain {
+                    self.terrain_dirty = false;
+                }
                 let timing = match outcome {
                     AcquireOutcome::Skipped(timing) => timing,
                     AcquireOutcome::Ready(acquired) => {
@@ -873,7 +1064,7 @@ impl ApplicationHandler for InteractiveApp {
                                 look_dir,
                             )
                         });
-                        match renderer.finish_frame(acquired, cam.as_ref(), &body_instances) {
+                        match renderer.finish_frame(acquired, cam.as_ref(), &body_instances, None) {
                             Ok(timing) => timing,
                             Err(error) => {
                                 self.fail(event_loop, error);
@@ -921,6 +1112,23 @@ impl ApplicationHandler for InteractiveApp {
                         window_stats,
                     );
                     let line = format!("{line} | {}", self.pose_stats.take_report());
+                    let line = match view {
+                        Some(v) => format!(
+                            "{line} | feet ({:.2}, {:.2}, {:.2}) m",
+                            v.predicted.position_m[0],
+                            v.predicted.position_m[1],
+                            v.predicted.position_m[2]
+                        ),
+                        None => line,
+                    };
+                    let line = match &self.renderer {
+                        Some(renderer) => format!(
+                            "{line} | {} | {}",
+                            renderer.scene_report(),
+                            self.hud.sky_report()
+                        ),
+                        None => line,
+                    };
                     if let Some(window) = &self.window {
                         window.set_title(&format!("Spall sandbox — interactive | {line}"));
                     }
@@ -1061,7 +1269,11 @@ fn view_dir_from(yaw: f32, pitch: f32) -> [f32; 3] {
     [sin_y * cos_p, sin_p, -cos_y * cos_p]
 }
 
-fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
+/// Cube instances (one per solid cell within the terrain-mesh cull window) for
+/// the terrain around `center_m`. Public alongside `rebuild_pass` for the same
+/// reason: instrumentation that needs the real geometry-building pipeline
+/// without a background worker.
+pub fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
     let cell_m = f64::from(CELL_M);
     let center_cell = GlobalCell::new(
         (center_m[0] / cell_m).floor() as i64,
@@ -1090,8 +1302,9 @@ fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
                         ((cell.y as f64 + 0.5) * cell_m) as f32,
                         ((cell.z as f64 + 0.5) * cell_m) as f32,
                     ],
-                    color: jittered_color(material_color(material), cell),
-                    scale: [1.0; 3],
+                    material: u32::from(material.0),
+                    size: [CELL_M; 3],
+                    _pad: 0.0,
                     rotation: IDENTITY_ROTATION,
                 });
             }
@@ -1259,8 +1472,9 @@ fn build_body_template(volume: &Volume) -> Vec<Instance> {
                         ((cell.y as f64 + 0.5) * cell_m) as f32,
                         ((cell.z as f64 + 0.5) * cell_m) as f32,
                     ],
-                    color: jittered_color(material_color(material), cell),
-                    scale: [1.0; 3],
+                    material: u32::from(material.0),
+                    size: [cell_m as f32; 3],
+                    _pad: 0.0,
                     rotation: IDENTITY_ROTATION,
                 });
             }
@@ -1399,7 +1613,7 @@ impl PoseStats {
 /// One thin axis-aligned cuboid from `a` to `b`. Capsule-box edges are all
 /// axis aligned, so this gives the cube-only debug renderer true continuous
 /// wire-like strokes without adding a separate line pipeline.
-fn debug_line(a: Vec3, b: Vec3, color: [f32; 3]) -> impl Iterator<Item = Instance> {
+fn debug_line(a: Vec3, b: Vec3, material: u32) -> impl Iterator<Item = Instance> {
     const THICKNESS_M: f32 = 0.0125;
     let delta = (b - a).abs();
     let mut dimensions = [THICKNESS_M; 3];
@@ -1414,8 +1628,9 @@ fn debug_line(a: Vec3, b: Vec3, color: [f32; 3]) -> impl Iterator<Item = Instanc
     let midpoint = (a + b) * 0.5;
     std::iter::once(Instance {
         offset: midpoint.to_array(),
-        color,
-        scale: std::array::from_fn(|component| dimensions[component] / CELL_M),
+        material,
+        size: dimensions,
+        _pad: 0.0,
         rotation: IDENTITY_ROTATION,
     })
 }
@@ -1438,7 +1653,7 @@ fn debug_line(a: Vec3, b: Vec3, color: [f32; 3]) -> impl Iterator<Item = Instanc
 /// which read as four floating dashed lines rather than anything box-shaped
 /// -- the full 12-edge wireframe below is what actually looks like "a body
 /// cube."
-fn build_capsule_debug_instances(feet_m: [f64; 3], color: [f32; 3]) -> Vec<Instance> {
+fn build_capsule_debug_instances(feet_m: [f64; 3], material: u32) -> Vec<Instance> {
     let params = CharacterParams::DEFAULT;
     let r = f64::from(params.radius_m) as f32;
     let height = f64::from(params.total_height_m()) as f32;
@@ -1463,9 +1678,9 @@ fn build_capsule_debug_instances(feet_m: [f64; 3], color: [f32; 3]) -> Vec<Insta
     let mut instances = Vec::new();
     for i in 0..4 {
         let j = (i + 1) % 4;
-        instances.extend(debug_line(bottom[i], bottom[j], color)); // bottom ring
-        instances.extend(debug_line(top[i], top[j], color)); // top ring
-        instances.extend(debug_line(bottom[i], top[i], color)); // vertical edge
+        instances.extend(debug_line(bottom[i], bottom[j], material)); // bottom ring
+        instances.extend(debug_line(top[i], top[j], material)); // top ring
+        instances.extend(debug_line(bottom[i], top[i], material)); // vertical edge
     }
     instances
 }
@@ -1490,219 +1705,59 @@ fn is_buried(volume: &Volume, cell: GlobalCell) -> bool {
     })
 }
 
-/// A small deterministic palette. This debug renderer intentionally does not
-/// read the scene's real `MaterialManifest` albedo — it exists to prove live
-/// input -> network -> predicted movement works end to end, not to preview
-/// real material art. The playground's own materials (ids `10`-`20`,
-/// `spall_sim::fixtures::playground_manifest`) are the one exception: they
-/// were chosen specifically to make that scene visually varied for a
-/// hands-on session through *this* renderer, so they get an explicit,
-/// matching entry here instead of landing on an arbitrary colour via the
-/// generic palette's modulo.
-/// Peak brightness variation applied per voxel by [`jittered_color`].
-const COLOR_JITTER: f32 = 0.08;
-
-/// `base` scaled by a stable pseudo-random brightness in
-/// `1 +/- COLOR_JITTER`, hashed from the cell's coordinates so a voxel keeps
-/// the same shade every rebuild and frame. Lets individual voxels read as
-/// distinct without changing what material they are.
-fn jittered_color(base: [f32; 3], cell: GlobalCell) -> [f32; 3] {
-    let mut h = (cell.x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (cell.y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-        ^ (cell.z as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
-    h ^= h >> 32;
-    h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
-    h ^= h >> 32;
-    let unit = (h & 0xFFFF) as f32 / 65_535.0; // 0..=1
-    let factor = 1.0 + (unit * 2.0 - 1.0) * COLOR_JITTER;
-    base.map(|c| (c * factor).clamp(0.0, 1.0))
-}
-
-fn material_color(id: MaterialId) -> [f32; 3] {
-    match id.0 {
-        10 => [0.25, 0.55, 0.2],  // grass
-        11 => [0.4, 0.28, 0.15],  // loam
-        12 => [0.65, 0.25, 0.18], // brick
-        13 => [0.82, 0.7, 0.45],  // sandstone
-        14 => [0.35, 0.38, 0.42], // slate
-        15 => [0.85, 0.15, 0.15], // debris red
-        16 => [0.9, 0.5, 0.1],    // debris orange
-        17 => [0.9, 0.85, 0.15],  // debris yellow
-        18 => [0.2, 0.75, 0.3],   // debris green
-        19 => [0.2, 0.4, 0.9],    // debris blue
-        20 => [0.6, 0.25, 0.8],   // debris purple
-        _ => {
-            const PALETTE: [[f32; 3]; 6] = [
-                [0.55, 0.55, 0.58],
-                [0.45, 0.32, 0.20],
-                [0.30, 0.55, 0.30],
-                [0.60, 0.55, 0.35],
-                [0.35, 0.35, 0.60],
-                [0.60, 0.35, 0.35],
-            ];
-            PALETTE[id.0 as usize % PALETTE.len()]
-        }
+/// The next debug view in the `F4` cycle, wrapping back to shaded.
+fn next_debug_view(view: DebugView) -> DebugView {
+    match view {
+        DebugView::Shaded => DebugView::Albedo,
+        DebugView::Albedo => DebugView::Normals,
+        DebugView::Normals => DebugView::Depth,
+        DebugView::Depth => DebugView::ShadowCascades,
+        DebugView::ShadowCascades => DebugView::ShadowVisibility,
+        DebugView::ShadowVisibility => DebugView::SkyVisibility,
+        DebugView::SkyVisibility => DebugView::Roughness,
+        DebugView::Roughness | DebugView::IndirectOnly => DebugView::Shaded,
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    normal: [f32; 3],
+/// How far (metres) the player may move from where the lighting cache was
+/// centred before it is re-centred. The cache reaches 32 m each way and rays 24
+/// m, so 8 m of drift keeps every nearby surface well inside it.
+const SKY_ANCHOR_DRIFT_M: f64 = 8.0;
+
+fn within_sky_anchor(anchor: [f64; 3], center: [f64; 3]) -> bool {
+    let horizontal = (anchor[0] - center[0]).hypot(anchor[2] - center[2]);
+    horizontal <= SKY_ANCHOR_DRIFT_M && (anchor[1] - center[1]).abs() <= SKY_ANCHOR_DRIFT_M
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct Instance {
-    offset: [f32; 3],
-    color: [f32; 3],
-    /// Per-axis multiplier of the shared `CELL_M` cube mesh.
-    scale: [f32; 3],
-    /// Unit quaternion `[x, y, z, w]` applied to the cube mesh and its
-    /// normals about its own centre. Identity for terrain and debug strokes.
-    rotation: [f32; 4],
-}
+/// One cube drawn by the shared `spall_render` instanced-cube path. The
+/// material is the cell's `MaterialId`, looked up in the manifest-derived
+/// table, so colour, roughness, metalness and emission all come from the same
+/// definitions the editor and capture tools use.
+pub(super) type Instance = CubeInstance;
 
-const IDENTITY_ROTATION: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+const IDENTITY_ROTATION: [f32; 4] = CubeInstance::IDENTITY_ROTATION;
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct Globals {
-    view_proj: [[f32; 4]; 4],
-    light_dir: [f32; 4],
-}
+/// Vertical field of view of the game camera.
+const CAMERA_FOV_Y_DEG: f32 = 75.0;
+const CAMERA_Z_NEAR_M: f32 = 0.05;
+const CAMERA_Z_FAR_M: f32 = 300.0;
 
-const SHADER: &str = r#"
-struct Globals {
-    view_proj: mat4x4<f32>,
-    light_dir: vec4<f32>,
-};
-@group(0) @binding(0) var<uniform> globals: Globals;
-
-struct VertexIn {
-    @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-};
-struct InstanceIn {
-    @location(2) offset: vec3<f32>,
-    @location(3) color: vec3<f32>,
-    @location(4) scale: vec3<f32>,
-    @location(5) rotation: vec4<f32>,
-};
-struct VertexOut {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) normal: vec3<f32>,
-    @location(1) color: vec3<f32>,
-};
-
-fn quat_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
-    let t = 2.0 * cross(q.xyz, v);
-    return v + q.w * t + cross(q.xyz, t);
-}
-
-@vertex
-fn vs_main(v: VertexIn, inst: InstanceIn) -> VertexOut {
-    var out: VertexOut;
-    let world_pos = quat_rotate(inst.rotation, v.position * inst.scale) + inst.offset;
-    out.clip_position = globals.view_proj * vec4<f32>(world_pos, 1.0);
-    out.normal = quat_rotate(inst.rotation, v.normal);
-    out.color = inst.color;
-    return out;
-}
-
-@fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    let light_dir = normalize(globals.light_dir.xyz);
-    let ndotl = max(dot(normalize(in.normal), -light_dir), 0.0);
-    let ambient = 0.25;
-    let lit = in.color * (ambient + (1.0 - ambient) * ndotl);
-    return vec4<f32>(lit, 1.0);
-}
-"#;
-
-/// One axis-aligned cube face: `normal`, plus tangent axes `u`/`v` chosen so
-/// `u x v == normal` (outward CCW winding for every face from the same
-/// corner-order rule).
-struct Face {
-    normal: [f32; 3],
-    u: [f32; 3],
-    v: [f32; 3],
-}
-
-const FACES: [Face; 6] = [
-    Face {
-        normal: [1.0, 0.0, 0.0],
-        u: [0.0, 1.0, 0.0],
-        v: [0.0, 0.0, 1.0],
-    },
-    Face {
-        normal: [-1.0, 0.0, 0.0],
-        u: [0.0, 0.0, 1.0],
-        v: [0.0, 1.0, 0.0],
-    },
-    Face {
-        normal: [0.0, 1.0, 0.0],
-        u: [0.0, 0.0, 1.0],
-        v: [1.0, 0.0, 0.0],
-    },
-    Face {
-        normal: [0.0, -1.0, 0.0],
-        u: [1.0, 0.0, 0.0],
-        v: [0.0, 0.0, 1.0],
-    },
-    Face {
-        normal: [0.0, 0.0, 1.0],
-        u: [1.0, 0.0, 0.0],
-        v: [0.0, 1.0, 0.0],
-    },
-    Face {
-        normal: [0.0, 0.0, -1.0],
-        u: [0.0, 1.0, 0.0],
-        v: [1.0, 0.0, 0.0],
-    },
-];
-
-fn cube_mesh() -> (Vec<Vertex>, Vec<u16>) {
-    let h = CELL_M / 2.0;
-    let mut vertices = Vec::with_capacity(24);
-    let mut indices = Vec::with_capacity(36);
-    for face in FACES {
-        let base = vertices.len() as u16;
-        for (su, sv) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
-            let position = [
-                face.normal[0] * h + face.u[0] * su * h + face.v[0] * sv * h,
-                face.normal[1] * h + face.u[1] * su * h + face.v[1] * sv * h,
-                face.normal[2] * h + face.u[2] * su * h + face.v[2] * sv * h,
-            ];
-            vertices.push(Vertex {
-                position,
-                normal: face.normal,
-            });
-        }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    }
-    (vertices, indices)
-}
-
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-
-struct WorldRenderer {
+pub(super) struct WorldRenderer {
+    environment: Environment,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
-    depth_view: wgpu::TextureView,
-    pipeline: wgpu::RenderPipeline,
-    globals_buffer: wgpu::Buffer,
-    globals_bind_group: wgpu::BindGroup,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
-    instance_buffer: Option<(wgpu::Buffer, u32)>,
-    /// Bodies, re-posed every frame after the swapchain acquire (see
-    /// `finish_frame`).
-    body_buffer: Option<(wgpu::Buffer, u32)>,
+    /// The shared `spall_render` frame renderer (shadows, HDR, tone map).
+    /// Terrain, bodies and debug overlays live in its resident instance
+    /// buffers.
+    scene: GameRenderer,
+    /// Reserved material and instances used only by the ENG-103 inspection
+    /// viewer; the normal game material table remains opaque.
+    debug_water_material: u32,
+    debug_water_instances: Vec<Instance>,
+    /// `F4` cycles this through the renderer's debug views.
+    debug_view: DebugView,
     /// The last camera basis the window built (`InteractiveApp` computes eye
     /// position / look direction; this struct only knows the surface aspect
     /// ratio needed to finish the projection).
@@ -1826,7 +1881,7 @@ impl HudGpuTimer {
 /// consecutive frames nearly identical, interspersed with larger jumps) that
 /// an average can't diagnose. This breaks a frame into the stages that can
 /// plausibly eat a vsync interval's worth of time on their own.
-struct FrameTiming {
+pub(super) struct FrameTiming {
     /// Wall time for the whole `render` call.
     total_ms: f32,
     /// `Some` only on the (occasional) frame a background `RebuildWorker`
@@ -1881,7 +1936,7 @@ impl FrameTiming {
 /// A frame that has acquired its swapchain image, awaiting only the
 /// camera-dependent draw ([`WorldRenderer::finish_frame`]) — see
 /// [`WorldRenderer::begin_frame`].
-struct AcquiredFrame {
+pub(super) struct AcquiredFrame {
     frame_start: Instant,
     surface_texture: wgpu::SurfaceTexture,
     view: wgpu::TextureView,
@@ -1894,15 +1949,27 @@ struct AcquiredFrame {
 /// for [`WorldRenderer::finish_frame`], or a frame that bailed out early
 /// (an `Outdated`/`Lost`/`Timeout` swapchain acquire) and already has its
 /// complete (if mostly-zero) timing.
-enum AcquireOutcome {
+pub(super) enum AcquireOutcome {
     Ready(AcquiredFrame),
     Skipped(FrameTiming),
 }
 
 impl WorldRenderer {
-    fn new(window: Arc<Window>) -> Result<Self, ClientError> {
-        use wgpu::util::DeviceExt;
+    /// Queue translucent cells for the local fluid inspection view.
+    pub(super) fn set_debug_water(&mut self, instances: &[Instance]) {
+        self.debug_water_instances.clear();
+        self.debug_water_instances
+            .extend(instances.iter().copied().map(|mut instance| {
+                instance.material = self.debug_water_material;
+                instance
+            }));
+    }
 
+    pub(super) fn new(
+        window: Arc<Window>,
+        environment: Environment,
+        materials: &[spall_render::Material],
+    ) -> Result<Self, ClientError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(window.clone()),
         ));
@@ -1966,7 +2033,6 @@ impl WorldRenderer {
             desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &surface_config);
-        let depth_view = create_depth_view(&device, surface_config.width, surface_config.height);
         let aspect = surface_config.width as f32 / surface_config.height.max(1) as f32;
         let yakui = yakui::Yakui::new();
         let yakui_winit = YakuiWinit::new(&window);
@@ -1976,147 +2042,31 @@ impl WorldRenderer {
             .contains(timestamp_features)
             .then(|| HudGpuTimer::new(&device, queue.get_timestamp_period()));
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("spall-interactive-shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("spall-interactive-globals-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("spall-interactive-globals"),
-            size: std::mem::size_of::<Globals>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("spall-interactive-globals-bind-group"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals_buffer.as_entire_binding(),
-            }],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("spall-interactive-pipeline-layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 0,
-                    shader_location: 0,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 12,
-                    shader_location: 1,
-                },
-            ],
-        };
-        let instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Instance>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 0,
-                    shader_location: 2,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 12,
-                    shader_location: 3,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 24,
-                    shader_location: 4,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x4,
-                    offset: 36,
-                    shader_location: 5,
-                },
-            ],
-        };
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("spall-interactive-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(vertex_layout), Some(instance_layout)],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let (vertices, indices) = cube_mesh();
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("spall-interactive-cube-vertices"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("spall-interactive-cube-indices"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let mut render_materials = materials.to_vec();
+        let debug_water_material = render_materials.len() as u32;
+        let water_color = materials.get(2).copied().unwrap_or_default();
+        render_materials.push(water_color.opacity(0.24));
+        let scene = GameRenderer::new(
+            &device,
+            &queue,
+            surface_config.format,
+            &render_materials,
+            (surface_config.width, surface_config.height),
+            required_features
+                .contains(timestamp_features)
+                .then(|| queue.get_timestamp_period()),
+        );
 
         Ok(Self {
+            environment,
             device,
             queue,
             surface,
             surface_config,
-            depth_view,
-            pipeline,
-            globals_buffer,
-            globals_bind_group,
-            vertex_buffer,
-            index_buffer,
-            index_count: indices.len() as u32,
-            instance_buffer: None,
-            body_buffer: None,
+            scene,
+            debug_water_material,
+            debug_water_instances: Vec::new(),
+            debug_view: DebugView::Shaded,
             aspect,
             yakui,
             yakui_winit,
@@ -2127,18 +2077,47 @@ impl WorldRenderer {
         })
     }
 
+    /// One report-line fragment: the shared renderer's per-pass GPU time
+    /// (previous completed frames) and resident instance memory.
+    fn scene_report(&self) -> String {
+        let (terrain, bodies, overlay) = self.scene.instance_counts();
+        let memory = self.scene.instance_bytes() as f64 / (1024.0 * 1024.0);
+        let sky_memory = self.scene.sky_bytes() as f64 / (1024.0 * 1024.0);
+        let sweep = self.scene.lighting_sweep_frames().unwrap_or(0);
+        let lit_after = self
+            .scene
+            .lighting_latency_ms()
+            .map_or("n/a".to_owned(), |ms| format!("{ms:.0} ms"));
+        match self.scene.pass_timings() {
+            Some(t) => format!(
+                "scene GPU {:.2} ms (shadow {:.2} / opaque {:.2} / tone {:.2}; sky visibility {} / bounce {} last recompute, {sky_memory:.0} MiB) | lighting sweep {sweep} frames (cache update to last slice recorded {lit_after}, not presented) | cubes {terrain} terrain + {bodies} body + {overlay} overlay ({memory:.1} MiB)",
+                t.total_ms(),
+                t.shadow_ms,
+                t.opaque_ms,
+                t.tone_map_ms,
+                t.sky_visibility_ms
+                    .map_or("n/a".to_owned(), |ms| format!("{ms:.2} ms")),
+                t.bounce_ms
+                    .map_or("n/a".to_owned(), |ms| format!("{ms:.2} ms"))
+            ),
+            None => format!(
+                "scene GPU timing unavailable | cubes {terrain} terrain + {bodies} body + {overlay} overlay ({memory:.1} MiB)"
+            ),
+        }
+    }
+
     fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
         self.yakui_winit.handle_window_event(&mut self.yakui, event)
     }
 
-    fn resize(&mut self, size: PhysicalSize<u32>) {
+    pub(super) fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             return;
         }
         self.surface_config.width = size.width;
         self.surface_config.height = size.height;
         self.surface.configure(&self.device, &self.surface_config);
-        self.depth_view = create_depth_view(&self.device, size.width, size.height);
+        self.scene.resize(&self.device, size.width, size.height);
         self.aspect = size.width as f32 / size.height as f32;
     }
 
@@ -2151,28 +2130,21 @@ impl WorldRenderer {
     /// 13): the caller now computes the camera *after* this returns, with a
     /// fresh timestamp, instead of before — see [`finish_frame`] and
     /// `InteractiveApp`'s `RedrawRequested` handler for why.
-    fn begin_frame(
+    pub(super) fn begin_frame(
         &mut self,
-        instances: Option<&Vec<Instance>>,
+        terrain: Option<&[Instance]>,
+        overlay: &[Instance],
     ) -> Result<AcquireOutcome, ClientError> {
-        use wgpu::util::DeviceExt as _;
-
         let frame_start = Instant::now();
         let mut buffer_upload_ms = None;
         let mut instance_count = None;
-        if let Some(instances) = instances {
+        if let Some(instances) = terrain {
             let upload_start = Instant::now();
-            let buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("spall-interactive-instances"),
-                    contents: bytemuck::cast_slice(instances),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
+            self.scene.set_terrain(&self.device, &self.queue, instances);
             buffer_upload_ms = Some(upload_start.elapsed().as_secs_f32() * 1000.0);
             instance_count = Some(instances.len() as u32);
-            self.instance_buffer = Some((buffer, instances.len() as u32));
         }
+        self.scene.set_overlay(&self.device, &self.queue, overlay);
 
         let acquire_start = Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
@@ -2228,14 +2200,13 @@ impl WorldRenderer {
     /// Draws and presents an already-acquired frame. `cam` is `None` before
     /// the local player has an authoritative pose yet (still connecting), in
     /// which case this just clears the screen.
-    fn finish_frame(
+    pub(super) fn finish_frame(
         &mut self,
         acquired: AcquiredFrame,
         cam: Option<&(Vec3, Vec3)>,
         bodies: &[Instance],
+        demo_hud: Option<(&str, &str, &str)>,
     ) -> Result<FrameTiming, ClientError> {
-        use wgpu::util::DeviceExt as _;
-
         let AcquiredFrame {
             frame_start,
             surface_texture,
@@ -2245,88 +2216,63 @@ impl WorldRenderer {
             acquire_ms,
         } = acquired;
 
-        let clear_color = wgpu::Color {
-            r: 0.45,
-            g: 0.65,
-            b: 0.85,
-            a: 1.0,
-        };
-
-        if let Some((eye, look_dir)) = cam {
-            // Targets the wgpu/DirectX NDC (`z in [0, 1]`, Y-up) — matches
-            // `spall_render::camera::Camera`'s convention.
-            let view_matrix = rh::view::look_to_mat4(*eye, *look_dir, Vec3::Y);
-            let proj = rh::proj::directx::perspective(
-                75f32.to_radians(),
-                self.aspect.max(1e-4),
-                0.05,
-                300.0,
-            );
-            let view_proj = proj * view_matrix;
-            let globals = Globals {
-                view_proj: view_proj.to_cols_array_2d(),
-                light_dir: [0.35, -0.8, 0.25, 0.0],
-            };
-            self.queue
-                .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        self.scene.set_bodies(&self.device, &self.queue, bodies);
+        if let Some((eye, _)) = cam {
+            self.debug_water_instances.sort_by(|a, b| {
+                let distance2 = |cube: &Instance| {
+                    let p = Vec3::from_array(cube.offset);
+                    (p - *eye).length_squared()
+                };
+                distance2(b).total_cmp(&distance2(a))
+            });
         }
-
-        self.body_buffer = (!bodies.is_empty()).then(|| {
-            (
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("spall-interactive-body-instances"),
-                        contents: bytemuck::cast_slice(bodies),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                bodies.len() as u32,
-            )
-        });
+        self.scene
+            .set_transparent_cubes(&self.device, &self.queue, &self.debug_water_instances);
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("spall-interactive-encoder"),
             });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("spall-interactive-pass"),
+        if let Some((eye, look_dir)) = cam {
+            let mut camera = Camera::looking_along(
+                *eye,
+                *look_dir,
+                CAMERA_FOV_Y_DEG.to_radians(),
+                self.aspect.max(1e-4),
+            );
+            camera.z_near = CAMERA_Z_NEAR_M;
+            camera.z_far = CAMERA_Z_FAR_M;
+            self.scene.render(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &view,
+                &camera,
+                &self.environment,
+                self.debug_view,
+            );
+        } else {
+            // No pose yet (still connecting): show the environment's
+            // background. Written straight to the sRGB surface, so the
+            // displayed colour is the environment's exactly.
+            let [r, g, b, a] = self.environment.background_linear();
+            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("spall-interactive-connecting-clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
                 })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
+                depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            if cam.is_some() {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.globals_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                for (buffer, count) in [&self.instance_buffer, &self.body_buffer]
-                    .into_iter()
-                    .flatten()
-                {
-                    if *count > 0 {
-                        pass.set_vertex_buffer(1, buffer.slice(..));
-                        pass.draw_indexed(0..self.index_count, 0, 0..*count);
-                    }
-                }
-            }
         }
         let hud_start = Instant::now();
         let (hud_gpu_slot, hud_gpu_ms) = self
@@ -2345,11 +2291,17 @@ impl WorldRenderer {
             let clicks = self.yakui_clicks;
             yakui::align(yakui::Alignment::TOP_LEFT, || {
                 yakui::column(|| {
-                    yakui::text(20.0, "SPALL");
-                    yakui::text(14.0, "WASD move  |  Space jump  |  Esc release cursor");
-                    yakui::text(12.0, "Authoritative multiplayer voxel sandbox");
-                    yakui::text(12.0, format!("HUD input test clicks: {clicks}"));
-                    clicked = yakui::button("Click to verify UI input").clicked;
+                    if let Some((heading, controls, status)) = demo_hud {
+                        yakui::text(20.0, heading.to_owned());
+                        yakui::text(14.0, controls.to_owned());
+                        yakui::text(12.0, status.to_owned());
+                    } else {
+                        yakui::text(20.0, "SPALL");
+                        yakui::text(14.0, "WASD move  |  Space jump  |  Esc release cursor");
+                        yakui::text(12.0, "Authoritative multiplayer voxel sandbox");
+                        yakui::text(12.0, format!("HUD input test clicks: {clicks}"));
+                        clicked = yakui::button("Click to verify UI input").clicked;
+                    }
                 });
             });
         }
@@ -2376,6 +2328,7 @@ impl WorldRenderer {
         let hud_cpu_ms = hud_start.elapsed().as_secs_f32() * 1000.0;
         let submit_start = Instant::now();
         self.queue.submit([encoder.finish()]);
+        self.scene.finish_timing();
         if let Some(slot) = hud_gpu_slot
             && let Some(timer) = self.hud_gpu_timer.as_mut()
         {
@@ -2409,24 +2362,6 @@ impl WorldRenderer {
             hud_gpu_ms,
         })
     }
-}
-
-fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("spall-interactive-depth"),
-        size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 #[cfg(test)]
@@ -2506,11 +2441,38 @@ mod input_tests {
     }
 
     #[test]
+    fn the_lighting_cache_only_recentres_after_real_movement() {
+        let anchor = [10.0, 1.0, 10.0];
+        assert!(within_sky_anchor(anchor, [10.5, 1.0, 12.0]));
+        assert!(
+            within_sky_anchor(anchor, [15.0, 1.0, 16.0]),
+            "6.4 m of drift is fine"
+        );
+        assert!(!within_sky_anchor(anchor, [10.0, 1.0, 19.0]));
+        assert!(!within_sky_anchor(anchor, [10.0, 10.0, 10.0]));
+    }
+
+    #[test]
+    fn the_debug_view_cycle_visits_every_window_view_and_wraps_to_shaded() {
+        let mut view = DebugView::Shaded;
+        let mut seen = vec![view];
+        for _ in 0..8 {
+            view = next_debug_view(view);
+            seen.push(view);
+        }
+        assert_eq!(seen.first(), seen.last(), "wraps after eight presses");
+        seen.pop();
+        seen.sort_by_key(|v| v.stem());
+        seen.dedup();
+        assert_eq!(seen.len(), 8, "no view repeats within a cycle");
+    }
+
+    #[test]
     fn capsule_debug_edges_are_thin_continuous_wire_strokes() {
-        let lines = build_capsule_debug_instances([0.0; 3], [0.1, 1.0, 1.0]);
+        let lines = build_capsule_debug_instances([0.0; 3], 99);
         assert_eq!(lines.len(), 12, "one cuboid per bounding-box edge");
         for line in lines {
-            let dimensions = line.scale.map(|scale| scale * CELL_M);
+            let dimensions = line.size;
             let thin_axes = dimensions
                 .into_iter()
                 .filter(|dimension| *dimension <= 0.013)
@@ -2524,12 +2486,12 @@ mod input_tests {
         let now = Instant::now();
         let draws = [BodyDraw {
             entity: 7,
-            template: Arc::new(vec![Instance {
-                offset: [0.0, 0.0, 0.0],
-                color: [1.0, 0.0, 0.0],
-                scale: [1.0; 3],
-                rotation: [0.0, 0.0, 0.0, 1.0],
-            }]),
+            template: Arc::new(vec![Instance::new(
+                [0.0, 0.0, 0.0],
+                1,
+                [CELL_M; 3],
+                [0.0, 0.0, 0.0, 1.0],
+            )]),
             translation_m: [2.0, 0.0, 0.0],
             rotation: [0.0, 0.0, 0.0, 1.0],
             net: None,

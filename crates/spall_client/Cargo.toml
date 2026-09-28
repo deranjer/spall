@@ -6,9 +6,11 @@ rust-version.workspace = true
 
 [dependencies]
 spall_core = { path = "../spall_core" }
+spall_fluid = { path = "../spall_fluid" }
 spall_protocol = { path = "../spall_protocol" }
 spall_net = { path = "../spall_net" }
 spall_physics = { path = "../spall_physics" }
+spall_render = { path = "../spall_render" }
 spall_sim = { path = "../spall_sim" }
 spall_voxel = { path = "../spall_voxel" }
 serde.workspace = true

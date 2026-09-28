@@ -1,14 +1,17 @@
 //! Native render-window host and the client-side replica. GPU voxel extraction
 //! and transport wiring are added by later tasks.
 
+pub mod grid_fluid_demo;
 pub mod interactive;
 pub mod net;
 pub mod predict;
 pub mod replica;
 pub mod residency;
+pub mod sky;
 pub mod tick_accumulator;
 pub mod window;
 
+pub use grid_fluid_demo::run_grid_fluid_demo_window;
 pub use interactive::{InteractiveSession, InteractiveView, LiveInput};
 pub use net::{
     BaselineScene, ClientNetConfig, ClientNetError, ClientResidencyLimits, ClientSummary,
@@ -19,9 +22,11 @@ pub use net::{
 pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
 pub use residency::{ClientResidency, ClientResidencyPass, MAX_RELOAD_REQUESTS_PER_STEP};
+pub use spall_render::{Environment, EnvironmentPreset};
 pub use window::{
-    run_interactive_window, run_interactive_window_with_game_content,
-    run_interactive_window_with_manifest, run_interactive_window_with_progression,
+    run_interactive_window, run_interactive_window_with_environment,
+    run_interactive_window_with_game_content, run_interactive_window_with_manifest,
+    run_interactive_window_with_progression,
 };
 
 use spall_core::{JsonlError, JsonlLog, ProcessEvent, ProcessRecord, ProcessRole};

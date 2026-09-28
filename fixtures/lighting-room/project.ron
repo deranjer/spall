@@ -1,0 +1,50 @@
+(
+    format_version: 1,
+    name: "Lighting Room",
+    material_mapping: {
+        "dirt": 6,
+        "emissive.lamp": 7,
+        "foliage.oak": 3,
+        "grass": 5,
+        "sandstone": 2,
+        "stone.granite": 1,
+        "wood.oak": 2,
+    },
+    asset_database: (
+        format_version: 1,
+        next_asset_id: 5,
+        assets: {
+            (1): (
+                id: (1),
+                name: "Scene Voxels",
+                kind: Voxel,
+                storage: "assets\\scene_voxels.spvox",
+                authoring_bounds: None,
+            ),
+            (2): (
+                id: (2),
+                name: "House (sealed)",
+                kind: Voxel,
+                storage: "assets\\house_sealed.spvox",
+                authoring_bounds: None,
+            ),
+            (3): (
+                id: (3),
+                name: "House (doorway)",
+                kind: Voxel,
+                storage: "assets\\house_doorway.spvox",
+                authoring_bounds: None,
+            ),
+            (4): (
+                id: (4),
+                name: "House (roofless)",
+                kind: Voxel,
+                storage: "assets\\house_roofless.spvox",
+                authoring_bounds: None,
+            ),
+        },
+    ),
+    scenes: {
+        "Main": "scenes/main.ron",
+    },
+)

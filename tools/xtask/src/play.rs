@@ -32,6 +32,16 @@ pub struct PlayArgs {
     /// `spall_client::BaselineScene` name.
     #[arg(long, default_value = "walk")]
     scene: String,
+    /// Play a scene authored in Spall Editor (a project directory or a scene
+    /// `.ron` inside one) instead of a built-in `--scene`. This is what the
+    /// editor's Run button launches.
+    #[arg(long, conflicts_with = "scene")]
+    editor_scene: Option<PathBuf>,
+    /// Lighting environment for the window: studio, daylight, overcast,
+    /// sunset or night. Defaults to the environment saved in the
+    /// `--editor-scene` file, else daylight.
+    #[arg(long)]
+    environment: Option<String>,
     /// Server tick budget, at the server's paced 60 Hz. Deliberately large —
     /// `--interactive` has no natural end (a person closes the window when
     /// done), unlike the scripted `session`/`scenario` harness this shares
@@ -70,6 +80,7 @@ pub struct PlayArgs {
 
 pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskError> {
     let needs_server_baseline = args.late_join
+        || args.editor_scene.is_some()
         || matches!(
             args.scene.as_str(),
             "playground" | "play" | "sandbox-playground"
@@ -127,8 +138,6 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         &output.join("server.jsonl").display().to_string(),
         "--ticks",
         &args.ticks.to_string(),
-        "--scene",
-        &args.scene,
         // A play session mostly just moves around; don't let the
         // idle-quiescence early-stop (meant for a scripted run with gaps
         // between edits) cut it short for want of a committed transaction.
@@ -136,6 +145,10 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         "0",
         "--paced",
     ]);
+    match &args.editor_scene {
+        Some(path) => server_cmd.arg("--editor-scene").arg(path),
+        None => server_cmd.args(["--scene", &args.scene]),
+    };
     hide_console(&mut server_cmd);
     let mut guard = ChildGuard::default();
     let server_child = server_cmd.spawn().map_err(|source| XtaskError::Output {
@@ -155,7 +168,10 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     eprintln!(
         "xtask play: server listening on {bound} (scene={}, ticks={}); opening the window \
          (WASD to move, mouse to look, Space to jump, Escape releases the cursor)...",
-        args.scene, args.ticks
+        args.editor_scene
+            .as_ref()
+            .map_or_else(|| args.scene.clone(), |path| path.display().to_string()),
+        args.ticks
     );
 
     let mut client_cmd = Command::new(sandbox_binary_profile("sandbox-client", profile));
@@ -170,6 +186,14 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         "--log-json",
         &output.join("client.jsonl").display().to_string(),
     ]);
+    let environment = args
+        .environment
+        .clone()
+        .or_else(|| args.editor_scene.as_deref().and_then(scene_environment_key));
+    if let Some(environment) = &environment {
+        eprintln!("xtask play: environment={environment}");
+        client_cmd.args(["--environment", environment]);
+    }
     if needs_server_baseline {
         client_cmd.arg("--late-join");
     }
@@ -198,6 +222,45 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             vec!["sandbox-client".into(), "--interactive".into()],
             client_status.code().unwrap_or(1),
         ))
+    }
+}
+
+/// The `environment` an editor scene file saved, read from a scene `.ron`
+/// (or a project directory's `scenes/main.ron`). A plain text scan: the
+/// editor writes it as a top-level `environment: "key",` field, and this
+/// launcher deliberately links no RON parser.
+fn scene_environment_key(path: &std::path::Path) -> Option<String> {
+    let file = if path.is_dir() {
+        path.join("scenes").join("main.ron")
+    } else {
+        path.to_path_buf()
+    };
+    parse_environment_key(&fs::read_to_string(file).ok()?)
+}
+
+fn parse_environment_key(scene_ron: &str) -> Option<String> {
+    scene_ron.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("environment:")?.trim();
+        let value = value.trim_end_matches(',').trim();
+        let key = value.strip_prefix('"')?.strip_suffix('"')?;
+        (!key.is_empty()).then(|| key.to_owned())
+    })
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::parse_environment_key;
+
+    #[test]
+    fn reads_the_saved_environment_key() {
+        let ron = "(
+    format_version: 1,
+    name: \"Main\",
+    environment: \"sunset\",
+    entities: {},
+)";
+        assert_eq!(parse_environment_key(ron).as_deref(), Some("sunset"));
+        assert_eq!(parse_environment_key("(name: \"Main\")"), None);
     }
 }
 

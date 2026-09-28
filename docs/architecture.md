@@ -13,18 +13,37 @@ spall_jobs    -> spall_core                     bounded scheduling, result token
 spall_mesh    -> spall_voxel, spall_jobs        surface generation, no GPU
 spall_structure -> spall_voxel, spall_jobs      connectivity, support, split plans
 spall_physics -> spall_voxel                    Rapier adapter, collision builds
+spall_fluid  -> spall_core, spall_voxel          CPU fluid state and solid-boundary snapshots
 spall_sim     -> spall_structure, spall_physics, spall_jobs, spall_protocol   authoritative state and tick order
 spall_protocol -> spall_core                   explicit DTOs and codecs only
 spall_net     -> spall_protocol                 Quinn transport adapter (Tokio; T09)
 spall_store   -> spall_protocol                 checkpoint/journal bytes and indexes
 spall_render  -> spall_mesh, spall_core            wgpu resources and render passes
 spall_server  -> spall_sim, spall_net, spall_store, spall_jobs
-spall_client  -> spall_net, spall_voxel, spall_physics, spall_render, spall_jobs
+spall_client  -> spall_net, spall_voxel, spall_physics, spall_render, spall_jobs, spall_fluid
 sandbox (example) -> spall_server, spall_client   game rules and executable entry points
 xtask                                    process/scenario/build orchestration
 ```
 
 spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The graph edge is refined from `spall_sim -> spall_structure, spall_physics` to add `-> spall_jobs, spall_protocol` (T08): staging is submitted to a `spall_jobs::Scheduler` and re-validated through a `JobToken` like any other off-tick result, and every commit emits a `spall_protocol::TopologyTransaction`. Both new targets are foundation crates (`-> spall_core`); no cycle is introduced. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
+
+ENG-103 introduces `spall_fluid -> spall_core, spall_voxel` as a CPU-only
+water crate. It captures only fully resident voxel geometry and rejects
+unknown cells. Its solver is a dense two-phase (water plus air) MAC grid:
+staggered face velocities, fractional water volume with geometric (PLIC)
+conservative transport, a variable-density pressure projection with a
+multigrid preconditioner, and isothermal compressible sealed air. A Salva
+particle backend was evaluated and removed. Evidence is in
+[`docs/reports/ENG-103.md`](reports/ENG-103.md). The solver is not yet
+advanced by the authoritative `spall_sim` tick, coupled to Rapier, replicated,
+or persisted; that integration is ENG-105. Rapier remains the sole rigid-body
+solver.
+
+ENG-104 adds a local-only client presentation path to `spall_fluid` for the
+interactive feasibility playground. That explicit `sandbox-client --grid-fluid-demo`
+mode owns and advances its own grid fixture for visual experimentation; normal
+networked clients do not advance or claim authority over fluid state. Gameplay
+authority, replication, and recovery remain future work.
 
 Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
 in-process `cargo xtask net-check` transport harness. Add `games/survival` only
@@ -188,6 +207,8 @@ Implement in this order:
 4. Dirty-region updates for terrain edits and both old/new AABBs of moving objects. Clear/rebuild overlapping occupancy correctly; removing one object must not erase another. Emissive sources contribute to lighting. Limit bounce count initially to one diffuse bounce.
 5. Temporal reprojection with depth/normal rejection, neighborhood clamping, disocclusion handling, and history invalidation after edits. Denoise and composite; reserve full-resolution raster silhouettes even when lighting is lower resolution.
 6. Expand quality/range only after G2: multiple clipmap levels, better diffuse visibility, local lights, reflections, and distant LOD.
+
+R3 (ENG-96) adds two direct-light contracts to the shared renderer (`docs/reports/ENG-96.md`): sun shadows are cascaded maps with normal-offset bias and physically-scaled PCSS penumbrae (the sun's angular size is an `Environment` parameter), and skylight is *visibility-aware* -- a derived, client-local occupancy grid in the frozen 128 cubed / 0.5 m layout feeds a six-direction sky-visibility pass, so enclosed rooms receive no outdoor ambient; unknown (non-resident) space blocks rays rather than counting as sky.
 
 The clipmap is a derived GPU lighting cache, not the world format. Do not require experimental hardware ray tracing or a sparse voxel octree for the initial renderer. Optional future hardware acceleration must preserve a supported baseline and be justified by captured evidence.
 

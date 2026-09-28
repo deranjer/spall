@@ -115,6 +115,8 @@ fn run_session(
         contact_damage: None,
         dormancy: None,
         timing_window: None,
+        credential_registry_file: None,
+        custom_world: None,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
     let fp_hex = wait_for_file(&fp_path, Duration::from_secs(20));

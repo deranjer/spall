@@ -1,8 +1,9 @@
 # Spall Voxel Asset (`.spvox`) format
 
-**Status:** approved format contract. The editor currently implements canonical
-static-asset `META`/`MTRL`/`PALT`/`VOXL`/`HASH` reading and writing; `PART`,
-`ANIM`, and the MagicaVoxel bridge remain pending.  
+**Status:** approved format contract. The editor implements canonical static
+`META`/`MTRL`/`PALT`/`VOXL`/`LAYR`/`HASH` reading and writing; `PART`,
+`STRC`, `ANIM`, and the MagicaVoxel bridge remain pending. Existing v1.0
+static assets remain readable and are written as v1.1 when saved.
 **Version:** 1.1  
 **File extension:** `.spvox`  
 **Magic:** `SPVX`
@@ -16,7 +17,7 @@ following:
 
 - **Editor project/scene documents.** The editor's current RON files own
   project-local `AssetId` values, scene placement, and undo history. SPVX owns
-  one reusable asset, not a project.
+  one reusable asset, including optional editable layers, not a project.
 - **Authoritative world saves, baselines, and network records.** SPVX contains
   no `WorldId`, runtime entity ID, volume ID, revision, body pose, ownership,
   physics handle, journal record, or protocol transaction. Those formats keep
@@ -77,8 +78,11 @@ operation.
 Pivots and animated translations use integer **subcell units**: `256` units
 equal one cell. This matches Spall's existing fixed-point brush granularity.
 Palette tint channels are 8-bit **sRGB** values; importing converts them to
-linear colour for rendering. Tint is authored display data only until the
-runtime's per-cell tint path exists.
+linear colour for rendering. In the sandbox runtime an authored tint is preserved
+as a *material variant*: the importer maps each tinted cell to the nearest of a
+small committed palette of variants of its material (`docs/reports/ENG-95.md`),
+so the tint survives edits, body splits, replication and saves as an ordinary
+`MaterialId`. The tint itself is still not stored per cell in the world.
 
 ## 4. Container
 
@@ -128,6 +132,7 @@ FourCC order, and finally `HASH`.
 | `VOXL` | exactly one | Sparse voxel runs |
 | `STRC` | zero or one | Symbolic part toughness and inter-part joint profiles |
 | `ANIM` | zero or one | Named transform-animation clips |
+| `LAYR` | zero or one | Optional authoring layers for a static root asset |
 | `HASH` | exactly one, final chunk | Content integrity digest |
 
 An empty asset is valid: it has an empty `MTRL` table and zero `VOXL` runs.
@@ -163,15 +168,25 @@ Defined required-feature bits:
 | `0` | `STRUCTURAL_PROFILES` | `STRC` is present or a part has a non-zero structural profile slot |
 
 A 1.0 reader therefore rejects an asset with structural profiles instead of
-misreading the extended `PART` record. A v1.1 writer sets no optional bits and
-sets required bit `0` exactly when structural-profile data is present.
+misreading the extended `PART` record. A v1.1 writer sets required bit `0`
+exactly when structural-profile data is present.
+
+Defined optional-feature bits:
+
+| Bit | Name | Set when |
+| ---: | --- | --- |
+| `0` | `AUTHORING_LAYERS` | `LAYR` is present |
+
+The bit and chunk must either both be present or both be absent. `LAYR` is
+optional because `VOXL` is the complete runtime topology; readers that do not
+edit layers may ignore it after checking chunk bounds and the final `HASH`.
 
 The UUID identifies the portable asset. The editor imports it into a
 project-local `AssetId`; the two identities are intentionally separate.
 
 ### 5.2 `MTRL`
 
-`MTRL` contains the material symbols used by `VOXL`:
+`MTRL` contains the material symbols used by `VOXL` and, when present, `LAYR`:
 
 ```text
 count: u16
@@ -182,8 +197,10 @@ entries: count × { key_len: u8, key_utf8 }
 bytewise sorted. A voxel run references its one-based table position; zero is
 invalid because air is absence, not a material.
 
-The importer resolves every key against a project-supplied material mapping and
-then the validated Spall material manifest. The default policy is **reject on
+An editor preserving `LAYR` resolves every key against a project-supplied
+material mapping and the validated Spall material manifest. A runtime that
+ignores optional authoring layers resolves only keys referenced by `VOXL`.
+The default policy for every key actually used by the importer is **reject on
 an unmapped key**. An import UI or command may offer an explicit mapping or
 material-creation workflow, but it must record that choice and must not guess
 from an RGB value.
@@ -254,6 +271,38 @@ material, and tint slots. Writers merge adjacent compatible runs.
 This stream is authoritative asset topology. Importers may partition it into
 Spall's internal 32³ bricks, but that partitioning is not a source-format
 property and must not change cells or material assignments.
+
+### 5.5a `LAYR` — editable authoring layers
+
+`LAYR` is optional in v1.1 and applies only to a static asset with the
+implicit root part (no `PART` chunk). Its raw payload is:
+
+```text
+layer_count: u16          // 1..=1024
+layers: layer_count × {
+  layer_id: u32           // nonzero, unique, stable within the asset
+  name_len: u8
+  name_utf8: u8[name_len] // 1..=255 UTF-8 bytes
+  visible: u8             // exactly 0 or 1
+  cell_count: u32
+  cells: cell_count × {
+    x: i32, y: i32, z: i32,
+    material_slot: u16,    // one-based MTRL index
+    tint_slot: u16         // zero or one-based PALT index
+  }
+}
+```
+
+Layer order is the stored order, bottom to top. Visible layers overlay earlier
+visible layers at matching coordinates; the last visible cell supplies both
+material and tint. Hidden layers contribute no cells. A reader with layer
+support must compose them and reject the asset unless the result matches
+`VOXL` exactly, including optional sRGB tints. Layers organize editing; they
+are not `PART` identities, entities, collision bodies, or structural joints.
+Cells within one layer are sorted by `(z, y, x)` with no duplicates. Different
+layers may overlap. Total source cells are limited to 64,000,000 and normal
+chunk limits apply. A flat v1.0 or v1.1 asset without `LAYR` remains editable;
+import does not invent a layer until the user creates one.
 
 ### 5.6 `STRC`
 
@@ -372,6 +421,10 @@ The header, compression choice, and chunk headers are excluded. This lets a
 writer recompress an asset without changing its logical identity. A reader
 verifies the digest after decoding every preceding chunk. It rejects a `HASH`
 chunk that is missing, duplicated, not the final chunk, or does not match.
+`LAYR` participates in this digest. Changing only layer metadata therefore
+changes the SPVX hash and may change a file-byte-based content manifest even
+when `VOXL` is unchanged. Runtime caches requiring geometry identity should
+derive it from validated `VOXL` instead.
 
 ## 6. Required validation limits
 
@@ -490,6 +543,8 @@ Every SPVX reader/writer implementation must have fixtures for:
   and a 32³ brick-boundary-crossing asset;
 - multiple portable material keys and an unmapped-key rejection;
 - sRGB tint preservation and linear-colour conversion;
+- overlapping visible layers, hidden source cells, canonical layer ordering,
+  invalid layer IDs/slots, and rejection when composed layers differ from `VOXL`;
 - a part hierarchy and a looped transform clip with event markers;
 - material-baseline, part-profile, and joint-profile resolution for a mixed
   metal/wood assembly, including a weak glued seam and a strong welded seam;
@@ -505,7 +560,7 @@ Every SPVX reader/writer implementation must have fixtures for:
 Round-trip guarantees are intentionally scoped:
 
 - SPVX → editor → SPVX preserves cells, portable material keys, sRGB tints,
-  cell size, pivot, part graph, structural profiles/joints, animation data,
+  cell size, pivot, authoring layers, part graph, structural profiles/joints, animation data,
   tags, and logical `HASH` when the project mapping is unchanged.
 - SPVX → runtime preserves only features that the selected runtime path
   implements. Unsupported authored data is retained by the asset/editor path;

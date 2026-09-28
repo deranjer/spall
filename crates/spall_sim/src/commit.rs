@@ -473,23 +473,50 @@ pub fn commit(
     // remain the replica's acceptance check.
     let mut bulk_baseline = None;
     if !crate::replication::inline_wire_fits(&topology) {
-        match build_split_baseline_ops(
-            vid,
-            brush_op,
-            parent_owner,
-            &parent_candidate,
-            &affected,
-            &child_ids,
-            &children,
-            staged.splits(),
-            transaction_id,
-            server_tick,
-        )? {
-            SplitEncoding::Inline(ops) => topology.ops = ops,
-            SplitEncoding::Bulk { ops, baseline } => {
-                topology.ops = ops;
-                bulk_baseline = Some(baseline);
+        // Inline blobs are only chosen when each fits `MAX_SPLIT_BASELINE_BLOB`,
+        // but hundreds of small children (a tree crown) can still add up past
+        // one control record, so the re-encoded form is checked as a whole and
+        // falls back to the bulk form when it does not fit.
+        let mut force_bulk = false;
+        loop {
+            match build_split_baseline_ops(
+                vid,
+                brush_op.clone(),
+                parent_owner,
+                &parent_candidate,
+                &affected,
+                &child_ids,
+                &children,
+                staged.splits(),
+                transaction_id,
+                server_tick,
+                force_bulk,
+            )? {
+                SplitEncoding::Inline(ops) => {
+                    topology.ops = ops;
+                    if crate::replication::inline_wire_fits(&topology) {
+                        break;
+                    }
+                    force_bulk = true;
+                }
+                SplitEncoding::Bulk { ops, baseline } => {
+                    topology.ops = ops;
+                    bulk_baseline = Some(baseline);
+                    break;
+                }
             }
+        }
+        // Even the marker form must fit one record; if it cannot, fail the
+        // commit loudly rather than send a record the transport refuses (which
+        // would silently drop every live client).
+        if !crate::replication::inline_wire_fits(&topology) {
+            return Err(CommitError::Replication(
+                crate::replication::ReplicationError::SplitTooLarge {
+                    volume: vid.get(),
+                    blob_bytes: topology.ops.len(),
+                    cap: spall_protocol::limits::MAX_CONTROL_RECORD,
+                },
+            ));
         }
     }
     topology.validate()?;
@@ -668,6 +695,7 @@ fn build_split_baseline_ops(
     splits: bool,
     transaction_id: spall_core::TransactionId,
     server_tick: Tick,
+    force_bulk: bool,
 ) -> Result<SplitEncoding, CommitError> {
     use spall_protocol::baseline::{BaselineOwner, BaselineWorld};
     use spall_protocol::limits::{MAX_ASSEMBLED_TRANSFER, MAX_BULK_PART, MAX_SPLIT_BASELINE_BLOB};
@@ -693,10 +721,12 @@ fn build_split_baseline_ops(
         volumes.push((bv, blob));
     }
 
-    // Inline path: every compressed blob fits one op.
-    if volumes
-        .iter()
-        .all(|(_, blob)| blob.len() <= MAX_SPLIT_BASELINE_BLOB)
+    // Inline path: every compressed blob fits one op (the caller checks that
+    // the whole record fits, and forces the bulk form when it does not).
+    if !force_bulk
+        && volumes
+            .iter()
+            .all(|(_, blob)| blob.len() <= MAX_SPLIT_BASELINE_BLOB)
     {
         let mut ops = vec![brush_op];
         let mut it = volumes.into_iter();

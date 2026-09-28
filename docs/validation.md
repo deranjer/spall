@@ -21,13 +21,38 @@ ENG-74 adds a separate editor package, outside the engine gate harness:
 `cargo check -p spall_editor`, `cargo test -p spall_editor --lib`, and
 `cargo clippy -p spall_editor --all-targets -- -D warnings` validate its CPU
 documents/commands and leaf dependency boundary. `cargo run -p spall_editor`
-opens the native shell for a manual project/scene/voxel editing pass. Native
+opens the native Yakui shell for a manual project/scene/voxel editing pass,
+including the SPVOX color preview in the Assets workspace. Native
 window interaction and launching an offline sandbox client require an available
 desktop GPU and remain a hands-on check rather than a CPU-CI claim.
 
 Editor command coverage includes stable asset-reference round trips, single-cell
 undo/redo, and mixed-colour box-stroke undo: each prior voxel material/tint must
 be restored exactly rather than replacing the whole selection with one colour.
+SPVX 1.1 layer coverage also checks hidden and overlapping source layers,
+deterministic save/reload, flat v1.0 import, composition against `VOXL`, and
+undoable layer cell/visibility changes. Runtime import reads only `VOXL` after
+validating the optional `LAYR` feature marker and the whole-file hash.
+
+ENG-91 ships immutable engine voxel sources in
+`crates/spall_voxel/assets/builtin/voxel/` and exposes them through
+`spall_voxel::builtin_assets::builtin_voxel_assets()` as canonical SPVX bytes.
+Terrain-generation consumers and the editor use that same catalog. In the
+editor's **Voxel Asset Library** bottom panel, built-ins and project assets are
+searchable and shown in a small-preview grid. Built-ins support read-only preview
+and **Edit Project Copy**; copies enter the project through an undoable editor
+command and save to project asset storage. The starting screen can open this
+catalog directly without opening a scene. The center viewport fills the space
+between side panels, the asset authoring controls are on the right, and the
+bottom panel spans the full workspace width with a searchable grid of small
+asset previews. The asset viewport shows a pointer crosshair and offers Studio,
+Daylight, Overcast, Sunset, and Night lighting presets. Checkpoint the two built-in keys and
+the SPVX reader using `cargo test -p spall_voxel` and editor CPU tests. Inspect
+File/Edit/Help menus, direct startup access to built-ins, panel collapse and
+dragging the left/right/bottom panel splitters, text readability, and viewport
+zoom/pan clipping, cursor tracking, lighting presets, and bottom-grid resizing
+in `cargo run -p spall_editor`; this native interaction is
+not a CPU test claim.
 
 T14 adds incremental cache updates. `LightingUpdate` is a plain
 (non-simulation) description of what changed — world-space AABBs cleared to air
@@ -426,6 +451,20 @@ At a gate, retain raw metrics alongside a concise report in `docs/reports/Gx.md`
 
 Use property tests for coordinates, storage/edit conservation, and codec bounds. Use tiny reference algorithms for topology/mesh coverage. Physics tests use position/energy tolerances where appropriate; exact hashes test topology, not floating-point trajectories. A rendered screenshot is not proof of collision or replication correctness.
 
+### ENG-103 grid-fluid basin candidate gate
+
+For the isolated MAC feasibility prototype, report the raw maximum cell speed
+for diagnosis, but evaluate basin stability using volume-weighted speed
+statistics over water cells with fraction `C >= 1e-3`. In the final third of the
+declared 3-second basin run, require weighted p95 <= 0.5 m/s and <=1% of
+eligible water volume above 0.5 m/s, alongside the existing <=1 J kinetic-energy
+rise, <0.15 m surface-p95 drift, and zero intact-solid crossings. Always include
+the same speed metrics at `C >= 0`, `1e-6`, `1e-4`, `1e-3`, and `1e-2` so this
+occupancy choice can be sensitivity-checked. `C=1e-3` is 0.1% of one 0.25 m
+cell (15.625 mL); this gate changes only how basin residual motion is assessed,
+not solver fractions or mass accounting. It is a feasibility-candidate
+criterion and does not establish production readiness.
+
 ## Gate workload and targets
 
 Choose and record a reference Windows gaming PC and dedicated-server CPU in T00. Provisional envelope: desktop six-core-class CPU, 32 GiB system RAM, discrete GPU with 8 GiB VRAM. This is a test planning envelope, not a published minimum specification or purchase recommendation. Repeat backend smoke tests on D3D12 and Vulkan when available. Linux headless CI is desirable from the start; Windows is the initial client target.
@@ -451,6 +490,20 @@ support propagation and brick-boundary ownership transfer); at least
 client; the body-targeted cut landing against the detached body; and the
 committed topology-event stream, replayed deterministically from the tick-0
 baseline via the durable journal, reproducing the live canonical hash. The
+### ENG-103 grid-fluid basin candidate gate
+
+For the isolated MAC feasibility prototype, report the raw maximum cell speed
+for diagnosis, but evaluate basin stability using volume-weighted speed
+statistics over water cells with fraction `C >= 1e-3`. In the final third of the
+declared 3-second basin run, require weighted p95 <= 0.5 m/s and <=1% of
+eligible water volume above 0.5 m/s, alongside the existing <=1 J kinetic-energy
+rise, <0.15 m surface-p95 drift, and zero intact-solid crossings. Always include
+the same speed metrics at `C >= 0`, `1e-6`, `1e-4`, `1e-3`, and `1e-2` so this
+occupancy choice can be sensitivity-checked. `C=1e-3` is 0.1% of one 0.25 m
+cell (15.625 mL); this gate changes only how basin residual motion is assessed,
+not solver fractions or mass accounting. It is a feasibility-candidate
+criterion and does not establish production readiness.
+
 `--loss-percent 2` variant additionally asserts the clients observed motion
 datagrams delivered out of `snapshot_seq` order.
 
@@ -876,3 +929,28 @@ resolves to unsupported geometry.
 `cargo run --release -p spall_mesh --bin lod_seam_bench` also hashes a seeded
 authoritative voxel brick before and after render-only seam generation and
 checks its hash and sampled solid remain unchanged.
+
+## ENG-93 — Editor Run plays the scene
+
+The editor's **Run** button saves the project and launches
+`cargo xtask play --editor-scene <scene.ron>`. `sandbox-server --editor-scene`
+loads the project through `sandbox::editor_scene` (no editor crate dependency),
+flattens placed assets into one 0.25 m terrain volume, and serves it as
+`spall_server::Scene::Custom` with player spawns chosen on the scene surface;
+the interactive client pulls its baseline over the late-join transfer.
+
+```powershell
+cargo test -p sandbox --test editor_scene
+cargo test -p spall_server --test custom_world
+cargo xtask play --editor-scene fixtures/terrain-trees-forest
+```
+
+Measured on the dev machine (debug build, `fixtures/terrain-trees-forest`): 1200
+paced server ticks at 59.999 Hz, client baseline of 147 bricks, 60 fps window,
+0 terrain fallbacks. Not measured: the window was not inspected by eye in this
+session, and no destruction/multi-client run was made on this scene.
+
+Known limit: the engine builds one exact whole-terrain collider and rejects
+terrain over 4096 greedy boxes whose bounding grid exceeds 131,072 cells
+(`ColliderInfeasible::TooLarge`). The forest is sized to fit (16 trees; 33 needed
+6891 boxes). Denser forests need an engine-side change and are not attempted here.

@@ -6,6 +6,19 @@ The versions and license strings below were verified from the locked registry
 manifests. Cargo may select compatible patch releases only by updating
 `Cargo.lock`; this record names the releases actually locked now.
 
+## ENG-103 — bounded fluid feasibility (verified 2026-09-27)
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by |
+| --- | ---: | --- | --- | --- |
+| rayon | 1.12.0 (vendored path `vendor/parallel/rayon-1.12.0`, with rayon-core 1.13.0) | default features; global pool, size from `RAYON_NUM_THREADS` or core count | `MIT OR Apache-2.0` | Data-parallel loops inside one MAC step: velocity advection, PLIC plane reconstruction, and face-flux assembly. Each element writes only its own slot and ordered `collect` keeps serial order, so results are bit-identical for any thread count. Pressure CG and the multigrid smoother stay serial because thread dispatch cost more than the work at scale 2. |
+
+The vendored crates (`rayon`, `rayon-core`, `crossbeam-deque`, `crossbeam-epoch`) live in the top-level `vendor/` directory, which the workspace lists in `exclude`. Cargo makes a path dependency an implicit workspace member when it sits inside a member's directory, and it ignores `exclude` there. Under `crates/spall_fluid/vendor` they were linted as Spall code, and `--all-features` enabled rayon-core's unsupported `web_spin_lock` (and, while vendored, Salva's mutually exclusive `dim2`/`f64`). Do not move them back under a member.
+
+The Salva 0.10.0 DFSPH particle backend was evaluated in ENG-103 and removed
+after the two-phase MAC grid was selected (roof-containment and cost gates
+failed; see `docs/reports/ENG-103.md`). The vendored `salva3d` copy and its
+`fnv`, `generational-arena`, and `itertools` 0.14 dependencies left the lock.
+
 ## T00 — build and process harness (verified 2026-09-06)
 
 | Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by T00 |
@@ -30,24 +43,30 @@ authentication, and multiplayer start in T09.
 
 ## ENG-74 — editor MVP (verified 2026-09-19)
 
-The editor is a leaf workspace package (`tools/spall_editor`). Its egui integration shares the device and queue selected by `spall_render::RenderContext` for the presentation surface; no Spall runtime crate imports egui or editor document types.
+The editor is a leaf workspace package (`tools/spall_editor`). Its Yakui integration shares the device and queue selected by `spall_render::RenderContext` for the presentation surface; no Spall runtime crate imports Yakui or editor document types. The scene viewport is drawn by `spall_render::ViewportRenderer` (shadow, HDR opaque and tone-map passes) into a texture that Yakui composites; the editor meshes the composed scene on the CPU (`scene_mesh`) and uses the workspace `glam` for camera and picking math.
 
 | Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by ENG-74 |
 | --- | ---: | --- | --- | --- |
-| egui | 0.36.2 | default features | `MIT OR Apache-2.0` | panels, menus, inspectors and voxel controls |
-| egui-wgpu | 0.36.2 | default features | `MIT OR Apache-2.0` | compositing the editor UI on the native surface |
-| egui-winit | 0.36.2 | default features | `MIT OR Apache-2.0` | native input/window event translation |
-| yakui, yakui-wgpu, yakui-winit | 0.3.0 (Git `d4cba2dabc2a201162ed105cf547ca95a26c44f3`) | workspace Git revision | `MIT OR Apache-2.0` | in-frame interactive client HUD |
+| yakui, yakui-wgpu, yakui-winit | 0.3.0 (Git `d4cba2dabc2a201162ed105cf547ca95a26c44f3`) | workspace Git revision | `MIT OR Apache-2.0` | editor widgets, in-frame client HUD, native input and compositing |
 | ron | 0.10.1 | default features | `MIT OR Apache-2.0` | versioned human-readable project, scene and voxel documents |
 
 ## ENG-89 — renderer and HUD migration (verified 2026-09-23)
 
-The workspace now resolves wgpu and Naga to 30.0.1, the editor's egui crates
-to 0.36.2, and all three Yakui crates to 0.3.0 from one Git revision
+The workspace now resolves wgpu and Naga to 30.0.1 and all three Yakui crates
+to 0.3.0 from one Git revision
 (`d4cba2dabc2a201162ed105cf547ca95a26c44f3`). `cargo tree -d` shows the
-matching renderer versions. Yakui uses the existing interactive client's
-device, queue, surface, and frame; it does not create a second application
-window.
+matching renderer versions. Both the editor and interactive client use Yakui
+with their existing window, device, queue, surface, and frame. The editor no
+longer uses egui.
+
+## ENG-90 — editor Yakui migration
+
+The editor uses the workspace-pinned Yakui, Yakui-wgpu, and Yakui-winit
+revision. Document changes still run through `EditorCommand` and `UndoStack`;
+native input and UI rendering share the editor's winit window and Spall render
+device/queue. The asset workspace displays occupied SPVOX cells as a colored
+X/Z layer preview selected by the Y coordinate; the visual grid is capped at
+32×32 cells per layer.
 
 ## T01 — IDs, schemas, canonical encoding (verified 2026-09-06)
 
@@ -365,6 +384,12 @@ implemented inside `spall_voxel`; `spall_server` reuses its existing
 `spall_sim`, `spall_store`, and `spall_structure` edges for durable eviction
 and dependency loading, and `spall_client` already depends on `spall_voxel`.
 `Cargo.lock` is unchanged.
+
+## Editor file pickers (verified 2026-09-26)
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by |
+| --- | ---: | --- | --- | --- |
+| rfd | 0.17.2 | default features | `MIT` | native open-folder, open-file and save-file dialogs in `tools/spall_editor` (project open/new, `.spvox` import/export) |
 
 ## Verified Windows prerequisites
 

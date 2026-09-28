@@ -45,6 +45,22 @@ impl Default for Camera {
 const PITCH_LIMIT: f32 = 1.553_343; // ~89 degrees
 
 impl Camera {
+    /// A camera at `position` looking along `direction` (need not be unit
+    /// length; a zero vector keeps the default orientation).
+    pub fn looking_along(position: Vec3, direction: Vec3, fov_y: f32, aspect: f32) -> Self {
+        let mut camera = Self {
+            position,
+            fov_y,
+            aspect,
+            ..Self::default()
+        };
+        if let Some(dir) = direction.try_normalize() {
+            camera.yaw = (-dir.x).atan2(-dir.z);
+            camera.pitch = dir.y.clamp(-1.0, 1.0).asin();
+        }
+        camera
+    }
+
     /// Unit forward vector (the direction `-Z` maps to after yaw/pitch).
     pub fn forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
@@ -93,6 +109,23 @@ impl Camera {
     /// The view frustum in world space for culling.
     pub fn frustum(&self) -> Frustum {
         Frustum::from_view_projection(self.view_projection())
+    }
+
+    /// World-space ray through a point of the viewport, for picking. `ndc` is
+    /// in clip space (`x` right, `y` up, both `[-1, 1]`). Returns the origin
+    /// on the near plane and a unit direction.
+    pub fn ray(&self, ndc: [f32; 2]) -> (Vec3, Vec3) {
+        let inverse = self.view_projection().inverse();
+        let near = inverse.project_point3(Vec3::new(ndc[0], ndc[1], 0.0));
+        let far = inverse.project_point3(Vec3::new(ndc[0], ndc[1], 1.0));
+        (near, (far - near).normalize_or_zero())
+    }
+
+    /// Clip-space position (`x` right, `y` up, `[-1, 1]` inside the viewport)
+    /// of `world`, or `None` when the point is behind the near plane.
+    pub fn project(&self, world: Vec3) -> Option<[f32; 2]> {
+        let clip = self.view_projection() * world.extend(1.0);
+        (clip.w > 1e-6).then(|| [clip.x / clip.w, clip.y / clip.w])
     }
 }
 
@@ -191,6 +224,23 @@ impl Frustum {
 mod tests {
     use super::*;
 
+    #[test]
+    fn looking_along_reproduces_the_direction() {
+        for dir in [
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::new(1.0, 0.2, 0.3),
+            Vec3::new(-0.5, -0.4, 0.9),
+            Vec3::new(0.0, 0.7, 1.0),
+        ] {
+            let camera = Camera::looking_along(Vec3::ZERO, dir * 3.0, 1.0, 1.0);
+            let forward = camera.forward();
+            assert!(
+                forward.dot(dir.normalize()) > 0.9999,
+                "{dir:?} -> {forward:?}"
+            );
+        }
+    }
+
     fn cam() -> Camera {
         Camera {
             position: Vec3::new(0.0, 0.0, 5.0),
@@ -226,6 +276,25 @@ mod tests {
         let clip = c.view_projection() * glam::Vec4::new(0.0, 0.0, 10.0, 1.0);
         // w <= 0 or |z| outside [0, w] => not visible.
         assert!(clip.w <= 0.0 || clip.z < 0.0 || clip.z > clip.w);
+    }
+
+    #[test]
+    fn a_pick_ray_round_trips_through_project() {
+        let mut c = cam();
+        c.look(0.4, -0.2);
+        for ndc in [[0.0, 0.0], [0.6, -0.3], [-0.9, 0.8]] {
+            let (origin, dir) = c.ray(ndc);
+            let point = origin + dir * 7.5;
+            let back = c.project(point).expect("in front of the camera");
+            assert!(
+                (back[0] - ndc[0]).abs() < 1e-3 && (back[1] - ndc[1]).abs() < 1e-3,
+                "{ndc:?} -> {back:?}"
+            );
+        }
+        // The centre ray is the camera's forward axis.
+        assert!((c.ray([0.0, 0.0]).1 - c.forward()).length() < 1e-4);
+        // Points behind the eye do not project.
+        assert!(c.project(c.position - c.forward() * 3.0).is_none());
     }
 
     #[test]

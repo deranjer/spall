@@ -50,7 +50,13 @@ impl RenderContext {
         }))
         .map_err(|_| RenderError::NoAdapter)?;
         let capabilities = surface.get_capabilities(&adapter);
-        let context = Self::from_adapter(adapter, "spall-render-surface")?;
+        // Surface-backed applications should be able to render at native
+        // display resolutions. Keep the conservative downlevel baseline for
+        // other limits, but expose the adapter's real 2D texture cap instead
+        // of silently imposing the default 2048-pixel limit.
+        let mut surface_limits = wgpu::Limits::downlevel_defaults();
+        surface_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+        let context = Self::from_adapter(adapter, "spall-render-surface", surface_limits)?;
         Ok((context, capabilities))
     }
 
@@ -89,10 +95,18 @@ impl RenderContext {
         }))
         .map_err(|_| RenderError::NoAdapter)?;
 
-        Self::from_adapter(adapter, "spall-render-headless")
+        Self::from_adapter(
+            adapter,
+            "spall-render-headless",
+            wgpu::Limits::downlevel_defaults(),
+        )
     }
 
-    fn from_adapter(adapter: wgpu::Adapter, label: &str) -> Result<Self, RenderError> {
+    fn from_adapter(
+        adapter: wgpu::Adapter,
+        label: &str,
+        required_limits: wgpu::Limits,
+    ) -> Result<Self, RenderError> {
         // Opt into render-pass timestamp queries when (and only when) the adapter
         // reports support. Where they are unavailable the capture path reports
         // GPU timing as unavailable rather than substituting a CPU figure.
@@ -110,7 +124,7 @@ impl RenderContext {
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some(label),
                 required_features,
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()
             }))?;

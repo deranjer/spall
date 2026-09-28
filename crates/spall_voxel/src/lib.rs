@@ -21,6 +21,7 @@
 pub mod accounting;
 pub mod brick;
 pub mod brush;
+pub mod builtin_assets;
 pub mod edit;
 pub mod fixtures;
 pub mod logical;

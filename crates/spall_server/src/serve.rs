@@ -241,6 +241,45 @@ pub enum Scene {
     /// (`crates/spall_server/tests/prediction_timeline.rs`). See
     /// [`spall_sim::spawn_push_test_box`].
     PushTest,
+    /// A game-supplied world (see [`CustomWorld`] and
+    /// [`ServeConfig::custom_world`]), e.g. a scene authored in the editor.
+    /// Never selected by name; the host must supply the world.
+    Custom,
+}
+
+/// A game-supplied world for [`Scene::Custom`]: a terrain/material/physics
+/// setup builder plus the feet positions (metres) for connecting players,
+/// indexed by connection slot. The builder runs once on the authoritative
+/// simulation thread when a new world is created.
+#[derive(Clone)]
+pub struct CustomWorld {
+    player_spawns: Vec<[f64; 3]>,
+    build: Arc<dyn Fn() -> spall_sim::WorldSetup + Send + Sync>,
+}
+
+impl CustomWorld {
+    /// `player_spawns` must be non-empty: every connection gets a capsule.
+    pub fn new(
+        player_spawns: Vec<[f64; 3]>,
+        build: impl Fn() -> spall_sim::WorldSetup + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            player_spawns,
+            build: Arc::new(build),
+        }
+    }
+
+    pub fn player_spawns(&self) -> &[[f64; 3]] {
+        &self.player_spawns
+    }
+}
+
+impl std::fmt::Debug for CustomWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomWorld")
+            .field("player_spawns", &self.player_spawns)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Scene {
@@ -264,6 +303,7 @@ impl Scene {
             "sleep-wake" | "sleepwake" | "t21-sleep-wake" => Some(Scene::SleepWake),
             "playground" | "play" | "sandbox-playground" => Some(Scene::Playground),
             "push-test" | "pushtest" => Some(Scene::PushTest),
+            // `Scene::Custom` is host-supplied and never parsed from a name.
             _ => None,
         }
     }
@@ -283,6 +323,7 @@ impl Scene {
             Scene::SleepWake => "sleep-wake",
             Scene::Playground => "playground",
             Scene::PushTest => "push-test",
+            Scene::Custom => "custom",
         }
     }
 
@@ -298,6 +339,7 @@ impl Scene {
                 | Scene::SleepWake
                 | Scene::Playground
                 | Scene::PushTest
+                | Scene::Custom
         )
     }
 
@@ -324,13 +366,14 @@ impl Scene {
 
     #[cfg(test)]
     fn simulation_with_terrain_collider_mode(self, mode: TerrainColliderMode) -> Simulation {
-        self.simulation_with_materials(mode, spall_sim::fixtures::stone_manifest())
+        self.simulation_with_materials(mode, spall_sim::fixtures::stone_manifest(), None)
     }
 
     fn simulation_with_materials(
         self,
         mode: TerrainColliderMode,
         materials: spall_core::MaterialManifest,
+        custom: Option<&CustomWorld>,
     ) -> Simulation {
         let mut setup = match self {
             Scene::BridgeCut => spall_sim::fixtures::bridged_terrain_setup(),
@@ -347,6 +390,8 @@ impl Scene {
             Scene::SleepWake => spall_sim::fixtures::sleep_wake_setup(),
             Scene::Playground => spall_sim::fixtures::playground_setup(),
             Scene::PushTest => spall_sim::fixtures::walk_arena_setup(),
+            // `serve` rejects a `Custom` scene without a world before this runs.
+            Scene::Custom => (custom.expect("Scene::Custom requires a CustomWorld").build)(),
         };
         setup.materials = materials;
         // No detached body in these scenes enables per-body CCD, and the serve
@@ -506,6 +551,9 @@ pub struct ServeConfig {
     /// Optional credential registry path polled for atomic rotation/revocation
     /// updates. Only used by player-credential authentication.
     pub credential_registry_file: Option<PathBuf>,
+    /// The world and player spawns for [`Scene::Custom`]; ignored for every
+    /// other scene. `serve` fails fast if `scene` is `Custom` and this is `None`.
+    pub custom_world: Option<CustomWorld>,
 }
 
 /// A bounded, explicit server timing window. The server records at most
@@ -586,6 +634,7 @@ impl ServeConfig {
             dormancy: None,
             timing_window: None,
             credential_registry_file: None,
+            custom_world: None,
         }
     }
 }
@@ -1546,6 +1595,17 @@ async fn serve_async(
     mut outbox_encoder: Option<CommittedEditOutboxEncoder>,
     outbox_processor: Option<OutboxProcessor>,
 ) -> Result<ServeSummary, ServeError> {
+    if matches!(config.scene, Scene::Custom)
+        && config
+            .custom_world
+            .as_ref()
+            .is_none_or(|world| world.player_spawns().is_empty())
+    {
+        return Err(ServeError::Configuration(
+            "Scene::Custom requires ServeConfig::custom_world with at least one player spawn"
+                .into(),
+        ));
+    }
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -1796,6 +1856,7 @@ async fn serve_async(
     let await_body_settle = config.await_body_settle;
     let motion_interest = config.motion_interest;
     let scene = config.scene;
+    let custom_world = config.custom_world.clone();
     let terrain_collider_mode = config.terrain_collider_mode;
     let clients_for_sim = clients.clone();
     let save = config.save.clone();
@@ -1842,6 +1903,7 @@ async fn serve_async(
         } = match setup_persistence_with_game_content(
             save.as_deref(),
             scene,
+            custom_world.as_ref(),
             &persist_cfg,
             save_faults,
             terrain_collider_mode,
@@ -2023,7 +2085,9 @@ async fn serve_async(
                         pending_player_inputs.remove_slot(session.slot().0);
                         // T19: give this connection an authoritative player
                         // capsule on a player scene (respawn on reconnect).
-                        let spawns = scene.player_spawns();
+                        let spawns = custom_world
+                            .as_ref()
+                            .map_or_else(|| scene.player_spawns(), CustomWorld::player_spawns);
                         if !spawns.is_empty() {
                             let slot = session.slot().0 as usize;
                             let spawn = spawns[slot.min(spawns.len() - 1)];
@@ -3719,6 +3783,7 @@ fn setup_persistence_with_terrain_collider_mode(
     setup_persistence_with_game_content(
         save,
         scene,
+        None,
         cfg,
         save_faults,
         terrain_collider_mode,
@@ -3728,9 +3793,11 @@ fn setup_persistence_with_terrain_collider_mode(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup_persistence_with_game_content(
     save: Option<&std::path::Path>,
     scene: Scene,
+    custom_world: Option<&CustomWorld>,
     cfg: &PersistConfig,
     save_faults: Option<spall_store::FaultPlan>,
     terrain_collider_mode: TerrainColliderMode,
@@ -3739,7 +3806,8 @@ fn setup_persistence_with_game_content(
     mut outbox_processor: Option<OutboxProcessor>,
 ) -> Result<Persistence, String> {
     let Some(path) = save else {
-        let mut sim = scene.simulation_with_materials(terrain_collider_mode, materials);
+        let mut sim =
+            scene.simulation_with_materials(terrain_collider_mode, materials, custom_world);
         if let Some(setup) = game_setup.take() {
             setup(&mut sim)?;
         }
@@ -3768,7 +3836,8 @@ fn setup_persistence_with_game_content(
         }
         // A genuinely new/empty database: seed it with the built-in scene.
         Err(spall_store::StoreError::NoCheckpoint) => {
-            let mut sim = scene.simulation_with_materials(terrain_collider_mode, materials);
+            let mut sim =
+                scene.simulation_with_materials(terrain_collider_mode, materials, custom_world);
             if let Some(setup) = game_setup.take() {
                 setup(&mut sim)?;
             }
@@ -4446,10 +4515,22 @@ async fn serve_conn(
             }
             for msg in batch.reliable {
                 let ok = match msg {
-                    Outbound::Transaction(tx) => conn
-                        .send_record(WireRecord::TopologyTransaction((*tx).clone()))
-                        .await
-                        .is_ok(),
+                    Outbound::Transaction(tx) => {
+                        let sent = conn
+                            .send_record(WireRecord::TopologyTransaction((*tx).clone()))
+                            .await;
+                        if let Err(error) = &sent {
+                            // Never a silent disconnect: an encode failure here
+                            // (e.g. a record over the control limit) ends this
+                            // client's stream, so say why.
+                            tracing::error!(
+                                transaction = tx.transaction_id.get(),
+                                %error,
+                                "topology transaction could not be sent; closing client stream"
+                            );
+                        }
+                        sent.is_ok()
+                    }
                     Outbound::Status(s) => conn
                         .send_record(WireRecord::ActionStatus((*s).clone()))
                         .await
