@@ -651,6 +651,11 @@ join-budget or full-envelope requirements.
 
 ### G4 — eight-client engine slice
 
+ENG-76 proximity-index measurements and their workload limits are recorded in
+[the takeover report](reports/ENG-76-proximity-index.md). The old worker lane
+with falling out-of-world bodies is diagnostic only. Its passing timings do
+not replace the integrated workload, physics budget, or 30-minute soak.
+
 See the [ENG-30 post-merge review](reviews/2026-09-10-eng-30-post-merge.md) for
 current evidence qualifications: live retry-exhaustion remains untested by the
 after-shutdown join fixture; increment 12 now enforces residency/traversal

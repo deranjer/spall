@@ -289,6 +289,12 @@ Accept: long weak cantilevers fail, comparable strong supports hold within decla
 
 ### T23 — G3/G4 integrated engine acceptance
 
+ENG-76 takeover (2026-09-22): exact spatial indexing replaces the quadratic
+dormancy proximity scan without changing sleep/wake policy. See
+[measured evidence and remaining gates](reports/ENG-76-proximity-index.md).
+The historical worker diagnostic and the integrated G4 workload are reported
+separately; ENG-76 and T23 remain open.
+
 Current disposition: **not accepted**, per the
 [2026-09-18 acceptance audit](reports/T23-acceptance-audit-2026-09-18.md).
 Of the audit's five findings, increment 37 (`docs/reports/G3.md`) fixes
