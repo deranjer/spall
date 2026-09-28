@@ -5,11 +5,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{AssetId, EditorError, VoxelAssetFile, VoxelCoord};
+use crate::{AssetId, EditorError, VoxelAssetFile, VoxelCoord, VoxelLayer, VoxelLayerCell};
 
 const MAGIC: &[u8; 4] = b"SPVX";
 const MAJOR: u16 = 1;
-const MINOR: u16 = 0;
+const MINOR: u16 = 1;
+const AUTHORING_LAYERS: u64 = 1;
+const MAX_LAYERS: usize = 1024;
 const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CHUNKS: usize = 64;
 const MAX_DECODED_CHUNK_BYTES: usize = 128 * 1024 * 1024;
@@ -34,13 +36,19 @@ struct Meta {
     pivot_subcells: [i32; 3],
     name: String,
     tags: BTreeMap<String, String>,
+    optional_features: u64,
 }
 
 pub(super) fn encode(asset: &VoxelAssetFile) -> Result<Vec<u8>, EditorError> {
     validate_asset_metadata(asset)?;
 
     let mut material_keys = BTreeSet::new();
-    for material in asset.voxels.values() {
+    for material in asset.voxels.values().chain(
+        asset
+            .layers
+            .iter()
+            .flat_map(|layer| layer.cells.values().map(|cell| &cell.material)),
+    ) {
         if *material == 0 {
             return invalid("air must be represented by absent SPVX cells");
         }
@@ -60,11 +68,13 @@ pub(super) fn encode(asset: &VoxelAssetFile) -> Result<Vec<u8>, EditorError> {
         .collect();
 
     let mut tint_values = BTreeSet::new();
-    for cell in asset.voxels.keys() {
-        if let Some(tint) = asset.colors.get(cell) {
-            tint_values.insert(*tint);
-        }
-    }
+    tint_values.extend(asset.colors.values().copied());
+    tint_values.extend(
+        asset
+            .layers
+            .iter()
+            .flat_map(|layer| layer.cells.values().filter_map(|cell| cell.tint)),
+    );
     if tint_values.len() > MAX_TABLE_ENTRIES {
         return invalid("SPVX tint palette exceeds 4,096 entries");
     }
@@ -85,6 +95,12 @@ pub(super) fn encode(asset: &VoxelAssetFile) -> Result<Vec<u8>, EditorError> {
         chunks.push((*b"PALT", palt));
     }
     chunks.push((*b"VOXL", voxl));
+    if !asset.layers.is_empty() {
+        chunks.push((
+            *b"LAYR",
+            encode_layers(asset, &material_slots, &tint_slots)?,
+        ));
+    }
 
     let digest = logical_hash(&chunks);
     let mut output = Vec::with_capacity(
@@ -118,7 +134,7 @@ pub(super) fn decode(
         return invalid("SPVX magic is missing");
     }
     let major = input.u16()?;
-    let _minor = input.u16()?;
+    let minor = input.u16()?;
     if major != MAJOR {
         return invalid(format!("SPVX major version {major} is unsupported"));
     }
@@ -182,6 +198,7 @@ pub(super) fn decode(
     let mut materials = None;
     let mut palette = Vec::new();
     let mut voxels = None;
+    let mut layers = None;
     for (chunk_id, payload) in &chunks[..chunks.len() - 1] {
         if !seen.insert(*chunk_id) {
             return invalid(format!("SPVX chunk {:?} is duplicated", fourcc(*chunk_id)));
@@ -191,6 +208,7 @@ pub(super) fn decode(
             b"MTRL" => materials = Some(decode_materials(payload)?),
             b"PALT" => palette = decode_palette(payload)?,
             b"VOXL" => voxels = Some(decode_voxels(payload)?),
+            b"LAYR" if minor >= 1 => layers = Some(payload.as_slice()),
             b"PART" | b"ANIM" => {
                 return invalid(format!(
                     "SPVX {} is valid but not yet retainable by the static editor",
@@ -206,9 +224,13 @@ pub(super) fn decode(
         pivot_subcells,
         name,
         tags,
+        optional_features,
     } = meta.ok_or_else(|| EditorError::Invalid("SPVX is missing META".into()))?;
     let materials = materials.ok_or_else(|| EditorError::Invalid("SPVX is missing MTRL".into()))?;
     let runs = voxels.ok_or_else(|| EditorError::Invalid("SPVX is missing VOXL".into()))?;
+    if (optional_features & AUTHORING_LAYERS != 0) != layers.is_some() {
+        return invalid("SPVX LAYR chunk and optional feature bit disagree");
+    }
 
     let mut resolved = Vec::with_capacity(materials.len());
     let mut used_ids = BTreeSet::new();
@@ -246,6 +268,7 @@ pub(super) fn decode(
         tags,
         voxels: BTreeMap::new(),
         colors: BTreeMap::new(),
+        layers: Vec::new(),
     };
     let mut expanded = 0_u64;
     for run in runs {
@@ -285,6 +308,13 @@ pub(super) fn decode(
             }
         }
     }
+    if let Some(payload) = layers {
+        asset.layers = decode_layers(payload, &resolved, &palette)?;
+        let (voxels, colors) = asset.flattened_layers();
+        if asset.voxels != voxels || asset.colors != colors {
+            return invalid("SPVX LAYR composition differs from authoritative VOXL/PALT");
+        }
+    }
     Ok(asset)
 }
 
@@ -298,7 +328,14 @@ fn encode_meta(asset: &VoxelAssetFile) -> Result<Vec<u8>, EditorError> {
     }
     push_string_u16(&mut output, &asset.name)?;
     push_u64(&mut output, 0); // required features
-    push_u64(&mut output, 0); // optional features
+    push_u64(
+        &mut output,
+        if asset.layers.is_empty() {
+            0
+        } else {
+            AUTHORING_LAYERS
+        },
+    );
     if asset.tags.len() > u16::MAX as usize {
         return invalid("SPVX has too many META tags");
     }
@@ -331,7 +368,11 @@ fn decode_meta(payload: &[u8]) -> Result<Meta, EditorError> {
     let pivot_subcells = [input.i32()?, input.i32()?, input.i32()?];
     let name = input.string_u16()?;
     validate_name(&name)?;
-    if input.u64()? != 0 || input.u64()? != 0 {
+    if input.u64()? != 0 {
+        return invalid("SPVX required/optional feature bits are unsupported");
+    }
+    let optional_features = input.u64()?;
+    if optional_features & !AUTHORING_LAYERS != 0 {
         return invalid("SPVX required/optional feature bits are unsupported");
     }
     let tag_count = input.u16()? as usize;
@@ -353,6 +394,7 @@ fn decode_meta(payload: &[u8]) -> Result<Meta, EditorError> {
         pivot_subcells,
         name,
         tags,
+        optional_features,
     })
 }
 
@@ -408,6 +450,130 @@ fn decode_palette(payload: &[u8]) -> Result<Vec<[u8; 3]>, EditorError> {
     }
     input.finish()?;
     Ok(result)
+}
+
+fn encode_layers(
+    asset: &VoxelAssetFile,
+    material_slots: &BTreeMap<&str, u16>,
+    tint_slots: &BTreeMap<[u8; 3], u16>,
+) -> Result<Vec<u8>, EditorError> {
+    let mut output = Vec::new();
+    push_u16(&mut output, asset.layers.len() as u16);
+    for layer in &asset.layers {
+        push_u32(&mut output, layer.id);
+        push_string_u8(&mut output, &layer.name)?;
+        output.push(u8::from(layer.visible));
+        push_u32(
+            &mut output,
+            u32::try_from(layer.cells.len())
+                .map_err(|_| EditorError::Invalid("SPVX layer has too many cells".into()))?,
+        );
+        let mut cells: Vec<_> = layer.cells.iter().collect();
+        cells.sort_by_key(|(cell, _)| (cell.z, cell.y, cell.x));
+        for (cell, state) in cells {
+            let key = asset.material_keys.get(&state.material).ok_or_else(|| {
+                EditorError::Invalid(format!(
+                    "material {} has no portable SPVX key",
+                    state.material
+                ))
+            })?;
+            let material_slot = *material_slots.get(key.as_str()).ok_or_else(|| {
+                EditorError::Invalid(format!("SPVX material key {key:?} was not tabled"))
+            })?;
+            let tint_slot = state
+                .tint
+                .map(|tint| {
+                    tint_slots.get(&tint).copied().ok_or_else(|| {
+                        EditorError::Invalid("SPVX layer tint was not tabled".into())
+                    })
+                })
+                .transpose()?
+                .unwrap_or(0);
+            push_i32(&mut output, cell.x);
+            push_i32(&mut output, cell.y);
+            push_i32(&mut output, cell.z);
+            push_u16(&mut output, material_slot);
+            push_u16(&mut output, tint_slot);
+        }
+    }
+    if output.len() > MAX_DECODED_CHUNK_BYTES {
+        return invalid("SPVX LAYR chunk exceeds the 128 MiB limit");
+    }
+    Ok(output)
+}
+
+fn decode_layers(
+    payload: &[u8],
+    materials: &[u16],
+    palette: &[[u8; 3]],
+) -> Result<Vec<VoxelLayer>, EditorError> {
+    let mut input = Reader::new(payload);
+    let count = input.u16()? as usize;
+    if count == 0 || count > MAX_LAYERS {
+        return invalid("SPVX LAYR count must be 1 through 1,024");
+    }
+    let mut ids = BTreeSet::new();
+    let mut layers = Vec::with_capacity(count);
+    let mut total_cells = 0_u64;
+    for _ in 0..count {
+        let id = input.u32()?;
+        if id == 0 || !ids.insert(id) {
+            return invalid("SPVX layer IDs must be unique and nonzero");
+        }
+        let name = input.string_u8()?;
+        validate_name(&name)?;
+        let visible = match input.u8()? {
+            0 => false,
+            1 => true,
+            _ => return invalid("SPVX layer visibility must be zero or one"),
+        };
+        let cell_count = input.u32()? as usize;
+        total_cells = total_cells
+            .checked_add(cell_count as u64)
+            .ok_or_else(|| EditorError::Invalid("SPVX layer cell count overflow".into()))?;
+        if total_cells > MAX_CELLS {
+            return invalid("SPVX layers exceed 64,000,000 source cells");
+        }
+        let mut cells = BTreeMap::new();
+        let mut prior = None;
+        for _ in 0..cell_count {
+            let cell = VoxelCoord {
+                x: input.i32()?,
+                y: input.i32()?,
+                z: input.i32()?,
+            };
+            let key = (cell.z, cell.y, cell.x);
+            if prior.is_some_and(|last| last >= key) {
+                return invalid("SPVX layer cells are not canonically sorted and unique");
+            }
+            prior = Some(key);
+            let material_slot = input.u16()?;
+            let tint_slot = input.u16()?;
+            let material = material_slot
+                .checked_sub(1)
+                .and_then(|slot| materials.get(slot as usize))
+                .copied()
+                .ok_or_else(|| {
+                    EditorError::Invalid("SPVX layer material slot is invalid".into())
+                })?;
+            let tint = if tint_slot == 0 {
+                None
+            } else {
+                Some(*palette.get((tint_slot - 1) as usize).ok_or_else(|| {
+                    EditorError::Invalid("SPVX layer tint slot is invalid".into())
+                })?)
+            };
+            cells.insert(cell, VoxelLayerCell { material, tint });
+        }
+        layers.push(VoxelLayer {
+            id,
+            name,
+            visible,
+            cells,
+        });
+    }
+    input.finish()?;
+    Ok(layers)
 }
 
 fn encode_voxels(
@@ -556,7 +722,34 @@ fn validate_asset_metadata(asset: &VoxelAssetFile) -> Result<(), EditorError> {
         ));
     }
     validate_name(&asset.name)?;
+    if asset.layers.len() > MAX_LAYERS {
+        return invalid("SPVX has more than 1,024 layers");
+    }
+    if !asset.layers.is_empty() {
+        let mut ids = BTreeSet::new();
+        let mut total_cells = 0_u64;
+        for layer in &asset.layers {
+            validate_name(&layer.name)?;
+            if layer.id == 0 || !ids.insert(layer.id) {
+                return invalid("SPVX layer IDs must be unique and nonzero");
+            }
+            total_cells = total_cells
+                .checked_add(layer.cells.len() as u64)
+                .ok_or_else(|| EditorError::Invalid("SPVX layer cell count overflow".into()))?;
+            if total_cells > MAX_CELLS || layer.cells.values().any(|cell| cell.material == 0) {
+                return invalid("SPVX layer source exceeds limits or contains air");
+            }
+        }
+        let (voxels, colors) = asset.flattened_layers();
+        if asset.voxels != voxels || asset.colors != colors {
+            return invalid("SPVX LAYR composition differs from authoritative VOXL/PALT");
+        }
+    }
     Ok(())
+}
+
+pub(super) fn validate_layered_asset(asset: &VoxelAssetFile) -> Result<(), EditorError> {
+    validate_asset_metadata(asset)
 }
 
 fn validate_name(name: &str) -> Result<(), EditorError> {
@@ -747,5 +940,157 @@ mod tests {
         let mapping = BTreeMap::from([("stone.granite".to_owned(), 1)]);
         let error = decode(&bytes, AssetId(1), &mapping).unwrap_err();
         assert!(error.to_string().contains("not mapped"));
+    }
+
+    #[test]
+    fn layered_asset_round_trip_preserves_hidden_and_overlapping_source() {
+        let mut asset = asset();
+        let origin = VoxelCoord { x: 0, y: 0, z: 0 };
+        let hidden = VoxelCoord { x: 5, y: 0, z: 0 };
+        asset.layers = vec![
+            VoxelLayer {
+                id: 4,
+                name: "Base".into(),
+                visible: true,
+                cells: BTreeMap::from([
+                    (
+                        origin,
+                        VoxelLayerCell {
+                            material: 2,
+                            tint: None,
+                        },
+                    ),
+                    (
+                        VoxelCoord { x: -1, y: 0, z: 2 },
+                        VoxelLayerCell {
+                            material: 2,
+                            tint: None,
+                        },
+                    ),
+                ]),
+            },
+            VoxelLayer {
+                id: 9,
+                name: "Paint".into(),
+                visible: true,
+                cells: BTreeMap::from([
+                    (
+                        origin,
+                        VoxelLayerCell {
+                            material: 3,
+                            tint: Some([54, 151, 62]),
+                        },
+                    ),
+                    (
+                        VoxelCoord { x: 0, y: 0, z: 2 },
+                        VoxelLayerCell {
+                            material: 2,
+                            tint: None,
+                        },
+                    ),
+                    (
+                        VoxelCoord { x: 1, y: 0, z: 2 },
+                        VoxelLayerCell {
+                            material: 3,
+                            tint: Some([54, 151, 62]),
+                        },
+                    ),
+                ]),
+            },
+            VoxelLayer {
+                id: 12,
+                name: "Hidden".into(),
+                visible: false,
+                cells: BTreeMap::from([(
+                    hidden,
+                    VoxelLayerCell {
+                        material: 1,
+                        tint: Some([220, 10, 10]),
+                    },
+                )]),
+            },
+        ];
+        (asset.voxels, asset.colors) = asset.flattened_layers();
+        let bytes = encode(&asset).unwrap();
+        assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 1);
+        let loaded = decode(&bytes, AssetId(99), &crate::default_material_mapping()).unwrap();
+        assert_eq!(loaded.layers, asset.layers);
+        assert_eq!(loaded.voxels, asset.voxels);
+        assert_eq!(loaded.colors, asset.colors);
+        assert_eq!(encode(&loaded).unwrap(), bytes);
+
+        asset.voxels.insert(hidden, 1);
+        assert!(
+            encode(&asset)
+                .unwrap_err()
+                .to_string()
+                .contains("composition")
+        );
+    }
+
+    #[test]
+    fn legacy_static_v1_0_remains_readable_and_reexports_as_v1_1() {
+        let mut bytes = encode(&asset()).unwrap();
+        bytes[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        let loaded = decode(&bytes, AssetId(7), &crate::default_material_mapping()).unwrap();
+        assert!(loaded.layers.is_empty());
+        let upgraded = encode(&loaded).unwrap();
+        assert_eq!(u16::from_le_bytes([upgraded[6], upgraded[7]]), 1);
+    }
+
+    #[test]
+    fn reader_rejects_layer_source_that_disagrees_with_voxl_even_with_valid_hash() {
+        let mut asset = asset();
+        asset.layers = vec![VoxelLayer {
+            id: 1,
+            name: "Base".into(),
+            visible: true,
+            cells: asset
+                .voxels
+                .iter()
+                .map(|(&cell, &material)| {
+                    (
+                        cell,
+                        VoxelLayerCell {
+                            material,
+                            tint: asset.colors.get(&cell).copied(),
+                        },
+                    )
+                })
+                .collect(),
+        }];
+        let mut bytes = encode(&asset).unwrap();
+        let mut offset = 12;
+        let mut hash_offset = None;
+        while offset < bytes.len() {
+            let id: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+            let len =
+                u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            if id == *b"LAYR" {
+                let payload = offset + 16;
+                let visible = payload + 2 + 4 + 1 + 4;
+                bytes[visible] = 0;
+            }
+            if id == *b"HASH" {
+                hash_offset = Some(offset);
+                break;
+            }
+            offset += 16 + len;
+        }
+        let hash_offset = hash_offset.unwrap();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"spall.asset.v1");
+        offset = 12;
+        while offset < hash_offset {
+            let len =
+                u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            hasher.update(&bytes[offset..offset + 4]);
+            hasher.update(&(len as u32).to_le_bytes());
+            hasher.update(&bytes[offset + 16..offset + 16 + len]);
+            offset += 16 + len;
+        }
+        bytes[hash_offset + 16..hash_offset + 48].copy_from_slice(hasher.finalize().as_bytes());
+        let error = decode(&bytes, AssetId(1), &crate::default_material_mapping()).unwrap_err();
+        assert!(error.to_string().contains("composition"));
     }
 }

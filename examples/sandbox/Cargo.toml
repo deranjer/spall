@@ -46,9 +46,15 @@ spall_render = { workspace = true, optional = true }
 spall_server = { path = "../../crates/spall_server" }
 spall_store = { path = "../../crates/spall_store" }
 spall_sim = { path = "../../crates/spall_sim" }
+spall_physics = { workspace = true }
+spall_structure = { workspace = true }
 glam.workspace = true
 serde_json = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
+
+[dev-dependencies]
+image.workspace = true
+wgpu.workspace = true

@@ -43,24 +43,30 @@ authentication, and multiplayer start in T09.
 
 ## ENG-74 — editor MVP (verified 2026-09-19)
 
-The editor is a leaf workspace package (`tools/spall_editor`). Its egui integration shares the device and queue selected by `spall_render::RenderContext` for the presentation surface; no Spall runtime crate imports egui or editor document types.
+The editor is a leaf workspace package (`tools/spall_editor`). Its Yakui integration shares the device and queue selected by `spall_render::RenderContext` for the presentation surface; no Spall runtime crate imports Yakui or editor document types. The scene viewport is drawn by `spall_render::ViewportRenderer` (shadow, HDR opaque and tone-map passes) into a texture that Yakui composites; the editor meshes the composed scene on the CPU (`scene_mesh`) and uses the workspace `glam` for camera and picking math.
 
 | Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by ENG-74 |
 | --- | ---: | --- | --- | --- |
-| egui | 0.36.2 | default features | `MIT OR Apache-2.0` | panels, menus, inspectors and voxel controls |
-| egui-wgpu | 0.36.2 | default features | `MIT OR Apache-2.0` | compositing the editor UI on the native surface |
-| egui-winit | 0.36.2 | default features | `MIT OR Apache-2.0` | native input/window event translation |
-| yakui, yakui-wgpu, yakui-winit | 0.3.0 (Git `d4cba2dabc2a201162ed105cf547ca95a26c44f3`) | workspace Git revision | `MIT OR Apache-2.0` | in-frame interactive client HUD |
+| yakui, yakui-wgpu, yakui-winit | 0.3.0 (Git `d4cba2dabc2a201162ed105cf547ca95a26c44f3`) | workspace Git revision | `MIT OR Apache-2.0` | editor widgets, in-frame client HUD, native input and compositing |
 | ron | 0.10.1 | default features | `MIT OR Apache-2.0` | versioned human-readable project, scene and voxel documents |
 
 ## ENG-89 — renderer and HUD migration (verified 2026-09-23)
 
-The workspace now resolves wgpu and Naga to 30.0.1, the editor's egui crates
-to 0.36.2, and all three Yakui crates to 0.3.0 from one Git revision
+The workspace now resolves wgpu and Naga to 30.0.1 and all three Yakui crates
+to 0.3.0 from one Git revision
 (`d4cba2dabc2a201162ed105cf547ca95a26c44f3`). `cargo tree -d` shows the
-matching renderer versions. Yakui uses the existing interactive client's
-device, queue, surface, and frame; it does not create a second application
-window.
+matching renderer versions. Both the editor and interactive client use Yakui
+with their existing window, device, queue, surface, and frame. The editor no
+longer uses egui.
+
+## ENG-90 — editor Yakui migration
+
+The editor uses the workspace-pinned Yakui, Yakui-wgpu, and Yakui-winit
+revision. Document changes still run through `EditorCommand` and `UndoStack`;
+native input and UI rendering share the editor's winit window and Spall render
+device/queue. The asset workspace displays occupied SPVOX cells as a colored
+X/Z layer preview selected by the Y coordinate; the visual grid is capped at
+32×32 cells per layer.
 
 ## T01 — IDs, schemas, canonical encoding (verified 2026-09-06)
 
@@ -378,6 +384,12 @@ implemented inside `spall_voxel`; `spall_server` reuses its existing
 `spall_sim`, `spall_store`, and `spall_structure` edges for durable eviction
 and dependency loading, and `spall_client` already depends on `spall_voxel`.
 `Cargo.lock` is unchanged.
+
+## Editor file pickers (verified 2026-09-26)
+
+| Direct dependency | Locked version | Enabled feature/configuration | Registry license string | Exercised by |
+| --- | ---: | --- | --- | --- |
+| rfd | 0.17.2 | default features | `MIT` | native open-folder, open-file and save-file dialogs in `tools/spall_editor` (project open/new, `.spvox` import/export) |
 
 ## Verified Windows prerequisites
 
