@@ -61,7 +61,7 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             limits: TransportLimits::default(),
-            handshake_timeout: Duration::from_secs(5),
+            handshake_timeout: handshake_timeout_from_env(),
             heartbeat_interval: Duration::from_millis(500),
             // A dependency-complete baseline may require a bounded, CPU-heavy
             // capture before its first bulk byte is available. Thirty seconds
@@ -88,4 +88,15 @@ impl TransportConfig {
             max_connections: 32,
         }
     }
+}
+
+/// The handshake timeout: `5 s`, or `SPALL_HANDSHAKE_TIMEOUT_MS` when set (a
+/// scenario-harness knob for impaired-network gate runs; production leaves it
+/// unset).
+fn handshake_timeout_from_env() -> Duration {
+    std::env::var("SPALL_HANDSHAKE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(Duration::from_secs(5), Duration::from_millis)
 }

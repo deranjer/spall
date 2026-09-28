@@ -115,6 +115,10 @@ struct Args {
     /// as the player returns. The committed world / agreed hash is unchanged.
     #[arg(long, default_value_t = 0)]
     residency_budget_bricks: usize,
+    /// Refuse a segmented late-join baseline whose manifest declares more decoded bytes than this
+    /// (checked before any segment is decoded).
+    #[arg(long)]
+    baseline_staging_budget_bytes: Option<u64>,
     /// Chebyshev brick radius kept resident around the predicted player.
     #[arg(long, default_value_t = 2)]
     residency_radius_bricks: i64,
@@ -225,6 +229,10 @@ struct CutFileEntry {
     radius: i64,
     #[serde(default)]
     target: CutFileTarget,
+    /// With `"target": "body"`: aim at this raw entity id instead of the sole
+    /// detached body.
+    #[serde(default)]
+    entity: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
@@ -255,7 +263,9 @@ fn read_cuts_file(path: &std::path::Path) -> Vec<Cut> {
                 radius: e.radius,
                 target: match e.target {
                     CutFileTarget::Terrain => ScriptTarget::Terrain,
-                    CutFileTarget::Body => ScriptTarget::DetachedBody,
+                    CutFileTarget::Body => e
+                        .entity
+                        .map_or(ScriptTarget::DetachedBody, ScriptTarget::Body),
                 },
             })
             .collect(),
@@ -457,6 +467,11 @@ fn run_replication(args: Args) -> ExitCode {
                 max_dense_bytes: args.residency_budget_dense_bytes.unwrap_or(u64::MAX),
             },
         ),
+        // Production clients always carry an explicit admission budget.
+        baseline_staging_budget_bytes: Some(
+            args.baseline_staging_budget_bytes
+                .unwrap_or(spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES),
+        ),
         on_replica_ready: None,
         interactive: None,
         client_authoritative: args.client_authoritative,
@@ -645,6 +660,7 @@ fn run_interactive(args: Args) -> ExitCode {
         summary_json: None,
         transport: TransportConfig::default(),
         client_residency: None,
+        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None, // set by `run_interactive_window` itself
         client_authoritative: args.client_authoritative,

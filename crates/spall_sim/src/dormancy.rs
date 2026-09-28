@@ -29,6 +29,9 @@ use std::collections::HashMap;
 
 use spall_core::EntityId;
 
+mod region_index;
+use region_index::RegionIndex;
+
 /// Tunables for [`DormancyPolicy`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DormancyConfig {
@@ -105,6 +108,9 @@ pub struct DormancyPlan {
     pub deactivate: Vec<EntityId>,
     /// Bodies to reactivate, in ascending entity-id order.
     pub reactivate: Vec<EntityId>,
+    /// The subset of [`Self::reactivate`] woken by a hard trigger (a terrain edit next to the body);
+    /// the rest were woken by proximity to an active region.
+    pub reactivate_hard: Vec<EntityId>,
     /// Awake bodies held awake this tick by a nearby active region.
     pub kept_awake_nearby: usize,
     /// Awake bodies partway through their settle countdown.
@@ -172,19 +178,18 @@ impl DormancyPolicy {
 
         let mut ordered: Vec<&BodyDormancyInput> = bodies.iter().collect();
         ordered.sort_by_key(|b| b.entity.get());
+        let regions = RegionIndex::new(regions);
 
         for body in ordered {
             let key = body.entity.get();
-            let near = regions.iter().any(|r| {
-                sphere_gap(body.centre_m, body.radius_m, r.centre_m, r.radius_m)
-                    <= self.config.wake_margin_m
-            });
+            let near = regions.any_near(body.centre_m, body.radius_m, self.config.wake_margin_m);
 
             if body.dormant {
                 self.settle.remove(&key);
                 let since = *self.dormant_since.entry(key).or_insert(tick);
                 if body.hard_wake {
                     plan.reactivate.push(body.entity);
+                    plan.reactivate_hard.push(body.entity);
                     self.dormant_since.remove(&key);
                 } else if near {
                     let held_long_enough =

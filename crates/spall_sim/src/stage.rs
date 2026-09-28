@@ -160,6 +160,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
     let cancel = CancelToken::new();
 
     // Pre-edit structural read set + generation / epoch.
+    let sp_idx = crate::prof::Span::start("stage.structure_index_build");
     let mut index = StructureIndex::build(
         &input.volume,
         input.anchor,
@@ -168,6 +169,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         input.topology_epoch,
         &cancel,
     )?;
+    drop(sp_idx);
     let mut token = index.token();
 
     // Merge in the plan's touched bricks at their pre-edit state.
@@ -194,6 +196,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         .map_err(|_| StageError::EvictedGeometryRequired(Vec::new()))?;
 
     // Dry-run the edit and re-classify support on the result.
+    let sp_dry = crate::prof::Span::start("stage.dry_run_and_reclassify");
     let mut post = input.volume.clone();
     let outcome = post.apply_edit(&plan)?;
     let report = index.apply_edit(
@@ -204,6 +207,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         SearchBudget::UNLIMITED,
     )?;
 
+    drop(sp_dry);
     // Which components detach:
     // - Terrain: every component the support search calls unsupported.
     // - A dynamic body: a free body has no anchor, so keep the largest component
