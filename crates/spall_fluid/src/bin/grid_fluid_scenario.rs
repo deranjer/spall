@@ -283,7 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let g = fixture.grid();
     let dims = g.spec().dimensions();
     println!(
-        "{{\"type\":\"grid_config\",\"backend\":\"MAC-FCT-VOF\",\"preconditioner\":\"{}\",\"scenario\":\"{}\",\"scale\":{},\"refinement_factor\":{},\"grid_dimensions\":[{},{},{}],\"terrain_cell_m\":0.25,\"water_cell_m\":{},\"initial_water_volume_m3\":{:.12},\"density_kg_m3\":{},\"gravity_m_s2\":[0,-9.81,0],\"fixed_outer_tick_s\":{},\"max_substeps_per_outer_tick\":{},\"cfl_limit\":{},\"pressure_tolerance_relative\":{},\"pressure_tolerance_absolute_pa_per_m2_l2\":1e-8,\"pressure_diagnostics\":{},\"fraction_diagnostics\":{},\"stage_diagnostics\":{},\"allocation_diagnostics\":{},\"allocation_tracking_feature_enabled\":{},\"pressure_iteration_limit\":{},\"build_profile\":\"{}\",\"salva_parallel_feature_enabled\":{},\"boundary_conditions\":\"closed x/z/floor, atmospheric free surface, solid faces zero-normal-flow\",\"method_doc\":\"docs/reports/ENG-103-grid-method.md\",\"allocated_solver_bytes\":{},\"hardware\":\"not queried by runner; record host separately\"}}",
+        "{{\"type\":\"grid_config\",\"backend\":\"MAC-FCT-VOF\",\"preconditioner\":\"{}\",\"scenario\":\"{}\",\"scale\":{},\"refinement_factor\":{},\"grid_dimensions\":[{},{},{}],\"terrain_cell_m\":0.25,\"water_cell_m\":{},\"initial_water_volume_m3\":{:.12},\"density_kg_m3\":{},\"gravity_m_s2\":[0,-9.81,0],\"fixed_outer_tick_s\":{},\"max_substeps_per_outer_tick\":{},\"cfl_limit\":{},\"pressure_tolerance_relative\":{},\"pressure_tolerance_absolute_pa_per_m2_l2\":1e-8,\"pressure_diagnostics\":{},\"fraction_diagnostics\":{},\"stage_diagnostics\":{},\"allocation_diagnostics\":{},\"allocation_tracking_feature_enabled\":{},\"pressure_iteration_limit\":{},\"build_profile\":\"{}\",\"rayon_threads\":{},\"boundary_conditions\":\"closed x/z/floor, atmospheric free surface, solid faces zero-normal-flow\",\"method_doc\":\"docs/reports/ENG-103-grid-method.md\",\"allocated_solver_bytes\":{},\"hardware\":\"not queried by runner; record host separately\"}}",
         cfg.preconditioner,
         cfg.scenario,
         cfg.scale,
@@ -309,7 +309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "release"
         },
-        cfg!(feature = "salva-parallel"),
+        rayon::current_num_threads(),
         g.allocated_bytes(),
     );
     let start = Instant::now();

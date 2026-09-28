@@ -827,6 +827,10 @@ integration (tick ordering with committed edits, overlap/displacement policy,
 replication, persistence, dormancy) is the next scoped assignment. See the
 dated sections of `docs/reports/ENG-103.md`.
 
+The Salva particle backend was removed after selection. The grid scenarios now
+build their scene and bit-identical reference volume in
+`fixtures::ReservoirScene`. Production integration is tracked as ENG-105.
+
 Swimming, boats, rigid-body coupling, multiplayer water DTOs, persistence,
 streaming-scale behavior, and replaceable water appearance are later scoped
 assignments. See Loopira ENG-103 for the matching tracked issue.
