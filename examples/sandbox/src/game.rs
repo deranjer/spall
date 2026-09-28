@@ -23,6 +23,9 @@ pub mod materials {
     pub const STONE: MaterialId = MaterialId(1);
     pub const DIRT: MaterialId = MaterialId(2);
     pub const WOOD: MaterialId = MaterialId(3);
+    /// A warm emissive block (ENG-102). Above every earlier id so the manifest
+    /// extends cleanly.
+    pub const LAMP: MaterialId = MaterialId(200);
 }
 
 /// Version of the sandbox's server-authoritative content rules.
@@ -315,6 +318,7 @@ pub fn record_gathered_material_drop(
     material: MaterialId,
     count: u32,
 ) -> Result<(), CraftError> {
+    let material = crate::appearance::base_material(material);
     let item = if material == materials::WOOD {
         items::WOOD_LOG
     } else if material == materials::STONE {
@@ -369,6 +373,8 @@ impl PlayerInventories {
         player_slot: u32,
         removed: &std::collections::BTreeMap<MaterialId, u64>,
     ) -> Result<Vec<ItemStack>, CraftError> {
+        // Appearance variants count as their base material.
+        let removed = &crate::appearance::merge_variants(removed);
         let mut drops = Vec::new();
         for (material, cells_per_item, item) in [
             (materials::WOOD, 16_u64, items::WOOD_LOG),
@@ -398,6 +404,8 @@ impl PlayerInventories {
         player_id: spall_protocol::PlayerId,
         removed: &std::collections::BTreeMap<MaterialId, u64>,
     ) -> Result<Vec<ItemStack>, CraftError> {
+        // Appearance variants count as their base material.
+        let removed = &crate::appearance::merge_variants(removed);
         let mut drops = Vec::new();
         for (material, cells_per_item, item) in [
             (materials::WOOD, 16_u64, items::WOOD_LOG),
@@ -620,8 +628,11 @@ fn def(id: MaterialId, name: &str, density: f32, albedo: [f32; 3]) -> MaterialDe
     }
 }
 
-/// The sandbox world's validated material manifest.
-pub fn manifest() -> MaterialManifest {
+/// The sandbox manifest as first shipped (until ENG-95). Its albedo values were
+/// authored as display (sRGB) picks but stored in a field the manifest contract
+/// defines as linear, so a correct linear renderer showed them pastel. Kept only
+/// as the predecessor of [`manifest`], so worlds saved under it still restore.
+pub fn legacy_manifest_v1() -> MaterialManifest {
     let mut entries = vec![
         MaterialDef {
             id: materials::AIR,
@@ -655,6 +666,116 @@ pub fn manifest() -> MaterialManifest {
             .cloned(),
     );
     MaterialManifest::validated(entries).expect("sandbox manifest is valid")
+}
+
+/// Display (sRGB-encoded) channel to linear light.
+fn srgb_to_linear(channel: f32) -> f32 {
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The sandbox manifest with linear albedos (ENG-95 step 1), before the
+/// appearance variants were added. The predecessor of [`manifest`].
+///
+/// Albedo is linear, as the manifest contract requires. The values are
+/// the original authored picks converted from sRGB, so the world looks as
+/// authored under the linear renderer instead of pastel. Only render fields
+/// change: ids, names and simulation properties are identical to
+/// [`legacy_manifest_v1`], which this manifest declares it supersedes, so
+/// saved worlds restore and are re-stamped at their next checkpoint. Clients
+/// and servers built before this change no longer match the handshake hash.
+pub fn manifest_v2_linear() -> MaterialManifest {
+    let previous = legacy_manifest_v1();
+    let entries = previous
+        .entries()
+        .iter()
+        .cloned()
+        .map(|mut def| {
+            def.render.albedo = def.render.albedo.map(srgb_to_linear);
+            def
+        })
+        .collect();
+    MaterialManifest::validated(entries)
+        .and_then(|manifest| manifest.superseding_appearance(&previous))
+        .expect("sandbox manifest is valid and differs from v1 by appearance alone")
+}
+
+/// The manifest with the appearance variants but before the emissive lamp
+/// (ENG-95 step 2). The predecessor of [`manifest`].
+///
+/// ENG-95 step 2: the linear manifest plus the appearance variants of
+/// [`crate::appearance`] -- extra materials with the same simulation properties
+/// as their base and an authored colour, so a tint survives edits, body splits,
+/// replication and reload as an ordinary `MaterialId`. It **extends**
+/// [`manifest_v2_linear`] (ids above every earlier material, nothing else
+/// changed), so worlds saved under it or under `legacy_manifest_v1` still
+/// restore. Clients and servers built before this change no longer match the
+/// handshake hash.
+pub fn manifest_v3_variants() -> MaterialManifest {
+    let previous = manifest_v2_linear();
+    let mut entries = previous.entries().to_vec();
+    // The frozen v3 rows, not the mutable current palette: this is a
+    // historical definition and its hash never changes.
+    entries.extend(crate::appearance::variant_entries_of(
+        crate::appearance::frozen_v3_variants(),
+        &previous,
+    ));
+    MaterialManifest::validated(entries)
+        .and_then(|manifest| manifest.superseding_extension(&previous))
+        .expect("sandbox manifest extends v2 by appearance variants only")
+}
+
+/// The emissive lamp: warm, rough, self-lit. Emission is `albedo x 5`, the
+/// encoding the renderer uses for every emitter, so it lights its surroundings
+/// through the bounce and reads as glowing in the direct pass. Solid and
+/// structural like stone, lighter.
+fn lamp_def() -> MaterialDef {
+    let mut def = def(materials::LAMP, "lamp", 900.0, [0.8, 0.5, 0.15]);
+    def.render.albedo = [0.8, 0.5, 0.15];
+    def.render.roughness = 0.6;
+    def.render.emissive = [4.0, 2.5, 0.75];
+    def
+}
+
+/// The manifest with the emissive lamp (id 200), before any later appearance
+/// variants (ENG-102). [`manifest_v3_variants`] plus the lamp; the predecessor of
+/// [`manifest`] once variants are added, and equal to it until then.
+pub fn manifest_v4_lamp() -> MaterialManifest {
+    let previous = manifest_v3_variants();
+    let mut entries = previous.entries().to_vec();
+    entries.push(lamp_def());
+    MaterialManifest::validated(entries)
+        .and_then(|manifest| manifest.superseding_extension(&previous))
+        .expect("sandbox manifest extends v3 by the emissive lamp only")
+}
+
+/// `previous` extended by `variants` (appended under their explicit ids). Errors
+/// if a row reuses an id, renames or recolours nothing existing is possible
+/// here, and every id must exceed `previous`'s highest.
+pub fn extend_with_variants(
+    previous: &MaterialManifest,
+    variants: Vec<crate::appearance::Variant>,
+) -> Result<MaterialManifest, spall_core::ManifestError> {
+    if variants.is_empty() {
+        return Ok(previous.clone());
+    }
+    let mut entries = previous.entries().to_vec();
+    entries.extend(crate::appearance::variant_entries_of(variants, previous));
+    MaterialManifest::validated(entries)?.superseding_extension(previous)
+}
+
+/// The sandbox world's validated material manifest: [`manifest_v4_lamp`] plus
+/// every appearance variant in `appearance_extensions.rs` (none yet, so it
+/// equals v4). Extending the palette appends variants under new ids, so it
+/// extends this manifest chain and worlds saved under any earlier manifest still
+/// restore with unchanged meaning. Clients and servers built with a different
+/// palette do not match the handshake hash.
+pub fn manifest() -> MaterialManifest {
+    extend_with_variants(&manifest_v4_lamp(), crate::appearance::extension_variants())
+        .expect("sandbox palette extensions extend the lamp manifest")
 }
 
 /// Server policy for the example's network-visible tools. The server owns the
@@ -884,6 +1005,29 @@ mod tests {
         let m = manifest();
         assert_eq!(m.get(materials::WOOD).unwrap().name, "wood");
         assert!(m.get(MaterialId(99)).is_none());
+    }
+
+    #[test]
+    fn the_linear_manifest_supersedes_v1_by_appearance_and_keeps_authored_looks() {
+        let (old, new) = (legacy_manifest_v1(), manifest_v2_linear());
+        assert_eq!(new.appearance_predecessors(), std::slice::from_ref(&old));
+        assert_ne!(
+            spall_protocol::content_manifest_hash(&new),
+            spall_protocol::content_manifest_hash(&old),
+            "the migration is a deliberate hash change"
+        );
+        // Grass (id 10) was authored as the display colour (0.25, 0.55, 0.2).
+        let grass = new.get(MaterialId(10)).unwrap().render.albedo;
+        for (linear, srgb) in grass.into_iter().zip([0.25_f32, 0.55, 0.2]) {
+            assert!(linear < srgb, "linear albedo is darker than the sRGB pick");
+            let encoded = 1.055 * linear.powf(1.0 / 2.4) - 0.055;
+            assert!((encoded - srgb).abs() < 1e-4, "{encoded} vs {srgb}");
+        }
+        // Air stays black; sim properties are untouched.
+        assert_eq!(new.get(materials::AIR).unwrap().render.albedo, [0.0; 3]);
+        for (a, b) in new.entries().iter().zip(old.entries()) {
+            assert_eq!(a.sim, b.sim);
+        }
     }
 
     #[test]

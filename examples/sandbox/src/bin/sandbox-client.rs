@@ -13,6 +13,10 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
     about = "Spall sandbox render-window / replication client"
 )]
 struct Args {
+    /// Open the local interactive MAC water inspection viewer. This private
+    /// debug simulation is separate from the authoritative game tick.
+    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive"])]
+    grid_fluid_demo: bool,
     /// T00 offline render host (no transport).
     #[arg(long)]
     offline: bool,
@@ -35,6 +39,11 @@ struct Args {
     /// `--move` if both are given.
     #[arg(long)]
     interactive: bool,
+    /// Lighting environment for `--interactive`: studio, daylight, overcast,
+    /// sunset or night. Defaults to daylight. The editor saves the choice in
+    /// the scene; `cargo xtask play` forwards it here.
+    #[arg(long)]
+    environment: Option<String>,
     /// Versioned game asset manifest required when the server serves custom assets.
     #[arg(long)]
     content_manifest: Option<PathBuf>,
@@ -288,6 +297,20 @@ fn main() -> ExitCode {
     sandbox::init_tracing();
     let args = Args::parse();
 
+    if args.grid_fluid_demo {
+        return match spall_client::run_grid_fluid_demo_window() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error @ spall_client::ClientError::Gpu(_)) => {
+                eprintln!("sandbox-client: {error}");
+                ExitCode::from(3)
+            }
+            Err(error) => {
+                eprintln!("sandbox-client: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     if args.connect.is_some() && args.interactive {
         return run_interactive(args);
     }
@@ -533,6 +556,22 @@ fn run_interactive(args: Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let environment = match args.environment.as_deref() {
+        None => spall_client::EnvironmentPreset::Daylight,
+        Some(key) => match spall_client::EnvironmentPreset::from_key(key) {
+            Some(preset) => preset,
+            None => {
+                eprintln!(
+                    "sandbox-client: unknown --environment `{key}` (expected one of: {})",
+                    spall_client::EnvironmentPreset::ALL
+                        .map(|p| p.key())
+                        .join(", ")
+                );
+                return ExitCode::from(2);
+            }
+        },
+    }
+    .environment();
     let connect_addr = args.connect.expect("checked by caller");
     let (Some(fp_file), Some(token_file)) = (args.server_fingerprint, args.join_token_file) else {
         eprintln!("sandbox-client: --connect requires --server-fingerprint and --join-token-file");
@@ -610,11 +649,12 @@ fn run_interactive(args: Args) -> ExitCode {
         interactive: None, // set by `run_interactive_window` itself
         client_authoritative: args.client_authoritative,
     };
-    match spall_client::run_interactive_window_with_progression(
+    match spall_client::run_interactive_window_with_environment(
         config,
         sandbox::game::manifest(),
         asset_hash,
         progression,
+        environment,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error @ spall_client::ClientError::Gpu(_)) => {

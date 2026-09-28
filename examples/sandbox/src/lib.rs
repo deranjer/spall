@@ -1,6 +1,10 @@
 //! Game-owned configuration belongs here.
 
+pub mod appearance;
+pub mod appearance_extensions;
+pub mod appearance_v3;
 pub mod content;
+pub mod editor_scene;
 /// Minimal game content (material catalog, player tools) that turns tool use
 /// into engine [`spall_sim::EditIntent`]s. The engine never imports this.
 pub mod game;

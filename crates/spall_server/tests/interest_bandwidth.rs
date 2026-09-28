@@ -83,6 +83,8 @@ fn base_config(
         contact_damage: None,
         dormancy: None,
         timing_window: None,
+        credential_registry_file: None,
+        custom_world: None,
     }
 }
 

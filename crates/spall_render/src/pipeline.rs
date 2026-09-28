@@ -7,8 +7,11 @@ use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
+use crate::environment::Environment;
 use crate::indirect::{IndirectPipeline, IndirectResources};
+use crate::instances::{CubeInstance, CubeVertex};
 use crate::scene::Material;
+use crate::sky_visibility::{SkyPipeline, SkyVisibility};
 use crate::vertex::GpuVertex;
 
 pub const CASCADE_COUNT: usize = 4;
@@ -27,6 +30,10 @@ pub enum DebugView {
     Roughness,
     /// T13 irradiance only: direct sun and T12 ambient are disabled.
     IndirectOnly,
+    /// Sun shadow visibility alone (`1` lit, `0` shadowed), after PCSS.
+    ShadowVisibility,
+    /// Sky visibility alone (`1` open sky, `0` enclosed) at each surface.
+    SkyVisibility,
 }
 
 impl DebugView {
@@ -39,6 +46,8 @@ impl DebugView {
             Self::ShadowCascades => 4.0,
             Self::Roughness => 5.0,
             Self::IndirectOnly => 6.0,
+            Self::ShadowVisibility => 7.0,
+            Self::SkyVisibility => 8.0,
         }
     }
 
@@ -51,6 +60,8 @@ impl DebugView {
             Self::ShadowCascades => "shadow_cascades",
             Self::Roughness => "roughness",
             Self::IndirectOnly => "indirect_only",
+            Self::ShadowVisibility => "shadow_visibility",
+            Self::SkyVisibility => "sky_visibility",
         }
     }
 }
@@ -84,7 +95,10 @@ struct Globals {
     sun_dir: [f32; 4],
     cascade_splits: [f32; 4],
     params: [f32; 4],
-    light: [f32; 4],
+    /// Sun tint in `rgb`, intensity in `w`.
+    sun: [f32; 4],
+    sky_color: [f32; 4],
+    ground_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -111,6 +125,9 @@ struct ToneGlobals {
 pub struct ScenePipeline {
     opaque: wgpu::RenderPipeline,
     shadow: wgpu::RenderPipeline,
+    opaque_cube: wgpu::RenderPipeline,
+    transparent_cube: wgpu::RenderPipeline,
+    shadow_cube: wgpu::RenderPipeline,
     tone_map: wgpu::RenderPipeline,
     scene_layout: wgpu::BindGroupLayout,
     shadow_layout: wgpu::BindGroupLayout,
@@ -124,11 +141,28 @@ pub struct ScenePipeline {
     shadow_sampler: wgpu::Sampler,
     linear_sampler: wgpu::Sampler,
     indirect: IndirectPipeline,
+    sky: SkyPipeline,
+    /// Bound wherever no sky occupancy exists; the shader then uses the
+    /// legacy hemispheric ambient.
+    sky_disabled: wgpu::BindGroup,
+    _sky_disabled_buffers: Vec<wgpu::Buffer>,
     sun_dir: Vec3,
 }
 
 impl ScenePipeline {
     pub fn new(device: &wgpu::Device) -> Self {
+        Self::new_for_output(device, COLOR_FORMAT)
+    }
+
+    /// As [`Self::new`], with the tone-map pass targeting `output_format`
+    /// (a swapchain format for a host that tone-maps straight to the window).
+    /// The format must be an sRGB one: the tone map writes linear values and
+    /// relies on the target's hardware encode, exactly once.
+    pub fn new_for_output(device: &wgpu::Device, output_format: wgpu::TextureFormat) -> Self {
+        assert!(
+            output_format.is_srgb(),
+            "the tone map needs an sRGB output format, got {output_format:?}"
+        );
         let opaque_shader = shader(
             device,
             "spall-t12-opaque",
@@ -208,17 +242,51 @@ impl ScenePipeline {
             "ScenePipeline::new: IndirectPipeline::new (3x vkCreateComputePipelines)",
         );
         let indirect = IndirectPipeline::new(device);
+        let sky = SkyPipeline::new(device);
+        let (sky_disabled, sky_disabled_buffers) = sky.disabled(device);
         crate::probe::mark("ScenePipeline::new: vkCreateGraphicsPipelines(opaque)");
         let opaque = create_opaque_pipeline(
             device,
             &opaque_shader,
             &scene_layout,
             indirect.display_layout(),
+            sky.display_layout(),
+            "vs_main",
+            &[Some(GpuVertex::LAYOUT)],
+        );
+        let opaque_cube = create_opaque_pipeline(
+            device,
+            &opaque_shader,
+            &scene_layout,
+            indirect.display_layout(),
+            sky.display_layout(),
+            "vs_cube",
+            &[Some(CubeVertex::LAYOUT), Some(CubeInstance::LAYOUT)],
+        );
+        let transparent_cube = create_transparent_cube_pipeline(
+            device,
+            &opaque_shader,
+            &scene_layout,
+            indirect.display_layout(),
+            sky.display_layout(),
         );
         crate::probe::mark("ScenePipeline::new: vkCreateGraphicsPipelines(shadow)");
-        let shadow = create_shadow_pipeline(device, &shadow_shader, &shadow_layout);
+        let shadow = create_shadow_pipeline(
+            device,
+            &shadow_shader,
+            &shadow_layout,
+            "vs_main",
+            &[Some(GpuVertex::LAYOUT)],
+        );
+        let shadow_cube = create_shadow_pipeline(
+            device,
+            &shadow_shader,
+            &shadow_layout,
+            "vs_cube",
+            &[Some(CubeVertex::LAYOUT), Some(CubeInstance::LAYOUT)],
+        );
         crate::probe::mark("ScenePipeline::new: vkCreateGraphicsPipelines(tone_map)");
-        let tone_map = create_tone_pipeline(device, &tone_shader, &tone_layout);
+        let tone_map = create_tone_pipeline(device, &tone_shader, &tone_layout, output_format);
         crate::probe::mark("ScenePipeline::new: all 6 pipelines OK (3 compute + 3 graphics)");
         let globals_buffer = uniform_buffer::<Globals>(device, "spall-t12-globals");
         let shadow_globals_buffers = (0..CASCADE_COUNT)
@@ -275,6 +343,9 @@ impl ScenePipeline {
         Self {
             opaque,
             shadow,
+            opaque_cube,
+            transparent_cube,
+            shadow_cube,
             tone_map,
             scene_layout,
             shadow_layout,
@@ -288,6 +359,9 @@ impl ScenePipeline {
             shadow_sampler,
             linear_sampler,
             indirect,
+            sky,
+            sky_disabled,
+            _sky_disabled_buffers: sky_disabled_buffers,
             sun_dir: default_sun_dir(),
         }
     }
@@ -297,6 +371,33 @@ impl ScenePipeline {
     }
     pub fn shadow(&self) -> &wgpu::RenderPipeline {
         &self.shadow
+    }
+    /// The bind group (`@group(2)`) that disables sky visibility.
+    pub fn sky_disabled_bind(&self) -> &wgpu::BindGroup {
+        &self.sky_disabled
+    }
+    pub(crate) fn sky_pipeline(&self) -> &SkyPipeline {
+        &self.sky
+    }
+    /// A sky-visibility resource set for one camera-local cache.
+    pub fn create_sky_visibility(
+        &self,
+        device: &wgpu::Device,
+        materials: &wgpu::Buffer,
+    ) -> SkyVisibility {
+        self.sky.create(device, materials)
+    }
+    /// Instanced-cube variant of [`Self::opaque`] (same bind groups).
+    pub fn opaque_cube(&self) -> &wgpu::RenderPipeline {
+        &self.opaque_cube
+    }
+    /// Alpha-blended cube variant. Draw back-to-front after opaque geometry.
+    pub fn transparent_cube(&self) -> &wgpu::RenderPipeline {
+        &self.transparent_cube
+    }
+    /// Instanced-cube variant of [`Self::shadow`] (same bind group).
+    pub fn shadow_cube(&self) -> &wgpu::RenderPipeline {
+        &self.shadow_cube
     }
     pub fn tone_map(&self) -> &wgpu::RenderPipeline {
         &self.tone_map
@@ -346,7 +447,7 @@ impl ScenePipeline {
         let gpu: Vec<GpuMaterial> = source
             .iter()
             .map(|m| GpuMaterial {
-                base_color: [m.base_color[0], m.base_color[1], m.base_color[2], 1.0],
+                base_color: [m.base_color[0], m.base_color[1], m.base_color[2], m.opacity],
                 params: [
                     m.roughness.clamp(0.04, 1.0),
                     m.metallic.clamp(0.0, 1.0),
@@ -375,16 +476,50 @@ impl ScenePipeline {
         exposure: f32,
         materials: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        let (light_view_proj, cascade_splits) = cascade_data(camera, self.sun_dir);
+        let environment = Environment {
+            sun_dir: self.sun_dir,
+            exposure,
+            ..Environment::default()
+        };
+        self.scene_bind_group_lit(device, queue, camera, view, &environment, materials)
+    }
+
+    /// [`Self::scene_bind_group`] lit by `environment` (its sun direction,
+    /// tints and ambient) instead of the fixed default. The caller must use
+    /// the same `environment.sun_dir` for the shadow cascades.
+    pub fn scene_bind_group_lit(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        camera: &Camera,
+        view: DebugView,
+        environment: &Environment,
+        materials: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        let (light_view_proj, cascade_splits) = cascade_data(camera, environment.sun_dir);
+        let [sr, sg, sb] = environment.sun_color;
+        let [kr, kg, kb] = environment.sky;
+        let [gr, gg, gb] = environment.ground;
         let globals = Globals {
             view_proj: camera.view_projection().to_cols_array_2d(),
             view: camera.view().to_cols_array_2d(),
             light_view_proj: light_view_proj.map(|matrix| matrix.to_cols_array_2d()),
             camera_pos: camera.position.extend(0.0).to_array(),
-            sun_dir: self.sun_dir.extend(0.0).to_array(),
+            // `w`: tan of the sun's half angular diameter, the PCSS light size.
+            sun_dir: environment
+                .sun_dir
+                .extend((environment.sun_angular_diameter_deg.to_radians() * 0.5).tan())
+                .to_array(),
             cascade_splits,
-            params: [view.code(), camera.z_near, camera.z_far, exposure],
-            light: [4.5, 0.13, 0.30, 0.0],
+            params: [
+                view.code(),
+                camera.z_near,
+                camera.z_far,
+                environment.exposure,
+            ],
+            sun: [sr, sg, sb, environment.sun_intensity],
+            sky_color: [kr, kg, kb, 0.0],
+            ground_color: [gr, gg, gb, 0.0],
         };
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -508,10 +643,13 @@ fn create_opaque_pipeline(
     shader: &wgpu::ShaderModule,
     layout: &wgpu::BindGroupLayout,
     indirect_layout: &wgpu::BindGroupLayout,
+    sky_layout: &wgpu::BindGroupLayout,
+    vertex_entry: &str,
+    vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
 ) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("spall-t12-opaque-layout"),
-        bind_group_layouts: &[Some(layout), Some(indirect_layout)],
+        bind_group_layouts: &[Some(layout), Some(indirect_layout), Some(sky_layout)],
         immediate_size: 0,
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -519,8 +657,8 @@ fn create_opaque_pipeline(
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
-            buffers: &[Some(GpuVertex::LAYOUT)],
+            entry_point: Some(vertex_entry),
+            buffers: vertex_buffers,
             compilation_options: Default::default(),
         },
         primitive: opaque_primitive(),
@@ -547,10 +685,57 @@ fn create_opaque_pipeline(
     })
 }
 
+fn create_transparent_cube_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::BindGroupLayout,
+    indirect_layout: &wgpu::BindGroupLayout,
+    sky_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("spall-debug-transparent-cube-layout"),
+        bind_group_layouts: &[Some(layout), Some(indirect_layout), Some(sky_layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("spall-debug-transparent-cube-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_cube"),
+            buffers: &[Some(CubeVertex::LAYOUT), Some(CubeInstance::LAYOUT)],
+            compilation_options: Default::default(),
+        },
+        primitive: opaque_primitive(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_shadow_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
     layout: &wgpu::BindGroupLayout,
+    vertex_entry: &str,
+    vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
 ) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("spall-shadow-layout"),
@@ -562,8 +747,8 @@ fn create_shadow_pipeline(
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
-            buffers: &[Some(GpuVertex::LAYOUT)],
+            entry_point: Some(vertex_entry),
+            buffers: vertex_buffers,
             compilation_options: Default::default(),
         },
         primitive: opaque_primitive(),
@@ -589,6 +774,7 @@ fn create_tone_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
     layout: &wgpu::BindGroupLayout,
+    output_format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("spall-tone-layout"),
@@ -614,7 +800,7 @@ fn create_tone_pipeline(
             module: shader,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
-                format: COLOR_FORMAT,
+                format: output_format,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],

@@ -273,6 +273,10 @@ impl AssetStore {
 pub struct LoadedVoxelCell {
     pub cell: GlobalCell,
     pub material: MaterialId,
+    /// The authored display tint (sRGB), if the cell has one. The static game
+    /// importer rejects tints; the editor-scene importer maps it to an
+    /// appearance variant of `material` (see `crate::appearance`).
+    pub tint: Option<[u8; 3]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +363,8 @@ fn validate_spvox(id: AssetId, bytes: &[u8]) -> Result<(), ContentError> {
     let mut saw_parts = false;
     let mut saw_structure = false;
     let mut saw_animation = false;
+    let mut saw_layers = false;
+    let mut meta_payload = None;
     let mut saw_hash = false;
     while offset < bytes.len() {
         if chunk_count >= MAX_SPVOX_CHUNKS
@@ -412,13 +418,19 @@ fn validate_spvox(id: AssetId, bytes: &[u8]) -> Result<(), ContentError> {
                 return Err(ContentError::InvalidSpvox(id));
             }
             match chunk_id {
-                b"META" if !saw_meta && chunk_count == 0 => saw_meta = true,
+                b"META" if !saw_meta && chunk_count == 0 => {
+                    saw_meta = true;
+                    meta_payload = Some(raw.clone());
+                }
                 b"MTRL" if !saw_materials => saw_materials = true,
                 b"VOXL" if !saw_voxels => saw_voxels = true,
                 b"PALT" if !saw_palette => saw_palette = true,
                 b"PART" if !saw_parts => saw_parts = true,
                 b"STRC" if !saw_structure => saw_structure = true,
                 b"ANIM" if !saw_animation => saw_animation = true,
+                b"LAYR" if !saw_layers && u16::from_le_bytes([bytes[6], bytes[7]]) >= 1 => {
+                    saw_layers = true;
+                }
                 b"META" | b"MTRL" | b"VOXL" | b"HASH" => {
                     return Err(ContentError::InvalidSpvox(id));
                 }
@@ -434,6 +446,20 @@ fn validate_spvox(id: AssetId, bytes: &[u8]) -> Result<(), ContentError> {
     if !saw_meta || !saw_materials || !saw_voxels || !saw_hash {
         return Err(ContentError::InvalidSpvox(id));
     }
+    let meta = meta_payload.ok_or(ContentError::InvalidSpvox(id))?;
+    let mut input = ByteReader::new(&meta);
+    input.take(16)?;
+    input.u8()?;
+    input.u8()?;
+    for _ in 0..3 {
+        input.i32()?;
+    }
+    input.string_u16()?;
+    let required = input.u64()?;
+    let optional = input.u64()?;
+    if required & !1 != 0 || optional & !1 != 0 || (optional & 1 != 0) != saw_layers {
+        return Err(ContentError::UnsupportedSpvoxFeature(id));
+    }
     Ok(())
 }
 
@@ -441,6 +467,26 @@ fn decode_static_voxels(
     id: AssetId,
     bytes: &[u8],
     material_mapping: &BTreeMap<String, MaterialId>,
+) -> Result<LoadedVoxelAsset, ContentError> {
+    decode_static_voxels_with(id, bytes, material_mapping, false)
+}
+
+/// Decodes an editor-authored static SPVX asset for scene playback. Display
+/// tints are accepted and dropped: runtime cells carry only a material, so the
+/// appearance at play time comes from the mapped material.
+pub fn decode_editor_voxels(
+    id: AssetId,
+    bytes: &[u8],
+    material_mapping: &BTreeMap<String, MaterialId>,
+) -> Result<LoadedVoxelAsset, ContentError> {
+    decode_static_voxels_with(id, bytes, material_mapping, true)
+}
+
+fn decode_static_voxels_with(
+    id: AssetId,
+    bytes: &[u8],
+    material_mapping: &BTreeMap<String, MaterialId>,
+    allow_display_tints: bool,
 ) -> Result<LoadedVoxelAsset, ContentError> {
     validate_spvox(id, bytes)?;
     let mut chunks = BTreeMap::<[u8; 4], Vec<u8>>::new();
@@ -487,7 +533,10 @@ fn decode_static_voxels(
     }
     let pivot_subcells = [input.i32()?, input.i32()?, input.i32()?];
     let name = input.string_u16()?;
-    if name.is_empty() || input.u64()? != 0 || input.u64()? != 0 {
+    if name.is_empty()
+        || input.u64()? != 0
+        || input.u64()? != u64::from(chunks.contains_key(b"LAYR"))
+    {
         return Err(ContentError::UnsupportedSpvoxFeature(id));
     }
     let tag_count = input.u16()? as usize;
@@ -510,30 +559,26 @@ fn decode_static_voxels(
         if key.is_empty() || previous_key.as_ref().is_some_and(|prior| prior >= &key) {
             return Err(ContentError::InvalidSpvox(id));
         }
-        let material = material_mapping
-            .get(&key)
-            .copied()
-            .filter(|material| material.0 != 0)
-            .ok_or_else(|| ContentError::UnmappedMaterial(id, key.clone()))?;
+        materials.push(key.clone());
         previous_key = Some(key);
-        materials.push(material);
     }
     input.finish()?;
 
-    let palette_count = chunks
+    let palette: Vec<[u8; 3]> = chunks
         .get(b"PALT")
         .map(|payload| {
             let mut reader = ByteReader::new(payload);
             let count = reader.u16()? as usize;
-            reader.take(count.checked_mul(3).ok_or(ContentError::InvalidSpvox(id))?)?;
+            if count > 4096 {
+                return Err(ContentError::InvalidSpvox(id));
+            }
+            let colors =
+                reader.take(count.checked_mul(3).ok_or(ContentError::InvalidSpvox(id))?)?;
             reader.finish()?;
-            Ok::<_, ContentError>(count)
+            Ok::<_, ContentError>(colors.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
         })
         .transpose()?
-        .unwrap_or(0);
-    if palette_count > 4096 {
-        return Err(ContentError::InvalidSpvox(id));
-    }
+        .unwrap_or_default();
 
     let voxel_payload = chunks.get(b"VOXL").ok_or(ContentError::InvalidSpvox(id))?;
     let mut input = ByteReader::new(voxel_payload);
@@ -557,13 +602,27 @@ fn decode_static_voxels(
         if part_id != 1 || length == 0 || material_slot == 0 {
             return Err(ContentError::UnsupportedSpvoxFeature(id));
         }
-        if tint_slot != 0 {
+        if tint_slot != 0 && !allow_display_tints {
             return Err(ContentError::UnsupportedSpvoxFeature(id));
         }
-        let material = materials
+        let key = materials
             .get(usize::from(material_slot - 1))
-            .copied()
             .ok_or(ContentError::InvalidSpvox(id))?;
+        let material = material_mapping
+            .get(key)
+            .copied()
+            .filter(|material| material.0 != 0)
+            .ok_or_else(|| ContentError::UnmappedMaterial(id, key.clone()))?;
+        // Tint slots are one-based palette references; zero means "the
+        // material's own appearance".
+        let tint = match tint_slot {
+            0 => None,
+            slot => Some(
+                *palette
+                    .get(usize::from(slot) - 1)
+                    .ok_or(ContentError::InvalidSpvox(id))?,
+            ),
+        };
         let endpoint = i64::from(x) + i64::from(length) - 1;
         if endpoint > i64::from(i32::MAX) {
             return Err(ContentError::InvalidSpvox(id));
@@ -592,6 +651,7 @@ fn decode_static_voxels(
             cells.push(LoadedVoxelCell {
                 cell: GlobalCell::new(i64::from(x) + i64::from(dx), i64::from(y), i64::from(z)),
                 material,
+                tint,
             });
         }
         previous = Some((z, y, x, endpoint + 1, material_slot, tint_slot));
@@ -700,4 +760,90 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, BoundedReadError> {
         return Err(BoundedReadError::TooLarge);
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+
+    fn chunk(bytes: &mut Vec<u8>, hasher: &mut blake3::Hasher, id: &[u8; 4], payload: &[u8]) {
+        bytes.extend_from_slice(id);
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        hasher.update(id);
+        hasher.update(&(payload.len() as u32).to_le_bytes());
+        hasher.update(payload);
+    }
+
+    fn layered_asset() -> Vec<u8> {
+        let mut bytes = b"SPVX".to_vec();
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"spall.asset.v1");
+        let mut meta = vec![1; 16];
+        meta.extend_from_slice(&[0; 14]); // cell size, axes, pivot
+        meta.extend_from_slice(&1_u16.to_le_bytes());
+        meta.push(b'x');
+        meta.extend_from_slice(&0_u64.to_le_bytes());
+        meta.extend_from_slice(&1_u64.to_le_bytes());
+        meta.extend_from_slice(&0_u16.to_le_bytes());
+        chunk(&mut bytes, &mut hasher, b"META", &meta);
+        let mut materials = 2_u16.to_le_bytes().to_vec();
+        materials.push(13);
+        materials.extend_from_slice(b"stone.granite");
+        materials.push(8);
+        materials.extend_from_slice(b"wood.oak");
+        chunk(&mut bytes, &mut hasher, b"MTRL", &materials);
+        let mut voxels = vec![0];
+        voxels.extend_from_slice(&1_u32.to_le_bytes());
+        voxels.extend_from_slice(&1_u32.to_le_bytes()); // root part
+        voxels.extend_from_slice(&[0; 12]); // xyz
+        voxels.extend_from_slice(&1_u32.to_le_bytes()); // length
+        voxels.extend_from_slice(&2_u16.to_le_bytes()); // material slot
+        voxels.extend_from_slice(&0_u16.to_le_bytes()); // tint slot
+        chunk(&mut bytes, &mut hasher, b"VOXL", &voxels);
+        let mut layers = 2_u16.to_le_bytes().to_vec();
+        layers.extend_from_slice(&1_u32.to_le_bytes()); // layer id
+        layers.push(4);
+        layers.extend_from_slice(b"Base");
+        layers.push(1); // visible
+        layers.extend_from_slice(&1_u32.to_le_bytes());
+        layers.extend_from_slice(&[0; 12]);
+        layers.extend_from_slice(&2_u16.to_le_bytes());
+        layers.extend_from_slice(&0_u16.to_le_bytes());
+        layers.extend_from_slice(&2_u32.to_le_bytes()); // hidden layer id
+        layers.push(6);
+        layers.extend_from_slice(b"Hidden");
+        layers.push(0);
+        layers.extend_from_slice(&1_u32.to_le_bytes());
+        layers.extend_from_slice(&1_i32.to_le_bytes()); // x
+        layers.extend_from_slice(&0_i32.to_le_bytes()); // y
+        layers.extend_from_slice(&0_i32.to_le_bytes()); // z
+        layers.extend_from_slice(&1_u16.to_le_bytes()); // hidden-only material
+        layers.extend_from_slice(&0_u16.to_le_bytes());
+        chunk(&mut bytes, &mut hasher, b"LAYR", &layers);
+        let digest = hasher.finalize();
+        bytes.extend_from_slice(b"HASH");
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&32_u32.to_le_bytes());
+        bytes.extend_from_slice(&32_u32.to_le_bytes());
+        bytes.extend_from_slice(digest.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn static_import_uses_voxl_and_accepts_layer_metadata() {
+        let bytes = layered_asset();
+        let mapping = BTreeMap::from([("wood.oak".to_owned(), MaterialId(2))]);
+        let loaded = decode_static_voxels(AssetId(7), &bytes, &mapping).unwrap();
+        assert_eq!(loaded.cells.len(), 1);
+        assert_eq!(loaded.cells[0].material, MaterialId(2));
+        let mut missing_layer = bytes.clone();
+        missing_layer[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(validate_spvox(AssetId(7), &missing_layer).is_err());
+    }
 }

@@ -20,7 +20,7 @@ spall_net     -> spall_protocol                 Quinn transport adapter (Tokio; 
 spall_store   -> spall_protocol                 checkpoint/journal bytes and indexes
 spall_render  -> spall_mesh, spall_core            wgpu resources and render passes
 spall_server  -> spall_sim, spall_net, spall_store, spall_jobs
-spall_client  -> spall_net, spall_voxel, spall_physics, spall_render, spall_jobs
+spall_client  -> spall_net, spall_voxel, spall_physics, spall_render, spall_jobs, spall_fluid
 sandbox (example) -> spall_server, spall_client   game rules and executable entry points
 xtask                                    process/scenario/build orchestration
 ```
@@ -38,6 +38,12 @@ particle backend was evaluated and removed. Evidence is in
 advanced by the authoritative `spall_sim` tick, coupled to Rapier, replicated,
 or persisted; that integration is ENG-105. Rapier remains the sole rigid-body
 solver.
+
+ENG-104 adds a local-only client presentation path to `spall_fluid` for the
+interactive feasibility playground. That explicit `sandbox-client --grid-fluid-demo`
+mode owns and advances its own grid fixture for visual experimentation; normal
+networked clients do not advance or claim authority over fluid state. Gameplay
+authority, replication, and recovery remain future work.
 
 Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
 in-process `cargo xtask net-check` transport harness. Add `games/survival` only
@@ -201,6 +207,8 @@ Implement in this order:
 4. Dirty-region updates for terrain edits and both old/new AABBs of moving objects. Clear/rebuild overlapping occupancy correctly; removing one object must not erase another. Emissive sources contribute to lighting. Limit bounce count initially to one diffuse bounce.
 5. Temporal reprojection with depth/normal rejection, neighborhood clamping, disocclusion handling, and history invalidation after edits. Denoise and composite; reserve full-resolution raster silhouettes even when lighting is lower resolution.
 6. Expand quality/range only after G2: multiple clipmap levels, better diffuse visibility, local lights, reflections, and distant LOD.
+
+R3 (ENG-96) adds two direct-light contracts to the shared renderer (`docs/reports/ENG-96.md`): sun shadows are cascaded maps with normal-offset bias and physically-scaled PCSS penumbrae (the sun's angular size is an `Environment` parameter), and skylight is *visibility-aware* -- a derived, client-local occupancy grid in the frozen 128 cubed / 0.5 m layout feeds a six-direction sky-visibility pass, so enclosed rooms receive no outdoor ambient; unknown (non-resident) space blocks rays rather than counting as sky.
 
 The clipmap is a derived GPU lighting cache, not the world format. Do not require experimental hardware ray tracing or a sparse voxel octree for the initial renderer. Optional future hardware acceleration must preserve a supported baseline and be justified by captured evidence.
 

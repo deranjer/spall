@@ -308,6 +308,7 @@ pub fn capture_scene(
             pass.set_pipeline(pipeline.opaque());
             pass.set_bind_group(0, &scene_bind, &[]);
             pass.set_bind_group(1, &indirect.display_bind, &[]);
+            pass.set_bind_group(2, pipeline.sky_disabled_bind(), &[]);
             draw_meshes(&mut pass, &draws);
         }
         {
@@ -672,6 +673,7 @@ pub fn capture_lighting_sequence(
             pass.set_pipeline(pipeline.opaque());
             pass.set_bind_group(0, &scene_bind, &[]);
             pass.set_bind_group(1, &indirect.history_display_bind, &[]);
+            pass.set_bind_group(2, pipeline.sky_disabled_bind(), &[]);
             draw_meshes(&mut pass, &draws);
         }
         {
@@ -1332,6 +1334,7 @@ pub fn capture_frame_loop(
             pass.set_pipeline(pipeline.opaque());
             pass.set_bind_group(0, &scene_bind, &[]);
             pass.set_bind_group(1, &indirect.history_display_bind, &[]);
+            pass.set_bind_group(2, pipeline.sky_disabled_bind(), &[]);
             draw_meshes(&mut pass, &draws);
         }
         {
@@ -1838,6 +1841,7 @@ fn render_motion_frame(
         pass.set_pipeline(pipeline.opaque());
         pass.set_bind_group(0, &scene_bind, &[]);
         pass.set_bind_group(1, &indirect.history_display_bind, &[]);
+        pass.set_bind_group(2, pipeline.sky_disabled_bind(), &[]);
         draw_meshes(&mut pass, draws);
     }
     {

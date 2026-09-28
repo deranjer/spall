@@ -441,6 +441,8 @@ fn inventory_response(
 fn cut_drops(
     removed: &std::collections::BTreeMap<spall_core::MaterialId, u64>,
 ) -> Result<Vec<ItemStack>, ProgressionStoreError> {
+    // Appearance variants count as their base material.
+    let removed = &crate::appearance::merge_variants(removed);
     let mut drops = Vec::new();
     for (material, cells_per_item, item) in [
         (game::materials::WOOD, 16_u64, game::items::WOOD_LOG),

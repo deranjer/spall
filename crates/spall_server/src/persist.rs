@@ -454,7 +454,14 @@ pub fn restore_with_terrain_collider_mode(
     validate_world_meta(&cp.meta, cfg)?;
 
     let runtime_hash = content_manifest_hash(&materials).0;
-    if runtime_hash != cp.meta.material_manifest_hash {
+    // A world saved under a manifest this one supersedes by appearance alone
+    // (`MaterialManifest::superseding_appearance`) restores normally; its next
+    // checkpoint records this manifest's hash.
+    let saved_under_predecessor = materials
+        .appearance_predecessors()
+        .iter()
+        .any(|previous| content_manifest_hash(previous).0 == cp.meta.material_manifest_hash);
+    if runtime_hash != cp.meta.material_manifest_hash && !saved_under_predecessor {
         return Err(PersistError::ManifestMismatch {
             checkpoint: hex32(&cp.meta.material_manifest_hash),
             runtime: hex32(&runtime_hash),

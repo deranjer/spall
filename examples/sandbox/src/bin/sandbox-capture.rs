@@ -898,6 +898,8 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         contact_damage: None,
         dormancy: None,
         timing_window: None,
+        credential_registry_file: None,
+        custom_world: None,
     };
     let server_thread = std::thread::spawn(move || serve(server_cfg));
 
