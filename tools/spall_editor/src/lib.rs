@@ -1,14 +1,15 @@
 //! Editor-owned documents and commands. This crate is deliberately a leaf of
-//! the workspace: Spall's runtime and renderer never import egui or editor
+//! the workspace: Spall's runtime and renderer never import Yakui or editor
 //! persistence types.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod scene_mesh;
 mod spvox;
 
 pub const PROJECT_FORMAT_VERSION: u32 = 1;
@@ -19,6 +20,9 @@ pub const VOXEL_FORMAT_VERSION: u32 = 1;
 /// value; moving an asset's on-disk file does not rewrite a scene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AssetId(pub u64);
+
+/// Name of the scene entity that carries the scene's freehand voxels.
+pub const SCENE_VOXELS_NAME: &str = "Scene Voxels";
 
 impl std::fmt::Display for AssetId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -105,6 +109,13 @@ pub struct VoxelChange {
     pub after: Option<VoxelState>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoxelLayerChange {
+    pub cell: VoxelCoord,
+    pub before: Option<VoxelLayerCell>,
+    pub after: Option<VoxelLayerCell>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Transform {
     pub translation: [f32; 3],
@@ -183,7 +194,16 @@ pub struct SceneFile {
     pub format_version: u32,
     pub name: String,
     pub next_entity_id: u64,
+    /// Lighting environment key (`spall_render::EnvironmentPreset::key`), used
+    /// by both the editor viewport and the game when this scene is played.
+    /// Older scene files without it load as `"studio"`.
+    #[serde(default = "default_environment")]
+    pub environment: String,
     pub entities: BTreeMap<EditorEntityId, SceneEntity>,
+}
+
+fn default_environment() -> String {
+    spall_render::EnvironmentPreset::default().key().to_owned()
 }
 
 impl SceneFile {
@@ -192,6 +212,7 @@ impl SceneFile {
             format_version: SCENE_FORMAT_VERSION,
             name: name.into(),
             next_entity_id: 1,
+            environment: default_environment(),
             entities: BTreeMap::new(),
         }
     }
@@ -236,6 +257,25 @@ pub struct VoxelAssetFile {
     /// material's simple fallback swatch.
     #[serde(default)]
     pub colors: BTreeMap<VoxelCoord, [u8; 3]>,
+    /// Optional editable source. Visible layers are composited in order;
+    /// `voxels` and `colors` are the verified flattened runtime result.
+    #[serde(default)]
+    pub layers: Vec<VoxelLayer>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoxelLayerCell {
+    pub material: u16,
+    /// None uses the mapped material's ordinary appearance.
+    pub tint: Option<[u8; 3]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoxelLayer {
+    pub id: u32,
+    pub name: String,
+    pub visible: bool,
+    pub cells: BTreeMap<VoxelCoord, VoxelLayerCell>,
 }
 
 impl VoxelAssetFile {
@@ -255,7 +295,24 @@ impl VoxelAssetFile {
             tags: BTreeMap::new(),
             voxels: BTreeMap::new(),
             colors: BTreeMap::new(),
+            layers: Vec::new(),
         }
+    }
+
+    pub fn flattened_layers(&self) -> (BTreeMap<VoxelCoord, u16>, BTreeMap<VoxelCoord, [u8; 3]>) {
+        let mut voxels = BTreeMap::new();
+        let mut colors = BTreeMap::new();
+        for layer in self.layers.iter().filter(|layer| layer.visible) {
+            for (&cell, state) in &layer.cells {
+                voxels.insert(cell, state.material);
+                if let Some(tint) = state.tint {
+                    colors.insert(cell, tint);
+                } else {
+                    colors.remove(&cell);
+                }
+            }
+        }
+        (voxels, colors)
     }
 
     pub fn state_at(&self, cell: VoxelCoord) -> Option<VoxelState> {
@@ -367,6 +424,56 @@ impl EditorModel {
         }
     }
 
+    /// The scene's freehand voxel asset: the asset referenced by the entity
+    /// named [`SCENE_VOXELS_NAME`], if the scene has one.
+    pub fn scene_voxels_asset(&self) -> Option<(EditorEntityId, AssetId)> {
+        self.scene.entities.values().find_map(|entity| {
+            (entity.name == SCENE_VOXELS_NAME)
+                .then_some(entity.voxel_asset)
+                .flatten()
+                .filter(|asset| self.voxel_assets.contains_key(asset))
+                .map(|asset| (entity.id, asset))
+        })
+    }
+
+    /// Flatten every placed entity into one voxel grid for the scene viewport.
+    ///
+    /// The grid uses the finest cell size (0.0625 m). Each entity's asset is
+    /// scaled, rotated (X, then Y, then Z, in degrees) and translated (metres)
+    /// about the asset origin. The map records which entity owns each composed
+    /// cell so a viewport click can select it. Later entities win where cells
+    /// overlap.
+    pub fn scene_composite(&self) -> (VoxelAssetFile, BTreeMap<VoxelCoord, EditorEntityId>) {
+        let mut composite = VoxelAssetFile::new(AssetId(0), self.scene.name.clone());
+        let mut owners = BTreeMap::new();
+        let placed: Vec<_> = self
+            .scene
+            .entities
+            .values()
+            .filter_map(|entity| {
+                let asset = entity
+                    .voxel_asset
+                    .and_then(|id| self.voxel_assets.get(&id))?;
+                Some((entity, asset))
+            })
+            .collect();
+        // A scene made only of 0.25 m assets is composed on a 0.25 m grid: a
+        // 0.0625 m grid would turn every cell into 64 and make an ordinary
+        // outdoor scene millions of cells, far more than the viewport can draw.
+        let coarse =
+            !placed.is_empty() && placed.iter().all(|(_, asset)| asset.cell_size_code == 0);
+        let scene_cell_m = if coarse { 0.25 } else { SCENE_CELL_METRES };
+        composite.cell_size_code = if coarse { 0 } else { 1 };
+        for (entity, asset) in placed {
+            place_asset_at(asset, &entity.transform, scene_cell_m, |cell, state| {
+                composite.voxels.insert(cell, state.material);
+                composite.colors.insert(cell, state.color);
+                owners.insert(cell, entity.id);
+            });
+        }
+        (composite, owners)
+    }
+
     pub fn save_all(&self) -> Result<(), EditorError> {
         write_ron(&self.root.join("project.ron"), &self.project)?;
         let scene_path = self.project.scenes.get(&self.scene.name).ok_or_else(|| {
@@ -383,7 +490,46 @@ impl EditorModel {
     }
 
     pub fn load(root: impl Into<PathBuf>) -> Result<Self, EditorError> {
-        let root = root.into();
+        Self::load_scene(root.into(), None)
+    }
+
+    /// Opens whatever a user pointed at: a project folder, a project's
+    /// `project.ron`, or one of its scene files (which becomes the active
+    /// scene). The project root is the nearest folder holding `project.ron`.
+    pub fn load_file(path: impl AsRef<Path>) -> Result<Self, EditorError> {
+        let path = path.as_ref();
+        if path.is_dir() {
+            return Self::load(path);
+        }
+        let mut first_error = None;
+        for root in path
+            .ancestors()
+            .skip(1)
+            .filter(|dir| dir.join("project.ron").is_file())
+        {
+            let attempt = if path.file_name().is_some_and(|name| name == "project.ron") {
+                Self::load(root)
+            } else {
+                Self::load_scene(root.to_path_buf(), Some(path))
+            };
+            match attempt {
+                Ok(model) => return Ok(model),
+                // A stray project.ron nested closer than the real one must not
+                // hide it, so keep looking outward and report the first failure.
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        Err(first_error.unwrap_or_else(|| {
+            EditorError::Invalid(format!(
+                "{} is not inside a Spall project (no project.ron found in any parent folder)",
+                path.display()
+            ))
+        }))
+    }
+
+    fn load_scene(root: PathBuf, wanted_scene: Option<&Path>) -> Result<Self, EditorError> {
         let project: ProjectFile = read_ron(&root.join("project.ron"))?;
         ensure_version("project", project.format_version, PROJECT_FORMAT_VERSION)?;
         ensure_version(
@@ -391,11 +537,28 @@ impl EditorModel {
             project.asset_database.format_version,
             PROJECT_FORMAT_VERSION,
         )?;
-        let (_, scene_path) = project
-            .scenes
-            .iter()
-            .next()
-            .ok_or_else(|| EditorError::Invalid("project has no scenes".into()))?;
+        let scene_path = match wanted_scene {
+            None => project
+                .scenes
+                .values()
+                .next()
+                .ok_or_else(|| EditorError::Invalid("project has no scenes".into()))?,
+            Some(wanted) => {
+                let wanted = fs::canonicalize(wanted)?;
+                project
+                    .scenes
+                    .values()
+                    .find(|relative| {
+                        fs::canonicalize(root.join(relative)).is_ok_and(|path| path == wanted)
+                    })
+                    .ok_or_else(|| {
+                        EditorError::Invalid(format!(
+                            "{} is not a scene listed in this project's project.ron",
+                            wanted.display()
+                        ))
+                    })?
+            }
+        };
         let scene: SceneFile = read_ron(&root.join(scene_path))?;
         ensure_version("scene", scene.format_version, SCENE_FORMAT_VERSION)?;
         let mut voxel_assets = BTreeMap::new();
@@ -434,16 +597,36 @@ impl EditorModel {
     pub fn import_spvox_command(&self, source: &Path) -> Result<EditorCommand, EditorError> {
         let id = AssetId(self.project.asset_database.next_asset_id);
         let asset = read_spvox(source, id, &self.project.material_mapping)?;
-        Ok(EditorCommand::CreateVoxelAsset {
-            record: AssetRecord {
-                id,
-                name: asset.name.clone(),
-                kind: AssetKind::Voxel,
-                storage: PathBuf::from(format!("assets/{id}.spvox")),
-                authoring_bounds: None,
-            },
-            asset,
-        })
+        Ok(self.create_import_command(id, asset))
+    }
+
+    /// Copies immutable engine-owned SPVX bytes into this project as a new,
+    /// editable project asset. The engine catalog itself is never mutated.
+    pub fn import_builtin_spvox_command(
+        &self,
+        bytes: &[u8],
+        name: &str,
+    ) -> Result<EditorCommand, EditorError> {
+        let id = AssetId(self.project.asset_database.next_asset_id);
+        let mut asset = spvox::decode(bytes, id, &self.project.material_mapping)?;
+        asset.name = name.to_owned();
+        Ok(self.create_import_command(id, asset))
+    }
+
+    /// Decodes an immutable bundled asset for read-only preview.
+    pub fn preview_builtin_spvox(&self, bytes: &[u8]) -> Result<VoxelAssetFile, EditorError> {
+        spvox::decode(bytes, AssetId(u64::MAX), &self.project.material_mapping)
+    }
+
+    fn create_import_command(&self, id: AssetId, asset: VoxelAssetFile) -> EditorCommand {
+        let record = AssetRecord {
+            id,
+            name: asset.name.clone(),
+            kind: AssetKind::Voxel,
+            storage: PathBuf::from(format!("assets/{id}.spvox")),
+            authoring_bounds: None,
+        };
+        EditorCommand::CreateVoxelAsset { record, asset }
     }
 
     /// Exports a selected project asset without exposing its project-local
@@ -458,6 +641,137 @@ impl EditorModel {
             .get(&asset)
             .ok_or_else(|| EditorError::Invalid(format!("missing {asset}")))?;
         write_spvox(destination, asset)
+    }
+}
+
+/// Largest number of grid cells scanned when placing one transformed asset.
+const MAX_PLACED_VOLUME: i64 = 4_000_000;
+/// Metres per cell of the scene grid.
+const SCENE_CELL_METRES: f32 = 0.0625;
+
+type Mat3 = [[f32; 3]; 3];
+
+fn rotation_matrix(degrees: [f32; 3]) -> Mat3 {
+    let [ax, ay, az] = degrees.map(f32::to_radians);
+    let (sx, cx) = ax.sin_cos();
+    let (sy, cy) = ay.sin_cos();
+    let (sz, cz) = az.sin_cos();
+    // Each turn follows the editor's viewport convention: a positive Y turn
+    // takes +X towards +Z.
+    let rx = [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]];
+    let ry = [[cy, 0.0, -sy], [0.0, 1.0, 0.0], [sy, 0.0, cy]];
+    let rz = [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]];
+    let mul = |a: Mat3, b: Mat3| {
+        let mut out = [[0.0; 3]; 3];
+        for (r, row) in out.iter_mut().enumerate() {
+            for (c, cell) in row.iter_mut().enumerate() {
+                *cell = (0..3).map(|k| a[r][k] * b[k][c]).sum();
+            }
+        }
+        out
+    };
+    mul(rz, mul(ry, rx))
+}
+
+/// Emit every cell of `asset` after `transform`, in scene-grid coordinates.
+///
+/// Works backwards from each target cell centre to a source cell so scaled or
+/// arbitrarily rotated assets come out solid rather than speckled.
+#[cfg(test)]
+fn place_asset(
+    asset: &VoxelAssetFile,
+    transform: &Transform,
+    emit: impl FnMut(VoxelCoord, VoxelState),
+) {
+    place_asset_at(asset, transform, SCENE_CELL_METRES, emit);
+}
+
+/// [`place_asset`] onto a scene grid of `scene_cell_m` metres per cell.
+fn place_asset_at(
+    asset: &VoxelAssetFile,
+    transform: &Transform,
+    scene_cell_m: f32,
+    mut emit: impl FnMut(VoxelCoord, VoxelState),
+) {
+    let (Some(min), Some(max)) = (
+        asset.voxels.keys().copied().reduce(|a, b| VoxelCoord {
+            x: a.x.min(b.x),
+            y: a.y.min(b.y),
+            z: a.z.min(b.z),
+        }),
+        asset.voxels.keys().copied().reduce(|a, b| VoxelCoord {
+            x: a.x.max(b.x),
+            y: a.y.max(b.y),
+            z: a.z.max(b.z),
+        }),
+    ) else {
+        return;
+    };
+    let asset_metres = if asset.cell_size_code == 0 {
+        0.25
+    } else {
+        SCENE_CELL_METRES
+    };
+    let ratio = asset_metres / scene_cell_m;
+    let scale = transform.scale.map(|s| s * ratio);
+    if scale.iter().any(|s| *s == 0.0 || !s.is_finite()) {
+        return;
+    }
+    let rotation = rotation_matrix(transform.rotation_degrees);
+    let shift = transform.translation.map(|t| t / scene_cell_m);
+
+    // Bounds of the transformed source box, in scene cells.
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for corner in 0..8 {
+        let source = [
+            if corner & 1 == 0 { min.x } else { max.x + 1 } as f32,
+            if corner & 2 == 0 { min.y } else { max.y + 1 } as f32,
+            if corner & 4 == 0 { min.z } else { max.z + 1 } as f32,
+        ];
+        for axis in 0..3 {
+            let placed: f32 = (0..3)
+                .map(|k| rotation[axis][k] * source[k] * scale[k])
+                .sum::<f32>()
+                + shift[axis];
+            lo[axis] = lo[axis].min(placed);
+            hi[axis] = hi[axis].max(placed);
+        }
+    }
+    let first = lo.map(|v| v.floor() as i64);
+    let last = hi.map(|v| v.ceil() as i64);
+    let volume: i64 = (0..3)
+        .map(|axis| (last[axis] - first[axis]).max(0))
+        .product();
+    if volume > MAX_PLACED_VOLUME {
+        return;
+    }
+    for x in first[0]..last[0] {
+        for y in first[1]..last[1] {
+            for z in first[2]..last[2] {
+                let centre = [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5];
+                let relative = [0, 1, 2].map(|axis| centre[axis] - shift[axis]);
+                // Inverse rotation is the transpose.
+                let source = [0, 1, 2].map(|axis| {
+                    (0..3).map(|k| rotation[k][axis] * relative[k]).sum::<f32>() / scale[axis]
+                });
+                let cell = VoxelCoord {
+                    x: source[0].floor() as i32,
+                    y: source[1].floor() as i32,
+                    z: source[2].floor() as i32,
+                };
+                if let Some(state) = asset.state_at(cell) {
+                    emit(
+                        VoxelCoord {
+                            x: x as i32,
+                            y: y as i32,
+                            z: z as i32,
+                        },
+                        state,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -499,6 +813,16 @@ pub enum EditorCommand {
     SetVoxels {
         asset: AssetId,
         changes: Vec<VoxelChange>,
+    },
+    SetAssetLayers {
+        asset: AssetId,
+        before: Vec<VoxelLayer>,
+        after: Vec<VoxelLayer>,
+    },
+    SetLayerVoxels {
+        asset: AssetId,
+        layer_id: u32,
+        changes: Vec<VoxelLayerChange>,
     },
 }
 
@@ -628,6 +952,11 @@ impl EditorCommand {
                     .voxel_assets
                     .get_mut(asset)
                     .ok_or_else(|| EditorError::Invalid(format!("missing {asset}")))?;
+                if !doc.layers.is_empty() {
+                    return Err(EditorError::Invalid(
+                        "layered assets require a layer-targeted voxel command".into(),
+                    ));
+                }
                 if doc.state_at(*cell) != *before {
                     return Err(EditorError::Invalid(format!(
                         "{asset} cell changed before command"
@@ -640,6 +969,11 @@ impl EditorCommand {
                     .voxel_assets
                     .get_mut(asset)
                     .ok_or_else(|| EditorError::Invalid(format!("missing {asset}")))?;
+                if !doc.layers.is_empty() {
+                    return Err(EditorError::Invalid(
+                        "layered assets require a layer-targeted voxel command".into(),
+                    ));
+                }
                 for change in changes {
                     if doc.state_at(change.cell) != change.before {
                         return Err(EditorError::Invalid(format!(
@@ -650,6 +984,74 @@ impl EditorCommand {
                 for change in changes {
                     doc.set_state(change.cell, change.after);
                 }
+            }
+            Self::SetAssetLayers {
+                asset,
+                before,
+                after,
+            } => {
+                let doc = model
+                    .voxel_assets
+                    .get_mut(asset)
+                    .ok_or_else(|| EditorError::Invalid(format!("missing {asset}")))?;
+                if &doc.layers != before {
+                    return Err(EditorError::Invalid(
+                        "asset layers changed before command".into(),
+                    ));
+                }
+                if !after.is_empty() {
+                    let mut candidate = doc.clone();
+                    candidate.layers = after.clone();
+                    let (voxels, colors) = candidate.flattened_layers();
+                    candidate.voxels = voxels;
+                    candidate.colors = colors;
+                    spvox::validate_layered_asset(&candidate)?;
+                    *doc = candidate;
+                } else {
+                    doc.layers.clear();
+                }
+            }
+            Self::SetLayerVoxels {
+                asset,
+                layer_id,
+                changes,
+            } => {
+                let doc = model
+                    .voxel_assets
+                    .get_mut(asset)
+                    .ok_or_else(|| EditorError::Invalid(format!("missing {asset}")))?;
+                let mut candidate = doc.clone();
+                let layer = candidate
+                    .layers
+                    .iter_mut()
+                    .find(|layer| layer.id == *layer_id)
+                    .ok_or_else(|| EditorError::Invalid(format!("missing layer {layer_id}")))?;
+                let mut seen = BTreeSet::new();
+                for change in changes {
+                    if !seen.insert(change.cell) {
+                        return Err(EditorError::Invalid(
+                            "duplicate cell in layer stroke".into(),
+                        ));
+                    }
+                    if layer.cells.get(&change.cell).copied() != change.before {
+                        return Err(EditorError::Invalid(
+                            "layer cells changed before command".into(),
+                        ));
+                    }
+                    if change.after.is_some_and(|state| state.material == 0) {
+                        return Err(EditorError::Invalid("layer cell cannot be air".into()));
+                    }
+                }
+                for change in changes {
+                    if let Some(state) = change.after {
+                        layer.cells.insert(change.cell, state);
+                    } else {
+                        layer.cells.remove(&change.cell);
+                    }
+                }
+                (candidate.voxels, candidate.colors) = candidate.flattened_layers();
+                spvox::validate_layered_asset(&candidate)?;
+                *doc = candidate;
             }
         }
         Ok(())
@@ -722,6 +1124,33 @@ impl EditorCommand {
                 changes: changes
                     .iter()
                     .map(|change| VoxelChange {
+                        cell: change.cell,
+                        before: change.after,
+                        after: change.before,
+                    })
+                    .collect(),
+            }
+            .apply(model),
+            Self::SetAssetLayers {
+                asset,
+                before,
+                after,
+            } => Self::SetAssetLayers {
+                asset: *asset,
+                before: after.clone(),
+                after: before.clone(),
+            }
+            .apply(model),
+            Self::SetLayerVoxels {
+                asset,
+                layer_id,
+                changes,
+            } => Self::SetLayerVoxels {
+                asset: *asset,
+                layer_id: *layer_id,
+                changes: changes
+                    .iter()
+                    .map(|change| VoxelLayerChange {
                         cell: change.cell,
                         before: change.after,
                         after: change.before,
@@ -830,6 +1259,108 @@ fn read_spvox(
 mod tests {
     use super::*;
 
+    fn one_voxel_asset(cell: VoxelCoord) -> VoxelAssetFile {
+        let mut asset = VoxelAssetFile::new(AssetId(1), "one");
+        asset.voxels.insert(cell, 1);
+        asset.colors.insert(cell, [1, 2, 3]);
+        asset
+    }
+
+    fn placed_cells(asset: &VoxelAssetFile, transform: Transform) -> Vec<VoxelCoord> {
+        let mut cells = Vec::new();
+        place_asset(asset, &transform, |cell, _| cells.push(cell));
+        cells
+    }
+
+    #[test]
+    fn placement_scales_solidly_and_rotates_about_any_axis() {
+        let asset = one_voxel_asset(VoxelCoord { x: 0, y: 0, z: 0 });
+        // Doubling the scale turns one cell into a 2x2x2 block.
+        let scaled = placed_cells(
+            &asset,
+            Transform {
+                scale: [2.0, 2.0, 2.0],
+                ..Transform::default()
+            },
+        );
+        assert_eq!(scaled.len(), 8);
+        // A cell at +X turned 90 degrees about Z ends up along Y, not X.
+        let off_axis = one_voxel_asset(VoxelCoord { x: 3, y: 0, z: 0 });
+        let turned = placed_cells(
+            &off_axis,
+            Transform {
+                rotation_degrees: [0.0, 0.0, 90.0],
+                ..Transform::default()
+            },
+        );
+        assert_eq!(turned, vec![VoxelCoord { x: -1, y: 3, z: 0 }]);
+        // Coarse (0.25 m) cells fill 4x4x4 scene cells.
+        let mut coarse = one_voxel_asset(VoxelCoord { x: 0, y: 0, z: 0 });
+        coarse.cell_size_code = 0;
+        assert_eq!(placed_cells(&coarse, Transform::default()).len(), 64);
+    }
+
+    #[test]
+    fn scene_composite_places_assets_and_freehand_voxels_with_owners() {
+        let mut model = EditorModel::new("unused", "test");
+        let mut undo = UndoStack::default();
+        // Freehand scene voxels.
+        let scene_cmd = model.new_voxel_asset_command(SCENE_VOXELS_NAME);
+        undo.execute(&mut model, scene_cmd).unwrap();
+        let terrain = model.scene.new_entity(SCENE_VOXELS_NAME);
+        let terrain_id = terrain.id;
+        undo.execute(&mut model, EditorCommand::CreateEntity { entity: terrain })
+            .unwrap();
+        undo.execute(
+            &mut model,
+            EditorCommand::SetEntityAsset {
+                entity: terrain_id,
+                before: None,
+                after: Some(AssetId(1)),
+            },
+        )
+        .unwrap();
+        let ground = VoxelCoord { x: 0, y: 0, z: 0 };
+        undo.execute(
+            &mut model,
+            EditorCommand::SetVoxel {
+                asset: AssetId(1),
+                cell: ground,
+                before: None,
+                after: Some(VoxelState::new(1, [9, 9, 9])),
+            },
+        )
+        .unwrap();
+        assert_eq!(model.scene_voxels_asset(), Some((terrain_id, AssetId(1))));
+
+        // A placed asset, moved 4 cells along X and turned a quarter.
+        let crate_cmd = model.new_voxel_asset_command("crate");
+        undo.execute(&mut model, crate_cmd).unwrap();
+        let mut placed = model.scene.new_entity("Crate");
+        let placed_id = placed.id;
+        placed.voxel_asset = Some(AssetId(2));
+        placed.transform.translation = [4.0 * 0.0625, 0.0, 0.0];
+        placed.transform.rotation_degrees = [0.0, 90.0, 0.0];
+        undo.execute(&mut model, EditorCommand::CreateEntity { entity: placed })
+            .unwrap();
+        undo.execute(
+            &mut model,
+            EditorCommand::SetVoxel {
+                asset: AssetId(2),
+                cell: VoxelCoord { x: 1, y: 0, z: 0 },
+                before: None,
+                after: Some(VoxelState::new(2, [1, 2, 3])),
+            },
+        )
+        .unwrap();
+
+        let (composite, owners) = model.scene_composite();
+        assert_eq!(composite.voxels.len(), 2);
+        assert_eq!(owners[&ground], terrain_id);
+        // Cell (1,0,0) turned a quarter about Y lands on (-1,0,1); moving +4 in X gives (3,0,1).
+        assert_eq!(owners[&VoxelCoord { x: 3, y: 0, z: 1 }], placed_id);
+    }
+
     #[test]
     fn command_undo_redo_restores_voxels_and_stable_asset_references() {
         let mut model = EditorModel::new("unused", "test");
@@ -875,6 +1406,103 @@ mod tests {
         assert_eq!(
             model.voxel_assets[&asset].state_at(cell),
             Some(VoxelState::new(4, [1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn layer_commands_compose_and_undo_without_losing_source_cells() {
+        let mut model = EditorModel::new(std::env::temp_dir(), "layers");
+        let mut undo = UndoStack::default();
+        let create = model.new_voxel_asset_command("tree");
+        undo.execute(&mut model, create).unwrap();
+        let asset = AssetId(1);
+        let cell = VoxelCoord { x: 0, y: 0, z: 0 };
+        let base = VoxelState::new(2, [80, 50, 20]);
+        undo.execute(
+            &mut model,
+            EditorCommand::SetVoxel {
+                asset,
+                cell,
+                before: None,
+                after: Some(base),
+            },
+        )
+        .unwrap();
+        let layers = vec![
+            VoxelLayer {
+                id: 1,
+                name: "Base".into(),
+                visible: true,
+                cells: BTreeMap::from([(
+                    cell,
+                    VoxelLayerCell {
+                        material: 2,
+                        tint: Some(base.color),
+                    },
+                )]),
+            },
+            VoxelLayer {
+                id: 2,
+                name: "Leaves".into(),
+                visible: true,
+                cells: BTreeMap::new(),
+            },
+        ];
+        undo.execute(
+            &mut model,
+            EditorCommand::SetAssetLayers {
+                asset,
+                before: vec![],
+                after: layers.clone(),
+            },
+        )
+        .unwrap();
+        let leaf = VoxelLayerCell {
+            material: 3,
+            tint: Some([20, 160, 30]),
+        };
+        undo.execute(
+            &mut model,
+            EditorCommand::SetLayerVoxels {
+                asset,
+                layer_id: 2,
+                changes: vec![VoxelLayerChange {
+                    cell,
+                    before: None,
+                    after: Some(leaf),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            model.voxel_assets[&asset].state_at(cell),
+            Some(VoxelState::new(3, [20, 160, 30]))
+        );
+        let mut hidden = model.voxel_assets[&asset].layers.clone();
+        let before_hide = hidden.clone();
+        hidden[1].visible = false;
+        undo.execute(
+            &mut model,
+            EditorCommand::SetAssetLayers {
+                asset,
+                before: before_hide,
+                after: hidden,
+            },
+        )
+        .unwrap();
+        assert_eq!(model.voxel_assets[&asset].state_at(cell), Some(base));
+        undo.undo(&mut model).unwrap();
+        assert_eq!(
+            model.voxel_assets[&asset].state_at(cell),
+            Some(VoxelState::new(3, [20, 160, 30]))
+        );
+        undo.undo(&mut model).unwrap();
+        assert_eq!(model.voxel_assets[&asset].layers, layers);
+        assert_eq!(model.voxel_assets[&asset].state_at(cell), Some(base));
+        undo.redo(&mut model).unwrap();
+        assert_eq!(
+            model.voxel_assets[&asset].state_at(cell),
+            Some(VoxelState::new(3, [20, 160, 30]))
         );
     }
 
@@ -1019,5 +1647,79 @@ mod tests {
             Some(bounds)
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builtin_copy_is_undoable_saved_to_project_and_keeps_bundle_unchanged() {
+        let root =
+            std::env::temp_dir().join(format!("spall-editor-builtin-{}", std::process::id()));
+        let bundled = spall_voxel::builtin_assets::builtin_voxel_assets()[0];
+        let source_digest = blake3::hash(bundled.bytes);
+        let mut model = EditorModel::new(&root, "builtin-copy");
+        let command = model
+            .import_builtin_spvox_command(bundled.bytes, bundled.name)
+            .unwrap();
+        let asset = match &command {
+            EditorCommand::CreateVoxelAsset { record, .. } => record.id,
+            _ => unreachable!(),
+        };
+        let mut undo = UndoStack::default();
+        undo.execute(&mut model, command).unwrap();
+        let source_voxel_count = spvox::decode(
+            bundled.bytes,
+            AssetId(u64::MAX),
+            &model.project.material_mapping,
+        )
+        .unwrap()
+        .voxels
+        .len();
+        assert!(source_voxel_count > 0);
+        assert_eq!(model.voxel_assets[&asset].voxels.len(), source_voxel_count);
+        model.save_all().unwrap();
+        let loaded = EditorModel::load(&root).unwrap();
+        assert!(loaded.project.asset_database.assets.contains_key(&asset));
+        assert_eq!(blake3::hash(bundled.bytes), source_digest);
+        undo.undo(&mut model).unwrap();
+        assert!(!model.voxel_assets.contains_key(&asset));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_file_opens_a_folder_project_ron_or_scene_ron() {
+        let root = std::env::temp_dir().join(format!("spall-open-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut model = EditorModel::new(&root, "Open Test");
+        let marker = model.scene.new_entity("Marker");
+        model.scene.entities.insert(marker.id, marker);
+        model.save_all().unwrap();
+        for path in [
+            root.clone(),
+            root.join("project.ron"),
+            root.join("scenes").join("main.ron"),
+        ] {
+            let loaded = EditorModel::load_file(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            assert_eq!(loaded.root, root, "{path:?}");
+            assert_eq!(loaded.scene.entities.len(), 1, "{path:?}");
+        }
+        // A stray project.ron nested next to the scene must not hide the real one.
+        let nested = root.join("scenes").join("inner");
+        fs::create_dir_all(&nested).unwrap();
+        EditorModel::new(&nested, "Stray").save_all().unwrap();
+        let loaded = EditorModel::load_file(root.join("scenes").join("main.ron")).unwrap();
+        assert_eq!(loaded.root, root);
+        // A .ron that is not a listed scene, and a file outside any project, fail clearly.
+        fs::write(root.join("scenes").join("stray.ron"), "()").unwrap();
+        let stray = EditorModel::load_file(root.join("scenes").join("stray.ron")).unwrap_err();
+        assert!(stray.to_string().contains("not a scene listed"), "{stray}");
+        let outside =
+            std::env::temp_dir().join(format!("spall-outside-{}.ron", std::process::id()));
+        fs::write(&outside, "()").unwrap();
+        let error = EditorModel::load_file(&outside).unwrap_err();
+        assert!(
+            error.to_string().contains("not inside a Spall project"),
+            "{error}"
+        );
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&root);
     }
 }

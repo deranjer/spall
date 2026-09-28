@@ -722,9 +722,11 @@ The rules version is logged at startup, but is not yet negotiated in the client
 
 ### ENG-74 — Editor MVP (user-authorized follow-up)
 
+Original completion used egui; the UI toolkit was migrated to Yakui in ENG-90.
+
 Dependencies: current engine workspace. Own: `tools/spall_editor`, editor-owned RON schemas, and editor documentation. This is intentionally outside the G0–G5 engine gate sequence and must not alter those gate claims.
 
-Build a separate native editor crate using Rust, winit, wgpu, egui, and egui-wgpu. It may depend on Spall rendering/voxel libraries, but no engine/runtime crate may depend on it or on egui. Add versioned, human-readable RON project and scene documents, plus portable `.spvox` voxel assets according to `docs/spvox-format.md`. Project/scene references must use a stable `AssetId`, never an authored absolute or raw asset path.
+Build a separate native editor crate using Rust, winit, wgpu, and Yakui. It may depend on Spall rendering/voxel libraries, but no engine/runtime crate may depend on it or on Yakui. Add versioned, human-readable RON project and scene documents, plus portable `.spvox` voxel assets according to `docs/spvox-format.md`. Project/scene references must use a stable `AssetId`, never an authored absolute or raw asset path.
 
 Implement an AssetDatabase and an EditorCommand-based undo/redo layer before UI mutations. The MVP launcher supports recent/open/new projects. Keep **Scenes** (placed objects and transforms) distinct from **Assets** (reusable authored voxel objects): the scene view has a collapsible hierarchy/inspector and a collapsible bottom toolbox that searches named assets, previews them, and places an asset as a new scene object. The asset view supports single-cell and bounded box painting/removal, selected material and RGB color, deterministic per-cell color jitter within a selected margin, and save. Keep advanced docking, procedural tools, animation, material authoring, and engine-management UI out of scope.
 
@@ -732,11 +734,114 @@ Accept: commands are the sole mutation route and undo/redo restores entity and v
 
 ### ENG-89 — wgpu 30 and Yakui HUD migration (user-authorized follow-up)
 
-Dependencies: current renderer and ENG-74 editor. Own: workspace GPU/UI dependency pins, `spall_render`, `spall_client`, `tools/spall_editor`, the local rendering proof of concept, and dependency/validation documentation. Keep Yakui crates on one exact upstream revision and keep editor egui crates compatible with the workspace wgpu types.
+Dependencies: current renderer and ENG-74 editor. Own: workspace GPU/UI dependency pins, `spall_render`, `spall_client`, `tools/spall_editor`, the local rendering proof of concept, and dependency/validation documentation. Keep Yakui crates on one exact upstream revision and keep editor UI crates compatible with the workspace wgpu types.
 
 Port instance/device/surface setup, pipelines, passes, polling, shader tooling, editor integration, and local proof of concept to wgpu 30. Integrate Yakui into the existing live client device and frame, including input/DPI/resize handling and CPU/GPU HUD timing where the adapter supports timestamps. Preserve rendering across surface loss and resize. Do not use Yakui's standalone application window as the client integration.
 
-Accept: `cargo tree -d` shows one wgpu/Naga line for application rendering and matching egui-wgpu; `cargo xtask check`, `cargo xtask smoke --graphical`, the G2 captures, the release G1 bounded run, and `cargo run -p spall_editor` complete. Inspect captures and the live HUD on D3D12 and Vulkan hardware; record frame/HUD CPU/GPU measurements against the pre-migration baseline. Hardware checks unavailable in the current environment must be recorded as unrun rather than inferred from compilation.
+Accept: `cargo tree -d` shows one wgpu/Naga line for application rendering; `cargo xtask check`, `cargo xtask smoke --graphical`, the G2 captures, the release G1 bounded run, and `cargo run -p spall_editor` complete. Inspect captures and the live HUD on D3D12 and Vulkan hardware; record frame/HUD CPU/GPU measurements against the pre-migration baseline. Hardware checks unavailable in the current environment must be recorded as unrun rather than inferred from compilation.
+
+### ENG-90 — Editor Yakui migration (user-authorized follow-up)
+
+Dependencies: ENG-74 and ENG-89. Port the complete editor launcher, scene and
+asset workspaces, hierarchy, inspector, toolbox, voxel painting controls, and
+viewport interaction to Yakui using the pinned workspace revision and the
+existing wgpu 30 surface/device. Preserve editor commands as the sole document
+mutation route, including undo/redo. Remove editor egui dependencies, update
+dependency and validation records, and inspect native interaction on hardware.
+Accept: `cargo check -p spall_editor --all-targets --all-features`, editor CPU
+tests, and `cargo run -p spall_editor` pass; no egui references remain in the
+workspace dependency graph; scene and voxel editing behavior matches ENG-74.
+
+### ENG-91 — Scene and built-in asset workspace layout
+
+Dependencies: ENG-74 and ENG-90. Own: `tools/spall_editor`, the built-in voxel
+asset catalog in `crates/spall_voxel`, and editor/asset documentation. Add File,
+Edit, and Help menus; a center scene/asset view; and collapsible, user-resizable
+left, right, and bottom panels. The viewport fills the space between side
+panels; the bottom panel always spans the workspace width. Keep the hierarchy,
+inspector, asset search, preview, painting, and EditorCommand-only project edits
+available in this layout. The starting screen opens Engine Assets directly
+without opening a scene. In the Assets workspace, keep the live 3D viewport in
+the center, voxel authoring controls in the right panel, and a searchable grid of
+small-preview assets across the resizable full-width bottom panel. Provide
+viewport cursor feedback and selectable lighting environments. Ship immutable built-in terrain assets under
+`crates/spall_voxel/assets/builtin/voxel/`, expose their canonical SPVX bytes
+through `spall_voxel` for generation consumers, and make the editor catalog
+searchable and previewable. Editing a built-in imports an undoable project copy
+under that project's `AssetDatabase`; it never overwrites the engine bundle.
+The initial catalog contains `palm_tree.spvox` and `weeping_willow.spvox`.
+Use readable, padded buttons and align row descriptions left with their
+actions on the right; labels and controls must remain readable at the default
+window size and when the side panels are resized.
+
+Accept: both built-ins decode with their stable portable material keys; the
+editor can browse/search/preview them and make editable project copies; the
+copy saves/reloads using a project `AssetId` and leaves bundled source bytes
+unchanged; scene and asset workspaces expose the three resize/collapse panels;
+`cargo test -p spall_voxel` and editor checks pass. Native drag/layout behavior
+is recorded as a hands-on check when a desktop session is available.
+
+### ENG-92 — SPVX 1.1 authoring layers
+
+User-authorized follow-up to ENG-91. Preserve the current editor work while
+extending static SPVX assets with optional editable layers. The canonical v1.1
+`LAYR` chunk stores stable layer IDs, order, names, visibility, and source cells;
+visible layers compose deterministically to the authoritative `VOXL` stream.
+Layer source is distinct from `PART` assembly and never enters world saves or
+network records. The editor saves, loads, selects, edits, and hides layers through
+undoable commands. Flat v1.0 assets remain readable and can be converted when a
+layer is added. The sandbox's static importer validates the optional feature
+marker and whole-file hash and continues to consume `VOXL` only. Update format
+and validation documentation without changing engine/editor dependency direction.
+
+Accept: layered SPVX round-trips retain hidden and overlapping source cells;
+the editor rejects a source/`VOXL` mismatch; layer edits and visibility undo
+exactly; the static runtime loads a valid layered asset; editor and sandbox
+checks pass. Record native layer interaction separately when a desktop session
+is available.
+
+### ENG-94..99 — Natural-lighting renderer programme (R1–R6)
+
+User-authorized 2026-09-26: a Teardown-inspired lighting direction shared by the
+editor and the game, rasterised visibility plus software voxel tracing for
+indirect light, with hardware ray tracing only as a separately-evaluated option.
+One bounded ticket per pass; `docs/reports/ENG-94.md` holds the audit that
+scoped it (what ran in the interactive game versus captures/editor).
+
+- **ENG-94 R1** — game window on the shared `spall_render` direct-light
+  pipeline (materials from the manifest, shadows for terrain and bodies, HDR,
+  tone map, resident buffers, debug views). First pass done; see the report.
+- **ENG-95 R2** — authored tint through edits, bodies, replication and
+  persistence; manifest-palette linearisation decision (changes the manifest
+  hash). Depends on R1. Implemented as material variants with explicit,
+  append-only variant ids (frozen v3 rows + generated extensions), an additive
+  manifest extension that refuses recolouring, and real client/late-join
+  evidence; validated on this machine, **not accepted** (release measurements and
+  editor/runtime parity metrics are ENG-99). See `docs/reports/ENG-95.md`.
+- **ENG-96 R3** — visibility-aware skylight, dark enclosed rooms, documented
+  shadow technique, geometry-submission decision. Depends on R1. First pass
+  done; see `docs/reports/ENG-96.md` (PCSS shadows, sky-visibility occupancy in
+  the game and editor, measured cube-vs-mesh decision). Enclosed rooms are black
+  until R4 adds bounce.
+- **ENG-97 R4** — the T13/T14 lighting cache in the interactive runtime.
+  Depends on R1, R3. The frozen cache surface changes only with new evidence.
+  First pass done (terrain, lit one-bounce sources, directional radiance, thin-wall
+  evaluation); see `docs/reports/ENG-97.md`. Bodies, dirty regions, scroll,
+  temporal and streamed boundaries are ENG-101 (R4b).
+- **ENG-100 R7** — move terrain (and body templates) from instanced cubes to
+  incremental greedy meshes (measured 23x fewer triangles, ~8x cheaper frame,
+  baked AO); depends on R3's evidence.
+- **ENG-101 R4b** — bodies as occluders/bounce sources, incremental sweeps.
+  First pass done; see `docs/reports/ENG-101.md`.
+- **ENG-102 R4c** — hitch-free scroll (double-buffered re-centre), low-angle
+  sampling, emissive manifest content, correlated edit-to-presented latency
+  instrumentation (real network + real renderer, one clock; commit → receipt →
+  rebuild → upload → sweep → presented), body-motion latency measured
+  separately. Debug-build only; release measurement and the streamed-world run
+  remain, and the dirty-bounds cull was deliberately not pursued (§2d). See
+  `docs/reports/ENG-102.md`.
+- **ENG-98 R5** — optional hardware ray tracing feasibility report. Independent.
+- **ENG-99 R6** — acceptance evidence and metrics. Depends on R1–R4.
 
 ## Assignment template
 
@@ -885,3 +990,17 @@ build their scene and bit-identical reference volume in
 Swimming, boats, rigid-body coupling, multiplayer water DTOs, persistence,
 streaming-scale behavior, and replaceable water appearance are later scoped
 assignments. See Loopira ENG-103 for the matching tracked issue.
+
+### ENG-104 — Interactive sandbox water demo
+
+User-requested local visualization follow-up to ENG-103. Add a dedicated mode
+to `sandbox-client` using the shared Spall renderer and the bounded,
+voxel-backed water fixture. Show the actual solid walls/dam and live fluid
+particle positions. Provide direct controls for canal excavation, dam breach,
+pause/resume, scene reset, and camera movement. Keep this explicit
+client-local debug mode separate from normal network replication: it does not
+establish server-authoritative water, multiplayer water state, or completion of
+ENG-103's failed feasibility gates. Launch instructions and implementation
+evidence are recorded in `docs/reports/ENG-104.md`; tracked in Loopira ENG-104.
+The original particle view (`--fluid-demo`) was removed with the Salva backend;
+the MAC grid viewer (`--grid-fluid-demo`) is the remaining water view.
