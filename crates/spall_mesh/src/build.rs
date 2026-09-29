@@ -127,6 +127,44 @@ pub fn build_volume_mesh(
     })
 }
 
+/// Build only `coord` while sampling its seam halo from the surrounding volume.
+/// The returned token covers this brick and every neighbouring presence/absence
+/// value that can change its faces or baked AO.
+pub fn build_brick_mesh(
+    volume: &Volume,
+    coord: spall_core::BrickCoord,
+    generation: Generation,
+    topology_epoch: TopologyEpoch,
+) -> Result<VolumeMesh, MeshError> {
+    let cells = crate::sample::ResidentCells::one_brick(coord)?;
+    let sampler = VolumeSampler::new(volume);
+    let quads = emit_greedy(&sampler, &cells);
+    let mesh = Mesh::from_quads(&quads, volume.cell_size().metres());
+    let mut exposed_unit_faces = 0u64;
+    let mut unresolved_halo_faces = 0u64;
+    for_each_exposed_face(&sampler, &cells, |face| {
+        exposed_unit_faces += 1;
+        if matches!(face.neighbour, Occupancy::Unknown(_)) {
+            unresolved_halo_faces += 1;
+        }
+    });
+    let resident = [coord];
+    Ok(VolumeMesh {
+        stats: MeshStats {
+            strategy: MeshStrategy::Greedy,
+            quad_count: quads.len(),
+            vertex_count: mesh.vertices.len(),
+            triangle_count: mesh.triangle_count(),
+            surface_area_m2: exposed_unit_faces as f64 * volume.cell_size().metres().powi(2),
+            exposed_unit_faces,
+            unresolved_halo_faces,
+        },
+        mesh,
+        quads,
+        token: build_token(volume, &resident, generation, topology_epoch),
+    })
+}
+
 /// Records one dependency per resident brick and one absent/failed sentinel per
 /// non-resident brick in the 26-neighbour halo of the resident set.
 fn build_token(
@@ -383,6 +421,58 @@ mod tests {
         // Surface of a 64 x 32 x 32 box: 2*(32*32) + 4*(64*32) unit faces.
         assert_eq!(vm.stats.exposed_unit_faces, 2 * 32 * 32 + 4 * 64 * 32);
         assert_eq!(vm.stats.quad_count, 6, "greedy merges across the seam");
+    }
+
+    #[test]
+    fn incremental_brick_mesh_reads_its_neighbour_seam_and_records_halo() {
+        let mut volume = Volume::new(vid(), CellSizeCode::Quarter);
+        volume
+            .insert_brick(BrickCoord::new(0, 0, 0), Brick::uniform(STONE, Revision(1)))
+            .unwrap();
+        let before = build_brick_mesh(
+            &volume,
+            BrickCoord::new(0, 0, 0),
+            gen1(),
+            TopologyEpoch::START,
+        )
+        .unwrap();
+        assert!(
+            before
+                .token
+                .reads()
+                .iter()
+                .any(|dep| dep.brick.brick == BrickCoord::new(1, 0, 0)
+                    && dep.state == spall_jobs::DepState::Absent)
+        );
+        assert!(
+            before
+                .quads
+                .iter()
+                .any(|quad| quad.dir == FaceDir::PosX && quad.plane == 32)
+        );
+        let mut current = MapWorld::new(gen1());
+        current.set_brick(vid(), BrickCoord::new(0, 0, 0), Revision(1));
+        assert!(!before.is_stale(&current));
+
+        volume
+            .insert_brick(BrickCoord::new(1, 0, 0), Brick::uniform(STONE, Revision(1)))
+            .unwrap();
+        current.set_brick(vid(), BrickCoord::new(1, 0, 0), Revision(1));
+        assert!(before.is_stale(&current));
+        let after = build_brick_mesh(
+            &volume,
+            BrickCoord::new(0, 0, 0),
+            gen1(),
+            TopologyEpoch::START,
+        )
+        .unwrap();
+        assert!(
+            !after
+                .quads
+                .iter()
+                .any(|quad| quad.dir == FaceDir::PosX && quad.plane == 32)
+        );
+        assert_eq!(after.stats.exposed_unit_faces, 5 * 32 * 32);
     }
 
     #[test]

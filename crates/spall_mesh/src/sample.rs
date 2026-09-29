@@ -167,6 +167,17 @@ pub struct ResidentCells {
 }
 
 impl ResidentCells {
+    /// Plan one brick for incremental chunk meshing. The sampler still reads
+    /// across the brick boundary, while only this brick's cells are emitted.
+    pub fn one_brick(coord: BrickCoord) -> Result<Self, MeshError> {
+        let Some(bounds) = CellBox::of_brick(coord) else {
+            return Err(MeshError::CoordinateOverflow { coord });
+        };
+        Ok(Self {
+            boxes: vec![bounds],
+        })
+    }
+
     /// Default ceiling on cell visits: `1 << 30` cells, i.e. 32768 resident
     /// bricks. Well past any G1 world; a larger resident set is an admission
     /// problem, not something to enumerate silently.

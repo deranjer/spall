@@ -297,6 +297,7 @@ impl GridFluidDemoApp {
             acquired,
             Some(&(self.camera.position, self.camera.forward())),
             &[],
+            &[],
             Some((
                 "ENG-103 TWO-PHASE WATER INSPECTION",
                 "1 reservoirs · 2 canal · 3 breach · 4 basin · 5 tunnel · 6 level basin · C open · B breach · X close · Space pause · R reset · WASD/QE move · mouse look",

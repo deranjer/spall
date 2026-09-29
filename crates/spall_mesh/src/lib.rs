@@ -43,7 +43,7 @@ pub mod mesh;
 pub mod sample;
 
 pub use ao::ao_factor;
-pub use build::{MeshOptions, VolumeMesh, build_volume_mesh};
+pub use build::{MeshOptions, VolumeMesh, build_brick_mesh, build_volume_mesh};
 pub use culled::emit_culled;
 pub use enumerate::{ExposedFace, for_each_exposed_face};
 pub use face::{FACE_DIRS, FaceDir};
