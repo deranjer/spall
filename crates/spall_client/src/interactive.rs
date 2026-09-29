@@ -317,6 +317,15 @@ pub struct InteractiveSession {
     /// Tool uses the window wants sent (reviewer cut keys / clicks): the network thread
     /// drains this and sends each as a reliable `ActionRequest`.
     pub action_queue: Mutex<Vec<spall_protocol::ActionRequest>>,
+    /// Admin commands (the admin menu's world reset) waiting for the network
+    /// thread to send.
+    pub admin_queue: Mutex<Vec<spall_protocol::AdminRequest>>,
+    /// The server's answer to the most recent admin command.
+    pub admin_status: Mutex<Option<spall_protocol::AdminStatus>>,
+    /// ENG-105: newest replicated water keyframe (presentation only).
+    pub water: Mutex<Option<Arc<spall_protocol::WaterKeyframe>>>,
+    /// Bumped each time an admin world reset replaced the replica.
+    pub world_resets: std::sync::atomic::AtomicU64,
 }
 
 /// Unquantized pose of a locally simulated body (testing-only client authority).
@@ -418,7 +427,26 @@ impl InteractiveSession {
             corrections,
             frames,
             action_queue: Mutex::new(Vec::new()),
+            admin_queue: Mutex::new(Vec::new()),
+            admin_status: Mutex::new(None),
+            water: Mutex::new(None),
+            world_resets: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Queues an admin command for the network thread to send.
+    pub fn push_admin(&self, command: spall_protocol::AdminCommand) {
+        use std::sync::atomic::AtomicU64;
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let request = spall_protocol::AdminRequest {
+            request_id: spall_protocol::RequestId(NEXT.fetch_add(1, Ordering::Relaxed)),
+            command,
+        };
+        *self.admin_status.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.admin_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(request);
     }
 
     /// Queues an action for the network thread to send.

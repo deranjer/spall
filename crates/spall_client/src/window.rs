@@ -15,12 +15,13 @@
 //! (rather than its current offscreen-capture use) is out of scope here and
 //! left to a follow-up increment.
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use spall_core::{BUTTON_JUMP, GlobalCell};
+use spall_core::{BUTTON_JUMP, GlobalCell, MaterialId};
 use spall_physics::CharacterParams;
 use spall_render::{
     Camera, CubeInstance, DebugView, Environment, EnvironmentPreset, GameRenderer,
@@ -54,9 +55,11 @@ use spall_core::MaterialManifest;
 /// pop in a little later after a big camera jump, never stalls a frame.
 /// `10.0` (the original value) left almost the whole scene invisible until
 /// the player was standing right in front of it — raised after user report.
-const VIEW_RADIUS_M: f32 = 48.0;
-const VIEW_HEIGHT_UP_M: f32 = 10.0;
-const VIEW_HEIGHT_DOWN_M: f32 = 8.0;
+/// The brick walk in [`build_instances`] skips empty and buried space, so the
+/// window is tall enough for valley walls and a flying camera.
+const VIEW_RADIUS_M: f32 = 64.0;
+const VIEW_HEIGHT_UP_M: f32 = 32.0;
+const VIEW_HEIGHT_DOWN_M: f32 = 32.0;
 /// Rebuild the instanced terrain draw once the player has moved this far
 /// (metres) from where it was last built, or the resident terrain changes.
 pub const REBUILD_DISTANCE_M: f64 = 1.0;
@@ -112,16 +115,99 @@ pub fn run_interactive_window_with_progression(
     )
 }
 
+/// Interactive window options beyond the network and content configuration.
+#[derive(Debug, Clone, Default)]
+pub struct InteractiveOptions {
+    /// Present without vsync (rendering-throughput measurement only).
+    pub uncapped: bool,
+    /// A scripted tour: each step runs, then the frame is saved to
+    /// `shots_dir`; the window closes after the last step. Empty = normal play.
+    pub shots: Vec<ShotStep>,
+    pub shots_dir: PathBuf,
+}
+
+/// One step of a scripted screenshot tour (see [`parse_shots`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShotStep {
+    /// Fly the camera to `eye` (metres) looking along yaw/pitch (degrees;
+    /// yaw 0 looks north along -Z, positive yaw turns toward +X).
+    Camera {
+        eye: [f32; 3],
+        yaw_deg: f32,
+        pitch_deg: f32,
+    },
+    /// Land and look from the player.
+    Walk,
+    /// Toggle the admin menu.
+    Menu,
+    /// Ask the server for an admin world reset.
+    Reset,
+    /// Pause without a screenshot.
+    Wait(f32),
+}
+
+/// Parses `x,y,z,yaw,pitch;menu;reset;walk;wait:2` into steps.
+pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
+    spec.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|step| match step {
+            "walk" => Ok(ShotStep::Walk),
+            "menu" => Ok(ShotStep::Menu),
+            "reset" => Ok(ShotStep::Reset),
+            _ if step.starts_with("wait:") => step[5..]
+                .parse()
+                .map(ShotStep::Wait)
+                .map_err(|_| format!("bad wait `{step}`")),
+            _ => {
+                let v: Vec<f32> = step
+                    .split(',')
+                    .map(|n| n.trim().parse::<f32>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| format!("bad camera shot `{step}`"))?;
+                match v[..] {
+                    [x, y, z, yaw_deg, pitch_deg] => Ok(ShotStep::Camera {
+                        eye: [x, y, z],
+                        yaw_deg,
+                        pitch_deg,
+                    }),
+                    _ => Err(format!("camera shot `{step}` needs x,y,z,yaw,pitch")),
+                }
+            }
+        })
+        .collect()
+}
+
 /// Interactive client lit by `environment` -- the same lighting model and
 /// numbers `spall_render` gives the editor's scene viewport, so a scene reads
 /// the same in both. The other `run_interactive_window_*` entry points use
 /// [`EnvironmentPreset::Daylight`].
 pub fn run_interactive_window_with_environment(
+    net_config: ClientNetConfig,
+    materials: MaterialManifest,
+    asset_manifest_hash: Option<[u8; 32]>,
+    progression_requests: Vec<spall_protocol::ProgressionRequest>,
+    environment: Environment,
+) -> Result<(), ClientError> {
+    run_interactive_window_with_options(
+        net_config,
+        materials,
+        asset_manifest_hash,
+        progression_requests,
+        environment,
+        InteractiveOptions::default(),
+    )
+}
+
+/// Interactive client with an optional no-vsync presentation path for
+/// profiling. This changes presentation pacing only; simulation remains 60 Hz.
+pub fn run_interactive_window_with_options(
     mut net_config: ClientNetConfig,
     materials: MaterialManifest,
     asset_manifest_hash: Option<[u8; 32]>,
     progression_requests: Vec<spall_protocol::ProgressionRequest>,
     environment: Environment,
+    options: InteractiveOptions,
 ) -> Result<(), ClientError> {
     let session = InteractiveSession::new();
     let net_config_streams_residency = net_config.client_residency.is_some();
@@ -150,6 +236,7 @@ pub fn run_interactive_window_with_environment(
         environment,
         render_materials,
         debug_material,
+        options,
         // Only a session that streams bricks can have an absent brick that
         // is genuinely unknown; otherwise absent means empty.
         !net_config_streams_residency,
@@ -197,6 +284,8 @@ struct HeldKeys {
     left: bool,
     right: bool,
     jump: bool,
+    descend: bool,
+    fast: bool,
 }
 
 impl HeldKeys {
@@ -237,6 +326,17 @@ struct InteractiveApp {
     render_materials: Vec<spall_render::Material>,
     /// Material index of the debug overlay colour (one past the manifest).
     debug_material: u32,
+    uncapped: bool,
+    /// Scripted camera tour (`--shots`); empty for normal play.
+    script: std::collections::VecDeque<ShotStep>,
+    shots_dir: PathBuf,
+    /// When the next script step runs; `None` until the world has arrived.
+    script_at: Option<Instant>,
+    shot_index: u32,
+    /// The current script step waits for its screenshot.
+    capture_due: bool,
+    /// Screenshot to take on the next presented frame.
+    pending_capture: Option<PathBuf>,
     /// True when the resident terrain instances must be re-uploaded (a
     /// rebuild landed or `F1` toggled visibility).
     terrain_dirty: bool,
@@ -288,6 +388,15 @@ struct InteractiveApp {
     /// default (adds a small number of bright markers around the player,
     /// which can otherwise obscure the view up close).
     show_capsule: bool,
+    admin_menu_open: bool,
+    fly_eye: Option<Vec3>,
+    last_fly_update: Option<Instant>,
+    /// ENG-105: `(frame_seq, server_tick)` of the water keyframe on the GPU.
+    water_key: Option<(u64, u64)>,
+    /// An admin command was sent and its `AdminStatus` has not arrived.
+    admin_request_pending: bool,
+    /// `InteractiveSession::world_resets` last acted on.
+    seen_world_resets: u64,
     result: Result<(), ClientError>,
 }
 
@@ -709,6 +818,7 @@ impl InteractiveApp {
         environment: Environment,
         render_materials: Vec<spall_render::Material>,
         debug_material: u32,
+        options: InteractiveOptions,
         absent_is_open: bool,
     ) -> Result<Self, ClientError> {
         let rebuild = RebuildWorker::spawn(session.clone(), absent_is_open)?;
@@ -720,6 +830,13 @@ impl InteractiveApp {
             environment,
             render_materials,
             debug_material,
+            uncapped: options.uncapped,
+            script: options.shots.into(),
+            shots_dir: options.shots_dir,
+            script_at: None,
+            shot_index: 0,
+            pending_capture: None,
+            capture_due: false,
             terrain_dirty: true,
             last_sky: None,
             sky_dirty: false,
@@ -742,12 +859,133 @@ impl InteractiveApp {
             show_terrain: true,
             show_bodies: true,
             show_capsule: false,
+            admin_menu_open: false,
+            fly_eye: None,
+            last_fly_update: None,
+            water_key: None,
+            admin_request_pending: false,
+            seen_world_resets: 0,
             result: Ok(()),
         })
     }
 
     fn view_dir(&self) -> [f32; 3] {
         view_dir_from(self.yaw, self.pitch)
+    }
+
+    /// Switches between walking the authoritative player and a free
+    /// spectator camera that starts at the current eye. The player stops
+    /// (neutral input) while flying and resumes from the held keys on landing.
+    /// Runs the scripted tour (`--shots`), one step at a time: each step
+    /// settles for a moment (terrain rebuilds around a moved camera), then the
+    /// next presented frame is saved. Closes the window after the last shot.
+    fn advance_script(&mut self, now: Instant, event_loop: &ActiveEventLoop) {
+        let Some(at) = self.script_at else {
+            if self.script.is_empty()
+                || self
+                    .session
+                    .view
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none()
+            {
+                return;
+            }
+            // Give the first terrain build and water keyframe time to land.
+            self.script_at = Some(now + Duration::from_secs(8));
+            return;
+        };
+        if now < at {
+            return;
+        }
+        if self.capture_due {
+            self.capture_due = false;
+            self.pending_capture = Some(
+                self.shots_dir
+                    .join(format!("shot-{:02}.png", self.shot_index)),
+            );
+            self.shot_index += 1;
+            self.script_at = Some(now + Duration::from_millis(800));
+            return;
+        }
+        let Some(step) = self.script.pop_front() else {
+            // Let the last PNG finish writing, then close.
+            if now >= at + Duration::from_millis(1500) {
+                self.session.request_stop();
+                event_loop.exit();
+            }
+            return;
+        };
+        let settle = match step {
+            ShotStep::Camera {
+                eye,
+                yaw_deg,
+                pitch_deg,
+            } => {
+                self.fly_eye = Some(Vec3::from_array(eye));
+                self.last_fly_update = Some(now);
+                self.session.input.set_movement([0.0; 3]);
+                self.yaw = yaw_deg.to_radians();
+                self.pitch = pitch_deg.to_radians().clamp(-MAX_PITCH, MAX_PITCH);
+                self.publish_look();
+                self.last_built_pos = None;
+                3.0
+            }
+            ShotStep::Walk => {
+                if self.fly_eye.is_some() {
+                    self.toggle_flight();
+                }
+                2.0
+            }
+            ShotStep::Menu => {
+                self.admin_menu_open = !self.admin_menu_open;
+                0.5
+            }
+            ShotStep::Reset => {
+                self.admin_request_pending = true;
+                self.session
+                    .push_admin(spall_protocol::AdminCommand::ResetWorld);
+                6.0
+            }
+            ShotStep::Wait(seconds) => {
+                self.script_at = Some(now + Duration::from_secs_f32(seconds.max(0.0)));
+                return;
+            }
+        };
+        self.capture_due = true;
+        self.script_at = Some(now + Duration::from_secs_f32(settle));
+    }
+
+    fn toggle_flight(&mut self) {
+        if self.fly_eye.take().is_none() {
+            self.fly_eye = self
+                .session
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map(|v| self.camera_follow.eye(v, Instant::now(), true));
+            self.session.input.set_movement([0.0; 3]);
+            self.session.input.set_button(BUTTON_JUMP, false);
+        } else {
+            self.publish_movement();
+        }
+        self.last_fly_update = Some(Instant::now());
+        // Terrain is built around the camera while flying; rebuild now.
+        self.last_built_pos = None;
+    }
+
+    /// Looks straight ahead again and, while flying, returns the camera to
+    /// the player.
+    fn recentre_view(&mut self) {
+        self.yaw = 0.0;
+        self.pitch = 0.0;
+        self.publish_look();
+        if self.fly_eye.is_some()
+            && let Some(view) = *self.session.view.lock().unwrap_or_else(|e| e.into_inner())
+        {
+            self.fly_eye = Some(self.camera_follow.eye(view, Instant::now(), true));
+            self.last_built_pos = None;
+        }
     }
 
     fn publish_look(&self) {
@@ -802,7 +1040,12 @@ impl ApplicationHandler for InteractiveApp {
             Ok(window) => Arc::new(window),
             Err(error) => return self.fail(event_loop, ClientError::Gpu(error.to_string())),
         };
-        match WorldRenderer::new(window.clone(), self.environment, &self.render_materials) {
+        match WorldRenderer::new(
+            window.clone(),
+            self.environment,
+            &self.render_materials,
+            self.uncapped,
+        ) {
             Ok(renderer) => {
                 self.window = Some(window);
                 self.renderer = Some(renderer);
@@ -855,7 +1098,35 @@ impl ApplicationHandler for InteractiveApp {
                     KeyCode::KeyD => self.held.right = held,
                     KeyCode::Space => {
                         self.held.jump = held;
-                        self.session.input.set_button(BUTTON_JUMP, held);
+                        if self.fly_eye.is_none() {
+                            self.session.input.set_button(BUTTON_JUMP, held);
+                        }
+                    }
+                    KeyCode::ControlLeft | KeyCode::ControlRight => self.held.descend = held,
+                    KeyCode::ShiftLeft | KeyCode::ShiftRight => self.held.fast = held,
+                    KeyCode::F12 if held && !event.repeat => {
+                        let stamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis());
+                        self.pending_capture = Some(
+                            PathBuf::from(".local/screenshots").join(format!("spall-{stamp}.png")),
+                        );
+                        return;
+                    }
+                    KeyCode::F10 if held && !event.repeat => {
+                        self.admin_menu_open = !self.admin_menu_open;
+                        if self.admin_menu_open {
+                            self.set_cursor_locked(false);
+                        }
+                        return;
+                    }
+                    KeyCode::KeyF if held && !event.repeat => {
+                        self.toggle_flight();
+                        return;
+                    }
+                    KeyCode::KeyR if held && !event.repeat => {
+                        self.recentre_view();
+                        return;
                     }
                     KeyCode::Escape if held && !event.repeat => {
                         self.set_cursor_locked(false);
@@ -921,10 +1192,13 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     _ => return,
                 }
-                self.publish_movement();
+                if self.fly_eye.is_none() {
+                    self.publish_movement();
+                }
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
+                self.advance_script(now, event_loop);
                 let due_for_report = self.hud.tick(now);
 
                 // Drain the background worker's result, if a fresh one has
@@ -947,7 +1221,11 @@ impl ApplicationHandler for InteractiveApp {
                 let view = *self.session.view.lock().unwrap_or_else(|e| e.into_inner());
 
                 if let Some(v) = view {
-                    let feet = v.predicted.position_m;
+                    // Terrain is built around whatever the camera follows:
+                    // the player, or the spectator camera while flying.
+                    let feet = self
+                        .fly_eye
+                        .map_or(v.predicted.position_m, |eye| eye.to_array().map(f64::from));
                     let moved_far_enough = self.last_built_pos.is_none_or(|p| {
                         let d = [feet[0] - p[0], feet[1] - p[1], feet[2] - p[2]];
                         (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() >= REBUILD_DISTANCE_M
@@ -1000,9 +1278,30 @@ impl ApplicationHandler for InteractiveApp {
                     Some(&empty)
                 };
                 let uploading_terrain = terrain.is_some();
+                // ENG-105: rebuild water columns only when a new keyframe
+                // (or a different domain after a reset) has arrived.
+                let water_frame = self
+                    .session
+                    .water
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let water_update = match &water_frame {
+                    Some(frame)
+                        if self.water_key != Some((frame.frame_seq, frame.server_tick.0)) =>
+                    {
+                        self.water_key = Some((frame.frame_seq, frame.server_tick.0));
+                        Some(build_water_instances(frame))
+                    }
+                    _ => None,
+                };
+                let mut menu_actions = AdminMenuActions::default();
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
+                if let Some(instances) = &water_update {
+                    renderer.set_debug_water(instances);
+                }
                 if self.sky_dirty {
                     let occupancy = self.last_sky.as_ref().filter(|_| self.sky_visibility_on);
                     // Nothing to upload yet (no rebuild has landed) keeps the
@@ -1069,12 +1368,71 @@ impl ApplicationHandler for InteractiveApp {
                             );
                         }
                         let cam = fresh_view.map(|v| {
-                            (
-                                self.camera_follow.eye(v, render_now, local_poses.is_none()),
-                                look_dir,
+                            let followed =
+                                self.camera_follow.eye(v, render_now, local_poses.is_none());
+                            if let Some(eye) = &mut self.fly_eye {
+                                let dt = self
+                                    .last_fly_update
+                                    .replace(render_now)
+                                    .map(|at| {
+                                        render_now.saturating_duration_since(at).as_secs_f32()
+                                    })
+                                    .unwrap_or(0.0)
+                                    .min(0.05);
+                                let forward = Vec3::from_array(view_dir_from(self.yaw, 0.0));
+                                // Positive X is screen-right when looking
+                                // down -Z at the default yaw. `forward × up`
+                                // keeps that basis aligned as yaw changes.
+                                let right = Vec3::new(-forward.z, 0.0, forward.x);
+                                let mut wish = Vec3::ZERO;
+                                if self.held.forward {
+                                    wish += forward;
+                                }
+                                if self.held.back {
+                                    wish -= forward;
+                                }
+                                if self.held.right {
+                                    wish += right;
+                                }
+                                if self.held.left {
+                                    wish -= right;
+                                }
+                                if self.held.jump {
+                                    wish.y += 1.0;
+                                }
+                                if self.held.descend {
+                                    wish.y -= 1.0;
+                                }
+                                if wish.length_squared() > 0.0 {
+                                    let speed = if self.held.fast {
+                                        FLY_FAST_SPEED_M_S
+                                    } else {
+                                        FLY_SPEED_M_S
+                                    };
+                                    *eye += wish.normalize() * (speed * dt);
+                                }
+                                (*eye, look_dir)
+                            } else {
+                                (followed, look_dir)
+                            }
+                        });
+                        if let Some(path) = self.pending_capture.take() {
+                            renderer.screenshot_request = Some(path);
+                        }
+                        let menu_view = self.admin_menu_open.then(|| {
+                            admin_menu_view(
+                                &self.session,
+                                self.fly_eye.is_some(),
+                                self.admin_request_pending,
                             )
                         });
-                        match renderer.finish_frame(acquired, cam.as_ref(), &body_instances, None) {
+                        match renderer.finish_frame(
+                            acquired,
+                            cam.as_ref(),
+                            &body_instances,
+                            None,
+                            menu_view.as_ref().map(|view| (view, &mut menu_actions)),
+                        ) {
                             Ok(timing) => timing,
                             Err(error) => {
                                 self.fail(event_loop, error);
@@ -1084,6 +1442,54 @@ impl ApplicationHandler for InteractiveApp {
                     }
                 };
                 self.hud.record_frame(&timing);
+                if menu_actions.toggle_flight {
+                    self.toggle_flight();
+                }
+                if menu_actions.recentre {
+                    self.recentre_view();
+                }
+                if menu_actions.reset_world {
+                    self.admin_request_pending = true;
+                    self.session
+                        .push_admin(spall_protocol::AdminCommand::ResetWorld);
+                }
+                if let Some(rate) = menu_actions.set_water_spring_rate {
+                    self.admin_request_pending = true;
+                    self.session
+                        .push_admin(spall_protocol::AdminCommand::SetWaterSpring { rate });
+                }
+                if let Some(open) = menu_actions.set_dam_gate {
+                    self.admin_request_pending = true;
+                    self.session
+                        .push_admin(spall_protocol::AdminCommand::SetDamGate { open });
+                }
+                if menu_actions.close {
+                    self.admin_menu_open = false;
+                }
+                // A reset baseline replaced the world: drop the old view.
+                let resets = self
+                    .session
+                    .world_resets
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if resets != self.seen_world_resets {
+                    self.seen_world_resets = resets;
+                    self.last_built_pos = None;
+                    self.last_body_draws.clear();
+                    if self.fly_eye.is_some() {
+                        self.fly_eye = None;
+                        self.last_fly_update = None;
+                    }
+                }
+                if self.admin_request_pending
+                    && self
+                        .session
+                        .admin_status
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some()
+                {
+                    self.admin_request_pending = false;
+                }
                 if let Some(frames) = &self.session.frames {
                     frames.record(
                         timing.total_ms,
@@ -1302,30 +1708,91 @@ pub fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
     let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
     let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
     let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
+    let min = GlobalCell::new(
+        center_cell.x - horiz,
+        center_cell.y - down,
+        center_cell.z - horiz,
+    );
+    let max = GlobalCell::new(
+        center_cell.x + horiz,
+        center_cell.y + up,
+        center_cell.z + horiz,
+    );
+    let (min_brick, _) = min.split();
+    let (max_brick, _) = max.split();
+    let edge = i64::from(spall_core::BRICK_EDGE);
 
     let mut instances = Vec::new();
-    for dz in -horiz..=horiz {
-        for dx in -horiz..=horiz {
-            for dy in -down..=up {
-                let cell =
-                    GlobalCell::new(center_cell.x + dx, center_cell.y + dy, center_cell.z + dz);
-                let Ok(Sample::Filled(material)) = volume.sample(cell) else {
+    let mut emit = |cell: GlobalCell, material: MaterialId| {
+        if is_buried(volume, cell) {
+            return;
+        }
+        instances.push(Instance {
+            offset: [
+                ((cell.x as f64 + 0.5) * cell_m) as f32,
+                ((cell.y as f64 + 0.5) * cell_m) as f32,
+                ((cell.z as f64 + 0.5) * cell_m) as f32,
+            ],
+            material: u32::from(material.0),
+            size: [CELL_M; 3],
+            _pad: 0.0,
+            rotation: IDENTITY_ROTATION,
+        });
+    };
+    // Walk whole bricks: uniform air is skipped outright and a uniform solid
+    // brick can only expose its shell, so the view window can be tall enough
+    // for hills and flight without sampling every empty cell in it.
+    for bz in min_brick.z..=max_brick.z {
+        for by in min_brick.y..=max_brick.y {
+            for bx in min_brick.x..=max_brick.x {
+                let coord = spall_core::BrickCoord::new(bx, by, bz);
+                let Ok(Some(brick)) = volume.snapshot_brick(coord) else {
                     continue;
                 };
-                if is_buried(volume, cell) {
+                let base = GlobalCell::new(bx * edge, by * edge, bz * edge);
+                let lo = [
+                    (min.x - base.x).max(0),
+                    (min.y - base.y).max(0),
+                    (min.z - base.z).max(0),
+                ];
+                let hi = [
+                    (max.x - base.x).min(edge - 1),
+                    (max.y - base.y).min(edge - 1),
+                    (max.z - base.z).min(edge - 1),
+                ];
+                let uniform = (!brick.is_dense())
+                    .then(|| brick.get(spall_core::LocalCell::new(0, 0, 0).expect("origin")));
+                if uniform == Some(MaterialId::AIR) {
                     continue;
                 }
-                instances.push(Instance {
-                    offset: [
-                        ((cell.x as f64 + 0.5) * cell_m) as f32,
-                        ((cell.y as f64 + 0.5) * cell_m) as f32,
-                        ((cell.z as f64 + 0.5) * cell_m) as f32,
-                    ],
-                    material: u32::from(material.0),
-                    size: [CELL_M; 3],
-                    _pad: 0.0,
-                    rotation: IDENTITY_ROTATION,
-                });
+                for z in lo[2]..=hi[2] {
+                    for y in lo[1]..=hi[1] {
+                        let shell_row = z == 0 || z == edge - 1 || y == 0 || y == edge - 1;
+                        let mut x = lo[0];
+                        while x <= hi[0] {
+                            let cell = GlobalCell::new(base.x + x, base.y + y, base.z + z);
+                            match uniform {
+                                Some(material) => emit(cell, material),
+                                None => {
+                                    let local =
+                                        spall_core::LocalCell::new(x as u8, y as u8, z as u8)
+                                            .expect("in-brick cell");
+                                    let material = brick.get(local);
+                                    if material != MaterialId::AIR {
+                                        emit(cell, material);
+                                    }
+                                }
+                            }
+                            // Inside a uniform solid brick only x = 0 / 31 can
+                            // be exposed on an interior row.
+                            x = if uniform.is_some() && !shell_row && x < edge - 1 {
+                                edge - 1
+                            } else {
+                                x + 1
+                            };
+                        }
+                    }
+                }
             }
         }
     }
@@ -1724,6 +2191,278 @@ fn is_buried(volume: &Volume, cell: GlobalCell) -> bool {
     })
 }
 
+/// Linear-space blue-green water, smooth and translucent.
+const WATER_MATERIAL: spall_render::Material =
+    spall_render::Material::new([0.03, 0.16, 0.26], 0.08, 0.0).opacity(0.62);
+
+/// Spectator flight speed, metres per second (`Shift` for the fast one).
+const FLY_SPEED_M_S: f32 = 12.0;
+const FLY_FAST_SPEED_M_S: f32 = 36.0;
+
+/// Water under this fraction of a cell is not drawn (thin films and spray).
+const WATER_DRAW_MIN: u8 = 6;
+
+/// Translucent water columns for one replicated keyframe: each vertical run
+/// of wet fluid cells becomes one box as tall as the run's summed fractions,
+/// so a column shows a single top surface instead of stacked cube faces.
+pub(super) fn build_water_instances(frame: &spall_protocol::WaterKeyframe) -> Vec<Instance> {
+    let [nx, ny, nz] = frame.dimensions.map(|d| d as usize);
+    let coarsen = f64::from(frame.coarsen);
+    let cell_m = f64::from(CELL_M) * coarsen;
+    let origin =
+        [frame.origin.x, frame.origin.y, frame.origin.z].map(|v| v as f64 * f64::from(CELL_M));
+    let mut instances = Vec::new();
+    for z in 0..nz {
+        for x in 0..nx {
+            let mut y = 0;
+            while y < ny {
+                let at = |y: usize| frame.fractions[x + nx * (y + ny * z)];
+                if at(y) < WATER_DRAW_MIN {
+                    y += 1;
+                    continue;
+                }
+                let start = y;
+                let mut filled = 0.0;
+                while y < ny && at(y) >= WATER_DRAW_MIN {
+                    filled += f64::from(at(y)) / 255.0;
+                    y += 1;
+                }
+                let height = filled * cell_m;
+                let bottom = origin[1] + start as f64 * cell_m;
+                instances.push(Instance {
+                    offset: [
+                        (origin[0] + (x as f64 + 0.5) * cell_m) as f32,
+                        (bottom + 0.5 * height) as f32,
+                        (origin[2] + (z as f64 + 0.5) * cell_m) as f32,
+                    ],
+                    material: 0,
+                    size: [cell_m as f32, height as f32, cell_m as f32],
+                    _pad: 0.0,
+                    rotation: IDENTITY_ROTATION,
+                });
+            }
+        }
+    }
+    instances
+}
+
+fn admin_menu_view(session: &InteractiveSession, flying: bool, pending: bool) -> AdminMenuView {
+    let admin_status = match (
+        pending,
+        session
+            .admin_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref(),
+    ) {
+        (_, Some(status)) if status.accepted => Some(format!("Server: {}", status.message)),
+        (_, Some(status)) => Some(format!("Refused: {}", status.message)),
+        (true, None) => Some("Waiting for the server...".to_owned()),
+        (false, None) => None,
+    };
+    let water = session
+        .water
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|frame| {
+            let cell_m = f64::from(CELL_M) * f64::from(frame.coarsen);
+            let volume: f64 = frame
+                .fractions
+                .iter()
+                .map(|f| f64::from(*f) / 255.0)
+                .sum::<f64>()
+                * cell_m.powi(3);
+            format!(
+                "Water: {:.0} m³ in a {}×{}×{} grid of {:.2} m cells, server frame {}",
+                volume,
+                frame.dimensions[0],
+                frame.dimensions[1],
+                frame.dimensions[2],
+                cell_m,
+                frame.frame_seq
+            )
+        });
+    AdminMenuView {
+        flying,
+        admin_status,
+        water,
+    }
+}
+
+/// Background of HUD panels.
+const PANEL_BG: yakui::Color = yakui::Color::rgb(16, 20, 28);
+const PANEL_ACCENT: yakui::Color = yakui::Color::rgb(120, 190, 255);
+const PANEL_MUTED: yakui::Color = yakui::Color::rgb(160, 170, 185);
+
+/// Every binding the interactive window handles, as shown in the admin menu.
+const KEYBINDS: &[(&str, &str)] = &[
+    ("W A S D", "Walk / fly"),
+    ("Mouse", "Look (left click captures the cursor)"),
+    ("Space", "Jump (walking) / rise (flying)"),
+    ("Ctrl", "Descend (flying)"),
+    ("Shift", "Fly faster"),
+    ("F", "Toggle flight"),
+    ("R", "Recentre the view on your player"),
+    ("F10", "Open / close this menu"),
+    ("Esc", "Release the cursor"),
+    ("F1", "Toggle terrain"),
+    ("F2", "Toggle detached bodies"),
+    ("F3", "Toggle capsule markers"),
+    ("F4", "Cycle render debug views"),
+    ("F5", "Toggle visibility-aware skylight"),
+    ("F6", "Toggle diffuse bounce"),
+];
+
+/// What the admin menu shows this frame.
+#[derive(Debug, Clone, Default)]
+pub(super) struct AdminMenuView {
+    pub flying: bool,
+    /// Server's reply to the last admin command, or "waiting" while pending.
+    pub admin_status: Option<String>,
+    /// One-line summary of the replicated water, if any has arrived.
+    pub water: Option<String>,
+}
+
+/// Buttons clicked in the admin menu this frame.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct AdminMenuActions {
+    pub toggle_flight: bool,
+    pub reset_world: bool,
+    pub recentre: bool,
+    pub close: bool,
+    /// `Some(rate)` when a spring rate button (off/normal/fast/max) was
+    /// clicked this frame.
+    pub set_water_spring_rate: Option<u8>,
+    /// `Some(open)` when a dam gate open/close button was clicked this frame.
+    pub set_dam_gate: Option<bool>,
+}
+
+fn section(title: &'static str) {
+    yakui::pad(yakui::widgets::Pad::balanced(0.0, 6.0), || {
+        let mut text = yakui::widgets::Text::new(15.0, title);
+        text.style.color = PANEL_ACCENT;
+        text.show();
+    });
+}
+
+fn muted(size: f32, line: impl Into<std::borrow::Cow<'static, str>>) {
+    let mut text = yakui::widgets::Text::new(size, line.into());
+    text.style.color = PANEL_MUTED;
+    text.show();
+}
+
+fn admin_menu_panel(
+    view: &AdminMenuView,
+    actions: &mut AdminMenuActions,
+    selected_environment: &mut Option<EnvironmentPreset>,
+) {
+    yakui::colored_box_container(PANEL_BG.with_alpha(0.88), || {
+        yakui::pad(yakui::widgets::Pad::all(14.0), || {
+            yakui::column(|| {
+                yakui::row(|| {
+                    yakui::text(22.0, "SPALL ADMIN");
+                    yakui::pad(yakui::widgets::Pad::balanced(12.0, 6.0), || {
+                        muted(13.0, "F10 to close");
+                    });
+                });
+
+                section("Movement");
+                muted(
+                    13.0,
+                    if view.flying {
+                        "Flying: spectator camera, no collision. Your player waits where you left it."
+                    } else {
+                        "Walking: server-authoritative character physics."
+                    },
+                );
+                yakui::row(|| {
+                    let label = if view.flying { "Land (walk)" } else { "Fly" };
+                    actions.toggle_flight |= yakui::button(label).clicked;
+                    yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                        actions.recentre |= yakui::button("Recentre view").clicked;
+                    });
+                });
+
+                section("World");
+                yakui::row(|| {
+                    actions.reset_world |= yakui::button("Reset world").clicked;
+                    yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                        actions.close |= yakui::button("Close menu").clicked;
+                    });
+                });
+                muted(
+                    12.0,
+                    "Reset rebuilds terrain, water, and bodies from the scene for every player.",
+                );
+                if let Some(status) = &view.admin_status {
+                    yakui::text(13.0, status.clone());
+                }
+                if let Some(water) = &view.water {
+                    muted(12.0, water.clone());
+                }
+
+                section("Water");
+                muted(
+                    12.0,
+                    "A scene with no gated spring or dam gate refuses these.",
+                );
+                yakui::row(|| {
+                    for (label, rate) in [
+                        ("Spring off", 0u8),
+                        ("Spring normal", 1),
+                        ("Spring fast", 2),
+                        ("Spring max", 3),
+                    ] {
+                        yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
+                            if yakui::button(label).clicked {
+                                actions.set_water_spring_rate = Some(rate);
+                            }
+                        });
+                    }
+                });
+                yakui::row(|| {
+                    if yakui::button("Open dam gate").clicked {
+                        actions.set_dam_gate = Some(true);
+                    }
+                    yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                        if yakui::button("Close dam gate").clicked {
+                            actions.set_dam_gate = Some(false);
+                        }
+                    });
+                });
+
+                section("Lighting");
+                yakui::row(|| {
+                    for preset in EnvironmentPreset::ALL {
+                        yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
+                            if yakui::button(preset.label()).clicked {
+                                *selected_environment = Some(preset);
+                            }
+                        });
+                    }
+                });
+
+                section("Controls");
+                yakui::row(|| {
+                    yakui::column(|| {
+                        for (key, _) in KEYBINDS {
+                            yakui::text(13.0, *key);
+                        }
+                    });
+                    yakui::pad(yakui::widgets::Pad::horizontal(14.0), || {
+                        yakui::column(|| {
+                            for (_, action) in KEYBINDS {
+                                muted(13.0, *action);
+                            }
+                        });
+                    });
+                });
+            });
+        });
+    });
+}
+
 /// The next debug view in the `F4` cycle, wrapping back to shaded.
 fn next_debug_view(view: DebugView) -> DebugView {
     match view {
@@ -1785,8 +2524,9 @@ pub(super) struct WorldRenderer {
     yakui_winit: YakuiWinit,
     yakui_wgpu: YakuiWgpu,
     yakui_buffers: yakui_wgpu::Buffers,
-    yakui_clicks: u64,
     hud_gpu_timer: Option<HudGpuTimer>,
+    /// Set to capture the next finished frame to this PNG path.
+    pub(super) screenshot_request: Option<PathBuf>,
 }
 
 struct HudGpuReadback {
@@ -1988,6 +2728,7 @@ impl WorldRenderer {
         window: Arc<Window>,
         environment: Environment,
         materials: &[spall_render::Material],
+        uncapped: bool,
     ) -> Result<Self, ClientError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(window.clone()),
@@ -2018,6 +2759,15 @@ impl WorldRenderer {
         }))
         .map_err(|error| ClientError::Gpu(error.to_string()))?;
         let capabilities = surface.get_capabilities(&adapter);
+        let present_mode = if uncapped {
+            [wgpu::PresentMode::Immediate, wgpu::PresentMode::AutoNoVsync]
+                .into_iter()
+                .find(|mode| capabilities.present_modes.contains(mode))
+                .unwrap_or(wgpu::PresentMode::Fifo)
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        eprintln!("spall-interactive: present mode {present_mode:?}");
         let format = capabilities
             .formats
             .iter()
@@ -2027,11 +2777,16 @@ impl WorldRenderer {
             .ok_or_else(|| ClientError::Gpu("surface exposes no texture format".into()))?;
         let size = window.inner_size();
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC lets F12 / `--screenshot` read the finished frame back.
+            usage: if capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode: capabilities.alpha_modes[0],
             color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
@@ -2063,8 +2818,8 @@ impl WorldRenderer {
 
         let mut render_materials = materials.to_vec();
         let debug_water_material = render_materials.len() as u32;
-        let water_color = materials.get(2).copied().unwrap_or_default();
-        render_materials.push(water_color.opacity(0.24));
+        // Water is presentation-only and drawn alpha-blended over the scene.
+        render_materials.push(WATER_MATERIAL);
         let scene = GameRenderer::new(
             &device,
             &queue,
@@ -2091,9 +2846,122 @@ impl WorldRenderer {
             yakui_winit,
             yakui_wgpu,
             yakui_buffers,
-            yakui_clicks: 0,
             hud_gpu_timer,
+            screenshot_request: None,
         })
+    }
+
+    /// Queues a copy of the finished frame (HUD included) for a screenshot.
+    /// `None` if this surface cannot be read back.
+    fn queue_screenshot_copy(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        path: PathBuf,
+    ) -> Option<PendingScreenshot> {
+        if !self
+            .surface_config
+            .usage
+            .contains(wgpu::TextureUsages::COPY_SRC)
+        {
+            eprintln!("spall-interactive: this surface cannot be read back; screenshot skipped");
+            return None;
+        }
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+        let padded = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spall-interactive-screenshot"),
+            size: u64::from(padded) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Some(PendingScreenshot {
+            buffer,
+            path,
+            width,
+            height,
+            padded,
+            bgra: matches!(
+                self.surface_config.format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            ),
+        })
+    }
+
+    /// Reads a submitted screenshot copy back and writes the PNG off-thread.
+    fn finish_screenshot(&self, pending: PendingScreenshot) -> Result<(), ClientError> {
+        let slice = pending.buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| ClientError::Render(error.to_string()))?;
+        if !matches!(rx.recv(), Ok(Ok(()))) {
+            eprintln!("spall-interactive: screenshot readback failed");
+            return Ok(());
+        }
+        let mut rgba = Vec::with_capacity((pending.width * pending.height * 4) as usize);
+        {
+            let mapped = slice
+                .get_mapped_range()
+                .map_err(|error| ClientError::Render(error.to_string()))?;
+            for row in mapped.chunks_exact(pending.padded as usize) {
+                for px in row[..(pending.width * 4) as usize].chunks_exact(4) {
+                    if pending.bgra {
+                        rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+                    } else {
+                        rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                    }
+                }
+            }
+        }
+        pending.buffer.unmap();
+        let PendingScreenshot {
+            path,
+            width,
+            height,
+            ..
+        } = pending;
+        std::thread::spawn(move || {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            match image::RgbaImage::from_raw(width, height, rgba).map(|img| img.save(&path)) {
+                Some(Ok(())) => {
+                    eprintln!("spall-interactive: screenshot saved to {}", path.display())
+                }
+                Some(Err(error)) => eprintln!(
+                    "spall-interactive: screenshot {} failed: {error}",
+                    path.display()
+                ),
+                None => eprintln!("spall-interactive: screenshot buffer had the wrong size"),
+            }
+        });
+        Ok(())
     }
 
     /// One report-line fragment: the shared renderer's per-pass GPU time
@@ -2225,6 +3093,7 @@ impl WorldRenderer {
         cam: Option<&(Vec3, Vec3)>,
         bodies: &[Instance],
         demo_hud: Option<(&str, &str, &str)>,
+        admin_menu: Option<(&AdminMenuView, &mut AdminMenuActions)>,
     ) -> Result<FrameTiming, ClientError> {
         let AcquiredFrame {
             frame_start,
@@ -2305,28 +3174,32 @@ impl WorldRenderer {
             timer.write_start(&mut encoder);
         }
         self.yakui.start();
-        let mut clicked = false;
+        let mut selected_environment = None;
+        let mut admin_menu = admin_menu;
         {
-            let clicks = self.yakui_clicks;
             yakui::align(yakui::Alignment::TOP_LEFT, || {
-                yakui::column(|| {
+                yakui::pad(yakui::widgets::Pad::all(12.0), || {
                     if let Some((heading, controls, status)) = demo_hud {
-                        yakui::text(20.0, heading.to_owned());
-                        yakui::text(14.0, controls.to_owned());
-                        yakui::text(12.0, status.to_owned());
+                        yakui::column(|| {
+                            yakui::text(20.0, heading.to_owned());
+                            yakui::text(14.0, controls.to_owned());
+                            yakui::text(12.0, status.to_owned());
+                        });
+                    } else if let Some((view, actions)) = admin_menu.as_mut() {
+                        admin_menu_panel(view, actions, &mut selected_environment);
                     } else {
-                        yakui::text(20.0, "SPALL");
-                        yakui::text(14.0, "WASD move  |  Space jump  |  Esc release cursor");
-                        yakui::text(12.0, "Authoritative multiplayer voxel sandbox");
-                        yakui::text(12.0, format!("HUD input test clicks: {clicks}"));
-                        clicked = yakui::button("Click to verify UI input").clicked;
+                        yakui::colored_box_container(PANEL_BG.with_alpha(0.55), || {
+                            yakui::pad(yakui::widgets::Pad::balanced(10.0, 6.0), || {
+                                yakui::text(13.0, "F10  menu & controls");
+                            });
+                        });
                     }
                 });
             });
         }
         self.yakui.finish();
-        if clicked {
-            self.yakui_clicks = self.yakui_clicks.saturating_add(1);
+        if let Some(preset) = selected_environment {
+            self.environment = preset.environment();
         }
         self.yakui_wgpu.paint_with_encoder(
             &mut self.yakui,
@@ -2345,8 +3218,14 @@ impl WorldRenderer {
             timer.resolve(&mut encoder, slot);
         }
         let hud_cpu_ms = hud_start.elapsed().as_secs_f32() * 1000.0;
+        let screenshot = self.screenshot_request.take().and_then(|path| {
+            self.queue_screenshot_copy(&mut encoder, &surface_texture.texture, path)
+        });
         let submit_start = Instant::now();
         self.queue.submit([encoder.finish()]);
+        if let Some(pending) = screenshot {
+            self.finish_screenshot(pending)?;
+        }
         self.scene.finish_timing();
         if let Some(slot) = hud_gpu_slot
             && let Some(timer) = self.hud_gpu_timer.as_mut()
@@ -2411,6 +3290,10 @@ mod input_tests {
             max_horizontal_correction_m: 0.0,
             unmatched_reconciles: 0,
             max_unmatched_displacement_m: 0.0,
+            prediction_steps: 0,
+            prediction_elapsed_ms: 0,
+            prediction_max_backlog_steps: 0,
+            prediction_dropped_steps: 0,
             window_stats: crate::predict::WindowStats::default(),
         }
     }
@@ -2563,6 +3446,56 @@ mod perf_probe {
         );
     }
 
+    /// The brick walk's uniform-brick shortcuts must emit exactly the exposed
+    /// cells a per-cell scan of the same window finds.
+    #[test]
+    fn brick_walk_matches_per_cell_scan() {
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+        let center = [2.0, 13.5, 2.0];
+        let mut fast: Vec<_> = build_instances(&volume, center)
+            .into_iter()
+            .map(|i| (i.offset.map(f32::to_bits), i.material))
+            .collect();
+        let cell_m = f64::from(CELL_M);
+        let c = center.map(|v| (v / cell_m).floor() as i64);
+        let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
+        let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
+        let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
+        let mut slow = Vec::new();
+        for coord in volume.resident_brick_coords() {
+            let edge = i64::from(spall_core::BRICK_EDGE);
+            for z in 0..edge {
+                for y in 0..edge {
+                    for x in 0..edge {
+                        let cell = GlobalCell::new(
+                            coord.x * edge + x,
+                            coord.y * edge + y,
+                            coord.z * edge + z,
+                        );
+                        let inside = (cell.x - c[0]).abs() <= horiz
+                            && (cell.z - c[2]).abs() <= horiz
+                            && cell.y >= c[1] - down
+                            && cell.y <= c[1] + up;
+                        if !inside {
+                            continue;
+                        }
+                        if let Ok(Sample::Filled(m)) = volume.sample(cell)
+                            && !is_buried(&volume, cell)
+                        {
+                            let offset = [cell.x, cell.y, cell.z]
+                                .map(|v| ((v as f64 + 0.5) * cell_m) as f32);
+                            slow.push((offset.map(f32::to_bits), u32::from(m.0)));
+                        }
+                    }
+                }
+            }
+        }
+        fast.sort_unstable();
+        slow.sort_unstable();
+        assert!(!slow.is_empty());
+        assert_eq!(fast, slow);
+    }
+
     #[test]
     fn build_instances_timing_g1_full_envelope() {
         let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
@@ -2612,4 +3545,14 @@ mod perf_probe {
             start.elapsed() / 10
         );
     }
+}
+
+/// A frame copy waiting to be read back and written as a PNG.
+struct PendingScreenshot {
+    buffer: wgpu::Buffer,
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    padded: u32,
+    bgra: bool,
 }

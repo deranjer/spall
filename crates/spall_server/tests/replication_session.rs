@@ -78,6 +78,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         // Fixture scripts cut at arbitrary cells no real aim ray would produce;
         // the ENG-47 dev-scenario path keeps this plumbing test working.
         dev_unvalidated_actions: true,
+        admin_commands: false,
         save_faults: None,
         await_body_settle: false,
         motion_interest: None,
@@ -120,6 +121,7 @@ fn client_replica_matches_the_server_hash_over_real_quic() {
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     };
 
     let client = run_replication_client(client_cfg).expect("client run");
@@ -195,6 +197,7 @@ fn server_persists_and_recovers_across_a_restart() {
         capture_workers: spall_server::serve::default_capture_workers(),
         // See above: arbitrary fixture cuts need the dev-scenario path.
         dev_unvalidated_actions: true,
+        admin_commands: false,
         save_faults: None,
         await_body_settle: false,
         motion_interest: None,
@@ -234,6 +237,7 @@ fn server_persists_and_recovers_across_a_restart() {
             on_replica_ready: None,
             interactive: None,
             client_authoritative: false,
+            admin_script: Vec::new(),
         };
         let _ = run_replication_client(client_cfg).expect("client run");
         server_thread
@@ -321,6 +325,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         max_join_retries: spall_server::serve::DEFAULT_MAX_JOIN_RETRIES,
         capture_workers: spall_server::serve::default_capture_workers(),
         dev_unvalidated_actions: false,
+        admin_commands: false,
         save_faults: Some(FaultPlan::disk_fail_checkpoint()),
         await_body_settle: false,
         motion_interest: None,
@@ -359,6 +364,7 @@ fn a_disk_fault_on_the_shutdown_checkpoint_fails_the_saved_run() {
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,
+        admin_script: Vec::new(),
     };
     let _ = run_replication_client(client_cfg).expect("client run");
 

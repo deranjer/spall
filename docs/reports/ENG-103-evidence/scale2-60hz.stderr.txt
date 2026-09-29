@@ -1,0 +1,1 @@
+Error: Sph(WaterInSolidCell(GlobalCell { x: 24, y: 5, z: 3 }))

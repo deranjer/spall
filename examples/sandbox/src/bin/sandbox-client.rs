@@ -44,6 +44,17 @@ struct Args {
     /// the scene; `cargo xtask play` forwards it here.
     #[arg(long)]
     environment: Option<String>,
+    /// Disable display vsync for interactive rendering measurements.
+    #[arg(long)]
+    uncapped: bool,
+    /// Scripted screenshot tour for `--interactive`: `x,y,z,yaw,pitch` camera
+    /// shots and `menu` / `reset` / `walk` / `wait:SECONDS` steps separated by
+    /// `;`. Each step is saved as a PNG in `--shots-dir`; the window closes
+    /// after the last one.
+    #[arg(long)]
+    shots: Option<String>,
+    #[arg(long, default_value = ".local/screenshots/tour")]
+    shots_dir: PathBuf,
     /// Versioned game asset manifest required when the server serves custom assets.
     #[arg(long)]
     content_manifest: Option<PathBuf>,
@@ -115,10 +126,6 @@ struct Args {
     /// as the player returns. The committed world / agreed hash is unchanged.
     #[arg(long, default_value_t = 0)]
     residency_budget_bricks: usize,
-    /// Refuse a segmented late-join baseline whose manifest declares more decoded bytes than this
-    /// (checked before any segment is decoded).
-    #[arg(long)]
-    baseline_staging_budget_bytes: Option<u64>,
     /// Chebyshev brick radius kept resident around the predicted player.
     #[arg(long, default_value_t = 2)]
     residency_radius_bricks: i64,
@@ -265,7 +272,7 @@ fn read_cuts_file(path: &std::path::Path) -> Vec<Cut> {
                     CutFileTarget::Terrain => ScriptTarget::Terrain,
                     CutFileTarget::Body => e
                         .entity
-                        .map_or(ScriptTarget::DetachedBody, ScriptTarget::Body),
+                        .map_or(ScriptTarget::DetachedBody, |_| ScriptTarget::DetachedBody),
                 },
             })
             .collect(),
@@ -467,14 +474,10 @@ fn run_replication(args: Args) -> ExitCode {
                 max_dense_bytes: args.residency_budget_dense_bytes.unwrap_or(u64::MAX),
             },
         ),
-        // Production clients always carry an explicit admission budget.
-        baseline_staging_budget_bytes: Some(
-            args.baseline_staging_budget_bytes
-                .unwrap_or(spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES),
-        ),
         on_replica_ready: None,
         interactive: None,
         client_authoritative: args.client_authoritative,
+        admin_script: Vec::new(),
     };
     match spall_client::run_replication_client_with_progression(
         config,
@@ -660,17 +663,30 @@ fn run_interactive(args: Args) -> ExitCode {
         summary_json: None,
         transport: TransportConfig::default(),
         client_residency: None,
-        baseline_staging_budget_bytes: None,
         on_replica_ready: None,
         interactive: None, // set by `run_interactive_window` itself
         client_authoritative: args.client_authoritative,
+        admin_script: Vec::new(),
     };
-    match spall_client::run_interactive_window_with_environment(
+    let shots = match args.shots.as_deref().map(spall_client::parse_shots) {
+        None => Vec::new(),
+        Some(Ok(shots)) => shots,
+        Some(Err(error)) => {
+            eprintln!("sandbox-client: --shots: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match spall_client::run_interactive_window_with_options(
         config,
         sandbox::game::manifest(),
         asset_hash,
         progression,
         environment,
+        spall_client::InteractiveOptions {
+            uncapped: args.uncapped,
+            shots,
+            shots_dir: args.shots_dir.clone(),
+        },
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error @ spall_client::ClientError::Gpu(_)) => {

@@ -23,6 +23,9 @@ const MAX_SPVOX_CHUNKS: usize = 64;
 const MAX_SPVOX_CHUNK_BYTES: usize = 128 * 1024 * 1024;
 const MAX_SPVOX_DECODED_BYTES: usize = 512 * 1024 * 1024;
 const MAX_RUNTIME_VOXELS: usize = 1_000_000;
+/// Editor scenes are the operator's own local project files, not untrusted
+/// content packages, and a whole valley terrain is one asset.
+const MAX_EDITOR_SCENE_VOXELS: usize = 8_000_000;
 const SPVOX_MAJOR_VERSION: u16 = 1;
 
 /// Stable game asset identity. IDs are authored constants, never assigned by
@@ -468,7 +471,7 @@ fn decode_static_voxels(
     bytes: &[u8],
     material_mapping: &BTreeMap<String, MaterialId>,
 ) -> Result<LoadedVoxelAsset, ContentError> {
-    decode_static_voxels_with(id, bytes, material_mapping, false)
+    decode_static_voxels_with(id, bytes, material_mapping, false, MAX_RUNTIME_VOXELS)
 }
 
 /// Decodes an editor-authored static SPVX asset for scene playback. Display
@@ -479,7 +482,7 @@ pub fn decode_editor_voxels(
     bytes: &[u8],
     material_mapping: &BTreeMap<String, MaterialId>,
 ) -> Result<LoadedVoxelAsset, ContentError> {
-    decode_static_voxels_with(id, bytes, material_mapping, true)
+    decode_static_voxels_with(id, bytes, material_mapping, true, MAX_EDITOR_SCENE_VOXELS)
 }
 
 fn decode_static_voxels_with(
@@ -487,6 +490,7 @@ fn decode_static_voxels_with(
     bytes: &[u8],
     material_mapping: &BTreeMap<String, MaterialId>,
     allow_display_tints: bool,
+    max_voxels: usize,
 ) -> Result<LoadedVoxelAsset, ContentError> {
     validate_spvox(id, bytes)?;
     let mut chunks = BTreeMap::<[u8; 4], Vec<u8>>::new();
@@ -586,7 +590,7 @@ fn decode_static_voxels_with(
         return Err(ContentError::UnsupportedSpvoxFeature(id));
     }
     let run_count = input.u32()? as usize;
-    if run_count > MAX_RUNTIME_VOXELS {
+    if run_count > max_voxels {
         return Err(ContentError::TooManyRuntimeVoxels(id));
     }
     let mut cells = Vec::new();
@@ -630,7 +634,7 @@ fn decode_static_voxels_with(
         if cells
             .len()
             .checked_add(length as usize)
-            .is_none_or(|count| count > MAX_RUNTIME_VOXELS)
+            .is_none_or(|count| count > max_voxels)
         {
             return Err(ContentError::TooManyRuntimeVoxels(id));
         }

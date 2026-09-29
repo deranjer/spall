@@ -306,6 +306,10 @@ pub struct ClientNetConfig {
     /// but does not correct player/body poses; replicated topology remains the
     /// source of voxel shapes. `false` leaves normal behavior unchanged.
     pub client_authoritative: bool,
+    /// Development admin commands, each sent once the observed server tick
+    /// reaches its tick. The server answers each with an `AdminStatus`
+    /// recorded in [`ClientSummary::admin_statuses`].
+    pub admin_script: Vec<(u64, spall_protocol::AdminCommand)>,
 }
 
 /// A shared handle to the live replica, and a callback invoked with it — see
@@ -358,6 +362,16 @@ pub struct ClientSummary {
     pub baseline_bricks: u64,
     /// T17: hash-repair baseline patches applied mid-session.
     pub repairs_applied: u64,
+    /// ENG-105: complete water keyframes received and decoded.
+    pub water_keyframes_received: u64,
+    /// Newest decoded water frame sequence (`0` if none arrived).
+    pub water_frame_seq: u64,
+    /// Water keyframes that failed to assemble or decode.
+    pub water_keyframe_errors: u64,
+    /// Admin world-reset baselines installed as a replacement world.
+    pub world_resets_installed: u64,
+    /// Server answers to `admin_script` commands, in arrival order.
+    pub admin_statuses: Vec<spall_protocol::AdminStatus>,
     /// Farthest a replicated body moved from its first observed pose, metres.
     /// A body that only ever reported a stationary snapshot reads `0.0`.
     pub max_body_displacement_m: f64,
@@ -544,6 +558,10 @@ struct Counters {
     /// Giant bulk-split `BaselineWorld`s received and applied mid-session
     /// (T17 increment 2).
     bulk_splits: AtomicU64,
+    water_keyframes: AtomicU64,
+    water_frame_seq: AtomicU64,
+    water_errors: AtomicU64,
+    world_resets: AtomicU64,
     /// Resident bricks in the installed late-join baseline (T17).
     baseline_bricks: AtomicU64,
     /// Entity id (+1, so `0` means "never fired") a `DetachedBody` scripted cut
@@ -1071,6 +1089,8 @@ async fn run_async(
     }));
     let counters = Arc::new(Counters::default());
     let progression_responses = Arc::new(Mutex::new(Vec::new()));
+    let admin_statuses: Arc<Mutex<Vec<spall_protocol::AdminStatus>>> =
+        Arc::new(Mutex::new(Vec::new()));
 
     // The window reads live terrain straight off the replica for its debug
     // draw; publish the handle once, up front, rather than threading it
@@ -1141,9 +1161,88 @@ async fn run_async(
         let counters = counters.clone();
         let throttle_tx = throttle_tx.clone();
         let progression_responses = progression_responses.clone();
+        let interactive = config.interactive.clone();
+        let admin_statuses = admin_statuses.clone();
         tokio::spawn(async move {
+            let mut water = spall_protocol::WaterAssembler::default();
             loop {
                 match conn.recv_record().await {
+                    Ok(Some(WireRecord::WaterSnapshot(chunk))) => match water.push(chunk) {
+                        Ok(Some(frame)) => {
+                            counters.water_keyframes.fetch_add(1, Ordering::Relaxed);
+                            counters
+                                .water_frame_seq
+                                .store(frame.frame_seq, Ordering::Relaxed);
+                            if let Some(session) = &interactive {
+                                *session.water.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(Arc::new(frame));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            // Presentation only: the next keyframe repairs it,
+                            // but a malformed frame from our own server is a
+                            // bug, so say so.
+                            counters.water_errors.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("spall-client: dropped a water keyframe: {error}");
+                        }
+                    },
+                    Ok(Some(WireRecord::AdminStatus(status))) => {
+                        eprintln!(
+                            "spall-client: admin request {} {}: {}",
+                            status.request_id.0,
+                            if status.accepted {
+                                "accepted"
+                            } else {
+                                "refused"
+                            },
+                            status.message
+                        );
+                        admin_statuses
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(status.clone());
+                        if let Some(session) = &interactive {
+                            *session
+                                .admin_status
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(status);
+                        }
+                    }
+                    Ok(Some(WireRecord::BaselineBegin(begin)))
+                        if begin.transfer_id.0 & spall_protocol::WORLD_RESET_TRANSFER_ID_BIT
+                            != 0 =>
+                    {
+                        // Admin world reset: a full baseline that *replaces*
+                        // the replica (bodies, transaction history, and
+                        // sequencing included). A failed transfer here leaves
+                        // the old world standing, which would silently diverge
+                        // from the server, so it ends the session instead.
+                        let installed = match receive_baseline_body(&conn).await {
+                            Some(world) => replica
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .install_baseline_world(&world),
+                            None => Err("reset baseline failed to assemble / verify".into()),
+                        };
+                        match installed {
+                            Ok(()) => {
+                                counters.world_resets.fetch_add(1, Ordering::Relaxed);
+                                if let Some(session) = &interactive {
+                                    session.world_resets.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "spall-client: world reset could not be installed: {error}"
+                                );
+                                counters
+                                    .baseline_transfer_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
                     Ok(Some(WireRecord::TopologyTransaction(tx))) => {
                         counters
                             .last_tick
@@ -1947,6 +2046,10 @@ async fn run_async(
                             max_horizontal_correction_m: stats.max_horizontal_correction_m,
                             unmatched_reconciles: stats.unmatched_reconciles,
                             max_unmatched_displacement_m: stats.max_unmatched_displacement_m,
+                            prediction_steps: 0,
+                            prediction_elapsed_ms: 0,
+                            prediction_max_backlog_steps: 0,
+                            prediction_dropped_steps: 0,
                             window_stats,
                         });
                 }
@@ -2068,12 +2171,39 @@ async fn run_async(
         })
     };
 
+    // Scripted development admin commands (headless world-reset tests).
+    let admin_scripter = {
+        let conn = conn.clone();
+        let counters = counters.clone();
+        let mut script = config.admin_script.clone();
+        script.sort_by_key(|(tick, _)| *tick);
+        tokio::spawn(async move {
+            for (index, (at_tick, command)) in script.into_iter().enumerate() {
+                while counters.last_tick.load(Ordering::Relaxed) < at_tick {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let request = spall_protocol::AdminRequest {
+                    request_id: RequestId(index as u64 + 1),
+                    command,
+                };
+                if conn
+                    .send_record(WireRecord::AdminRequest(request))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    };
+
     // Wait for the server to finish (control stream closes), or the observed
     // server tick to reach `run_ticks`, or the overall deadline.
     let done = {
         let counters = counters.clone();
         let run_ticks = config.run_ticks;
         let interactive = config.interactive.clone();
+        let admin_conn = conn.clone();
         async move {
             tokio::select! {
                 _ = async { let _ = control.await; let _ = motion.await; } => {}
@@ -2095,6 +2225,18 @@ async fn run_async(
                         if interactive.as_ref().is_some_and(|s| s.stop.load(Ordering::Relaxed)) {
                             return;
                         }
+                        // The admin menu's commands ride the same poll.
+                        let admin: Vec<_> = interactive
+                            .as_ref()
+                            .map(|s| std::mem::take(&mut *s.admin_queue.lock().unwrap_or_else(|e| e.into_inner())))
+                            .unwrap_or_default();
+                        for request in admin {
+                            if let Err(error) =
+                                admin_conn.send_record(WireRecord::AdminRequest(request)).await
+                            {
+                                eprintln!("spall-client: admin request could not be sent: {error}");
+                            }
+                        }
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }, if interactive.is_some() => {}
@@ -2108,6 +2250,7 @@ async fn run_async(
         m.abort();
     }
     retrier.abort();
+    admin_scripter.abort();
     liveness.abort();
 
     let _ = conn.say_bye("client complete").await;
@@ -2204,6 +2347,14 @@ async fn run_async(
         late_join: config.late_join,
         baseline_bricks,
         repairs_applied: counters.patches.load(Ordering::Relaxed),
+        water_keyframes_received: counters.water_keyframes.load(Ordering::Relaxed),
+        water_frame_seq: counters.water_frame_seq.load(Ordering::Relaxed),
+        water_keyframe_errors: counters.water_errors.load(Ordering::Relaxed),
+        world_resets_installed: counters.world_resets.load(Ordering::Relaxed),
+        admin_statuses: admin_statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
         max_body_displacement_m,
         body_cut_committed,
         movement,

@@ -1016,6 +1016,24 @@ The Salva particle backend was removed after selection. The grid scenarios now
 build their scene and bit-identical reference volume in
 `fixtures::ReservoirScene`. Production integration is tracked as ENG-105.
 
+### ENG-105 — Authoritative water integration (increment 1 in progress)
+
+`spall_sim` owns one explicitly bounded, fully resident `MacGridWorld` for a
+scene that supplies `WaterSetup`. Each fixed 60 Hz simulation tick first commits
+terrain transactions, refreshes the fluid solid boundary, conservatively moves
+water out of newly occupied cells, and advances the fluid solver before Rapier.
+If the solver's stability preflight exceeds its bounded substep budget, water
+skips that fluid step and reports skipped ticks/time; the server tick rate and
+physics dt remain fixed. A placement that cannot conservatively displace water
+through connected open cells fails without mutating fluid state.
+
+The valley showcase's authored water is loaded as water fractions instead of
+collidable blue voxels, and its custom server world installs that setup. This
+increment does not add client snapshots/presentation, late-join repair, durable
+water checkpoints, multiple/streamed regions, or dynamic-body coupling. Those
+remain later ENG-105 increments; do not describe the server-side state as
+replicated or persisted. See [`docs/reports/ENG-105-increment-1.md`](reports/ENG-105-increment-1.md).
+
 Swimming, boats, rigid-body coupling, multiplayer water DTOs, persistence,
 streaming-scale behavior, and replaceable water appearance are later scoped
 assignments. See Loopira ENG-103 for the matching tracked issue.

@@ -41,6 +41,9 @@ pub enum WireTag {
     Handshake = 12,
     ProgressionRequest = 13,
     ProgressionResponse = 14,
+    WaterSnapshot = 15,
+    AdminRequest = 16,
+    AdminStatus = 17,
 }
 
 impl WireTag {
@@ -60,6 +63,9 @@ impl WireTag {
             12 => Self::Handshake,
             13 => Self::ProgressionRequest,
             14 => Self::ProgressionResponse,
+            15 => Self::WaterSnapshot,
+            16 => Self::AdminRequest,
+            17 => Self::AdminStatus,
             _ => return None,
         })
     }
@@ -414,6 +420,11 @@ pub struct VolumeHash {
 /// collide with a late-join / repair transfer id (which are small, allocated by
 /// the server's own counter). The low 63 bits are the split's `TransactionId`.
 pub const SPLIT_BULK_TRANSFER_ID_BIT: u64 = 1 << 63;
+
+/// Reserved `TransferId` bit marking a full baseline sent after an admin world
+/// reset. The receiving replica *replaces* its world with it instead of merging
+/// it as a repair patch.
+pub const WORLD_RESET_TRANSFER_ID_BIT: u64 = 1 << 62;
 
 /// One ordered operation inside a transaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

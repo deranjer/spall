@@ -106,6 +106,7 @@ pub enum MacError {
     SubstepBudgetExceeded { required: u32, maximum: u32 },
     InvalidWaterFraction,
     WaterOverlapsSolid(GlobalCell),
+    WaterDisplacementCapacityExceeded { cell: GlobalCell },
     BoundaryMismatch,
     IncompatibleEnclosedPressureRegion,
     Ic0NonPositivePivot { cell: usize, pivot: f64 },
@@ -125,6 +126,10 @@ impl std::fmt::Display for MacError {
             ),
             Self::InvalidWaterFraction => write!(f, "water fraction must be finite and in 0..=1"),
             Self::WaterOverlapsSolid(cell) => write!(f, "water overlaps solid voxel {cell:?}"),
+            Self::WaterDisplacementCapacityExceeded { cell } => write!(
+                f,
+                "placing solid at {cell:?} leaves no open capacity for all displaced water"
+            ),
             Self::BoundaryMismatch => write!(f, "candidate boundary dimensions do not match grid"),
             Self::IncompatibleEnclosedPressureRegion => write!(
                 f,
@@ -378,6 +383,12 @@ impl MacGridWorld {
 
     pub fn fraction_at(&self, cell: GlobalCell) -> Option<f64> {
         self.cell_index_global(cell).map(|i| self.fraction[i])
+    }
+
+    /// Every cell's liquid fraction in [`DomainSpec`] linear order (X fastest,
+    /// then Y, then Z). Solid cells are always zero.
+    pub fn fractions(&self) -> &[f64] {
+        &self.fraction
     }
 
     pub fn set_fraction(&mut self, cell: GlobalCell, fraction: f64) -> Result<(), MacError> {
@@ -778,6 +789,123 @@ impl MacGridWorld {
         self.previous_pressure_preconditioner = None;
         self.enforce_wall_velocities();
         Ok(())
+    }
+
+    /// Atomically installs a new solid boundary and conservatively relocates
+    /// any water cells covered by the new solids. Each source distributes its
+    /// fraction breadth-first through face-adjacent open cells, in stable
+    /// `-X,+X,-Y,+Y,-Z,+Z` order. No water is deleted on capacity failure.
+    pub fn refresh_boundary_displacing(
+        &mut self,
+        boundary: &SolidBoundary,
+    ) -> Result<f64, MacError> {
+        if boundary.spec() != self.spec {
+            return Err(MacError::BoundaryMismatch);
+        }
+        let mut candidate_solid = Vec::with_capacity(self.solid.len());
+        let mut candidate_fraction = self.fraction.clone();
+        let mut displaced = Vec::new();
+        // `index` addresses three different parallel arrays here (and feeds
+        // `cell_at`), not just `candidate_fraction`, so `enumerate()` over one
+        // of them would not actually simplify this.
+        #[allow(clippy::needless_range_loop)]
+        for index in 0..self.solid.len() {
+            let cell = self.spec.cell_at(index);
+            let is_solid = boundary.is_solid(cell).ok_or(MacError::BoundaryMismatch)?;
+            candidate_solid.push(is_solid);
+            if is_solid && candidate_fraction[index] > 0.0 {
+                displaced.push((index, candidate_fraction[index]));
+                candidate_fraction[index] = 0.0;
+            }
+        }
+
+        let mut visited = vec![false; self.solid.len()];
+        let mut queue = VecDeque::new();
+        let neighbor_cells = |cell: GlobalCell| {
+            [
+                cell.x
+                    .checked_sub(1)
+                    .map(|x| GlobalCell::new(x, cell.y, cell.z)),
+                cell.x
+                    .checked_add(1)
+                    .map(|x| GlobalCell::new(x, cell.y, cell.z)),
+                cell.y
+                    .checked_sub(1)
+                    .map(|y| GlobalCell::new(cell.x, y, cell.z)),
+                cell.y
+                    .checked_add(1)
+                    .map(|y| GlobalCell::new(cell.x, y, cell.z)),
+                cell.z
+                    .checked_sub(1)
+                    .map(|z| GlobalCell::new(cell.x, cell.y, z)),
+                cell.z
+                    .checked_add(1)
+                    .map(|z| GlobalCell::new(cell.x, cell.y, z)),
+            ]
+        };
+        for (source, mut remaining) in displaced.iter().copied() {
+            visited.fill(false);
+            queue.clear();
+            visited[source] = true;
+            for neighbor in neighbor_cells(self.spec.cell_at(source))
+                .into_iter()
+                .flatten()
+            {
+                if let Some(index) = self.cell_index_global(neighbor)
+                    && !visited[index]
+                    && !candidate_solid[index]
+                {
+                    visited[index] = true;
+                    queue.push_back(index);
+                }
+            }
+            while let Some(index) = queue.pop_front() {
+                if remaining > 0.0 {
+                    let capacity = (1.0 - candidate_fraction[index]).max(0.0);
+                    let transfer = capacity.min(remaining);
+                    candidate_fraction[index] += transfer;
+                    remaining -= transfer;
+                }
+                if remaining <= f64::EPSILON {
+                    break;
+                }
+                for neighbor in neighbor_cells(self.spec.cell_at(index))
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(next) = self.cell_index_global(neighbor)
+                        && !visited[next]
+                        && !candidate_solid[next]
+                    {
+                        visited[next] = true;
+                        queue.push_back(next);
+                    }
+                }
+            }
+            if remaining > 1.0e-12 {
+                return Err(MacError::WaterDisplacementCapacityExceeded {
+                    cell: self.spec.cell_at(source),
+                });
+            }
+        }
+
+        let moved_fraction: f64 = displaced.iter().map(|(_, fraction)| fraction).sum();
+        self.solid = candidate_solid;
+        self.fraction = candidate_fraction;
+        self.pressure_pa.fill(0.0);
+        self.previous_liquid.fill(false);
+        if let Some(diagonal) = &mut self.previous_pressure_diagonal {
+            diagonal.fill(0.0);
+        }
+        if let Some(labels) = &mut self.previous_component_labels {
+            labels.fill(None);
+        }
+        if let Some(anchors) = &mut self.previous_component_anchors {
+            anchors.clear();
+        }
+        self.previous_pressure_preconditioner = None;
+        self.enforce_wall_velocities();
+        Ok(moved_fraction * self.cell_volume())
     }
 
     /// Advance one outer fixed tick. Stability overload returns before any
@@ -4677,6 +4805,101 @@ mod tests {
             staged_volume.sample(GlobalCell::new(0, 0, 0)).unwrap(),
             spall_voxel::Sample::Filled(MaterialId(1))
         );
+    }
+
+    #[test]
+    fn boundary_edit_displaces_fully_submerged_cell_without_losing_water() {
+        let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [4, 3, 3], 128).unwrap();
+        let mut volume = Volume::new(VolumeId::new(903).unwrap(), CellSizeCode::Quarter);
+        volume
+            .insert_brick(
+                BrickCoord::new(0, 0, 0),
+                Brick::uniform(MaterialId::AIR, Revision(1)),
+            )
+            .unwrap();
+        let initial_boundary = SolidBoundary::capture(&volume, spec).unwrap();
+        let mut grid = MacGridWorld::new(&initial_boundary, quiet_config(false)).unwrap();
+        let source = GlobalCell::new(1, 1, 1);
+        grid.set_fraction(source, 1.0).unwrap();
+        let initial_volume = grid.water_volume_m3();
+
+        let mut edit = spall_voxel::EditPlan::new(volume.id());
+        edit.set(source, MaterialId(1));
+        volume.apply_edit(&edit).unwrap();
+        let edited_boundary = SolidBoundary::capture(&volume, spec).unwrap();
+        let displaced = grid.refresh_boundary_displacing(&edited_boundary).unwrap();
+
+        assert!((grid.water_volume_m3() - initial_volume).abs() < 1.0e-12);
+        assert!((displaced - initial_volume).abs() < 1.0e-12);
+        assert_eq!(grid.fraction_at(source), Some(0.0));
+        assert_eq!(grid.active_cells(), 1);
+    }
+
+    #[test]
+    fn boundary_edit_displaces_water_within_a_sealed_pocket() {
+        let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [4, 3, 3], 128).unwrap();
+        let mut volume = Volume::new(VolumeId::new(904).unwrap(), CellSizeCode::Quarter);
+        volume
+            .insert_brick(
+                BrickCoord::new(0, 0, 0),
+                Brick::uniform(MaterialId(1), Revision(1)),
+            )
+            .unwrap();
+        let source = GlobalCell::new(1, 1, 1);
+        let reservoir = GlobalCell::new(2, 1, 1);
+        let mut opening = spall_voxel::EditPlan::new(volume.id());
+        opening.set(source, MaterialId::AIR);
+        opening.set(reservoir, MaterialId::AIR);
+        volume.apply_edit(&opening).unwrap();
+        let boundary = SolidBoundary::capture(&volume, spec).unwrap();
+        let mut grid = MacGridWorld::new(&boundary, quiet_config(false)).unwrap();
+        grid.set_fraction(source, 0.75).unwrap();
+        grid.set_fraction(reservoir, 0.25).unwrap();
+        let initial_volume = grid.water_volume_m3();
+
+        let mut placement = spall_voxel::EditPlan::new(volume.id());
+        placement.set(source, MaterialId(1));
+        volume.apply_edit(&placement).unwrap();
+        let edited_boundary = SolidBoundary::capture(&volume, spec).unwrap();
+        grid.refresh_boundary_displacing(&edited_boundary).unwrap();
+
+        assert!((grid.water_volume_m3() - initial_volume).abs() < 1.0e-12);
+        assert_eq!(grid.fraction_at(source), Some(0.0));
+        assert_eq!(grid.fraction_at(reservoir), Some(1.0));
+    }
+
+    #[test]
+    fn boundary_displacement_cannot_teleport_through_solid_walls() {
+        let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [4, 3, 3], 128).unwrap();
+        let mut volume = Volume::new(VolumeId::new(905).unwrap(), CellSizeCode::Quarter);
+        volume
+            .insert_brick(
+                BrickCoord::new(0, 0, 0),
+                Brick::uniform(MaterialId(1), Revision(1)),
+            )
+            .unwrap();
+        let source = GlobalCell::new(1, 1, 1);
+        let isolated_cavity = GlobalCell::new(3, 1, 1);
+        let mut open = spall_voxel::EditPlan::new(volume.id());
+        open.set(source, MaterialId::AIR);
+        open.set(isolated_cavity, MaterialId::AIR);
+        volume.apply_edit(&open).unwrap();
+        let initial = SolidBoundary::capture(&volume, spec).unwrap();
+        let mut grid = MacGridWorld::new(&initial, quiet_config(false)).unwrap();
+        grid.set_fraction(source, 0.75).unwrap();
+        let before_fraction = grid.fraction.clone();
+        let before_solid = grid.solid.clone();
+
+        let mut placement = spall_voxel::EditPlan::new(volume.id());
+        placement.set(source, MaterialId(1));
+        volume.apply_edit(&placement).unwrap();
+        let edited = SolidBoundary::capture(&volume, spec).unwrap();
+        assert!(matches!(
+            grid.refresh_boundary_displacing(&edited),
+            Err(MacError::WaterDisplacementCapacityExceeded { cell }) if cell == source
+        ));
+        assert_eq!(grid.fraction, before_fraction);
+        assert_eq!(grid.solid, before_solid);
     }
 
     #[test]

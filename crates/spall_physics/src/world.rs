@@ -1160,7 +1160,12 @@ impl PhysicsWorld {
             .iter()
             .enumerate()
             .filter(|(_, e)| !e.retired && !e.dormant)
-            .map(|(i, e)| (e.body, BodyId(i as u32)))
+            .map(|(i, e)| {
+                (
+                    e.body,
+                    BodyId((u64::from(self.id_namespace) << 32) | i as u64),
+                )
+            })
             .collect();
         let mut out = Vec::new();
         for &id in ids {

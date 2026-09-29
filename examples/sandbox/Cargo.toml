@@ -36,6 +36,7 @@ postcard.workspace = true
 serde.workspace = true
 rusqlite.workspace = true
 spall_client = { path = "../../crates/spall_client", optional = true }
+spall_fluid = { path = "../../crates/spall_fluid" }
 spall_core = { path = "../../crates/spall_core" }
 spall_mesh = { workspace = true, optional = true }
 spall_jobs = { workspace = true, optional = true }

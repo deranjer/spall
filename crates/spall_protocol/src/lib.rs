@@ -28,6 +28,7 @@ pub mod limits;
 pub mod records;
 pub mod segment;
 pub mod session;
+pub mod water;
 
 pub use input::{frame_input, player_entity, recent_input, session_player_entity};
 
@@ -55,9 +56,13 @@ pub use records::{
     ProgressionOperation, ProgressionOutcome, ProgressionRejectCode, ProgressionRequest,
     ProgressionResponse, RecentInput, Record, RecordError, RepairKey, RepairRequest, RequestId,
     SPLIT_BULK_TRANSFER_ID_BIT, SnapshotSeq, TopologyOp, TopologyTransaction, TransferId,
-    VolumeHash, WIRE_SCHEMA_VERSION, WireTag,
+    VolumeHash, WIRE_SCHEMA_VERSION, WORLD_RESET_TRANSFER_ID_BIT, WireTag,
 };
 pub use session::{
     GenerationExhausted, PlayerId, SeqVerdict, SequenceGate, SessionId, SessionRegistry, SlotId,
     StaleSession, StreamKind, StreamSeq,
+};
+pub use water::{
+    AdminCommand, AdminRequest, AdminStatus, WaterAssembler, WaterCodecError, WaterKeyframe,
+    WaterSnapshot, encode_water_keyframe,
 };

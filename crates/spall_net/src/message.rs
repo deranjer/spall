@@ -14,9 +14,10 @@
 
 use serde::{Deserialize, Serialize};
 use spall_protocol::{
-    ActionRequest, ActionStatus, BaselineAck, BaselineBegin, BaselineEnd, BaselinePart, CodecError,
-    DurableThrough, Handshake, ProgressionRequest, ProgressionResponse, RepairRequest,
-    TopologyTransaction, WireTag, decode_control, encode_control,
+    ActionRequest, ActionStatus, AdminRequest, AdminStatus, BaselineAck, BaselineBegin,
+    BaselineEnd, BaselinePart, CodecError, DurableThrough, Handshake, ProgressionRequest,
+    ProgressionResponse, RepairRequest, TopologyTransaction, WaterSnapshot, WireTag,
+    decode_control, encode_control,
 };
 
 use crate::message::private::Sealed;
@@ -38,6 +39,9 @@ pub enum WireRecord {
     Handshake(Handshake),
     ProgressionRequest(ProgressionRequest),
     ProgressionResponse(ProgressionResponse),
+    WaterSnapshot(WaterSnapshot),
+    AdminRequest(AdminRequest),
+    AdminStatus(AdminStatus),
 }
 
 impl WireRecord {
@@ -56,6 +60,9 @@ impl WireRecord {
             Self::Handshake(_) => WireTag::Handshake,
             Self::ProgressionRequest(_) => WireTag::ProgressionRequest,
             Self::ProgressionResponse(_) => WireTag::ProgressionResponse,
+            Self::WaterSnapshot(_) => WireTag::WaterSnapshot,
+            Self::AdminRequest(_) => WireTag::AdminRequest,
+            Self::AdminStatus(_) => WireTag::AdminStatus,
         }
     }
 
@@ -75,6 +82,9 @@ impl WireRecord {
             Self::Handshake(r) => encode_control(r),
             Self::ProgressionRequest(r) => encode_control(r),
             Self::ProgressionResponse(r) => encode_control(r),
+            Self::WaterSnapshot(r) => encode_control(r),
+            Self::AdminRequest(r) => encode_control(r),
+            Self::AdminStatus(r) => encode_control(r),
         }
     }
 
@@ -103,6 +113,9 @@ impl WireRecord {
             WireTag::Handshake => Self::Handshake(decode_control(bytes)?),
             WireTag::ProgressionRequest => Self::ProgressionRequest(decode_control(bytes)?),
             WireTag::ProgressionResponse => Self::ProgressionResponse(decode_control(bytes)?),
+            WireTag::WaterSnapshot => Self::WaterSnapshot(decode_control(bytes)?),
+            WireTag::AdminRequest => Self::AdminRequest(decode_control(bytes)?),
+            WireTag::AdminStatus => Self::AdminStatus(decode_control(bytes)?),
             WireTag::InputFrame | WireTag::MotionSnapshot => {
                 return Err(CodecError::TagMismatch {
                     expected: WireTag::Handshake,
