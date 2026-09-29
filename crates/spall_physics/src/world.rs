@@ -1169,7 +1169,7 @@ impl PhysicsWorld {
             .collect();
         let mut out = Vec::new();
         for &id in ids {
-            let entry = &self.entries[id.0 as usize];
+            let entry = &self.entries[entry_index(id, self.id_namespace)];
             if entry.retired || entry.dormant {
                 continue;
             }
@@ -1304,8 +1304,8 @@ impl PhysicsWorld {
             out.push(ContactImpulse {
                 bodies: [b1, b2],
                 dynamic: [
-                    self.bodies[self.entries[b1.0 as usize].body].is_dynamic(),
-                    self.bodies[self.entries[b2.0 as usize].body].is_dynamic(),
+                    self.bodies[self.entries[entry_index(b1, self.id_namespace)].body].is_dynamic(),
+                    self.bodies[self.entries[entry_index(b2, self.id_namespace)].body].is_dynamic(),
                 ],
                 point_m: [
                     (point_sum[0] * inv) as f32,
