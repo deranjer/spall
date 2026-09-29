@@ -143,6 +143,20 @@ impl EditPipeline {
         self.pending.is_empty() && self.inflight.is_empty() && self.scheduler.is_drained()
     }
 
+    /// Bodies targeted by an intent that is queued or staged but not yet committed. Dormancy
+    /// must not deactivate these: a commit rebuilds the target's collider, which needs a live
+    /// physics body.
+    pub fn targeted_bodies(&self) -> HashSet<spall_core::EntityId> {
+        self.pending
+            .iter()
+            .chain(self.inflight.values())
+            .filter_map(|q| match q.intent.target {
+                EditTarget::Body(e) => Some(e),
+                EditTarget::Terrain => None,
+            })
+            .collect()
+    }
+
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
@@ -337,6 +351,15 @@ impl EditPipeline {
 
                 if self.committed.contains_key(&request.0) {
                     continue; // idempotent: already committed
+                }
+
+                // Defensive: a body-targeted commit rebuilds its collider, which needs the live
+                // physics body. `submit` reactivates a dormant target and dormancy skips targeted
+                // bodies, but never let a commit reach a dormant body (it would panic in the solver).
+                if let EditTarget::Body(entity) = queued.intent.target
+                    && world.body_is_dormant(entity)
+                {
+                    world.reactivate_body(entity);
                 }
 
                 let control_seq = ControlSeq(*next_control_seq);
