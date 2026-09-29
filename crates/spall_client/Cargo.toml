@@ -6,6 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 spall_core = { path = "../spall_core" }
+spall_jobs = { path = "../spall_jobs" }
+spall_mesh = { path = "../spall_mesh" }
 spall_fluid = { path = "../spall_fluid" }
 spall_protocol = { path = "../spall_protocol" }
 spall_net = { path = "../spall_net" }

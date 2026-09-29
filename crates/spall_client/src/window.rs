@@ -15,13 +15,15 @@
 //! (rather than its current offscreen-capture use) is out of scope here and
 //! left to a follow-up increment.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use spall_core::{BUTTON_JUMP, GlobalCell, MaterialId};
+use spall_core::{BUTTON_JUMP, BrickCoord, GlobalCell, MaterialId};
+use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::CharacterParams;
 use spall_render::{
     Camera, CubeInstance, DebugView, Environment, EnvironmentPreset, GameRenderer,
@@ -337,9 +339,6 @@ struct InteractiveApp {
     capture_due: bool,
     /// Screenshot to take on the next presented frame.
     pending_capture: Option<PathBuf>,
-    /// True when the resident terrain instances must be re-uploaded (a
-    /// rebuild landed or `F1` toggled visibility).
-    terrain_dirty: bool,
     /// The newest sky occupancy the rebuild worker produced, kept so `F5` can
     /// switch visibility-aware skylight off and on without a rebuild.
     last_sky: Option<spall_render::indirect::LightingVolume>,
@@ -370,7 +369,8 @@ struct InteractiveApp {
     /// instances (see [`build_body_instances`]) — bodies move continuously
     /// and are cheap to rebuild, so they must not wait on the throttled,
     /// much more expensive terrain rebuild to appear or move.
-    last_terrain_instances: Vec<Instance>,
+    pending_mesh_updates: Vec<(BrickCoord, Vec<spall_render::GpuVertex>, Vec<u32>)>,
+    pending_mesh_removed: Vec<BrickCoord>,
     /// [`BodyWorker`]'s most recently completed result — see that struct's
     /// doc for why this moved off the render thread entirely (first a
     /// blocking lock, then even a `try_lock`-gated build, both measurably
@@ -438,11 +438,119 @@ struct RebuildWorker {
 pub struct RebuildOutcome {
     pub center_m: [f64; 3],
     pub instances: Vec<Instance>,
+    /// Changed greedy terrain chunks; unchanged chunks retain their GPU buffers.
+    pub mesh_updates: Vec<(BrickCoord, Vec<spall_render::GpuVertex>, Vec<u32>)>,
+    /// Chunks that left render residency or became empty.
+    pub mesh_removed: Vec<BrickCoord>,
+    pub mesh_elapsed: Duration,
     /// Sky occupancy built from the same volume snapshot as `instances`, or
     /// `None` when it is identical to the last one sent (nothing to recompute).
     pub sky: Option<spall_render::indirect::LightingVolume>,
     pub sky_stats: crate::sky::SkyOccupancyStats,
     pub elapsed: Duration,
+}
+
+#[derive(Default)]
+struct TerrainMeshCache(HashMap<BrickCoord, spall_mesh::VolumeMesh>);
+
+struct VolumeMeshWorld<'a>(&'a Volume);
+
+impl WorldView for VolumeMeshWorld<'_> {
+    fn generation(&self) -> Generation {
+        Generation::START
+    }
+    fn topology_epoch(&self) -> TopologyEpoch {
+        TopologyEpoch::START
+    }
+    fn brick_status(&self, brick: BrickRef) -> BrickStatus {
+        match self.0.brick_state(brick.brick) {
+            Ok(spall_voxel::BrickState::Resident { revision, .. }) => {
+                BrickStatus::Resident(revision)
+            }
+            Ok(spall_voxel::BrickState::Failed) => BrickStatus::Failed,
+            Ok(spall_voxel::BrickState::Absent) | Err(_) => BrickStatus::Absent,
+        }
+    }
+}
+
+fn visible_terrain_bricks(volume: &Volume, center_m: [f64; 3]) -> Vec<BrickCoord> {
+    let cell_m = f64::from(CELL_M);
+    let center = GlobalCell::new(
+        (center_m[0] / cell_m).floor() as i64,
+        (center_m[1] / cell_m).floor() as i64,
+        (center_m[2] / cell_m).floor() as i64,
+    );
+    let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
+    let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
+    let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
+    let (min_brick, _) =
+        GlobalCell::new(center.x - horiz, center.y - down, center.z - horiz).split();
+    let (max_brick, _) = GlobalCell::new(center.x + horiz, center.y + up, center.z + horiz).split();
+    let mut coords = Vec::new();
+    for z in min_brick.z..=max_brick.z {
+        for y in min_brick.y..=max_brick.y {
+            for x in min_brick.x..=max_brick.x {
+                let coord = BrickCoord::new(x, y, z);
+                if volume.snapshot_brick(coord).ok().flatten().is_some() {
+                    coords.push(coord);
+                }
+            }
+        }
+    }
+    coords
+}
+
+fn update_terrain_mesh_cache(
+    volume: &Volume,
+    center_m: [f64; 3],
+    cache: &mut TerrainMeshCache,
+) -> (
+    Vec<(BrickCoord, Vec<spall_render::GpuVertex>, Vec<u32>)>,
+    Vec<BrickCoord>,
+) {
+    let started = Instant::now();
+    let visible = visible_terrain_bricks(volume, center_m);
+    let world = VolumeMeshWorld(volume);
+    let mut updates = Vec::new();
+    let mut removed = Vec::new();
+    for coord in &visible {
+        if cache
+            .0
+            .get(coord)
+            .is_some_and(|mesh| mesh.token.is_fresh(&world))
+        {
+            continue;
+        }
+        let Ok(mesh) =
+            spall_mesh::build_brick_mesh(volume, *coord, Generation::START, TopologyEpoch::START)
+        else {
+            continue;
+        };
+        let (vertices, indices) = spall_render::to_gpu(&mesh.mesh, glam::Mat4::IDENTITY);
+        if mesh.mesh.is_empty() {
+            if cache.0.remove(coord).is_some() {
+                removed.push(*coord);
+            }
+        } else {
+            cache.0.insert(*coord, mesh);
+            updates.push((*coord, vertices, indices));
+        }
+    }
+    let visible: std::collections::HashSet<_> = visible.into_iter().collect();
+    for coord in cache
+        .0
+        .keys()
+        .copied()
+        .filter(|coord| !visible.contains(coord))
+        .collect::<Vec<_>>()
+    {
+        cache.0.remove(&coord);
+        removed.push(coord);
+    }
+    updates.sort_by_key(|(coord, _, _)| coord.sort_key());
+    removed.sort_by_key(|coord| coord.sort_key());
+    tracing::debug!(target: "spall_client::terrain_mesh", rebuild_ms = started.elapsed().as_secs_f64()*1000.0, updated = updates.len(), removed = removed.len(), "rebuilt incremental greedy chunks");
+    (updates, removed)
 }
 
 /// One rebuild pass: terrain instances plus a sky occupancy grid (only when it
@@ -459,13 +567,35 @@ pub fn rebuild_pass(
     last_sky: &mut Option<spall_render::indirect::LightingVolume>,
     absent_is_open: bool,
 ) -> Option<RebuildOutcome> {
+    rebuild_pass_inner(
+        replica,
+        center_m,
+        sky_anchor,
+        last_sky,
+        absent_is_open,
+        true,
+    )
+}
+
+fn rebuild_pass_inner(
+    replica: &Arc<Mutex<ReplicaWorld>>,
+    center_m: [f64; 3],
+    sky_anchor: &mut Option<[f64; 3]>,
+    last_sky: &mut Option<spall_render::indirect::LightingVolume>,
+    absent_is_open: bool,
+    include_legacy_instances: bool,
+) -> Option<RebuildOutcome> {
     let volume = replica
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .terrain_volume()
         .cloned()?;
     let start = Instant::now();
-    let instances = build_instances(&volume, center_m);
+    let instances = if include_legacy_instances {
+        build_instances(&volume, center_m)
+    } else {
+        Vec::new()
+    };
     // Keep the cache where it is until the player has moved far enough to
     // matter, so a stationary or slowly moving player produces an identical
     // grid and no lighting recompute.
@@ -485,6 +615,9 @@ pub fn rebuild_pass(
     Some(RebuildOutcome {
         center_m,
         instances,
+        mesh_updates: Vec::new(),
+        mesh_removed: Vec::new(),
+        mesh_elapsed: Duration::ZERO,
         sky,
         sky_stats,
         elapsed: start.elapsed(),
@@ -503,19 +636,32 @@ impl RebuildWorker {
             .spawn(move || {
                 let mut sky_anchor: Option<[f64; 3]> = None;
                 let mut last_sky: Option<spall_render::indirect::LightingVolume> = None;
+                let mut mesh_cache = TerrainMeshCache::default();
                 for center_m in request_rx {
                     let Some(replica) = session.replica.get() else {
                         continue;
                     };
-                    let Some(outcome) = rebuild_pass(
+                    let Some(mut outcome) = rebuild_pass_inner(
                         replica,
                         center_m,
                         &mut sky_anchor,
                         &mut last_sky,
                         absent_is_open,
+                        false,
                     ) else {
                         continue;
                     };
+                    if let Some(volume) = replica
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .terrain_volume()
+                        .cloned()
+                    {
+                        let mesh_started = Instant::now();
+                        (outcome.mesh_updates, outcome.mesh_removed) =
+                            update_terrain_mesh_cache(&volume, center_m, &mut mesh_cache);
+                        outcome.mesh_elapsed = mesh_started.elapsed();
+                    }
                     if result_tx.send(outcome).is_err() {
                         return; // the window is gone
                     }
@@ -802,7 +948,7 @@ impl Hud {
         };
         format!(
             "{fps:.0} fps | frame {:.1} ms (avg) / {max_frame_ms:.1} ms (max) | HUD CPU {avg_hud_cpu_ms:.3} ms (avg) / {max_hud_cpu_ms:.3} ms (max), GPU {hud_gpu_report} | buffer upload {max_buffer_upload_ms:.1} ms (max) | \
-             rebuild {:.1} ms ({} instances) | server tick {server_tick} | \
+             rebuild {:.1} ms ({} changed greedy chunks) | server tick {server_tick} | \
              +{new_corrections} corrections ({new_idle} idle) (lifetime max {max_correction_m:.3} m idle {max_idle_correction_m:.3} m vert {max_vertical_correction_m:.3} m horiz {max_horizontal_correction_m:.3} m) | \
              +{new_unmatched} unmatched (lifetime max displacement {max_unmatched_displacement_m:.3} m) | \
              prediction {prediction_hz:.1} Hz, backlog max {prediction_max_backlog_steps}, dropped {prediction_dropped_steps} | \
@@ -837,7 +983,6 @@ impl InteractiveApp {
             shot_index: 0,
             pending_capture: None,
             capture_due: false,
-            terrain_dirty: true,
             last_sky: None,
             sky_dirty: false,
             sky_visibility_on: true,
@@ -853,7 +998,8 @@ impl InteractiveApp {
             last_dispatch_at: None,
             camera_follow: CameraFollow::default(),
             hud: Hud::default(),
-            last_terrain_instances: Vec::new(),
+            pending_mesh_updates: Vec::new(),
+            pending_mesh_removed: Vec::new(),
             last_body_draws: Vec::new(),
             pose_stats: PoseStats::default(),
             show_terrain: true,
@@ -1133,9 +1279,8 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     KeyCode::F1 if held && !event.repeat => {
                         self.show_terrain = !self.show_terrain;
-                        self.terrain_dirty = true;
                         println!(
-                            "spall-interactive: terrain instances {}",
+                            "spall-interactive: terrain greedy meshes {}",
                             if self.show_terrain { "ON" } else { "OFF" }
                         );
                         return;
@@ -1206,10 +1351,10 @@ impl ApplicationHandler for InteractiveApp {
                 // Only the newest matters if somehow more than one queued up.
                 while let Ok(outcome) = self.rebuild.result_rx.try_recv() {
                     self.hud
-                        .record_rebuild(outcome.elapsed, outcome.instances.len());
+                        .record_rebuild(outcome.mesh_elapsed, outcome.mesh_updates.len());
                     self.last_built_pos = Some(outcome.center_m);
-                    self.last_terrain_instances = outcome.instances;
-                    self.terrain_dirty = true;
+                    self.pending_mesh_updates.extend(outcome.mesh_updates);
+                    self.pending_mesh_removed.extend(outcome.mesh_removed);
                     if let Some(sky) = outcome.sky {
                         self.last_sky = Some(sky);
                         self.sky_dirty = true;
@@ -1269,15 +1414,8 @@ impl ApplicationHandler for InteractiveApp {
                 // only when a rebuild landed or its visibility toggled --
                 // not every frame. Bodies move continuously, so they are
                 // re-posed (into their own reused buffer) every frame.
-                let empty = Vec::new();
-                let terrain = if !self.terrain_dirty {
-                    None
-                } else if self.show_terrain {
-                    Some(&self.last_terrain_instances)
-                } else {
-                    Some(&empty)
-                };
-                let uploading_terrain = terrain.is_some();
+                let terrain_updates = std::mem::take(&mut self.pending_mesh_updates);
+                let terrain_removed = std::mem::take(&mut self.pending_mesh_removed);
                 // ENG-105: rebuild water columns only when a new keyframe
                 // (or a different domain after a reset) has arrived.
                 let water_frame = self
@@ -1299,6 +1437,17 @@ impl ApplicationHandler for InteractiveApp {
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
+                renderer.scene.set_terrain_meshes_visible(self.show_terrain);
+                if !terrain_updates.is_empty() || !terrain_removed.is_empty() {
+                    if let Err(error) = renderer.scene.update_terrain_meshes(
+                        &renderer.device,
+                        &terrain_updates,
+                        &terrain_removed,
+                    ) {
+                        self.fail(event_loop, ClientError::Render(error.to_string()));
+                        return;
+                    }
+                }
                 if let Some(instances) = &water_update {
                     renderer.set_debug_water(instances);
                 }
@@ -1315,7 +1464,7 @@ impl ApplicationHandler for InteractiveApp {
                         self.sky_dirty = false;
                     }
                 }
-                let outcome = match renderer.begin_frame(terrain.map(Vec::as_slice), &overlay) {
+                let outcome = match renderer.begin_frame(None, &overlay) {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         self.fail(event_loop, error);
@@ -1324,9 +1473,6 @@ impl ApplicationHandler for InteractiveApp {
                 };
                 // `begin_frame` uploaded the terrain before it could fail or
                 // skip, so the resident buffer is current either way.
-                if uploading_terrain {
-                    self.terrain_dirty = false;
-                }
                 let timing = match outcome {
                     AcquireOutcome::Skipped(timing) => timing,
                     AcquireOutcome::Ready(acquired) => {
@@ -1357,16 +1503,16 @@ impl ApplicationHandler for InteractiveApp {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
-                        let mut body_instances = Vec::new();
-                        if self.show_bodies {
-                            pose_body_instances(
+                        let (body_mesh_updates, live_body_meshes) = if self.show_bodies {
+                            pose_body_meshes(
                                 &self.last_body_draws,
                                 local_poses.as_ref(),
                                 render_now,
                                 &mut self.pose_stats,
-                                &mut body_instances,
-                            );
-                        }
+                            )
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
                         let cam = fresh_view.map(|v| {
                             let followed =
                                 self.camera_follow.eye(v, render_now, local_poses.is_none());
@@ -1429,7 +1575,8 @@ impl ApplicationHandler for InteractiveApp {
                         match renderer.finish_frame(
                             acquired,
                             cam.as_ref(),
-                            &body_instances,
+                            &body_mesh_updates,
+                            &live_body_meshes,
                             None,
                             menu_view.as_ref().map(|view| (view, &mut menu_actions)),
                         ) {
@@ -1831,19 +1978,16 @@ impl NetPose {
     }
 }
 
-/// Per-body cell instances in body-local space, keyed by topology revision.
-/// A body's cells only change when its topology does, so the per-cell volume
-/// walk (thousands of `sample` calls with ~200 debris bodies) happens once per
-/// topology, not once per frame; each frame only re-poses the cached cells.
-type BodyTemplates = std::collections::HashMap<u64, (u64, Arc<Vec<Instance>>)>;
+/// Per-body greedy mesh templates, keyed by topology revision.
+type BodyTemplates = std::collections::HashMap<u64, (u64, Arc<spall_mesh::Mesh>)>;
 
-/// A body's cached cells plus the pose the worker last saw for it. The render
-/// thread re-poses `template` itself at draw time (see
-/// [`pose_body_instances`]); the worker's pose is only the fallback for bodies
-/// with no locally simulated pose.
+/// A body's cached mesh plus the pose the worker last saw for it.
 struct BodyDraw {
     entity: u64,
+    #[cfg(test)]
+    #[allow(dead_code)]
     template: Arc<Vec<Instance>>,
+    mesh: Arc<spall_mesh::Mesh>,
     translation_m: [f64; 3],
     rotation: [f32; 4],
     net: Option<NetPose>,
@@ -1913,6 +2057,8 @@ fn snapshot_bodies(
 }
 
 /// Body-local cube positions/colours for `volume` (no pose applied).
+#[cfg(test)]
+#[allow(dead_code)]
 fn build_body_template(volume: &Volume) -> Vec<Instance> {
     let mut instances = Vec::new();
     let bricks = volume.resident_brick_coords();
@@ -1969,6 +2115,17 @@ fn build_body_template(volume: &Volume) -> Vec<Instance> {
     instances
 }
 
+fn build_body_mesh_template(volume: &Volume) -> spall_mesh::Mesh {
+    spall_mesh::build_volume_mesh(
+        volume,
+        Generation::START,
+        TopologyEpoch::START,
+        Default::default(),
+    )
+    .map(|built| built.mesh)
+    .unwrap_or_default()
+}
+
 /// Every detached body's cached cells and last-seen pose, built from
 /// [`snapshot_bodies`]'s output entirely after the replica lock has been
 /// released (see that function's doc for why this split exists). Nothing in
@@ -1983,17 +2140,17 @@ fn collect_body_draws(views: &[BodyView], templates: &mut BodyTemplates) -> Vec<
     let mut draws = Vec::with_capacity(views.len());
     for view in views {
         if let Some(volume) = &view.volume {
-            templates.insert(
-                view.entity,
-                (view.revision, Arc::new(build_body_template(volume))),
-            );
+            let mesh = Arc::new(build_body_mesh_template(volume));
+            templates.insert(view.entity, (view.revision, mesh));
         }
-        let Some((_, template)) = templates.get(&view.entity) else {
+        let Some((_, mesh)) = templates.get(&view.entity) else {
             continue;
         };
         draws.push(BodyDraw {
             entity: view.entity,
-            template: template.clone(),
+            #[cfg(test)]
+            template: Arc::new(Vec::new()),
+            mesh: mesh.clone(),
             translation_m: view.translation_m,
             rotation: view.rotation,
             net: view.net.clone(),
@@ -2006,6 +2163,8 @@ fn collect_body_draws(views: &[BodyView], templates: &mut BodyTemplates) -> Vec<
 /// simulated pose interpolated to `now` when there is one, else the pose the
 /// worker last saw. Each cube gets the body's full rotation (its centre is
 /// rotated and so is its mesh), not just its centre.
+#[allow(dead_code)]
+#[cfg(test)]
 fn pose_body_instances(
     draws: &[BodyDraw],
     local_poses: Option<&crate::interactive::LocalBodyPoses>,
@@ -2051,6 +2210,55 @@ fn pose_body_instances(
             ..*cell
         }));
     }
+}
+
+fn pose_body_meshes(
+    draws: &[BodyDraw],
+    local_poses: Option<&crate::interactive::LocalBodyPoses>,
+    now: Instant,
+    stats: &mut PoseStats,
+) -> (Vec<(u64, Vec<spall_render::GpuVertex>, Vec<u32>)>, Vec<u64>) {
+    let mut output = Vec::with_capacity(draws.len());
+    let mut live = Vec::with_capacity(draws.len());
+    for draw in draws {
+        let (translation_m, rotation) = match local_poses.and_then(|p| p.sample(draw.entity, now)) {
+            Some(pose) => (pose.translation_m, pose.rotation),
+            None => match &draw.net {
+                Some(net) => {
+                    let tick = net.render_tick(now);
+                    match net.sampler.presented(tick, net.focus_m) {
+                        Some(pose) => {
+                            if net.sampler.is_moving() {
+                                let age_ms = net.sampler.latest_age_ticks(tick).unwrap_or(0.0)
+                                    / net.sampler.hz()
+                                    * 1000.0;
+                                stats.record(draw.entity, pose.translation_m, age_ms);
+                            }
+                            (
+                                pose.translation_m,
+                                pose.rotation.to_unit().unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                            )
+                        }
+                        None => (draw.translation_m, draw.rotation),
+                    }
+                }
+                None => (draw.translation_m, draw.rotation),
+            },
+        };
+        let [x, y, z, w] = rotation;
+        let transform = glam::Mat4::from_rotation_translation(
+            glam::Quat::from_xyzw(x, y, z, w),
+            Vec3::new(
+                translation_m[0] as f32,
+                translation_m[1] as f32,
+                translation_m[2] as f32,
+            ),
+        );
+        let (vertices, indices) = spall_render::to_gpu(&draw.mesh, transform);
+        output.push((draw.entity, vertices, indices));
+        live.push(draw.entity);
+    }
+    (output, live)
 }
 
 /// Draw-time pose diagnostics for moving network bodies: how old the newest
@@ -2967,8 +3175,10 @@ impl WorldRenderer {
     /// One report-line fragment: the shared renderer's per-pass GPU time
     /// (previous completed frames) and resident instance memory.
     fn scene_report(&self) -> String {
-        let (terrain, bodies, overlay) = self.scene.instance_counts();
-        let memory = self.scene.instance_bytes() as f64 / (1024.0 * 1024.0);
+        let (_, _, overlay) = self.scene.instance_counts();
+        let (terrain_chunks, terrain_triangles, body_meshes, body_triangles, mesh_bytes) =
+            self.scene.mesh_stats();
+        let memory = (self.scene.instance_bytes() + mesh_bytes) as f64 / (1024.0 * 1024.0);
         let sky_memory = self.scene.sky_bytes() as f64 / (1024.0 * 1024.0);
         let sweep = self.scene.lighting_sweep_frames().unwrap_or(0);
         let lit_after = self
@@ -2977,7 +3187,7 @@ impl WorldRenderer {
             .map_or("n/a".to_owned(), |ms| format!("{ms:.0} ms"));
         match self.scene.pass_timings() {
             Some(t) => format!(
-                "scene GPU {:.2} ms (shadow {:.2} / opaque {:.2} / tone {:.2}; sky visibility {} / bounce {} last recompute, {sky_memory:.0} MiB) | lighting sweep {sweep} frames (cache update to last slice recorded {lit_after}, not presented) | cubes {terrain} terrain + {bodies} body + {overlay} overlay ({memory:.1} MiB)",
+                "scene GPU {:.2} ms (shadow {:.2} / opaque {:.2} / tone {:.2}; sky visibility {} / bounce {} last recompute, {sky_memory:.0} MiB) | lighting sweep {sweep} frames (cache update to last slice recorded {lit_after}, not presented) | greedy {terrain_chunks} terrain chunks / {terrain_triangles} tris + {body_meshes} body meshes / {body_triangles} tris + {overlay} debug cubes ({memory:.1} MiB)",
                 t.total_ms(),
                 t.shadow_ms,
                 t.opaque_ms,
@@ -2988,7 +3198,7 @@ impl WorldRenderer {
                     .map_or("n/a".to_owned(), |ms| format!("{ms:.2} ms"))
             ),
             None => format!(
-                "scene GPU timing unavailable | cubes {terrain} terrain + {bodies} body + {overlay} overlay ({memory:.1} MiB)"
+                "scene GPU timing unavailable | greedy {terrain_chunks} terrain chunks / {terrain_triangles} tris + {body_meshes} body meshes / {body_triangles} tris + {overlay} debug cubes ({memory:.1} MiB)"
             ),
         }
     }
@@ -3091,7 +3301,8 @@ impl WorldRenderer {
         &mut self,
         acquired: AcquiredFrame,
         cam: Option<&(Vec3, Vec3)>,
-        bodies: &[Instance],
+        body_meshes: &[(u64, Vec<spall_render::GpuVertex>, Vec<u32>)],
+        live_body_meshes: &[u64],
         demo_hud: Option<(&str, &str, &str)>,
         admin_menu: Option<(&AdminMenuView, &mut AdminMenuActions)>,
     ) -> Result<FrameTiming, ClientError> {
@@ -3104,7 +3315,10 @@ impl WorldRenderer {
             acquire_ms,
         } = acquired;
 
-        self.scene.set_bodies(&self.device, &self.queue, bodies);
+        self.scene.set_bodies(&self.device, &self.queue, &[]);
+        self.scene
+            .set_body_meshes(&self.device, &self.queue, body_meshes, live_body_meshes)
+            .map_err(|error| ClientError::Render(error.to_string()))?;
         if let Some((eye, _)) = cam {
             self.debug_water_instances.sort_by(|a, b| {
                 let distance2 = |cube: &Instance| {
@@ -3268,6 +3482,31 @@ mod input_tests {
 
     use super::*;
 
+    #[test]
+    fn reports_incremental_mesh_and_edit_to_mesh_latency() {
+        let mut volume = spall_mesh::fixtures::cube([0, 0, 0], 8);
+        let center = [1.0, 1.0, 1.0];
+        let mut cache = TerrainMeshCache::default();
+        let started = Instant::now();
+        let (initial, _) = update_terrain_mesh_cache(&volume, center, &mut cache);
+        let initial_elapsed = started.elapsed();
+        assert_eq!(initial.len(), 1);
+
+        let mut edit = spall_voxel::EditPlan::new(volume.id());
+        edit.set(GlobalCell::new(0, 0, 0), MaterialId::AIR);
+        volume.apply_edit(&edit).expect("fixture edit should apply");
+        let started = Instant::now();
+        let (changed, _) = update_terrain_mesh_cache(&volume, center, &mut cache);
+        let edit_to_mesh = started.elapsed();
+        assert_eq!(changed.len(), 1, "only the edited brick should be rebuilt");
+        eprintln!(
+            "incremental_rebuild_ms={:.3} edit_to_mesh_ms={:.3} updated_bricks={}",
+            initial_elapsed.as_secs_f64() * 1000.0,
+            edit_to_mesh.as_secs_f64() * 1000.0,
+            changed.len()
+        );
+    }
+
     fn view(
         position_m: [f64; 3],
         velocity_m_s: [f32; 3],
@@ -3384,16 +3623,21 @@ mod input_tests {
     }
 
     #[test]
-    fn locally_simulated_pose_reaches_body_render_instances() {
+    fn locally_simulated_pose_transforms_body_mesh_vertices() {
         let now = Instant::now();
         let draws = [BodyDraw {
             entity: 7,
-            template: Arc::new(vec![Instance::new(
-                [0.0, 0.0, 0.0],
-                1,
-                [CELL_M; 3],
-                [0.0, 0.0, 0.0, 1.0],
-            )]),
+            template: Arc::new(Vec::new()),
+            mesh: Arc::new(spall_mesh::Mesh {
+                vertices: vec![spall_mesh::Vertex {
+                    position: [0.0; 3],
+                    normal: [0.0, 1.0, 0.0],
+                    material: 1,
+                    ao: 1.0,
+                    local_uv: [0.0; 2],
+                }],
+                indices: Vec::new(),
+            }),
             translation_m: [2.0, 0.0, 0.0],
             rotation: [0.0, 0.0, 0.0, 1.0],
             net: None,
@@ -3408,17 +3652,12 @@ mod input_tests {
             curr_at: now,
             step: Duration::from_millis(16),
         };
-        let mut instances = Vec::new();
-        pose_body_instances(
-            &draws,
-            Some(&local),
-            now,
-            &mut PoseStats::default(),
-            &mut instances,
-        );
+        let (meshes, live) = pose_body_meshes(&draws, Some(&local), now, &mut PoseStats::default());
 
-        assert_eq!(instances.len(), 1);
-        assert_eq!(instances[0].offset, [8.0, 1.0, 3.0]);
+        assert_eq!(live, vec![7]);
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(meshes[0].0, 7);
+        assert_eq!(meshes[0].1[0].position, [8.0, 1.0, 3.0]);
     }
 }
 
