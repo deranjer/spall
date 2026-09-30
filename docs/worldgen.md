@@ -120,10 +120,16 @@ instances, ~140 fps), 1.5-4 ms elsewhere. **Note:** with vsync on, a window that
 is occluded or in the background is throttled by Windows to about 4 fps; use
 `--uncapped` to measure.
 
-**Hammer.** Left click (cursor captured) sends the game's `DIG` tool along the
-camera ray; hold to repeat (140 ms); the wheel sets the radius, 1-8 cells
-(default 3; the server caps it per tool). The client queues an `ActionRequest`
-through `InteractiveSession::push_action` (which nothing drained before) and the
+**Hammer.** A crosshair marks the screen centre (white with a target in
+reach, red without), a cyan wireframe shows the cells a swing would break, and
+a label shows the radius and the material under the crosshair (or "click to
+capture the mouse" until the cursor is captured). The target is found each frame
+by casting the camera ray through the client's replica of the terrain with the
+game's `DIG` reach (12 m). Left click (cursor captured) sends `DIG` along the
+camera ray; hold to repeat (140 ms); the wheel sets the radius, 0-8 cells
+(default 2; radius 0 breaks exactly one voxel, 1/2/3 break 7/33/123 cells; the
+server caps it per tool). The client queues an `ActionRequest` through
+`InteractiveSession::push_action` (which nothing drained before) and the
 network thread sends it. The server finds the hit cell from the ray; the client
 only supplies eye, direction and radius. `worldgen_hammer` is an end-to-end test:
 a real server hosts a generated world and the client replica receives the crater.

@@ -218,6 +218,11 @@ pub fn run_interactive_window_with_options(
     // so colour, roughness, metalness and emission match the editor and the
     // capture tools. One extra entry past the manifest ids draws debug
     // overlays.
+    let material_names: std::collections::BTreeMap<u16, String> = materials
+        .entries()
+        .iter()
+        .map(|def| (def.id.0, def.name.clone()))
+        .collect();
     let mut render_materials = materials_from_manifest(&materials);
     let debug_material = render_materials.len() as u32;
     render_materials.push(spall_render::Material::new([0.02, 0.9, 0.9], 0.5, 0.0).emissive(2.0));
@@ -243,6 +248,7 @@ pub fn run_interactive_window_with_options(
         // is genuinely unknown; otherwise absent means empty.
         !net_config_streams_residency,
     )?;
+    app.material_names = material_names;
 
     let net_thread = std::thread::Builder::new()
         .name("spall-client-net".into())
@@ -400,6 +406,10 @@ struct InteractiveApp {
     last_hammer_at: Option<Instant>,
     hammer_radius: i64,
     next_action_id: u64,
+    /// The solid cell under the crosshair, refreshed every frame.
+    hammer_target: Option<(GlobalCell, MaterialId)>,
+    /// Material names by id, for the crosshair label.
+    material_names: std::collections::BTreeMap<u16, String>,
     /// ENG-105: `(frame_seq, server_tick)` of the water keyframe on the GPU.
     water_key: Option<(u64, u64)>,
     /// An admin command was sent and its `AdminStatus` has not arrived.
@@ -876,6 +886,8 @@ impl InteractiveApp {
             last_hammer_at: None,
             hammer_radius: HAMMER_RADIUS_DEFAULT,
             next_action_id: HAMMER_REQUEST_BASE,
+            hammer_target: None,
+            material_names: std::collections::BTreeMap::new(),
             water_key: None,
             admin_request_pending: false,
             seen_world_resets: 0,
@@ -1113,7 +1125,7 @@ impl ApplicationHandler for InteractiveApp {
                     winit::event::MouseScrollDelta::PixelDelta(p) => (p.y / 40.0).round() as i64,
                 };
                 if steps != 0 {
-                    self.hammer_radius = (self.hammer_radius + steps).clamp(1, HAMMER_RADIUS_MAX);
+                    self.hammer_radius = (self.hammer_radius + steps).clamp(0, HAMMER_RADIUS_MAX);
                     eprintln!(
                         "spall-interactive: hammer radius {} cells",
                         self.hammer_radius
@@ -1295,13 +1307,23 @@ impl ApplicationHandler for InteractiveApp {
                 while let Ok(draws) = self.body_worker.result_rx.try_recv() {
                     self.last_body_draws = draws;
                 }
-                let overlay = if self.show_capsule
+                let mut overlay = if self.show_capsule
                     && let Some(v) = view
                 {
                     build_capsule_debug_instances(v.predicted.position_m, self.debug_material)
                 } else {
                     Vec::new()
                 };
+                // The cells the hammer would break (last frame's target).
+                if let Some((cell, _)) = self.hammer_target
+                    && !self.admin_menu_open
+                {
+                    overlay.extend(hammer_outline(
+                        cell,
+                        self.hammer_radius,
+                        self.debug_material,
+                    ));
+                }
                 // Terrain lives in a resident GPU buffer and is re-uploaded
                 // only when a rebuild landed or its visibility toggled --
                 // not every frame. Bodies move continuously, so they are
@@ -1467,6 +1489,40 @@ impl ApplicationHandler for InteractiveApp {
                                 (followed, look_dir)
                             }
                         });
+                        self.hammer_target = match cam {
+                            Some((eye, dir)) => {
+                                match self.session.replica.get().and_then(|r| r.try_lock().ok()) {
+                                    Some(replica) => replica
+                                        .terrain_volume()
+                                        .and_then(|volume| cast_hammer_ray(volume, eye, dir)),
+                                    // The network thread holds the replica: keep
+                                    // last frame's target rather than flicker.
+                                    None => self.hammer_target,
+                                }
+                            }
+                            _ => None,
+                        };
+                        renderer.set_crosshair((!self.admin_menu_open && cam.is_some()).then(
+                            || CrosshairView {
+                                in_reach: self.hammer_target.is_some(),
+                                label: match self.hammer_target {
+                                    // A click only captures the mouse until it is.
+                                    _ if !self.cursor_locked => {
+                                        "click to capture the mouse, then click to break".to_owned()
+                                    }
+                                    Some((_, material)) => format!(
+                                            "hammer r{}  {}",
+                                            self.hammer_radius,
+                                            self.material_names
+                                                .get(&material.0)
+                                                .map_or("?", String::as_str)
+                                        ),
+                                    None => {
+                                        format!("hammer r{}  out of reach", self.hammer_radius)
+                                    }
+                                },
+                            },
+                        ));
                         if let Some((eye, dir)) = cam
                             && self.cursor_locked
                             && hammer_due(
@@ -2372,9 +2428,18 @@ impl PoseStats {
 /// axis aligned, so this gives the cube-only debug renderer true continuous
 /// wire-like strokes without adding a separate line pipeline.
 fn debug_line(a: Vec3, b: Vec3, material: u32) -> impl Iterator<Item = Instance> {
-    const THICKNESS_M: f32 = 0.0125;
+    debug_line_thick(a, b, material, 0.0125)
+}
+
+/// [`debug_line`] with an explicit stroke thickness in metres.
+fn debug_line_thick(
+    a: Vec3,
+    b: Vec3,
+    material: u32,
+    thickness_m: f32,
+) -> impl Iterator<Item = Instance> {
     let delta = (b - a).abs();
-    let mut dimensions = [THICKNESS_M; 3];
+    let mut dimensions = [thickness_m; 3];
     let axis = if delta.x >= delta.y && delta.x >= delta.z {
         0
     } else if delta.y >= delta.z {
@@ -2382,7 +2447,7 @@ fn debug_line(a: Vec3, b: Vec3, material: u32) -> impl Iterator<Item = Instance>
     } else {
         2
     };
-    dimensions[axis] = delta[axis] + THICKNESS_M;
+    dimensions[axis] = delta[axis] + thickness_m;
     let midpoint = (a + b) * 0.5;
     std::iter::once(Instance {
         offset: midpoint.to_array(),
@@ -2477,7 +2542,13 @@ const FLY_FAST_SPEED_M_S: f32 = 36.0;
 /// button repeats at this interval.
 const HAMMER_TOOL: u16 = 0;
 const HAMMER_REPEAT: Duration = Duration::from_millis(140);
-const HAMMER_RADIUS_DEFAULT: i64 = 3;
+/// Radius 0 breaks exactly the struck voxel; 1, 2, 3 break 7, 33, 123 cells.
+const HAMMER_RADIUS_DEFAULT: i64 = 2;
+/// The game's `DIG` tool reach (`sandbox::game::tool_catalog`): past this the
+/// server refuses the swing, so the crosshair shows no target.
+const HAMMER_REACH_M: f64 = 12.0;
+/// Stroke thickness of the target outline: a tenth of a voxel, visible at range.
+const HAMMER_STROKE_M: f32 = 0.025;
 const HAMMER_RADIUS_MAX: i64 = 8;
 /// Request ids for window-fired tools start here, clear of the scripted (low)
 /// and review-cut (`1_000_000 + n`) ranges.
@@ -2496,7 +2567,7 @@ pub fn hammer_request(
     use spall_protocol::{ActionKind, ActionRequest, ClaimedTarget, InputSeq, RequestId};
     let brush = spall_core::SphereBrush::new(
         BrushPoint::from_units(0, 0, 0),
-        radius_cells.clamp(1, HAMMER_RADIUS_MAX) * BRUSH_UNIT,
+        radius_cells.clamp(0, HAMMER_RADIUS_MAX) * BRUSH_UNIT,
     )
     .expect("hammer radius is within brush limits");
     ActionRequest {
@@ -2509,6 +2580,87 @@ pub fn hammer_request(
         claimed_target: ClaimedTarget::Terrain,
         claimed_brush: brush,
     }
+}
+
+/// The solid cell the camera ray meets within the hammer's reach, and its
+/// material, found in the client's own replica of the terrain. The server does
+/// the authoritative version of this from the same eye and direction.
+fn cast_hammer_ray(volume: &Volume, eye: Vec3, dir: Vec3) -> Option<(GlobalCell, MaterialId)> {
+    use spall_voxel::query::{Ray, RayConfig, RayOutcome, cast_ray};
+    let cell_m = f64::from(CELL_M);
+    let origin = glam::DVec3::new(f64::from(eye.x), f64::from(eye.y), f64::from(eye.z)) / cell_m;
+    let heading = glam::DVec3::new(f64::from(dir.x), f64::from(dir.y), f64::from(dir.z));
+    match cast_ray(
+        volume,
+        Ray::new(origin, heading),
+        RayConfig::new(HAMMER_REACH_M / cell_m),
+    ) {
+        Ok(RayOutcome::Hit(hit)) => Some((hit.cell, hit.material)),
+        _ => None,
+    }
+}
+
+/// Wireframe of the cells a swing at `cell` with `radius_cells` can remove: the
+/// sphere's bounding box (one voxel at radius 0), as thin strokes.
+fn hammer_outline(cell: GlobalCell, radius_cells: i64, material: u32) -> Vec<Instance> {
+    let cell_m = CELL_M;
+    let lo = Vec3::new(
+        (cell.x - radius_cells) as f32,
+        (cell.y - radius_cells) as f32,
+        (cell.z - radius_cells) as f32,
+    ) * cell_m;
+    let hi = Vec3::new(
+        (cell.x + radius_cells + 1) as f32,
+        (cell.y + radius_cells + 1) as f32,
+        (cell.z + radius_cells + 1) as f32,
+    ) * cell_m;
+    let corner = |x: bool, y: bool, z: bool| {
+        Vec3::new(
+            if x { hi.x } else { lo.x },
+            if y { hi.y } else { lo.y },
+            if z { hi.z } else { lo.z },
+        )
+    };
+    let mut out = Vec::with_capacity(12);
+    for y in [false, true] {
+        for z in [false, true] {
+            out.extend(debug_line_thick(
+                corner(false, y, z),
+                corner(true, y, z),
+                material,
+                HAMMER_STROKE_M,
+            ));
+        }
+    }
+    for x in [false, true] {
+        for z in [false, true] {
+            out.extend(debug_line_thick(
+                corner(x, false, z),
+                corner(x, true, z),
+                material,
+                HAMMER_STROKE_M,
+            ));
+        }
+    }
+    for x in [false, true] {
+        for y in [false, true] {
+            out.extend(debug_line_thick(
+                corner(x, y, false),
+                corner(x, y, true),
+                material,
+                HAMMER_STROKE_M,
+            ));
+        }
+    }
+    out
+}
+
+/// What the crosshair shows: whether the hammer has a target in reach, and a
+/// one-line label (radius and what is being hit).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct CrosshairView {
+    pub in_reach: bool,
+    pub label: String,
 }
 
 /// Whether a swing is due: a fresh click always is; a held button repeats
@@ -2689,6 +2841,35 @@ fn admin_menu_view(session: &InteractiveSession, flying: bool, pending: bool) ->
     }
 }
 
+/// A plus at the centre of the screen, white with a target in reach and red
+/// without, and the hammer label just under it.
+fn draw_crosshair(view: &CrosshairView) {
+    let color = if view.in_reach {
+        yakui::Color::rgb(255, 255, 255)
+    } else {
+        yakui::Color::rgb(255, 90, 80)
+    };
+    yakui::align(yakui::Alignment::CENTER, || {
+        yakui::stack(|| {
+            yakui::align(yakui::Alignment::CENTER, || {
+                yakui::colored_box(color, yakui::Vec2::new(18.0, 2.0));
+            });
+            yakui::align(yakui::Alignment::CENTER, || {
+                yakui::colored_box(color, yakui::Vec2::new(2.0, 18.0));
+            });
+        });
+    });
+    yakui::align(yakui::Alignment::BOTTOM_CENTER, || {
+        yakui::pad(yakui::widgets::Pad::all(28.0), || {
+            yakui::colored_box_container(PANEL_BG.with_alpha(0.55), || {
+                yakui::pad(yakui::widgets::Pad::balanced(10.0, 4.0), || {
+                    yakui::text(13.0, view.label.clone());
+                });
+            });
+        });
+    });
+}
+
 /// Background of HUD panels.
 const PANEL_BG: yakui::Color = yakui::Color::rgb(16, 20, 28);
 const PANEL_ACCENT: yakui::Color = yakui::Color::rgb(120, 190, 255);
@@ -2702,7 +2883,7 @@ const KEYBINDS: &[(&str, &str)] = &[
         "Left click",
         "Hammer: break voxels where you aim (hold to repeat)",
     ),
-    ("Wheel", "Hammer radius 1-8 cells"),
+    ("Wheel", "Hammer radius 0-8 cells (0 = one voxel)"),
     ("Space", "Jump (walking) / rise (flying)"),
     ("Ctrl", "Descend (flying)"),
     ("Shift", "Fly faster"),
@@ -2919,6 +3100,8 @@ pub(super) struct WorldRenderer {
     debug_water_material: u32,
     /// Water as merged boxes, unclipped; the per-frame draw list in
     /// `debug_water_instances` is this clipped to the terrain window.
+    /// The hammer crosshair and its label; `None` hides it (cursor not captured).
+    crosshair: Option<CrosshairView>,
     debug_water_source: Vec<Instance>,
     water_window: Option<[f64; 3]>,
     debug_water_instances: Vec<Instance>,
@@ -3127,6 +3310,10 @@ impl WorldRenderer {
         self.debug_water_source = merge_water_columns(instances, self.debug_water_material);
     }
 
+    pub(super) fn set_crosshair(&mut self, view: Option<CrosshairView>) {
+        self.crosshair = view;
+    }
+
     /// Centre of the terrain window water is drawn in, or `None` before any
     /// terrain has landed (then no water is drawn: it would float in the sky).
     pub(super) fn set_water_window(&mut self, center_m: Option<[f64; 3]>) {
@@ -3260,6 +3447,7 @@ impl WorldRenderer {
             surface_config,
             scene,
             debug_water_material,
+            crosshair: None,
             debug_water_source: Vec::new(),
             water_window: None,
             debug_water_instances: Vec::new(),
@@ -3620,6 +3808,9 @@ impl WorldRenderer {
                     }
                 });
             });
+        }
+        if let Some(crosshair) = &self.crosshair {
+            draw_crosshair(crosshair);
         }
         self.yakui.finish();
         if let Some(preset) = selected_environment {
@@ -4032,11 +4223,105 @@ mod perf_probe {
             r.claimed_brush.radius_units(),
             HAMMER_RADIUS_MAX * spall_core::units::BRUSH_UNIT
         );
-        let small = hammer_request(1, Vec3::ZERO, Vec3::Z, 0);
+        let single = hammer_request(1, Vec3::ZERO, Vec3::Z, 0);
         assert_eq!(
-            small.claimed_brush.radius_units(),
-            spall_core::units::BRUSH_UNIT
+            single.claimed_brush.radius_units(),
+            0,
+            "radius 0 breaks one voxel"
         );
+        let below = hammer_request(1, Vec3::ZERO, Vec3::Z, -5);
+        assert_eq!(below.claimed_brush.radius_units(), 0);
+    }
+
+    /// A 32x32x32-cell stone block whose top face is at cell y = 32 (8 m), under
+    /// three bricks of air.
+    fn stone_block() -> Volume {
+        use spall_core::{BrickCoord, VolumeId};
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), spall_core::CellSizeCode::Quarter);
+        volume
+            .insert_brick(
+                BrickCoord::new(0, 0, 0),
+                spall_voxel::brick::Brick::uniform(MaterialId(1), spall_core::Revision::ZERO),
+            )
+            .unwrap();
+        // Resident air above, so a ray never crosses an unloaded brick.
+        for by in 1..=3 {
+            volume
+                .insert_brick(
+                    BrickCoord::new(0, by, 0),
+                    spall_voxel::brick::Brick::uniform(MaterialId::AIR, spall_core::Revision::ZERO),
+                )
+                .unwrap();
+        }
+        volume
+    }
+
+    #[test]
+    fn the_crosshair_ray_finds_the_struck_cell_within_reach_only() {
+        let volume = stone_block();
+        // 1 m above the block's top face (y = 8 m), looking straight down at x=z=4.1 m.
+        let hit = cast_hammer_ray(&volume, Vec3::new(4.1, 9.0, 4.1), Vec3::NEG_Y);
+        assert_eq!(hit, Some((GlobalCell::new(16, 31, 16), MaterialId(1))));
+        // Looking up or sideways into open air: nothing.
+        assert_eq!(
+            cast_hammer_ray(&volume, Vec3::new(4.1, 9.0, 4.1), Vec3::Y),
+            None
+        );
+        // Beyond the 12 m reach of the dig tool: no target, matching the server.
+        assert_eq!(
+            cast_hammer_ray(&volume, Vec3::new(4.1, 8.0 + 13.0, 4.1), Vec3::NEG_Y),
+            None
+        );
+        // Just inside reach still hits.
+        assert!(cast_hammer_ray(&volume, Vec3::new(4.1, 8.0 + 11.0, 4.1), Vec3::NEG_Y).is_some());
+    }
+
+    #[test]
+    fn the_hammer_outline_is_a_twelve_edge_box_of_the_brush_extent() {
+        // Strokes are `HAMMER_STROKE_M` thick and overhang the box by up to that.
+        const STROKE: f32 = HAMMER_STROKE_M + 0.0001;
+        let cell = GlobalCell::new(10, 20, 30);
+        for radius in [0, 2, 8] {
+            let edges = hammer_outline(cell, radius, 9);
+            assert_eq!(edges.len(), 12, "radius {radius}");
+            assert!(edges.iter().all(|e| e.material == 9));
+            // Every stroke lies within the brush's bounding box (plus stroke width).
+            let lo = Vec3::new(
+                (10 - radius) as f32,
+                (20 - radius) as f32,
+                (30 - radius) as f32,
+            ) * CELL_M;
+            let hi = Vec3::new(
+                (11 + radius) as f32,
+                (21 + radius) as f32,
+                (31 + radius) as f32,
+            ) * CELL_M;
+            for e in &edges {
+                for a in 0..3 {
+                    let half = e.size[a] * 0.5;
+                    assert!(
+                        e.offset[a] - half >= lo[a] - STROKE,
+                        "radius {radius} axis {a}"
+                    );
+                    assert!(
+                        e.offset[a] + half <= hi[a] + STROKE,
+                        "radius {radius} axis {a}"
+                    );
+                }
+            }
+            // The strokes together span the whole box on every axis.
+            for a in 0..3 {
+                let min = edges
+                    .iter()
+                    .map(|e| e.offset[a] - e.size[a] * 0.5)
+                    .fold(f32::MAX, f32::min);
+                let max = edges
+                    .iter()
+                    .map(|e| e.offset[a] + e.size[a] * 0.5)
+                    .fold(f32::MIN, f32::max);
+                assert!((min - lo[a]).abs() <= STROKE && (max - hi[a]).abs() <= STROKE);
+            }
+        }
     }
 
     #[test]
