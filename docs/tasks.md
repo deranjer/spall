@@ -397,6 +397,8 @@ Lands in increments against `docs/reports/G3.md`.
 
 ### T24 — G5 larger-world feasibility
 
+Procedural generation follow-up (ENG-113/114/115): `spall_worldgen` crate, sandbox/xtask wiring and editor panel, tracked separately from the G5 feasibility gate. See `docs/worldgen.md`; ENG-113 implements the crate only.
+
 Dependencies: T23. Own: separate architecture decision and scale prototype.
 
 Measure region streaming, render LOD seams, world generation versions, multiple rebased physics regions, region merge/split, body transfer, and structural graph growth. Set a measured world/player/debris envelope. Do not just enlarge constants.
