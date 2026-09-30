@@ -3176,6 +3176,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spall_worldgen"
+version = "0.1.0"
+dependencies = [
+ "spall_core",
+ "spall_voxel",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
