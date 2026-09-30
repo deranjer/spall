@@ -399,7 +399,7 @@ mod tests {
         // schema 2 changes checkpoint publication, not these journal bytes.
         let payload = JournalPayload::Topology {
             transaction: encode_control(&a_tx()).unwrap(),
-            participants: vec![],
+            participants: vec![vec![1, 2, 3]],
         };
         let bytes = encode(&payload).unwrap();
         let back: JournalPayload = decode(&bytes).unwrap();
@@ -408,12 +408,12 @@ mod tests {
         enum LegacyJournal {
             Topology {
                 transaction: Vec<u8>,
-                participants: Vec<StoredBody>,
+                participants: Vec<Vec<u8>>,
             },
         }
         let old = LegacyJournal::Topology {
             transaction: encode_control(&a_tx()).unwrap(),
-            participants: vec![],
+            participants: vec![vec![1, 2, 3]],
         };
         assert_eq!(encode(&old).unwrap(), bytes);
     }

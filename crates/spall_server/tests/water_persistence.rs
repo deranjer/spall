@@ -73,7 +73,8 @@ fn exact_water_checkpoint_and_journal_survive_restart_and_failed_commit() {
     let mut sim = fixture();
     let mut saved = sim.water().unwrap().canonical_state();
     saved.trapped[0] = 0.375_f64.to_bits();
-    sim.restore_water(&saved).unwrap();
+    sim.restore_water_regions(std::slice::from_ref(&saved))
+        .unwrap();
     let cp = persist::capture(&sim, &cfg, 0).unwrap();
     let mut writer = Writer::open(&path).unwrap();
     writer.publish_checkpoint(&cp).unwrap();

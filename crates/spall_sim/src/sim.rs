@@ -225,15 +225,6 @@ impl Simulation {
         self.water.as_ref()
     }
 
-    pub fn restore_water(
-        &mut self,
-        state: &spall_protocol::WaterState,
-    ) -> Result<(), crate::water::WaterError> {
-        let water = crate::water::AuthoritativeWater::restore(&self.world.terrain().volume, state)?;
-        self.water = Some(water);
-        Ok(())
-    }
-
     pub fn water_regions(&self) -> impl Iterator<Item = &crate::water::AuthoritativeWater> {
         self.water.iter().chain(self.additional_water.iter())
     }
