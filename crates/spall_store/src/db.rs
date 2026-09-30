@@ -70,6 +70,8 @@ impl Writer {
         )?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Reject unsupported saves before WAL can rewrite their file header.
+        ensure_schema(&conn)?;
 
         // WAL + FULL, then read them back — a silent fallback to rollback
         // journalling or a weaker sync would break the durability contract.
@@ -82,8 +84,6 @@ impl Writer {
         if sync < 2 {
             return Err(StoreError::NotSynchronousFull(sync));
         }
-
-        ensure_schema(&conn)?;
 
         Ok(Self {
             conn,

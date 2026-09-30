@@ -807,3 +807,27 @@ fn missing_or_corrupt_water_checkpoint_never_restores_a_silent_dry_world() {
         ));
     }
 }
+
+#[test]
+fn unsupported_save_versions_are_rejected_before_changing_rollback_journal_mode() {
+    for version in [1, STORE_SCHEMA_VERSION + 1] {
+        let scratch = Scratch::new(&format!("rollback-schema-{version}"));
+        {
+            let mut writer = Writer::open(scratch.db()).unwrap();
+            writer.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+        }
+        let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+        drop(conn);
+        let bytes = std::fs::read(scratch.db()).unwrap();
+        assert!(matches!(
+            Writer::open(scratch.db()),
+            Err(StoreError::SchemaTooOld { .. } | StoreError::SchemaTooNew { .. })
+        ));
+        assert!(
+            std::fs::read(scratch.db()).unwrap() == bytes,
+            "version rejection must not rewrite the SQLite journal-mode header"
+        );
+    }
+}
