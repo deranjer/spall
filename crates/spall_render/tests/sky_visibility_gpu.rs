@@ -22,6 +22,7 @@ fn materials() -> Vec<Material> {
     vec![
         Material::default(),
         Material::new([0.7, 0.7, 0.7], 0.9, 0.0),
+        Material::new([0.8, 0.5, 0.15], 0.6, 0.0).emissive(5.0),
     ]
 }
 
@@ -471,7 +472,18 @@ fn sky_visibility_cost_at_forest_scale() {
             )
         })
         .collect();
-    let occupancy = occupancy(&terrain, Vec3::ZERO);
+    // The same scene with a dozen 1 m emissive lamps scattered through it, to
+    // cost the analytic emitter lighting (the plain scene has no emitters).
+    let mut terrain_with_lamps = terrain.clone();
+    for i in 0..12 {
+        let a = i as f32 * 0.52;
+        terrain_with_lamps.push(CubeInstance::new(
+            [a.cos() * 14.0, 1.2, a.sin() * 14.0 - 4.0],
+            2,
+            [1.0; 3],
+            IDENTITY,
+        ));
+    }
 
     let (width, height_px) = (1920, 1080);
     let target = OffscreenTarget::new(&ctx.device, width, height_px);
@@ -502,7 +514,14 @@ fn sky_visibility_cost_at_forest_scale() {
         bodies.len(),
         ctx.supports_gpu_timestamps(),
     );
-    for (label, with_sky) in [("legacy_ambient", false), ("sky_visibility", true)] {
+    let cases = [
+        ("legacy_ambient", false, false),
+        ("sky_visibility", true, false),
+        ("sky_visibility_12_lamps", true, true),
+    ];
+    for (index, (label, with_sky, lamps)) in cases.into_iter().enumerate() {
+        let terrain = if lamps { &terrain_with_lamps } else { &terrain };
+        let occupancy = occupancy(terrain, Vec3::ZERO);
         let mut renderer = GameRenderer::new(
             &ctx.device,
             &ctx.queue,
@@ -512,7 +531,7 @@ fn sky_visibility_cost_at_forest_scale() {
             ctx.supports_gpu_timestamps()
                 .then(|| ctx.timestamp_period_ns()),
         );
-        renderer.set_terrain(&ctx.device, &ctx.queue, &terrain);
+        renderer.set_terrain(&ctx.device, &ctx.queue, terrain);
         renderer.set_bodies(&ctx.device, &ctx.queue, &bodies);
         if with_sky {
             renderer.set_sky_occupancy(&ctx.device, &ctx.queue, Some(&occupancy));
@@ -579,7 +598,7 @@ fn sky_visibility_cost_at_forest_scale() {
             ms(sky_recompute),
             ms(bounce_recompute),
             renderer.sky_bytes(),
-            if with_sky { "" } else { "," }
+            if index + 1 == cases.len() { "" } else { "," }
         ));
         json.push_str(&block);
     }

@@ -1070,11 +1070,29 @@ impl SkyVisibility {
             // bin arithmetic) so it always matches the occupancy and material
             // table the slice sees, including edits and moving bodies.
             encoder.clear_buffer(&self.emitters.bins, 0, None);
+            // The bounce timing spans both passes: the emitter gather takes the
+            // begin stamp and the bounce pass the end stamp, so the reported
+            // bounce cost includes the gather.
+            let (emit_timestamps, bounce_timestamps) = match bounce_timestamps {
+                Some(ts) => (
+                    Some(wgpu::ComputePassTimestampWrites {
+                        query_set: ts.query_set,
+                        beginning_of_pass_write_index: ts.beginning_of_pass_write_index,
+                        end_of_pass_write_index: None,
+                    }),
+                    Some(wgpu::ComputePassTimestampWrites {
+                        query_set: ts.query_set,
+                        beginning_of_pass_write_index: None,
+                        end_of_pass_write_index: ts.end_of_pass_write_index,
+                    }),
+                ),
+                None => (None, None),
+            };
             {
                 let emit_bind = self.emit_bind.lock().unwrap_or_else(|e| e.into_inner());
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("spall-emitter-pass"),
-                    timestamp_writes: None,
+                    timestamp_writes: emit_timestamps,
                 });
                 pass.set_bind_group(0, &*emit_bind, &[]);
                 pass.set_pipeline(&pipeline.emit_gather);
