@@ -1,3 +1,5 @@
+> Historical partial validation. Completion evidence and current contracts are in [ENG-105](ENG-105.md).
+
 # ENG-105 replication validation — 2026-09-29
 
 Bounded follow-up to merged PR #167, not acceptance of ENG-105. The existing

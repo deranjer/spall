@@ -992,3 +992,35 @@ Known limit: the engine builds one exact whole-terrain collider and rejects
 terrain over 4096 greedy boxes whose bounding grid exceeds 131,072 cells
 (`ColliderInfeasible::TooLarge`). The forest is sized to fit (16 trees; 33 needed
 6891 boxes). Denser forests need an engine-side change and are not attempted here.
+
+
+## ENG-105 authoritative water integration
+
+Run `cargo xtask check` for formatting, strict workspace clippy with all targets
+and features, and the complete CPU test suite. Targeted evidence commands:
+
+```powershell
+cargo test -p spall_protocol water -- --nocapture
+cargo test -p spall_fluid boundary_ -- --nocapture
+cargo test -p spall_sim --lib water::tests -- --nocapture
+cargo test -p spall_sim --test authoritative_water -- --nocapture
+cargo test -p spall_server --test water_replication -- --nocapture
+cargo test -p spall_server --test water_persistence -- --nocapture
+cargo test -p spall_store --test durability -- --nocapture
+cargo test -p spall_server budget_bounds_sustained_egress -- --nocapture
+cargo test --release -p spall_sim --test water_regions -- --nocapture
+```
+
+The three-region run uses three complete ENG-103 scale-1 reservoirs, each
+24 x 12 x 8 fluid cells, at 0.25 m resolution, fixed 1/60 s outer dt, eight
+maximum substeps, 600 ticks. The two-client QUIC run joins its second client
+during flow, cuts the dam with an actual action, and resets all three regions.
+Protocol tests independently inject gaps, reordered/duplicated bricks, malformed
+headers and bounded decompression overruns, then install repair. Exact save
+recovery tests include retained volume and an interrupted journal commit; store
+tests reject missing/corrupt canonical rows and verify schema-1 copy migration.
+
+Report measured timings and application bytes separately from targets; hardware
+render captures, IP/QUIC retransmission bandwidth, a long production soak and
+seamless cross-grid exchange are not established by these bounded CPU tests.
+See [ENG-105 evidence](reports/ENG-105.md).
