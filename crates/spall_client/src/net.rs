@@ -2281,6 +2281,7 @@ async fn run_async(
         let run_ticks = config.run_ticks;
         let interactive = config.interactive.clone();
         let admin_conn = conn.clone();
+        let action_counters = counters.clone();
         async move {
             tokio::select! {
                 _ = async { let _ = control.await; let _ = motion.await; } => {}
@@ -2312,6 +2313,23 @@ async fn run_async(
                                 admin_conn.send_record(WireRecord::AdminRequest(request)).await
                             {
                                 eprintln!("spall-client: admin request could not be sent: {error}");
+                            }
+                        }
+                        // Tool uses from the window (the hammer) go out on the
+                        // same poll. Not tracked for retry: a held tool simply
+                        // fires again.
+                        let actions: Vec<_> = interactive
+                            .as_ref()
+                            .map(|s| std::mem::take(&mut *s.action_queue.lock().unwrap_or_else(|e| e.into_inner())))
+                            .unwrap_or_default();
+                        for request in actions {
+                            match admin_conn.send_record(WireRecord::ActionRequest(request)).await {
+                                Ok(_) => {
+                                    action_counters.actions.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(error) => {
+                                    eprintln!("spall-client: action request could not be sent: {error}");
+                                }
                             }
                         }
                         tokio::time::sleep(Duration::from_millis(20)).await;

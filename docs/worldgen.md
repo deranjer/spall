@@ -93,6 +93,44 @@ to smaller arenas (tests use 256 cells).
   river, cave-mouth pits in the meadow, and the dark bedrock wall. Cave
   interiors, moss/mud detail and lighting inside tunnels were not inspected.
 
+## Client rendering and the hammer (ENG-114 follow-up)
+Playing the first showcase exposed three problems, fixed in `spall_client`:
+- **Frame rate (~36-45 fps flying).** The debug terrain renderer drew one cube per
+  exposed cell (936k at the spawn). Frame time tracked the instance count
+  (936k = 28 ms, 747k = 22 ms, <=490k = vsync). `build_instances` now merges
+  exposed cells into boxes (`greedy_boxes`: x runs, equal rows, equal slabs), so
+  the same views are 183k / 82k / 43k / 100k instances.
+- **Rebuild time (1-2.4 s per rebuild, terrain popped in seconds late).** The
+  walk did six `BTreeMap` lookups per solid cell. Each brick is now scanned from
+  a padded array (`BrickGrid`) and fully buried uniform bricks are skipped:
+  2300 ms -> 110 ms at the spawn, ~1000 ms -> 60-70 ms elsewhere (release,
+  `worldgen_render_cost` test, `--ignored`). Equivalence with the old per-cell
+  scan is tested on a random multi-brick volume.
+- **Water always drawn.** Water was a global list of translucent cubes, sorted
+  and uploaded every frame, with no distance limit, so it floated in the sky
+  where terrain had not streamed. Water columns are merged into boxes once per
+  keyframe and clipped every frame to the terrain view window (none before any
+  terrain has landed).
+- The terrain window now reaches 96 m below the camera (was 32 m), so flying
+  above the peaks keeps the ground in view.
+
+Measured in a real `cargo xtask play --worldgen showcase --uncapped --release`
+session (frame time, not vsync-limited): 6-7 ms at the heaviest view (221k
+instances, ~140 fps), 1.5-4 ms elsewhere. **Note:** with vsync on, a window that
+is occluded or in the background is throttled by Windows to about 4 fps; use
+`--uncapped` to measure.
+
+**Hammer.** Left click (cursor captured) sends the game's `DIG` tool along the
+camera ray; hold to repeat (140 ms); the wheel sets the radius, 1-8 cells
+(default 3; the server caps it per tool). The client queues an `ActionRequest`
+through `InteractiveSession::push_action` (which nothing drained before) and the
+network thread sends it. The server finds the hit cell from the ray; the client
+only supplies eye, direction and radius. `worldgen_hammer` is an end-to-end test:
+a real server hosts a generated world and the client replica receives the crater.
+The renderer culls back faces and only draws exposed cells, so flying (no
+collision) into the ground shows through it; the ground is solid (see the
+structure tests) and digging reveals the layers.
+
 ## Not included
 Trees, grass, props, flowing rivers (water is initially static, filled to sea
 level; springs/sinks are a consumer decision), streaming/infinite worlds, 3D
