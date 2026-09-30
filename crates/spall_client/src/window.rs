@@ -146,9 +146,20 @@ pub enum ShotStep {
     Reset,
     /// Pause without a screenshot.
     Wait(f32),
+    /// Switch the render view (`shaded`, `indirect_only`, `sky_visibility`...)
+    /// without a screenshot.
+    View(DebugView),
+    /// Visibility-aware skylight on or off, without a screenshot.
+    Skylight(bool),
+    /// Diffuse bounce on or off, without a screenshot.
+    Bounce(bool),
+    /// Switch the environment preset (`daylight`, `night`...) without a
+    /// screenshot.
+    Environment(EnvironmentPreset),
 }
 
-/// Parses `x,y,z,yaw,pitch;menu;reset;walk;wait:2` into steps.
+/// Parses `x,y,z,yaw,pitch;menu;reset;walk;wait:2;view:indirect_only;sky:off;
+/// bounce:on` into steps.
 pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
     spec.split(';')
         .map(str::trim)
@@ -161,6 +172,19 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
                 .parse()
                 .map(ShotStep::Wait)
                 .map_err(|_| format!("bad wait `{step}`")),
+            _ if step.starts_with("view:") => LIGHTING_VIEWS
+                .iter()
+                .find(|v| v.stem() == &step[5..])
+                .copied()
+                .map(ShotStep::View)
+                .ok_or_else(|| format!("unknown view `{step}`")),
+            _ if step.starts_with("env:") => EnvironmentPreset::from_key(&step[4..])
+                .map(ShotStep::Environment)
+                .ok_or_else(|| format!("unknown environment `{step}`")),
+            "sky:on" => Ok(ShotStep::Skylight(true)),
+            "sky:off" => Ok(ShotStep::Skylight(false)),
+            "bounce:on" => Ok(ShotStep::Bounce(true)),
+            "bounce:off" => Ok(ShotStep::Bounce(false)),
             _ => {
                 let v: Vec<f32> = step
                     .split(',')
@@ -1061,6 +1085,10 @@ impl InteractiveApp {
             }
             return;
         };
+        println!(
+            "spall-interactive: shot step {step:?} (next shot index {})",
+            self.shot_index
+        );
         let settle = match step {
             ShotStep::Camera {
                 eye,
@@ -1074,7 +1102,7 @@ impl InteractiveApp {
                 self.pitch = pitch_deg.to_radians().clamp(-MAX_PITCH, MAX_PITCH);
                 self.publish_look();
                 self.last_built_pos = None;
-                3.0
+                6.0
             }
             ShotStep::Walk => {
                 if self.fly_eye.is_some() {
@@ -1096,9 +1124,64 @@ impl InteractiveApp {
                 self.script_at = Some(now + Duration::from_secs_f32(seconds.max(0.0)));
                 return;
             }
+            ShotStep::View(view) => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.debug_view = view;
+                }
+                self.script_at = Some(now + Duration::from_millis(500));
+                return;
+            }
+            ShotStep::Environment(preset) => {
+                self.environment = preset.environment();
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.environment = preset.environment();
+                }
+                self.script_at = Some(now + Duration::from_secs(3));
+                return;
+            }
+            ShotStep::Skylight(on) => {
+                if self.sky_visibility_on != on {
+                    self.toggle_sky_visibility();
+                }
+                self.script_at = Some(now + Duration::from_secs(2));
+                return;
+            }
+            ShotStep::Bounce(on) => {
+                if self.bounce_on != on {
+                    self.toggle_bounce();
+                }
+                self.script_at = Some(now + Duration::from_secs(2));
+                return;
+            }
         };
         self.capture_due = true;
         self.script_at = Some(now + Duration::from_secs_f32(settle));
+    }
+
+    fn toggle_sky_visibility(&mut self) {
+        self.sky_visibility_on = !self.sky_visibility_on;
+        self.sky_dirty = true;
+        println!(
+            "spall-interactive: visibility-aware skylight {}",
+            if self.sky_visibility_on {
+                "ON"
+            } else {
+                "OFF (legacy unconditional ambient)"
+            }
+        );
+    }
+
+    fn toggle_bounce(&mut self) {
+        self.bounce_on = !self.bounce_on;
+        if let Some(renderer) = &self.renderer {
+            renderer
+                .scene
+                .set_bounce_enabled(&renderer.queue, self.bounce_on);
+        }
+        println!(
+            "spall-interactive: diffuse bounce {}",
+            if self.bounce_on { "ON" } else { "OFF" }
+        );
     }
 
     fn toggle_flight(&mut self) {
@@ -1301,29 +1384,11 @@ impl ApplicationHandler for InteractiveApp {
                         return;
                     }
                     KeyCode::F5 if held && !event.repeat => {
-                        self.sky_visibility_on = !self.sky_visibility_on;
-                        self.sky_dirty = true;
-                        println!(
-                            "spall-interactive: visibility-aware skylight {}",
-                            if self.sky_visibility_on {
-                                "ON"
-                            } else {
-                                "OFF (legacy unconditional ambient)"
-                            }
-                        );
+                        self.toggle_sky_visibility();
                         return;
                     }
                     KeyCode::F6 if held && !event.repeat => {
-                        self.bounce_on = !self.bounce_on;
-                        if let Some(renderer) = &self.renderer {
-                            renderer
-                                .scene
-                                .set_bounce_enabled(&renderer.queue, self.bounce_on);
-                        }
-                        println!(
-                            "spall-interactive: diffuse bounce {}",
-                            if self.bounce_on { "ON" } else { "OFF" }
-                        );
+                        self.toggle_bounce();
                         return;
                     }
                     KeyCode::F4 if held && !event.repeat => {
@@ -1581,6 +1646,8 @@ impl ApplicationHandler for InteractiveApp {
                                 &self.session,
                                 self.fly_eye.is_some(),
                                 self.admin_request_pending,
+                                self.sky_visibility_on,
+                                self.bounce_on,
                             )
                         });
                         match renderer.finish_frame(
@@ -1602,6 +1669,12 @@ impl ApplicationHandler for InteractiveApp {
                 self.hud.record_frame(&timing);
                 if menu_actions.toggle_flight {
                     self.toggle_flight();
+                }
+                if menu_actions.toggle_sky_visibility {
+                    self.toggle_sky_visibility();
+                }
+                if menu_actions.toggle_bounce {
+                    self.toggle_bounce();
                 }
                 if menu_actions.recentre {
                     self.recentre_view();
@@ -2465,7 +2538,13 @@ pub(super) fn build_water_instances(frame: &spall_protocol::WaterKeyframe) -> Ve
     instances
 }
 
-fn admin_menu_view(session: &InteractiveSession, flying: bool, pending: bool) -> AdminMenuView {
+fn admin_menu_view(
+    session: &InteractiveSession,
+    flying: bool,
+    pending: bool,
+    sky_visibility_on: bool,
+    bounce_on: bool,
+) -> AdminMenuView {
     let admin_status = match (
         pending,
         session
@@ -2506,6 +2585,8 @@ fn admin_menu_view(session: &InteractiveSession, flying: bool, pending: bool) ->
         flying,
         admin_status,
         water,
+        sky_visibility_on,
+        bounce_on,
     }
 }
 
@@ -2541,6 +2622,10 @@ pub(super) struct AdminMenuView {
     pub admin_status: Option<String>,
     /// One-line summary of the replicated water, if any has arrived.
     pub water: Option<String>,
+    /// Visibility-aware skylight (`F5`) is on.
+    pub sky_visibility_on: bool,
+    /// Diffuse bounce (`F6`) is on.
+    pub bounce_on: bool,
 }
 
 /// Buttons clicked in the admin menu this frame.
@@ -2555,6 +2640,8 @@ pub(super) struct AdminMenuActions {
     pub set_water_spring_rate: Option<u8>,
     /// `Some(open)` when a dam gate open/close button was clicked this frame.
     pub set_dam_gate: Option<bool>,
+    pub toggle_sky_visibility: bool,
+    pub toggle_bounce: bool,
 }
 
 fn section(title: &'static str) {
@@ -2575,106 +2662,254 @@ fn admin_menu_panel(
     view: &AdminMenuView,
     actions: &mut AdminMenuActions,
     selected_environment: &mut Option<EnvironmentPreset>,
+    environment: &mut Environment,
+    debug_view: &mut DebugView,
 ) {
     yakui::colored_box_container(PANEL_BG.with_alpha(0.88), || {
         yakui::pad(yakui::widgets::Pad::all(14.0), || {
-            yakui::column(|| {
-                yakui::row(|| {
-                    yakui::text(22.0, "SPALL ADMIN");
-                    yakui::pad(yakui::widgets::Pad::balanced(12.0, 6.0), || {
-                        muted(13.0, "F10 to close");
-                    });
-                });
-
-                section("Movement");
-                muted(
-                    13.0,
-                    if view.flying {
-                        "Flying: spectator camera, no collision. Your player waits where you left it."
-                    } else {
-                        "Walking: server-authoritative character physics."
-                    },
-                );
-                yakui::row(|| {
-                    let label = if view.flying { "Land (walk)" } else { "Fly" };
-                    actions.toggle_flight |= yakui::button(label).clicked;
-                    yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
-                        actions.recentre |= yakui::button("Recentre view").clicked;
-                    });
-                });
-
-                section("World");
-                yakui::row(|| {
-                    actions.reset_world |= yakui::button("Reset world").clicked;
-                    yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
-                        actions.close |= yakui::button("Close menu").clicked;
-                    });
-                });
-                muted(
-                    12.0,
-                    "Reset rebuilds terrain, water, and bodies from the scene for every player.",
-                );
-                if let Some(status) = &view.admin_status {
-                    yakui::text(13.0, status.clone());
-                }
-                if let Some(water) = &view.water {
-                    muted(12.0, water.clone());
-                }
-
-                section("Water");
-                muted(
-                    12.0,
-                    "A scene with no gated spring or dam gate refuses these.",
-                );
-                yakui::row(|| {
-                    for (label, rate) in [
-                        ("Spring off", 0u8),
-                        ("Spring normal", 1),
-                        ("Spring fast", 2),
-                        ("Spring max", 3),
-                    ] {
-                        yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
-                            if yakui::button(label).clicked {
-                                actions.set_water_spring_rate = Some(rate);
-                            }
+            yakui::row(|| {
+                yakui::column(|| {
+                    yakui::row(|| {
+                        yakui::text(22.0, "SPALL ADMIN");
+                        yakui::pad(yakui::widgets::Pad::balanced(12.0, 6.0), || {
+                            muted(13.0, "F10 to close");
                         });
+                    });
+
+                    section("Movement");
+                    muted(
+                        13.0,
+                        if view.flying {
+                            "Flying: spectator camera, no collision. Your player waits where you left it."
+                        } else {
+                            "Walking: server-authoritative character physics."
+                        },
+                    );
+                    yakui::row(|| {
+                        let label = if view.flying { "Land (walk)" } else { "Fly" };
+                        actions.toggle_flight |= yakui::button(label).clicked;
+                        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                            actions.recentre |= yakui::button("Recentre view").clicked;
+                        });
+                    });
+
+                    section("World");
+                    yakui::row(|| {
+                        actions.reset_world |= yakui::button("Reset world").clicked;
+                        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                            actions.close |= yakui::button("Close menu").clicked;
+                        });
+                    });
+                    muted(
+                        12.0,
+                        "Reset rebuilds terrain, water, and bodies from the scene for every player.",
+                    );
+                    if let Some(status) = &view.admin_status {
+                        yakui::text(13.0, status.clone());
                     }
-                });
-                yakui::row(|| {
-                    if yakui::button("Open dam gate").clicked {
-                        actions.set_dam_gate = Some(true);
+                    if let Some(water) = &view.water {
+                        muted(12.0, water.clone());
                     }
-                    yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
-                        if yakui::button("Close dam gate").clicked {
-                            actions.set_dam_gate = Some(false);
+
+                    section("Water");
+                    muted(
+                        12.0,
+                        "A scene with no gated spring or dam gate refuses these.",
+                    );
+                    yakui::row(|| {
+                        for (label, rate) in [
+                            ("Spring off", 0u8),
+                            ("Spring normal", 1),
+                            ("Spring fast", 2),
+                            ("Spring max", 3),
+                        ] {
+                            yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
+                                if yakui::button(label).clicked {
+                                    actions.set_water_spring_rate = Some(rate);
+                                }
+                            });
                         }
                     });
-                });
-
-                section("Lighting");
-                yakui::row(|| {
-                    for preset in EnvironmentPreset::ALL {
-                        yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
-                            if yakui::button(preset.label()).clicked {
-                                *selected_environment = Some(preset);
+                    yakui::row(|| {
+                        if yakui::button("Open dam gate").clicked {
+                            actions.set_dam_gate = Some(true);
+                        }
+                        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                            if yakui::button("Close dam gate").clicked {
+                                actions.set_dam_gate = Some(false);
                             }
                         });
-                    }
-                });
-
-                section("Controls");
-                yakui::row(|| {
-                    yakui::column(|| {
-                        for (key, _) in KEYBINDS {
-                            yakui::text(13.0, *key);
-                        }
                     });
-                    yakui::pad(yakui::widgets::Pad::horizontal(14.0), || {
+
+                    section("Controls");
+                    yakui::row(|| {
                         yakui::column(|| {
-                            for (_, action) in KEYBINDS {
-                                muted(13.0, *action);
+                            for (key, _) in KEYBINDS {
+                                yakui::text(13.0, *key);
                             }
                         });
+                        yakui::pad(yakui::widgets::Pad::horizontal(14.0), || {
+                            yakui::column(|| {
+                                for (_, action) in KEYBINDS {
+                                    muted(13.0, *action);
+                                }
+                            });
+                        });
+                    });
+                });
+                yakui::pad(yakui::widgets::Pad::horizontal(18.0), || {
+                    yakui::column(|| {
+                        section("Lighting");
+                        muted(12.0, "Environment preset (resets sun and exposure)");
+                        yakui::row(|| {
+                            for preset in EnvironmentPreset::ALL {
+                                yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
+                                    if yakui::button(preset.label()).clicked {
+                                        *selected_environment = Some(preset);
+                                    }
+                                });
+                            }
+                        });
+                        yakui::row(|| {
+                            let on_off = |on: bool| if on { "ON" } else { "OFF" };
+                            if yakui::button(format!(
+                                "F5 Skylight visibility: {}",
+                                on_off(view.sky_visibility_on)
+                            ))
+                            .clicked
+                            {
+                                actions.toggle_sky_visibility = true;
+                            }
+                            yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                                // Bounce lives in the skylight cache: with F5 off
+                                // there is no cache, so F6 has nothing to show.
+                                let note = if view.sky_visibility_on {
+                                    ""
+                                } else {
+                                    " (needs F5)"
+                                };
+                                if yakui::button(format!(
+                                    "F6 Bounce: {}{note}",
+                                    on_off(view.bounce_on)
+                                ))
+                                .clicked
+                                {
+                                    actions.toggle_bounce = true;
+                                }
+                            });
+                        });
+                        muted(
+                            12.0,
+                            "F5 off = legacy flat ambient (no interior darkening, no bounce).",
+                        );
+                        muted(12.0, "Render view (F4 cycles)");
+                        for row in LIGHTING_VIEWS.chunks(5) {
+                            yakui::row(|| {
+                                for &view_kind in row {
+                                    let name = view_kind.stem();
+                                    // Say when a view cannot show anything in the
+                                    // current F5/F6 state instead of leaving it blank.
+                                    let needs = match view_kind {
+                                        DebugView::SkyVisibility if !view.sky_visibility_on => {
+                                            " (needs F5)"
+                                        }
+                                        DebugView::IndirectOnly
+                                            if !view.sky_visibility_on || !view.bounce_on =>
+                                        {
+                                            " (needs F5+F6)"
+                                        }
+                                        _ => "",
+                                    };
+                                    let label = if *debug_view == view_kind {
+                                        format!("[{name}]{needs}")
+                                    } else {
+                                        format!("{name}{needs}")
+                                    };
+                                    yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
+                                        if yakui::button(label).clicked {
+                                            *debug_view = view_kind;
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                        let elevation = (-environment.sun_dir.y)
+                            .clamp(-1.0, 1.0)
+                            .asin()
+                            .to_degrees();
+                        let azimuth = environment
+                            .sun_dir
+                            .z
+                            .atan2(environment.sun_dir.x)
+                            .to_degrees();
+                        let (mut d_elevation, mut d_azimuth) = (0.0_f32, 0.0_f32);
+                        let (mut d_exposure, mut d_sun, mut d_sky, mut d_size) =
+                            (1.0_f32, 1.0, 1.0, 1.0);
+                        yakui::row(|| {
+                            stepper_row(
+                                &format!("Sun elevation {elevation:.0} deg"),
+                                &mut d_elevation,
+                                -10.0,
+                                10.0,
+                            );
+                            yakui::pad(yakui::widgets::Pad::horizontal(16.0), || {
+                                stepper_row(
+                                    &format!("Sun azimuth {azimuth:.0} deg"),
+                                    &mut d_azimuth,
+                                    -15.0,
+                                    15.0,
+                                );
+                            });
+                        });
+                        yakui::row(|| {
+                            stepper_scale_row(
+                                &format!("Sun intensity {:.2}", environment.sun_intensity),
+                                &mut d_sun,
+                            );
+                            yakui::pad(yakui::widgets::Pad::horizontal(16.0), || {
+                                stepper_scale_row(
+                                    &format!("Exposure {:.2}", environment.exposure),
+                                    &mut d_exposure,
+                                );
+                            });
+                        });
+                        yakui::row(|| {
+                            stepper_scale_row(
+                                &format!(
+                                    "Sky {:.2} / ground {:.2}",
+                                    environment.sky[1], environment.ground[1]
+                                ),
+                                &mut d_sky,
+                            );
+                            yakui::pad(yakui::widgets::Pad::horizontal(16.0), || {
+                                stepper_scale_row(
+                                    &format!(
+                                        "Sun size {:.1} deg",
+                                        environment.sun_angular_diameter_deg
+                                    ),
+                                    &mut d_size,
+                                );
+                            });
+                        });
+                        if d_elevation != 0.0 || d_azimuth != 0.0 {
+                            let el = (elevation + d_elevation).clamp(-89.0, 89.0).to_radians();
+                            let az = (azimuth + d_azimuth).to_radians();
+                            environment.sun_dir =
+                                Vec3::new(el.cos() * az.cos(), -el.sin(), el.cos() * az.sin());
+                        }
+                        environment.sun_intensity =
+                            (environment.sun_intensity * d_sun).clamp(0.0, 40.0);
+                        environment.exposure =
+                            (environment.exposure * d_exposure).clamp(0.05, 20.0);
+                        environment.sun_angular_diameter_deg =
+                            (environment.sun_angular_diameter_deg * d_size).clamp(0.05, 20.0);
+                        for channel in environment
+                            .sky
+                            .iter_mut()
+                            .chain(environment.ground.iter_mut())
+                        {
+                            *channel *= d_sky;
+                        }
                     });
                 });
             });
@@ -2682,18 +2917,54 @@ fn admin_menu_panel(
     });
 }
 
+/// Every render view the Lighting panel offers, in `F4` order.
+const LIGHTING_VIEWS: [DebugView; 9] = [
+    DebugView::Shaded,
+    DebugView::IndirectOnly,
+    DebugView::SkyVisibility,
+    DebugView::ShadowVisibility,
+    DebugView::ShadowCascades,
+    DebugView::Albedo,
+    DebugView::Normals,
+    DebugView::Depth,
+    DebugView::Roughness,
+];
+
+/// A `-`/`+` button pair that adds `minus`/`plus` to `delta`, then a label.
+fn stepper_row(label: &str, delta: &mut f32, minus: f32, plus: f32) {
+    yakui::row(|| {
+        if yakui::button("-").clicked {
+            *delta += minus;
+        }
+        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+            if yakui::button("+").clicked {
+                *delta += plus;
+            }
+        });
+        yakui::text(13.0, label.to_owned());
+    });
+}
+
+/// A `-`/`+` button pair that scales `scale` (starting at 1) by 1/1.25 or
+/// 1.25, then a label.
+fn stepper_scale_row(label: &str, scale: &mut f32) {
+    yakui::row(|| {
+        if yakui::button("-").clicked {
+            *scale /= 1.25;
+        }
+        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+            if yakui::button("+").clicked {
+                *scale *= 1.25;
+            }
+        });
+        yakui::text(13.0, label.to_owned());
+    });
+}
+
 /// The next debug view in the `F4` cycle, wrapping back to shaded.
 fn next_debug_view(view: DebugView) -> DebugView {
-    match view {
-        DebugView::Shaded => DebugView::Albedo,
-        DebugView::Albedo => DebugView::Normals,
-        DebugView::Normals => DebugView::Depth,
-        DebugView::Depth => DebugView::ShadowCascades,
-        DebugView::ShadowCascades => DebugView::ShadowVisibility,
-        DebugView::ShadowVisibility => DebugView::SkyVisibility,
-        DebugView::SkyVisibility => DebugView::Roughness,
-        DebugView::Roughness | DebugView::IndirectOnly => DebugView::Shaded,
-    }
+    let at = LIGHTING_VIEWS.iter().position(|v| *v == view).unwrap_or(0);
+    LIGHTING_VIEWS[(at + 1) % LIGHTING_VIEWS.len()]
 }
 
 /// How far (metres) the player may move from where the lighting cache was
@@ -3411,7 +3682,13 @@ impl WorldRenderer {
                             yakui::text(12.0, status.to_owned());
                         });
                     } else if let Some((view, actions)) = admin_menu.as_mut() {
-                        admin_menu_panel(view, actions, &mut selected_environment);
+                        admin_menu_panel(
+                            view,
+                            actions,
+                            &mut selected_environment,
+                            &mut self.environment,
+                            &mut self.debug_view,
+                        );
                     } else {
                         yakui::colored_box_container(PANEL_BG.with_alpha(0.55), || {
                             yakui::pad(yakui::widgets::Pad::balanced(10.0, 6.0), || {
@@ -3608,15 +3885,15 @@ mod input_tests {
     fn the_debug_view_cycle_visits_every_window_view_and_wraps_to_shaded() {
         let mut view = DebugView::Shaded;
         let mut seen = vec![view];
-        for _ in 0..8 {
+        for _ in 0..9 {
             view = next_debug_view(view);
             seen.push(view);
         }
-        assert_eq!(seen.first(), seen.last(), "wraps after eight presses");
+        assert_eq!(seen.first(), seen.last(), "wraps after nine presses");
         seen.pop();
         seen.sort_by_key(|v| v.stem());
         seen.dedup();
-        assert_eq!(seen.len(), 8, "no view repeats within a cycle");
+        assert_eq!(seen.len(), 9, "no view repeats within a cycle");
     }
 
     #[test]
