@@ -1,8 +1,10 @@
 # ENG-105 increment 1: authoritative water
 
-Status: implementation evidence for the first ENG-105 increment only. Water
-replication, client rendering, persistence, body interaction, dormancy, and
-streaming are still open.
+Status: historical evidence for the first ENG-105 increment. PR #167 subsequently
+merged full-domain keyframes and client presentation. Persistence, body
+interaction, dormancy, and streaming remain open. The current audit and exact
+acceptance gaps are in [replication validation](ENG-105-replication-validation.md);
+the remaining-work paragraphs below describe the original increment's baseline.
 
 ## Server ownership and tick order
 

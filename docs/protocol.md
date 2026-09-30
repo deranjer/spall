@@ -65,6 +65,27 @@ Without world persistence, harvest remains ephemeral.
 
 Limits start at 64 KiB per control record, 1 MiB per bulk part, 64 MiB per assembled transfer, and 256 KiB maximum decompressed data per material-only brick record (actual material payload is 64 KiB). Validate counts before allocation and decompress with output bounds. A multi-volume transaction can span staged bulk parts; its visible commit marker is small. Larger regions are split into multiple dependency-complete transfers. Each connection has bounded staging memory and a timeout.
 
+## Water presentation (ENG-105, partial increment 2)
+
+`WaterSnapshot` uses wire schema 3, tag 15, on the ordered control stream.
+It describes one bounded domain with origin, fluid dimensions, voxels per fluid
+cell, server tick, frame sequence, and chunk index/count. The payload is zstd
+compressed fractions in X/Y/Z order, one byte per cell (`255` is full).
+At most 4,194,304 cells, 64 chunks, and 49,152 compressed bytes per chunk are
+accepted; every nonfinal chunk is full-sized. The compressed limit is 3 MiB,
+so poorly compressible frames may fail encoding even within the cell limit.
+The assembler validates before staging and bounds decoded output to the
+declared cell count plus one byte to detect overruns. Malformed chunks clear
+partial staging; corrupt or overlong decoded frames never publish. The next
+complete keyframe repairs incomplete reception.
+
+The server queues each new frame at most once per live client at a maximum
+15 Hz cadence, after the late-join barrier. Queued water retains only the newest
+frame; a frame already being written completes in order. Clients only present
+received fractions. Per-brick deltas, interest and a measured byte-rate budget
+remain required; fixed size/cadence caps do not establish that bandwidth gate.
+Water is not yet part of canonical checkpoints or durable recovery.
+
 ## Exact geometry, approximate motion
 
 Use a hybrid representation for topology changes:

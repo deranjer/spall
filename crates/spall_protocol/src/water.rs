@@ -19,8 +19,9 @@ pub const MAX_WATER_CELLS: usize = 4 * 1024 * 1024;
 /// Compressed bytes carried by one chunk; leaves headroom under
 /// [`limits::MAX_CONTROL_RECORD`] for the envelope and other fields.
 pub const MAX_WATER_CHUNK: usize = 48 * 1024;
-/// Chunks in one keyframe. `MAX_WATER_CHUNKS * MAX_WATER_CHUNK` is 3 MiB, far
-/// above any compressed frame a bounded domain produces.
+/// Chunks in one keyframe. The compressed staging limit is 3 MiB. A domain
+/// within the cell limit can still exceed this limit if poorly compressible;
+/// the encoder returns an explicit error in that case.
 pub const MAX_WATER_CHUNKS: usize = 64;
 /// Largest voxels-per-fluid-cell factor a keyframe may declare.
 pub const MAX_WATER_COARSEN: u8 = 8;
@@ -88,6 +89,9 @@ impl Record for WaterSnapshot {
             )
             .into());
         }
+        if self.chunk_index + 1 < self.chunk_count && self.payload.len() != MAX_WATER_CHUNK {
+            return Err(RecordError::Inconsistent("nonfinal water chunk is short"));
+        }
         Ok(())
     }
 }
@@ -95,6 +99,10 @@ impl Record for WaterSnapshot {
 /// Why a keyframe could not be built or assembled.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WaterCodecError {
+    #[error("water domain has an empty axis")]
+    EmptyDomain,
+    #[error("invalid water chunk: {0}")]
+    InvalidChunk(String),
     #[error("water frame has {cells} fractions but its dimensions describe {expected}")]
     LengthMismatch { cells: usize, expected: usize },
     #[error("water frame describes {0} cells, above the keyframe limit")]
@@ -120,6 +128,9 @@ pub fn encode_water_keyframe(
         .iter()
         .try_fold(1usize, |n, axis| n.checked_mul(*axis as usize))
         .ok_or(WaterCodecError::TooManyCells(usize::MAX))?;
+    if expected == 0 {
+        return Err(WaterCodecError::EmptyDomain);
+    }
     if expected > MAX_WATER_CELLS {
         return Err(WaterCodecError::TooManyCells(expected));
     }
@@ -169,15 +180,21 @@ pub struct WaterKeyframe {
 
 /// Reassembles keyframe chunks arriving in order on the control stream. A
 /// chunk from a different frame than the one in progress abandons it: the
-/// server sends whole frames back to back, so a switch only follows a reset.
+/// server sends whole frames back to back. Missing chunks or mismatched
+/// headers discard the partial frame; the next complete keyframe repairs it.
 #[derive(Debug, Default)]
 pub struct WaterAssembler {
     partial: Option<(WaterSnapshot, Vec<u8>)>,
 }
 
 impl WaterAssembler {
-    /// Feeds one validated chunk; returns the frame it completes, if any.
+    /// Validates a chunk before staging or allocating decoded storage; returns
+    /// the frame it completes, if any. Invalid input discards partial staging.
     pub fn push(&mut self, chunk: WaterSnapshot) -> Result<Option<WaterKeyframe>, WaterCodecError> {
+        if let Err(error) = chunk.validate() {
+            self.partial = None;
+            return Err(WaterCodecError::InvalidChunk(error.to_string()));
+        }
         let same_frame = self.partial.as_ref().is_some_and(|(head, bytes)| {
             head.frame_seq == chunk.frame_seq
                 && head.server_tick == chunk.server_tick
@@ -384,6 +401,94 @@ mod tests {
                 cells: 7,
                 expected: 8
             })
+        );
+    }
+
+    #[test]
+    fn assembler_rejects_unvalidated_headers_and_recovers() {
+        let valid =
+            encode_water_keyframe(Tick(1), 1, GlobalCell::new(0, 0, 0), [2, 2, 2], 1, &[0; 8])
+                .unwrap()
+                .remove(0);
+        let mut invalid = Vec::new();
+        let mut chunk = valid.clone();
+        chunk.dimensions = [u32::MAX; 3];
+        invalid.push(chunk);
+        let mut chunk = valid.clone();
+        chunk.chunk_index = u16::MAX;
+        invalid.push(chunk);
+        let mut chunk = valid.clone();
+        chunk.coarsen = 0;
+        invalid.push(chunk);
+        let mut chunk = valid.clone();
+        chunk.chunk_count = MAX_WATER_CHUNKS as u16 + 1;
+        invalid.push(chunk);
+        let mut chunk = valid.clone();
+        chunk.payload = vec![0; MAX_WATER_CHUNK + 1];
+        invalid.push(chunk);
+        let mut assembler = WaterAssembler::default();
+        for chunk in invalid {
+            assert!(assembler.push(chunk).is_err());
+            assert!(assembler.partial.is_none());
+            assert_eq!(
+                assembler.push(valid.clone()).unwrap().unwrap().fractions,
+                [0; 8]
+            );
+        }
+    }
+
+    #[test]
+    fn short_nonfinal_chunk_is_rejected_and_clears_staging() {
+        let chunks = encode_water_keyframe(
+            Tick(1),
+            1,
+            GlobalCell::new(0, 0, 0),
+            [128, 8, 128],
+            1,
+            &frame(131072, 7),
+        )
+        .unwrap();
+        let mut assembler = WaterAssembler::default();
+        assert!(assembler.push(chunks[0].clone()).unwrap().is_none());
+        let mut short = chunks[0].clone();
+        short.payload.pop();
+        assert!(short.validate().is_err());
+        assert!(assembler.push(short).is_err());
+        assert!(assembler.partial.is_none());
+        for chunk in chunks {
+            assembler.push(chunk).unwrap();
+        }
+        assert!(assembler.partial.is_none());
+    }
+
+    #[test]
+    fn decompression_overrun_and_corruption_do_not_publish_or_poison_repair() {
+        let valid =
+            encode_water_keyframe(Tick(1), 1, GlobalCell::new(0, 0, 0), [2, 2, 2], 1, &[0; 8])
+                .unwrap()
+                .remove(0);
+        let mut assembler = WaterAssembler::default();
+        let mut bomb = valid.clone();
+        bomb.payload = zstd::stream::encode_all(&vec![0; MAX_WATER_CELLS][..], 3).unwrap();
+        assert_eq!(
+            assembler.push(bomb),
+            Err(WaterCodecError::LengthMismatch {
+                cells: 9,
+                expected: 8,
+            })
+        );
+        let mut corrupt = valid.clone();
+        corrupt.payload = vec![0; 20];
+        assert!(assembler.push(corrupt).is_err());
+        assert!(assembler.partial.is_none());
+        assert_eq!(assembler.push(valid).unwrap().unwrap().fractions, [0; 8]);
+    }
+
+    #[test]
+    fn encoder_rejects_empty_domains() {
+        assert!(
+            encode_water_keyframe(Tick(1), 1, GlobalCell::new(0, 0, 0), [2, 0, 2], 1, &[],)
+                .is_err()
         );
     }
 }

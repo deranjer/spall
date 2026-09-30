@@ -1016,7 +1016,7 @@ The Salva particle backend was removed after selection. The grid scenarios now
 build their scene and bit-identical reference volume in
 `fixtures::ReservoirScene`. Production integration is tracked as ENG-105.
 
-### ENG-105 — Authoritative water integration (increment 1 in progress)
+### ENG-105 — Authoritative water integration (partial increments 1–2)
 
 `spall_sim` owns one explicitly bounded, fully resident `MacGridWorld` for a
 scene that supplies `WaterSetup`. Each fixed 60 Hz simulation tick first commits
@@ -1024,15 +1024,20 @@ terrain transactions, refreshes the fluid solid boundary, conservatively moves
 water out of newly occupied cells, and advances the fluid solver before Rapier.
 If the solver's stability preflight exceeds its bounded substep budget, water
 skips that fluid step and reports skipped ticks/time; the server tick rate and
-physics dt remain fixed. A placement that cannot conservatively displace water
-through connected open cells fails without mutating fluid state.
+physics dt remain fixed. A boundary refresh that cannot conservatively displace
+water through connected open cells fails without mutating fluid state. This
+does not satisfy the ticket's always-succeed placement decision. Optional worker
+execution also publishes asynchronously; revision validation and owner-thread
+application at tick boundaries remain open.
 
 The valley showcase's authored water is loaded as water fractions instead of
 collidable blue voxels, and its custom server world installs that setup. This
-increment does not add client snapshots/presentation, late-join repair, durable
-water checkpoints, multiple/streamed regions, or dynamic-body coupling. Those
-remain later ENG-105 increments; do not describe the server-side state as
-replicated or persisted. See [`docs/reports/ENG-105-increment-1.md`](reports/ENG-105-increment-1.md).
+merged implementation also sends quantized full-domain keyframes at up to 15 Hz
+and presents them on clients, including late join and scene reset. Per-brick
+deltas, bandwidth scheduling, durable water checkpoints, multiple/streamed
+regions, and dynamic-body coupling remain open. Do not describe water as
+persisted. See [`docs/reports/ENG-105-increment-1.md`](reports/ENG-105-increment-1.md)
+and [`docs/reports/ENG-105-replication-validation.md`](reports/ENG-105-replication-validation.md).
 
 Swimming, boats, rigid-body coupling, multiplayer water DTOs, persistence,
 streaming-scale behavior, and replaceable water appearance are later scoped

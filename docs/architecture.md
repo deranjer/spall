@@ -40,15 +40,21 @@ scene supplies `WaterSetup`. A committed terrain edit refreshes the fluid
 boundary with conservative displacement before the fixed 60 Hz water step;
 Rapier remains the sole rigid-body solver and water does not yet displace or
 push dynamic bodies. Stability-budget overflow skips that fluid step and is
-reported in water tick metrics without changing server dt. Network snapshots,
-late-join repair, and canonical persistence remain ENG-105 follow-up increments.
+reported in water tick metrics without changing server dt. Merged increment 2
+adds quantized full-domain keyframes and a presentation-only client replica.
+Optional worker execution applies boundaries off-thread and publishes frames
+asynchronously; revision validation and owner-thread publication at tick
+boundaries remain open. Per-brick deltas, bandwidth scheduling, and canonical
+persistence remain ENG-105 follow-up work. Displacement still fails when
+connected capacity is exhausted, contrary to the ticket's always-succeed
+placement decision; a conservative capacity policy is an acceptance gap.
 
 ENG-104 adds a local-only client presentation path to `spall_fluid` for the
 interactive feasibility playground. That explicit `sandbox-client --grid-fluid-demo`
 mode owns and advances its own grid fixture for visual experimentation; normal
 networked clients do not advance or claim authority over fluid state. Server
-water authority is separate from that local playground; client presentation,
-replication, and recovery remain future work.
+water authority is separate from that local playground; normal clients present
+received keyframes without fluid lockstep. Durable recovery remains future work.
 
 Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
 in-process `cargo xtask net-check` transport harness. Add `games/survival` only
