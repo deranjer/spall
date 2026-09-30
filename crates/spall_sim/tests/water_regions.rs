@@ -69,6 +69,11 @@ fn three_reservoir_regions_conserve_and_round_trip_independently() {
         let tick_started = Instant::now();
         let report = sim.tick().unwrap();
         assert_eq!(report.water_regions.len(), 2);
+        assert!(report.water.as_ref().unwrap().step.is_some());
+        assert!(
+            report.water_regions.iter().all(|m| m.step.is_some()),
+            "the sustained-cost fixture must keep all three pressure domains active"
+        );
         fluid_us += report.water.as_ref().unwrap().step_duration.as_micros()
             + report
                 .water_regions
