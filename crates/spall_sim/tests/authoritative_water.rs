@@ -192,3 +192,87 @@ fn authoritative_dam_breach_refreshes_boundary_then_flows_conservatively() {
         (sim.water().unwrap().grid().unwrap().water_volume_m3() - starting_volume).abs() < 1.0e-8
     );
 }
+
+#[test]
+fn real_placement_fills_a_full_sealed_pocket_and_reopening_releases_its_ledger() {
+    let source = GlobalCell::new(1, 1, 1);
+    let domain = spall_fluid::DomainSpec::new(GlobalCell::new(0, 0, 0), [3; 3], 27).unwrap();
+    let mut terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+    terrain
+        .insert_brick(
+            BrickCoord::new(0, 0, 0),
+            Brick::uniform(MaterialId::AIR, Revision(1)),
+        )
+        .unwrap();
+    let mut walls = EditPlan::new(terrain.id());
+    for z in 0..3 {
+        for y in 0..3 {
+            for x in 0..3 {
+                let cell = GlobalCell::new(x, y, z);
+                if cell != source {
+                    walls.set(cell, MaterialId(1));
+                }
+            }
+        }
+    }
+    terrain.apply_edit(&walls).unwrap();
+    let mut world = fixtures::flat_terrain_setup();
+    world.terrain = terrain;
+    world.terrain_collider_region = (domain.origin(), GlobalCell::new(2, 2, 2));
+    world.anchor = AnchorPlane::at(0);
+    let mut config = SimulationConfig::new(world);
+    let mut water = WaterSetup::new(domain, vec![(source, 1.0)]);
+    water.config.open_top = false;
+    config.water = Some(water);
+    let mut sim = Simulation::new(config).unwrap();
+    let initial = sim.water().unwrap().frame().volume_m3;
+    let brush = SphereBrush::new(
+        BrushPoint::from_units(
+            BRUSH_UNIT + BRUSH_UNIT / 2,
+            BRUSH_UNIT + BRUSH_UNIT / 2,
+            BRUSH_UNIT + BRUSH_UNIT / 2,
+        ),
+        BRUSH_UNIT / 4,
+    )
+    .unwrap();
+    for (id, kind) in [
+        (105, spall_sim::EditKind::Place(MaterialId(1))),
+        (106, spall_sim::EditKind::Cut),
+    ] {
+        sim.submit(EditIntent {
+            request_id: RequestId(id),
+            actor: EntityId::new(999).unwrap(),
+            target: EditTarget::Terrain,
+            kind,
+            brush,
+            explosion: None,
+        })
+        .unwrap();
+        let mut committed = false;
+        for _ in 0..30 {
+            let report = sim.tick().unwrap();
+            assert!((sim.water().unwrap().frame().volume_m3 - initial).abs() < 1e-12);
+            if report.committed.iter().any(|(r, _)| *r == RequestId(id)) {
+                committed = true;
+                break;
+            }
+        }
+        assert!(
+            committed,
+            "sealed-pocket edit must commit: {:?}",
+            sim.action_status(RequestId(id))
+        );
+        let grid = sim.water().unwrap().grid().unwrap();
+        if id == 105 {
+            assert_eq!(grid.trapped_volume_m3(), initial);
+            assert_eq!(grid.fraction_at(source), Some(0.0));
+            assert!(matches!(
+                sim.world().terrain().volume.sample(source).unwrap(),
+                Sample::Filled(_)
+            ));
+        } else {
+            assert_eq!(grid.trapped_volume_m3(), 0.0);
+            assert_eq!(grid.fraction_at(source), Some(1.0));
+        }
+    }
+}

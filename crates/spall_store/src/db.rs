@@ -263,6 +263,10 @@ impl Writer {
                     "INSERT INTO journal (seq, tick, payload, crc) VALUES (?, ?, ?, ?)",
                 )?;
                 for r in records {
+                    if let dto::JournalPayload::WaterState(states) = &r.payload {
+                        spall_protocol::water::validate_water_states(states)
+                            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                    }
                     let body = dto::encode(&r.payload)?;
                     let crc = crc16(&body);
                     stmt.execute(params![r.seq as i64, r.tick as i64, &body, &crc])?;
@@ -377,6 +381,14 @@ impl Writer {
         }
 
         let meta_blob = dto::encode(&checkpoint.meta)?;
+        spall_protocol::water::validate_water_states(&checkpoint.water)
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        let water_blob = dto::encode(&checkpoint.water)?;
+        if water_blob.len() > dto::MAX_STORED_WATER_BYTES {
+            return Err(StoreError::Corrupt(
+                "water checkpoint exceeds byte limit".into(),
+            ));
+        }
         let now_ms = unix_millis();
 
         self.maybe_arm_real_write_failure()?;
@@ -402,6 +414,19 @@ impl Writer {
                 ],
             )?;
             // A re-published tick starts clean.
+            tx.execute(
+                "DELETE FROM checkpoint_water WHERE tick = ?",
+                params![checkpoint.tick as i64],
+            )?;
+            tx.execute(
+                "INSERT INTO checkpoint_water (tick, state, crc) VALUES (?, ?, ?)",
+                params![
+                    checkpoint.tick as i64,
+                    &water_blob,
+                    crc16(&water_blob).as_slice()
+                ],
+            )?;
+            payload_bytes += water_blob.len() as u64;
             tx.execute(
                 "DELETE FROM checkpoint_bodies WHERE tick = ?",
                 params![checkpoint.tick as i64],

@@ -24,18 +24,17 @@ use spall_protocol::{
 /// without modification (`docs/protocol.md`: "Unknown newer schemas are
 /// rejected without modifying the database").
 ///
-/// **Deliberately kept at 1 for the T17-increment-2 `JournalPayload::TopologyBulkSplit`
-/// addition (ENG-64):** appending a `postcard` enum variant leaves every existing
-/// `Topology` / `PoseBatch` row fully decodable, this repo has no deployed older
-/// binary, and no migration harness exists — bumping would reject every existing
-/// world database on open with `SchemaTooOld`.
-pub const STORE_SCHEMA_VERSION: u32 = 1;
+/// Schema 2 adds atomic canonical water rows. Schema 1 is migrated into a new
+/// database with `cargo xtask migrate-water-save`; the source stays intact.
+pub const STORE_SCHEMA_VERSION: u32 = 2;
 
 /// Largest accepted stored brick payload, compressed. `docs/protocol.md` caps a
 /// material-only brick record at 256 KiB decompressed for 64 KiB of real
 /// payload; the compressed frame is always smaller, and this bounds a hostile
 /// or corrupt row before allocation.
 pub const MAX_STORED_BRICK_BYTES: usize = 256 * 1024;
+/// Exact bits, bounded source lists and at most four million cells in a group.
+pub const MAX_STORED_WATER_BYTES: usize = 128 * 1024 * 1024;
 
 /// Errors converting between save records and their encoded forms.
 #[derive(Debug, thiserror::Error)]
@@ -152,6 +151,8 @@ pub struct StoredBrick {
 /// DB transaction is the checkpoint-publication contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Checkpoint {
+    /// Independently versioned water state in an auxiliary checkpoint row.
+    pub water: Vec<spall_protocol::WaterState>,
     pub tick: u64,
     /// Highest journal sequence this checkpoint already includes. Recovery
     /// replays the durable journal suffix strictly after this.
@@ -215,6 +216,8 @@ pub enum JournalPayload {
         /// `BaselineWorld::encode_compressed()` bytes (zstd).
         baseline: Vec<u8>,
     },
+    /// Exact canonical water state after the topology records at this tick.
+    WaterState(Vec<spall_protocol::WaterState>),
 }
 
 impl JournalPayload {
@@ -392,8 +395,8 @@ mod tests {
     #[test]
     fn appending_the_bulk_split_variant_keeps_old_rows_decodable() {
         // A `Topology` row encoded before the new variant existed still round
-        // trips (postcard variant-append is one-way compatible; keep
-        // STORE_SCHEMA_VERSION at 1).
+        // trips. Compare against the historical variant-zero layout; save
+        // schema 2 changes checkpoint publication, not these journal bytes.
         let payload = JournalPayload::Topology {
             transaction: encode_control(&a_tx()).unwrap(),
             participants: vec![],
@@ -401,7 +404,18 @@ mod tests {
         let bytes = encode(&payload).unwrap();
         let back: JournalPayload = decode(&bytes).unwrap();
         assert_eq!(back, payload);
-        assert_eq!(STORE_SCHEMA_VERSION, 1);
+        #[derive(Serialize)]
+        enum LegacyJournal {
+            Topology {
+                transaction: Vec<u8>,
+                participants: Vec<StoredBody>,
+            },
+        }
+        let old = LegacyJournal::Topology {
+            transaction: encode_control(&a_tx()).unwrap(),
+            participants: vec![],
+        };
+        assert_eq!(encode(&old).unwrap(), bytes);
     }
 
     #[test]
@@ -426,6 +440,7 @@ mod tests {
                 topology_hash_version: 1,
             },
             bodies: vec![],
+            water: Vec::new(),
             bricks: vec![StoredBrick {
                 volume_id: 1,
                 coord: [-1, 0, 2],

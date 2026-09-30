@@ -364,6 +364,8 @@ pub struct ClientSummary {
     pub repairs_applied: u64,
     /// ENG-105: complete water keyframes received and decoded.
     pub water_keyframes_received: u64,
+    pub water_delta_frames_received: u64,
+    pub water_regions_received: u64,
     /// Newest decoded water frame sequence (`0` if none arrived).
     pub water_frame_seq: u64,
     /// Water keyframes that failed to assemble or decode.
@@ -559,6 +561,8 @@ struct Counters {
     /// (T17 increment 2).
     bulk_splits: AtomicU64,
     water_keyframes: AtomicU64,
+    water_delta_frames: AtomicU64,
+    water_regions: AtomicU64,
     water_frame_seq: AtomicU64,
     water_errors: AtomicU64,
     world_resets: AtomicU64,
@@ -727,6 +731,41 @@ pub struct MovementTrace {
     pub body_jumps: Vec<BodyJumpRow>,
 }
 
+/// An immutable clone of the replica's terrain, tagged with the replica's
+/// resident-terrain generation it was cloned at.
+#[derive(Clone)]
+struct CachedTerrainSnapshot {
+    generation: u64,
+    volume: Arc<spall_voxel::Volume>,
+}
+
+/// The current immutable terrain snapshot, cloning the replica volume only
+/// when its resident-terrain generation changed. Shared by the mover and the
+/// motion reader so a 60 Hz prediction tick or a remote motion packet does no
+/// whole-volume work (a hash walk or a clone of every resident brick, under
+/// the replica lock that also gates network ingest) -- on a large scene that
+/// cost starves the mover loop and, with it, input delivery.
+///
+/// This was `d1600d5`'s fix; the `3379a57` merge took the other side's
+/// `net.rs` and silently dropped it.
+fn cached_terrain_snapshot(
+    replica: &Mutex<ReplicaWorld>,
+    cache: &Mutex<Option<CachedTerrainSnapshot>>,
+) -> Option<CachedTerrainSnapshot> {
+    let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+    let generation = guard.terrain_generation();
+    let mut cached = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = cached.as_ref().filter(|c| c.generation == generation) {
+        return Some(hit.clone());
+    }
+    let fresh = CachedTerrainSnapshot {
+        generation,
+        volume: Arc::new(guard.terrain_volume()?.clone()),
+    };
+    *cached = Some(fresh.clone());
+    Some(fresh)
+}
+
 /// T19 predicted-player state shared by the mover and motion tasks. The mover
 /// owns terrain rebuilds and prediction ticks; the motion task only reconciles.
 struct Predictor {
@@ -734,7 +773,7 @@ struct Predictor {
     params: CharacterParams,
     phys: ClientPhysics,
     player: Option<PredictedPlayer>,
-    terrain_hash: Option<Hash32>,
+    terrain_generation: Option<u64>,
     input_seq: u64,
     recent: std::collections::VecDeque<RecentInput>,
     /// The server tick observed on the *first* authoritative snapshot for this
@@ -775,7 +814,7 @@ impl Predictor {
             params: CharacterParams::DEFAULT,
             phys,
             player: None,
-            terrain_hash: None,
+            terrain_generation: None,
             input_seq: 0,
             recent: std::collections::VecDeque::new(),
             script_origin_tick: None,
@@ -1146,6 +1185,8 @@ async fn run_async(
             Arc::new(Mutex::new(predictor))
         });
 
+    let terrain_cache: Arc<Mutex<Option<CachedTerrainSnapshot>>> = Arc::new(Mutex::new(None));
+
     // Bounded resend of `ActionRequest`s the server throttled (its per-tick
     // admission quota was exceeded — an explicitly retryable rejection). The
     // scripter records each request it sends; the control reader forwards
@@ -1164,27 +1205,63 @@ async fn run_async(
         let interactive = config.interactive.clone();
         let admin_statuses = admin_statuses.clone();
         tokio::spawn(async move {
-            let mut water = spall_protocol::WaterAssembler::default();
+            let mut water =
+                HashMap::<spall_core::GlobalCell, spall_protocol::WaterAssembler>::new();
+            let mut water_deltas =
+                HashMap::<spall_core::GlobalCell, spall_protocol::WaterDeltaAssembler>::new();
             loop {
                 match conn.recv_record().await {
-                    Ok(Some(WireRecord::WaterSnapshot(chunk))) => match water.push(chunk) {
+                    Ok(Some(WireRecord::WaterSnapshot(chunk))) => {
+                        match if water.len() >= 8 && !water.contains_key(&chunk.origin) {
+                            Err(spall_protocol::WaterCodecError::InvalidChunk(
+                                "water region limit".into(),
+                            ))
+                        } else {
+                            water.entry(chunk.origin).or_default().push(chunk)
+                        } {
+                            Ok(Some(frame)) => {
+                                water_deltas
+                                    .entry(frame.origin)
+                                    .or_default()
+                                    .install(frame.clone());
+                                counters
+                                    .water_regions
+                                    .store(water_deltas.len() as u64, Ordering::Relaxed);
+                                counters.water_keyframes.fetch_add(1, Ordering::Relaxed);
+                                counters
+                                    .water_frame_seq
+                                    .store(frame.frame_seq, Ordering::Relaxed);
+                                if let Some(session) = &interactive {
+                                    session.publish_water(frame);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                // Presentation only: the next keyframe repairs it,
+                                // but a malformed frame from our own server is a
+                                // bug, so say so.
+                                counters.water_errors.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("spall-client: dropped a water keyframe: {error}");
+                            }
+                        }
+                    }
+                    Ok(Some(WireRecord::WaterDelta(delta))) => match water_deltas
+                        .get_mut(&delta.origin)
+                        .map_or(Ok(None), |a| a.push(delta))
+                    {
                         Ok(Some(frame)) => {
-                            counters.water_keyframes.fetch_add(1, Ordering::Relaxed);
+                            counters.water_delta_frames.fetch_add(1, Ordering::Relaxed);
                             counters
                                 .water_frame_seq
                                 .store(frame.frame_seq, Ordering::Relaxed);
                             if let Some(session) = &interactive {
-                                *session.water.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(Arc::new(frame));
+                                session.publish_water(frame);
                             }
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            // Presentation only: the next keyframe repairs it,
-                            // but a malformed frame from our own server is a
-                            // bug, so say so.
                             counters.water_errors.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("spall-client: dropped a water keyframe: {error}");
+                            eprintln!("spall-client: rejected water delta: {error}");
                         }
                     },
                     Ok(Some(WireRecord::AdminStatus(status))) => {
@@ -1227,8 +1304,11 @@ async fn run_async(
                         };
                         match installed {
                             Ok(()) => {
+                                water.clear();
+                                water_deltas.clear();
                                 counters.world_resets.fetch_add(1, Ordering::Relaxed);
                                 if let Some(session) = &interactive {
+                                    session.clear_water();
                                     session.world_resets.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
@@ -1421,6 +1501,7 @@ async fn run_async(
         let replica = replica.clone();
         let counters = counters.clone();
         let predictor = predictor.clone();
+        let terrain_cache = terrain_cache.clone();
         let interactive = config.interactive.clone();
         let client_authoritative = config.client_authoritative;
         tokio::spawn(async move {
@@ -1437,10 +1518,8 @@ async fn run_async(
                             // matching the mover loop's lock ordering
                             // (`replica` then `pred`) to avoid a cross-task
                             // deadlock risk.
-                            let terrain_volume = {
-                                let guard = replica.lock().unwrap_or_else(|e| e.into_inner());
-                                guard.terrain_volume().cloned()
-                            };
+                            let terrain_volume = cached_terrain_snapshot(&replica, &terrain_cache)
+                                .map(|terrain| terrain.volume);
                             let mut guard = pred.lock().unwrap_or_else(|e| e.into_inner());
                             let p: &mut Predictor = &mut guard;
                             if snap.body == p.entity {
@@ -1658,6 +1737,7 @@ async fn run_async(
     let mover = predictor.clone().map(|pred| {
         let conn = conn.clone();
         let replica = replica.clone();
+        let terrain_cache = terrain_cache.clone();
         let counters = counters.clone();
         let script = config.movement_script.clone();
         let session = conn.session();
@@ -1721,7 +1801,9 @@ async fn run_async(
                 // borrowable both for the dirty-check block below *and* for
                 // every `pl.tick` call afterward, which now also needs a
                 // fresh `&Volume` each tick for its own window cache.
-                let (terrain_hash, terrain_volume, body_collisions, traced_samplers) = {
+                let terrain = cached_terrain_snapshot(&replica, &terrain_cache);
+                let terrain_volume = terrain.as_ref().map(|t| t.volume.clone());
+                let (body_collisions, traced_samplers) = {
                     let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
                     // Scripted runs only: what the renderer would draw, for the
                     // trace (see `BodyTick`).
@@ -1765,12 +1847,7 @@ async fn run_async(
                         body_collision_versions.insert(raw_entity, topology_version);
                     }
                     body_collision_versions.retain(|entity, _| live.contains(entity));
-                    (
-                        guard.terrain_resident_hash(),
-                        guard.terrain_volume().cloned(),
-                        bodies,
-                        traced_samplers,
-                    )
+                    (bodies, traced_samplers)
                 };
                 // All predictor-lock work happens in this non-async block, which
                 // returns the datagram to send (and the predicted feet position
@@ -1831,14 +1908,14 @@ async fn run_async(
                             ..b.clone()
                         })
                         .collect();
-                    if let (Some(hash), Some(volume)) = (terrain_hash, &terrain_volume)
-                        && p.terrain_hash != Some(hash)
+                    if let Some(terrain) = &terrain
+                        && p.terrain_generation != Some(terrain.generation)
                     {
-                        p.phys.set_terrain(volume);
-                        let first = p.terrain_hash.is_none();
-                        p.terrain_hash = Some(hash);
+                        p.phys.set_terrain(&terrain.volume);
+                        let first = p.terrain_generation.is_none();
+                        p.terrain_generation = Some(terrain.generation);
                         if client_authoritative {
-                            p.local_terrain = Some(volume.clone());
+                            p.local_terrain = Some((*terrain.volume).clone());
                         }
                         if !client_authoritative
                             && !first
@@ -2348,6 +2425,8 @@ async fn run_async(
         baseline_bricks,
         repairs_applied: counters.patches.load(Ordering::Relaxed),
         water_keyframes_received: counters.water_keyframes.load(Ordering::Relaxed),
+        water_delta_frames_received: counters.water_delta_frames.load(Ordering::Relaxed),
+        water_regions_received: counters.water_regions.load(Ordering::Relaxed),
         water_frame_seq: counters.water_frame_seq.load(Ordering::Relaxed),
         water_keyframe_errors: counters.water_errors.load(Ordering::Relaxed),
         world_resets_installed: counters.world_resets.load(Ordering::Relaxed),

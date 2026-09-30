@@ -164,6 +164,8 @@ pub struct MacGridWorld {
     config: MacConfig,
     solid: Vec<bool>,
     fraction: Vec<f64>,
+    /// Cell-volume units retained at placement sites with no connected capacity.
+    trapped: Vec<f64>,
     pressure_pa: Vec<f64>,
     previous_liquid: Vec<bool>,
     previous_pressure_diagonal: Option<Vec<f64>>,
@@ -225,6 +227,7 @@ impl MacGridWorld {
             config,
             solid,
             fraction: vec![0.0; cell_count],
+            trapped: vec![0.0; cell_count],
             pressure_pa: vec![0.0; cell_count],
             previous_liquid: vec![false; cell_count],
             previous_pressure_diagonal: None,
@@ -391,6 +394,63 @@ impl MacGridWorld {
         &self.fraction
     }
 
+    pub fn trapped_fractions(&self) -> &[f64] {
+        &self.trapped
+    }
+
+    pub fn restore_fractions(&mut self, values: &[f64]) -> Result<(), MacError> {
+        if values.len() != self.fraction.len()
+            || values.iter().enumerate().any(|(i, v)| {
+                !v.is_finite() || !(-1e-9..=1.0 + 1e-9).contains(v) || (self.solid[i] && *v != 0.0)
+            })
+        {
+            return Err(MacError::InvalidWaterFraction);
+        }
+        self.fraction.copy_from_slice(values);
+        Ok(())
+    }
+
+    /// Recover a durable amount snapshot against newer committed geometry.
+    /// Any overlap is conservatively displaced/retained before publication.
+    pub fn restore_displacing(
+        &mut self,
+        values: &[f64],
+        boundary: &SolidBoundary,
+    ) -> Result<(), MacError> {
+        if values.len() != self.fraction.len()
+            || values
+                .iter()
+                .any(|v| !v.is_finite() || !(-1e-9..=1.0 + 1e-9).contains(v))
+        {
+            return Err(MacError::InvalidWaterFraction);
+        }
+        let mut candidate = self.clone();
+        candidate.fraction.copy_from_slice(values);
+        candidate.refresh_boundary_retaining(boundary)?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub fn trapped_volume_m3(&self) -> f64 {
+        self.trapped.iter().sum::<f64>() * self.cell_volume()
+    }
+
+    pub fn restore_trapped(&mut self, values: &[f64]) -> Result<(), MacError> {
+        if values.len() != self.trapped.len() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err(MacError::InvalidWaterFraction);
+        }
+        self.trapped.copy_from_slice(values);
+        Ok(())
+    }
+
+    pub fn restore_outflow(&mut self, value: f64) -> Result<(), MacError> {
+        if !value.is_finite() || value < 0.0 {
+            return Err(MacError::InvalidWaterFraction);
+        }
+        self.cumulative_open_outflow_m3 = value;
+        Ok(())
+    }
+
     pub fn set_fraction(&mut self, cell: GlobalCell, fraction: f64) -> Result<(), MacError> {
         if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
             return Err(MacError::InvalidWaterFraction);
@@ -406,7 +466,7 @@ impl MacGridWorld {
     }
 
     pub fn water_volume_m3(&self) -> f64 {
-        self.fraction.iter().sum::<f64>() * self.cell_volume()
+        self.fraction.iter().sum::<f64>() * self.cell_volume() + self.trapped_volume_m3()
     }
 
     pub fn water_mass_kg(&self) -> f64 {
@@ -423,7 +483,8 @@ impl MacGridWorld {
 
     pub fn allocated_bytes(&self) -> usize {
         (self.solid.capacity() + self.previous_liquid.capacity()) * size_of::<bool>()
-            + (self.fraction.capacity() + self.pressure_pa.capacity()) * size_of::<f64>()
+            + (self.fraction.capacity() + self.trapped.capacity() + self.pressure_pa.capacity())
+                * size_of::<f64>()
             + (self.u.capacity() + self.v.capacity() + self.w.capacity()) * size_of::<f64>()
             + self
                 .previous_pressure_diagonal
@@ -799,12 +860,31 @@ impl MacGridWorld {
         &mut self,
         boundary: &SolidBoundary,
     ) -> Result<f64, MacError> {
+        self.refresh_boundary_policy(boundary, false)
+    }
+
+    /// Production placement policy: retain any unplaceable volume at its source
+    /// in an explicit ledger. Reopening connected capacity releases that volume.
+    /// The ledger never participates in flow or crosses intervening solid cells.
+    pub fn refresh_boundary_retaining(
+        &mut self,
+        boundary: &SolidBoundary,
+    ) -> Result<f64, MacError> {
+        self.refresh_boundary_policy(boundary, true)
+    }
+
+    fn refresh_boundary_policy(
+        &mut self,
+        boundary: &SolidBoundary,
+        retain: bool,
+    ) -> Result<f64, MacError> {
         if boundary.spec() != self.spec {
             return Err(MacError::BoundaryMismatch);
         }
         let mut candidate_solid = Vec::with_capacity(self.solid.len());
         let mut candidate_fraction = self.fraction.clone();
         let mut displaced = Vec::new();
+        let mut candidate_trapped = self.trapped.clone();
         // `index` addresses three different parallel arrays here (and feeds
         // `cell_at`), not just `candidate_fraction`, so `enumerate()` over one
         // of them would not actually simplify this.
@@ -816,6 +896,10 @@ impl MacGridWorld {
             if is_solid && candidate_fraction[index] > 0.0 {
                 displaced.push((index, candidate_fraction[index]));
                 candidate_fraction[index] = 0.0;
+            }
+            if candidate_trapped[index] > 0.0 {
+                displaced.push((index, candidate_trapped[index]));
+                candidate_trapped[index] = 0.0;
             }
         }
 
@@ -847,6 +931,9 @@ impl MacGridWorld {
             visited.fill(false);
             queue.clear();
             visited[source] = true;
+            if !candidate_solid[source] {
+                queue.push_back(source);
+            }
             for neighbor in neighbor_cells(self.spec.cell_at(source))
                 .into_iter()
                 .flatten()
@@ -866,7 +953,7 @@ impl MacGridWorld {
                     candidate_fraction[index] += transfer;
                     remaining -= transfer;
                 }
-                if remaining <= f64::EPSILON {
+                if remaining == 0.0 {
                     break;
                 }
                 for neighbor in neighbor_cells(self.spec.cell_at(index))
@@ -882,7 +969,9 @@ impl MacGridWorld {
                     }
                 }
             }
-            if remaining > 1.0e-12 {
+            if remaining > 0.0 && retain {
+                candidate_trapped[source] += remaining;
+            } else if remaining > 0.0 {
                 return Err(MacError::WaterDisplacementCapacityExceeded {
                     cell: self.spec.cell_at(source),
                 });
@@ -892,6 +981,7 @@ impl MacGridWorld {
         let moved_fraction: f64 = displaced.iter().map(|(_, fraction)| fraction).sum();
         self.solid = candidate_solid;
         self.fraction = candidate_fraction;
+        self.trapped = candidate_trapped;
         self.pressure_pa.fill(0.0);
         self.previous_liquid.fill(false);
         if let Some(diagonal) = &mut self.previous_pressure_diagonal {
@@ -4900,6 +4990,50 @@ mod tests {
         ));
         assert_eq!(grid.fraction, before_fraction);
         assert_eq!(grid.solid, before_solid);
+    }
+
+    #[test]
+    fn boundary_retains_sealed_water_and_releases_only_connected_capacity() {
+        let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [4, 3, 3], 128).unwrap();
+        let mut volume = Volume::new(VolumeId::new(905).unwrap(), CellSizeCode::Quarter);
+        volume
+            .insert_brick(
+                BrickCoord::new(0, 0, 0),
+                Brick::uniform(MaterialId(1), Revision(1)),
+            )
+            .unwrap();
+        let source = GlobalCell::new(1, 1, 1);
+        let other = GlobalCell::new(3, 1, 1);
+        let mut edit = spall_voxel::EditPlan::new(volume.id());
+        edit.set(source, MaterialId::AIR);
+        edit.set(other, MaterialId::AIR);
+        volume.apply_edit(&edit).unwrap();
+        let mut grid = MacGridWorld::new(
+            &SolidBoundary::capture(&volume, spec).unwrap(),
+            quiet_config(false),
+        )
+        .unwrap();
+        grid.set_fraction(source, 0.75).unwrap();
+        let initial = grid.water_volume_m3();
+        edit.set(source, MaterialId(1));
+        volume.apply_edit(&edit).unwrap();
+        grid.refresh_boundary_retaining(&SolidBoundary::capture(&volume, spec).unwrap())
+            .unwrap();
+        assert_eq!(grid.water_volume_m3(), initial);
+        assert_eq!(grid.trapped_volume_m3(), initial);
+        assert_eq!(grid.fraction_at(other), Some(0.0));
+        for _ in 0..4 {
+            grid.step(1.0 / 60.0).unwrap();
+        }
+        assert_eq!(grid.water_volume_m3(), initial);
+        edit.set(source, MaterialId::AIR);
+        volume.apply_edit(&edit).unwrap();
+        grid.refresh_boundary_retaining(&SolidBoundary::capture(&volume, spec).unwrap())
+            .unwrap();
+        assert_eq!(grid.water_volume_m3(), initial);
+        assert_eq!(grid.trapped_volume_m3(), 0.0);
+        assert_eq!(grid.fraction_at(source), Some(0.75));
+        assert_eq!(grid.fraction_at(other), Some(0.0));
     }
 
     #[test]

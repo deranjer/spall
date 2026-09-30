@@ -1280,20 +1280,32 @@ impl ApplicationHandler for InteractiveApp {
                 let uploading_terrain = terrain.is_some();
                 // ENG-105: rebuild water columns only when a new keyframe
                 // (or a different domain after a reset) has arrived.
-                let water_frame = self
+                let water_generation = self
                     .session
-                    .water
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                let water_update = match &water_frame {
-                    Some(frame)
-                        if self.water_key != Some((frame.frame_seq, frame.server_tick.0)) =>
-                    {
-                        self.water_key = Some((frame.frame_seq, frame.server_tick.0));
-                        Some(build_water_instances(frame))
-                    }
-                    _ => None,
+                    .water_publications
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let water_key = (
+                    water_generation,
+                    self.session
+                        .world_resets
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                let water_update = if self.water_key != Some(water_key) {
+                    self.water_key = Some(water_key);
+                    let frames = self
+                        .session
+                        .water_regions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    Some(
+                        frames
+                            .iter()
+                            .flat_map(|frame| build_water_instances(frame))
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
                 };
                 let mut menu_actions = AdminMenuActions::default();
                 let Some(renderer) = &mut self.renderer else {

@@ -69,6 +69,7 @@ pub struct TickReport {
     /// region. The fluid step runs after committed terrain edits and before
     /// the Rapier step.
     pub water: Option<crate::water::WaterTickMetrics>,
+    pub water_regions: Vec<crate::water::WaterTickMetrics>,
     /// Requests that committed this tick, with their transaction summary.
     pub committed: Vec<(RequestId, Committed)>,
     /// Requests whose commit lost a conflict and were re-queued for recompute.

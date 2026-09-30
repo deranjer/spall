@@ -9,27 +9,22 @@
 //! [`SolidBoundary::coarsened`]. Scenes pick this to keep a whole valley's
 //! water inside the solver budget.
 //!
-//! [`WaterExecution::Worker`] moves the solver onto its own thread. The
-//! simulation tick then only forwards elapsed time and committed boundaries;
-//! the worker steps at its own fixed rate and publishes the newest
-//! [`WaterFrame`]. When the solver cannot keep up, the worker drops the excess
-//! simulated time (reported as skipped) rather than stalling the server tick,
-//! so water runs slower than real time instead of delaying players.
+//! Worker execution solves an immutable clone with a fixed fluid dt. The owner
+//! validates its boundary revision and source rate before installing a result
+//! at a tick boundary. Busy or stale work drops explicitly accounted fluid time;
+//! the server tick keeps its fixed dt.
 
 use spall_core::GlobalCell;
 use spall_fluid::grid_mac::{MacConfig, MacGridWorld, MacStepMetrics, PressurePreconditioner};
 use spall_fluid::{DomainSpec, SolidBoundary, grid_mac::MacError};
 use spall_voxel::Volume;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Voxel edge length the fluid domain is declared in.
 const VOXEL_CELL_M: f64 = 0.25;
-/// Accumulated simulated time the worker will run behind before it discards
-/// the excess instead of trying to catch up.
-const MAX_WORKER_BACKLOG_STEPS: f64 = 3.0;
 
 /// Where the fluid solver runs.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -131,6 +126,9 @@ pub struct WaterFrame {
     /// Total volume that left through the open top of the domain.
     pub open_outflow_m3: f64,
     pub fractions: Vec<u8>,
+    /// Exact owner state for checkpoints; never used as a presentation DTO.
+    pub exact_fractions: Vec<f64>,
+    pub trapped: Vec<f64>,
 }
 
 impl WaterFrame {
@@ -158,6 +156,8 @@ impl WaterFrame {
                 .iter()
                 .map(|f| (f.clamp(0.0, 1.0) * 255.0).round() as u8)
                 .collect(),
+            exact_fractions: grid.fractions().to_vec(),
+            trapped: grid.trapped_fractions().to_vec(),
         }
     }
 }
@@ -165,6 +165,11 @@ impl WaterFrame {
 /// Water timing and accounting from one authoritative server tick.
 #[derive(Debug, Clone, Default)]
 pub struct WaterTickMetrics {
+    pub sleeping: bool,
+    pub waiting_for_residency: bool,
+    pub trapped_volume_m3: f64,
+    pub volume_m3: f64,
+    pub open_outflow_m3: f64,
     /// Time spent on the simulation thread capturing a committed boundary.
     pub boundary_refresh: Duration,
     /// Volume moved out of newly solid cells. Inline mode reports this tick's
@@ -178,8 +183,8 @@ pub struct WaterTickMetrics {
     /// preflight rejected a step or because a worker fell behind. The server
     /// tick and dt are unchanged.
     pub skipped_ticks: u64,
-    /// Simulated fluid time dropped by this tick's skips (inline) or so far
-    /// (worker). Observability only.
+    /// Cumulative simulated fluid time dropped, including residency pauses.
+    /// Observability only.
     pub skipped_duration: Duration,
     /// Newest published frame sequence.
     pub frame_seq: u64,
@@ -292,6 +297,7 @@ pub struct WaterSeedReport {
 
 /// Authoritative water owned by `Simulation`, never by a client or ECS entity.
 pub struct AuthoritativeWater {
+    setup: WaterSetup,
     domain: DomainSpec,
     coarsen: u32,
     seed: WaterSeedReport,
@@ -300,6 +306,11 @@ pub struct AuthoritativeWater {
     /// thread): which `WaterSetup::gated_sources` footprint, if any, is
     /// currently refilled.
     gated_rate: Arc<AtomicU8>,
+    sleeping: bool,
+    quiet_steps: u32,
+    boundary_pending: bool,
+    residency_skips: u64,
+    residency_skipped_s: f64,
 }
 
 enum Engine {
@@ -307,6 +318,7 @@ enum Engine {
         grid: Box<MacGridWorld>,
         frame: Arc<WaterFrame>,
         skipped_ticks: u64,
+        skipped_s: f64,
         exchange: Exchange,
     },
     Worker(WaterWorker),
@@ -314,7 +326,44 @@ enum Engine {
 
 impl AuthoritativeWater {
     pub fn new(terrain: &Volume, setup: WaterSetup) -> Result<Self, WaterError> {
-        let coarsen = setup.coarsen.max(1);
+        let coarsen = setup.coarsen;
+        let dims = setup.domain.dimensions();
+        let cells = dims
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul((*d / coarsen.max(1)) as usize));
+        let voxels = dims
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul(*d as usize));
+        if !(1..=8).contains(&coarsen)
+            || dims.iter().any(|d| *d % coarsen != 0)
+            || cells.is_none_or(|n| n > spall_protocol::water::MAX_WATER_CELLS)
+            || voxels.is_none_or(|n| n > 32 * 1024 * 1024)
+            || setup.config.cell_size_m != VOXEL_CELL_M * f64::from(coarsen)
+            || std::iter::once(&setup.sources)
+                .chain(setup.gated_sources.iter())
+                .chain(std::iter::once(&setup.sinks))
+                .any(|v| v.len() > spall_protocol::water::MAX_WATER_SOURCE_CELLS)
+        {
+            return Err(WaterError::Boundary(
+                "water setup exceeds canonical domain limits".into(),
+            ));
+        }
+
+        let origin = setup.domain.origin();
+        let lo = [origin.x, origin.y, origin.z];
+        if std::iter::once(&setup.sources)
+            .chain(setup.gated_sources.iter())
+            .chain(std::iter::once(&setup.sinks))
+            .flatten()
+            .any(|p| {
+                [p.x, p.y, p.z].iter().enumerate().any(|(i, v)| {
+                    i128::from(*v) < i128::from(lo[i])
+                        || i128::from(*v) >= i128::from(lo[i]) + i128::from(dims[i])
+                })
+            })
+        {
+            return Err(WaterError::Boundary("water source outside domain".into()));
+        }
         let boundary = capture_boundary(terrain, setup.domain, coarsen)?;
         let mut grid = MacGridWorld::new(&boundary, setup.config).map_err(WaterError::Solver)?;
         grid.set_pressure_preconditioner(PressurePreconditioner::Multigrid);
@@ -328,6 +377,7 @@ impl AuthoritativeWater {
                 grid: Box::new(grid),
                 frame,
                 skipped_ticks: 0,
+                skipped_s: 0.0,
                 exchange,
             },
             WaterExecution::Worker { step_dt_s } => {
@@ -345,7 +395,134 @@ impl AuthoritativeWater {
             seed,
             engine,
             gated_rate,
+            setup,
+            sleeping: false,
+            quiet_steps: 0,
+            boundary_pending: false,
+            residency_skips: 0,
+            residency_skipped_s: 0.0,
         })
+    }
+
+    pub fn canonical_state(&self) -> spall_protocol::WaterState {
+        let frame = self.frame();
+        let c = self.setup.config;
+        let coords = |cells: &[GlobalCell]| cells.iter().map(|p| [p.x, p.y, p.z]).collect();
+        spall_protocol::WaterState {
+            version: 1,
+            origin: [
+                self.domain.origin().x,
+                self.domain.origin().y,
+                self.domain.origin().z,
+            ],
+            voxel_dimensions: self.domain.dimensions(),
+            coarsen: self.coarsen,
+            config_bits: [
+                c.cell_size_m,
+                c.density_kg_m3,
+                c.gravity_m_s2[0],
+                c.gravity_m_s2[1],
+                c.gravity_m_s2[2],
+                c.cfl_limit,
+                c.pressure_relative_tolerance,
+                c.pressure_absolute_tolerance,
+            ]
+            .map(f64::to_bits),
+            max_substeps: c.max_substeps,
+            pressure_max_iterations: c.pressure_max_iterations,
+            open_top: c.open_top,
+            frame_seq: frame.seq,
+            fluid_time_bits: frame.fluid_time_s.to_bits(),
+            spring_added_bits: frame.spring_added_m3.to_bits(),
+            drain_removed_bits: frame.drain_removed_m3.to_bits(),
+            outflow_bits: frame.open_outflow_m3.to_bits(),
+            fractions: frame.exact_fractions.iter().map(|v| v.to_bits()).collect(),
+            trapped: frame.trapped.iter().map(|v| v.to_bits()).collect(),
+            sources: coords(&self.setup.sources),
+            gated_sources: self.setup.gated_sources.each_ref().map(|v| coords(v)),
+            sinks: coords(&self.setup.sinks),
+            gated_rate: self.gated_sources_rate(),
+        }
+    }
+
+    /// Restore exact amounts and accounting, deliberately resetting velocity,
+    /// pressure and numerical caches to rest. The owner installs this atomically.
+    pub fn restore(
+        terrain: &Volume,
+        state: &spall_protocol::WaterState,
+    ) -> Result<Self, WaterError> {
+        state
+            .validate()
+            .map_err(|e| WaterError::Boundary(e.to_string()))?;
+        let domain = DomainSpec::new(
+            GlobalCell::new(state.origin[0], state.origin[1], state.origin[2]),
+            state.voxel_dimensions,
+            spall_protocol::water::MAX_WATER_CELLS * 512,
+        )
+        .map_err(|e| WaterError::Boundary(e.to_string()))?;
+        let c = state.config_bits.map(f64::from_bits);
+        let mut setup = WaterSetup::new(domain, Vec::new()).with_coarsening(state.coarsen);
+        setup.config = MacConfig {
+            cell_size_m: c[0],
+            density_kg_m3: c[1],
+            gravity_m_s2: [c[2], c[3], c[4]],
+            cfl_limit: c[5],
+            pressure_relative_tolerance: c[6],
+            pressure_absolute_tolerance: c[7],
+            max_substeps: state.max_substeps,
+            pressure_max_iterations: state.pressure_max_iterations,
+            pressure_diagnostics: false,
+            open_top: state.open_top,
+        };
+        let cells = |values: &[[i64; 3]]| {
+            values
+                .iter()
+                .map(|p| GlobalCell::new(p[0], p[1], p[2]))
+                .collect()
+        };
+        setup.sources = cells(&state.sources);
+        setup.gated_sources = state.gated_sources.each_ref().map(|v| cells(v));
+        setup.sinks = cells(&state.sinks);
+        let mut result = Self::new(terrain, setup)?;
+        result.set_gated_sources_rate(state.gated_rate);
+        let boundary = capture_boundary(terrain, result.domain, result.coarsen)?;
+        if let Engine::Inline {
+            grid,
+            frame,
+            exchange,
+            ..
+        } = &mut result.engine
+        {
+            grid.restore_trapped(
+                &state
+                    .trapped
+                    .iter()
+                    .map(|b| f64::from_bits(*b))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(WaterError::Solver)?;
+            grid.restore_displacing(
+                &state
+                    .fractions
+                    .iter()
+                    .map(|b| f64::from_bits(*b))
+                    .collect::<Vec<_>>(),
+                &boundary,
+            )
+            .map_err(WaterError::Solver)?;
+            grid.restore_outflow(f64::from_bits(state.outflow_bits))
+                .map_err(WaterError::Solver)?;
+            exchange.added_m3 = f64::from_bits(state.spring_added_bits);
+            exchange.removed_m3 = f64::from_bits(state.drain_removed_bits);
+            *frame = Arc::new(WaterFrame::capture(
+                state.frame_seq,
+                f64::from_bits(state.fluid_time_bits),
+                state.coarsen,
+                grid,
+                exchange,
+            ));
+        }
+        Ok(result)
     }
 
     /// The voxel-cell domain this water was declared over.
@@ -376,12 +553,11 @@ impl AuthoritativeWater {
         self.seed
     }
 
-    /// The live solver grid, only available for inline execution (a worker
-    /// owns its grid on another thread; read [`Self::frame`] instead).
+    /// The owner's committed grid. Worker candidates are never exposed here.
     pub fn grid(&self) -> Option<&MacGridWorld> {
         match &self.engine {
             Engine::Inline { grid, .. } => Some(grid),
-            Engine::Worker(_) => None,
+            Engine::Worker(worker) => Some(&worker.grid),
         }
     }
 
@@ -400,11 +576,74 @@ impl AuthoritativeWater {
         boundary_dirty: bool,
         dt_s: f64,
     ) -> Result<WaterTickMetrics, WaterError> {
-        let mut report = WaterTickMetrics::default();
-        let boundary = if boundary_dirty {
+        if !dt_s.is_finite() || dt_s <= 0.0 {
+            return Err(WaterError::Solver(MacError::InvalidTimeStep));
+        }
+        let frame = self.frame();
+        let (skips, skipped_s) = match &self.engine {
+            Engine::Inline {
+                skipped_ticks,
+                skipped_s,
+                ..
+            } => (*skipped_ticks, *skipped_s),
+            Engine::Worker(w) => (w.skipped_steps, w.skipped_s),
+        };
+        let mut report = WaterTickMetrics {
+            volume_m3: frame.volume_m3,
+            open_outflow_m3: frame.open_outflow_m3,
+            trapped_volume_m3: self.grid().map_or(0.0, MacGridWorld::trapped_volume_m3),
+            ..WaterTickMetrics::default()
+        };
+        self.boundary_pending |= boundary_dirty;
+        // Check every domain's declared residency even while sleeping. Missing
+        // geometry suspends time instead of guessing an air/drain/wall boundary.
+        let origin = self.domain.origin();
+        let dims = self.domain.dimensions();
+        let lo = [origin.x, origin.y, origin.z];
+        let hi = std::array::from_fn::<_, 3, _>(|i| lo[i] + i64::from(dims[i]) - 1);
+        let mut unknown = false;
+        for bz in lo[2].div_euclid(32)..=hi[2].div_euclid(32) {
+            for by in lo[1].div_euclid(32)..=hi[1].div_euclid(32) {
+                for bx in lo[0].div_euclid(32)..=hi[0].div_euclid(32) {
+                    let cell = GlobalCell::new(
+                        (bx * 32).max(lo[0]),
+                        (by * 32).max(lo[1]),
+                        (bz * 32).max(lo[2]),
+                    );
+                    let sample = terrain
+                        .sample(cell)
+                        .map_err(|e| WaterError::Boundary(e.to_string()))?;
+                    unknown |= matches!(sample, spall_voxel::Sample::Unknown(_));
+                }
+            }
+        }
+        if unknown {
+            self.boundary_pending = true;
+            self.residency_skips += 1;
+            self.residency_skipped_s += dt_s;
+            report.waiting_for_residency = true;
+            report.skipped_ticks = skips + self.residency_skips;
+            report.skipped_duration = Duration::from_secs_f64(skipped_s + self.residency_skipped_s);
+            report.frame_seq = self.frame().seq;
+            return Ok(report);
+        }
+        if self.boundary_pending || self.gated_sources_rate() > 0 {
+            self.sleeping = false;
+            self.quiet_steps = 0;
+        }
+        report.trapped_volume_m3 = self.grid().map_or(0.0, MacGridWorld::trapped_volume_m3);
+        if self.sleeping {
+            report.skipped_ticks = skips + self.residency_skips;
+            report.skipped_duration = Duration::from_secs_f64(skipped_s + self.residency_skipped_s);
+            report.sleeping = true;
+            report.frame_seq = self.frame().seq;
+            return Ok(report);
+        }
+        let boundary = if self.boundary_pending {
             let started = Instant::now();
             let boundary = capture_boundary(terrain, self.domain, self.coarsen)?;
             report.boundary_refresh = started.elapsed();
+            self.boundary_pending = false;
             Some(boundary)
         } else {
             None
@@ -414,12 +653,20 @@ impl AuthoritativeWater {
                 grid,
                 frame,
                 skipped_ticks,
+                skipped_s,
                 exchange,
             } => {
                 if let Some(boundary) = boundary {
                     report.displaced_volume_m3 = grid
-                        .refresh_boundary_displacing(&boundary)
+                        .refresh_boundary_retaining(&boundary)
                         .map_err(WaterError::Solver)?;
+                    *frame = Arc::new(WaterFrame::capture(
+                        frame.seq + 1,
+                        frame.fluid_time_s,
+                        self.coarsen,
+                        grid,
+                        exchange,
+                    ));
                 }
                 let started = Instant::now();
                 match grid.step(dt_s) {
@@ -439,16 +686,39 @@ impl AuthoritativeWater {
                         // state unchanged; keep the fixed server dt and surface
                         // the debt.
                         *skipped_ticks = skipped_ticks.saturating_add(1);
-                        report.skipped_duration = Duration::from_secs_f64(dt_s);
+                        *skipped_s += dt_s;
                     }
                     Err(error) => return Err(WaterError::Solver(error)),
                 }
                 report.skipped_ticks = *skipped_ticks;
+                report.skipped_duration = Duration::from_secs_f64(*skipped_s);
                 report.step_duration = started.elapsed();
                 report.frame_seq = frame.seq;
             }
             Engine::Worker(worker) => worker.advance(dt_s, boundary, &mut report)?,
         }
+        if report.step.is_some()
+            && self.setup.sources.is_empty()
+            && self.setup.sinks.is_empty()
+            && self.gated_sources_rate() == 0
+            && self
+                .grid()
+                .is_some_and(|g| g.max_face_component_velocity_m_s() <= 1e-5)
+        {
+            self.quiet_steps += 1;
+            if self.quiet_steps >= 60 {
+                self.sleeping = true;
+            }
+        } else if report.step.is_some() {
+            self.quiet_steps = 0;
+        }
+        let frame = self.frame();
+        report.volume_m3 = frame.volume_m3;
+        report.open_outflow_m3 = frame.open_outflow_m3;
+        report.sleeping = self.sleeping;
+        report.trapped_volume_m3 = self.grid().map_or(0.0, MacGridWorld::trapped_volume_m3);
+        report.skipped_ticks += self.residency_skips;
+        report.skipped_duration += Duration::from_secs_f64(self.residency_skipped_s);
         Ok(report)
     }
 }
@@ -506,86 +776,103 @@ fn seed_fractions(
     Ok(report)
 }
 
-/// Messages from the simulation thread to the worker.
+/// Immutable job input; only one fluid job may be outstanding.
 struct Advance {
+    grid: MacGridWorld,
+    exchange: Exchange,
+    revision: u64,
+    rate: u8,
     dt_s: f64,
-    boundary: Option<SolidBoundary>,
 }
 
-#[derive(Default)]
-struct WorkerStatus {
-    failure: Option<String>,
-    skipped_steps: u64,
-    skipped_s: f64,
-    displaced_m3: f64,
-    last_step: Option<(MacStepMetrics, Duration)>,
-}
-
-struct WorkerShared {
-    latest: Mutex<Arc<WaterFrame>>,
-    status: Mutex<WorkerStatus>,
+struct Completed {
+    input: Advance,
+    outcome: Result<MacStepMetrics, MacError>,
+    duration: Duration,
 }
 
 struct WaterWorker {
-    submit: Option<mpsc::Sender<Advance>>,
-    shared: Arc<WorkerShared>,
+    grid: Box<MacGridWorld>,
+    exchange: Exchange,
+    frame: Arc<WaterFrame>,
+    submit: Option<mpsc::SyncSender<Advance>>,
+    completed: mpsc::Receiver<Completed>,
     thread: Option<std::thread::JoinHandle<()>>,
+    revision: u64,
+    in_flight: bool,
+    owed_s: f64,
+    step_dt_s: f64,
+    coarsen: u32,
+    skipped_steps: u64,
+    skipped_s: f64,
 }
 
 impl WaterWorker {
     fn spawn(
-        mut grid: MacGridWorld,
+        grid: MacGridWorld,
         frame: Arc<WaterFrame>,
-        mut exchange: Exchange,
+        exchange: Exchange,
         coarsen: u32,
         step_dt_s: f64,
     ) -> Result<Self, WaterError> {
-        let shared = Arc::new(WorkerShared {
-            latest: Mutex::new(frame),
-            status: Mutex::new(WorkerStatus::default()),
-        });
-        let (submit, work) = mpsc::channel::<Advance>();
-        let thread_shared = Arc::clone(&shared);
+        let (submit, work) = mpsc::sync_channel::<Advance>(1);
+        let (publish, completed) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("spall-water".into())
             .spawn(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_worker(
-                        &mut grid,
-                        &mut exchange,
-                        &work,
-                        &thread_shared,
-                        coarsen,
-                        step_dt_s,
-                    )
-                }));
-                let failure = match outcome {
-                    Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(error.to_string()),
-                    Err(panic) => Some(format!(
-                        "panicked: {}",
-                        panic
-                            .downcast_ref::<&str>()
-                            .map(|s| (*s).to_owned())
-                            .or_else(|| panic.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "non-string panic payload".into())
-                    )),
-                };
-                if let Some(failure) = failure {
-                    eprintln!("spall-water: worker stopped: {failure}");
-                    lock(&thread_shared.status).failure = Some(failure);
+                while let Ok(mut input) = work.recv() {
+                    let started = Instant::now();
+                    let outcome = input.grid.step(input.dt_s);
+                    if outcome.is_ok() {
+                        input.exchange.apply(&mut input.grid);
+                    }
+                    if publish
+                        .send(Completed {
+                            input,
+                            outcome,
+                            duration: started.elapsed(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             })
-            .map_err(|error| WaterError::Worker(format!("thread did not start: {error}")))?;
+            .map_err(|e| WaterError::Worker(e.to_string()))?;
         Ok(Self {
+            grid: Box::new(grid),
+            frame,
+            exchange,
             submit: Some(submit),
-            shared,
+            completed,
             thread: Some(thread),
+            revision: 0,
+            in_flight: false,
+            owed_s: 0.0,
+            step_dt_s,
+            coarsen,
+            skipped_steps: 0,
+            skipped_s: 0.0,
         })
     }
 
     fn latest(&self) -> Arc<WaterFrame> {
-        Arc::clone(&lock(&self.shared.latest))
+        Arc::clone(&self.frame)
+    }
+
+    fn publish(&mut self, advanced_s: f64) {
+        self.frame = Arc::new(WaterFrame::capture(
+            self.frame.seq + 1,
+            self.frame.fluid_time_s + advanced_s,
+            self.coarsen,
+            &self.grid,
+            &self.exchange,
+        ));
+    }
+
+    fn skip(&mut self) {
+        self.skipped_steps += 1;
+        self.skipped_s += self.step_dt_s;
     }
 
     fn advance(
@@ -594,117 +881,85 @@ impl WaterWorker {
         boundary: Option<SolidBoundary>,
         report: &mut WaterTickMetrics,
     ) -> Result<(), WaterError> {
-        {
-            let mut status = lock(&self.shared.status);
-            if let Some(failure) = &status.failure {
-                return Err(WaterError::Worker(failure.clone()));
-            }
-            if let Some((metrics, duration)) = status.last_step.take() {
-                report.step = Some(metrics);
-                report.step_duration = duration;
-            }
-            report.skipped_ticks = status.skipped_steps;
-            report.skipped_duration = Duration::from_secs_f64(status.skipped_s);
-            report.displaced_volume_m3 = status.displaced_m3;
+        // Refresh live owner geometry before considering a completed job. An
+        // old job can never overwrite a newly committed boundary or its ledger.
+        if let Some(boundary) = boundary {
+            self.revision = self
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| WaterError::Worker("water revision exhausted".into()))?;
+            report.displaced_volume_m3 = self
+                .grid
+                .refresh_boundary_retaining(&boundary)
+                .map_err(WaterError::Solver)?;
+            self.publish(0.0);
         }
-        report.frame_seq = self.latest().seq;
-        let sent = self
-            .submit
-            .as_ref()
-            .is_some_and(|submit| submit.send(Advance { dt_s, boundary }).is_ok());
-        if !sent || self.thread.as_ref().is_some_and(|t| t.is_finished()) {
-            let failure = lock(&self.shared.status)
-                .failure
-                .clone()
-                .unwrap_or_else(|| "worker thread exited without reporting a reason".into());
-            return Err(WaterError::Worker(failure));
+        match self.completed.try_recv() {
+            Ok(done) => {
+                self.in_flight = false;
+                if done.input.revision != self.revision
+                    || done.input.rate != self.exchange.gated_rate.load(Ordering::Relaxed)
+                {
+                    self.skip();
+                } else {
+                    match done.outcome {
+                        Ok(metrics) => {
+                            report.step = Some(metrics);
+                            report.step_duration = done.duration;
+                            *self.grid = done.input.grid;
+                            let live_rate = Arc::clone(&self.exchange.gated_rate);
+                            self.exchange = done.input.exchange;
+                            self.exchange.gated_rate = live_rate;
+                            self.publish(self.step_dt_s);
+                        }
+                        Err(MacError::SubstepBudgetExceeded { .. }) => self.skip(),
+                        Err(e) => return Err(WaterError::Solver(e)),
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(WaterError::Worker("water job worker exited".into()));
+            }
         }
+        self.owed_s += dt_s;
+        while self.owed_s + 1e-9 >= self.step_dt_s {
+            self.owed_s = (self.owed_s - self.step_dt_s).max(0.0);
+            if self.in_flight {
+                self.skip();
+                continue;
+            }
+            let rate = self.exchange.gated_rate.load(Ordering::Relaxed);
+            let mut exchange = self.exchange.clone();
+            exchange.gated_rate = Arc::new(AtomicU8::new(rate));
+            let input = Advance {
+                grid: (*self.grid).clone(),
+                exchange,
+                rate,
+                revision: self.revision,
+                dt_s: self.step_dt_s,
+            };
+            self.submit
+                .as_ref()
+                .ok_or_else(|| WaterError::Worker("worker closed".into()))?
+                .try_send(input)
+                .map_err(|e| WaterError::Worker(e.to_string()))?;
+            self.in_flight = true;
+        }
+        report.frame_seq = self.frame.seq;
+        report.skipped_ticks = self.skipped_steps;
+        report.skipped_duration = Duration::from_secs_f64(self.skipped_s);
         Ok(())
     }
 }
 
 impl Drop for WaterWorker {
     fn drop(&mut self) {
-        // Closing the channel ends the worker loop.
         self.submit = None;
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
-}
-
-fn run_worker(
-    grid: &mut MacGridWorld,
-    exchange: &mut Exchange,
-    work: &mpsc::Receiver<Advance>,
-    shared: &WorkerShared,
-    coarsen: u32,
-    step_dt_s: f64,
-) -> Result<(), WaterError> {
-    let mut owed_s = 0.0;
-    let mut seq = lock(&shared.latest).seq;
-    let mut fluid_time_s = 0.0;
-    while let Ok(first) = work.recv() {
-        // Coalesce everything that queued while the last step ran: boundaries
-        // apply in commit order, elapsed time sums.
-        let mut pending = vec![first];
-        pending.extend(work.try_iter());
-        for message in pending {
-            owed_s += message.dt_s;
-            if let Some(boundary) = message.boundary {
-                let displaced = grid
-                    .refresh_boundary_displacing(&boundary)
-                    .map_err(WaterError::Solver)?;
-                lock(&shared.status).displaced_m3 += displaced;
-            }
-        }
-        let backlog_s = step_dt_s * MAX_WORKER_BACKLOG_STEPS;
-        if owed_s > backlog_s {
-            let dropped = owed_s - backlog_s;
-            let mut status = lock(&shared.status);
-            status.skipped_s += dropped;
-            status.skipped_steps += (dropped / step_dt_s).floor() as u64;
-            owed_s = backlog_s;
-        }
-        let mut stepped = false;
-        // Tolerate float accumulation so 2 x 1/60 still pays for one 1/30 step.
-        while owed_s + 1.0e-9 >= step_dt_s {
-            owed_s -= step_dt_s;
-            let started = Instant::now();
-            match grid.step(step_dt_s) {
-                Ok(metrics) => {
-                    stepped = true;
-                    exchange.apply(grid);
-                    fluid_time_s += step_dt_s;
-                    lock(&shared.status).last_step = Some((metrics, started.elapsed()));
-                }
-                Err(MacError::SubstepBudgetExceeded { .. }) => {
-                    let mut status = lock(&shared.status);
-                    status.skipped_steps += 1;
-                    status.skipped_s += step_dt_s;
-                }
-                Err(error) => return Err(WaterError::Solver(error)),
-            }
-        }
-        if stepped {
-            seq += 1;
-            let frame = Arc::new(WaterFrame::capture(
-                seq,
-                fluid_time_s,
-                coarsen,
-                grid,
-                exchange,
-            ));
-            *lock(&shared.latest) = frame;
-        }
-    }
-    Ok(())
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -875,7 +1130,7 @@ mod tests {
             AuthoritativeWater::new(&volume, setup.with_coarsening(2).on_worker(1.0 / 30.0))
                 .unwrap();
         let start = water.frame();
-        assert!(water.grid().is_none());
+        assert!(water.grid().is_some());
         for _ in 0..30 {
             water.tick(&volume, false, 1.0 / 60.0).unwrap();
         }
@@ -884,11 +1139,100 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         while water.frame().seq == start.seq && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
+            water.tick(&volume, false, 1.0 / 60.0).unwrap();
         }
         let frame = water.frame();
         assert!(frame.seq > start.seq, "worker never published a step");
         assert!(frame.fluid_time_s > 0.0);
         assert!((frame.volume_m3 - start.volume_m3).abs() < 1.0e-8);
         assert_ne!(frame.fractions, start.fractions, "released water must move");
+    }
+
+    #[test]
+    fn unknown_residency_suspends_without_guessing_and_resumes_conservatively() {
+        let (mut volume, setup) = tank();
+        let resident = volume.clone();
+        let mut water = AuthoritativeWater::new(&volume, setup).unwrap();
+        let before = water.canonical_state();
+        volume.evict_brick(BrickCoord::new(0, 0, 0));
+        let metrics = water.tick(&volume, false, 1.0 / 60.0).unwrap();
+        assert!(metrics.waiting_for_residency);
+        assert_eq!(metrics.skipped_ticks, 1);
+        assert_eq!(water.canonical_state(), before);
+        let metrics = water.tick(&resident, false, 1.0 / 60.0).unwrap();
+        assert!(metrics.step.is_some());
+        assert!(
+            (water.frame().volume_m3
+                - before
+                    .fractions
+                    .iter()
+                    .map(|b| f64::from_bits(*b))
+                    .sum::<f64>()
+                    * 0.25_f64.powi(3))
+            .abs()
+                < 1e-10
+        );
+    }
+
+    #[test]
+    fn quiet_water_sleeps_and_a_committed_boundary_wakes_it() {
+        let (volume, mut setup) = tank();
+        setup.config.gravity_m_s2 = [0.0; 3];
+        let mut water = AuthoritativeWater::new(&volume, setup).unwrap();
+        for _ in 0..60 {
+            water.tick(&volume, false, 1.0 / 60.0).unwrap();
+        }
+        let before = water.canonical_state();
+        let sleeping = water.tick(&volume, false, 1.0 / 60.0).unwrap();
+        assert!(sleeping.sleeping);
+        assert!(sleeping.step.is_none());
+        assert_eq!(water.canonical_state(), before);
+        assert!(
+            water
+                .tick(&volume, true, 1.0 / 60.0)
+                .unwrap()
+                .step
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_worker_result_cannot_overwrite_a_placement_or_trapped_ledger() {
+        let (mut volume, setup) = tank();
+        let mut water = AuthoritativeWater::new(&volume, setup.on_worker(1.0 / 30.0)).unwrap();
+        let Engine::Worker(worker) = &mut water.engine else {
+            panic!("worker");
+        };
+        let input = Advance {
+            grid: (*worker.grid).clone(),
+            exchange: worker.exchange.clone(),
+            revision: 0,
+            rate: 0,
+            dt_s: 1.0 / 60.0,
+        };
+        let (send, recv) = mpsc::sync_channel(1);
+        worker.completed = recv;
+        worker.in_flight = true;
+        send.send(Completed {
+            input,
+            outcome: Ok(MacStepMetrics::default()),
+            duration: Duration::ZERO,
+        })
+        .unwrap();
+        let cell = GlobalCell::new(3, 2, 3);
+        let initial = water.frame().volume_m3;
+        let mut edit = EditPlan::new(volume.id());
+        edit.set(cell, MaterialId(1));
+        volume.apply_edit(&edit).unwrap();
+        let report = water.tick(&volume, true, 1.0 / 60.0).unwrap();
+        assert_eq!(report.skipped_ticks, 1);
+        assert_eq!(water.grid().unwrap().fraction_at(cell), Some(0.0));
+        assert!((water.frame().volume_m3 - initial).abs() < 1e-12);
+        assert_eq!(water.frame().fluid_time_s, 0.0);
+        volume.evict_brick(BrickCoord::new(0, 0, 0));
+        let paused = water.tick(&volume, false, 1.0 / 60.0).unwrap();
+        assert!(paused.waiting_for_residency);
+        assert_eq!(paused.skipped_ticks, 2, "preserve earlier stale-job skips");
+        assert!(paused.skipped_duration.as_secs_f64() >= 1.0 / 30.0);
     }
 }

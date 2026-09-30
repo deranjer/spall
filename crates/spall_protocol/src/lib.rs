@@ -64,5 +64,7 @@ pub use session::{
 };
 pub use water::{
     AdminCommand, AdminRequest, AdminStatus, WaterAssembler, WaterCodecError, WaterKeyframe,
-    WaterSnapshot, encode_water_keyframe,
+    WaterSnapshot, WaterState, encode_water_keyframe,
 };
+pub mod water_delta;
+pub use water_delta::{WaterDelta, WaterDeltaAssembler, water_deltas};
