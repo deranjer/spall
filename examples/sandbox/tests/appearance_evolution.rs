@@ -115,10 +115,12 @@ fn variant_ids_are_unique_and_never_collide_with_reserved_materials() {
     for variant in appearance::extension_variants() {
         assert!(variant.id.0 >= EXTENSION_ID_BASE);
     }
-    assert!(
-        EXTENSION_ID_BASE > materials::LAMP.0,
-        "extensions live above the lamp"
-    );
+    const {
+        assert!(
+            EXTENSION_ID_BASE > materials::LAMP.0,
+            "extensions live above the lamp"
+        );
+    }
     // The generator's constant agrees (it cannot depend on this crate).
     let generator = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))

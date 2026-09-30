@@ -273,6 +273,16 @@ fn parse_environment_key(scene_ron: &str) -> Option<String> {
     })
 }
 
+#[cfg(windows)]
+fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console(_: &mut Command) {}
+
 #[cfg(test)]
 mod environment_tests {
     use super::parse_environment_key;
@@ -289,13 +299,3 @@ mod environment_tests {
         assert_eq!(parse_environment_key("(name: \"Main\")"), None);
     }
 }
-
-#[cfg(windows)]
-fn hide_console(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn hide_console(_: &mut Command) {}

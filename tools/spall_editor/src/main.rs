@@ -845,6 +845,7 @@ fn voxel_extents(asset: &spall_editor::VoxelAssetFile) -> Option<(VoxelCoord, Vo
 
 /// Draw a selected SPVOX asset as a shaded isometric voxel model. This is a
 /// 3D projection of the full asset, not a single horizontal slice.
+#[allow(clippy::too_many_arguments)] // Existing preview contract.
 fn draw_asset_3d_preview(
     asset: spall_editor::VoxelAssetFile,
     camera: PreviewCamera,
@@ -977,6 +978,7 @@ impl MeshBudget {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Existing preview contract.
 fn paint_asset_model(
     asset: &spall_editor::VoxelAssetFile,
     camera: PreviewCamera,
@@ -1213,13 +1215,15 @@ fn paint_asset_model(
     }
 }
 
+type ProjectedFace = (VoxelCoord, [(f32, f32, f32); 4], f32, f32);
+
 fn voxel_faces(
     cell: VoxelCoord,
     sin_yaw: f32,
     cos_yaw: f32,
     sin_pitch: f32,
     cos_pitch: f32,
-) -> [(VoxelCoord, [(f32, f32, f32); 4], f32, f32); 6] {
+) -> [ProjectedFace; 6] {
     let (x, y, z) = (cell.x as f32, cell.y as f32, cell.z as f32);
     [
         (

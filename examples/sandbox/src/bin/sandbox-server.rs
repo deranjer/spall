@@ -886,10 +886,10 @@ fn sandbox_progression_response(
             }
         }
     };
-    if request.catalog_version != sandbox::game::RECIPE_CATALOG_VERSION {
-        if matches!(request.operation, Operation::InspectInventory) {
-            outcome = Outcome::Rejected(Reject::CatalogVersion);
-        }
+    if request.catalog_version != sandbox::game::RECIPE_CATALOG_VERSION
+        && matches!(request.operation, Operation::InspectInventory)
+    {
+        outcome = Outcome::Rejected(Reject::CatalogVersion);
     }
     ProgressionResponse {
         request_id: request.request_id,

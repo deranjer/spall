@@ -166,11 +166,8 @@ fn start_server(
                 {
                     let _ = started.try_send(());
                     std::thread::sleep(Duration::from_millis(300));
-                    let result = principal.and_then(|id| {
-                        handler_store
-                            .execute_request(id, request.clone(), response)
-                            .ok()
-                    });
+                    let result = principal
+                        .and_then(|id| handler_store.execute_request(id, request, response).ok());
                     if let Some(result) = result {
                         let _ = finished.send(());
                         return result;
@@ -181,7 +178,7 @@ fn start_server(
                     return response(&mut Inventory::default(), request);
                 };
                 handler_store
-                    .execute_request(player_id, request.clone(), response)
+                    .execute_request(player_id, request, response)
                     .unwrap_or_else(|_| response(&mut Inventory::default(), request))
             },
         );

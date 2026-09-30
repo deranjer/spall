@@ -1295,7 +1295,7 @@ impl EditorApp {
                 z: hi[2],
             },
         );
-        if !bounds.cell_count().is_some_and(|count| count <= 16384) {
+        if bounds.cell_count().is_none_or(|count| count > 16384) {
             self.status = "Box operation is limited to 16,384 cells".into();
             return;
         }

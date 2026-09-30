@@ -1,3 +1,5 @@
+type CellTuple = (i32, i32, i32);
+
 use std::path::PathBuf;
 
 use spall_editor::{AssetId, EditorCommand, EditorModel, Transform, VoxelAssetFile, VoxelCoord};
@@ -48,7 +50,7 @@ fn connect_foliage_to_trunk(asset: &mut VoxelAssetFile) {
                 }
             }
         }
-        let mut nearest: Option<((i32, i32, i32), (i32, i32, i32), i32)> = None;
+        let mut nearest: Option<(CellTuple, CellTuple, i32)> = None;
         for &d in cells.difference(&visited) {
             for &v in &visited {
                 let dist = (d.0 - v.0).abs() + (d.1 - v.1).abs() + (d.2 - v.2).abs();
@@ -86,8 +88,8 @@ fn connect_foliage_to_trunk(asset: &mut VoxelAssetFile) {
                 z += (to.2 - z).signum();
             }
             let cell = VoxelCoord { x, y, z };
-            if !asset.voxels.contains_key(&cell) {
-                asset.voxels.insert(cell, material);
+            if let std::collections::btree_map::Entry::Vacant(entry) = asset.voxels.entry(cell) {
+                entry.insert(material);
                 if let Some(tint) = tint {
                     asset.colors.insert(cell, tint);
                 }
