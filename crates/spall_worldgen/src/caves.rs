@@ -16,7 +16,7 @@
 
 use crate::columns::ColumnMap;
 use crate::noise::{fbm2, fbm3, hash01};
-use crate::spec::SEA_LEVEL;
+use crate::spec::{BORDER_CELLS, SEA_LEVEL};
 
 /// Lattice spacing of the sampled field, in cells.
 pub const STEP: i64 = 4;
@@ -129,8 +129,9 @@ impl CaveField {
             let dir = COMPASS[(r(2) * 8.0) as usize % 8];
             attempt += 1;
             let (ex, ez) = (x + dir[0] * length, z + dir[1] * length);
-            let margin = CHAMBER_RADIUS + 6.0;
-            if ex < margin || ez < margin || ex > size - margin || ez > size - margin {
+            let margin = CHAMBER_RADIUS + 6.0 + BORDER_CELLS as f64;
+            let out = |a: f64| a < margin || a > size - margin;
+            if out(ex) || out(ez) || out(x) || out(z) {
                 continue;
             }
             let (ix, iz) = (x as i64, z as i64);

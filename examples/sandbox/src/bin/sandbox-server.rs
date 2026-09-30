@@ -85,6 +85,15 @@ struct Args {
     /// player capsule on the scene's surface. Placed assets become terrain.
     #[arg(long, conflicts_with = "scene")]
     editor_scene: Option<PathBuf>,
+    /// Play a procedurally generated world: the named preset (`showcase`),
+    /// generated from `--seed`. Every client gets a player capsule on a meadow
+    /// spawn. Conflicts with `--scene` and `--editor-scene`.
+    #[arg(long, conflicts_with_all = ["scene", "editor_scene"])]
+    worldgen: Option<String>,
+    /// Arena edge of a `--worldgen` world in cells (0.25 m each): a multiple of
+    /// 32 from 128 to 4096. The default is 1024 (256 m).
+    #[arg(long, default_value_t = sandbox::worldgen_scene::DEFAULT_SIZE_CELLS, requires = "worldgen")]
+    worldgen_size: u32,
     /// Use the legacy whole-terrain collider for a controlled comparison.
     /// Per-brick terrain collision is the normal mode.
     #[arg(long)]
@@ -418,7 +427,32 @@ fn run_serve(args: Args) -> ExitCode {
     };
 
     let mut custom_world = None;
-    let scene = if let Some(path) = &args.editor_scene {
+    let scene = if let Some(preset) = &args.worldgen {
+        let started = std::time::Instant::now();
+        match sandbox::worldgen_scene::generate(preset, args.seed, args.worldgen_size) {
+            Ok(generated) => {
+                let world = generated.world();
+                tracing::info!(
+                    preset = %preset,
+                    seed = args.seed,
+                    size_cells = args.worldgen_size,
+                    gen_version = world.version,
+                    bricks = world.terrain.resident_brick_count(),
+                    water_cells = world.water.cells.len(),
+                    cave_mouths = world.cave_mouths.len(),
+                    player_spawns = ?generated.player_spawns(),
+                    generate_ms = started.elapsed().as_millis() as u64,
+                    "generated world"
+                );
+                custom_world = Some(generated.into_custom_world());
+                Scene::Custom
+            }
+            Err(error) => {
+                eprintln!("sandbox-server: --worldgen {preset:?}: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else if let Some(path) = &args.editor_scene {
         match sandbox::editor_scene::load(path) {
             Ok(loaded) => {
                 let (min, max) = loaded.bounds();

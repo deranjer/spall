@@ -30,6 +30,14 @@ fn measure_showcase() {
         w.water.domain_cells()
     );
     println!("mouths {:?} spawns {:?}", w.cave_mouths, w.spawns);
+    for (x, z) in &w.cave_mouths {
+        println!(
+            "mouth metres x={} z={} surface_y={}",
+            *x as f64 * 0.25,
+            *z as f64 * 0.25,
+            w.columns.height(*x, *z) as f64 * 0.25
+        );
+    }
     // cave fraction among rock cells below the surface and above floor.
     let (mut solid, mut caves) = (0u64, 0u64);
     for z in (0..size as i64).step_by(3) {

@@ -23,7 +23,7 @@ pub fn top_down_rgba(columns: &ColumnMap) -> Vec<u8> {
     for z in 0..size {
         for x in 0..size {
             let h = columns.height(x, z);
-            let rgb = if h < SEA_LEVEL {
+            let rgb = if columns.is_water(x, z) {
                 let depth = f64::from(SEA_LEVEL - h).min(30.0) / 30.0;
                 [
                     (60.0 - 40.0 * depth) as u8,

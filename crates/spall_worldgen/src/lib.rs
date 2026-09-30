@@ -24,6 +24,6 @@ pub use generate::{
     GeneratedWorld, SPAWN_HEADROOM_CELLS, WATER_DOMAIN_BUDGET, WaterPlan, generate,
 };
 pub use spec::{
-    GEN_VERSION, GenError, HEIGHT_CELLS, Preset, SEA_LEVEL, SHOWCASE_SIZE_CELLS, WorldGenSpec,
-    WorldgenPalette,
+    BORDER_CELLS, GEN_VERSION, GenError, HEIGHT_CELLS, Preset, SEA_LEVEL, SHOWCASE_SIZE_CELLS,
+    WALL_TOP, WorldGenSpec, WorldgenPalette,
 };

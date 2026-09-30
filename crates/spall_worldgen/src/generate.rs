@@ -3,7 +3,8 @@
 use crate::caves::{CaveField, CornerGrid, MOUTH_RADIUS};
 use crate::columns::{Biome, ColumnMap, Stack};
 use crate::spec::{
-    BRICK, GEN_VERSION, GenError, HEIGHT_BRICKS, HEIGHT_CELLS, SEA_LEVEL, WorldGenSpec,
+    BORDER_CELLS, BRICK, GEN_VERSION, GenError, HEIGHT_BRICKS, HEIGHT_CELLS, SEA_LEVEL, WALL_TOP,
+    WorldGenSpec,
 };
 use spall_core::{BrickCoord, CELLS_PER_BRICK, CellSizeCode, GlobalCell, MaterialId, Revision};
 use spall_voxel::brick::Brick;
@@ -157,6 +158,23 @@ fn generate_column(
     bx: i64,
     bz: i64,
 ) -> Vec<(BrickCoord, Brick)> {
+    let last = i64::from(spec.size_cells) / BRICK - 1;
+    if bx == 0 || bz == 0 || bx == last || bz == last {
+        // The arena wall: solid bedrock up to `WALL_TOP`, open sky above.
+        return (0..HEIGHT_BRICKS)
+            .map(|by| {
+                let material = if by * BRICK <= WALL_TOP {
+                    spec.palette.bedrock
+                } else {
+                    MaterialId::AIR
+                };
+                (
+                    BrickCoord::new(bx, by, bz),
+                    Brick::uniform(material, Revision::ZERO),
+                )
+            })
+            .collect();
+    }
     let fp = footprint(spec, columns, bx, bz);
     let mut out = Vec::with_capacity(HEIGHT_BRICKS as usize);
     for by in 0..HEIGHT_BRICKS {
@@ -185,10 +203,10 @@ fn water_plan(columns: &ColumnMap) -> WaterPlan {
     let mut hi = [i64::MIN; 3];
     for z in 0..size {
         for x in 0..size {
-            let h = i64::from(columns.height(x, z));
-            if h >= i64::from(SEA_LEVEL) {
+            if !columns.is_water(x, z) {
                 continue;
             }
+            let h = i64::from(columns.height(x, z));
             for y in h + 1..=i64::from(SEA_LEVEL) {
                 cells.push(GlobalCell::new(x, y, z));
             }
@@ -220,7 +238,11 @@ fn find_spawns(columns: &ColumnMap, caves: &CaveField) -> Vec<[f64; 3]> {
             for i in -ring..=ring {
                 for (dx, dz) in [(i, -ring), (i, ring), (-ring, i), (ring, i)] {
                     let (x, z) = (cx + dx, cz + dz);
-                    if x < 8 || z < 8 || x >= size - 8 || z >= size - 8 {
+                    if x < BORDER_CELLS + 8
+                        || z < BORDER_CELLS + 8
+                        || x >= size - BORDER_CELLS - 8
+                        || z >= size - BORDER_CELLS - 8
+                    {
                         continue;
                     }
                     let h = columns.height(x, z);

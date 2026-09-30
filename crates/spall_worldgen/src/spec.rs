@@ -6,7 +6,7 @@ use thiserror::Error;
 /// Bumped whenever the same `(spec, seed)` would produce different voxels.
 /// A saved world must never be regenerated over with a different version:
 /// modified bricks (including all-air tombstones) win over generated ones.
-pub const GEN_VERSION: u32 = 1;
+pub const GEN_VERSION: u32 = 2;
 
 /// Edge of a brick in cells (mirrors `spall_core::BRICK_EDGE`).
 pub const BRICK: i64 = 32;
@@ -14,6 +14,13 @@ pub const BRICK: i64 = 32;
 pub const HEIGHT_BRICKS: i64 = 12;
 /// Vertical extent in cells. Cell `y = 0` is the bottom of the bedrock brick.
 pub const HEIGHT_CELLS: i64 = HEIGHT_BRICKS * BRICK;
+/// Thickness of the solid bedrock wall around the arena, in cells: exactly one
+/// brick, so the wall is made of cheap uniform bricks. It keeps players inside
+/// the resident arena; generated content lives strictly inside it.
+pub const BORDER_CELLS: i64 = BRICK;
+/// Highest solid cell of the border wall: every brick below the top brick.
+/// Above every peak, so the wall cannot be walked or jumped over.
+pub const WALL_TOP: i64 = (HEIGHT_BRICKS - 1) * BRICK - 1;
 /// Water surface: cells with `y <= SEA_LEVEL` above the terrain are water.
 pub const SEA_LEVEL: i32 = 128;
 /// Smallest and largest supported arena edge in cells.

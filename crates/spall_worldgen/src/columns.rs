@@ -6,7 +6,7 @@
 //! layout coordinates, so one layout scales to any arena size.
 
 use crate::noise::{fbm2, ridged2, smoothstep};
-use crate::spec::{GenError, SEA_LEVEL, WorldGenSpec, WorldgenPalette};
+use crate::spec::{BORDER_CELLS, GenError, SEA_LEVEL, WorldGenSpec, WorldgenPalette};
 use spall_core::MaterialId;
 
 /// Above this many cells over the sea, mountain surfaces are snow.
@@ -270,9 +270,17 @@ impl ColumnMap {
         self.lowland[self.idx(x, z)]
     }
 
-    /// Whether water covers the column (terrain below the sea surface).
+    /// Whether `(x, z)` is inside the arena's bedrock border wall, where the
+    /// generated terrain is replaced by solid wall.
+    pub fn in_border(&self, x: i64, z: i64) -> bool {
+        let edge = i64::from(self.size) - BORDER_CELLS;
+        x < BORDER_CELLS || z < BORDER_CELLS || x >= edge || z >= edge
+    }
+
+    /// Whether water covers the column: terrain below the sea surface, outside
+    /// the border wall (water never enters the wall).
     pub fn is_water(&self, x: i64, z: i64) -> bool {
-        self.height(x, z) < SEA_LEVEL
+        !self.in_border(x, z) && self.height(x, z) < SEA_LEVEL
     }
 
     pub fn min_max_height(&self) -> (i32, i32) {
@@ -306,7 +314,7 @@ impl ColumnMap {
             Biome::Swamp => {
                 if h < SEA_LEVEL - 6 {
                     st(p.gravel, 2, p.clay, 8)
-                } else if h <= SEA_LEVEL + 5 {
+                } else if h <= SEA_LEVEL + 1 {
                     st(p.mud, 8, p.clay, 4)
                 } else {
                     st(p.moss, 3, p.mud, 6)

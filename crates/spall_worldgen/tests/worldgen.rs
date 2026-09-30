@@ -39,6 +39,11 @@ fn filled(s: Sample) -> Option<MaterialId> {
     }
 }
 
+fn in_border(x: i64, z: i64, size: u32) -> bool {
+    let edge = i64::from(size) - BORDER_CELLS;
+    x < BORDER_CELLS || z < BORDER_CELLS || x >= edge || z >= edge
+}
+
 /// Horizontal reach of a cave mouth from its surface start, plus its chamber.
 fn mouth_reach(size: u32) -> i64 {
     (f64::from(size) * 0.15).min(160.0) as i64 + 20
@@ -64,10 +69,10 @@ fn generation_is_deterministic_and_seed_sensitive() {
 /// different world: bump `GEN_VERSION` and update this value deliberately.
 #[test]
 fn golden_digest_for_version() {
-    assert_eq!(GEN_VERSION, 1);
+    assert_eq!(GEN_VERSION, 2);
     assert_eq!(
         digest_hex(&small().terrain),
-        "71810a217d2e3da9a059015b8442c9f41a1265a4ca61b318a4f8089bca5a6377",
+        "61e51043a9d7aa10fe7f46b292414a984c2c5c666c9d2755c8c431e221a1073f",
         "showcase seed 1 at {SMALL} cells"
     );
 }
@@ -106,6 +111,9 @@ fn columns_are_bedrock_then_rock_then_air() {
     let p = palette();
     for z in (0..i64::from(SMALL)).step_by(5) {
         for x in (0..i64::from(SMALL)).step_by(5) {
+            if in_border(x, z, SMALL) {
+                continue;
+            }
             let h = i64::from(w.columns.height(x, z));
             for y in (0..HEIGHT_CELLS).step_by(3) {
                 let m = filled(at(w, x, y, z));
@@ -135,6 +143,9 @@ fn caves_exist_but_stay_a_minority_and_keep_their_roof() {
     let (mut rock, mut voids) = (0u64, 0u64);
     for z in (0..i64::from(SMALL)).step_by(2) {
         for x in (0..i64::from(SMALL)).step_by(2) {
+            if in_border(x, z, SMALL) {
+                continue;
+            }
             let h = i64::from(w.columns.height(x, z));
             let exempt = near_mouth(w, x, z, SMALL);
             for y in CAVE_FLOOR..=h {
@@ -331,4 +342,45 @@ fn generation_reports_the_arena_region_and_anchor() {
         GlobalCell::new(i64::from(SMALL) - 1, HEIGHT_CELLS - 1, i64::from(SMALL) - 1)
     );
     assert_eq!(w.version, GEN_VERSION);
+}
+
+#[test]
+fn a_bedrock_wall_one_brick_thick_encloses_the_arena() {
+    let w = small();
+    let p = palette();
+    let edge = i64::from(SMALL);
+    for (x, z) in [
+        (0, 100),
+        (BORDER_CELLS - 1, 100),
+        (edge - 1, 100),
+        (edge - BORDER_CELLS, 100),
+        (100, 0),
+        (100, BORDER_CELLS - 1),
+        (100, edge - 1),
+        (100, edge - BORDER_CELLS),
+    ] {
+        for y in [0, 100, 200, WALL_TOP] {
+            assert_eq!(
+                filled(at(w, x, y, z)),
+                Some(p.bedrock),
+                "wall at {x},{y},{z}"
+            );
+        }
+        assert_eq!(
+            filled(at(w, x, WALL_TOP + 1, z)),
+            None,
+            "open sky over the wall"
+        );
+    }
+    // The wall is above every peak and never touches generated content.
+    assert!(WALL_TOP > i64::from(w.columns.min_max_height().1));
+    let inner = BORDER_CELLS;
+    assert_ne!(filled(at(w, inner, 40, 100)), Some(p.bedrock));
+    for s in &w.spawns {
+        let (x, z) = ((s[0] / 0.25) as i64, (s[2] / 0.25) as i64);
+        assert!(!in_border(x, z, SMALL));
+    }
+    for &(x, z) in &w.cave_mouths {
+        assert!(!in_border(x, z, SMALL));
+    }
 }

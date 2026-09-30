@@ -2711,6 +2711,7 @@ dependencies = [
  "spall_store",
  "spall_structure",
  "spall_voxel",
+ "spall_worldgen",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
