@@ -121,6 +121,7 @@ pub struct Simulation {
     next_control_seq: u64,
     next_damage_seq: u64,
     water: Option<crate::water::AuthoritativeWater>,
+    additional_water: Vec<crate::water::AuthoritativeWater>,
 }
 
 impl Simulation {
@@ -148,6 +149,7 @@ impl Simulation {
             next_control_seq: 1,
             next_damage_seq: 0,
             water: None,
+            additional_water: Vec::new(),
         };
         if let Some(setup) = water_setup {
             simulation.water = Some(
@@ -179,6 +181,7 @@ impl Simulation {
             // Canonical fluid state is added to checkpoints in ENG-105
             // increment 3; recovered simulations do not claim water yet.
             water: None,
+            additional_water: Vec::new(),
         }
     }
 
@@ -199,6 +202,7 @@ impl Simulation {
             mut world,
             pipeline,
             water,
+            additional_water,
             ..
         } = fresh;
         let (f_entity, f_volume, f_transaction, f_journal_seq) = world.registry().counters();
@@ -211,6 +215,7 @@ impl Simulation {
         self.world = world;
         self.pipeline = pipeline;
         self.water = water;
+        self.additional_water = additional_water;
         Ok(())
     }
 
@@ -218,6 +223,119 @@ impl Simulation {
     /// install a fluid region (or was restored before persistence support).
     pub fn water(&self) -> Option<&crate::water::AuthoritativeWater> {
         self.water.as_ref()
+    }
+
+    pub fn water_regions(&self) -> impl Iterator<Item = &crate::water::AuthoritativeWater> {
+        self.water.iter().chain(self.additional_water.iter())
+    }
+
+    pub fn add_water_region(
+        &mut self,
+        setup: crate::water::WaterSetup,
+    ) -> Result<(), crate::water::WaterError> {
+        self.validate_water_region(setup.domain)?;
+        let count = setup.domain.dimensions().iter().try_fold(1usize, |n, d| {
+            n.checked_mul((*d / setup.coarsen.max(1)) as usize)
+        });
+        let existing: usize = self
+            .water_regions()
+            .map(|w| w.frame().fractions.len())
+            .sum();
+        if count.is_none_or(|n| n.saturating_add(existing) > spall_protocol::water::MAX_WATER_CELLS)
+        {
+            return Err(crate::water::WaterError::Boundary(
+                "aggregate water cell limit exceeded".into(),
+            ));
+        }
+        let water = crate::water::AuthoritativeWater::new(&self.world.terrain().volume, setup)?;
+        if self.water.is_none() {
+            self.water = Some(water);
+        } else {
+            self.additional_water.push(water);
+        }
+        Ok(())
+    }
+
+    fn validate_water_region(
+        &self,
+        domain: spall_fluid::DomainSpec,
+    ) -> Result<(), crate::water::WaterError> {
+        if self.water_regions().count() >= 8 {
+            return Err(crate::water::WaterError::Boundary(
+                "at most eight water regions".into(),
+            ));
+        }
+        let bounds = |d: spall_fluid::DomainSpec| {
+            let p = d.origin();
+            let size = d.dimensions();
+            (
+                [p.x, p.y, p.z],
+                [
+                    p.x + i64::from(size[0]) - 1,
+                    p.y + i64::from(size[1]) - 1,
+                    p.z + i64::from(size[2]) - 1,
+                ],
+            )
+        };
+        let (lo, hi) = bounds(domain);
+        for water in self.water_regions() {
+            let (other_lo, other_hi) = bounds(water.domain());
+            if (0..3).all(|i| lo[i] <= other_hi[i] && other_lo[i] <= hi[i]) {
+                return Err(crate::water::WaterError::Boundary(
+                    "overlapping water regions require a joint pressure domain".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn restore_water_regions(
+        &mut self,
+        states: &[spall_protocol::WaterState],
+    ) -> Result<(), crate::water::WaterError> {
+        spall_protocol::water::validate_water_states(states)
+            .map_err(|e| crate::water::WaterError::Boundary(e.to_string()))?;
+        let mut restored = Vec::new();
+        for state in states {
+            restored.push(crate::water::AuthoritativeWater::restore(
+                &self.world.terrain().volume,
+                state,
+            )?);
+        }
+        if restored.len() > 8 {
+            return Err(crate::water::WaterError::Boundary(
+                "too many saved water regions".into(),
+            ));
+        }
+        for (i, water) in restored.iter().enumerate() {
+            let p = water.domain().origin();
+            let d = water.domain().dimensions();
+            for other in &restored[..i] {
+                let q = other.domain().origin();
+                let e = other.domain().dimensions();
+                if [
+                    (p.x, q.x, d[0], e[0]),
+                    (p.y, q.y, d[1], e[1]),
+                    (p.z, q.z, d[2], e[2]),
+                ]
+                .iter()
+                .all(|(a, b, da, db)| {
+                    i128::from(*a) < i128::from(*b) + i128::from(*db)
+                        && i128::from(*b) < i128::from(*a) + i128::from(*da)
+                }) {
+                    return Err(crate::water::WaterError::Boundary(
+                        "saved water regions overlap".into(),
+                    ));
+                }
+            }
+        }
+        self.water = if restored.is_empty() {
+            None
+        } else {
+            Some(restored.remove(0))
+        };
+        self.additional_water = restored;
+        Ok(())
     }
 
     /// Sets this world's scene-authored gated spring(s) to `rate` (an admin
@@ -382,6 +500,17 @@ impl Simulation {
                         f64::from(TICK_DT_S),
                     )
                     .map_err(|error| TickError::Water(error.to_string()))?,
+            );
+        }
+        for water in &mut self.additional_water {
+            report.water_regions.push(
+                water
+                    .tick(
+                        &self.world.terrain().volume,
+                        !report.committed.is_empty(),
+                        f64::from(TICK_DT_S),
+                    )
+                    .map_err(|e| TickError::Water(e.to_string()))?,
             );
         }
         let physics_started = std::time::Instant::now();

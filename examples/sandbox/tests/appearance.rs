@@ -239,7 +239,7 @@ fn variants_survive_an_edit_a_body_split_and_a_save() {
         for dy in -8..=24 {
             for dz in -24..=24 {
                 let cell = GlobalCell::new(trunk.x + dx, trunk.y + dy, trunk.z + dz);
-                if dx.abs() <= 3 && dz.abs() <= 3 && (dy - 0).abs() <= 3 {
+                if dx.abs() <= 3 && dz.abs() <= 3 && dy.abs() <= 3 {
                     continue; // inside or beside the cut
                 }
                 if let Sample::Filled(m) = material_at(&sim, cell) {

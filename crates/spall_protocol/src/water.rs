@@ -3,7 +3,7 @@
 //! Water replication is presentation-only: the server owns the fluid solver and
 //! periodically sends a full keyframe of quantized cell fractions. Keyframes
 //! are self-contained, so a late joiner or a client that missed one is repaired
-//! by the next; there are no deltas to gap. A keyframe is the zstd stream of
+//! by the next; changed-brick deltas use a validated baseline sequence. A keyframe is the zstd stream of
 //! one byte per fluid cell, split into [`WaterSnapshot`] chunks that each fit
 //! a control record.
 
@@ -19,11 +19,158 @@ pub const MAX_WATER_CELLS: usize = 4 * 1024 * 1024;
 /// Compressed bytes carried by one chunk; leaves headroom under
 /// [`limits::MAX_CONTROL_RECORD`] for the envelope and other fields.
 pub const MAX_WATER_CHUNK: usize = 48 * 1024;
-/// Chunks in one keyframe. `MAX_WATER_CHUNKS * MAX_WATER_CHUNK` is 3 MiB, far
-/// above any compressed frame a bounded domain produces.
-pub const MAX_WATER_CHUNKS: usize = 64;
+/// Chunks in one keyframe. The compressed staging limit is 4.5 MiB. A domain
+/// within the cell limit can still exceed this limit if poorly compressible;
+/// the encoder returns an explicit error in that case.
+pub const MAX_WATER_CHUNKS: usize = 96;
 /// Largest voxels-per-fluid-cell factor a keyframe may declare.
 pub const MAX_WATER_COARSEN: u8 = 8;
+/// Aggregate limit across independently bounded pressure domains.
+pub const MAX_WATER_REGIONS: usize = 8;
+pub const MAX_WATER_SOURCE_CELLS: usize = 65_536;
+
+/// Validate a checkpoint/journal group before allocating solver grids.
+pub fn validate_water_states(states: &[WaterState]) -> Result<(), WaterCodecError> {
+    if states.len() > MAX_WATER_REGIONS {
+        return Err(WaterCodecError::InvalidChunk(
+            "too many water regions".into(),
+        ));
+    }
+    let mut cells = 0usize;
+    for state in states {
+        state.validate()?;
+        cells = cells
+            .checked_add(state.fractions.len())
+            .ok_or(WaterCodecError::InvalidChunk(
+                "aggregate water cell limit exceeded".into(),
+            ))?;
+    }
+    if cells > MAX_WATER_CELLS {
+        return Err(WaterCodecError::InvalidChunk(
+            "aggregate water cell limit exceeded".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Canonical restart state, schema independent of presentation snapshots.
+/// Fractions and retained cell-volumes use explicit IEEE-754 bits. Velocities,
+/// pressure and solver caches deliberately reset to rest after recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaterState {
+    pub version: u16,
+    pub origin: [i64; 3],
+    pub voxel_dimensions: [u32; 3],
+    pub coarsen: u32,
+    /// cell size, density, gravity XYZ, CFL, relative/absolute pressure tolerance.
+    pub config_bits: [u64; 8],
+    pub max_substeps: u32,
+    pub pressure_max_iterations: u32,
+    pub open_top: bool,
+    pub frame_seq: u64,
+    pub fluid_time_bits: u64,
+    pub spring_added_bits: u64,
+    pub drain_removed_bits: u64,
+    pub outflow_bits: u64,
+    pub fractions: Vec<u64>,
+    pub trapped: Vec<u64>,
+    pub sources: Vec<[i64; 3]>,
+    pub gated_sources: [Vec<[i64; 3]>; 3],
+    pub sinks: Vec<[i64; 3]>,
+    pub gated_rate: u8,
+}
+
+impl WaterState {
+    pub fn validate(&self) -> Result<(), WaterCodecError> {
+        let bad = || WaterCodecError::InvalidChunk("invalid canonical water state".into());
+        if self.version != 1
+            || !(1..=u32::from(MAX_WATER_COARSEN)).contains(&self.coarsen)
+            || self.frame_seq == 0
+            || self.gated_rate > 3
+        {
+            return Err(bad());
+        }
+        let mut cells = 1usize;
+        let mut voxels = 1usize;
+        for (i, axis) in self.voxel_dimensions.iter().enumerate() {
+            if *axis == 0
+                || *axis % self.coarsen != 0
+                || self.origin[i].checked_add(i64::from(*axis) - 1).is_none()
+            {
+                return Err(bad());
+            }
+            cells = cells
+                .checked_mul((*axis / self.coarsen) as usize)
+                .ok_or_else(bad)?;
+            voxels = voxels.checked_mul(*axis as usize).ok_or_else(bad)?;
+        }
+        if voxels > 32 * 1024 * 1024 {
+            return Err(bad());
+        }
+        if cells > MAX_WATER_CELLS || self.fractions.len() != cells || self.trapped.len() != cells {
+            return Err(bad());
+        }
+        if self.fractions.iter().any(|b| {
+            let v = f64::from_bits(*b);
+            !v.is_finite() || !(-1e-9..=1.0 + 1e-9).contains(&v)
+        }) || self.trapped.iter().any(|b| {
+            let v = f64::from_bits(*b);
+            !v.is_finite() || v < 0.0
+        }) {
+            return Err(bad());
+        }
+        if !self
+            .trapped
+            .iter()
+            .map(|b| f64::from_bits(*b))
+            .sum::<f64>()
+            .is_finite()
+        {
+            return Err(bad());
+        }
+        for bits in [
+            self.fluid_time_bits,
+            self.spring_added_bits,
+            self.drain_removed_bits,
+            self.outflow_bits,
+        ] {
+            let v = f64::from_bits(bits);
+            if !v.is_finite() || v < 0.0 {
+                return Err(bad());
+            }
+        }
+        for list in std::iter::once(&self.sources)
+            .chain(self.gated_sources.iter())
+            .chain(std::iter::once(&self.sinks))
+        {
+            if list.len() > MAX_WATER_SOURCE_CELLS {
+                return Err(bad());
+            }
+            if list.iter().any(|cell| {
+                (0..3).any(|i| {
+                    cell[i] < self.origin[i]
+                        || cell[i] > self.origin[i] + i64::from(self.voxel_dimensions[i]) - 1
+                })
+            }) {
+                return Err(bad());
+            }
+        }
+        let c = self.config_bits.map(f64::from_bits);
+        if c.iter().any(|v| !v.is_finite())
+            || c[0] != 0.25 * f64::from(self.coarsen)
+            || c[1] <= 0.0
+            || c[5] <= 0.0
+            || c[5] > 1.0
+            || c[6] <= 0.0
+            || c[7] <= 0.0
+            || self.max_substeps == 0
+            || self.pressure_max_iterations == 0
+        {
+            return Err(bad());
+        }
+        Ok(())
+    }
+}
 
 /// One chunk of a water keyframe. Every chunk of a frame repeats its header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +216,19 @@ impl Record for WaterSnapshot {
                 detail: "must be 1..=8",
             });
         }
+        for (origin, axis) in [self.origin.x, self.origin.y, self.origin.z]
+            .into_iter()
+            .zip(self.dimensions)
+        {
+            if origin
+                .checked_add(i64::from(axis) * i64::from(self.coarsen) - 1)
+                .is_none()
+            {
+                return Err(RecordError::Inconsistent(
+                    "water domain coordinate overflow",
+                ));
+            }
+        }
         limits::check_count(
             "WaterSnapshot.chunk_count",
             usize::from(self.chunk_count),
@@ -88,6 +248,9 @@ impl Record for WaterSnapshot {
             )
             .into());
         }
+        if self.chunk_index + 1 < self.chunk_count && self.payload.len() != MAX_WATER_CHUNK {
+            return Err(RecordError::Inconsistent("nonfinal water chunk is short"));
+        }
         Ok(())
     }
 }
@@ -95,6 +258,10 @@ impl Record for WaterSnapshot {
 /// Why a keyframe could not be built or assembled.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WaterCodecError {
+    #[error("water domain has an empty axis")]
+    EmptyDomain,
+    #[error("invalid water chunk: {0}")]
+    InvalidChunk(String),
     #[error("water frame has {cells} fractions but its dimensions describe {expected}")]
     LengthMismatch { cells: usize, expected: usize },
     #[error("water frame describes {0} cells, above the keyframe limit")]
@@ -120,6 +287,9 @@ pub fn encode_water_keyframe(
         .iter()
         .try_fold(1usize, |n, axis| n.checked_mul(*axis as usize))
         .ok_or(WaterCodecError::TooManyCells(usize::MAX))?;
+    if expected == 0 {
+        return Err(WaterCodecError::EmptyDomain);
+    }
     if expected > MAX_WATER_CELLS {
         return Err(WaterCodecError::TooManyCells(expected));
     }
@@ -169,15 +339,21 @@ pub struct WaterKeyframe {
 
 /// Reassembles keyframe chunks arriving in order on the control stream. A
 /// chunk from a different frame than the one in progress abandons it: the
-/// server sends whole frames back to back, so a switch only follows a reset.
+/// server sends whole frames back to back. Missing chunks or mismatched
+/// headers discard the partial frame; the next complete keyframe repairs it.
 #[derive(Debug, Default)]
 pub struct WaterAssembler {
     partial: Option<(WaterSnapshot, Vec<u8>)>,
 }
 
 impl WaterAssembler {
-    /// Feeds one validated chunk; returns the frame it completes, if any.
+    /// Validates a chunk before staging or allocating decoded storage; returns
+    /// the frame it completes, if any. Invalid input discards partial staging.
     pub fn push(&mut self, chunk: WaterSnapshot) -> Result<Option<WaterKeyframe>, WaterCodecError> {
+        if let Err(error) = chunk.validate() {
+            self.partial = None;
+            return Err(WaterCodecError::InvalidChunk(error.to_string()));
+        }
         let same_frame = self.partial.as_ref().is_some_and(|(head, bytes)| {
             head.frame_seq == chunk.frame_seq
                 && head.server_tick == chunk.server_tick
@@ -384,6 +560,94 @@ mod tests {
                 cells: 7,
                 expected: 8
             })
+        );
+    }
+
+    #[test]
+    fn assembler_rejects_unvalidated_headers_and_recovers() {
+        let valid =
+            encode_water_keyframe(Tick(1), 1, GlobalCell::new(0, 0, 0), [2, 2, 2], 1, &[0; 8])
+                .unwrap()
+                .remove(0);
+        let mut invalid = Vec::new();
+        let mut chunk = valid.clone();
+        chunk.dimensions = [u32::MAX; 3];
+        invalid.push(chunk);
+        let mut chunk = valid.clone();
+        chunk.chunk_index = u16::MAX;
+        invalid.push(chunk);
+        let mut chunk = valid.clone();
+        chunk.coarsen = 0;
+        invalid.push(chunk);
+        let mut chunk = valid.clone();
+        chunk.chunk_count = MAX_WATER_CHUNKS as u16 + 1;
+        invalid.push(chunk);
+        let mut chunk = valid.clone();
+        chunk.payload = vec![0; MAX_WATER_CHUNK + 1];
+        invalid.push(chunk);
+        let mut assembler = WaterAssembler::default();
+        for chunk in invalid {
+            assert!(assembler.push(chunk).is_err());
+            assert!(assembler.partial.is_none());
+            assert_eq!(
+                assembler.push(valid.clone()).unwrap().unwrap().fractions,
+                [0; 8]
+            );
+        }
+    }
+
+    #[test]
+    fn short_nonfinal_chunk_is_rejected_and_clears_staging() {
+        let chunks = encode_water_keyframe(
+            Tick(1),
+            1,
+            GlobalCell::new(0, 0, 0),
+            [128, 8, 128],
+            1,
+            &frame(131072, 7),
+        )
+        .unwrap();
+        let mut assembler = WaterAssembler::default();
+        assert!(assembler.push(chunks[0].clone()).unwrap().is_none());
+        let mut short = chunks[0].clone();
+        short.payload.pop();
+        assert!(short.validate().is_err());
+        assert!(assembler.push(short).is_err());
+        assert!(assembler.partial.is_none());
+        for chunk in chunks {
+            assembler.push(chunk).unwrap();
+        }
+        assert!(assembler.partial.is_none());
+    }
+
+    #[test]
+    fn decompression_overrun_and_corruption_do_not_publish_or_poison_repair() {
+        let valid =
+            encode_water_keyframe(Tick(1), 1, GlobalCell::new(0, 0, 0), [2, 2, 2], 1, &[0; 8])
+                .unwrap()
+                .remove(0);
+        let mut assembler = WaterAssembler::default();
+        let mut bomb = valid.clone();
+        bomb.payload = zstd::stream::encode_all(&vec![0; MAX_WATER_CELLS][..], 3).unwrap();
+        assert_eq!(
+            assembler.push(bomb),
+            Err(WaterCodecError::LengthMismatch {
+                cells: 9,
+                expected: 8,
+            })
+        );
+        let mut corrupt = valid.clone();
+        corrupt.payload = vec![0; 20];
+        assert!(assembler.push(corrupt).is_err());
+        assert!(assembler.partial.is_none());
+        assert_eq!(assembler.push(valid).unwrap().unwrap().fractions, [0; 8]);
+    }
+
+    #[test]
+    fn encoder_rejects_empty_domains() {
+        assert!(
+            encode_water_keyframe(Tick(1), 1, GlobalCell::new(0, 0, 0), [2, 0, 2], 1, &[],)
+                .is_err()
         );
     }
 }

@@ -65,6 +65,63 @@ Without world persistence, harvest remains ephemeral.
 
 Limits start at 64 KiB per control record, 1 MiB per bulk part, 64 MiB per assembled transfer, and 256 KiB maximum decompressed data per material-only brick record (actual material payload is 64 KiB). Validate counts before allocation and decompress with output bounds. A multi-volume transaction can span staged bulk parts; its visible commit marker is small. Larger regions are split into multiple dependency-complete transfers. Each connection has bounded staging memory and a timeout.
 
+## Water presentation and recovery (ENG-105)
+
+Protocol version 4 uses ALPN `spall/4`. `WaterSnapshot` keeps record schema 3,
+tag 15, on the ordered control stream: domain origin, fluid dimensions,
+coarsening, server tick, sequence, chunk index/count, and zstd fractions in
+X/Y/Z order (`255` full). Bounds are 4,194,304 cells, 96 chunks and 49,152
+compressed bytes per chunk (4.5 MiB staged); nonfinal chunks must be full.
+The assembler validates before staging and reads at most the declared cell
+count plus one byte. Bad headers, corrupt streams and overlong output clear
+staging without publishing a partial frame.
+
+`WaterDelta` uses independent record schema 1, tag 18. It names the domain
+origin, installed base sequence, new sequence/tick, ordinal/count, relative
+fluid brick coordinate and zstd quantized fractions. Fluid bricks are 16 cells
+per axis with edge clipping; at most 4096 changed bricks, 4160 compressed bytes
+per brick, and bounded decoded output. Ordered unique coordinates, consistent
+headers and the installed base are required. A complete candidate publishes
+atomically. A missing base waits for the next full frame; malformed changes
+leave the installed presentation unchanged. The sender chooses the smaller
+valid full frame or delta group.
+
+Each live session/domain gets a 128 KiB/s bucket with a 128 KiB initial burst,
+at most 15 Hz updates and a full repair requested at least every 60 server ticks.
+Large frames finish over multiple ticks before a successor is chosen; the byte
+budget can delay repair completion. Up to eight domains give at most 1 MiB/s
+and 1 MiB burst per client. Budget accounting includes encoded record bytes
+plus 32 bytes per record; QUIC retransmissions and IP framing are outside this
+application-byte measurement. Water uses bounded reliable FIFO backlog and
+completes in order; overflow disconnects for re-baselining. Clients retain at
+most eight domain assemblers and render received fractions only. There is no
+water spatial interest filter in this bounded authored-domain integration.
+
+World save schema 2 adds an explicit `checkpoint_water` row for every published
+checkpoint, including empty water groups, with BLAKE3-16 integrity. Missing or
+corrupt rows are recovery errors. Canonical `WaterState` schema 1 stores explicit
+IEEE-754 bits for exact fractions, trapped cell volumes, configuration, fluid
+time and cumulative source/drain/open-outflow volumes, plus source cells and
+gate rate. The group is limited to eight domains and 4,194,304 fluid cells;
+each source list is bounded to 65,536 entries, with a 128 MiB checkpoint byte
+ceiling. Terrain topology, poses and a canonical water group share the ordered
+atomic journal batch. Recovery applies saved amounts to recovered committed
+geometry, conserving displaced mass. Velocity, pressure, solver cache and sleep
+reset to rest/awake; restarting is not a continuation of the pre-crash flow
+trajectory. Presentation bytes never serve as canonical saves.
+
+Older saves require an explicit copy migration:
+
+```powershell
+cargo xtask migrate-water-save --source old/world.db --output migrated/world.db
+```
+
+The source stays intact. The destination must be absent; migration copies
+schema-1 geometry/history, inserts empty water groups, rewrites metadata to
+schema 2 and verifies recovery. Schema-1 saves did not persist water, so water
+cannot be reconstructed from their historical presentation. Older binaries
+reject the schema-2 version instead of silently dropping water.
+
 ## Exact geometry, approximate motion
 
 Use a hybrid representation for topology changes:
@@ -270,7 +327,7 @@ baseline regions, 4096 baseline parts.
 ## T09 transport adapter (implemented)
 
 `crates/spall_net` layers Quinn/QUIC on the T01 records. It owns transport only:
-no simulation, storage, or rendering. ALPN is `spall/3`; TLS is 1.3-only.
+no simulation, storage, or rendering. ALPN is `spall/4`; TLS is 1.3-only.
 
 **Sessions.** Clients pin the server certificate fingerprint (BLAKE3 of the
 certificate DER, carried out of band). Legacy development mode accepts one

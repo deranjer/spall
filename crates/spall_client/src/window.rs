@@ -500,14 +500,13 @@ fn visible_terrain_bricks(volume: &Volume, center_m: [f64; 3]) -> Vec<BrickCoord
     coords
 }
 
+type MeshUpdate<K> = (K, Vec<spall_render::GpuVertex>, Vec<u32>);
+
 fn update_terrain_mesh_cache(
     volume: &Volume,
     center_m: [f64; 3],
     cache: &mut TerrainMeshCache,
-) -> (
-    Vec<(BrickCoord, Vec<spall_render::GpuVertex>, Vec<u32>)>,
-    Vec<BrickCoord>,
-) {
+) -> (Vec<MeshUpdate<BrickCoord>>, Vec<BrickCoord>) {
     let started = Instant::now();
     let visible = visible_terrain_bricks(volume, center_m);
     let world = VolumeMeshWorld(volume);
@@ -1418,35 +1417,47 @@ impl ApplicationHandler for InteractiveApp {
                 let terrain_removed = std::mem::take(&mut self.pending_mesh_removed);
                 // ENG-105: rebuild water columns only when a new keyframe
                 // (or a different domain after a reset) has arrived.
-                let water_frame = self
+                let water_generation = self
                     .session
-                    .water
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                let water_update = match &water_frame {
-                    Some(frame)
-                        if self.water_key != Some((frame.frame_seq, frame.server_tick.0)) =>
-                    {
-                        self.water_key = Some((frame.frame_seq, frame.server_tick.0));
-                        Some(build_water_instances(frame))
-                    }
-                    _ => None,
+                    .water_publications
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let water_key = (
+                    water_generation,
+                    self.session
+                        .world_resets
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                let water_update = if self.water_key != Some(water_key) {
+                    self.water_key = Some(water_key);
+                    let frames = self
+                        .session
+                        .water_regions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    Some(
+                        frames
+                            .iter()
+                            .flat_map(|frame| build_water_instances(frame))
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
                 };
                 let mut menu_actions = AdminMenuActions::default();
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
                 renderer.scene.set_terrain_meshes_visible(self.show_terrain);
-                if !terrain_updates.is_empty() || !terrain_removed.is_empty() {
-                    if let Err(error) = renderer.scene.update_terrain_meshes(
+                if (!terrain_updates.is_empty() || !terrain_removed.is_empty())
+                    && let Err(error) = renderer.scene.update_terrain_meshes(
                         &renderer.device,
                         &terrain_updates,
                         &terrain_removed,
-                    ) {
-                        self.fail(event_loop, ClientError::Render(error.to_string()));
-                        return;
-                    }
+                    )
+                {
+                    self.fail(event_loop, ClientError::Render(error.to_string()));
+                    return;
                 }
                 if let Some(instances) = &water_update {
                     renderer.set_debug_water(instances);
@@ -2217,7 +2228,7 @@ fn pose_body_meshes(
     local_poses: Option<&crate::interactive::LocalBodyPoses>,
     now: Instant,
     stats: &mut PoseStats,
-) -> (Vec<(u64, Vec<spall_render::GpuVertex>, Vec<u32>)>, Vec<u64>) {
+) -> (Vec<MeshUpdate<u64>>, Vec<u64>) {
     let mut output = Vec::with_capacity(draws.len());
     let mut live = Vec::with_capacity(draws.len());
     for draw in draws {

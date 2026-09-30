@@ -262,6 +262,7 @@ pub struct CustomWorld {
     player_spawns: Vec<[f64; 3]>,
     build: Arc<dyn Fn() -> spall_sim::WorldSetup + Send + Sync>,
     water: Option<spall_sim::WaterSetup>,
+    additional_water: Vec<spall_sim::WaterSetup>,
     dam_gate: Option<DamGate>,
 }
 
@@ -293,6 +294,7 @@ impl CustomWorld {
             player_spawns,
             build: Arc::new(build),
             water,
+            additional_water: Vec::new(),
             dam_gate: None,
         }
     }
@@ -302,6 +304,11 @@ impl CustomWorld {
     #[must_use]
     pub fn with_dam_gate(mut self, gate: DamGate) -> Self {
         self.dam_gate = Some(gate);
+        self
+    }
+
+    pub fn with_additional_water(mut self, regions: Vec<spall_sim::WaterSetup>) -> Self {
+        self.additional_water = regions;
         self
     }
 
@@ -450,6 +457,12 @@ impl Scene {
         sim_config.terrain_collider_mode = mode;
         sim_config.water = custom.and_then(CustomWorld::water_setup).cloned();
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
+        if let Some(custom) = custom {
+            for setup in &custom.additional_water {
+                sim.add_water_region(setup.clone())
+                    .expect("custom water domains must be disjoint and resident");
+            }
+        }
         if matches!(self, Scene::G4Workload) {
             // Row 12: 256 active (64 near the west cluster's first spawn) +
             // 4096 sleeping debris bodies, built once at scene-construction
@@ -753,9 +766,10 @@ pub struct ServeSummary {
     /// ENG-48: `RepairRequest`s dropped because their session exceeded
     /// [`MAX_REPAIRS_PER_CLIENT_PER_TICK`] this tick.
     pub inbound_repairs_throttled: u64,
-    /// ENG-105: water keyframes queued to clients (one per session per new
-    /// frame, at most every [`WATER_KEYFRAME_INTERVAL_TICKS`]).
+    /// Water update batches queued (historical field name); a batch may contain
+    /// full-frame chunks or changed-brick deltas.
     pub water_keyframes_sent: u64,
+    pub water_bytes_queued: u64,
     /// Admin world resets performed.
     pub world_resets: u64,
     /// T20: motion snapshots actually sent this run, summed over every client
@@ -1180,6 +1194,7 @@ pub fn serve_with_game_content_and_commit_handler(
 }
 
 /// Host with both post-commit harvest and authenticated progression handlers.
+#[allow(clippy::too_many_arguments)] // Preserve the established game callback API.
 pub fn serve_with_game_content_and_handlers(
     config: ServeConfig,
     tool_catalog: ToolCatalog,
@@ -1211,6 +1226,7 @@ pub fn serve_with_game_content_and_handlers(
 /// Same as [`serve_with_game_content_and_handlers`], but authenticates clients
 /// using server-provisioned credentials, each bound to a stable `PlayerId`.
 /// The shared development join token in `ServeConfig` is ignored on this path.
+#[allow(clippy::too_many_arguments)] // Preserve the established game callback API.
 pub fn serve_with_game_content_and_player_credentials(
     config: ServeConfig,
     tool_catalog: ToolCatalog,
@@ -1243,6 +1259,7 @@ pub fn serve_with_game_content_and_player_credentials(
 /// Credential-authenticated host whose harvest events are transactionally
 /// coupled to the world journal and replayed through the game's idempotent
 /// outbox processor after restart.
+#[allow(clippy::too_many_arguments)] // Preserve the established game callback API.
 pub fn serve_with_game_content_and_player_credentials_and_outbox(
     config: ServeConfig,
     tool_catalog: ToolCatalog,
@@ -1274,6 +1291,7 @@ pub fn serve_with_game_content_and_player_credentials_and_outbox(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // One internal join point for existing entry points.
 fn serve_with_game_content_and_optional_setup(
     config: ServeConfig,
     tool_catalog: ToolCatalog,
@@ -1464,10 +1482,8 @@ enum Outbound {
     Progression(Arc<spall_protocol::ProgressionResponse>),
     Admin(Arc<spall_protocol::AdminStatus>),
     Motion(Arc<Vec<MotionSnapshot>>),
-    /// ENG-105: one water keyframe's chunks. Lossy like motion — only the
-    /// newest unsent keyframe is kept — but written on the reliable control
-    /// stream because a keyframe is far larger than a datagram.
-    Water(Arc<Vec<spall_protocol::WaterSnapshot>>),
+    /// Ordered water update chunks, counted against the reliable backlog.
+    Water(Arc<Vec<WireRecord>>),
     /// A baseline transfer: `BaselineBegin` on control, parts on a bulk stream,
     /// `BaselineEnd` on control. Carries the whole world for a first late join,
     /// or one brick for a hash repair — the client decides replace vs. merge
@@ -1541,7 +1557,6 @@ struct OutboundQueue {
     reliable: VecDeque<Outbound>,
     reliable_bytes: usize,
     motion: Option<Arc<Vec<MotionSnapshot>>>,
-    water: Option<Arc<Vec<spall_protocol::WaterSnapshot>>>,
     /// Set once a reliable push blew the bound. The writer flushes what is
     /// already queued, says goodbye, and exits.
     overflowed: bool,
@@ -1559,10 +1574,6 @@ impl OutboundQueue {
             // Lossy: keep only the newest unsent batch.
             Outbound::Motion(snaps) => {
                 self.motion = Some(snaps);
-                Ok(())
-            }
-            Outbound::Water(frame) => {
-                self.water = Some(frame);
                 Ok(())
             }
             // The shutdown marker always goes through — it ends the stream.
@@ -1616,7 +1627,14 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
         Outbound::Progression(reply) => 64 + reply.inventory.len() * 8,
         Outbound::Admin(status) => 64 + status.message.len(),
         Outbound::Baseline(t) => 64 + t.payload_bytes(),
-        Outbound::Motion(_) | Outbound::Water(_) | Outbound::Shutdown(_) => 0,
+        Outbound::Water(records) => records
+            .iter()
+            .map(|r| {
+                r.encode_framed()
+                    .map_or(MAX_RELIABLE_BACKLOG_BYTES, |b| b.len() + 32)
+            })
+            .sum(),
+        Outbound::Motion(_) | Outbound::Shutdown(_) => 0,
     }
 }
 
@@ -1624,13 +1642,12 @@ fn reliable_msg_bytes(msg: &Outbound) -> usize {
 struct OutboundBatch {
     reliable: Vec<Outbound>,
     motion: Option<Arc<Vec<MotionSnapshot>>>,
-    water: Option<Arc<Vec<spall_protocol::WaterSnapshot>>>,
     overflowed: bool,
 }
 
 impl OutboundBatch {
     fn is_empty(&self) -> bool {
-        self.reliable.is_empty() && self.motion.is_none() && self.water.is_none()
+        self.reliable.is_empty() && self.motion.is_none()
     }
 }
 
@@ -1678,7 +1695,6 @@ impl OutboundHandle {
         OutboundBatch {
             reliable: q.reliable.drain(..).collect(),
             motion: q.motion.take(),
-            water: q.water.take(),
             overflowed: q.overflowed,
         }
     }
@@ -1698,6 +1714,7 @@ impl OutboundHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Existing host configuration and game callbacks.
 async fn serve_async(
     config: ServeConfig,
     tool_catalog: ToolCatalog,
@@ -2158,9 +2175,12 @@ async fn serve_async(
         let mut pending_player_inputs = PlayerInputSchedule::default();
         // ENG-105: the water frame each session was last sent, so a session
         // that becomes live later still receives the current frame.
-        let mut water_sent: HashMap<u64, u64> = HashMap::new();
-        let mut water_keyframe: Option<(u64, Arc<Vec<spall_protocol::WaterSnapshot>>)> = None;
+        let mut water_sent: HashMap<
+            u64,
+            HashMap<GlobalCell, crate::water_replication::WaterPublisher>,
+        > = HashMap::new();
         let mut water_keyframes_sent = 0u64;
+        let mut water_bytes_queued = 0u64;
         let mut pending_admin: Vec<(SessionId, spall_protocol::AdminRequest)> = Vec::new();
         // A dam-gate edit only reports `Queued` immediately; its real
         // outcome (committed, or rejected — e.g. the terrain-size "giant
@@ -2366,7 +2386,7 @@ async fn serve_async(
                                     .try_send(ProgressionWork {
                                         session,
                                         player_id: player_principals.get(&session.raw()).copied(),
-                                        request: req.clone(),
+                                        request: req,
                                     })
                                     .is_ok()
                             });
@@ -2477,7 +2497,6 @@ async fn serve_async(
                                 prev_body_y.clear();
                                 body_stable_ticks = 0;
                                 water_sent.clear();
-                                water_keyframe = None;
                                 if let Some(drops) = playground_drops.as_mut() {
                                     *drops = playground_drop_schedules(&sim);
                                 }
@@ -2882,32 +2901,47 @@ async fn serve_async(
                 lj.answer_repair(session, &req, &sim, &clients_for_sim);
             }
 
-            // ENG-105 increment 2: presentation water keyframes at 15 Hz to
-            // live sessions only (a joining client gets its first keyframe
-            // after its baseline barrier). Each session is sent each frame at
-            // most once; an unchanged frame is not resent.
-            if tick.get() % WATER_KEYFRAME_INTERVAL_TICKS == 0 {
-                let newest = sim.water().map(|water| water.frame().seq);
-                if newest.is_some() && water_keyframe.as_ref().map(|(seq, _)| *seq) != newest {
-                    match water_keyframe_for(&sim) {
-                        Some(Ok(keyframe)) => water_keyframe = Some(keyframe),
-                        Some(Err(e)) => {
-                            return SimResult::error(
-                                format!("water keyframe could not be encoded: {e}"),
-                                ticks_run,
-                            );
-                        }
-                        None => {}
-                    }
-                }
-                if let Some((seq, chunks)) = &water_keyframe {
-                    for session in lj.live_sessions().collect::<Vec<_>>() {
-                        if water_sent.insert(session.raw(), *seq) != Some(*seq) {
+            // Budget water independently per live session. Keyframes are
+            // periodic repair; changed bricks reference the last queued frame.
+            for water in sim.water_regions() {
+                let frame = water.frame();
+                let current = spall_protocol::WaterKeyframe {
+                    server_tick: sim.current_tick(),
+                    frame_seq: frame.seq,
+                    origin: frame.origin,
+                    dimensions: frame.dimensions,
+                    coarsen: frame.coarsen as u8,
+                    fractions: frame.fractions.clone(),
+                };
+                for session in lj.live_sessions().collect::<Vec<_>>() {
+                    match water_sent
+                        .entry(session.raw())
+                        .or_default()
+                        .entry(frame.origin)
+                        .or_default()
+                        .poll(tick.get(), &current)
+                    {
+                        Ok(records) if !records.is_empty() => {
                             water_keyframes_sent += 1;
+                            water_bytes_queued += records
+                                .iter()
+                                .map(|r| {
+                                    r.encode_framed().expect("publisher validated record").len()
+                                        as u64
+                                        + 32
+                                })
+                                .sum::<u64>();
                             send_to(
                                 &clients_for_sim,
                                 session,
-                                Outbound::Water(Arc::clone(chunks)),
+                                Outbound::Water(Arc::new(records)),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            return SimResult::error(
+                                format!("water update encoding: {e}"),
+                                ticks_run,
                             );
                         }
                     }
@@ -3180,11 +3214,11 @@ async fn serve_async(
                             acknowledged.push(done.event_id);
                         }
                     }
-                    if shutdown_error.is_none() {
-                        if let Err(error) = pipe.submit_acknowledge_outbox(acknowledged) {
-                            shutdown_error =
-                                Some(format!("final outbox acknowledgement failed: {error}"));
-                        }
+                    if shutdown_error.is_none()
+                        && let Err(error) = pipe.submit_acknowledge_outbox(acknowledged)
+                    {
+                        shutdown_error =
+                            Some(format!("final outbox acknowledgement failed: {error}"));
                     }
                 }
             }
@@ -3274,6 +3308,7 @@ async fn serve_async(
             actions_throttled,
             repairs_throttled,
             water_keyframes_sent,
+            water_bytes_queued,
             world_resets,
             motion_snapshots_sent: motion_egress.snapshots_sent,
             motion_snapshots_interest_culled: motion_egress.interest_culled,
@@ -3404,6 +3439,7 @@ async fn serve_async(
         inbound_actions_throttled: sim_result.actions_throttled,
         inbound_repairs_throttled: sim_result.repairs_throttled,
         water_keyframes_sent: sim_result.water_keyframes_sent,
+        water_bytes_queued: sim_result.water_bytes_queued,
         world_resets: sim_result.world_resets,
         motion_snapshots_sent: sim_result.motion_snapshots_sent,
         motion_snapshots_interest_culled: sim_result.motion_snapshots_interest_culled,
@@ -3609,6 +3645,7 @@ struct SimResult {
     actions_throttled: u64,
     repairs_throttled: u64,
     water_keyframes_sent: u64,
+    water_bytes_queued: u64,
     world_resets: u64,
     motion_snapshots_sent: u64,
     motion_snapshots_interest_culled: u64,
@@ -3666,6 +3703,7 @@ impl SimResult {
             actions_throttled: 0,
             repairs_throttled: 0,
             water_keyframes_sent: 0,
+            water_bytes_queued: 0,
             world_resets: 0,
             motion_snapshots_sent: 0,
             motion_snapshots_interest_culled: 0,
@@ -4385,6 +4423,16 @@ fn tick_journal_batch(
     if let Some(last) = batch.last() {
         *journalled_through = last.seq;
     }
+    if sim.water().is_some() {
+        let state = sim.water_regions().map(|w| w.canonical_state()).collect();
+        let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
+        batch.push(spall_store::JournalRecord {
+            seq: seq.0,
+            tick,
+            payload: spall_store::JournalPayload::WaterState(state),
+        });
+        *journalled_through = seq.0;
+    }
     Ok(batch)
 }
 
@@ -4752,25 +4800,6 @@ fn playground_drop_schedules(
     )
 }
 
-/// Builds one keyframe's chunks from the simulation's newest water frame.
-fn water_keyframe_for(
-    sim: &Simulation,
-) -> Option<Result<(u64, Arc<Vec<spall_protocol::WaterSnapshot>>), spall_protocol::WaterCodecError>>
-{
-    let frame = sim.water()?.frame();
-    Some(
-        spall_protocol::encode_water_keyframe(
-            sim.current_tick(),
-            frame.seq,
-            frame.origin,
-            frame.dimensions,
-            frame.coarsen,
-            &frame.fractions,
-        )
-        .map(|chunks| (frame.seq, Arc::new(chunks))),
-    )
-}
-
 /// Sends a single shared, supersedable motion batch to the supplied sessions.
 /// The caller chooses those sessions from [`LateJoin::live_sessions`] so a
 /// joining replica cannot consume link capacity before its baseline barrier.
@@ -5063,7 +5092,17 @@ async fn serve_conn(
                     Outbound::Baseline(transfer) => send_baseline(&conn, &transfer).await,
                     // Motion and water are never queued as reliable; ignore
                     // defensively.
-                    Outbound::Motion(_) | Outbound::Water(_) => true,
+                    Outbound::Motion(_) => true,
+                    Outbound::Water(records) => {
+                        let mut ok = true;
+                        for record in records.iter() {
+                            if conn.send_record(record.clone()).await.is_err() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        ok
+                    }
                     Outbound::Shutdown(reason) => {
                         let _ = conn.say_bye(reason).await;
                         false
@@ -5081,20 +5120,7 @@ async fn serve_conn(
                     motion_seq += 1;
                 }
             }
-            if let Some(frame) = batch.water {
-                // Chunks of one keyframe go back to back on the ordered
-                // control stream, so the client never sees them interleaved
-                // with another keyframe.
-                for chunk in frame.iter() {
-                    if let Err(error) = conn
-                        .send_record(WireRecord::WaterSnapshot(chunk.clone()))
-                        .await
-                    {
-                        tracing::error!(%error, "water keyframe could not be sent; closing client stream");
-                        break 'writer;
-                    }
-                }
-            }
+
             if batch.overflowed {
                 // ENG-48: this client's reliable backlog blew its bound. The
                 // accepted backlog above has been flushed; end the connection

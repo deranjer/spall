@@ -324,6 +324,8 @@ pub struct InteractiveSession {
     pub admin_status: Mutex<Option<spall_protocol::AdminStatus>>,
     /// ENG-105: newest replicated water keyframe (presentation only).
     pub water: Mutex<Option<Arc<spall_protocol::WaterKeyframe>>>,
+    pub water_regions: Mutex<Vec<Arc<spall_protocol::WaterKeyframe>>>,
+    pub water_publications: std::sync::atomic::AtomicU64,
     /// Bumped each time an admin world reset replaced the replica.
     pub world_resets: std::sync::atomic::AtomicU64,
 }
@@ -397,6 +399,29 @@ const CORRECTION_LOG_PATH: &str = ".local/runs/interactive-corrections.jsonl";
 const FRAME_LOG_PATH: &str = ".local/runs/interactive-frames.jsonl";
 
 impl InteractiveSession {
+    pub fn publish_water(&self, frame: spall_protocol::WaterKeyframe) {
+        let frame = Arc::new(frame);
+        let mut regions = self.water_regions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = regions.iter_mut().find(|f| f.origin == frame.origin) {
+            *slot = Arc::clone(&frame);
+        } else if regions.len() < 8 {
+            regions.push(Arc::clone(&frame));
+        }
+        regions.sort_by_key(|f| (f.origin.x, f.origin.y, f.origin.z));
+        *self.water.lock().unwrap_or_else(|e| e.into_inner()) = regions.first().cloned();
+        self.water_publications
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn clear_water(&self) {
+        self.water_regions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self.water.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.water_publications
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     pub fn new() -> Arc<Self> {
         let corrections = match CorrectionLog::create(std::path::Path::new(CORRECTION_LOG_PATH)) {
             Ok(log) => Some(log),
@@ -430,6 +455,8 @@ impl InteractiveSession {
             admin_queue: Mutex::new(Vec::new()),
             admin_status: Mutex::new(None),
             water: Mutex::new(None),
+            water_regions: Mutex::new(Vec::new()),
+            water_publications: std::sync::atomic::AtomicU64::new(0),
             world_resets: std::sync::atomic::AtomicU64::new(0),
         })
     }

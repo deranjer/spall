@@ -21,6 +21,45 @@ use spall_store::{
 
 // --- tiny scratch-dir helper ------------------------------------------------
 
+#[test]
+fn schema_one_water_migration_copies_and_verifies_without_editing_source() {
+    let scratch = Scratch::new("water-migration");
+    let source = scratch.db();
+    let destination = scratch.dir.join("migrated.db");
+    let cp = checkpoint(0, 0);
+    let mut writer = Writer::open(&source).unwrap();
+    writer.publish_checkpoint(&cp).unwrap();
+    drop(writer);
+    // A historical schema-1 fixture: identical body/brick/meta field layouts,
+    // no authoritative-water table and the original version stamp.
+    let conn = rusqlite::Connection::open(&source).unwrap();
+    let mut old_meta = cp.meta.clone();
+    old_meta.store_schema_version = 1;
+    let blob = postcard::to_allocvec(&old_meta).unwrap();
+    conn.execute("UPDATE checkpoints SET meta = ?", [&blob])
+        .unwrap();
+    conn.execute("UPDATE world SET meta = ?", [&blob]).unwrap();
+    conn.execute_batch("DROP TABLE checkpoint_water; PRAGMA user_version = 1;")
+        .unwrap();
+    drop(conn);
+    let original = std::fs::read(&source).unwrap();
+    spall_store::migrate_v1_water(&source, &destination).unwrap();
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    let recovered = recover(&destination).unwrap();
+    assert_eq!(recovered.checkpoint.world_hash, cp.world_hash);
+    assert_eq!(recovered.checkpoint.bricks, cp.bricks);
+    assert!(recovered.checkpoint.water.is_empty());
+    assert_eq!(
+        recovered.checkpoint.meta.store_schema_version,
+        STORE_SCHEMA_VERSION
+    );
+    assert!(spall_store::migrate_v1_water(&source, &destination).is_err());
+    assert!(matches!(
+        Writer::open(&source),
+        Err(StoreError::SchemaTooOld { .. })
+    ));
+}
+
 struct Scratch {
     dir: PathBuf,
 }
@@ -82,6 +121,7 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         world_hash: [tick as u8; 32],
         meta: m,
         bodies: vec![],
+        water: Vec::new(),
         bricks: vec![
             StoredBrick {
                 volume_id: 1,
@@ -744,4 +784,50 @@ fn full_journal_prune_then_reopen_then_edit_never_reuses_sequences() {
         vec![4, 5]
     );
     assert_eq!(rec.durable_through, 5);
+}
+
+#[test]
+fn missing_or_corrupt_water_checkpoint_never_restores_a_silent_dry_world() {
+    for (tag, sql) in [
+        ("missing_water", "DELETE FROM checkpoint_water"),
+        ("corrupt_water", "UPDATE checkpoint_water SET state = X'01'"),
+        ("missing_water_table", "DROP TABLE checkpoint_water"),
+    ] {
+        let scratch = Scratch::new(tag);
+        {
+            let mut writer = Writer::open(scratch.db()).unwrap();
+            writer.publish_checkpoint(&checkpoint(100, 0)).unwrap();
+        }
+        let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+        conn.execute_batch(sql).unwrap();
+        drop(conn);
+        assert!(matches!(
+            recover(scratch.db()),
+            Err(StoreError::CheckpointsUnrecoverable(_))
+        ));
+    }
+}
+
+#[test]
+fn unsupported_save_versions_are_rejected_before_changing_rollback_journal_mode() {
+    for version in [1, STORE_SCHEMA_VERSION + 1] {
+        let scratch = Scratch::new(&format!("rollback-schema-{version}"));
+        {
+            let mut writer = Writer::open(scratch.db()).unwrap();
+            writer.publish_checkpoint(&checkpoint(0, 0)).unwrap();
+        }
+        let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+        drop(conn);
+        let bytes = std::fs::read(scratch.db()).unwrap();
+        assert!(matches!(
+            Writer::open(scratch.db()),
+            Err(StoreError::SchemaTooOld { .. } | StoreError::SchemaTooNew { .. })
+        ));
+        assert!(
+            std::fs::read(scratch.db()).unwrap() == bytes,
+            "version rejection must not rewrite the SQLite journal-mode header"
+        );
+    }
 }

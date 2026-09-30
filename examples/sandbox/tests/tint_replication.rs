@@ -106,6 +106,7 @@ fn observe(replica: &Arc<Mutex<ReplicaWorld>>, cells: &[GlobalCell]) -> Observed
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn client_config(
     dir: &Path,
     label: &str,
@@ -295,9 +296,8 @@ fn tinted_terrain_and_detached_bodies_replicate_to_early_and_late_clients() {
             continue;
         };
         for seen in [&early_seen, &late_seen] {
-            match seen.terrain[index] {
-                Sample::Filled(now) => assert_eq!(now, before, "{cell:?} changed on a replica"),
-                _ => {}
+            if let Sample::Filled(now) = seen.terrain[index] {
+                assert_eq!(now, before, "{cell:?} changed on a replica");
             }
         }
         match late_seen.terrain[index] {

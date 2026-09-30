@@ -429,6 +429,7 @@ fn take_marked(
 /// The server fluid region for a scene's authored water: the bounding box of
 /// its water, springs, drains, and basin hints plus margins, kept inside the
 /// resident air envelope and snapped outward to whole 0.5 m fluid cells.
+#[allow(clippy::too_many_arguments)]
 fn water_setup(
     water: &[GlobalCell],
     springs: Vec<GlobalCell>,

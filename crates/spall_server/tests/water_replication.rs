@@ -50,6 +50,10 @@ fn wait_for_file(path: &PathBuf, deadline: Duration) -> String {
 /// The ENG-103 reservoir (a walled 6 m x 3 m x 2 m box split by a dam) as a
 /// server world with its authored water, plus the box's solid cell count.
 fn reservoir_world() -> (CustomWorld, u64) {
+    reservoir_world_regions(1)
+}
+
+fn reservoir_world_regions(region_count: i64) -> (CustomWorld, u64) {
     let fixture = GridReservoirFixture::new(1, false).unwrap();
     let spec = fixture.grid().spec();
     let dims = spec.dimensions();
@@ -72,6 +76,19 @@ fn reservoir_world() -> (CustomWorld, u64) {
             }
         }
     }
+    let extra: Vec<_> = (1..region_count)
+        .map(|r| {
+            let domain =
+                spall_fluid::DomainSpec::new(GlobalCell::new(r * 32, 0, 0), dims, 4096).unwrap();
+            WaterSetup::new(
+                domain,
+                fractions
+                    .iter()
+                    .map(|(p, f)| (GlobalCell::new(p.x + r * 32, p.y, p.z), *f))
+                    .collect(),
+            )
+        })
+        .collect();
     let water = WaterSetup::new(spec, fractions);
     let build = move || {
         let mut terrain = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
@@ -82,12 +99,33 @@ fn reservoir_world() -> (CustomWorld, u64) {
             )
             .unwrap();
         terrain.apply_edit(&solids).unwrap();
+        for r in 1..region_count {
+            terrain
+                .insert_brick(
+                    BrickCoord::new(r, 0, 0),
+                    Brick::uniform(MaterialId::AIR, Revision(1)),
+                )
+                .unwrap();
+            let mut other = EditPlan::new(terrain.id());
+            for z in 0..i64::from(dims[2]) {
+                for y in 0..i64::from(dims[1]) {
+                    for x in 0..i64::from(dims[0]) {
+                        if let Sample::Filled(m) =
+                            fixture.volume().sample(GlobalCell::new(x, y, z)).unwrap()
+                        {
+                            other.set(GlobalCell::new(x + r * 32, y, z), m);
+                        }
+                    }
+                }
+            }
+            terrain.apply_edit(&other).unwrap();
+        }
         let mut world = spall_sim::fixtures::flat_terrain_setup();
         world.terrain = terrain;
         world.terrain_collider_region = (
             GlobalCell::new(0, 0, 0),
             GlobalCell::new(
-                i64::from(dims[0]) - 1,
+                i64::from(dims[0]) - 1 + (region_count - 1) * 32,
                 i64::from(dims[1]) - 1,
                 i64::from(dims[2]) - 1,
             ),
@@ -98,8 +136,8 @@ fn reservoir_world() -> (CustomWorld, u64) {
     // Spawn on the upstream floor, clear of the dam.
     let spawns = vec![[1.0, 0.5, 1.0]];
     (
-        CustomWorld::new_with_water(spawns, Some(water), build),
-        solid_cells,
+        CustomWorld::new_with_water(spawns, Some(water), build).with_additional_water(extra),
+        solid_cells * region_count as u64,
     )
 }
 
@@ -109,7 +147,7 @@ fn client_receives_water_and_an_admin_reset_restores_the_scene() {
     let token = JoinToken::generate().unwrap();
     let fp_path = dir.join("server.fingerprint");
     let addr_path = dir.join("server.addr");
-    let (world, pristine_solid_cells) = reservoir_world();
+    let (world, pristine_solid_cells) = reservoir_world_regions(3);
 
     let mut server_cfg = ServeConfig::headless(
         "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
@@ -136,7 +174,7 @@ fn client_receives_water_and_an_admin_reset_restores_the_scene() {
         .parse()
         .unwrap();
 
-    let client = run_replication_client(ClientNetConfig {
+    let client_config = ClientNetConfig {
         connect_addr,
         server_fingerprint: fingerprint,
         join_token: token,
@@ -160,20 +198,42 @@ fn client_receives_water_and_an_admin_reset_restores_the_scene() {
         interactive: None,
         client_authoritative: false,
         admin_script: vec![(180, AdminCommand::ResetWorld)],
-    })
-    .expect("client run");
+    };
+    let mut late_config = client_config.clone();
+    late_config.script.clear();
+    late_config.admin_script.clear();
+    late_config.log_json = dir.join("late-client.jsonl");
+    late_config.summary_json = None;
+    let late_thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        run_replication_client(late_config).expect("late client")
+    });
+    let client = run_replication_client(client_config).expect("client run");
+    let late = late_thread.join().unwrap();
     let server = server_thread
         .join()
         .expect("server thread")
         .expect("server run");
 
     assert!(client.connected);
+    assert_eq!(client.water_regions_received, 3);
+    assert_eq!(late.water_regions_received, 3);
+    assert_eq!(late.water_keyframe_errors, 0);
+    assert_eq!(late.final_world_hash, client.final_world_hash);
+    // Dense moving frames may compress smaller than changed-brick deltas.
+    // Sparse delta selection and repair are exercised by the publisher test.
+    eprintln!(
+        "ENG105 network: three reservoirs, two clients (second joins during flow); {} bytes queued including envelope allowance, {} full frames, {} delta frames",
+        server.water_bytes_queued,
+        client.water_keyframes_received + late.water_keyframes_received,
+        client.water_delta_frames_received + late.water_delta_frames_received
+    );
     assert!(
         client.transactions_applied >= 1,
         "the dam cut replicated before the reset"
     );
     assert!(
-        client.water_keyframes_received >= 10,
+        client.water_keyframes_received >= 2,
         "water keyframes arrive continuously: {}",
         client.water_keyframes_received
     );

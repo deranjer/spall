@@ -22,33 +22,52 @@ spall_render  -> spall_mesh, spall_core            wgpu resources and render pas
 spall_server  -> spall_sim, spall_net, spall_store, spall_jobs
 spall_client  -> spall_net, spall_voxel, spall_physics, spall_render, spall_jobs, spall_fluid
 sandbox (example) -> spall_server, spall_client   game rules and executable entry points
-xtask                                    process/scenario/build orchestration
+xtask          -> spall_store                   process/scenario/build orchestration and save migration
 ```
 
 spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The graph edge is refined from `spall_sim -> spall_structure, spall_physics` to add `-> spall_jobs, spall_protocol` (T08): staging is submitted to a `spall_jobs::Scheduler` and re-validated through a `JobToken` like any other off-tick result, and every commit emits a `spall_protocol::TopologyTransaction`. Both new targets are foundation crates (`-> spall_core`); no cycle is introduced. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
 
 ENG-103 introduces `spall_fluid -> spall_core, spall_voxel` as a CPU-only
-water crate. It captures only fully resident voxel geometry and rejects
-unknown cells. Its solver is a dense two-phase (water plus air) MAC grid:
-staggered face velocities, fractional water volume with geometric (PLIC)
-conservative transport, a variable-density pressure projection with a
-multigrid preconditioner, and isothermal compressible sealed air. A Salva
-particle backend was evaluated and removed. Evidence is in
-[`docs/reports/ENG-103.md`](reports/ENG-103.md). ENG-105 increment 1 now lets
-`spall_sim::Simulation` own one fully resident, bounded `MacGridWorld` when a
-scene supplies `WaterSetup`. A committed terrain edit refreshes the fluid
-boundary with conservative displacement before the fixed 60 Hz water step;
-Rapier remains the sole rigid-body solver and water does not yet displace or
-push dynamic bodies. Stability-budget overflow skips that fluid step and is
-reported in water tick metrics without changing server dt. Network snapshots,
-late-join repair, and canonical persistence remain ENG-105 follow-up increments.
+water crate. Its dense two-phase MAC/PLIC solver uses variable-density
+pressure projection, multigrid preconditioning and isothermal sealed air.
+Evidence is in [`docs/reports/ENG-103.md`](reports/ENG-103.md).
 
-ENG-104 adds a local-only client presentation path to `spall_fluid` for the
-interactive feasibility playground. That explicit `sandbox-client --grid-fluid-demo`
-mode owns and advances its own grid fixture for visual experimentation; normal
-networked clients do not advance or claim authority over fluid state. Server
-water authority is separate from that local playground; client presentation,
-replication, and recovery remain future work.
+ENG-105 lets `Simulation` own up to eight explicitly authored, disjoint bounded
+water domains, with at most 4,194,304 fluid cells across the group and 32 million
+voxel cells per domain. A connected pressure system belongs in one domain;
+independent domains do not exchange water across their declared sides. Side
+boundaries are authored closed walls; the configured open top has accounted
+outflow. This bounds the integration without introducing an artificial wall
+where an in-domain terrain brick is unloaded: any unknown brick suspends the
+whole domain, preserves its mass, and requires a fresh boundary when residency
+returns. It does not implement seamless fluid exchange across streaming grids.
+
+The order is terrain commits, boundary refresh/displacement, accepted water
+step, then Rapier. Placement displaces through face-connected capacity, retaining
+any excess at the source in an explicit trapped-volume ledger. Reopening space
+redistributes the ledger without crossing walls or deleting mass. Water and
+voxel occupancy stay separate. Rapier remains the sole body solver; bodies are
+currently ignored by water and receive no buoyancy or drag.
+
+Inline water steps at the fixed 60 Hz tick. Worker mode solves one immutable
+clone at a time, with a fixed fluid dt. Only the owner can install a result at a
+tick boundary after validating boundary revision and spring rate. Busy, stale,
+unresident or stability-budget rejected steps report skipped fluid time; server
+dt never changes. Quiet regions sleep after 60 accepted steps below 1e-5 m/s
+face speed, without active sources or drains. Committed boundary changes,
+residency restoration and active gated springs wake them; flowing cells within
+one pressure domain remain part of that domain's solve.
+
+Clients receive quantized presentation snapshots and changed-brick deltas;
+normal clients never advance the authoritative solver. A bounded token bucket
+paces ordered updates, with periodic full repair and independent late-join
+baselines. Canonical exact fractions, ledger and source/outflow accounting are
+checkpointed and journaled atomically with the terrain/pose batch. Restart
+preserves these amounts and resets velocities, pressure, sleep and caches to
+rest. See [`docs/reports/ENG-105.md`](reports/ENG-105.md).
+
+ENG-104's explicit `sandbox-client --grid-fluid-demo` is a local experimental
+viewer; its independently advanced fixture is separate from network authority.
 
 Engine libraries live in `crates/spall_*`. The `sandbox` package lives in `examples/sandbox`, with game-specific rules/material catalogs and the `sandbox-server` / `sandbox-client` binaries. `sandbox_game` below denotes that package's game-rules module, not another engine dependency. Hosts receive game configuration and, when needed, a small statically linked rules interface; engine libraries never import the example. T00 only needs host configurations/run functions and thin binaries, not speculative gameplay hooks. `tools/xtask` owns orchestration; as of T09 it also links `spall_net` for the
 in-process `cargo xtask net-check` transport harness. Add `games/survival` only

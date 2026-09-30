@@ -31,9 +31,11 @@ pub mod dto;
 pub mod fault;
 pub mod inject;
 pub mod metrics;
+mod migrate;
 pub mod recover;
 pub mod residency_store;
 mod schema;
+pub use migrate::migrate_v1_water;
 
 pub use brick::{BrickCodecError, DENSE_CELL_BYTES, decode_cells, encode_cells};
 pub use db::{DEFAULT_MAX_BATCH_RECORDS, WalCheckpoint, Writer};

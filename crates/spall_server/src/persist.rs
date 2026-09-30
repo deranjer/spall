@@ -220,6 +220,7 @@ pub(crate) fn capture_with_terrain_bricks(
     };
 
     Ok(Checkpoint {
+        water: sim.water_regions().map(|w| w.canonical_state()).collect(),
         tick: sim.current_tick().get(),
         journal_cursor,
         world_hash: world.world_hash().0,
@@ -545,6 +546,7 @@ pub fn restore_with_terrain_collider_mode(
     // replayed record. Simulation time resumes here so the first post-recovery
     // tick is strictly newer than every durable record (ENG-39).
     let mut durable_tick = cp.tick;
+    let mut water_state = cp.water.clone();
 
     for record in &recovery.journal {
         // The durable suffix is seq-ordered; its record ticks must be
@@ -562,6 +564,16 @@ pub fn restore_with_terrain_collider_mode(
         // transaction plus an out-of-band `BaselineWorld`; ordinary topology
         // records replay with `None`.
         let topology = match &record.payload {
+            JournalPayload::WaterState(state) => {
+                for region in state {
+                    region
+                        .validate()
+                        .map_err(|_| PersistError::BadField("journal water state"))?;
+                }
+                water_state = state.clone();
+                last_seq = record.seq;
+                continue;
+            }
             JournalPayload::Topology { .. } => record
                 .payload
                 .as_topology()
@@ -623,10 +635,10 @@ pub fn restore_with_terrain_collider_mode(
 
     // Resume at the durable suffix tick, not `cp.tick`: the next `tick()` then
     // stamps events at `durable_tick + 1`, strictly after every durable record.
-    Ok((
-        Simulation::from_restored(world, Tick(durable_tick)),
-        last_seq,
-    ))
+    let mut sim = Simulation::from_restored(world, Tick(durable_tick));
+    sim.restore_water_regions(&water_state)
+        .map_err(|_| PersistError::BadField("water recovery"))?;
+    Ok((sim, last_seq))
 }
 
 /// Full-history replay: recover from the **oldest** checkpoint in `db_path` (the
