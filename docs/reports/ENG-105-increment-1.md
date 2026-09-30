@@ -1,3 +1,5 @@
+> Historical increment-1 report. Completion evidence and current contracts are in [ENG-105](ENG-105.md).
+
 # ENG-105 increment 1: authoritative water
 
 Status: historical evidence for the first ENG-105 increment. PR #167 subsequently

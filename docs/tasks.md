@@ -1018,32 +1018,25 @@ The Salva particle backend was removed after selection. The grid scenarios now
 build their scene and bit-identical reference volume in
 `fixtures::ReservoirScene`. Production integration is tracked as ENG-105.
 
-### ENG-105 — Authoritative water integration (partial increments 1–2)
+### ENG-105 � Authoritative water integration
 
-`spall_sim` owns one explicitly bounded, fully resident `MacGridWorld` for a
-scene that supplies `WaterSetup`. Each fixed 60 Hz simulation tick first commits
-terrain transactions, refreshes the fluid solid boundary, conservatively moves
-water out of newly occupied cells, and advances the fluid solver before Rapier.
-If the solver's stability preflight exceeds its bounded substep budget, water
-skips that fluid step and reports skipped ticks/time; the server tick rate and
-physics dt remain fixed. A boundary refresh that cannot conservatively displace
-water through connected open cells fails without mutating fluid state. This
-does not satisfy the ticket's always-succeed placement decision. Optional worker
-execution also publishes asynchronously; revision validation and owner-thread
-application at tick boundaries remain open.
+Integration now includes owner-thread boundary displacement and validated
+immutable worker results, the user-approved trapped-volume ledger for sealed
+placements, changed-brick presentation deltas, budgeted full repair and late
+join, exact checkpoint/journal amounts with reset-to-rest recovery, quiet-water
+sleep and conservative residency suspension, and several independently bounded
+pressure domains. Connected water stays within one authored domain; exchange
+between streaming grids is a later scaling extension.
 
-The valley showcase's authored water is loaded as water fractions instead of
-collidable blue voxels, and its custom server world installs that setup. This
-merged implementation also sends quantized full-domain keyframes at up to 15 Hz
-and presents them on clients, including late join and scene reset. Per-brick
-deltas, bandwidth scheduling, durable water checkpoints, multiple/streamed
-regions, and dynamic-body coupling remain open. Do not describe water as
-persisted. See [`docs/reports/ENG-105-increment-1.md`](reports/ENG-105-increment-1.md)
-and [`docs/reports/ENG-105-replication-validation.md`](reports/ENG-105-replication-validation.md).
+Evidence, exact checks, sustained timings/bandwidth and remaining limits are in
+[`docs/reports/ENG-105.md`](reports/ENG-105.md). Earlier partial implementation
+reports are historical: [`ENG-105-increment-1`](reports/ENG-105-increment-1.md)
+and [`replication validation`](reports/ENG-105-replication-validation.md).
 
-Swimming, boats, rigid-body coupling, multiplayer water DTOs, persistence,
-streaming-scale behavior, and replaceable water appearance are later scoped
-assignments. See Loopira ENG-103 for the matching tracked issue.
+Rigid-body coupling, swimming, boats, sailing and appearance remain separate
+assignments. The measured three-reservoir fluid cost exceeds the earlier 2 ms
+proposal; this integration does not resolve the larger ENG-103 pressure-cost
+limits or establish a whole-game/GPU performance gate.
 
 ### ENG-104 — Interactive sandbox water demo
 
