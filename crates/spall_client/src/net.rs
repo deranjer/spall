@@ -1212,8 +1212,8 @@ async fn run_async(
     // scripter records each request it sends; the control reader forwards
     // retryable rejection kinds here; the retrier resends each request within
     // its throttle and overload budgets.
-    let sent_actions: Arc<Mutex<HashMap<u64, (WireRecord, u8, u8)>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    type SentActions = Arc<Mutex<HashMap<u64, (WireRecord, u8, u8)>>>;
+    let sent_actions: SentActions = Arc::new(Mutex::new(HashMap::new()));
     let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
 
     // Control reader: apply transactions, answer repair gaps.

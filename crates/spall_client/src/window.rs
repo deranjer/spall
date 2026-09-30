@@ -500,14 +500,13 @@ fn visible_terrain_bricks(volume: &Volume, center_m: [f64; 3]) -> Vec<BrickCoord
     coords
 }
 
+type MeshUpdate<K> = (K, Vec<spall_render::GpuVertex>, Vec<u32>);
+
 fn update_terrain_mesh_cache(
     volume: &Volume,
     center_m: [f64; 3],
     cache: &mut TerrainMeshCache,
-) -> (
-    Vec<(BrickCoord, Vec<spall_render::GpuVertex>, Vec<u32>)>,
-    Vec<BrickCoord>,
-) {
+) -> (Vec<MeshUpdate<BrickCoord>>, Vec<BrickCoord>) {
     let started = Instant::now();
     let visible = visible_terrain_bricks(volume, center_m);
     let world = VolumeMeshWorld(volume);
@@ -1450,15 +1449,15 @@ impl ApplicationHandler for InteractiveApp {
                     return;
                 };
                 renderer.scene.set_terrain_meshes_visible(self.show_terrain);
-                if !terrain_updates.is_empty() || !terrain_removed.is_empty() {
-                    if let Err(error) = renderer.scene.update_terrain_meshes(
+                if (!terrain_updates.is_empty() || !terrain_removed.is_empty())
+                    && let Err(error) = renderer.scene.update_terrain_meshes(
                         &renderer.device,
                         &terrain_updates,
                         &terrain_removed,
-                    ) {
-                        self.fail(event_loop, ClientError::Render(error.to_string()));
-                        return;
-                    }
+                    )
+                {
+                    self.fail(event_loop, ClientError::Render(error.to_string()));
+                    return;
                 }
                 if let Some(instances) = &water_update {
                     renderer.set_debug_water(instances);
@@ -2229,7 +2228,7 @@ fn pose_body_meshes(
     local_poses: Option<&crate::interactive::LocalBodyPoses>,
     now: Instant,
     stats: &mut PoseStats,
-) -> (Vec<(u64, Vec<spall_render::GpuVertex>, Vec<u32>)>, Vec<u64>) {
+) -> (Vec<MeshUpdate<u64>>, Vec<u64>) {
     let mut output = Vec::with_capacity(draws.len());
     let mut live = Vec::with_capacity(draws.len());
     for draw in draws {
