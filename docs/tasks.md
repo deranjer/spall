@@ -859,7 +859,9 @@ scoped it (what ran in the interactive game versus captures/editor).
   temporal and streamed boundaries are ENG-101 (R4b).
 - **ENG-100 R7** — move terrain (and body templates) from instanced cubes to
   incremental greedy meshes (measured 23x fewer triangles, ~8x cheaper frame,
-  baked AO); depends on R3's evidence.
+  baked AO); depends on R3's evidence. First pass done; see
+  `docs/reports/ENG-100.md` (incremental and edit-to-mesh latency still need a
+  live measurement).
 - **ENG-101 R4b** — bodies as occluders/bounce sources, incremental sweeps.
   First pass done; see `docs/reports/ENG-101.md`.
 - **ENG-102 R4c** — hitch-free scroll (double-buffered re-centre), low-angle

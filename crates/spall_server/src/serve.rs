@@ -715,6 +715,8 @@ pub struct ServeSummary {
     pub clients_connected: usize,
     pub transactions_committed: u64,
     pub actions_rejected: u64,
+    /// Per-run intent admission and pipeline pressure, including queue-full rejections.
+    pub intent_stats: IntentStats,
     pub final_world_hash: String,
     pub total_solid_cells: u64,
     pub body_count: usize,
@@ -921,6 +923,50 @@ pub struct ServeSummary {
     pub physics_max_ms: f64,
     pub physics_samples: u64,
     pub physics_window_complete: bool,
+}
+
+/// Admission and per-tick pressure observed by the authoritative edit pipeline.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct IntentStats {
+    pub queue_full_rejections: u64,
+    pub pending_max: u64,
+    pub retried_conflicts: u64,
+    pub stale_discards: u64,
+    pub serialized_regions: u64,
+    pub ticks: u64,
+    pub pending_ticks: u64,
+    pub commits_in_pending_ticks: u64,
+    pub pending_depth_sum: u64,
+}
+
+impl IntentStats {
+    fn record_tick(
+        &mut self,
+        pending_after: usize,
+        committed: usize,
+        retried: usize,
+        stale_discards: usize,
+        serialized_regions: usize,
+    ) {
+        self.ticks += 1;
+        self.pending_max = self.pending_max.max(pending_after as u64);
+        self.pending_depth_sum += pending_after as u64;
+        self.retried_conflicts += retried as u64;
+        self.stale_discards += stale_discards as u64;
+        self.serialized_regions += serialized_regions as u64;
+        if pending_after > 0 {
+            self.pending_ticks += 1;
+            self.commits_in_pending_ticks += committed as u64;
+        }
+    }
+}
+
+fn intent_rejection_reason(error: &spall_sim::IntentError) -> String {
+    if matches!(error, spall_sim::IntentError::QueueFull { .. }) {
+        format!("overloaded: {error}; retry with backoff")
+    } else {
+        error.to_string()
+    }
 }
 
 /// One connection's total egress this run, alongside where its interest
@@ -2054,6 +2100,7 @@ async fn serve_async(
         // per-tick admission quota and were bounced with a retry response
         // (actions) or dropped (repairs).
         let mut actions_throttled = 0u64;
+        let mut intent_stats = IntentStats::default();
         let mut repairs_throttled = 0u64;
 
         // T11a / ENG-62: commit-latency measurement + admission accounting.
@@ -2304,11 +2351,14 @@ async fn serve_async(
                                     );
                                 }
                                 Err(e) => {
+                                    if matches!(e, spall_sim::IntentError::QueueFull { .. }) {
+                                        intent_stats.queue_full_rejections += 1;
+                                    }
                                     reject(
                                         &clients_for_sim,
                                         session,
                                         req.request_id,
-                                        &e.to_string(),
+                                        &intent_rejection_reason(&e),
                                     );
                                     rejected_total += 1;
                                 }
@@ -2574,6 +2624,13 @@ async fn serve_async(
                 Err(e) => return SimResult::error(format!("tick failed: {e}"), ticks_run),
             };
             ticks_run += 1;
+            intent_stats.record_tick(
+                report.pending_after,
+                report.committed.len(),
+                report.retried.len(),
+                report.discarded_stale.len(),
+                report.serialized_regions.len(),
+            );
             let tick = sim.current_tick();
             // Correct an earlier "queued" dam-gate admin reply once its edit
             // actually resolves — committed or (today, on this scene's giant
@@ -3210,6 +3267,7 @@ async fn serve_async(
             ticks_run,
             committed_total,
             rejected_total,
+            intent_stats,
             final_world_hash: sim.world().world_hash().to_string(),
             total_solid_cells: sim.world().total_solid_cells(),
             body_count: sim.world().body_count(),
@@ -3350,7 +3408,8 @@ async fn serve_async(
         // residency_checkpoint_bricks_logical_total (incremental checkpoint
         // capture evidence).
         // v9: T23 / G4 bounded owning-tick and physics timing telemetry.
-        version: 9,
+        // v10: ENG-109 authoritative intent admission and pipeline pressure.
+        version: 10,
         result: result.to_string(),
         scene: format!("{scene:?}"),
         bound_addr: bound.to_string(),
@@ -3358,6 +3417,7 @@ async fn serve_async(
         clients_connected,
         transactions_committed: sim_result.committed_total,
         actions_rejected: sim_result.rejected_total,
+        intent_stats: sim_result.intent_stats.clone(),
         final_world_hash: sim_result.final_world_hash.clone(),
         total_solid_cells: sim_result.total_solid_cells,
         body_count: sim_result.body_count,
@@ -3563,6 +3623,7 @@ struct SimResult {
     ticks_run: u64,
     committed_total: u64,
     rejected_total: u64,
+    intent_stats: IntentStats,
     final_world_hash: String,
     total_solid_cells: u64,
     body_count: usize,
@@ -3620,6 +3681,7 @@ impl SimResult {
             ticks_run,
             committed_total: 0,
             rejected_total: 0,
+            intent_stats: IntentStats::default(),
             final_world_hash: String::new(),
             total_solid_cells: 0,
             body_count: 0,
@@ -5104,6 +5166,50 @@ async fn serve_conn(
 mod tests {
     use super::*;
     use spall_store::{JournalPayload, JournalRecord};
+
+    #[test]
+    fn queue_full_intent_rejections_are_marked_retryable() {
+        let reason = intent_rejection_reason(&spall_sim::IntentError::QueueFull { limit: 256 });
+        assert!(reason.starts_with("overloaded:"));
+        assert!(reason.contains("retry with backoff"));
+        let reason =
+            intent_rejection_reason(&spall_sim::IntentError::DuplicateRequest(RequestId(9)));
+        assert!(!reason.starts_with("overloaded:"));
+    }
+
+    #[test]
+    fn intent_stats_serialize_pipeline_pressure_fields() {
+        let stats = IntentStats {
+            queue_full_rejections: 2,
+            pending_max: 8,
+            retried_conflicts: 3,
+            stale_discards: 1,
+            serialized_regions: 4,
+            ticks: 20,
+            pending_ticks: 7,
+            commits_in_pending_ticks: 9,
+            pending_depth_sum: 31,
+        };
+        let value = serde_json::to_value(stats).unwrap();
+        assert_eq!(value["queue_full_rejections"], 2);
+        assert_eq!(value["pending_max"], 8);
+        assert_eq!(value["pending_depth_sum"], 31);
+    }
+
+    #[test]
+    fn intent_stats_accumulate_pending_and_rebase_activity_per_tick() {
+        let mut stats = IntentStats::default();
+        stats.record_tick(2, 1, 3, 1, 2);
+        stats.record_tick(0, 1, 0, 0, 0);
+        assert_eq!(stats.ticks, 2);
+        assert_eq!(stats.pending_max, 2);
+        assert_eq!(stats.pending_depth_sum, 2);
+        assert_eq!(stats.pending_ticks, 1);
+        assert_eq!(stats.commits_in_pending_ticks, 1);
+        assert_eq!(stats.retried_conflicts, 3);
+        assert_eq!(stats.stale_discards, 1);
+        assert_eq!(stats.serialized_regions, 2);
+    }
 
     #[test]
     fn player_credential_registry_parser_never_echoes_tokens() {
