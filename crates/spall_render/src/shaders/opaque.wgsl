@@ -185,6 +185,15 @@ fn hemisphere_radiance(dy: f32) -> vec3<f32> {
     return mix(globals.ground_color.rgb, globals.sky_color.rgb, dy * 0.5 + 0.5);
 }
 
+// Sky colour a vertical face receives through its unblocked rays. Sky
+// visibility already discards every ray that hits the ground or a wall, so the
+// rays that remain all point above the horizon and see sky, not the average of
+// sky and ground the legacy unconditional ambient used for side faces. Blending
+// the dark ground colour in here counted the blocked half of the hemisphere a
+// second time and left open-air walls in shade about half as bright as they
+// should be; the ground's contribution comes from the bounce term instead.
+const SIDE_SKY_DY: f32 = 0.5;
+
 fn decode_rgb9e5(v: u32) -> vec3<f32> {
     let scale = exp2(f32(v >> 27u) - 24.0);
     return vec3<f32>(f32(v & 511u), f32((v >> 9u) & 511u), f32((v >> 18u) & 511u)) * scale;
@@ -232,22 +241,41 @@ fn sky_light(world_pos: vec3<f32>, n: vec3<f32>) -> SkyLight {
             sky_face_value(packed, face_y),
             sky_face_value(packed, face_z),
         );
-        if bounce_on {
+        weight += w;
+    }
+    // Bounce is a low-frequency term estimated from a handful of rays per cell,
+    // so a single cell is noisy. Reconstruct it with a wider tent filter (3
+    // cells per axis, radius 1.5 cells) instead of the 2-cell trilinear the
+    // skylight uses; solid and unknown cells still contribute nothing.
+    var bounce_weight = 0.0;
+    if bounce_on {
+        let nearest = vec3<i32>(floor(c + vec3<f32>(0.5)));
+        for (var k = 0; k < 27; k += 1) {
+            let o = vec3<i32>(k % 3 - 1, (k / 3) % 3 - 1, k / 9 - 1);
+            let cell = nearest + o;
+            if any(cell < vec3<i32>(0)) || any(cell >= vec3<i32>(dim)) { continue; }
+            let d = abs(vec3<f32>(cell) - c);
+            let tw = max(1.5 - d, vec3<f32>(0.0));
+            let w = tw.x * tw.y * tw.z;
+            if w <= 0.0 { continue; }
+            let idx = u32(cell.x + dim * (cell.y + dim * cell.z));
+            let packed = sky_faces[idx];
+            if ((packed.y >> 16u) & 255u) == 0u { continue; }
             bounce_acc += w * (n.x * n.x * decode_rgb9e5(sky_bounce[idx * 6u + face_x])
                 + n.y * n.y * decode_rgb9e5(sky_bounce[idx * 6u + face_y])
                 + n.z * n.z * decode_rgb9e5(sky_bounce[idx * 6u + face_z]));
+            bounce_weight += w;
         }
-        weight += w;
     }
     // Every neighbour solid: buried, nothing sees the sky.
     let v = select(vec3<f32>(0.0), acc / max(weight, 0.0001), weight > 0.0001);
     let w = n * n;
     let up = select(-1.0, 1.0, n.y >= 0.0);
-    result.radiance = w.x * v.x * hemisphere_radiance(0.0)
+    result.radiance = w.x * v.x * hemisphere_radiance(SIDE_SKY_DY)
         + w.y * v.y * hemisphere_radiance(up)
-        + w.z * v.z * hemisphere_radiance(0.0);
+        + w.z * v.z * hemisphere_radiance(SIDE_SKY_DY);
     result.visibility = w.x * v.x + w.y * v.y + w.z * v.z;
-    if bounce_on && weight > 0.0001 { result.bounce = bounce_acc / weight; }
+    if bounce_on && bounce_weight > 0.0001 { result.bounce = bounce_acc / bounce_weight; }
     return result;
 }
 

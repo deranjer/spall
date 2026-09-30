@@ -582,9 +582,10 @@ fn narrow_gaps_close_and_one_metre_gaps_open() {
 }
 
 /// Light arriving at a low angle: a lamp several metres away on the same floor
-/// subtends only a few degrees of elevation, where the cosine lobe still has
-/// weight. It must still reach the floor, and fall off roughly as the inverse
-/// square of the distance.
+/// subtends only a few degrees of elevation. It must still reach the floor, and
+/// keep falling off with distance out to 9 m. Since far emission is lit
+/// analytically (see `emitters.wgsl`) instead of by whichever rays happen to hit
+/// the lamp, there is no longer a range where a small lamp falls between rays.
 #[test]
 #[ignore = "requires a working GPU adapter"]
 fn a_distant_lamp_still_lights_the_floor_and_falls_off() {
@@ -614,20 +615,122 @@ fn a_distant_lamp_still_lights_the_floor_and_falls_off() {
         println!("floor {d:.1} m from the lamp: {v:.4}");
     }
     assert!(
-        values[2].1 > 0.004,
+        values[2].1 > 0.0005,
         "4.5 m away should still be lit: {values:?}"
     );
-    // Beyond ~5 m a lamp this small (about 10 degrees across) falls between the
-    // fixed rays, so its reach is documented (~4.5 m), not asserted.
+    assert!(
+        values[4].1 > 0.0001,
+        "9 m away should still be lit now that far emission is analytic: {values:?}"
+    );
     for pair in values.windows(2) {
         assert!(
             pair[0].1 >= pair[1].1,
             "light must not increase with distance: {values:?}"
         );
     }
+    // The floor sees the lamp at grazing incidence, so on top of the 1/d^2 of
+    // distance the receiver cosine falls with it: steeper than 9x from 1.5 m to
+    // 4.5 m, but not a cliff.
     let ratio = values[0].1 / values[2].1.max(1e-6);
     assert!(
-        (2.0..40.0).contains(&ratio),
-        "1.5 m vs 4.5 m should fall off steeply (1/d^2 would be 9x): {ratio}"
+        (2.0..200.0).contains(&ratio),
+        "1.5 m vs 4.5 m should fall off steeply (1/d^2 alone would be 9x): {ratio}"
+    );
+}
+
+/// A small lamp far from a wall used to light it by luck: a cell's 66 rays mostly
+/// miss a 1 m target 14 m away, so a few cells got a full-strength hit and their
+/// neighbours nothing (random bright spots). Lit analytically, the wall's
+/// brightness varies smoothly. This measures the variation across a grid of
+/// wall points; a speckled wall has a coefficient of variation above 1.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn a_small_distant_lamp_lights_a_wall_smoothly() {
+    let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored test");
+    // Looking at the wall's +x face; the lamp is behind the camera, out of view.
+    let camera = Camera::looking_along(
+        Vec3::new(8.0, 2.0, 0.0),
+        Vec3::new(-1.0, 0.0, 0.0),
+        70_f32.to_radians(),
+        SIZE.0 as f32 / SIZE.1 as f32,
+    );
+    let mut environment = EnvironmentPreset::Night.environment();
+    environment.sun_intensity = 0.0;
+    environment.sky = [0.0; 3];
+    environment.ground = [0.0; 3];
+    let boxes = vec![
+        ground(),
+        boxed(WHITE, [0.0, 2.0, 0.0], [0.5, 4.0, 20.0]),
+        boxed(LAMP, [14.0, 1.5, 0.0], [1.0, 1.0, 1.0]),
+    ];
+    let image = render(
+        &ctx,
+        &camera,
+        &environment,
+        DebugView::IndirectOnly,
+        &boxes,
+        true,
+    );
+    save_png("distant-lamp-wall-indirect-only.png", &image);
+    let mut samples = Vec::new();
+    for zi in -4..=4 {
+        for yi in [1.0_f32, 2.0, 3.0] {
+            let p = Vec3::new(0.26, yi, zi as f32);
+            samples.push(at(&camera, &image, p)[0]);
+        }
+    }
+    let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+    let variance =
+        samples.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / samples.len() as f32;
+    let cv = variance.sqrt() / mean.max(1e-9);
+    println!("wall 14 m from a 1 m lamp: mean {mean:.5}, coefficient of variation {cv:.3}");
+    assert!(mean > 0.0005, "the wall must be lit by the lamp: {mean}");
+    assert!(
+        cv < 0.35,
+        "a distant lamp must light the wall smoothly, not as random spots: cv {cv}"
+    );
+}
+
+/// More emissive bins than the emitter list holds: the bounce pass must fall
+/// back to sampling emission with rays, not silently drop lamps.
+#[test]
+#[ignore = "requires a working GPU adapter"]
+fn too_many_emitters_fall_back_to_rays_instead_of_going_dark() {
+    use spall_render::sky_visibility::EMITTER_CAPACITY;
+    let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored test");
+    let camera = top_camera();
+    let mut environment = EnvironmentPreset::Night.environment();
+    environment.sun_intensity = 0.0;
+    environment.sky = [0.0; 3];
+    environment.ground = [0.0; 3];
+    // One lamp per 2 m bin, more than the list can hold, all well away from the
+    // probe so the probe's light is the sum of many distant lamps.
+    let per_axis = ((EMITTER_CAPACITY as f32).sqrt().ceil() as i32) + 2;
+    let mut boxes = vec![ground()];
+    for ix in 0..per_axis {
+        for iz in 0..per_axis {
+            let x = -28.0 + 2.0 * ix as f32 + 1.0;
+            let z = -28.0 + 2.0 * iz as f32 + 1.0;
+            boxes.push(boxed(GLOW, [x, 0.5, z], [0.5, 1.0, 0.5]));
+        }
+    }
+    assert!(
+        (per_axis * per_axis) as u32 > EMITTER_CAPACITY,
+        "the scene must overflow the emitter list"
+    );
+    let image = render(
+        &ctx,
+        &camera,
+        &environment,
+        DebugView::IndirectOnly,
+        &boxes,
+        true,
+    );
+    save_png("emitter-overflow-indirect-only.png", &image);
+    let lit = at(&camera, &image, Vec3::new(0.0, 0.0, 0.0));
+    println!("floor amid {} lamps: {lit:?}", per_axis * per_axis);
+    assert!(
+        lit[0] > 0.001,
+        "an overflowing emitter list must fall back to rays, not go dark: {lit:?}"
     );
 }

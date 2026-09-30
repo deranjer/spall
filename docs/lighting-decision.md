@@ -191,3 +191,18 @@ evidence stand as recorded above. The thin-wall evaluation there (walls of one
 voxel and up block completely; openings under 0.75 m close; a one-metre opening
 is guaranteed open) is the first measurement of the frozen cache against
 authored detail, and proposes no change to it.
+
+## Addendum (ENG-102, 2026-09-30): runtime lighting as shipped
+
+The frozen cache surface (`128^3` cells, `0.5 m`, derived and client-local) is
+unchanged. Two statements above are historical and superseded for the
+interactive runtime, as recorded in `docs/reports/ENG-102.md` section 7:
+
+- The workspace is on wgpu 30, not the pinned `24.0.5` the T13 numbers were
+  taken on. The runtime passes were re-measured on wgpu 30 in release at
+  1920x1080 (steady-state GPU pass p95 about 2.8 ms at forest scale against the
+  provisional 12 ms budget; full-cache bounce recompute about 5 ms).
+- The bounce pass casts 66 rays per cell (rotated per cell by a hash of the
+  world cell) rather than twelve fixed rays, and lights distant emissive
+  surfaces analytically from a gathered emitter list instead of hoping rays hit
+  them. The T13/T14 prototype passes and their captures stand as recorded.
