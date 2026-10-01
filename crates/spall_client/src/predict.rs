@@ -797,13 +797,18 @@ fn too_large_to_mirror(volume: &Volume) -> bool {
     cells > spall_physics::occupancy::MAX_GRID_CELLS
 }
 
-/// The collision window around the player, in cells: 193 x 129 x 193 = 4.8M,
-/// under the grid cap. Rebuilt when the player comes within the margins.
-const WINDOW_HALF_XZ: i64 = 96;
-const WINDOW_BELOW: i64 = 48;
-const WINDOW_ABOVE: i64 = 80;
-const WINDOW_MARGIN_XZ: i64 = 32;
-const WINDOW_MARGIN_Y: i64 = 16;
+/// The collision window around the player, in cells: 49 x 41 x 49 = 98k, a few
+/// milliseconds to build. The character sweeps against the volume itself (the
+/// query window); this collider is only the fallback and the has-terrain gate,
+/// so a few metres around the player is all it must cover. A 193 x 129 x 193
+/// window took 124 ms to rebuild on the thread that publishes the predicted
+/// position, a visible hitch every time the player neared its edge or edited
+/// the terrain. Rebuilt when the player comes within the margins.
+const WINDOW_HALF_XZ: i64 = 24;
+const WINDOW_BELOW: i64 = 16;
+const WINDOW_ABOVE: i64 = 24;
+const WINDOW_MARGIN_XZ: i64 = 10;
+const WINDOW_MARGIN_Y: i64 = 6;
 
 fn window_around(feet_m: [f64; 3]) -> (GlobalCell, GlobalCell) {
     let cell_m = f64::from(CELL_M);
@@ -2014,7 +2019,7 @@ mod large_world_window_tests {
         assert!(!phys.covers(far));
         assert!(phys.needs_window_move(far));
         // Walking toward the window's edge asks for a rebuild before leaving it.
-        assert!(phys.needs_window_move([40.0 + 17.0, 8.5, 40.0]));
+        assert!(phys.needs_window_move([40.0 + 4.0, 8.5, 40.0]));
 
         // Rebuilt around the new position, the player is covered again.
         phys.set_focus(far);

@@ -370,6 +370,8 @@ struct InteractiveApp {
     last_dispatch_at: Option<Instant>,
     /// The replica terrain generation the last rebuild request was issued for.
     last_dispatch_generation: Option<u64>,
+    /// A hammer swing was just previewed: rebuild at once, not at the next timer.
+    force_rebuild: bool,
     /// One-sample-delayed camera interpolation and correction smoothing.
     /// Keeping the two newest mover publications prevents forward
     /// extrapolation from overshooting the actual stop point.
@@ -459,10 +461,15 @@ struct RebuildWorker {
     request_tx: mpsc::Sender<[f64; 3]>,
     result_rx: mpsc::Receiver<RebuildOutcome>,
     in_flight: bool,
+    /// Hammer swings awaiting the server, shared with the worker thread.
+    pending: Arc<Mutex<Vec<PendingCut>>>,
 }
 
 pub struct RebuildOutcome {
     pub center_m: [f64; 3],
+    /// `true` for the geometry result of a pass; `false` for the lighting
+    /// result that follows it, which carries no instances.
+    pub instances_included: bool,
     pub instances: Vec<Instance>,
     /// Sky occupancy built from the same volume snapshot as `instances`, or
     /// `None` when it is identical to the last one sent (nothing to recompute).
@@ -505,22 +512,67 @@ pub fn rebuild_pass_cached(
     absent_is_open: bool,
     cache: &mut TerrainInstanceCache,
 ) -> Option<RebuildOutcome> {
-    let volume = replica
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .terrain_volume()
-        .cloned()?;
+    let (volume, _generation, instances, geometry) =
+        rebuild_instances(replica, center_m, cache, &mut Vec::new())?;
+    let (sky, sky_stats, lighting) =
+        rebuild_sky(&volume, center_m, sky_anchor, last_sky, absent_is_open);
+    Some(RebuildOutcome {
+        center_m,
+        instances_included: true,
+        instances,
+        sky,
+        sky_stats,
+        elapsed: geometry + lighting,
+    })
+}
+
+/// Phase one of a rebuild: the terrain boxes around `center_m` from `replica`'s
+/// current terrain (reusing `cache`), plus the volume snapshot and terrain
+/// generation they were built from. Cheap after the first pass, so it is sent
+/// to the window before the lighting work.
+pub fn rebuild_instances(
+    replica: &Arc<Mutex<ReplicaWorld>>,
+    center_m: [f64; 3],
+    cache: &mut TerrainInstanceCache,
+    pending: &mut Vec<PendingCut>,
+) -> Option<(Volume, u64, Vec<Instance>, Duration)> {
+    let (mut volume, generation) = {
+        let replica = replica.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            replica.terrain_volume().cloned()?,
+            replica.terrain_generation(),
+        )
+    };
     let start = Instant::now();
-    let instances = build_instances_cached(&volume, center_m, cache);
-    // Keep the cache where it is until the player has moved far enough to
-    // matter, so a stationary or slowly moving player produces an identical
-    // grid and no lighting recompute.
+    // Unconfirmed swings are drawn on this private copy; the lighting pass
+    // below gets the same copy, so a preview is lit like the real thing.
+    let volatile = apply_pending_cuts(&mut volume, pending, start);
+    let instances = build_instances_volatile(&volume, center_m, cache, &volatile);
+    Some((volume, generation, instances, start.elapsed()))
+}
+
+/// Phase two of a rebuild: the sky occupancy grid around `center_m` (kept where
+/// it is until the player has moved far enough to matter, so a slowly moving
+/// player produces an identical grid), or `None` when it is identical to the
+/// last one sent.
+pub fn rebuild_sky(
+    volume: &Volume,
+    center_m: [f64; 3],
+    sky_anchor: &mut Option<[f64; 3]>,
+    last_sky: &mut Option<spall_render::indirect::LightingVolume>,
+    absent_is_open: bool,
+) -> (
+    Option<spall_render::indirect::LightingVolume>,
+    crate::sky::SkyOccupancyStats,
+    Duration,
+) {
+    let start = Instant::now();
     let sky_center = match *sky_anchor {
         Some(anchor) if within_sky_anchor(anchor, center_m) => anchor,
         _ => center_m,
     };
     *sky_anchor = Some(sky_center);
-    let (grid, sky_stats) = crate::sky::build_sky_occupancy(&volume, sky_center, absent_is_open);
+    let (grid, sky_stats) = crate::sky::build_sky_occupancy(volume, sky_center, absent_is_open);
     let changed = last_sky
         .as_ref()
         .is_none_or(|last| last.origin() != grid.origin() || last.cells() != grid.cells());
@@ -528,13 +580,7 @@ pub fn rebuild_pass_cached(
         *last_sky = Some(grid.clone());
         grid
     });
-    Some(RebuildOutcome {
-        center_m,
-        instances,
-        sky,
-        sky_stats,
-        elapsed: start.elapsed(),
-    })
+    (sky, sky_stats, start.elapsed())
 }
 
 impl RebuildWorker {
@@ -544,28 +590,73 @@ impl RebuildWorker {
     fn spawn(session: Arc<InteractiveSession>, absent_is_open: bool) -> Result<Self, ClientError> {
         let (request_tx, request_rx) = mpsc::channel::<[f64; 3]>();
         let (result_tx, result_rx) = mpsc::channel();
+        let pending: Arc<Mutex<Vec<PendingCut>>> = Arc::new(Mutex::new(Vec::new()));
+        let worker_pending = pending.clone();
         std::thread::Builder::new()
             .name("spall-client-rebuild".into())
             .spawn(move || {
                 let mut sky_anchor: Option<[f64; 3]> = None;
                 let mut last_sky: Option<spall_render::indirect::LightingVolume> = None;
                 let mut terrain_cache = TerrainInstanceCache::new();
+                let mut last_sky_generation: Option<u64> = None;
                 for center_m in request_rx {
                     let Some(replica) = session.replica.get() else {
                         continue;
                     };
-                    let Some(outcome) = rebuild_pass_cached(
-                        replica,
+                    let mut previews = worker_pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let Some((volume, generation, instances, elapsed)) =
+                        rebuild_instances(replica, center_m, &mut terrain_cache, &mut previews)
+                    else {
+                        continue;
+                    };
+                    // Expired previews leave the shared list; the replica's own
+                    // confirmation is detected per pass (the centre cell is air).
+                    worker_pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .retain(|p| p.at.elapsed() < PENDING_CUT_LIFETIME);
+
+                    // Geometry first: it is what an edit or a step changes on
+                    // screen, and it is cheap once the cache is warm.
+                    let geometry = RebuildOutcome {
+                        center_m,
+                        instances_included: true,
+                        instances,
+                        sky: None,
+                        sky_stats: crate::sky::SkyOccupancyStats::default(),
+                        elapsed,
+                    };
+                    if result_tx.send(geometry).is_err() {
+                        return; // the window is gone
+                    }
+                    // Lighting only when the terrain changed or the player left
+                    // the area the last grid was built around; rebuilding it on
+                    // every step cost 15-40 ms for an identical result.
+                    let anchored = sky_anchor.is_some_and(|a| within_sky_anchor(a, center_m));
+                    if last_sky_generation == Some(generation) && anchored {
+                        continue;
+                    }
+                    last_sky_generation = Some(generation);
+                    let (sky, sky_stats, sky_elapsed) = rebuild_sky(
+                        &volume,
                         center_m,
                         &mut sky_anchor,
                         &mut last_sky,
                         absent_is_open,
-                        &mut terrain_cache,
-                    ) else {
-                        continue;
+                    );
+                    let lighting = RebuildOutcome {
+                        center_m,
+                        instances_included: false,
+                        instances: Vec::new(),
+                        sky,
+                        sky_stats,
+                        elapsed: sky_elapsed,
                     };
-                    if result_tx.send(outcome).is_err() {
-                        return; // the window is gone
+                    if result_tx.send(lighting).is_err() {
+                        return;
                     }
                 }
             })
@@ -574,6 +665,7 @@ impl RebuildWorker {
             request_tx,
             result_rx,
             in_flight: false,
+            pending,
         })
     }
 }
@@ -900,6 +992,7 @@ impl InteractiveApp {
             last_built_pos: None,
             last_dispatch_at: None,
             last_dispatch_generation: None,
+            force_rebuild: false,
             camera_follow: CameraFollow::default(),
             hud: Hud::default(),
             last_terrain_instances: Vec::new(),
@@ -1291,27 +1384,30 @@ impl ApplicationHandler for InteractiveApp {
                 // landed since the last frame (never blocks — `try_recv`).
                 // Only the newest matters if somehow more than one queued up.
                 while let Ok(outcome) = self.rebuild.result_rx.try_recv() {
-                    self.hud
-                        .record_rebuild(outcome.elapsed, outcome.instances.len());
-                    self.last_built_pos = Some(outcome.center_m);
-                    self.emitter_instances = outcome
-                        .instances
-                        .iter()
-                        .filter(|i| {
-                            self.render_materials
-                                .get(i.material as usize)
-                                .is_some_and(|m| m.emissive > 0.0)
-                        })
-                        .copied()
-                        .collect();
-                    self.last_terrain_instances = outcome.instances;
-                    self.terrain_dirty = true;
+                    if outcome.instances_included {
+                        self.hud
+                            .record_rebuild(outcome.elapsed, outcome.instances.len());
+                        self.last_built_pos = Some(outcome.center_m);
+                        self.emitter_instances = outcome
+                            .instances
+                            .iter()
+                            .filter(|i| {
+                                self.render_materials
+                                    .get(i.material as usize)
+                                    .is_some_and(|m| m.emissive > 0.0)
+                            })
+                            .copied()
+                            .collect();
+                        self.last_terrain_instances = outcome.instances;
+                        self.terrain_dirty = true;
+                        self.rebuild.in_flight = false;
+                    } else {
+                        self.hud.record_sky(outcome.sky_stats);
+                    }
                     if let Some(sky) = outcome.sky {
                         self.last_sky = Some(sky);
                         self.sky_dirty = true;
                     }
-                    self.hud.record_sky(outcome.sky_stats);
-                    self.rebuild.in_flight = false;
                 }
 
                 let view = *self.session.view.lock().unwrap_or_else(|e| e.into_inner());
@@ -1344,9 +1440,13 @@ impl ApplicationHandler for InteractiveApp {
                     let terrain_changed =
                         generation.is_some() && generation != self.last_dispatch_generation;
                     if !self.rebuild.in_flight
-                        && (moved_far_enough || due_for_recheck || terrain_changed)
+                        && (moved_far_enough
+                            || due_for_recheck
+                            || terrain_changed
+                            || self.force_rebuild)
                         && self.rebuild.request_tx.send(feet).is_ok()
                     {
+                        self.force_rebuild = false;
                         self.rebuild.in_flight = true;
                         self.last_dispatch_at = Some(now);
                         self.last_dispatch_generation = generation;
@@ -1602,6 +1702,22 @@ impl ApplicationHandler for InteractiveApp {
                             self.last_hammer_at = Some(render_now);
                             let id = self.next_action_id;
                             self.next_action_id += 1;
+                            // Draw the cut now, a round trip before the server's.
+                            if let Some((cell, _)) = self.hammer_target {
+                                let mut pending = self
+                                    .rebuild
+                                    .pending
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if pending.len() < MAX_PENDING_CUTS {
+                                    pending.push(PendingCut {
+                                        cell,
+                                        radius_cells: self.hammer_radius,
+                                        at: render_now,
+                                    });
+                                }
+                                self.force_rebuild = true;
+                            }
                             self.session.push_action(hammer_request(
                                 id,
                                 eye,
@@ -1906,8 +2022,7 @@ pub fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
 }
 
 /// Per-brick results of [`build_instances_cached`], keyed by the brick's own
-/// revision and its six neighbours' (the buried test reads their faces) plus
-/// the part of it inside the view window. An edit changes one brick's revision,
+/// revision and its six neighbours' (the buried test reads their faces). An edit changes one brick's revision,
 /// so the next rebuild recomputes that brick and its neighbours and reuses the
 /// rest: a hammer swing costs milliseconds, not a full window walk.
 pub struct TerrainInstanceCache {
@@ -1939,7 +2054,10 @@ impl Default for TerrainInstanceCache {
     }
 }
 
-/// The inclusive cell window the terrain draw covers around `center_m`.
+/// The inclusive cell window the terrain draw covers around `center_m`,
+/// widened to whole bricks: a brick is drawn entirely or not at all, so its
+/// cached boxes do not depend on where the window's edge falls and walking does
+/// not invalidate every brick along the edge each metre.
 fn view_window(center_m: [f64; 3]) -> (GlobalCell, GlobalCell) {
     let cell_m = f64::from(CELL_M);
     let center_cell = GlobalCell::new(
@@ -1950,18 +2068,84 @@ fn view_window(center_m: [f64; 3]) -> (GlobalCell, GlobalCell) {
     let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
     let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
     let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
+    let edge = i64::from(spall_core::BRICK_EDGE);
+    let floor = |v: i64| v.div_euclid(edge) * edge;
+    let ceil = |v: i64| v.div_euclid(edge) * edge + edge - 1;
     (
         GlobalCell::new(
-            center_cell.x - horiz,
-            center_cell.y - down,
-            center_cell.z - horiz,
+            floor(center_cell.x - horiz),
+            floor(center_cell.y - down),
+            floor(center_cell.z - horiz),
         ),
         GlobalCell::new(
-            center_cell.x + horiz,
-            center_cell.y + up,
-            center_cell.z + horiz,
+            ceil(center_cell.x + horiz),
+            ceil(center_cell.y + up),
+            ceil(center_cell.z + horiz),
         ),
     )
+}
+
+/// A hammer swing the client has sent but the server has not yet confirmed. It
+/// is drawn at once on a private copy of the terrain so a carved trench appears
+/// at the crosshair, not a round trip behind it, and dropped when the replica
+/// shows the cut or after [`PENDING_CUT_LIFETIME`] (a refused swing disappears).
+/// The replica itself is never touched, so integrity hashes are unaffected.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingCut {
+    pub cell: GlobalCell,
+    pub radius_cells: i64,
+    pub at: Instant,
+}
+
+/// How long an unconfirmed swing stays drawn.
+const PENDING_CUT_LIFETIME: Duration = Duration::from_millis(800);
+/// Most previews kept at once.
+const MAX_PENDING_CUTS: usize = 64;
+
+/// Drops previews the replica already shows (their centre cell is air in
+/// `volume`) or that have expired, then carves the rest out of `volume`.
+/// Returns the bricks whose boxes must not be cached: every brick a preview
+/// changed and its face neighbours (their buried tests read those faces).
+pub fn apply_pending_cuts(
+    volume: &mut Volume,
+    pending: &mut Vec<PendingCut>,
+    now: Instant,
+) -> std::collections::HashSet<spall_core::BrickCoord> {
+    pending.retain(|p| {
+        now.saturating_duration_since(p.at) < PENDING_CUT_LIFETIME
+            && !matches!(volume.sample(p.cell), Ok(Sample::Empty { .. }))
+    });
+    let mut volatile = std::collections::HashSet::new();
+    for p in pending.iter() {
+        let r = p.radius_cells.clamp(0, HAMMER_RADIUS_MAX);
+        let mut plan = spall_voxel::EditPlan::new(volume.id());
+        for dz in -r..=r {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx * dx + dy * dy + dz * dz > r * r {
+                        continue;
+                    }
+                    let cell = GlobalCell::new(p.cell.x + dx, p.cell.y + dy, p.cell.z + dz);
+                    if matches!(volume.sample(cell), Ok(Sample::Filled(_))) {
+                        plan.set(cell, MaterialId::AIR);
+                    }
+                }
+            }
+        }
+        if let Ok(outcome) = volume.apply_edit(&plan) {
+            for b in &outcome.bricks {
+                volatile.insert(b.coord);
+                for [dx, dy, dz] in BRICK_NEIGHBOURS {
+                    volatile.insert(spall_core::BrickCoord::new(
+                        b.coord.x + dx,
+                        b.coord.y + dy,
+                        b.coord.z + dz,
+                    ));
+                }
+            }
+        }
+    }
+    volatile
 }
 
 /// [`build_instances`], reusing the boxes of every brick whose cache key is
@@ -1972,9 +2156,22 @@ pub fn build_instances_cached(
     center_m: [f64; 3],
     cache: &mut TerrainInstanceCache,
 ) -> Vec<Instance> {
+    build_instances_volatile(volume, center_m, cache, &std::collections::HashSet::new())
+}
+
+/// [`build_instances_cached`] where bricks in `volatile` neither read nor write
+/// the cache: they are rebuilt from `volume` every time. For a volume that
+/// carries local, unconfirmed edits (see [`PendingCut`]): a revision number
+/// identifies a brick's contents only along the server's history, so boxes
+/// built from a preview must never be stored under it.
+pub fn build_instances_volatile(
+    volume: &Volume,
+    center_m: [f64; 3],
+    cache: &mut TerrainInstanceCache,
+    volatile: &std::collections::HashSet<spall_core::BrickCoord>,
+) -> Vec<Instance> {
     use std::hash::{Hash, Hasher};
     let cell_m = f64::from(CELL_M);
-    let edge = i64::from(spall_core::BRICK_EDGE);
     let (min, max) = view_window(center_m);
     let (min_brick, _) = min.split();
     let (max_brick, _) = max.split();
@@ -2001,16 +2198,11 @@ pub fn build_instances_cached(
                     revision(spall_core::BrickCoord::new(bx + dx, by + dy, bz + dz))
                         .hash(&mut hasher);
                 }
-                // The window clips edge bricks differently as the centre moves.
-                for (m, v) in [(min.x, bx), (min.y, by), (min.z, bz)] {
-                    (m - v * edge).clamp(0, edge).hash(&mut hasher);
-                }
-                for (m, v) in [(max.x, bx), (max.y, by), (max.z, bz)] {
-                    (m - v * edge).clamp(-1, edge - 1).hash(&mut hasher);
-                }
                 let key = hasher.finish();
                 visited.insert(coord);
-                if let Some((cached_key, boxes)) = cache.bricks.get(&coord)
+                let is_volatile = volatile.contains(&coord);
+                if !is_volatile
+                    && let Some((cached_key, boxes)) = cache.bricks.get(&coord)
                     && *cached_key == key
                 {
                     instances.extend_from_slice(boxes);
@@ -2030,7 +2222,12 @@ pub fn build_instances_cached(
                     })
                     .collect();
                 instances.extend_from_slice(&boxes);
-                cache.bricks.insert(coord, (key, boxes));
+                if is_volatile {
+                    // Forget any entry too: its key may now match a preview.
+                    cache.bricks.remove(&coord);
+                } else {
+                    cache.bricks.insert(coord, (key, boxes));
+                }
             }
         }
     }
@@ -4757,10 +4954,8 @@ mod perf_probe {
                 )
             })
             .collect();
-        let c = center.map(|v| (v / cell_m).floor() as i64);
-        let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
-        let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
-        let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
+        // The draw window is whole bricks (see `view_window`).
+        let (window_min, window_max) = view_window(center);
         let mut slow = Vec::new();
         for coord in volume.resident_brick_coords() {
             let edge = i64::from(spall_core::BRICK_EDGE);
@@ -4772,10 +4967,9 @@ mod perf_probe {
                             coord.y * edge + y,
                             coord.z * edge + z,
                         );
-                        let inside = (cell.x - c[0]).abs() <= horiz
-                            && (cell.z - c[2]).abs() <= horiz
-                            && cell.y >= c[1] - down
-                            && cell.y <= c[1] + up;
+                        let inside = (window_min.x..=window_max.x).contains(&cell.x)
+                            && (window_min.y..=window_max.y).contains(&cell.y)
+                            && (window_min.z..=window_max.z).contains(&cell.z);
                         if !inside {
                             continue;
                         }
@@ -4794,6 +4988,67 @@ mod perf_probe {
         slow.sort_unstable();
         assert!(!slow.is_empty());
         assert_eq!(fast, slow);
+    }
+
+    /// An unconfirmed swing carves a private copy at once, never enters the
+    /// cache, and is dropped once the volume shows the cut or it expires.
+    #[test]
+    fn pending_cut_previews_without_poisoning_the_cache() {
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+        let center = [2.0, 13.5, 2.0];
+        let (cell, _) = visible_cells(&volume, center)
+            .into_iter()
+            .map(|(m, c)| (GlobalCell::new(c[0], c[1], c[2]), m))
+            .next()
+            .expect("the fixture has terrain");
+        let mut cache = TerrainInstanceCache::new();
+        let base = build_instances_cached(&volume, center, &mut cache);
+
+        let now = Instant::now();
+        let mut preview = volume.clone();
+        let mut pending = vec![PendingCut {
+            cell,
+            radius_cells: 1,
+            at: now,
+        }];
+        let volatile = apply_pending_cuts(&mut preview, &mut pending, now);
+        assert!(!volatile.is_empty());
+        assert!(matches!(preview.sample(cell), Ok(Sample::Empty { .. })));
+        assert!(
+            matches!(volume.sample(cell), Ok(Sample::Filled(_))),
+            "the original is untouched"
+        );
+        let carved = build_instances_volatile(&preview, center, &mut cache, &volatile);
+        assert_ne!(
+            carved.len(),
+            base.len(),
+            "the preview changes what is drawn"
+        );
+
+        // Nothing from the preview leaked into the cache: the real volume still
+        // draws exactly what it did before.
+        let mut again = build_instances_cached(&volume, center, &mut cache);
+        let mut base_sorted = base.clone();
+        let key = |i: &Instance| (i.offset.map(f32::to_bits), i.material);
+        again.sort_by_key(key);
+        base_sorted.sort_by_key(key);
+        assert_eq!(again, base_sorted);
+
+        // Confirmed (the volume already shows it) or expired previews are dropped.
+        let mut confirmed = vec![PendingCut {
+            cell,
+            radius_cells: 1,
+            at: now,
+        }];
+        apply_pending_cuts(&mut preview.clone(), &mut confirmed, now);
+        assert!(confirmed.is_empty());
+        let mut stale = vec![PendingCut {
+            cell,
+            radius_cells: 1,
+            at: now,
+        }];
+        apply_pending_cuts(&mut volume.clone(), &mut stale, now + PENDING_CUT_LIFETIME);
+        assert!(stale.is_empty());
     }
 
     /// Greedy boxes cover every input cell exactly once, never merge across
