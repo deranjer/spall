@@ -42,7 +42,7 @@ pub mod materials {
 }
 
 /// Version of the sandbox's server-authoritative content rules.
-pub const GAME_RULES_VERSION: u32 = 2;
+pub const GAME_RULES_VERSION: u32 = 3;
 
 /// Version of the sandbox-owned collision damage values below.
 pub const DAMAGE_RULES_VERSION: u32 = 2;
@@ -616,6 +616,8 @@ pub mod tool_ids {
     pub const PLACE_STONE: u16 = 1;
     pub const PLACE_WOOD: u16 = 2;
     pub const PLACE_DIRT: u16 = 3;
+    /// The torch: places the emissive lamp where the player aims.
+    pub const PLACE_LAMP: u16 = 4;
 }
 
 fn def(id: MaterialId, name: &str, density: f32, albedo: [f32; 3]) -> MaterialDef {
@@ -879,6 +881,17 @@ pub fn tool_catalog() -> spall_server::ToolCatalog {
                 kind: EditKind::Place(materials::DIRT),
                 max_radius_cells: 2,
                 reach_m: 8.0,
+            },
+            // The torch: a small emissive lamp ball (radius 2 = 33 voxels, about
+            // 1.25 m across) against the struck surface, at the same reach as
+            // digging. Smaller emitters do not light anything: the lighting
+            // cache cannot resolve a lamp under about 1 m (see
+            // `tests/worldgen_torch_light.rs`).
+            ToolRule {
+                id: tool_ids::PLACE_LAMP,
+                kind: EditKind::Place(materials::LAMP),
+                max_radius_cells: 2,
+                reach_m: 12.0,
             },
         ],
     )

@@ -1908,8 +1908,16 @@ async fn run_async(
                             ..b.clone()
                         })
                         .collect();
+                    // A large world is mirrored as a window around the player:
+                    // tell physics where the player is, and rebuild the window
+                    // when they near its edge (no-ops for a small world).
+                    let feet = p.player.as_ref().map(|pl| pl.predicted().position_m);
+                    if let Some(feet) = feet {
+                        p.phys.set_focus(feet);
+                    }
+                    let window_moved = feet.is_some_and(|f| p.phys.needs_window_move(f));
                     if let Some(terrain) = &terrain
-                        && p.terrain_generation != Some(terrain.generation)
+                        && (p.terrain_generation != Some(terrain.generation) || window_moved)
                     {
                         p.phys.set_terrain(&terrain.volume);
                         let first = p.terrain_generation.is_none();

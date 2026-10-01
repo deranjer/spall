@@ -137,6 +137,26 @@ The renderer culls back faces and only draws exposed cells, so flying (no
 collision) into the ground shows through it; the ground is solid (see the
 structure tests) and digging reveals the layers.
 
+## Walking and the torch (ENG-114 follow-up)
+- **WASD did nothing while flying worked.** The client predicts walking against
+  its own physics world, and `ClientPhysics::set_terrain` built one dense grid
+  over the whole replica: it found the bounding box by sampling every cell of
+  every resident brick (hundreds of millions of samples for the 256 m arena) and
+  the grid exceeds the physics grid cap (8M cells), so no collider existed and
+  prediction never started (`ticks: 0`). For worlds whose resident bricks'
+  bounding box exceeds the cap the client now mirrors a 193 x 129 x 193-cell
+  window around the player (`windowed_occupancy`, scanned per brick) and rebuilds
+  it when the player comes within 8 m of its edge; smaller worlds are unchanged.
+  `worldgen_walk` (256 cells in CI, `WALK_SIZE=1024 --release` for the full
+  arena) walks a scripted player: 34 m, 98% grounded, one 0.9 mm correction.
+- **Torch (`T`).** Places the game's emissive lamp, the new `PLACE_LAMP` tool
+  (`GAME_RULES_VERSION` 3, reach 12 m), as a radius-2 ball (33 voxels, about
+  1.25 m across) against the surface under the crosshair. Smaller lamps do not
+  light anything: measured offscreen at night (`worldgen_torch_light`), ground a
+  metre away is 1.0x at radius 0 or 1, 1.6-3.1x at radius 2 and 2.7-20x at
+  radius 3, because the lighting cache cannot resolve an emitter under about
+  1 m. `worldgen_torch` checks the placement end to end.
+
 ## Not included
 Trees, grass, props, flowing rivers (water is initially static, filled to sea
 level; springs/sinks are a consumer decision), streaming/infinite worlds, 3D

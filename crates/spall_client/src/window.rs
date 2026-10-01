@@ -403,6 +403,8 @@ struct InteractiveApp {
     /// the last swing went out / the radius in cells (mouse wheel).
     hammer_held: bool,
     hammer_pending: bool,
+    /// `T` was pressed and the torch has not been sent yet.
+    torch_pending: bool,
     last_hammer_at: Option<Instant>,
     hammer_radius: i64,
     next_action_id: u64,
@@ -883,6 +885,7 @@ impl InteractiveApp {
             last_fly_update: None,
             hammer_held: false,
             hammer_pending: false,
+            torch_pending: false,
             last_hammer_at: None,
             hammer_radius: HAMMER_RADIUS_DEFAULT,
             next_action_id: HAMMER_REQUEST_BASE,
@@ -1029,6 +1032,7 @@ impl InteractiveApp {
     fn clear_held_actions(&mut self) {
         self.hammer_held = false;
         self.hammer_pending = false;
+        self.torch_pending = false;
         self.held.clear_on_focus_loss(&self.session.input);
     }
 
@@ -1175,6 +1179,10 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     KeyCode::KeyR if held && !event.repeat => {
                         self.recentre_view();
+                        return;
+                    }
+                    KeyCode::KeyT if held && !event.repeat => {
+                        self.torch_pending = true;
                         return;
                     }
                     KeyCode::Escape if held && !event.repeat => {
@@ -1542,6 +1550,16 @@ impl ApplicationHandler for InteractiveApp {
                                 dir,
                                 self.hammer_radius,
                             ));
+                        }
+                        if self.torch_pending {
+                            self.torch_pending = false;
+                            if let Some((eye, dir)) = cam
+                                && self.cursor_locked
+                            {
+                                let id = self.next_action_id;
+                                self.next_action_id += 1;
+                                self.session.push_action(torch_request(id, eye, dir));
+                            }
                         }
                         if let Some(path) = self.pending_capture.take() {
                             renderer.screenshot_request = Some(path);
@@ -2554,6 +2572,13 @@ const HAMMER_RADIUS_MAX: i64 = 8;
 /// and review-cut (`1_000_000 + n`) ranges.
 const HAMMER_REQUEST_BASE: u64 = 2_000_000;
 
+/// The torch: the game's `PLACE_LAMP` tool, bound to `T`. It places a small
+/// emissive lamp ball against the surface under the crosshair.
+const TORCH_TOOL: u16 = 4;
+/// Radius in cells (2 = 33 voxels, about 1.25 m across): the smallest lamp the
+/// lighting cache resolves, so the smallest that actually lights its surroundings.
+pub const TORCH_RADIUS_CELLS: i64 = 2;
+
 /// The `Cut` a hammer swing sends: aimed from the eye along the view. The
 /// claimed brush centre is ignored by the server (it uses its own hit cell);
 /// only the radius is kept, after the tool's cap.
@@ -2563,8 +2588,40 @@ pub fn hammer_request(
     dir: Vec3,
     radius_cells: i64,
 ) -> spall_protocol::ActionRequest {
+    tool_request(
+        id,
+        HAMMER_TOOL,
+        spall_protocol::ActionKind::Cut,
+        eye,
+        dir,
+        radius_cells,
+    )
+}
+
+/// The `Place` a torch sends: aimed like a swing; the server places the lamp
+/// in the empty cell against the struck face.
+pub fn torch_request(id: u64, eye: Vec3, dir: Vec3) -> spall_protocol::ActionRequest {
+    tool_request(
+        id,
+        TORCH_TOOL,
+        spall_protocol::ActionKind::Place,
+        eye,
+        dir,
+        TORCH_RADIUS_CELLS,
+    )
+}
+
+/// An aimed tool use: the game tool `tool`, `action`, from `eye` along `dir`.
+fn tool_request(
+    id: u64,
+    tool: u16,
+    action: spall_protocol::ActionKind,
+    eye: Vec3,
+    dir: Vec3,
+    radius_cells: i64,
+) -> spall_protocol::ActionRequest {
     use spall_core::units::{BRUSH_UNIT, BrushPoint};
-    use spall_protocol::{ActionKind, ActionRequest, ClaimedTarget, InputSeq, RequestId};
+    use spall_protocol::{ActionRequest, ClaimedTarget, InputSeq, RequestId};
     let brush = spall_core::SphereBrush::new(
         BrushPoint::from_units(0, 0, 0),
         radius_cells.clamp(0, HAMMER_RADIUS_MAX) * BRUSH_UNIT,
@@ -2573,8 +2630,8 @@ pub fn hammer_request(
     ActionRequest {
         request_id: RequestId(id),
         input_seq: InputSeq(id),
-        action: ActionKind::Cut,
-        tool: HAMMER_TOOL,
+        action,
+        tool,
         aim_origin_m: [f64::from(eye.x), f64::from(eye.y), f64::from(eye.z)],
         aim_dir: [dir.x, dir.y, dir.z],
         claimed_target: ClaimedTarget::Terrain,
@@ -2883,6 +2940,7 @@ const KEYBINDS: &[(&str, &str)] = &[
         "Left click",
         "Hammer: break voxels where you aim (hold to repeat)",
     ),
+    ("T", "Torch: place a light where you aim"),
     ("Wheel", "Hammer radius 0-8 cells (0 = one voxel)"),
     ("Space", "Jump (walking) / rise (flying)"),
     ("Ctrl", "Descend (flying)"),
