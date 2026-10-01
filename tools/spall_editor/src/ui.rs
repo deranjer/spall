@@ -19,6 +19,7 @@ const CARD_THUMB: f32 = 60.0;
 pub(crate) enum Modal {
     NewAsset,
     ImportExport,
+    WorldGen,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,6 +49,7 @@ enum MenuAction {
     OpenProject,
     NewAsset,
     ImportExport,
+    GenerateWorld,
     Save,
     RunScene,
     Exit,
@@ -240,6 +242,7 @@ impl EditorApp {
                     MenuEntry::new("Import / Export…").enabled(has_model),
                     MenuAction::ImportExport,
                 ),
+                (MenuEntry::new("Generate World…"), MenuAction::GenerateWorld),
                 (
                     MenuEntry::new("Save")
                         .shortcut("Ctrl+S")
@@ -313,6 +316,7 @@ impl EditorApp {
             MenuAction::OpenProject => self.open_project_dialog(),
             MenuAction::NewAsset => self.modal = Some(Modal::NewAsset),
             MenuAction::ImportExport => self.modal = Some(Modal::ImportExport),
+            MenuAction::GenerateWorld => self.modal = Some(Modal::WorldGen),
             MenuAction::Save => self.save(),
             MenuAction::RunScene => self.run_scene(),
             MenuAction::Exit => self.exit_requested = true,
@@ -719,12 +723,75 @@ impl EditorApp {
             Modal::NewAsset => {
                 theme::modal(viewport, "New Asset", 400.0, || self.new_asset_dialog())
             }
+            Modal::WorldGen => {
+                theme::modal(viewport, "Generate World", 460.0, || self.worldgen_dialog())
+            }
             Modal::ImportExport => theme::modal(viewport, "Import / Export", 460.0, || {
                 self.import_export_dialog()
             }),
         };
         if close {
             self.modal = None;
+        }
+    }
+
+    fn worldgen_dialog(&mut self) {
+        use crate::worldgen_panel::{SIZES, legend};
+        theme::hint("Preview the generated showcase arena, then walk it in the game.");
+        theme::hint("Mountains, hills, swamp with lake and river, desert, caves.");
+        theme::field_with_placeholder("Seed", &mut self.worldgen.seed_text, "1");
+        theme::hstack(6.0, || {
+            for size in SIZES {
+                let kind = if self.worldgen.size_cells == size {
+                    ButtonKind::Primary
+                } else {
+                    ButtonKind::Secondary
+                };
+                if theme::button(kind, ButtonSize::Small, &format!("{} m", size / 4)) {
+                    self.worldgen.size_cells = size;
+                }
+            }
+            if theme::button(ButtonKind::Secondary, ButtonSize::Small, "Randomize seed") {
+                self.worldgen.seed_text = crate::worldgen_panel::random_seed().to_string();
+            }
+        });
+        if theme::button(ButtonKind::Primary, ButtonSize::Regular, "Generate preview") {
+            self.generate_worldgen_preview();
+        }
+        if let Some(error) = &self.worldgen.error {
+            theme::label(12.0, theme::TEXT_MUTED, error.clone());
+        }
+        let Some(preview) = &self.worldgen.preview else {
+            return;
+        };
+        if let Some(texture) = self.worldgen_texture {
+            yakui::image(texture, Vec2::splat(420.0));
+        }
+        for (name, [r, g, b], share) in legend(&preview.stats) {
+            theme::hstack(8.0, || {
+                yakui::constrained(Constraints::tight(Vec2::splat(12.0)), || {
+                    RoundRect::new(2.0)
+                        .color(Color::rgb(r, g, b))
+                        .min_size(Vec2::splat(12.0))
+                        .show();
+                });
+                theme::label(12.0, theme::TEXT, format!("{name}  {:.0}%", share * 100.0));
+            });
+        }
+        let (low, high) = (preview.stats.min_height, preview.stats.max_height);
+        theme::hint(&format!(
+            "Water {:.0}% of the map, terrain {:.0}-{:.0} m above the arena floor, seed {}",
+            preview.stats.water_share * 100.0,
+            f64::from(low) * 0.25,
+            f64::from(high) * 0.25,
+            preview.seed
+        ));
+        if theme::button(
+            ButtonKind::Primary,
+            ButtonSize::Regular,
+            "Run in game (cargo xtask play)",
+        ) {
+            self.run_worldgen();
         }
     }
 

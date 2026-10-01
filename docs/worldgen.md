@@ -201,6 +201,24 @@ structure tests) and digging reveals the layers.
   the compact labels, per-component facts and face masks cell for cell against a
   reference flood fill.
 
+## Editor panel (ENG-115)
+
+File > Generate World... opens a dialog in `spall-editor` (no project needed):
+seed field (empty = 1), arena size (128 m or 256 m), Randomize seed, Generate
+preview, and Run in game.
+
+- The preview is a top-down map of the server's own `ColumnMap` (biome colour
+  shaded by height, snow caps, water darkening with depth) with a legend of
+  biome shares, water share and height range. A test pins it to
+  `top_down_rgba(ColumnMap::compute(spec))`, so what you see is the world the
+  server builds from the same seed and size.
+- Run in game spawns `cargo xtask play --worldgen showcase --seed N
+  --worldgen-size S` from the workspace, like the scene Run button.
+- It is a 2D map, not an in-viewport 3D preview: the viewport only renders
+  `.spvox` scenes. Caves are not shown (the map is columns only).
+- Logic lives in `tools/spall_editor/src/worldgen_panel.rs` (CPU-testable);
+  the dialog is in `ui.rs` and the texture upload in `main.rs`.
+
 ## Not included
 Trees, grass, props, flowing rivers (water is initially static, filled to sea
 level; springs/sinks are a consumer decision), streaming/infinite worlds, 3D

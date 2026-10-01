@@ -3000,6 +3000,7 @@ dependencies = [
  "serde",
  "spall_render",
  "spall_voxel",
+ "spall_worldgen",
  "thiserror 2.0.20",
  "wgpu",
  "winit",

@@ -22,6 +22,7 @@ mod scene_viewport;
 mod theme;
 mod thumbnail;
 mod ui;
+mod worldgen_panel;
 
 use thumbnail::ThumbMesh;
 use ui::{Modal, RightTab, SceneTab, SceneView};
@@ -241,6 +242,10 @@ struct EditorApp {
     ctrl_held: bool,
     exit_requested: bool,
     modal: Option<Modal>,
+    /// The World Gen dialog's inputs and last preview.
+    worldgen: worldgen_panel::WorldgenPanel,
+    /// yakui id of the preview picture, once one has been uploaded.
+    worldgen_texture: Option<yakui::TextureId>,
     scene_tab: SceneTab,
     scene_select: bool,
     scene_view: Option<SceneView>,
@@ -337,6 +342,8 @@ impl Default for EditorApp {
             builtin_preview: None,
             builtin_cards: Vec::new(),
             project_thumbnails: Vec::new(),
+            worldgen: worldgen_panel::WorldgenPanel::default(),
+            worldgen_texture: None,
             project_path: String::new(),
             project_name: String::new(),
             asset_name: String::new(),
@@ -699,6 +706,97 @@ impl EditorApp {
                 Err(e) => e.to_string(),
             };
         }
+    }
+    /// Generates the preview for the dialog's seed and size and uploads it as
+    /// a texture. Errors are shown in the dialog.
+    fn generate_worldgen_preview(&mut self) {
+        let seed = match worldgen_panel::parse_seed(&self.worldgen.seed_text) {
+            Ok(seed) => seed,
+            Err(error) => {
+                self.worldgen.error = Some(error);
+                return;
+            }
+        };
+        let preview = match worldgen_panel::generate_preview(seed, self.worldgen.size_cells) {
+            Ok(preview) => preview,
+            Err(error) => {
+                self.worldgen.error = Some(error);
+                self.worldgen.preview = None;
+                return;
+            }
+        };
+        let Some(gpu) = self.gpu.as_mut() else {
+            self.worldgen.error = Some("No GPU surface to show the preview on".into());
+            return;
+        };
+        let extent = wgpu::Extent3d {
+            width: preview.size_cells,
+            height: preview.size_cells,
+            depth_or_array_layers: 1,
+        };
+        let texture = gpu.context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("worldgen preview"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gpu.context.queue.write_texture(
+            texture.as_image_copy(),
+            &preview.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * preview.size_cells),
+                rows_per_image: Some(preview.size_cells),
+            },
+            extent,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        match self.worldgen_texture {
+            Some(id) => gpu.yakui.update_texture(id, view),
+            None => {
+                self.worldgen_texture = Some(gpu.yakui.add_texture(
+                    view,
+                    wgpu::FilterMode::Linear,
+                    wgpu::FilterMode::Linear,
+                    wgpu::MipmapFilterMode::Nearest,
+                    wgpu::AddressMode::ClampToEdge,
+                ));
+            }
+        }
+        self.status = format!(
+            "Generated showcase preview: seed {seed}, {} m arena",
+            preview.size_cells / 4
+        );
+        self.worldgen.error = None;
+        self.worldgen.preview = Some(preview);
+    }
+
+    /// Plays the previewed world: `cargo xtask play --worldgen ...` builds the
+    /// sandbox and opens a client in it. No project or scene is involved.
+    fn run_worldgen(&mut self) {
+        let Some(preview) = &self.worldgen.preview else {
+            return;
+        };
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .map(std::path::Path::to_path_buf);
+        let mut command = std::process::Command::new("cargo");
+        command.args(worldgen_panel::play_args(preview.seed, preview.size_cells));
+        if let Some(workspace) = workspace {
+            command.current_dir(workspace);
+        }
+        self.status = match command.spawn() {
+            Ok(_) => format!(
+                "Launched generated world (seed {}); the first run builds the sandbox",
+                preview.seed
+            ),
+            Err(e) => format!("Could not launch cargo xtask play: {e}"),
+        };
     }
     fn run_scene(&mut self) {
         self.save();
