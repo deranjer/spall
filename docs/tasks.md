@@ -1069,3 +1069,18 @@ Validation: `cargo test -p spall_ecology`, `cargo run -p sandbox --example ecolo
 Add a client-local rendered showcase for ENG-116's grass/tree lifecycle. Keep the ecology clock independently controllable: pause/resume, one-interval stepping, and bounded speed presets. Make accepted tree growth visible in the actual sandbox voxel renderer; show seeds, seedlings and the grass biomass patch; allow grass harvest, branch cutting, and root destruction through the showcase. It is a private local Simulation fixture, not a production world, server persistence, or network feature.
 
 Validation: `cargo test -p spall_client ecology_demo::tests`, `cargo check -p sandbox --features client --bin sandbox-client`, and `cargo xtask check`. Manual GPU presentation is separate from CPU checks. See `docs/validation.md` for the command and keys.
+
+### ENG-117 correction pass — 2026-10-01
+
+User-requested audit after viewing the interactive result: replace the misleading
+thin generated-terrain crop with a completely resident 16 m clearing; show every
+live terrain/body cell through the shared renderer; ground seeds, seedlings and
+grass on current voxel surfaces; reject germination through rock roofs; use
+horizontal crowding; require committed growth before maturity; improve new
+connected tree skeletons and attach soft foliage to live growth tips. Correct
+side-branch cutting, root destruction and partial single-cell growth acknowledgment.
+Bump ecology plan version to 2 without regenerating persisted skeletons or changing
+terrain generation/manifest versions. Capture seedling, juvenile, mature,
+dispersal and damage states using the interactive scene's actual geometry builder.
+Production server/network/persistence integration remains a separate assignment.
+See `docs/reports/ENG-117-corrections.md` for checks and visual evidence.

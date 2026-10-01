@@ -20,6 +20,9 @@ struct Args {
     /// Open the client-local interactive ecology growth showcase.
     #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "grid_fluid_demo"])]
     ecology_demo: bool,
+    /// Save a bounded sequence from the ecology showcase through the real renderer.
+    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "grid_fluid_demo", "ecology_demo"])]
+    ecology_capture: Option<PathBuf>,
     /// T00 offline render host (no transport).
     #[arg(long)]
     offline: bool,
@@ -331,6 +334,18 @@ fn main() -> ExitCode {
         };
     }
 
+    if let Some(output) = &args.ecology_capture {
+        return match spall_client::ecology_demo::capture_ecology_demo(
+            sandbox::ecology_scene::setup(),
+            output,
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("ecology capture: {error}");
+                ExitCode::from(3)
+            }
+        };
+    }
     if args.ecology_demo {
         return run_ecology_demo();
     }
@@ -367,139 +382,7 @@ fn main() -> ExitCode {
 }
 
 fn run_ecology_demo() -> ExitCode {
-    use spall_client::EcologyDemoSetup;
-    use spall_core::{GlobalCell, MaterialId};
-    use spall_ecology::{
-        EcologyConfig, EcologyInputs, EcologyState, SpeciesDefinition, SpeciesId,
-        initial_placement, place_grass_patch,
-    };
-    use spall_voxel::Sample;
-    use std::collections::BTreeMap;
-
-    let scene = match sandbox::worldgen_scene::generate("showcase", 71, 128) {
-        Ok(scene) => scene,
-        Err(error) => {
-            eprintln!("sandbox-client ecology demo: world generation failed: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    let generated = scene.world();
-    let species_id = SpeciesId(1);
-    let species = SpeciesDefinition {
-        version: 1,
-        id: species_id,
-        wood: sandbox::game::materials::WOOD,
-        soil_materials: [
-            MaterialId(10),
-            MaterialId(2),
-            MaterialId(214),
-            MaterialId(213),
-        ],
-        min_moisture: 20,
-        max_moisture: 220,
-        min_sky_exposure: 12,
-        min_spacing_cells: 4,
-        seed_radius_cells: 4,
-        seed_lifetime_ms: 20_000,
-        seedling_ms: 1_000,
-        juvenile_ms: 1_000,
-        cell_growth_ms: 1_000,
-    };
-    let config = EcologyConfig {
-        update_interval_ms: 1_000,
-        max_work_per_update: 32,
-        max_seed_records: 128,
-        max_plants: 32,
-        grass_regrowth_per_interval: 2,
-        spawn_clearance_cells: 12,
-        bounds: Some(generated.region),
-    };
-    let mut inputs = EcologyInputs::default();
-    for z in 0..128_i64 {
-        for x in 0..128_i64 {
-            let soil = GlobalCell::new(x, i64::from(generated.columns.height(x, z)), z);
-            if matches!(generated.terrain.sample(soil), Ok(Sample::Filled(_))) {
-                inputs.moisture.insert(soil, 128);
-            }
-        }
-    }
-    let spawn_cells: Vec<_> = generated
-        .spawns
-        .iter()
-        .map(|p| {
-            GlobalCell::new(
-                (p[0] * 4.0) as i64,
-                (p[1] * 4.0) as i64,
-                (p[2] * 4.0) as i64,
-            )
-        })
-        .collect();
-    for spawn in &spawn_cells {
-        for y in 0..config.spawn_clearance_cells {
-            inputs
-                .prohibited
-                .insert(GlobalCell::new(spawn.x, spawn.y + i64::from(y), spawn.z));
-        }
-    }
-    let mut state = EcologyState::default();
-    let placed = initial_placement(
-        &generated.columns,
-        &generated.terrain,
-        species,
-        &inputs,
-        spall_ecology::InitialPlacementConfig {
-            seed: 0x00EC_0106,
-            maximum: 1,
-            bounds: generated.region,
-            spawn_cells: &spawn_cells,
-            ecology: config,
-        },
-        &mut state,
-    );
-    if placed == 0 {
-        eprintln!("sandbox-client ecology demo: no terrain-valid tree candidate was found");
-        return ExitCode::from(1);
-    }
-    let focus = state
-        .plants
-        .values()
-        .next()
-        .expect("one plant was placed")
-        .root;
-    let patch_anchor = GlobalCell::new(focus.x + 5, focus.y, focus.z);
-    let grass_patch_id = match place_grass_patch(&mut state, species_id, patch_anchor, 100) {
-        Ok(id) => id,
-        Err(error) => {
-            eprintln!("sandbox-client ecology demo: grass setup failed: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    let mut ground_cells = Vec::new();
-    for z in (focus.z - 18).max(0)..=(focus.z + 18).min(127) {
-        for x in (focus.x - 18).max(0)..=(focus.x + 18).min(127) {
-            let top = i64::from(generated.columns.height(x, z));
-            for y in (top - 3).max(generated.region.0.y)..=top {
-                if let Ok(Sample::Filled(material)) =
-                    generated.terrain.sample(GlobalCell::new(x, y, z))
-                {
-                    ground_cells.push((GlobalCell::new(x, y, z), material));
-                }
-            }
-        }
-    }
-    let mut definitions = BTreeMap::new();
-    definitions.insert(species_id, species);
-    let setup = EcologyDemoSetup {
-        world: scene.world_setup(),
-        ground_cells,
-        focus,
-        state,
-        inputs,
-        definitions,
-        config,
-        grass_patch_id,
-        grass_material: sandbox::game::materials::MOSS,
-    };
+    let setup = sandbox::ecology_scene::setup();
     match spall_client::run_ecology_demo_window(setup) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error @ spall_client::ClientError::Gpu(_)) => {

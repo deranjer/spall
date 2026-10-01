@@ -33,8 +33,6 @@ const MOUSE_SENSITIVITY: f32 = 0.0025;
 /// Game-authored setup for the isolated ecology showcase window.
 pub struct EcologyDemoSetup {
     pub world: WorldSetup,
-    /// Small, terrain-validated ground crop around the initial tree.
-    pub ground_cells: Vec<(GlobalCell, MaterialId)>,
     pub focus: GlobalCell,
     pub state: EcologyState,
     pub inputs: EcologyInputs,
@@ -42,16 +40,17 @@ pub struct EcologyDemoSetup {
     pub config: EcologyConfig,
     pub grass_patch_id: u64,
     pub grass_material: MaterialId,
+    pub foliage_material: MaterialId,
 }
 
 struct EcologyDemoState {
-    ground_cells: Vec<(GlobalCell, MaterialId)>,
     state: EcologyState,
     inputs: EcologyInputs,
     definitions: BTreeMap<SpeciesId, SpeciesDefinition>,
     config: EcologyConfig,
     grass_patch_id: u64,
     grass_material: MaterialId,
+    foliage_material: MaterialId,
 }
 
 /// Opens the local visualizer. Ecology time controls never change wall-clock
@@ -61,6 +60,82 @@ pub fn run_ecology_demo_window(setup: EcologyDemoSetup) -> Result<(), ClientErro
     let mut app = EcologyDemoApp::new(setup)?;
     event_loop.run_app(&mut app)?;
     app.result
+}
+
+/// Bounded visual evidence from the same Simulation and instance builder as
+/// the interactive window. Does not open a window or create a network session.
+pub fn capture_ecology_demo(
+    setup: EcologyDemoSetup,
+    output: &std::path::Path,
+) -> Result<(), ClientError> {
+    use spall_render::{DebugView, GameRenderer, OffscreenTarget, RenderContext};
+    std::fs::create_dir_all(output).map_err(|e| ClientError::Render(e.to_string()))?;
+    let mut app = EcologyDemoApp::new(setup)?;
+    let ctx = RenderContext::headless().map_err(|e| ClientError::Gpu(e.to_string()))?;
+    let materials = materials_from_manifest(app.sim.world().materials());
+    let (width, height) = (1280, 800);
+    app.camera.aspect = width as f32 / height as f32;
+    let target = OffscreenTarget::new(&ctx.device, width, height);
+    let mut renderer = GameRenderer::new(
+        &ctx.device,
+        &ctx.queue,
+        spall_render::pipeline::COLOR_FORMAT,
+        &materials,
+        (width, height),
+        None,
+    );
+    let mut summary = Vec::new();
+    for (name, seconds, action) in [
+        ("seedling", 0, None),
+        ("juvenile", 3, None),
+        ("mature", 9, None),
+        ("dispersal", 18, None),
+        ("branch-cut", 0, Some(KeyCode::KeyB)),
+        ("root-cut", 0, Some(KeyCode::KeyX)),
+    ] {
+        for _ in 0..seconds {
+            app.advance_ecology(1000);
+        }
+        if let Some(key) = action {
+            app.act(key);
+        }
+        app.refresh_geometry();
+        renderer.set_terrain(&ctx.device, &ctx.queue, &app.terrain);
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ecology-evidence"),
+            });
+        renderer.render(
+            &ctx.device,
+            &ctx.queue,
+            &mut encoder,
+            target.color_view(),
+            &app.camera,
+            &EnvironmentPreset::Daylight.environment(),
+            DebugView::Shaded,
+        );
+        target.copy_to_readback(&mut encoder);
+        ctx.queue.submit([encoder.finish()]);
+        let rgba = target
+            .read_rgba(&ctx)
+            .map_err(|e| ClientError::Render(e.to_string()))?;
+        image::save_buffer(
+            output.join(format!("{name}.png")),
+            &rgba,
+            width,
+            height,
+            image::ColorType::Rgba8,
+        )
+        .map_err(|e| ClientError::Render(e.to_string()))?;
+        summary.push(serde_json::json!({"frame": name, "ecology_ms": app.setup.state.ecological_time_ms, "plants": app.setup.state.plants.len(), "seeds": app.setup.state.seeds.len(), "wood_cells": app.setup.state.plants.values().map(|p| p.committed_cells).sum::<u32>(), "instances": app.terrain.len(), "message": app.message}));
+    }
+    std::fs::write(
+        output.join("summary.json"),
+        serde_json::to_vec_pretty(&summary).unwrap(),
+    )
+    .map_err(|e| ClientError::Render(e.to_string()))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,7 +186,7 @@ struct EcologyDemoApp {
     last_frame: Instant,
     title_update: Instant,
     request: u64,
-    next_tree_cell: usize,
+    physics_credit: Duration,
     branch_cut: bool,
     root_cut: bool,
     message: String,
@@ -122,7 +197,6 @@ impl EcologyDemoApp {
     fn new(setup: EcologyDemoSetup) -> Result<Self, ClientError> {
         let EcologyDemoSetup {
             world,
-            ground_cells,
             focus,
             state,
             inputs,
@@ -130,20 +204,21 @@ impl EcologyDemoApp {
             config,
             grass_patch_id,
             grass_material,
+            foliage_material,
         } = setup;
         let sim = Simulation::new(SimulationConfig::new(world))
             .map_err(|error| ClientError::Render(format!("ecology simulation: {error}")))?;
-        let focus = cell_m(focus);
-        let eye = focus + Vec3::new(6.0, 6.0, 9.0);
+        let focus = cell_m(focus) + Vec3::Y * 1.3;
+        let eye = focus + Vec3::new(4.5, 2.5, 6.0);
         let camera = Camera::looking_along(eye, focus - eye, 60.0_f32.to_radians(), 16.0 / 9.0);
         let setup = EcologyDemoState {
-            ground_cells,
             state,
             inputs,
             definitions,
             config,
             grass_patch_id,
             grass_material,
+            foliage_material,
         };
         let mut app = Self {
             window: None,
@@ -159,7 +234,7 @@ impl EcologyDemoApp {
             last_frame: Instant::now(),
             title_update: Instant::now(),
             request: 1,
-            next_tree_cell: 0,
+            physics_credit: Duration::ZERO,
             branch_cut: false,
             root_cut: false,
             message: "Showcase ready".into(),
@@ -249,7 +324,8 @@ impl EcologyDemoApp {
             .enumerate()
             .skip(1)
             .find(|(index, branch)| {
-                *index < self.next_tree_cell
+                *index < plant.committed_cells as usize
+                    && (branch.cell.x != plant.root.x || branch.cell.z != plant.root.z)
                     && !branch.removed
                     && matches!(
                         self.sim.world().terrain().volume.sample(branch.cell),
@@ -265,7 +341,7 @@ impl EcologyDemoApp {
             Ok(true) => {
                 cut_branch(&mut self.setup.state, plant_id, index);
                 self.branch_cut = true;
-                self.message = "Branch cut; regrowth stays attached to surviving skeleton".into();
+                self.message = "Branch cut; removed branch stays removed".into();
                 self.refresh_geometry();
             }
             Ok(false) => self.message = "Branch cut was not committed".into(),
@@ -335,96 +411,44 @@ impl EcologyDemoApp {
                     acknowledge(&mut self.setup.state, &proposal, CommitAck::Stale);
                     continue;
                 }
-                let mut requests = Vec::with_capacity(proposal.cells.len());
-                let mut targets_valid = true;
-                for (cell, material) in &proposal.cells {
+                // This inspection harness submits existing single-cell intents.
+                // Acknowledge the accepted prefix if a later cell fails; never
+                // leave submitted requests orphaned or reject already-grown wood.
+                let mut accepted = proposal.clone();
+                accepted.cells.clear();
+                for &(cell, material) in &proposal.cells {
                     if !matches!(
-                        self.sim.world().terrain().volume.sample(*cell),
+                        self.sim.world().terrain().volume.sample(cell),
                         Ok(Sample::Empty { .. })
                     ) {
-                        targets_valid = false;
                         break;
                     }
-                    let request = RequestId(self.request);
-                    self.request = self.request.saturating_add(1);
-                    let center = BrushPoint::from_units(
-                        cell.x * BRUSH_UNIT + BRUSH_UNIT / 2,
-                        cell.y * BRUSH_UNIT + BRUSH_UNIT / 2,
-                        cell.z * BRUSH_UNIT + BRUSH_UNIT / 2,
-                    );
-                    let actor = match EntityId::new(1) {
-                        Ok(actor) => actor,
+                    match self.submit_cell_edit(cell, EditKind::Place(material)) {
+                        Ok(true) => accepted.cells.push((cell, material)),
+                        Ok(false) => break,
                         Err(error) => {
                             self.message = error.to_string();
-                            targets_valid = false;
-                            break;
-                        }
-                    };
-                    let brush = match SphereBrush::new(center, 0) {
-                        Ok(brush) => brush,
-                        Err(error) => {
-                            self.message = error.to_string();
-                            targets_valid = false;
-                            break;
-                        }
-                    };
-                    match self.sim.submit(EditIntent {
-                        request_id: request,
-                        actor,
-                        target: EditTarget::Terrain,
-                        kind: EditKind::Place(*material),
-                        brush,
-                        explosion: None,
-                    }) {
-                        Ok(_) => requests.push(request),
-                        Err(error) => {
-                            self.message = error.to_string();
-                            targets_valid = false;
                             break;
                         }
                     }
                 }
-                let committed = if targets_valid && requests.len() == proposal.cells.len() {
-                    match self.sim.tick() {
-                        Ok(tick) => requests
-                            .iter()
-                            .filter(|id| {
-                                tick.committed
-                                    .iter()
-                                    .any(|(committed_id, _)| committed_id == *id)
-                            })
-                            .count(),
-                        Err(error) => {
-                            self.message = error.to_string();
-                            0
-                        }
-                    }
+                if !accepted.cells.is_empty() {
+                    let plant = &self.setup.state.plants[&proposal.plant_id];
+                    let last = accepted.cells.last().unwrap().0;
+                    accepted.next_committed_cells =
+                        plant.skeleton.iter().position(|b| b.cell == last).unwrap() as u32 + 1;
+                    accepted.acknowledged_elapsed_ms = accepted.cells.len() as u64
+                        * self.setup.definitions[&plant.species].cell_growth_ms;
+                    acknowledge(&mut self.setup.state, &accepted, CommitAck::Accepted);
+                    self.message = format!(
+                        "Tree grew {} connected 25 cm wood cells",
+                        accepted.cells.len()
+                    );
                 } else {
-                    0
-                };
-                let all_committed = committed == proposal.cells.len();
-                acknowledge(
-                    &mut self.setup.state,
-                    &proposal,
-                    if all_committed {
-                        CommitAck::Accepted
-                    } else {
-                        CommitAck::Rejected
-                    },
-                );
-                if all_committed {
-                    self.message =
-                        format!("Tree grew {} connected wood cells", proposal.cells.len());
+                    acknowledge(&mut self.setup.state, &proposal, CommitAck::Rejected);
                 }
             }
         }
-        self.next_tree_cell = self
-            .setup
-            .state
-            .plants
-            .values()
-            .next()
-            .map_or(0, |plant| plant.committed_cells as usize);
         let current_committed = self
             .setup
             .state
@@ -448,76 +472,7 @@ impl EcologyDemoApp {
     }
 
     fn refresh_geometry(&mut self) {
-        let mut instances = Vec::with_capacity(self.setup.ground_cells.len() + 128);
-        for (cell, material) in &self.setup.ground_cells {
-            instances.push(CubeInstance::new(
-                cell_center(*cell),
-                u32::from(material.0),
-                [CELL_M; 3],
-                CubeInstance::IDENTITY_ROTATION,
-            ));
-        }
-        if let Some(patch) = self.setup.state.grass.get(&self.setup.grass_patch_id) {
-            let count =
-                usize::from(patch.biomass).saturating_mul(9) / usize::from(patch.capacity.max(1));
-            for i in 0..count {
-                let x = (i % 3) as i64 - 1;
-                let z = (i / 3) as i64 - 1;
-                let cell = GlobalCell::new(patch.anchor.x + x, patch.anchor.y, patch.anchor.z + z);
-                let mut center = cell_center(cell);
-                center[1] -= CELL_M * 0.48;
-                instances.push(CubeInstance::new(
-                    center,
-                    u32::from(self.setup.grass_material.0),
-                    [CELL_M * 0.8, CELL_M * 0.12, CELL_M * 0.8],
-                    CubeInstance::IDENTITY_ROTATION,
-                ));
-            }
-        }
-        for plant in self.setup.state.plants.values() {
-            for branch in plant.skeleton.iter().take(plant.committed_cells as usize) {
-                if branch.removed
-                    || !matches!(
-                        self.sim.world().terrain().volume.sample(branch.cell),
-                        Ok(Sample::Filled(_))
-                    )
-                {
-                    continue;
-                }
-                let material = self.setup.definitions[&plant.species].wood;
-                instances.push(CubeInstance::new(
-                    cell_center(branch.cell),
-                    u32::from(material.0),
-                    [CELL_M; 3],
-                    CubeInstance::IDENTITY_ROTATION,
-                ));
-            }
-        }
-        for seed in self.setup.state.seeds.values() {
-            let mut center = cell_center(seed.cell);
-            center[1] += CELL_M * 0.3;
-            instances.push(CubeInstance::new(
-                center,
-                u32::from(self.setup.grass_material.0),
-                [CELL_M * 0.22; 3],
-                CubeInstance::IDENTITY_ROTATION,
-            ));
-        }
-        for plant in self
-            .setup
-            .state
-            .plants
-            .values()
-            .filter(|plant| plant.committed_cells == 0)
-        {
-            instances.push(CubeInstance::new(
-                cell_center(plant.root),
-                u32::from(self.setup.grass_material.0),
-                [CELL_M * 0.4, CELL_M * 0.7, CELL_M * 0.4],
-                CubeInstance::IDENTITY_ROTATION,
-            ));
-        }
-        self.terrain = instances;
+        self.terrain = presentation_instances(&self.sim, &self.setup);
         self.terrain_dirty = true;
     }
 
@@ -528,6 +483,19 @@ impl EcologyDemoApp {
         self.last_frame = now;
         let ecology_ms = self.clock.advance_ms(elapsed);
         self.advance_ecology(ecology_ms);
+        self.physics_credit += elapsed;
+        let tick_dt = Duration::from_secs_f64(f64::from(spall_sim::TICK_DT_S));
+        while self.physics_credit >= tick_dt {
+            self.physics_credit -= tick_dt;
+            if let Err(error) = self.sim.tick() {
+                self.message = error.to_string();
+                self.clock.paused = true;
+                break;
+            }
+        }
+        if self.sim.world().bodies().next().is_some() {
+            self.refresh_geometry();
+        }
         let mut movement = Vec3::ZERO;
         for (key, axis) in [
             (KeyCode::KeyW, Vec3::NEG_Z),
@@ -684,6 +652,161 @@ impl ApplicationHandler for EcologyDemoApp {
     }
 }
 
+// The complete live volume is drawn, including terrain beneath new plants.
+// Foliage and grass are presentation instances only, never physics/topology cells.
+fn presentation_instances(sim: &Simulation, setup: &EcologyDemoState) -> Vec<CubeInstance> {
+    let volume = &sim.world().terrain().volume;
+    let mut instances = crate::window::build_instances(volume, [8.0, 2.0, 8.0]);
+    for body in sim.world().bodies() {
+        let rotation = body.pose.rotation.as_quat();
+        let translation = Vec3::from_array(body.pose.translation_m.map(|v| v as f32));
+        for mut cube in crate::window::build_instances(&body.volume, [8.0, 2.0, 8.0]) {
+            cube.offset = (rotation * Vec3::from_array(cube.offset) + translation).to_array();
+            cube.rotation = rotation.to_array();
+            instances.push(cube);
+        }
+    }
+    for patch in setup.state.grass.values() {
+        let def = &setup.definitions[&patch.species];
+        let count = usize::from(patch.biomass) * 81 / usize::from(patch.capacity.max(1));
+        for i in 0..count {
+            let reference = GlobalCell::new(
+                patch.anchor.x + (i % 9) as i64 - 4,
+                patch.anchor.y,
+                patch.anchor.z + (i / 9) as i64 - 4,
+            );
+            if let Some(root) = supported_root(volume, reference, def, setup) {
+                for blade in 0..3 {
+                    let mut center = cell_center(root);
+                    let height = 0.10 + ((i + blade) % 4) as f32 * 0.025;
+                    center[0] += (blade as f32 - 1.0) * 0.045;
+                    center[1] = root.y as f32 * CELL_M + height * 0.5;
+                    center[2] += ((i % 3) as f32 - 1.0) * 0.025;
+                    instances.push(CubeInstance::new(
+                        center,
+                        u32::from(setup.grass_material.0),
+                        [0.02, height, 0.025],
+                        CubeInstance::IDENTITY_ROTATION,
+                    ));
+                }
+            }
+        }
+    }
+    for seed in setup.state.seeds.values() {
+        if let Some(root) =
+            supported_root(volume, seed.cell, &setup.definitions[&seed.species], setup)
+        {
+            let mut center = cell_center(root);
+            center[1] = root.y as f32 * CELL_M + 0.015;
+            instances.push(CubeInstance::new(
+                center,
+                u32::from(setup.grass_material.0),
+                [0.04, 0.03, 0.04],
+                CubeInstance::IDENTITY_ROTATION,
+            ));
+        }
+    }
+    for plant in setup.state.plants.values().filter(|p| p.root_alive) {
+        if plant.committed_cells == 0 {
+            if supported_root(
+                volume,
+                plant.root,
+                &setup.definitions[&plant.species],
+                setup,
+            ) != Some(plant.root)
+            {
+                continue;
+            }
+            let mut center = cell_center(plant.root);
+            center[1] = plant.root.y as f32 * CELL_M + 0.1;
+            instances.push(CubeInstance::new(
+                center,
+                u32::from(setup.definitions[&plant.species].wood.0),
+                [0.025, 0.2, 0.025],
+                CubeInstance::IDENTITY_ROTATION,
+            ));
+            for dx in [-0.045, 0.045] {
+                let mut leaf = center;
+                leaf[0] += dx;
+                leaf[1] += 0.04;
+                instances.push(CubeInstance::new(
+                    leaf,
+                    u32::from(setup.foliage_material.0),
+                    [0.075, 0.04, 0.06],
+                    CubeInstance::IDENTITY_ROTATION,
+                ));
+            }
+            continue;
+        }
+        let grown = &plant.skeleton[..(plant.committed_cells as usize).min(plant.skeleton.len())];
+        for (index, branch) in grown.iter().enumerate() {
+            if branch.removed
+                || !matches!(volume.sample(branch.cell), Ok(Sample::Filled(m)) if m == setup.definitions[&plant.species].wood)
+            {
+                continue;
+            }
+            if grown
+                .iter()
+                .any(|c| !c.removed && c.parent == Some(index as u32))
+            {
+                continue;
+            }
+            let radius = if plant.committed_cells < 12 { 1 } else { 3 };
+            // Rounded, slightly irregular leaf clusters attached to live tips.
+            for z in -radius..=radius {
+                for y in -radius..=radius {
+                    for x in -radius..=radius {
+                        if x * x + z * z + 2 * y * y > radius * radius + 1 {
+                            continue;
+                        }
+                        let mut center = cell_center(branch.cell);
+                        center[0] += x as f32 * 0.22;
+                        center[1] += 0.3 + y as f32 * 0.22;
+                        center[2] += z as f32 * 0.22;
+                        let cell = GlobalCell::new(
+                            (center[0] / CELL_M).floor() as i64,
+                            (center[1] / CELL_M).floor() as i64,
+                            (center[2] / CELL_M).floor() as i64,
+                        );
+                        if !matches!(volume.sample(cell), Ok(Sample::Empty { .. })) {
+                            continue;
+                        }
+                        let width = if (x + z + index as i32).rem_euclid(3) == 0 {
+                            0.18
+                        } else {
+                            0.22
+                        };
+                        instances.push(CubeInstance::new(
+                            center,
+                            u32::from(setup.foliage_material.0),
+                            [width, 0.20, width],
+                            CubeInstance::IDENTITY_ROTATION,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    instances
+}
+
+fn supported_root(
+    volume: &spall_voxel::Volume,
+    reference: GlobalCell,
+    def: &SpeciesDefinition,
+    setup: &EcologyDemoState,
+) -> Option<GlobalCell> {
+    let (root, _) = spall_ecology::surface_root(volume, reference, setup.config.bounds);
+    let root = root?;
+    let soil = GlobalCell::new(root.x, root.y - 1, root.z);
+    if !matches!(volume.sample(soil), Ok(Sample::Filled(m)) if def.soil_materials.contains(&m))
+        || setup.inputs.prohibited.contains(&root)
+    {
+        return None;
+    }
+    Some(root)
+}
+
 fn cell_center(cell: GlobalCell) -> [f32; 3] {
     [
         ((cell.x as f32) + 0.5) * CELL_M,
@@ -698,7 +821,7 @@ fn cell_m(cell: GlobalCell) -> Vec3 {
 
 #[cfg(test)]
 mod tests {
-    use super::DemoClock;
+    use super::*;
     use std::time::Duration;
 
     #[test]
@@ -717,5 +840,178 @@ mod tests {
             ..fast
         };
         assert_eq!(paused.advance_ms(Duration::from_secs(10)), 0);
+    }
+    fn fixture() -> EcologyDemoSetup {
+        use spall_core::{CellSizeCode, VolumeId};
+        use spall_voxel::{EditPlan, Volume};
+        let id = VolumeId::new(1).unwrap();
+        let mut volume = Volume::new(id, CellSizeCode::Quarter);
+        volume
+            .apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(31, 95, 31),
+                MaterialId::AIR,
+            ))
+            .unwrap();
+        volume
+            .apply_edit(&EditPlan::filled_box(
+                id,
+                GlobalCell::new(0, 0, 0),
+                GlobalCell::new(31, 0, 31),
+                MaterialId(1),
+            ))
+            .unwrap();
+        let species = SpeciesDefinition {
+            version: 1,
+            id: SpeciesId(1),
+            wood: MaterialId(2),
+            soil_materials: [MaterialId(1); 4],
+            min_moisture: 20,
+            max_moisture: 220,
+            min_sky_exposure: 12,
+            min_spacing_cells: 8,
+            seed_radius_cells: 12,
+            seed_lifetime_ms: 30_000,
+            seedling_ms: 3_000,
+            juvenile_ms: 7_000,
+            cell_growth_ms: 200,
+        };
+        let mut inputs = EcologyInputs::default();
+        for z in 0..32 {
+            for x in 0..32 {
+                inputs.moisture.insert(GlobalCell::new(x, 0, z), 128);
+            }
+        }
+        let config = EcologyConfig {
+            update_interval_ms: 1000,
+            max_seed_records: 0,
+            max_plants: 1,
+            bounds: Some((GlobalCell::new(0, 0, 0), GlobalCell::new(31, 95, 31))),
+            ..Default::default()
+        };
+        let focus = GlobalCell::new(12, 1, 12);
+        let mut state = EcologyState::default();
+        spall_ecology::place_tree(&mut state, &volume, species, &inputs, config, focus).unwrap();
+        let grass_patch_id = spall_ecology::place_grass_patch(
+            &mut state,
+            SpeciesId(1),
+            GlobalCell::new(22, 1, 22),
+            100,
+        )
+        .unwrap();
+        EcologyDemoSetup {
+            world: WorldSetup {
+                terrain: volume,
+                terrain_collider_region: config.bounds.unwrap(),
+                materials: spall_sim::fixtures::stone_manifest(),
+                anchor: spall_sim::fixtures::flat_terrain_setup().anchor,
+                physics: spall_physics::PhysicsConfig {
+                    disable_ccd: true,
+                    ..Default::default()
+                },
+            },
+            focus,
+            state,
+            inputs,
+            definitions: BTreeMap::from([(species.id, species)]),
+            config,
+            grass_patch_id,
+            grass_material: MaterialId(1),
+            foliage_material: MaterialId(1),
+        }
+    }
+
+    #[test]
+    fn soft_vegetation_bases_are_on_the_soil_surface_and_holes_are_not_drawn() {
+        use spall_voxel::EditPlan;
+        let mut setup = fixture();
+        setup.state.seeds.insert(
+            9,
+            spall_ecology::SeedRecord {
+                id: 9,
+                species: SpeciesId(1),
+                cell: GlobalCell::new(6, 8, 6),
+                expires_at_ms: 50_000,
+            },
+        );
+        let app = EcologyDemoApp::new(setup).unwrap();
+        let seed = app
+            .terrain
+            .iter()
+            .find(|i| i.size == [0.04, 0.03, 0.04])
+            .unwrap();
+        assert!((seed.offset[1] - seed.size[1] * 0.5 - CELL_M).abs() < 1e-6);
+        let stem = app
+            .terrain
+            .iter()
+            .find(|i| i.size == [0.025, 0.2, 0.025])
+            .unwrap();
+        assert!((stem.offset[1] - stem.size[1] * 0.5 - CELL_M).abs() < 1e-6);
+        let mut setup = fixture();
+        setup
+            .world
+            .terrain
+            .apply_edit(&EditPlan::filled_box(
+                setup.world.terrain.id(),
+                GlobalCell::new(6, 0, 6),
+                GlobalCell::new(6, 0, 6),
+                MaterialId::AIR,
+            ))
+            .unwrap();
+        setup.state.seeds.insert(
+            9,
+            spall_ecology::SeedRecord {
+                id: 9,
+                species: SpeciesId(1),
+                cell: GlobalCell::new(6, 8, 6),
+                expires_at_ms: 50_000,
+            },
+        );
+        let app = EcologyDemoApp::new(setup).unwrap();
+        assert!(!app.terrain.iter().any(|i| i.size == [0.04, 0.03, 0.04]));
+    }
+
+    #[test]
+    fn full_growth_has_foliage_correct_wood_volume_and_branch_cut_preserves_trunk() {
+        let mut app = EcologyDemoApp::new(fixture()).unwrap();
+        for _ in 0..12 {
+            app.advance_ecology(1000);
+        }
+        let plant = app.setup.state.plants.values().next().unwrap();
+        assert_eq!(plant.stage, spall_ecology::PlantStage::Mature);
+        assert_eq!(plant.committed_cells as usize, plant.skeleton.len());
+        let expected = plant.committed_cells as f32 * CELL_M.powi(3);
+        let rendered: f32 = app
+            .terrain
+            .iter()
+            .filter(|i| i.material == 2)
+            .map(|i| i.size.iter().product::<f32>())
+            .sum();
+        assert!((rendered - expected).abs() < 1e-5);
+        assert!(
+            app.terrain
+                .iter()
+                .any(|i| i.size[1] == 0.20 && i.size[0] >= 0.18)
+        );
+        app.cut_one_branch();
+        assert!(app.branch_cut);
+        let root = app.setup.state.plants.values().next().unwrap().root;
+        assert!(matches!(
+            app.sim.world().terrain().volume.sample(root),
+            Ok(Sample::Filled(MaterialId(2)))
+        ));
+        app.destroy_one_root();
+        assert!(app.root_cut);
+        assert!(!app.setup.state.plants.values().next().unwrap().root_alive);
+        assert!(
+            app.sim.world().bodies().next().is_some(),
+            "detached wood remains a real body"
+        );
+        let seed_count = app.setup.state.seeds.len();
+        for _ in 0..10 {
+            app.advance_ecology(1000);
+        }
+        assert_eq!(app.setup.state.seeds.len(), seed_count);
     }
 }

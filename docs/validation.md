@@ -1050,4 +1050,22 @@ Run the local interactive ecology showcase with:
 cargo run -p sandbox --features client --bin sandbox-client -- --ecology-demo
 ```
 
-The window uses generated showcase terrain and a private `Simulation` instance. It is an inspection fixture and does not connect to or save a server world. Controls: **Space** pause/resume ecological time; **.** advance one ecology interval while paused; **+/-** select 1x, 4x, or 16x; **H** harvest grass; **B** cut a grown branch; **X** destroy the root; **WASD/QE** fly; click to capture the mouse, **Esc** release it. The HUD reports ecology time, speed, grass biomass, plant stage/count, and seed count. `cargo test -p spall_client ecology_demo::tests` covers the deterministic clock controls. A real desktop GPU/window presentation pass must be recorded separately from the CPU checks.
+The window uses a fully resident 16 m stepped clearing and a private `Simulation` instance. The earlier generated-terrain crop is superseded by the ENG-117 correction pass. It is an inspection fixture and does not connect to or save a server world. Controls: **Space** pause/resume ecological time; **.** advance one ecology interval while paused; **+/-** select 1x, 4x, or 16x; **H** harvest grass; **B** cut a grown branch; **X** destroy the root; **WASD/QE** fly; click to capture the mouse, **Esc** release it. The HUD reports ecology time, speed, grass biomass, plant stage/count, and seed count. `cargo test -p spall_client ecology_demo::tests` covers the deterministic clock controls. A real desktop GPU/window presentation pass must be recorded separately from the CPU checks.
+
+ENG-117 correction validation adds terrain contact, exact 25 cm wood-volume,
+foliage, side-branch/root damage and clearing-residency checks:
+
+```powershell
+cargo test -p spall_ecology
+cargo test -p spall_client ecology_demo::tests
+cargo test -p sandbox --features client ecology_scene::tests
+cargo run -p sandbox --features client --bin sandbox-client -- --ecology-capture .local/runs/ecology-corrections
+cargo xtask check
+```
+
+The capture command runs the same private Simulation, growth acknowledgment,
+instance builder, camera and GameRenderer as the showcase. It saves six PNGs
+and structured state counts at 0, 3, 12, and 30 ecological seconds, then after
+branch/root cuts. It does not open a window or validate mouse/keyboard interaction.
+Grass and foliage remain visual instances, not solid occupancy or physics bodies.
+Wood retains 0.25 m cells; greedy merging changes draw boxes, never cell resolution.
