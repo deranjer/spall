@@ -445,6 +445,8 @@ struct InteractiveApp {
     material_names: std::collections::BTreeMap<u16, String>,
     /// ENG-105: `(frame_seq, server_tick)` of the water keyframe on the GPU.
     water_key: Option<(u64, u64)>,
+    /// Terrain window centre the water look was last built for.
+    water_built_window: Option<[f64; 3]>,
     /// An admin command was sent and its `AdminStatus` has not arrived.
     admin_request_pending: bool,
     /// `InteractiveSession::world_resets` last acted on.
@@ -1262,6 +1264,7 @@ impl InteractiveApp {
             hammer_target: None,
             material_names: std::collections::BTreeMap::new(),
             water_key: None,
+            water_built_window: None,
             admin_request_pending: false,
             seen_world_resets: 0,
             result: Ok(()),
@@ -1782,25 +1785,28 @@ impl ApplicationHandler for InteractiveApp {
                         .world_resets
                         .load(std::sync::atomic::Ordering::Relaxed),
                 );
-                let water_update = if self.water_key != Some(water_key) {
+                // The water look is clipped to the terrain window, so it is
+                // rebuilt when the window moves as well.
+                let water_window = self.last_built_pos;
+                let water_update = if self.water_key != Some(water_key)
+                    || self.water_built_window != water_window
+                {
                     self.water_key = Some(water_key);
+                    self.water_built_window = water_window;
                     let frames = self
                         .session
                         .water_regions
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
-                    Some(
-                        frames
-                            .iter()
-                            .flat_map(|frame| build_water_instances(frame))
-                            .collect::<Vec<_>>(),
-                    )
+                    // No terrain yet: nothing to anchor water to.
+                    Some(water_window.map(|center| {
+                        crate::water_look::build_water_look(&frames, center, VIEW_RADIUS_M, 0)
+                    }))
                 } else {
                     None
                 };
                 let mut menu_actions = AdminMenuActions::default();
-                let water_window = self.last_built_pos;
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
@@ -1815,10 +1821,9 @@ impl ApplicationHandler for InteractiveApp {
                     self.fail(event_loop, ClientError::Render(error.to_string()));
                     return;
                 }
-                if let Some(instances) = &water_update {
-                    renderer.set_debug_water(instances);
+                if let Some(look) = water_update {
+                    renderer.set_water_look(look);
                 }
-                renderer.set_water_window(water_window);
                 if self.sky_dirty {
                     let occupancy = self.last_sky.as_ref().filter(|_| self.sky_visibility_on);
                     // Nothing to upload yet (no rebuild has landed) keeps the
@@ -3520,9 +3525,6 @@ fn hammer_due(pending: bool, held: bool, last: Option<Instant>, now: Instant) ->
     pending || (held && last.is_none_or(|at| now.saturating_duration_since(at) >= HAMMER_REPEAT))
 }
 
-/// Water under this fraction of a cell is not drawn (thin films and spray).
-const WATER_DRAW_MIN: u8 = 6;
-
 /// Merges the water columns of a keyframe (all one cell wide, same-height runs
 /// side by side) into as few boxes as possible and assigns the water material:
 /// a flat lake is a handful of boxes, not one per fluid column.
@@ -3602,50 +3604,6 @@ fn clip_water_to_window(boxes: &[Instance], center_m: [f64; 3], out: &mut Vec<In
             out.push(Instance { offset, size, ..*b });
         }
     }
-}
-
-/// Translucent water columns for one replicated keyframe: each vertical run
-/// of wet fluid cells becomes one box as tall as the run's summed fractions,
-/// so a column shows a single top surface instead of stacked cube faces.
-pub(super) fn build_water_instances(frame: &spall_protocol::WaterKeyframe) -> Vec<Instance> {
-    let [nx, ny, nz] = frame.dimensions.map(|d| d as usize);
-    let coarsen = f64::from(frame.coarsen);
-    let cell_m = f64::from(CELL_M) * coarsen;
-    let origin =
-        [frame.origin.x, frame.origin.y, frame.origin.z].map(|v| v as f64 * f64::from(CELL_M));
-    let mut instances = Vec::new();
-    for z in 0..nz {
-        for x in 0..nx {
-            let mut y = 0;
-            while y < ny {
-                let at = |y: usize| frame.fractions[x + nx * (y + ny * z)];
-                if at(y) < WATER_DRAW_MIN {
-                    y += 1;
-                    continue;
-                }
-                let start = y;
-                let mut filled = 0.0;
-                while y < ny && at(y) >= WATER_DRAW_MIN {
-                    filled += f64::from(at(y)) / 255.0;
-                    y += 1;
-                }
-                let height = filled * cell_m;
-                let bottom = origin[1] + start as f64 * cell_m;
-                instances.push(Instance {
-                    offset: [
-                        (origin[0] + (x as f64 + 0.5) * cell_m) as f32,
-                        (bottom + 0.5 * height) as f32,
-                        (origin[2] + (z as f64 + 0.5) * cell_m) as f32,
-                    ],
-                    material: 0,
-                    size: [cell_m as f32, height as f32, cell_m as f32],
-                    _pad: 0.0,
-                    rotation: IDENTITY_ROTATION,
-                });
-            }
-        }
-    }
-    instances
 }
 
 fn admin_menu_view(
@@ -4155,6 +4113,8 @@ pub(super) struct WorldRenderer {
     debug_water_source: Vec<Instance>,
     water_window: Option<[f64; 3]>,
     debug_water_instances: Vec<Instance>,
+    /// Clock for the water's animated caustics.
+    water_epoch: Instant,
     /// `F4` cycles this through the renderer's debug views.
     debug_view: DebugView,
     /// The last camera basis the window built (`InteractiveApp` computes eye
@@ -4360,14 +4320,30 @@ impl WorldRenderer {
         self.debug_water_source = merge_water_columns(instances, self.debug_water_material);
     }
 
-    pub(super) fn set_crosshair(&mut self, view: Option<CrosshairView>) {
-        self.crosshair = view;
+    /// Installs (or, with `None`, clears) the smoothed water surface and the
+    /// height field behind the underwater look.
+    pub(super) fn set_water_look(&mut self, look: Option<crate::water_look::WaterLook>) {
+        match look {
+            Some(look) => {
+                self.scene.set_water_surface(
+                    &self.device,
+                    &self.queue,
+                    &look.vertices,
+                    &look.indices,
+                );
+                self.scene
+                    .set_water_field(&self.device, &self.queue, Some(look.field));
+            }
+            None => {
+                self.scene
+                    .set_water_surface(&self.device, &self.queue, &[], &[]);
+                self.scene.set_water_field(&self.device, &self.queue, None);
+            }
+        }
     }
 
-    /// Centre of the terrain window water is drawn in, or `None` before any
-    /// terrain has landed (then no water is drawn: it would float in the sky).
-    pub(super) fn set_water_window(&mut self, center_m: Option<[f64; 3]>) {
-        self.water_window = center_m;
+    pub(super) fn set_crosshair(&mut self, view: Option<CrosshairView>) {
+        self.crosshair = view;
     }
 
     /// Rebuilds the draw list: the water boxes clipped to the terrain window.
@@ -4501,6 +4477,7 @@ impl WorldRenderer {
             debug_water_source: Vec::new(),
             water_window: None,
             debug_water_instances: Vec::new(),
+            water_epoch: Instant::now(),
             debug_view: DebugView::Shaded,
             aspect,
             yakui,
@@ -4772,6 +4749,8 @@ impl WorldRenderer {
         self.scene
             .set_body_meshes(&self.device, &self.queue, body_meshes, live_body_meshes)
             .map_err(|error| ClientError::Render(error.to_string()))?;
+        self.scene
+            .set_water_time(self.water_epoch.elapsed().as_secs_f32());
         self.clip_water();
         if let Some((eye, _)) = cam {
             self.debug_water_instances.sort_by(|a, b| {

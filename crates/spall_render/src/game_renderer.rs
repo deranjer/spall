@@ -215,6 +215,9 @@ pub struct GameRenderer {
     /// Drawn lit but never shadow-casting (debug overlays).
     overlay: InstanceSet,
     transparent: InstanceSet,
+    /// The smoothed water surface sheet, drawn alpha-blended after the opaque
+    /// scene.
+    water_surface: DynamicMesh,
     /// Camera-local sky occupancy + visibility; `None` keeps the legacy
     /// unconditional hemispheric ambient.
     sky: Option<SkyVisibility>,
@@ -328,6 +331,7 @@ impl GameRenderer {
             bodies: InstanceSet::new(),
             overlay: InstanceSet::new(),
             transparent: InstanceSet::new(),
+            water_surface: DynamicMesh::new(device),
             sky: None,
             timer: timestamp_period_ns.map(|period| PassTimer::new(device, period)),
             timed_slot: None,
@@ -510,6 +514,33 @@ impl GameRenderer {
         instances: &[CubeInstance],
     ) -> u64 {
         self.transparent.set(device, queue, instances)
+    }
+
+    /// Replace the water surface sheet (empty slices clear it).
+    pub fn set_water_surface(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[GpuVertex],
+        indices: &[u32],
+    ) {
+        self.water_surface.update(device, queue, vertices, indices);
+    }
+
+    /// Supply (or clear, with `None`) the water surface heights used for
+    /// underwater fog, tint and caustics.
+    pub fn set_water_field(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        field: Option<crate::water::WaterField>,
+    ) {
+        self.pipeline.set_water_field(device, queue, field);
+    }
+
+    /// Water animation clock in seconds (caustics).
+    pub fn set_water_time(&mut self, seconds: f32) {
+        self.pipeline.set_water_time(seconds);
     }
 
     /// Supply (or clear, with `None`) the camera-local occupancy that makes
@@ -753,7 +784,7 @@ impl GameRenderer {
             );
             self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies, &self.overlay]);
         }
-        if self.transparent.count() > 0 {
+        if self.transparent.count() > 0 || self.water_surface.index_count > 0 {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("spall-game-transparent-cube-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -789,6 +820,16 @@ impl GameRenderer {
                 &[],
             );
             self.draw_cubes(&mut pass, &[&self.transparent]);
+            if self.water_surface.index_count > 0 {
+                // Same bind groups as the cubes above.
+                pass.set_pipeline(self.pipeline.water_surface());
+                pass.set_vertex_buffer(0, self.water_surface.vertices.slice(..));
+                pass.set_index_buffer(
+                    self.water_surface.indices.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..self.water_surface.index_count, 0, 0..1);
+            }
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

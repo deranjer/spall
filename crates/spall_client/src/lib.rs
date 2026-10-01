@@ -10,6 +10,7 @@ pub mod residency;
 pub mod segmented;
 pub mod sky;
 pub mod tick_accumulator;
+pub mod water_look;
 pub mod window;
 
 pub use grid_fluid_demo::run_grid_fluid_demo_window;
