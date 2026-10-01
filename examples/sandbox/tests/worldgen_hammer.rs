@@ -61,7 +61,15 @@ fn sample(replica: &Arc<Mutex<ReplicaWorld>>, cell: GlobalCell) -> Option<Sample
 
 #[test]
 fn a_hammer_swing_digs_a_crater_the_client_replica_sees() {
-    let scene = worldgen_scene::generate("showcase", 1, 256).expect("generate");
+    let scene = worldgen_scene::generate(
+        "showcase",
+        1,
+        std::env::var("HAMMER_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256),
+    )
+    .expect("generate");
     let spawn = scene.player_spawns()[0];
     // Aim straight down at the ground 6 m under a point above the first spawn.
     let (x, z) = (
@@ -89,8 +97,25 @@ fn a_hammer_swing_digs_a_crater_the_client_replica_sees() {
     config.fingerprint_out = Some(dir.join("server.fingerprint"));
     config.addr_out = Some(dir.join("server.addr"));
     config.transport = patient_transport();
+    // Timestamp the server's commit of the cut, to split server time from the
+    // network and the client's apply.
+    let committed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let commit_slot = committed_at.clone();
+    let commit_handler: spall_server::CommittedEditHandler = Box::new(move |_, _, _, removed| {
+        if !removed.is_empty() {
+            commit_slot.lock().unwrap().get_or_insert_with(Instant::now);
+        }
+    });
     let server = std::thread::spawn(move || {
-        spall_server::serve_with_game_content(config, game::tool_catalog(), game::manifest())
+        spall_server::serve_with_game_content_and_commit_handler(
+            config,
+            game::tool_catalog(),
+            game::manifest(),
+            game::contact_damage_profiles(),
+            None,
+            None,
+            commit_handler,
+        )
     });
     let fingerprint = Fingerprint::from_hex(&wait_for(&dir.join("server.fingerprint"))).unwrap();
     let addr: SocketAddr = wait_for(&dir.join("server.addr")).parse().unwrap();
@@ -140,6 +165,7 @@ fn a_hammer_swing_digs_a_crater_the_client_replica_sees() {
     }
 
     // One swing, radius 3 cells.
+    let swung = Instant::now();
     session.push_action(hammer_request(2_000_000, eye, Vec3::NEG_Y, 3));
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -164,6 +190,17 @@ fn a_hammer_swing_digs_a_crater_the_client_replica_sees() {
             );
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+    println!(
+        "click to replica change: {:.0} ms",
+        swung.elapsed().as_secs_f64() * 1e3
+    );
+    if let Some(at) = *committed_at.lock().unwrap() {
+        println!(
+            "server committed the cut {:.0} ms after the click; the replica changed {:.0} ms after that",
+            at.saturating_duration_since(swung).as_secs_f64() * 1e3,
+            at.elapsed().as_secs_f64() * 1e3
+        );
     }
     // A crater of the brush's size: centre column down to the radius is gone,
     // well below it and well to the side are untouched.

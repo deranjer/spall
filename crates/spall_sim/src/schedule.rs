@@ -110,6 +110,9 @@ pub struct EditPipeline {
     active_regions: HashSet<RegionKey>,
     max_pending: usize,
     serialize_threshold: u32,
+    /// Brick labels of the live terrain, memoized by revision so staging an
+    /// edit relabels only the bricks it changed instead of the whole world.
+    label_cache: spall_structure::LabelCache,
 }
 
 impl EditPipeline {
@@ -125,7 +128,22 @@ impl EditPipeline {
             active_regions: HashSet::new(),
             max_pending,
             serialize_threshold: serialize_threshold.max(1),
+            label_cache: spall_structure::LabelCache::new(),
         }
+    }
+
+    /// Labels every terrain brick into the label cache now, so the first edit
+    /// of a large world does not pay for the whole-world labelling (about a
+    /// second at 12k bricks) the way every later one does not. Safe to skip: an
+    /// unwarmed cache fills on the first staging pass.
+    pub fn warm_labels(&self, world: &SimWorld) {
+        let _ = spall_structure::SupportGraph::build_cached(
+            &world.terrain().volume,
+            world.anchor(),
+            spall_structure::ResidencyMode::AllResident,
+            &spall_structure::CancelToken::new(),
+            &self.label_cache,
+        );
     }
 
     /// The committed [`Committed`] for `request_id`, if it has committed.
@@ -266,7 +284,8 @@ impl EditPipeline {
                     world.anchor(),
                     generation,
                     epoch,
-                );
+                )
+                .with_label_cache(self.label_cache.clone());
                 let request = JobRequest::new(
                     Lane::Edit,
                     Priority::NORMAL,

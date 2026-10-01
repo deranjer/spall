@@ -39,6 +39,10 @@ pub struct StageInput {
     pub kind: EditKind,
     pub brush: spall_core::SphereBrush,
     pub explosion: Option<ExplosionImpulse>,
+    /// Memoized brick labels of the **live** volume `volume` was cloned from,
+    /// shared by every staging pass of one pipeline. `None` relabels every brick
+    /// each time (small worlds, tests). Never hand it a dry-run volume.
+    pub label_cache: Option<spall_structure::LabelCache>,
 }
 
 impl StageInput {
@@ -67,7 +71,15 @@ impl StageInput {
             kind: intent.kind,
             brush: intent.brush,
             explosion: intent.explosion,
+            label_cache: None,
         }
+    }
+
+    /// Reuses `cache` for the structural analysis of this live snapshot.
+    #[must_use]
+    pub fn with_label_cache(mut self, cache: spall_structure::LabelCache) -> Self {
+        self.label_cache = Some(cache);
+        self
     }
 }
 
@@ -161,14 +173,25 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
 
     // Pre-edit structural read set + generation / epoch.
     let sp_idx = crate::prof::Span::start("stage.structure_index_build");
-    let mut index = StructureIndex::build(
-        &input.volume,
-        input.anchor,
-        ResidencyMode::AllResident,
-        input.generation,
-        input.topology_epoch,
-        &cancel,
-    )?;
+    let mut index = match &input.label_cache {
+        Some(cache) => StructureIndex::build_cached(
+            &input.volume,
+            input.anchor,
+            ResidencyMode::AllResident,
+            input.generation,
+            input.topology_epoch,
+            &cancel,
+            cache,
+        )?,
+        None => StructureIndex::build(
+            &input.volume,
+            input.anchor,
+            ResidencyMode::AllResident,
+            input.generation,
+            input.topology_epoch,
+            &cancel,
+        )?,
+    };
     drop(sp_idx);
     let mut token = index.token();
 

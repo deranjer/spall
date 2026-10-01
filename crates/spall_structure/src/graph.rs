@@ -14,13 +14,21 @@
 //! so connectivity through that face is unknown, not absent.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
-use spall_core::{BRICK_EDGE, BrickCoord, GlobalCell, LocalCell, Revision, VolumeId};
+use spall_core::{BRICK_EDGE, BrickCoord, GlobalCell, Revision, VolumeId};
 use spall_voxel::{BrickState, Volume};
 
-use crate::label::{BrickLabels, LocalComponent, label_brick};
+use crate::label::{BrickLabels, LabelCache, LocalComponent, label_brick};
 
 const EDGE: i64 = BRICK_EDGE as i64;
+const EDGE_US: usize = BRICK_EDGE as usize;
+
+/// Linear index of a brick-local cell, `x + 32 * (y + 32 * z)`.
+#[inline]
+fn idx_of(x: usize, y: usize, z: usize) -> usize {
+    x + EDGE_US * (y + EDGE_US * z)
+}
 
 /// Canonical order key for a node: `(z, y, x, local)`.
 type NodeOrder = (i64, i64, i64, u16);
@@ -160,7 +168,7 @@ pub struct SupportGraph {
     residency: ResidencyMode,
     /// Per-brick labelling, keyed by raw `(x, y, z)`. Only bricks with at least
     /// one solid cell are kept.
-    labels: BTreeMap<(i64, i64, i64), BrickLabels>,
+    labels: BTreeMap<(i64, i64, i64), Arc<BrickLabels>>,
     /// Revision each labelled brick was read at (feeds the job token).
     brick_revision: BTreeMap<(i64, i64, i64), Revision>,
     /// Neighbour bricks probed during assembly that were absent. This includes
@@ -187,6 +195,30 @@ impl SupportGraph {
         residency: ResidencyMode,
         cancel: &CancelToken,
     ) -> Result<Self, Interrupted> {
+        Self::build_with(volume, anchor, residency, cancel, None)
+    }
+
+    /// [`Self::build`], reusing (and filling) `cache` for every brick whose
+    /// revision it already holds. Pass a cache only when `volume` is the live
+    /// volume, never a dry-run copy (see [`LabelCache`]). A volume's cache is
+    /// pruned to its resident bricks.
+    pub fn build_cached(
+        volume: &Volume,
+        anchor: AnchorPlane,
+        residency: ResidencyMode,
+        cancel: &CancelToken,
+        cache: &LabelCache,
+    ) -> Result<Self, Interrupted> {
+        Self::build_with(volume, anchor, residency, cancel, Some(cache))
+    }
+
+    fn build_with(
+        volume: &Volume,
+        anchor: AnchorPlane,
+        residency: ResidencyMode,
+        cancel: &CancelToken,
+        cache: Option<&LabelCache>,
+    ) -> Result<Self, Interrupted> {
         let mut graph = Self {
             volume: volume.id(),
             anchor,
@@ -206,7 +238,10 @@ impl SupportGraph {
             if cancel.is_cancelled() {
                 return Err(Interrupted::Cancelled);
             }
-            graph.relabel_brick(volume, coord);
+            graph.relabel_brick(volume, coord, cache);
+        }
+        if let Some(cache) = cache {
+            cache.retain_volume(volume.id(), |key| graph.brick_revision.contains_key(key));
         }
         graph.reassemble(volume, cancel, SearchBudget::UNLIMITED)?;
         Ok(graph)
@@ -278,7 +313,7 @@ impl SupportGraph {
 
     /// The labelling of one brick, if it carries any solid cell.
     pub fn brick_labels(&self, coord: BrickCoord) -> Option<&BrickLabels> {
-        self.labels.get(&(coord.x, coord.y, coord.z))
+        self.labels.get(&(coord.x, coord.y, coord.z)).map(|v| &**v)
     }
 
     /// The global component a solid cell belongs to, if any. Requires the scan
@@ -304,7 +339,7 @@ impl SupportGraph {
             if cancel.is_cancelled() {
                 return Err(Interrupted::Cancelled);
             }
-            self.relabel_brick(volume, coord);
+            self.relabel_brick(volume, coord, None);
         }
         self.reassemble(volume, cancel, budget)
     }
@@ -325,15 +360,22 @@ impl SupportGraph {
 
     /// (Re)labels one brick from the live volume. A brick with no solid cell is
     /// dropped from the label / revision maps.
-    fn relabel_brick(&mut self, volume: &Volume, coord: BrickCoord) {
+    fn relabel_brick(&mut self, volume: &Volume, coord: BrickCoord, cache: Option<&LabelCache>) {
         let key = (coord.x, coord.y, coord.z);
         match volume.brick_state(coord) {
             Ok(BrickState::Resident { revision, .. }) => {
-                let snap = volume
-                    .snapshot_brick(coord)
-                    .expect("bounds checked by brick_state")
-                    .expect("resident per brick_state");
-                let labels = label_brick(&snap);
+                let cached = cache.and_then(|c| c.get(volume.id(), key, revision));
+                let labels = cached.unwrap_or_else(|| {
+                    let snap = volume
+                        .snapshot_brick(coord)
+                        .expect("bounds checked by brick_state")
+                        .expect("resident per brick_state");
+                    let labels = Arc::new(label_brick(&snap));
+                    if let Some(cache) = cache {
+                        cache.put(volume.id(), key, revision, labels.clone());
+                    }
+                    labels
+                });
                 if labels.is_empty() {
                     self.labels.remove(&key);
                 } else {
@@ -423,26 +465,16 @@ impl SupportGraph {
         labels: &BrickLabels,
         local: LocalComponent,
     ) -> (bool, Vec<BrickCoord>) {
-        let cells = labels.cells(local);
-        let mut anchored = false;
-        let mut faces = [false; 6];
-        for cell in &cells {
-            let g = GlobalCell::from_parts(coord, *cell).expect("structural cell within i64 range");
-            if g.y == self.anchor.y {
-                anchored = true;
-            }
-            let (x, y, z) = (
-                i64::from(cell.x()),
-                i64::from(cell.y()),
-                i64::from(cell.z()),
-            );
-            faces[0] |= x == 0;
-            faces[1] |= x == EDGE - 1;
-            faces[2] |= y == 0;
-            faces[3] |= y == EDGE - 1;
-            faces[4] |= z == 0;
-            faces[5] |= z == EDGE - 1;
-        }
+        // Per-component facts were computed once when the brick was labelled: a
+        // cell on the support plane is a cell at that height in this brick, and
+        // a face is present when any cell touches it.
+        let faces = labels.faces(local);
+        let anchored = coord
+            .y
+            .checked_mul(EDGE)
+            .and_then(|base| self.anchor.y.checked_sub(base))
+            .filter(|local_y| (0..EDGE).contains(local_y))
+            .is_some_and(|local_y| labels.has_layer(local, local_y as u8));
 
         let mut unresolved = Vec::new();
         for (face, &present) in faces.iter().enumerate() {
@@ -498,46 +530,56 @@ impl SupportGraph {
     /// `axis`) wherever their boundary cells are both solid at matching
     /// cross-face coordinates.
     fn link_face(&mut self, a: BrickCoord, b: BrickCoord, axis: usize) {
-        let hi = (BRICK_EDGE - 1) as u8;
-        let mut edges: Vec<(usize, usize)> = Vec::new();
+        // `a`'s `+axis` face against `b`'s `-axis` face; the face masks share
+        // `(u, v)` coordinates across the pair (see `BrickLabels::face_mask`).
+        let (face_a, face_b) = (2 * axis + 1, 2 * axis);
+        let mut pairs: BTreeSet<(LocalComponent, LocalComponent)> = BTreeSet::new();
         {
             let la = &self.labels[&(a.x, a.y, a.z)];
             let lb = &self.labels[&(b.x, b.y, b.z)];
-            for u in 0..BRICK_EDGE as u8 {
-                for v in 0..BRICK_EDGE as u8 {
-                    let (ca, cb) = match axis {
-                        0 => (
-                            LocalCell::new(hi, u, v).unwrap(),
-                            LocalCell::new(0, u, v).unwrap(),
-                        ),
-                        1 => (
-                            LocalCell::new(u, hi, v).unwrap(),
-                            LocalCell::new(u, 0, v).unwrap(),
-                        ),
-                        _ => (
-                            LocalCell::new(u, v, hi).unwrap(),
-                            LocalCell::new(u, v, 0).unwrap(),
-                        ),
-                    };
-                    let (Some(comp_a), Some(comp_b)) = (la.component_at(ca), lb.component_at(cb))
-                    else {
-                        continue;
-                    };
-                    let na = self.node_of[&NodeKey {
-                        brick: a,
-                        local: comp_a,
+            let (ma, mb) = (la.face_mask(face_a), lb.face_mask(face_b));
+            if la.count() == 1 && lb.count() == 1 {
+                // One component each: they bond iff any boundary cell pair is
+                // solid on both sides.
+                if ma.iter().zip(mb).any(|(x, y)| x & y != 0) {
+                    pairs.insert((LocalComponent(1), LocalComponent(1)));
+                }
+            } else {
+                // At least one brick has several components: compare the
+                // labels of the cell pairs that are solid on both sides.
+                for v in 0..BRICK_EDGE as usize {
+                    let mut both = ma[v] & mb[v];
+                    while both != 0 {
+                        let u = both.trailing_zeros() as usize;
+                        both &= both - 1;
+                        let (ia, ib) = match axis {
+                            0 => (idx_of(EDGE_US - 1, u, v), idx_of(0, u, v)),
+                            1 => (idx_of(u, EDGE_US - 1, v), idx_of(u, 0, v)),
+                            _ => (idx_of(u, v, EDGE_US - 1), idx_of(u, v, 0)),
+                        };
+                        pairs.insert((
+                            LocalComponent(la.label_at_index(ia)),
+                            LocalComponent(lb.label_at_index(ib)),
+                        ));
                     }
-                    .order()];
-                    let nb = self.node_of[&NodeKey {
-                        brick: b,
-                        local: comp_b,
-                    }
-                    .order()];
-                    edges.push((na, nb));
                 }
             }
         }
-        for (na, nb) in edges {
+        for (comp_a, comp_b) in pairs {
+            debug_assert!(
+                comp_a.get() != 0 && comp_b.get() != 0,
+                "masks are solid cells"
+            );
+            let na = self.node_of[&NodeKey {
+                brick: a,
+                local: comp_a,
+            }
+            .order()];
+            let nb = self.node_of[&NodeKey {
+                brick: b,
+                local: comp_b,
+            }
+            .order()];
             self.adj[na].insert(nb);
             self.adj[nb].insert(na);
         }

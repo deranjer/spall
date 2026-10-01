@@ -165,11 +165,30 @@ structure tests) and digging reveals the layers.
   hashed from the voxel the fragment lies in, so merged boxes keep their speed).
   It applies to axis-aligned cube instances only (terrain), not rotated bodies,
   and is client-side and cosmetic: no material ids, replication or saves change.
-- **Hammer latency.** A swing took most of a second to appear (500 ms rebuild
-  timer plus a 105-165 ms full window walk). The terrain draw is now cached per
-  brick (`TerrainInstanceCache`, keyed by the brick's and its neighbours'
-  revisions and the window clip) and a rebuild is dispatched as soon as the
-  replica's terrain generation changes: an edit rebuild is 1-4 ms (was 90-150).
+- **Hammer latency.** A swing took ~3.5 s to show on the full arena. Measured
+  (`worldgen_hammer` with `HAMMER_SIZE=1024`, release; the commit-handler hook
+  splits server from client): the server committed the cut 3458 ms after the
+  click and the client replica saw it 93 ms later, so the cost was on the
+  server. `stage_edit` built the structural index of the **whole terrain** for
+  every cut (about 12k bricks: a 64 KiB per-cell label array even for uniform
+  bricks, flood-filled, then a full graph reassembly twice, whose brick linking
+  scanned 1024 cell pairs per face). It is now incremental and still exact:
+  brick labels are compact (uniform bricks and single-component bricks need no
+  per-cell array), memoized by revision in a pipeline-owned `LabelCache` written
+  only from builds of the live volume (never a dry run), warmed when the
+  simulation is created; per-component facts (faces, anchor layer) are
+  precomputed; and neighbouring bricks link through 32x32-bit face masks
+  (`BrickLabels::face_mask`) instead of cell scans. Cut commit on the full arena:
+  3000 ms -> 135 ms (200-270 ms with the water region running); click to replica
+  change 3551 ms -> 358 ms (269 ms server + 89 ms client). What remains is the
+  whole-world result hash in the commit (~55 ms), a whole-world solid count
+  (~26 ms) and the water re-sync. On the client, the terrain draw is also cached
+  per brick (`TerrainInstanceCache`, keyed by the revisions of the brick and its
+  neighbours and the window clip) and rebuilt the moment the replica's terrain
+  changes: 1-4 ms (was 90-150 ms). The topology contract is unchanged: the
+  structural scenario and oracle tests (38) pass, and a randomized test checks
+  the compact labels, per-component facts and face masks cell for cell against a
+  reference flood fill.
 
 ## Not included
 Trees, grass, props, flowing rivers (water is initially static, filled to sea

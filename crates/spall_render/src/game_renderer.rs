@@ -386,18 +386,18 @@ impl GameRenderer {
         self.timer.as_ref().and_then(|timer| timer.latest)
     }
 
-    /// Record shadows, HDR shading and the tone map into `encoder`, writing the
-    /// tone-mapped frame to `output` (which must match the size given to
-    /// [`Self::new`]/[`Self::resize`]). The host draws its UI afterwards.
-    ///
-    /// Call [`Self::finish_timing`] after submitting `encoder`.
-    #[allow(clippy::too_many_arguments)]
     /// Sets the point lights the following frames are shaded with (the nearest
     /// [`crate::MAX_POINT_LIGHTS`]; see [`crate::PointLight`]).
     pub fn set_point_lights(&self, lights: &[crate::PointLight]) {
         self.pipeline.set_point_lights(lights);
     }
 
+    /// Record shadows, HDR shading and the tone map into `encoder`, writing the
+    /// tone-mapped frame to `output` (which must match the size given to
+    /// [`Self::new`]/[`Self::resize`]). The host draws its UI afterwards.
+    ///
+    /// Call [`Self::finish_timing`] after submitting `encoder`.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         device: &wgpu::Device,

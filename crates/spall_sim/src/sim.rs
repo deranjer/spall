@@ -159,6 +159,7 @@ impl Simulation {
                     })?,
             );
         }
+        simulation.pipeline.warm_labels(&simulation.world);
         Ok(simulation)
     }
 
@@ -168,7 +169,7 @@ impl Simulation {
     /// `spall_store` — and control-stream sequencing restarts at 1 for the fresh
     /// post-restart session.
     pub fn from_restored(world: SimWorld, tick: Tick) -> Self {
-        Self {
+        let simulation = Self {
             world,
             pipeline: EditPipeline::new(
                 SimulationConfig::DEFAULT_MAX_PENDING_INTENTS,
@@ -182,7 +183,9 @@ impl Simulation {
             // increment 3; recovered simulations do not claim water yet.
             water: None,
             additional_water: Vec::new(),
-        }
+        };
+        simulation.pipeline.warm_labels(&simulation.world);
+        simulation
     }
 
     pub fn world(&self) -> &SimWorld {

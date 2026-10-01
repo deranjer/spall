@@ -189,3 +189,66 @@ fn measure_full_arena_stand_up() {
     println!("120 ticks: {:?}, worst {:?}", t.elapsed(), worst);
     println!("player {:?}", sim.player_state(player));
 }
+
+/// Times the authoritative simulation around one hammer-sized cut on the full
+/// arena, with and without the water region, to see where server time goes:
+/// `cargo test -p sandbox --release --test worldgen_scene -- --ignored --nocapture measure_cut`.
+#[test]
+#[ignore]
+fn measure_cut_latency_on_the_full_arena() {
+    use spall_core::units::{BRUSH_UNIT, BrushPoint};
+    use spall_core::{SphereBrush, player_entity_for};
+    use spall_protocol::RequestId;
+    use spall_sim::{EditIntent, EditTarget};
+
+    for with_water in [false, true] {
+        let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::DEFAULT_SIZE_CELLS)
+            .expect("generate");
+        let spawn = scene.player_spawns()[0];
+        let (x, z) = (
+            (spawn[0] / 0.25).floor() as i64,
+            (spawn[2] / 0.25).floor() as i64,
+        );
+        let ground_y = (spawn[1] / 0.25).round() as i64 - 1;
+        let mut config = SimulationConfig::new(scene.world_setup());
+        if with_water {
+            config.water = scene.water_setup().cloned();
+        }
+        let mut sim = Simulation::new(config).expect("stands up");
+        let player = player_entity_for(0);
+        sim.add_player(player, spawn);
+        for _ in 0..60 {
+            sim.tick().expect("tick");
+        }
+        for cut in 0..4_i64 {
+            let half = BRUSH_UNIT / 2;
+            let brush = SphereBrush::new(
+                BrushPoint::from_units(
+                    (x + cut * 14) * BRUSH_UNIT + half,
+                    ground_y * BRUSH_UNIT + half,
+                    z * BRUSH_UNIT + half,
+                ),
+                3 * BRUSH_UNIT,
+            )
+            .unwrap();
+            sim.submit(EditIntent::cut(
+                RequestId(1 + cut as u64),
+                player,
+                EditTarget::Terrain,
+                brush,
+            ))
+            .expect("submit");
+            for tick in 0..60 {
+                let s = Instant::now();
+                let report = sim.tick().expect("tick");
+                let ms = s.elapsed().as_secs_f64() * 1e3;
+                if !report.committed.is_empty() {
+                    println!(
+                        "water {with_water}: cut {cut} committed on tick {tick}, that tick {ms:.1} ms"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
