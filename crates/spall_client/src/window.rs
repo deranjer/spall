@@ -563,6 +563,41 @@ fn visible_terrain_bricks(volume: &Volume, center_m: [f64; 3]) -> Vec<BrickCoord
 
 pub type MeshUpdate<K> = (K, Vec<spall_render::GpuVertex>, Vec<u32>);
 
+/// Meshes `coords` of `volume` on up to `available_parallelism` threads,
+/// results in input order. A panic in a mesher thread propagates (never
+/// swallowed).
+fn mesh_chunks_parallel(
+    volume: &Volume,
+    coords: &[BrickCoord],
+) -> Vec<(
+    BrickCoord,
+    Result<spall_mesh::VolumeMesh, spall_mesh::MeshError>,
+)> {
+    let build = |coord: &BrickCoord| {
+        (
+            *coord,
+            spall_mesh::build_brick_mesh(volume, *coord, Generation::START, TopologyEpoch::START),
+        )
+    };
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(coords.len().div_ceil(4).max(1));
+    if threads <= 1 {
+        return coords.iter().map(build).collect();
+    }
+    let per = coords.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = coords
+            .chunks(per)
+            .map(|part| scope.spawn(move || part.iter().map(build).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    })
+}
+
 /// Brings `cache` up to date with `volume` around `center_m` and returns the
 /// chunks to upload and to drop. Bricks in `volatile` are carved by unconfirmed
 /// previews: a revision number identifies contents only along the server's
@@ -579,34 +614,47 @@ fn update_terrain_mesh_cache(
     let world = VolumeMeshWorld(volume);
     let mut updates = Vec::new();
     let mut removed = Vec::new();
-    for coord in &visible {
-        let is_volatile = volatile.contains(coord);
-        if !is_volatile
-            && cache
-                .0
-                .get(coord)
-                .is_some_and(|mesh| mesh.token.is_fresh(&world))
-        {
-            continue;
-        }
-        let Ok(mesh) =
-            spall_mesh::build_brick_mesh(volume, *coord, Generation::START, TopologyEpoch::START)
-        else {
+    // Which visible chunks need meshing: not cached, stale, or carved by a
+    // preview.
+    let stale: Vec<BrickCoord> = visible
+        .iter()
+        .copied()
+        .filter(|coord| {
+            volatile.contains(coord)
+                || !cache
+                    .0
+                    .get(coord)
+                    .is_some_and(|mesh| mesh.token.is_fresh(&world))
+        })
+        .collect();
+    // Meshing a chunk reads only the immutable `volume`, so the chunks are
+    // built on several threads (a cold start meshes over a thousand of them).
+    for (coord, built) in mesh_chunks_parallel(volume, &stale) {
+        let is_volatile = volatile.contains(&coord);
+        let Ok(mesh) = built else {
             continue;
         };
         let (vertices, indices) = spall_render::to_gpu(&mesh.mesh, glam::Mat4::IDENTITY);
         if mesh.mesh.is_empty() {
-            // A preview's empty mesh must clear whatever the GPU still holds.
-            if cache.0.remove(coord).is_some() || is_volatile {
-                removed.push(*coord);
+            // Empty bricks (open air) are cached too, or every pass would
+            // re-mesh thousands of them. A chunk that was drawn and is now
+            // empty, or a preview's empty mesh, must clear what the GPU holds.
+            let was_drawn = cache.0.get(&coord).is_some_and(|old| !old.mesh.is_empty());
+            if was_drawn || is_volatile {
+                removed.push(coord);
+            }
+            if is_volatile {
+                cache.0.remove(&coord);
+            } else {
+                cache.0.insert(coord, mesh);
             }
         } else {
             if is_volatile {
-                cache.0.remove(coord);
+                cache.0.remove(&coord);
             } else {
-                cache.0.insert(*coord, mesh);
+                cache.0.insert(coord, mesh);
             }
-            updates.push((*coord, vertices, indices));
+            updates.push((coord, vertices, indices));
         }
     }
     let visible: std::collections::HashSet<_> = visible.into_iter().collect();
@@ -617,8 +665,13 @@ fn update_terrain_mesh_cache(
         .filter(|coord| !visible.contains(coord))
         .collect::<Vec<_>>()
     {
-        cache.0.remove(&coord);
-        removed.push(coord);
+        if cache
+            .0
+            .remove(&coord)
+            .is_some_and(|old| !old.mesh.is_empty())
+        {
+            removed.push(coord);
+        }
     }
     updates.sort_by_key(|(coord, _, _)| coord.sort_key());
     removed.sort_by_key(|coord| coord.sort_key());
@@ -5656,6 +5709,14 @@ mod perf_probe {
         let mut cache = TerrainMeshCache::default();
         let (initial, removed) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
         assert!(!initial.is_empty() && removed.is_empty());
+        // Every visible brick is remembered, open-air bricks (empty meshes)
+        // included: forgetting them re-meshed thousands every pass (a 4 s
+        // pass on the 256 m arena, which stalled edits for seconds).
+        assert_eq!(
+            cache.0.len(),
+            visible_terrain_bricks(&volume, center).len(),
+            "empty bricks must be cached too"
+        );
         let (quiet, _) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
         assert!(quiet.is_empty(), "nothing changed, nothing re-meshed");
 
@@ -5835,4 +5896,36 @@ struct PendingScreenshot {
     height: u32,
     padded: u32,
     bgra: bool,
+}
+
+/// The rebuild worker's terrain caches, public so measurements can time one
+/// pass exactly as the worker runs it.
+#[derive(Default)]
+pub struct LiveTerrain {
+    meshes: TerrainMeshCache,
+    emitters: EmitterCache,
+}
+
+impl LiveTerrain {
+    /// Times the mesh and emitter updates of one pass, in milliseconds, after
+    /// carving `previews` into a private copy of `volume` like the worker does.
+    pub fn timed_pass(
+        &mut self,
+        volume: &Volume,
+        center_m: [f64; 3],
+        emissive: &[bool],
+        previews: &[PendingCut],
+    ) -> (f64, f64, usize, usize) {
+        let mut volume = volume.clone();
+        let mut previews = previews.to_vec();
+        let volatile = apply_pending_cuts(&mut volume, &mut previews, Instant::now());
+        let t = Instant::now();
+        let (updates, removed) =
+            update_terrain_mesh_cache(&volume, center_m, &mut self.meshes, &volatile);
+        let mesh_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let _ = self.emitters.update(&volume, center_m, emissive, &volatile);
+        let emitter_ms = t.elapsed().as_secs_f64() * 1e3;
+        (mesh_ms, emitter_ms, updates.len(), removed.len())
+    }
 }

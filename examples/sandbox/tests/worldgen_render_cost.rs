@@ -121,3 +121,70 @@ fn measure_rebuild_while_walking() {
         "walking 120 m, 1 m steps: mean {mean:.1} ms, max {max:.1} ms, {over_16} steps over 16 ms"
     );
 }
+
+/// One worker pass on the full arena: cold, after a real hammer edit, and with
+/// an unconfirmed preview, mesh and emitter updates timed separately.
+#[test]
+#[ignore]
+fn measure_live_terrain_pass() {
+    use spall_core::GlobalCell;
+    let scene = worldgen_scene::generate("showcase", 1, worldgen_scene::DEFAULT_SIZE_CELLS)
+        .expect("generate");
+    let volume = scene.world().terrain.clone();
+    let spawn = scene.player_spawns()[0];
+    let center = spawn;
+    let manifest = sandbox::game::manifest();
+    let materials = spall_client::window::terrain_render_materials(&manifest);
+    let emissive: Vec<bool> = materials.iter().map(|m| m.emissive > 0.0).collect();
+    let (x, z) = (
+        (spawn[0] / 0.25).floor() as i64,
+        (spawn[2] / 0.25).floor() as i64,
+    );
+    let y = (spawn[1] / 0.25).round() as i64 - 1;
+    let cell = GlobalCell::new(x + 8, y, z);
+
+    let mut live = spall_client::window::LiveTerrain::default();
+    let cold = live.timed_pass(&volume, center, &emissive, &[]);
+    println!(
+        "cold   : mesh {:7.1} ms, emitters {:7.1} ms, {} chunks",
+        cold.0, cold.1, cold.2
+    );
+    let warm = live.timed_pass(&volume, center, &emissive, &[]);
+    println!(
+        "warm   : mesh {:7.1} ms, emitters {:7.1} ms, {} chunks",
+        warm.0, warm.1, warm.2
+    );
+
+    let preview = [spall_client::window::PendingCut {
+        cell,
+        radius_cells: 2,
+        at: std::time::Instant::now(),
+    }];
+    for i in 0..3 {
+        let p = live.timed_pass(&volume, center, &emissive, &preview);
+        println!(
+            "preview{i}: mesh {:7.1} ms, emitters {:7.1} ms, {} chunks, {} removed",
+            p.0, p.1, p.2, p.3
+        );
+    }
+    let mut edited = volume.clone();
+    let mut plan = spall_voxel::EditPlan::new(edited.id());
+    for dz in -2..=2 {
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                if dx * dx + dy * dy + dz * dz <= 4 {
+                    plan.set(
+                        GlobalCell::new(cell.x + dx, cell.y + dy, cell.z + dz),
+                        spall_core::MaterialId::AIR,
+                    );
+                }
+            }
+        }
+    }
+    edited.apply_edit(&plan).expect("edit");
+    let real = live.timed_pass(&edited, center, &emissive, &[]);
+    println!(
+        "real   : mesh {:7.1} ms, emitters {:7.1} ms, {} chunks",
+        real.0, real.1, real.2
+    );
+}
