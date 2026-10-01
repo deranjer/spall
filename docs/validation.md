@@ -1024,3 +1024,21 @@ Report measured timings and application bytes separately from targets; hardware
 render captures, IP/QUIC retransmission bandwidth, a long production soak and
 seamless cross-grid exchange are not established by these bounded CPU tests.
 See [ENG-105 evidence](reports/ENG-105.md).
+
+
+## ENG-116 ecology validation
+
+Run the ecology invariants, small generated-world scenario, larger scaling workload, then the complete required workspace check:
+
+```powershell
+cargo test -p spall_ecology
+cargo run -p sandbox --example ecology-clearing
+cargo run -p sandbox --example ecology-clearing -- --large
+cargo xtask check
+```
+
+The headless example emits JSONL lifecycle events followed by one metrics record. It exercises placement on `spall_worldgen` voxel terrain, grass harvest/regrowth, mature tree growth and seedling establishment, branch/root cuts through authoritative `Simulation` edit staging, plus a deliberately rejected and stale growth proposal. Proposal acceptance in this fixture does not establish production ecology/server transaction integration.
+
+Report dimensions, plant/patch/seed counts, update interval, elapsed ecological time, work budget, final and peak deferred queue, accepted wood cells, per-step timing percentiles, generation/placement/run elapsed time, canonical encoded ecology-state bytes, and state digest. Encoded bytes exclude terrain storage and allocator overhead; do not describe them as process memory. Performance allocations remain targets until separately measured.
+
+Unknown and unloaded behavior, state continuation, deterministic proposals, seed expiry/region accounting, crowding, regrowth suitability, permanent branch damage, and stale/rejected acknowledgment are CPU tests. World persistence/journal recovery, networking, graphical vegetation, and production serving are not established here. See [ENG-116 report](reports/ENG-116.md).
