@@ -250,6 +250,10 @@ impl EditPipeline {
         // region-scoped epochs are a separate design change.
         const MAX_REBASE_ROUNDS: usize = 4;
         let mut rebase_round = 0usize;
+        // The edit lane's capacity is also the submission budget for the entire tick, including
+        // any stale-result rebase rounds below.
+        let max_submit = self.scheduler.config().lane(Lane::Edit).max_in_flight as usize;
+        let mut submitted = 0usize;
         let mut serialized_regions_this_tick = HashSet::new();
         // Geometry reloads are an external residency transition, not a stale
         // topology rebase. Keep their intents out of `pending` until this
@@ -265,7 +269,15 @@ impl EditPipeline {
             let generation = world.generation();
             let epoch = world.topology_epoch();
             let mut deferred: VecDeque<QueuedIntent> = VecDeque::new();
+            // Keep jobs waiting for a scheduler dispatch slot out of its queue. A queued job
+            // holds this tick's topology token; a commit later in this round invalidates it
+            // before it can run, wasting a slot and starving fresh work under sustained load.
+            // Deferring the intent lets it be submitted with a current token on the next tick.
             while let Some(queued) = self.pending.pop_front() {
+                if submitted >= max_submit {
+                    deferred.push_back(queued);
+                    continue;
+                }
                 // A serialized region admits at most one job per tick.  The
                 // separate per-tick set keeps that lane's contract intact
                 // across same-tick rebase rounds, while independent regions
@@ -302,6 +314,7 @@ impl EditPipeline {
                 );
                 match self.scheduler.submit(request) {
                     Ok(handle) => {
+                        submitted += 1;
                         self.active_regions.insert(queued.region);
                         if self.serialized.contains(&queued.region) {
                             serialized_regions_this_tick.insert(queued.region);
@@ -651,6 +664,30 @@ mod tests {
         );
         assert!(pipeline.pending.is_empty());
         assert_eq!(pipeline.inflight.len(), 1);
+    }
+
+    #[test]
+    fn submits_no_more_than_the_edit_lane_budget_per_tick() {
+        let mut world = SimWorld::new(crate::fixtures::flat_terrain_setup()).unwrap();
+        let mut pipeline = EditPipeline::new(8, 3);
+        let budget = spall_jobs::LaneBudget::new(8, 1024 * 1024, 1);
+        pipeline.scheduler =
+            Scheduler::new(SchedulerConfig::default().with_lane(Lane::Edit, budget));
+        for request in 1..=3 {
+            pipeline
+                .submit_intent(cut(request, request as i64 * 10, 1, 2, 1), &world)
+                .unwrap();
+        }
+
+        let mut journal = JournalSink::new();
+        let mut next_control_seq = 1;
+        let report = pipeline
+            .run_tick(&mut world, &mut journal, Tick(1), &mut next_control_seq)
+            .unwrap();
+
+        assert_eq!(report.committed.len(), 1);
+        assert!(report.discarded_stale.is_empty());
+        assert_eq!(report.pending_after, 2);
     }
 
     #[test]

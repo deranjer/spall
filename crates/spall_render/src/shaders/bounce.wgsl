@@ -1,6 +1,7 @@
 // One diffuse bounce over the camera-local occupancy cache, with *lit* sources.
 //
-// For every air cell near a surface, 66 fixed rays (see `ray_direction`) are walked through the occupancy. The first
+// For every air cell near a surface, 66 rays (the fixed set in `ray_direction`,
+// rotated per cell, see `cell_jitter`) are walked through the occupancy. The first
 // occupied cell they enter is a bounce source; its outgoing radiance is what
 // that surface is actually emitting or reflecting right now:
 //
@@ -13,11 +14,15 @@
 // sky visibility, so counting it here too would count it twice. Solid and
 // unknown cells are opaque; an unknown cell emits nothing.
 //
+// Emission far from the receiver is not left to the rays: a lamp is too small a
+// target, so distant emitters are lit analytically (next-event estimation, see
+// the NEE notes below and `emitters.wgsl`).
+//
 // Each cell stores six face radiances (a directional ambient cube), the
 // cosine-weighted average over the rays in that face's hemisphere with misses
 // counting as zero. For a surface that sees uniform radiance L over its whole
 // hemisphere the reflected light is `albedo * L` -- the furnace case. Bleed is
-// soft and blocky (14 fixed rays, 0.5 m cells); documented in
+// soft and blocky (0.5 m cells, a few dozen rays); documented in
 // docs/reports/ENG-97.md. Derived, client-local lighting only.
 
 const PI: f32 = 3.14159265359;
@@ -42,6 +47,36 @@ struct BounceGlobals {
 @group(0) @binding(2) var<storage, read> materials: array<Material>;
 @group(0) @binding(3) var<storage, read_write> radiance: array<u32>;
 @group(0) @binding(4) var<uniform> globals: BounceGlobals;
+// Emissive bins gathered by emitters.wgsl: a header (x = how many there are,
+// which can exceed MAX_EMITTERS, meaning the list overflowed) and 4 vec4 per
+// emitter: (centroid xyz in cells, exposed faces +x), (radiance rgb, exposed
+// faces -x), (exposed faces +y -y +z -z).
+struct EmitterBlock {
+    header: vec4<u32>,
+    items: array<vec4<f32>, MAX_EMITTERS * 3u>,
+};
+@group(0) @binding(5) var<uniform> emitters: EmitterBlock;
+
+// Emission is lit two ways. Close to a source, rays see it often enough: a lamp
+// 1 m from a wall fills a good part of the hemisphere. Far from it, a lamp is a
+// small target and rays hit it by luck, which speckles distant walls, so those
+// receivers are lit analytically from the gathered emitters (one shadow ray
+// each) and rays stop counting far emission. The hand-off is a smooth ramp over
+// [NEE_NEAR_CELLS, NEE_FAR_CELLS] so no ring shows where one method takes over:
+// a ray's emission is weighted by `1 - w` at the distance it hit, the analytic
+// term by `w` at the emitter's centroid distance.
+const NEE_NEAR_CELLS: f32 = 3.0;
+const NEE_FAR_CELLS: f32 = 6.0;
+
+fn nee_weight(distance_cells: f32) -> f32 {
+    return smoothstep(NEE_NEAR_CELLS, NEE_FAR_CELLS, distance_cells);
+}
+
+// Whether the emitter list is complete. On overflow every emitter is sampled by
+// rays as before, so a lamp is never silently dropped.
+fn nee_active() -> bool {
+    return emitters.header.x <= MAX_EMITTERS;
+}
 
 const RAY_COUNT: u32 = 66u;
 
@@ -123,6 +158,47 @@ fn ray_direction(i: u32) -> vec3<f32> {
     return dirs[i];
 }
 
+// A different small random rotation of the whole ray set for every cell. With
+// one shared set, neighbouring cells sample the same ground spots along the
+// same lines, which reads as fans of streaks and 1 m blobs on a surface built
+// from 0.25 m voxels. Rotating per cell turns that structure into fine noise
+// that the receiver's trilinear filter over eight cells then averages. The
+// rotation is a pure function of the cell's *world* position (the cache origin
+// is snapped to the cell grid), so a recompute is deterministic and re-centring
+// the cache as the camera moves does not re-roll the noise: the same wall keeps
+// the same rays, so lighting does not pop as you walk toward it.
+const MAX_JITTER_RAD: f32 = 0.45;
+
+fn pcg(v: u32) -> u32 {
+    let s = v * 747796405u + 2891336453u;
+    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+struct Jitter { axis: vec3<f32>, cos_a: f32, sin_a: f32, };
+
+fn cell_jitter(cell: vec3<i32>) -> Jitter {
+    let h0 = pcg(u32(cell.x) ^ pcg(u32(cell.y) ^ pcg(u32(cell.z))));
+    let h1 = pcg(h0);
+    let h2 = pcg(h1);
+    let u0 = f32(h0) / 4294967295.0;
+    let u1 = f32(h1) / 4294967295.0;
+    let u2 = f32(h2) / 4294967295.0;
+    let z = 2.0 * u0 - 1.0;
+    let phi = 2.0 * PI * u1;
+    let r = sqrt(max(1.0 - z * z, 0.0));
+    let angle = (2.0 * u2 - 1.0) * MAX_JITTER_RAD;
+    var j: Jitter;
+    j.axis = vec3<f32>(r * cos(phi), r * sin(phi), z);
+    j.cos_a = cos(angle);
+    j.sin_a = sin(angle);
+    return j;
+}
+
+fn jitter_dir(j: Jitter, v: vec3<f32>) -> vec3<f32> {
+    return v * j.cos_a + cross(j.axis, v) * j.sin_a + j.axis * dot(j.axis, v) * (1.0 - j.cos_a);
+}
+
 fn face_of_normal(n: vec3<f32>) -> u32 {
     if n.x > 0.5 { return 0u; }
     if n.x < -0.5 { return 1u; }
@@ -142,14 +218,22 @@ fn hemisphere_radiance(dy: f32) -> vec3<f32> {
 }
 
 // Outgoing radiance of the surface a ray hit.
-fn source_radiance(hit: Hit, dim: i32, max_cells: f32) -> vec3<f32> {
+fn source_radiance(hit: Hit, dim: i32, max_cells: f32, origin: vec3<f32>) -> vec3<f32> {
     if hit.value >= arrayLength(&materials) { return vec3<f32>(0.0); }
     let material = materials[hit.value];
     let base = material.base_color.rgb;
-    var out = base * max(material.params.z, 0.0);
+    var emitted = base * max(material.params.z, 0.0);
+    if nee_active() {
+        let hit_cells = length(vec3<f32>(hit.front) + vec3<f32>(0.5) - origin);
+        emitted *= 1.0 - nee_weight(hit_cells);
+    }
+    var out = emitted;
 
     let sky_seen = face_value(visibility[index_of(hit.front, dim)], face_of_normal(hit.normal));
-    out += base * sky_seen * hemisphere_radiance(hit.normal.y);
+    // Same convention as the opaque pass: a vertical face's unblocked rays see
+    // sky, not the sky/ground average.
+    let sky_dy = select(hit.normal.y, 0.5, abs(hit.normal.y) < 0.5);
+    out += base * sky_seen * hemisphere_radiance(sky_dy);
 
     let to_sun = -globals.sun_dir.xyz;
     let n_dot_l = dot(hit.normal, to_sun);
@@ -208,18 +292,57 @@ fn bounce_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         sum[f] = vec3<f32>(0.0);
         weight_sum[f] = 0.0;
     }
+    let world_cell = cell + vec3<i32>(round(globals.origin_cell_size.xyz / globals.origin_cell_size.w));
+    let jitter = cell_jitter(world_cell);
     for (var i = 0u; i < RAY_COUNT; i += 1u) {
-        let dir = ray_direction(i);
+        let dir = jitter_dir(jitter, ray_direction(i));
         var source = vec3<f32>(0.0);
         let hit = trace_first_hit(origin, dir, dim, max_cells);
-        if hit.hit { source = source_radiance(hit, dim, max_cells); }
+        if hit.hit { source = source_radiance(hit, dim, max_cells, origin); }
         for (var f = 0u; f < 6u; f += 1u) {
             let w = max(dot(dir, face_axis(f)), 0.0);
             sum[f] += source * w;
             weight_sum[f] += w;
         }
     }
+    // Far emitters, analytically: irradiance E = L * A_proj * cos(receiver) / d^2
+    // per face, and the cache stores E / pi (see the furnace note above).
+    var direct: array<vec3<f32>, 6>;
+    for (var f = 0u; f < 6u; f += 1u) { direct[f] = vec3<f32>(0.0); }
+    if nee_active() {
+        let cell_m = globals.origin_cell_size.w;
+        for (var e = 0u; e < emitters.header.x; e += 1u) {
+            let position = emitters.items[e * 3u].xyz;
+            let to_emitter = position - origin;
+            let distance_cells = length(to_emitter);
+            let weight = nee_weight(distance_cells);
+            if weight <= 0.0 || distance_cells > max_cells { continue; }
+            let dir = to_emitter / distance_cells;
+            // Shadow ray to the emitter: it must reach emissive material near
+            // the centroid before anything else.
+            let first = trace_first_hit(origin, dir, dim, distance_cells + 2.0);
+            if !first.hit || first.value >= arrayLength(&materials) { continue; }
+            if materials[first.value].params.z <= 0.0 { continue; }
+            if length(vec3<f32>(first.front) + vec3<f32>(0.5) - position) > 5.0 { continue; }
+            // Faces the receiver can see: a face with outward normal n shows
+            // when n points back toward the receiver.
+            let back = -dir;
+            let record_a = emitters.items[e * 3u];
+            let record_b = emitters.items[e * 3u + 1u];
+            let faces_yz = emitters.items[e * 3u + 2u];
+            let area_cells = record_a.w * max(back.x, 0.0) + record_b.w * max(-back.x, 0.0)
+                + faces_yz.x * max(back.y, 0.0) + faces_yz.y * max(-back.y, 0.0)
+                + faces_yz.z * max(back.z, 0.0) + faces_yz.w * max(-back.z, 0.0);
+            if area_cells <= 0.0 { continue; }
+            let radiance_e = record_b.xyz;
+            let distance_m = distance_cells * cell_m;
+            let scale = weight * area_cells * cell_m * cell_m / (distance_m * distance_m * PI);
+            for (var f = 0u; f < 6u; f += 1u) {
+                direct[f] += radiance_e * scale * max(dot(dir, face_axis(f)), 0.0);
+            }
+        }
+    }
     for (var f = 0u; f < 6u; f += 1u) {
-        radiance[index * 6u + f] = encode_rgb9e5(sum[f] / max(weight_sum[f], 1.0e-4));
+        radiance[index * 6u + f] = encode_rgb9e5(sum[f] / max(weight_sum[f], 1.0e-4) + direct[f]);
     }
 }

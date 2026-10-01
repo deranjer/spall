@@ -12,7 +12,9 @@
 //!    the actual sun (shadow rays through the occupancy), the actual sky
 //!    visibility, and material emission. It does not count skylight itself
 //!    (the opaque pass applies that from sky visibility), so nothing is counted
-//!    twice.
+//!    twice. Distant emitters are lit analytically from a small list of
+//!    emissive bins gathered before each slice (`emitters.wgsl`), because a lamp
+//!    is too small a target for a cell's rays to hit reliably.
 //!
 //! Both feed one bind group the opaque pass samples. A renderer with no
 //! occupancy binds the disabled stub and the shader falls back to the legacy
@@ -37,6 +39,25 @@ use crate::instances::CubeInstance;
 /// Longest ray, in cells (24 m). A ray this long without a hit has reached the
 /// sky; anything further is beyond the shading distance that matters.
 pub const SKY_MAX_RAY_CELLS: u32 = 48;
+
+/// Most emissive bins the bounce pass lights analytically. More than this and
+/// the pass falls back to sampling emission with rays (see `emitters.wgsl`).
+pub const EMITTER_CAPACITY: u32 = 340;
+/// Cells per emitter bin along each axis (2 m bins).
+const EMITTER_BIN_CELLS: u32 = 4;
+/// `u32`s per emitter bin in the gather buffer, and bytes per emitter record.
+const EMITTER_BIN_STRIDE: u64 = 16;
+const EMITTER_RECORD_BYTES: u64 = 48;
+/// Bytes of the emitter records buffer and its uniform copy: a 16-byte header
+/// then one record per emitter.
+const EMITTER_BLOCK_BYTES: u64 = 16 + EMITTER_CAPACITY as u64 * EMITTER_RECORD_BYTES;
+
+/// Constants the emitter and bounce shaders share with this module.
+fn shader_constants() -> String {
+    format!(
+        "const DIM: i32 = {LIGHT_VOLUME_DIM};\nconst MAX_EMITTERS: u32 = {EMITTER_CAPACITY}u;\n"
+    )
+}
 
 /// Occupancy value for a cell the builder cannot vouch for. Any non-zero value
 /// blocks; this one is distinguishable in debugging and counts.
@@ -101,7 +122,21 @@ pub(crate) struct SkyPipeline {
     compute_layout: wgpu::BindGroupLayout,
     bounce: wgpu::ComputePipeline,
     bounce_layout: wgpu::BindGroupLayout,
+    emit_gather: wgpu::ComputePipeline,
+    emit_compact: wgpu::ComputePipeline,
+    emit_finish: wgpu::ComputePipeline,
+    emit_layout: wgpu::BindGroupLayout,
     display_layout: wgpu::BindGroupLayout,
+}
+
+/// The emissive-bin gather buffers shared by the emitter and bounce passes.
+struct EmitterBuffers {
+    /// Per-bin accumulators, cleared before every gather.
+    bins: wgpu::Buffer,
+    /// Header plus one record per populated bin, written by the gather.
+    records: wgpu::Buffer,
+    /// The same block as a uniform, copied from `records` for the bounce pass.
+    uniform: wgpu::Buffer,
 }
 
 fn storage_entry(
@@ -159,6 +194,16 @@ impl SkyPipeline {
                 storage_entry(2, true, wgpu::ShaderStages::COMPUTE),
                 storage_entry(3, false, wgpu::ShaderStages::COMPUTE),
                 uniform_entry(4, wgpu::ShaderStages::COMPUTE),
+                uniform_entry(5, wgpu::ShaderStages::COMPUTE), // emitter block
+            ],
+        });
+        let emit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("spall-emitter-compute-layout"),
+            entries: &[
+                storage_entry(0, true, wgpu::ShaderStages::COMPUTE), // cells
+                storage_entry(1, true, wgpu::ShaderStages::COMPUTE), // materials
+                storage_entry(2, false, wgpu::ShaderStages::COMPUTE), // bins
+                storage_entry(3, false, wgpu::ShaderStages::COMPUTE), // records
             ],
         });
         let display_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -197,17 +242,41 @@ impl SkyPipeline {
             &compute_layout,
             "sky_visibility_main",
         );
+        let constants = shader_constants();
         let bounce = make(
             "spall-bounce-pipeline",
-            [dda, include_str!("shaders/bounce.wgsl")].concat(),
+            [constants.as_str(), dda, include_str!("shaders/bounce.wgsl")].concat(),
             &bounce_layout,
             "bounce_main",
+        );
+        let emitter_source = [constants.as_str(), include_str!("shaders/emitters.wgsl")].concat();
+        let emit_gather = make(
+            "spall-emitter-gather-pipeline",
+            emitter_source.clone(),
+            &emit_layout,
+            "gather_main",
+        );
+        let emit_compact = make(
+            "spall-emitter-compact-pipeline",
+            emitter_source.clone(),
+            &emit_layout,
+            "compact_main",
+        );
+        let emit_finish = make(
+            "spall-emitter-finish-pipeline",
+            emitter_source,
+            &emit_layout,
+            "finish_main",
         );
         Self {
             compute,
             compute_layout,
             bounce,
             bounce_layout,
+            emit_gather,
+            emit_compact,
+            emit_finish,
+            emit_layout,
             display_layout,
         }
     }
@@ -249,6 +318,7 @@ impl SkyPipeline {
         (bind, vec![cells, visibility, radiance, globals])
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bounce_bind(
         &self,
         device: &wgpu::Device,
@@ -257,6 +327,7 @@ impl SkyPipeline {
         materials: &wgpu::Buffer,
         radiance: &wgpu::Buffer,
         globals: &wgpu::Buffer,
+        emitters: &EmitterBuffers,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("spall-bounce-compute-bind"),
@@ -267,6 +338,26 @@ impl SkyPipeline {
                 entry(2, materials),
                 entry(3, radiance),
                 entry(4, globals),
+                entry(5, &emitters.uniform),
+            ],
+        })
+    }
+
+    fn emit_bind(
+        &self,
+        device: &wgpu::Device,
+        cells: &wgpu::Buffer,
+        materials: &wgpu::Buffer,
+        emitters: &EmitterBuffers,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("spall-emitter-compute-bind"),
+            layout: &self.emit_layout,
+            entries: &[
+                entry(0, cells),
+                entry(1, materials),
+                entry(2, &emitters.bins),
+                entry(3, &emitters.records),
             ],
         })
     }
@@ -303,6 +394,25 @@ impl SkyPipeline {
             std::mem::size_of::<BounceGlobals>() as u64,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         );
+        let bin_count = u64::from(LIGHT_VOLUME_DIM / EMITTER_BIN_CELLS).pow(3);
+        let emitters = EmitterBuffers {
+            bins: buffer(
+                "spall-emitter-bins",
+                (bin_count * EMITTER_BIN_STRIDE + 1) * 4,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
+            records: buffer(
+                "spall-emitter-records",
+                EMITTER_BLOCK_BYTES,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            ),
+            uniform: buffer(
+                "spall-emitter-block",
+                EMITTER_BLOCK_BYTES,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
+        };
+        let emit_bind = self.emit_bind(device, &cells, materials, &emitters);
         // Two result sets. Recomputes in place (bodies, terrain edits) write the
         // front set the opaque pass is reading; re-centring the cache writes the
         // back set and swaps when it is complete, so shading never sees a
@@ -341,6 +451,7 @@ impl SkyPipeline {
                 materials,
                 &radiance,
                 &bounce_globals,
+                &emitters,
             );
             (
                 ResultSet {
@@ -360,6 +471,8 @@ impl SkyPipeline {
             bounce_globals,
             sets: [set0, set1],
             bounce_binds: Mutex::new([bounce0, bounce1]),
+            emitters,
+            emit_bind: Mutex::new(emit_bind),
             front: AtomicUsize::new(0),
             state: Mutex::new(State {
                 origin: Vec3::ZERO,
@@ -498,6 +611,10 @@ pub struct SkyVisibility {
     /// The bounce pass's bind group per result set; recreated when the material
     /// table changes.
     bounce_binds: Mutex<[wgpu::BindGroup; 2]>,
+    /// Emissive bins gathered before each bounce slice.
+    emitters: EmitterBuffers,
+    /// The emitter gather's bind group; recreated with the material table.
+    emit_bind: Mutex<wgpu::BindGroup>,
     /// Index of the result set the opaque pass reads.
     front: AtomicUsize,
     state: Mutex<State>,
@@ -769,9 +886,12 @@ impl SkyVisibility {
                 materials,
                 &set._radiance,
                 &self.bounce_globals,
+                &self.emitters,
             );
         }
         drop(binds);
+        *self.emit_bind.lock().unwrap_or_else(|e| e.into_inner()) =
+            pipeline.emit_bind(device, &self.cells, materials, &self.emitters);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.pending.bounce_only = true;
         state.pending.full = true;
@@ -836,7 +956,12 @@ impl SkyVisibility {
     /// bounce radiance each).
     pub fn allocated_bytes(&self) -> u64 {
         let cells = u64::from(LIGHT_VOLUME_DIM).pow(3);
-        cells * 4 + 2 * cells * (8 + 24)
+        let bins = u64::from(LIGHT_VOLUME_DIM / EMITTER_BIN_CELLS).pow(3);
+        cells * 4
+            + 2 * cells * (8 + 24)
+            + (bins * EMITTER_BIN_STRIDE + 1) * 4
+            + 2 * EMITTER_BLOCK_BYTES
+            + 16
     }
 
     pub(crate) fn display_bind(&self) -> &wgpu::BindGroup {
@@ -940,6 +1065,51 @@ impl SkyVisibility {
             sky_ran = true;
         }
         if run.bounce && can_bounce {
+            // Gather emissive cells into the emitter list this slice reads. It
+            // is rebuilt for every slice (a few thousandths of a millisecond of
+            // bin arithmetic) so it always matches the occupancy and material
+            // table the slice sees, including edits and moving bodies.
+            encoder.clear_buffer(&self.emitters.bins, 0, None);
+            // The bounce timing spans both passes: the emitter gather takes the
+            // begin stamp and the bounce pass the end stamp, so the reported
+            // bounce cost includes the gather.
+            let (emit_timestamps, bounce_timestamps) = match bounce_timestamps {
+                Some(ts) => (
+                    Some(wgpu::ComputePassTimestampWrites {
+                        query_set: ts.query_set,
+                        beginning_of_pass_write_index: ts.beginning_of_pass_write_index,
+                        end_of_pass_write_index: None,
+                    }),
+                    Some(wgpu::ComputePassTimestampWrites {
+                        query_set: ts.query_set,
+                        beginning_of_pass_write_index: None,
+                        end_of_pass_write_index: ts.end_of_pass_write_index,
+                    }),
+                ),
+                None => (None, None),
+            };
+            {
+                let emit_bind = self.emit_bind.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("spall-emitter-pass"),
+                    timestamp_writes: emit_timestamps,
+                });
+                pass.set_bind_group(0, &*emit_bind, &[]);
+                pass.set_pipeline(&pipeline.emit_gather);
+                pass.dispatch_workgroups(groups, groups, groups);
+                pass.set_pipeline(&pipeline.emit_compact);
+                let bin_count = (LIGHT_VOLUME_DIM / EMITTER_BIN_CELLS).pow(3);
+                pass.dispatch_workgroups(bin_count.div_ceil(64), 1, 1);
+                pass.set_pipeline(&pipeline.emit_finish);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(
+                &self.emitters.records,
+                0,
+                &self.emitters.uniform,
+                0,
+                EMITTER_BLOCK_BYTES,
+            );
             queue.write_buffer(
                 &self.bounce_globals,
                 BOUNCE_REGION_OFFSET,

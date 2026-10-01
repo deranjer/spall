@@ -201,6 +201,27 @@ structure tests) and digging reveals the layers.
   the compact labels, per-component facts and face masks cell for cell against a
   reference flood fill.
 
+## Rendering after the ENG-100 merge
+
+Main now draws terrain from incremental greedy meshes (`spall_mesh`), so the
+window's rebuild worker was reworked on top of that path:
+
+- Terrain meshes use a `vs_terrain` pipeline entry so the per-voxel colour
+  jitter (keyed on the world cell) stays on for static terrain and off for
+  moving body meshes.
+- Torch/lamp point lights come from an `EmitterCache` (emissive cells of the
+  visible dense bricks, rescanned only when a brick's revision changes).
+- The worker sends terrain meshes first, then emitters and the sky grid; the sky
+  grid is skipped when the terrain generation is unchanged and the player is
+  still near the grid anchor.
+- Hammer swings are previewed on a private copy of the replica terrain until the
+  server's cut arrives (800 ms cap). Preview bricks and their neighbours bypass
+  the mesh and emitter caches: a revision number identifies contents only along
+  the server's history.
+- The older instanced-box terrain builder (`build_instances`, with its brick
+  cache) remains as the reference path for measurements; the live window does
+  not use it.
+
 ## Editor panel (ENG-115)
 
 File > Generate World... opens a dialog in `spall-editor` (no project needed):

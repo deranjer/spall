@@ -15,13 +15,15 @@
 //! (rather than its current offscreen-capture use) is out of scope here and
 //! left to a follow-up increment.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use spall_core::{BUTTON_JUMP, GlobalCell, MaterialId};
+use spall_core::{BUTTON_JUMP, BrickCoord, GlobalCell, MaterialId};
+use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::CharacterParams;
 use spall_render::{
     Camera, CubeInstance, DebugView, Environment, EnvironmentPreset, GameRenderer,
@@ -146,9 +148,20 @@ pub enum ShotStep {
     Reset,
     /// Pause without a screenshot.
     Wait(f32),
+    /// Switch the render view (`shaded`, `indirect_only`, `sky_visibility`...)
+    /// without a screenshot.
+    View(DebugView),
+    /// Visibility-aware skylight on or off, without a screenshot.
+    Skylight(bool),
+    /// Diffuse bounce on or off, without a screenshot.
+    Bounce(bool),
+    /// Switch the environment preset (`daylight`, `night`...) without a
+    /// screenshot.
+    Environment(EnvironmentPreset),
 }
 
-/// Parses `x,y,z,yaw,pitch;menu;reset;walk;wait:2` into steps.
+/// Parses `x,y,z,yaw,pitch;menu;reset;walk;wait:2;view:indirect_only;sky:off;
+/// bounce:on` into steps.
 pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
     spec.split(';')
         .map(str::trim)
@@ -161,6 +174,19 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
                 .parse()
                 .map(ShotStep::Wait)
                 .map_err(|_| format!("bad wait `{step}`")),
+            _ if step.starts_with("view:") => LIGHTING_VIEWS
+                .iter()
+                .find(|v| v.stem() == &step[5..])
+                .copied()
+                .map(ShotStep::View)
+                .ok_or_else(|| format!("unknown view `{step}`")),
+            _ if step.starts_with("env:") => EnvironmentPreset::from_key(&step[4..])
+                .map(ShotStep::Environment)
+                .ok_or_else(|| format!("unknown environment `{step}`")),
+            "sky:on" => Ok(ShotStep::Skylight(true)),
+            "sky:off" => Ok(ShotStep::Skylight(false)),
+            "bounce:on" => Ok(ShotStep::Bounce(true)),
+            "bounce:off" => Ok(ShotStep::Bounce(false)),
             _ => {
                 let v: Vec<f32> = step
                     .split(',')
@@ -345,9 +371,6 @@ struct InteractiveApp {
     capture_due: bool,
     /// Screenshot to take on the next presented frame.
     pending_capture: Option<PathBuf>,
-    /// True when the resident terrain instances must be re-uploaded (a
-    /// rebuild landed or `F1` toggled visibility).
-    terrain_dirty: bool,
     /// The newest sky occupancy the rebuild worker produced, kept so `F5` can
     /// switch visibility-aware skylight off and on without a rebuild.
     last_sky: Option<spall_render::indirect::LightingVolume>,
@@ -382,7 +405,8 @@ struct InteractiveApp {
     /// instances (see [`build_body_instances`]) — bodies move continuously
     /// and are cheap to rebuild, so they must not wait on the throttled,
     /// much more expensive terrain rebuild to appear or move.
-    last_terrain_instances: Vec<Instance>,
+    pending_mesh_updates: Vec<(BrickCoord, Vec<spall_render::GpuVertex>, Vec<u32>)>,
+    pending_mesh_removed: Vec<BrickCoord>,
     /// [`BodyWorker`]'s most recently completed result — see that struct's
     /// doc for why this moved off the render thread entirely (first a
     /// blocking lock, then even a `try_lock`-gated build, both measurably
@@ -467,10 +491,19 @@ struct RebuildWorker {
 
 pub struct RebuildOutcome {
     pub center_m: [f64; 3],
-    /// `true` for the geometry result of a pass; `false` for the lighting
-    /// result that follows it, which carries no instances.
-    pub instances_included: bool,
+    /// `true` for the terrain result of a pass; `false` for the lighting
+    /// result that follows it (emitters and sky only).
+    pub terrain_included: bool,
+    /// Legacy instanced terrain; only [`rebuild_pass`] fills it.
     pub instances: Vec<Instance>,
+    /// Changed greedy terrain chunks; unchanged chunks retain their GPU buffers.
+    pub mesh_updates: Vec<(BrickCoord, Vec<spall_render::GpuVertex>, Vec<u32>)>,
+    /// Chunks that left render residency or became empty.
+    pub mesh_removed: Vec<BrickCoord>,
+    pub mesh_elapsed: Duration,
+    /// Emissive cells of the visible terrain (torches and lamps), for the
+    /// point lights; sent with the lighting result.
+    pub emitters: Option<Vec<Instance>>,
     /// Sky occupancy built from the same volume snapshot as `instances`, or
     /// `None` when it is identical to the last one sent (nothing to recompute).
     pub sky: Option<spall_render::indirect::LightingVolume>,
@@ -478,13 +511,128 @@ pub struct RebuildOutcome {
     pub elapsed: Duration,
 }
 
+#[derive(Default)]
+struct TerrainMeshCache(HashMap<BrickCoord, spall_mesh::VolumeMesh>);
+
+struct VolumeMeshWorld<'a>(&'a Volume);
+
+impl WorldView for VolumeMeshWorld<'_> {
+    fn generation(&self) -> Generation {
+        Generation::START
+    }
+    fn topology_epoch(&self) -> TopologyEpoch {
+        TopologyEpoch::START
+    }
+    fn brick_status(&self, brick: BrickRef) -> BrickStatus {
+        match self.0.brick_state(brick.brick) {
+            Ok(spall_voxel::BrickState::Resident { revision, .. }) => {
+                BrickStatus::Resident(revision)
+            }
+            Ok(spall_voxel::BrickState::Failed) => BrickStatus::Failed,
+            Ok(spall_voxel::BrickState::Absent) | Err(_) => BrickStatus::Absent,
+        }
+    }
+}
+
+fn visible_terrain_bricks(volume: &Volume, center_m: [f64; 3]) -> Vec<BrickCoord> {
+    let cell_m = f64::from(CELL_M);
+    let center = GlobalCell::new(
+        (center_m[0] / cell_m).floor() as i64,
+        (center_m[1] / cell_m).floor() as i64,
+        (center_m[2] / cell_m).floor() as i64,
+    );
+    let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
+    let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
+    let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
+    let (min_brick, _) =
+        GlobalCell::new(center.x - horiz, center.y - down, center.z - horiz).split();
+    let (max_brick, _) = GlobalCell::new(center.x + horiz, center.y + up, center.z + horiz).split();
+    let mut coords = Vec::new();
+    for z in min_brick.z..=max_brick.z {
+        for y in min_brick.y..=max_brick.y {
+            for x in min_brick.x..=max_brick.x {
+                let coord = BrickCoord::new(x, y, z);
+                if volume.snapshot_brick(coord).ok().flatten().is_some() {
+                    coords.push(coord);
+                }
+            }
+        }
+    }
+    coords
+}
+
+pub type MeshUpdate<K> = (K, Vec<spall_render::GpuVertex>, Vec<u32>);
+
+/// Brings `cache` up to date with `volume` around `center_m` and returns the
+/// chunks to upload and to drop. Bricks in `volatile` are carved by unconfirmed
+/// previews: a revision number identifies contents only along the server's
+/// history, so they are always rebuilt and never remembered (a stale mesh could
+/// otherwise survive under a colliding revision).
+fn update_terrain_mesh_cache(
+    volume: &Volume,
+    center_m: [f64; 3],
+    cache: &mut TerrainMeshCache,
+    volatile: &std::collections::HashSet<BrickCoord>,
+) -> (Vec<MeshUpdate<BrickCoord>>, Vec<BrickCoord>) {
+    let started = Instant::now();
+    let visible = visible_terrain_bricks(volume, center_m);
+    let world = VolumeMeshWorld(volume);
+    let mut updates = Vec::new();
+    let mut removed = Vec::new();
+    for coord in &visible {
+        let is_volatile = volatile.contains(coord);
+        if !is_volatile
+            && cache
+                .0
+                .get(coord)
+                .is_some_and(|mesh| mesh.token.is_fresh(&world))
+        {
+            continue;
+        }
+        let Ok(mesh) =
+            spall_mesh::build_brick_mesh(volume, *coord, Generation::START, TopologyEpoch::START)
+        else {
+            continue;
+        };
+        let (vertices, indices) = spall_render::to_gpu(&mesh.mesh, glam::Mat4::IDENTITY);
+        if mesh.mesh.is_empty() {
+            // A preview's empty mesh must clear whatever the GPU still holds.
+            if cache.0.remove(coord).is_some() || is_volatile {
+                removed.push(*coord);
+            }
+        } else {
+            if is_volatile {
+                cache.0.remove(coord);
+            } else {
+                cache.0.insert(*coord, mesh);
+            }
+            updates.push((*coord, vertices, indices));
+        }
+    }
+    let visible: std::collections::HashSet<_> = visible.into_iter().collect();
+    for coord in cache
+        .0
+        .keys()
+        .copied()
+        .filter(|coord| !visible.contains(coord))
+        .collect::<Vec<_>>()
+    {
+        cache.0.remove(&coord);
+        removed.push(coord);
+    }
+    updates.sort_by_key(|(coord, _, _)| coord.sort_key());
+    removed.sort_by_key(|coord| coord.sort_key());
+    tracing::debug!(target: "spall_client::terrain_mesh", rebuild_ms = started.elapsed().as_secs_f64()*1000.0, updated = updates.len(), removed = removed.len(), "rebuilt incremental greedy chunks");
+    (updates, removed)
+}
+
 /// One rebuild pass: terrain instances plus a sky occupancy grid (only when it
 /// actually changed) from `replica`'s current terrain volume around `center_m`.
-/// This is exactly what [`RebuildWorker`]'s background thread runs per request
-/// — extracted so latency instrumentation can time and drive the real pipeline
-/// stage by stage instead of re-implementing it. `sky_anchor` / `last_sky` carry
-/// state across calls, same as the worker's loop locals. Returns `None` only
-/// when the replica has no terrain yet.
+/// This is the legacy instanced-cube terrain path, kept for latency
+/// instrumentation and as a reference; the window's worker draws terrain from
+/// greedy meshes (see [`RebuildWorker`]). `sky_anchor` / `last_sky` carry state
+/// across calls, same as the worker's loop locals. Returns `None` only when the
+/// replica has no terrain yet.
 pub fn rebuild_pass(
     replica: &Arc<Mutex<ReplicaWorld>>,
     center_m: [f64; 3],
@@ -492,69 +640,48 @@ pub fn rebuild_pass(
     last_sky: &mut Option<spall_render::indirect::LightingVolume>,
     absent_is_open: bool,
 ) -> Option<RebuildOutcome> {
-    rebuild_pass_cached(
-        replica,
-        center_m,
-        sky_anchor,
-        last_sky,
-        absent_is_open,
-        &mut TerrainInstanceCache::new(),
-    )
-}
-
-/// [`rebuild_pass`] reusing `cache` across passes (what the rebuild worker
-/// does): only bricks whose revisions changed are recomputed.
-pub fn rebuild_pass_cached(
-    replica: &Arc<Mutex<ReplicaWorld>>,
-    center_m: [f64; 3],
-    sky_anchor: &mut Option<[f64; 3]>,
-    last_sky: &mut Option<spall_render::indirect::LightingVolume>,
-    absent_is_open: bool,
-    cache: &mut TerrainInstanceCache,
-) -> Option<RebuildOutcome> {
-    let (volume, _generation, instances, geometry) =
-        rebuild_instances(replica, center_m, cache, &mut Vec::new())?;
-    let (sky, sky_stats, lighting) =
-        rebuild_sky(&volume, center_m, sky_anchor, last_sky, absent_is_open);
+    let volume = replica
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .terrain_volume()
+        .cloned()?;
+    let start = Instant::now();
+    let instances = build_instances(&volume, center_m);
+    let (sky, sky_stats, _) = rebuild_sky(&volume, center_m, sky_anchor, last_sky, absent_is_open);
     Some(RebuildOutcome {
         center_m,
-        instances_included: true,
+        terrain_included: true,
         instances,
+        mesh_updates: Vec::new(),
+        mesh_removed: Vec::new(),
+        mesh_elapsed: Duration::ZERO,
+        emitters: None,
         sky,
         sky_stats,
-        elapsed: geometry + lighting,
+        elapsed: start.elapsed(),
     })
 }
 
-/// Phase one of a rebuild: the terrain boxes around `center_m` from `replica`'s
-/// current terrain (reusing `cache`), plus the volume snapshot and terrain
-/// generation they were built from. Cheap after the first pass, so it is sent
-/// to the window before the lighting work.
-pub fn rebuild_instances(
-    replica: &Arc<Mutex<ReplicaWorld>>,
+/// The greedy terrain chunks the window draws around `center_m` and the
+/// emissive cells (as unit cubes) that light it with point lights: exactly what
+/// the rebuild worker produces on its first pass. For renders in tests and
+/// measurements that must exercise the live terrain path.
+pub fn live_terrain_for_render(
+    volume: &Volume,
     center_m: [f64; 3],
-    cache: &mut TerrainInstanceCache,
-    pending: &mut Vec<PendingCut>,
-) -> Option<(Volume, u64, Vec<Instance>, Duration)> {
-    let (mut volume, generation) = {
-        let replica = replica.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            replica.terrain_volume().cloned()?,
-            replica.terrain_generation(),
-        )
-    };
-    let start = Instant::now();
-    // Unconfirmed swings are drawn on this private copy; the lighting pass
-    // below gets the same copy, so a preview is lit like the real thing.
-    let volatile = apply_pending_cuts(&mut volume, pending, start);
-    let instances = build_instances_volatile(&volume, center_m, cache, &volatile);
-    Some((volume, generation, instances, start.elapsed()))
+    materials: &[spall_render::Material],
+) -> (Vec<MeshUpdate<BrickCoord>>, Vec<Instance>) {
+    let none = std::collections::HashSet::new();
+    let (meshes, _) =
+        update_terrain_mesh_cache(volume, center_m, &mut TerrainMeshCache::default(), &none);
+    let emissive: Vec<bool> = materials.iter().map(|m| m.emissive > 0.0).collect();
+    let emitters = EmitterCache::default().update(volume, center_m, &emissive, &none);
+    (meshes, emitters)
 }
 
-/// Phase two of a rebuild: the sky occupancy grid around `center_m` (kept where
-/// it is until the player has moved far enough to matter, so a slowly moving
-/// player produces an identical grid), or `None` when it is identical to the
-/// last one sent.
+/// The sky occupancy grid around `center_m` (kept where it is until the player
+/// has moved far enough to matter, so a slowly moving player produces an
+/// identical grid), or `None` when it is identical to the last one sent.
 pub fn rebuild_sky(
     volume: &Volume,
     center_m: [f64; 3],
@@ -583,11 +710,106 @@ pub fn rebuild_sky(
     (sky, sky_stats, start.elapsed())
 }
 
+/// Per-brick emissive cells of the visible terrain, keyed by the brick's
+/// revision: only changed bricks are rescanned. Uniform bricks are skipped (a
+/// solid emissive block is a wall, not a torch).
+#[derive(Default)]
+struct EmitterCache(HashMap<BrickCoord, (spall_core::Revision, Vec<Instance>)>);
+
+/// Most emissive cells kept per brick and overall, so a glowing wall cannot
+/// flood the point-light selection.
+const MAX_EMITTERS_PER_BRICK: usize = 64;
+const MAX_EMITTERS: usize = 2048;
+
+impl EmitterCache {
+    /// The emissive cells (as unit cubes at their centres) of every visible
+    /// brick of `volume`. `emissive[id]` says whether material `id` emits.
+    fn update(
+        &mut self,
+        volume: &Volume,
+        center_m: [f64; 3],
+        emissive: &[bool],
+        volatile: &std::collections::HashSet<BrickCoord>,
+    ) -> Vec<Instance> {
+        use spall_core::LocalCell;
+        if !emissive.iter().any(|&e| e) {
+            return Vec::new();
+        }
+        let cell_m = CELL_M;
+        let visible = visible_terrain_bricks(volume, center_m);
+        let keep: std::collections::HashSet<_> = visible.iter().copied().collect();
+        self.0.retain(|coord, _| keep.contains(coord));
+        let mut out = Vec::new();
+        for coord in visible {
+            let Ok(Some(snap)) = volume.snapshot_brick(coord) else {
+                continue;
+            };
+            if !snap.is_dense() {
+                self.0.remove(&coord);
+                continue;
+            }
+            let revision = snap.revision();
+            let is_volatile = volatile.contains(&coord);
+            if !is_volatile
+                && let Some((cached, found)) = self.0.get(&coord)
+                && *cached == revision
+            {
+                out.extend_from_slice(found);
+                continue;
+            }
+            let mut found = Vec::new();
+            'scan: for z in 0..32u8 {
+                for y in 0..32u8 {
+                    for x in 0..32u8 {
+                        let local = LocalCell::new(x, y, z).expect("in-brick");
+                        let material = snap.get(local).0;
+                        if !emissive
+                            .get(usize::from(material))
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let centre = [
+                            ((coord.x * 32 + i64::from(x)) as f32 + 0.5) * cell_m,
+                            ((coord.y * 32 + i64::from(y)) as f32 + 0.5) * cell_m,
+                            ((coord.z * 32 + i64::from(z)) as f32 + 0.5) * cell_m,
+                        ];
+                        found.push(Instance::new(
+                            centre,
+                            u32::from(material),
+                            [cell_m; 3],
+                            IDENTITY_ROTATION,
+                        ));
+                        if found.len() >= MAX_EMITTERS_PER_BRICK {
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+            out.extend_from_slice(&found);
+            if is_volatile {
+                // A preview's revision is not the server's: never remember it.
+                self.0.remove(&coord);
+            } else {
+                self.0.insert(coord, (revision, found));
+            }
+        }
+        out.truncate(MAX_EMITTERS);
+        out
+    }
+}
+
 impl RebuildWorker {
     /// Spawns the worker thread. It exits on its own once `request_tx`'s
-    /// last sender (owned by the `InteractiveApp` this returns into) drops —
-    /// no explicit shutdown signal or join needed.
-    fn spawn(session: Arc<InteractiveSession>, absent_is_open: bool) -> Result<Self, ClientError> {
+    /// last sender (owned by the `InteractiveApp` this returns into) drops --
+    /// no explicit shutdown signal or join needed. `emissive[id]` says which
+    /// materials emit light (for the torch point lights).
+    fn spawn(
+        session: Arc<InteractiveSession>,
+        absent_is_open: bool,
+        emissive: Vec<bool>,
+    ) -> Result<Self, ClientError> {
         let (request_tx, request_rx) = mpsc::channel::<[f64; 3]>();
         let (result_tx, result_rx) = mpsc::channel();
         let pending: Arc<Mutex<Vec<PendingCut>>> = Arc::new(Mutex::new(Vec::new()));
@@ -597,63 +819,88 @@ impl RebuildWorker {
             .spawn(move || {
                 let mut sky_anchor: Option<[f64; 3]> = None;
                 let mut last_sky: Option<spall_render::indirect::LightingVolume> = None;
-                let mut terrain_cache = TerrainInstanceCache::new();
+                let mut mesh_cache = TerrainMeshCache::default();
+                let mut emitter_cache = EmitterCache::default();
                 let mut last_sky_generation: Option<u64> = None;
                 for center_m in request_rx {
                     let Some(replica) = session.replica.get() else {
                         continue;
                     };
+                    let (mut volume, generation) = {
+                        let replica = replica.lock().unwrap_or_else(|e| e.into_inner());
+                        let Some(volume) = replica.terrain_volume().cloned() else {
+                            continue;
+                        };
+                        (volume, replica.terrain_generation())
+                    };
+                    // Unconfirmed hammer swings are drawn on this private copy
+                    // (never on the replica); their bricks bypass the caches.
                     let mut previews = worker_pending
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
-                    let Some((volume, generation, instances, elapsed)) =
-                        rebuild_instances(replica, center_m, &mut terrain_cache, &mut previews)
-                    else {
-                        continue;
-                    };
-                    // Expired previews leave the shared list; the replica's own
-                    // confirmation is detected per pass (the centre cell is air).
+                    let volatile = apply_pending_cuts(&mut volume, &mut previews, Instant::now());
                     worker_pending
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .retain(|p| p.at.elapsed() < PENDING_CUT_LIFETIME);
 
                     // Geometry first: it is what an edit or a step changes on
-                    // screen, and it is cheap once the cache is warm.
+                    // screen, and it is cheap once the mesh cache is warm.
+                    let started = Instant::now();
+                    let (mesh_updates, mesh_removed) =
+                        update_terrain_mesh_cache(&volume, center_m, &mut mesh_cache, &volatile);
+                    let mesh_elapsed = started.elapsed();
                     let geometry = RebuildOutcome {
                         center_m,
-                        instances_included: true,
-                        instances,
+                        terrain_included: true,
+                        instances: Vec::new(),
+                        mesh_updates,
+                        mesh_removed,
+                        mesh_elapsed,
+                        emitters: None,
                         sky: None,
                         sky_stats: crate::sky::SkyOccupancyStats::default(),
-                        elapsed,
+                        elapsed: mesh_elapsed,
                     };
                     if result_tx.send(geometry).is_err() {
                         return; // the window is gone
                     }
-                    // Lighting only when the terrain changed or the player left
-                    // the area the last grid was built around; rebuilding it on
-                    // every step cost 15-40 ms for an identical result.
+
+                    // Then the lighting: emitters and sky. The sky grid is only
+                    // rebuilt when the terrain changed or the player left the
+                    // area the last grid was built around; rebuilding it on every
+                    // step cost 15-40 ms for an identical result.
                     let anchored = sky_anchor.is_some_and(|a| within_sky_anchor(a, center_m));
-                    if last_sky_generation == Some(generation) && anchored {
-                        continue;
-                    }
-                    last_sky_generation = Some(generation);
-                    let (sky, sky_stats, sky_elapsed) = rebuild_sky(
-                        &volume,
-                        center_m,
-                        &mut sky_anchor,
-                        &mut last_sky,
-                        absent_is_open,
-                    );
+                    let emitters = emitter_cache.update(&volume, center_m, &emissive, &volatile);
+                    let (sky, sky_stats, elapsed) =
+                        if last_sky_generation == Some(generation) && anchored {
+                            (
+                                None,
+                                crate::sky::SkyOccupancyStats::default(),
+                                Duration::ZERO,
+                            )
+                        } else {
+                            last_sky_generation = Some(generation);
+                            rebuild_sky(
+                                &volume,
+                                center_m,
+                                &mut sky_anchor,
+                                &mut last_sky,
+                                absent_is_open,
+                            )
+                        };
                     let lighting = RebuildOutcome {
                         center_m,
-                        instances_included: false,
+                        terrain_included: false,
                         instances: Vec::new(),
+                        mesh_updates: Vec::new(),
+                        mesh_removed: Vec::new(),
+                        mesh_elapsed: Duration::ZERO,
+                        emitters: Some(emitters),
                         sky,
                         sky_stats,
-                        elapsed: sky_elapsed,
+                        elapsed,
                     };
                     if result_tx.send(lighting).is_err() {
                         return;
@@ -942,7 +1189,7 @@ impl Hud {
         };
         format!(
             "{fps:.0} fps | frame {:.1} ms (avg) / {max_frame_ms:.1} ms (max) | HUD CPU {avg_hud_cpu_ms:.3} ms (avg) / {max_hud_cpu_ms:.3} ms (max), GPU {hud_gpu_report} | buffer upload {max_buffer_upload_ms:.1} ms (max) | \
-             rebuild {:.1} ms ({} instances) | server tick {server_tick} | \
+             rebuild {:.1} ms ({} changed greedy chunks) | server tick {server_tick} | \
              +{new_corrections} corrections ({new_idle} idle) (lifetime max {max_correction_m:.3} m idle {max_idle_correction_m:.3} m vert {max_vertical_correction_m:.3} m horiz {max_horizontal_correction_m:.3} m) | \
              +{new_unmatched} unmatched (lifetime max displacement {max_unmatched_displacement_m:.3} m) | \
              prediction {prediction_hz:.1} Hz, backlog max {prediction_max_backlog_steps}, dropped {prediction_dropped_steps} | \
@@ -961,7 +1208,8 @@ impl InteractiveApp {
         options: InteractiveOptions,
         absent_is_open: bool,
     ) -> Result<Self, ClientError> {
-        let rebuild = RebuildWorker::spawn(session.clone(), absent_is_open)?;
+        let emissive: Vec<bool> = render_materials.iter().map(|m| m.emissive > 0.0).collect();
+        let rebuild = RebuildWorker::spawn(session.clone(), absent_is_open, emissive)?;
         let body_worker = BodyWorker::spawn(session.clone())?;
         Ok(Self {
             session,
@@ -977,7 +1225,6 @@ impl InteractiveApp {
             shot_index: 0,
             pending_capture: None,
             capture_due: false,
-            terrain_dirty: true,
             last_sky: None,
             sky_dirty: false,
             sky_visibility_on: true,
@@ -995,7 +1242,8 @@ impl InteractiveApp {
             force_rebuild: false,
             camera_follow: CameraFollow::default(),
             hud: Hud::default(),
-            last_terrain_instances: Vec::new(),
+            pending_mesh_updates: Vec::new(),
+            pending_mesh_removed: Vec::new(),
             last_body_draws: Vec::new(),
             pose_stats: PoseStats::default(),
             show_terrain: true,
@@ -1067,6 +1315,10 @@ impl InteractiveApp {
             }
             return;
         };
+        println!(
+            "spall-interactive: shot step {step:?} (next shot index {})",
+            self.shot_index
+        );
         let settle = match step {
             ShotStep::Camera {
                 eye,
@@ -1080,7 +1332,7 @@ impl InteractiveApp {
                 self.pitch = pitch_deg.to_radians().clamp(-MAX_PITCH, MAX_PITCH);
                 self.publish_look();
                 self.last_built_pos = None;
-                3.0
+                6.0
             }
             ShotStep::Walk => {
                 if self.fly_eye.is_some() {
@@ -1102,9 +1354,64 @@ impl InteractiveApp {
                 self.script_at = Some(now + Duration::from_secs_f32(seconds.max(0.0)));
                 return;
             }
+            ShotStep::View(view) => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.debug_view = view;
+                }
+                self.script_at = Some(now + Duration::from_millis(500));
+                return;
+            }
+            ShotStep::Environment(preset) => {
+                self.environment = preset.environment();
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.environment = preset.environment();
+                }
+                self.script_at = Some(now + Duration::from_secs(3));
+                return;
+            }
+            ShotStep::Skylight(on) => {
+                if self.sky_visibility_on != on {
+                    self.toggle_sky_visibility();
+                }
+                self.script_at = Some(now + Duration::from_secs(2));
+                return;
+            }
+            ShotStep::Bounce(on) => {
+                if self.bounce_on != on {
+                    self.toggle_bounce();
+                }
+                self.script_at = Some(now + Duration::from_secs(2));
+                return;
+            }
         };
         self.capture_due = true;
         self.script_at = Some(now + Duration::from_secs_f32(settle));
+    }
+
+    fn toggle_sky_visibility(&mut self) {
+        self.sky_visibility_on = !self.sky_visibility_on;
+        self.sky_dirty = true;
+        println!(
+            "spall-interactive: visibility-aware skylight {}",
+            if self.sky_visibility_on {
+                "ON"
+            } else {
+                "OFF (legacy unconditional ambient)"
+            }
+        );
+    }
+
+    fn toggle_bounce(&mut self) {
+        self.bounce_on = !self.bounce_on;
+        if let Some(renderer) = &self.renderer {
+            renderer
+                .scene
+                .set_bounce_enabled(&renderer.queue, self.bounce_on);
+        }
+        println!(
+            "spall-interactive: diffuse bounce {}",
+            if self.bounce_on { "ON" } else { "OFF" }
+        );
     }
 
     fn toggle_flight(&mut self) {
@@ -1312,9 +1619,8 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     KeyCode::F1 if held && !event.repeat => {
                         self.show_terrain = !self.show_terrain;
-                        self.terrain_dirty = true;
                         println!(
-                            "spall-interactive: terrain instances {}",
+                            "spall-interactive: terrain greedy meshes {}",
                             if self.show_terrain { "ON" } else { "OFF" }
                         );
                         return;
@@ -1336,29 +1642,11 @@ impl ApplicationHandler for InteractiveApp {
                         return;
                     }
                     KeyCode::F5 if held && !event.repeat => {
-                        self.sky_visibility_on = !self.sky_visibility_on;
-                        self.sky_dirty = true;
-                        println!(
-                            "spall-interactive: visibility-aware skylight {}",
-                            if self.sky_visibility_on {
-                                "ON"
-                            } else {
-                                "OFF (legacy unconditional ambient)"
-                            }
-                        );
+                        self.toggle_sky_visibility();
                         return;
                     }
                     KeyCode::F6 if held && !event.repeat => {
-                        self.bounce_on = !self.bounce_on;
-                        if let Some(renderer) = &self.renderer {
-                            renderer
-                                .scene
-                                .set_bounce_enabled(&renderer.queue, self.bounce_on);
-                        }
-                        println!(
-                            "spall-interactive: diffuse bounce {}",
-                            if self.bounce_on { "ON" } else { "OFF" }
-                        );
+                        self.toggle_bounce();
                         return;
                     }
                     KeyCode::F4 if held && !event.repeat => {
@@ -1384,25 +1672,18 @@ impl ApplicationHandler for InteractiveApp {
                 // landed since the last frame (never blocks — `try_recv`).
                 // Only the newest matters if somehow more than one queued up.
                 while let Ok(outcome) = self.rebuild.result_rx.try_recv() {
-                    if outcome.instances_included {
+                    if outcome.terrain_included {
                         self.hud
-                            .record_rebuild(outcome.elapsed, outcome.instances.len());
+                            .record_rebuild(outcome.mesh_elapsed, outcome.mesh_updates.len());
                         self.last_built_pos = Some(outcome.center_m);
-                        self.emitter_instances = outcome
-                            .instances
-                            .iter()
-                            .filter(|i| {
-                                self.render_materials
-                                    .get(i.material as usize)
-                                    .is_some_and(|m| m.emissive > 0.0)
-                            })
-                            .copied()
-                            .collect();
-                        self.last_terrain_instances = outcome.instances;
-                        self.terrain_dirty = true;
+                        self.pending_mesh_updates.extend(outcome.mesh_updates);
+                        self.pending_mesh_removed.extend(outcome.mesh_removed);
                         self.rebuild.in_flight = false;
                     } else {
                         self.hud.record_sky(outcome.sky_stats);
+                    }
+                    if let Some(emitters) = outcome.emitters {
+                        self.emitter_instances = emitters;
                     }
                     if let Some(sky) = outcome.sky {
                         self.last_sky = Some(sky);
@@ -1487,15 +1768,8 @@ impl ApplicationHandler for InteractiveApp {
                 // only when a rebuild landed or its visibility toggled --
                 // not every frame. Bodies move continuously, so they are
                 // re-posed (into their own reused buffer) every frame.
-                let empty = Vec::new();
-                let terrain = if !self.terrain_dirty {
-                    None
-                } else if self.show_terrain {
-                    Some(&self.last_terrain_instances)
-                } else {
-                    Some(&empty)
-                };
-                let uploading_terrain = terrain.is_some();
+                let terrain_updates = std::mem::take(&mut self.pending_mesh_updates);
+                let terrain_removed = std::mem::take(&mut self.pending_mesh_removed);
                 // ENG-105: rebuild water columns only when a new keyframe
                 // (or a different domain after a reset) has arrived.
                 let water_generation = self
@@ -1530,6 +1804,17 @@ impl ApplicationHandler for InteractiveApp {
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
+                renderer.scene.set_terrain_meshes_visible(self.show_terrain);
+                if (!terrain_updates.is_empty() || !terrain_removed.is_empty())
+                    && let Err(error) = renderer.scene.update_terrain_meshes(
+                        &renderer.device,
+                        &terrain_updates,
+                        &terrain_removed,
+                    )
+                {
+                    self.fail(event_loop, ClientError::Render(error.to_string()));
+                    return;
+                }
                 if let Some(instances) = &water_update {
                     renderer.set_debug_water(instances);
                 }
@@ -1547,7 +1832,7 @@ impl ApplicationHandler for InteractiveApp {
                         self.sky_dirty = false;
                     }
                 }
-                let outcome = match renderer.begin_frame(terrain.map(Vec::as_slice), &overlay) {
+                let outcome = match renderer.begin_frame(None, &overlay) {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         self.fail(event_loop, error);
@@ -1556,9 +1841,6 @@ impl ApplicationHandler for InteractiveApp {
                 };
                 // `begin_frame` uploaded the terrain before it could fail or
                 // skip, so the resident buffer is current either way.
-                if uploading_terrain {
-                    self.terrain_dirty = false;
-                }
                 let timing = match outcome {
                     AcquireOutcome::Skipped(timing) => timing,
                     AcquireOutcome::Ready(acquired) => {
@@ -1589,16 +1871,16 @@ impl ApplicationHandler for InteractiveApp {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
-                        let mut body_instances = Vec::new();
-                        if self.show_bodies {
-                            pose_body_instances(
+                        let (body_mesh_updates, live_body_meshes) = if self.show_bodies {
+                            pose_body_meshes(
                                 &self.last_body_draws,
                                 local_poses.as_ref(),
                                 render_now,
                                 &mut self.pose_stats,
-                                &mut body_instances,
-                            );
-                        }
+                            )
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
                         let cam = fresh_view.map(|v| {
                             let followed =
                                 self.camera_follow.eye(v, render_now, local_poses.is_none());
@@ -1743,12 +2025,15 @@ impl ApplicationHandler for InteractiveApp {
                                 &self.session,
                                 self.fly_eye.is_some(),
                                 self.admin_request_pending,
+                                self.sky_visibility_on,
+                                self.bounce_on,
                             )
                         });
                         match renderer.finish_frame(
                             acquired,
                             cam.as_ref(),
-                            &body_instances,
+                            &body_mesh_updates,
+                            &live_body_meshes,
                             None,
                             menu_view.as_ref().map(|view| (view, &mut menu_actions)),
                         ) {
@@ -1763,6 +2048,12 @@ impl ApplicationHandler for InteractiveApp {
                 self.hud.record_frame(&timing);
                 if menu_actions.toggle_flight {
                     self.toggle_flight();
+                }
+                if menu_actions.toggle_sky_visibility {
+                    self.toggle_sky_visibility();
+                }
+                if menu_actions.toggle_bounce {
+                    self.toggle_bounce();
                 }
                 if menu_actions.recentre {
                     self.recentre_view();
@@ -2553,19 +2844,16 @@ impl NetPose {
     }
 }
 
-/// Per-body cell instances in body-local space, keyed by topology revision.
-/// A body's cells only change when its topology does, so the per-cell volume
-/// walk (thousands of `sample` calls with ~200 debris bodies) happens once per
-/// topology, not once per frame; each frame only re-poses the cached cells.
-type BodyTemplates = std::collections::HashMap<u64, (u64, Arc<Vec<Instance>>)>;
+/// Per-body greedy mesh templates, keyed by topology revision.
+type BodyTemplates = std::collections::HashMap<u64, (u64, Arc<spall_mesh::Mesh>)>;
 
-/// A body's cached cells plus the pose the worker last saw for it. The render
-/// thread re-poses `template` itself at draw time (see
-/// [`pose_body_instances`]); the worker's pose is only the fallback for bodies
-/// with no locally simulated pose.
+/// A body's cached mesh plus the pose the worker last saw for it.
 struct BodyDraw {
     entity: u64,
+    #[cfg(test)]
+    #[allow(dead_code)]
     template: Arc<Vec<Instance>>,
+    mesh: Arc<spall_mesh::Mesh>,
     translation_m: [f64; 3],
     rotation: [f32; 4],
     net: Option<NetPose>,
@@ -2635,6 +2923,8 @@ fn snapshot_bodies(
 }
 
 /// Body-local cube positions/colours for `volume` (no pose applied).
+#[cfg(test)]
+#[allow(dead_code)]
 fn build_body_template(volume: &Volume) -> Vec<Instance> {
     let mut instances = Vec::new();
     let bricks = volume.resident_brick_coords();
@@ -2691,6 +2981,17 @@ fn build_body_template(volume: &Volume) -> Vec<Instance> {
     instances
 }
 
+fn build_body_mesh_template(volume: &Volume) -> spall_mesh::Mesh {
+    spall_mesh::build_volume_mesh(
+        volume,
+        Generation::START,
+        TopologyEpoch::START,
+        Default::default(),
+    )
+    .map(|built| built.mesh)
+    .unwrap_or_default()
+}
+
 /// Every detached body's cached cells and last-seen pose, built from
 /// [`snapshot_bodies`]'s output entirely after the replica lock has been
 /// released (see that function's doc for why this split exists). Nothing in
@@ -2705,17 +3006,17 @@ fn collect_body_draws(views: &[BodyView], templates: &mut BodyTemplates) -> Vec<
     let mut draws = Vec::with_capacity(views.len());
     for view in views {
         if let Some(volume) = &view.volume {
-            templates.insert(
-                view.entity,
-                (view.revision, Arc::new(build_body_template(volume))),
-            );
+            let mesh = Arc::new(build_body_mesh_template(volume));
+            templates.insert(view.entity, (view.revision, mesh));
         }
-        let Some((_, template)) = templates.get(&view.entity) else {
+        let Some((_, mesh)) = templates.get(&view.entity) else {
             continue;
         };
         draws.push(BodyDraw {
             entity: view.entity,
-            template: template.clone(),
+            #[cfg(test)]
+            template: Arc::new(Vec::new()),
+            mesh: mesh.clone(),
             translation_m: view.translation_m,
             rotation: view.rotation,
             net: view.net.clone(),
@@ -2728,6 +3029,8 @@ fn collect_body_draws(views: &[BodyView], templates: &mut BodyTemplates) -> Vec<
 /// simulated pose interpolated to `now` when there is one, else the pose the
 /// worker last saw. Each cube gets the body's full rotation (its centre is
 /// rotated and so is its mesh), not just its centre.
+#[allow(dead_code)]
+#[cfg(test)]
 fn pose_body_instances(
     draws: &[BodyDraw],
     local_poses: Option<&crate::interactive::LocalBodyPoses>,
@@ -2773,6 +3076,55 @@ fn pose_body_instances(
             ..*cell
         }));
     }
+}
+
+fn pose_body_meshes(
+    draws: &[BodyDraw],
+    local_poses: Option<&crate::interactive::LocalBodyPoses>,
+    now: Instant,
+    stats: &mut PoseStats,
+) -> (Vec<MeshUpdate<u64>>, Vec<u64>) {
+    let mut output = Vec::with_capacity(draws.len());
+    let mut live = Vec::with_capacity(draws.len());
+    for draw in draws {
+        let (translation_m, rotation) = match local_poses.and_then(|p| p.sample(draw.entity, now)) {
+            Some(pose) => (pose.translation_m, pose.rotation),
+            None => match &draw.net {
+                Some(net) => {
+                    let tick = net.render_tick(now);
+                    match net.sampler.presented(tick, net.focus_m) {
+                        Some(pose) => {
+                            if net.sampler.is_moving() {
+                                let age_ms = net.sampler.latest_age_ticks(tick).unwrap_or(0.0)
+                                    / net.sampler.hz()
+                                    * 1000.0;
+                                stats.record(draw.entity, pose.translation_m, age_ms);
+                            }
+                            (
+                                pose.translation_m,
+                                pose.rotation.to_unit().unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                            )
+                        }
+                        None => (draw.translation_m, draw.rotation),
+                    }
+                }
+                None => (draw.translation_m, draw.rotation),
+            },
+        };
+        let [x, y, z, w] = rotation;
+        let transform = glam::Mat4::from_rotation_translation(
+            glam::Quat::from_xyzw(x, y, z, w),
+            Vec3::new(
+                translation_m[0] as f32,
+                translation_m[1] as f32,
+                translation_m[2] as f32,
+            ),
+        );
+        let (vertices, indices) = spall_render::to_gpu(&draw.mesh, transform);
+        output.push((draw.entity, vertices, indices));
+        live.push(draw.entity);
+    }
+    (output, live)
 }
 
 /// Draw-time pose diagnostics for moving network bodies: how old the newest
@@ -3296,7 +3648,13 @@ pub(super) fn build_water_instances(frame: &spall_protocol::WaterKeyframe) -> Ve
     instances
 }
 
-fn admin_menu_view(session: &InteractiveSession, flying: bool, pending: bool) -> AdminMenuView {
+fn admin_menu_view(
+    session: &InteractiveSession,
+    flying: bool,
+    pending: bool,
+    sky_visibility_on: bool,
+    bounce_on: bool,
+) -> AdminMenuView {
     let admin_status = match (
         pending,
         session
@@ -3337,6 +3695,8 @@ fn admin_menu_view(session: &InteractiveSession, flying: bool, pending: bool) ->
         flying,
         admin_status,
         water,
+        sky_visibility_on,
+        bounce_on,
     }
 }
 
@@ -3407,6 +3767,10 @@ pub(super) struct AdminMenuView {
     pub admin_status: Option<String>,
     /// One-line summary of the replicated water, if any has arrived.
     pub water: Option<String>,
+    /// Visibility-aware skylight (`F5`) is on.
+    pub sky_visibility_on: bool,
+    /// Diffuse bounce (`F6`) is on.
+    pub bounce_on: bool,
 }
 
 /// Buttons clicked in the admin menu this frame.
@@ -3421,6 +3785,8 @@ pub(super) struct AdminMenuActions {
     pub set_water_spring_rate: Option<u8>,
     /// `Some(open)` when a dam gate open/close button was clicked this frame.
     pub set_dam_gate: Option<bool>,
+    pub toggle_sky_visibility: bool,
+    pub toggle_bounce: bool,
 }
 
 fn section(title: &'static str) {
@@ -3441,106 +3807,254 @@ fn admin_menu_panel(
     view: &AdminMenuView,
     actions: &mut AdminMenuActions,
     selected_environment: &mut Option<EnvironmentPreset>,
+    environment: &mut Environment,
+    debug_view: &mut DebugView,
 ) {
     yakui::colored_box_container(PANEL_BG.with_alpha(0.88), || {
         yakui::pad(yakui::widgets::Pad::all(14.0), || {
-            yakui::column(|| {
-                yakui::row(|| {
-                    yakui::text(22.0, "SPALL ADMIN");
-                    yakui::pad(yakui::widgets::Pad::balanced(12.0, 6.0), || {
-                        muted(13.0, "F10 to close");
-                    });
-                });
-
-                section("Movement");
-                muted(
-                    13.0,
-                    if view.flying {
-                        "Flying: spectator camera, no collision. Your player waits where you left it."
-                    } else {
-                        "Walking: server-authoritative character physics."
-                    },
-                );
-                yakui::row(|| {
-                    let label = if view.flying { "Land (walk)" } else { "Fly" };
-                    actions.toggle_flight |= yakui::button(label).clicked;
-                    yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
-                        actions.recentre |= yakui::button("Recentre view").clicked;
-                    });
-                });
-
-                section("World");
-                yakui::row(|| {
-                    actions.reset_world |= yakui::button("Reset world").clicked;
-                    yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
-                        actions.close |= yakui::button("Close menu").clicked;
-                    });
-                });
-                muted(
-                    12.0,
-                    "Reset rebuilds terrain, water, and bodies from the scene for every player.",
-                );
-                if let Some(status) = &view.admin_status {
-                    yakui::text(13.0, status.clone());
-                }
-                if let Some(water) = &view.water {
-                    muted(12.0, water.clone());
-                }
-
-                section("Water");
-                muted(
-                    12.0,
-                    "A scene with no gated spring or dam gate refuses these.",
-                );
-                yakui::row(|| {
-                    for (label, rate) in [
-                        ("Spring off", 0u8),
-                        ("Spring normal", 1),
-                        ("Spring fast", 2),
-                        ("Spring max", 3),
-                    ] {
-                        yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
-                            if yakui::button(label).clicked {
-                                actions.set_water_spring_rate = Some(rate);
-                            }
+            yakui::row(|| {
+                yakui::column(|| {
+                    yakui::row(|| {
+                        yakui::text(22.0, "SPALL ADMIN");
+                        yakui::pad(yakui::widgets::Pad::balanced(12.0, 6.0), || {
+                            muted(13.0, "F10 to close");
                         });
+                    });
+
+                    section("Movement");
+                    muted(
+                        13.0,
+                        if view.flying {
+                            "Flying: spectator camera, no collision. Your player waits where you left it."
+                        } else {
+                            "Walking: server-authoritative character physics."
+                        },
+                    );
+                    yakui::row(|| {
+                        let label = if view.flying { "Land (walk)" } else { "Fly" };
+                        actions.toggle_flight |= yakui::button(label).clicked;
+                        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                            actions.recentre |= yakui::button("Recentre view").clicked;
+                        });
+                    });
+
+                    section("World");
+                    yakui::row(|| {
+                        actions.reset_world |= yakui::button("Reset world").clicked;
+                        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                            actions.close |= yakui::button("Close menu").clicked;
+                        });
+                    });
+                    muted(
+                        12.0,
+                        "Reset rebuilds terrain, water, and bodies from the scene for every player.",
+                    );
+                    if let Some(status) = &view.admin_status {
+                        yakui::text(13.0, status.clone());
                     }
-                });
-                yakui::row(|| {
-                    if yakui::button("Open dam gate").clicked {
-                        actions.set_dam_gate = Some(true);
+                    if let Some(water) = &view.water {
+                        muted(12.0, water.clone());
                     }
-                    yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
-                        if yakui::button("Close dam gate").clicked {
-                            actions.set_dam_gate = Some(false);
+
+                    section("Water");
+                    muted(
+                        12.0,
+                        "A scene with no gated spring or dam gate refuses these.",
+                    );
+                    yakui::row(|| {
+                        for (label, rate) in [
+                            ("Spring off", 0u8),
+                            ("Spring normal", 1),
+                            ("Spring fast", 2),
+                            ("Spring max", 3),
+                        ] {
+                            yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
+                                if yakui::button(label).clicked {
+                                    actions.set_water_spring_rate = Some(rate);
+                                }
+                            });
                         }
                     });
-                });
-
-                section("Lighting");
-                yakui::row(|| {
-                    for preset in EnvironmentPreset::ALL {
-                        yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
-                            if yakui::button(preset.label()).clicked {
-                                *selected_environment = Some(preset);
+                    yakui::row(|| {
+                        if yakui::button("Open dam gate").clicked {
+                            actions.set_dam_gate = Some(true);
+                        }
+                        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                            if yakui::button("Close dam gate").clicked {
+                                actions.set_dam_gate = Some(false);
                             }
                         });
-                    }
-                });
-
-                section("Controls");
-                yakui::row(|| {
-                    yakui::column(|| {
-                        for (key, _) in KEYBINDS {
-                            yakui::text(13.0, *key);
-                        }
                     });
-                    yakui::pad(yakui::widgets::Pad::horizontal(14.0), || {
+
+                    section("Controls");
+                    yakui::row(|| {
                         yakui::column(|| {
-                            for (_, action) in KEYBINDS {
-                                muted(13.0, *action);
+                            for (key, _) in KEYBINDS {
+                                yakui::text(13.0, *key);
                             }
                         });
+                        yakui::pad(yakui::widgets::Pad::horizontal(14.0), || {
+                            yakui::column(|| {
+                                for (_, action) in KEYBINDS {
+                                    muted(13.0, *action);
+                                }
+                            });
+                        });
+                    });
+                });
+                yakui::pad(yakui::widgets::Pad::horizontal(18.0), || {
+                    yakui::column(|| {
+                        section("Lighting");
+                        muted(12.0, "Environment preset (resets sun and exposure)");
+                        yakui::row(|| {
+                            for preset in EnvironmentPreset::ALL {
+                                yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
+                                    if yakui::button(preset.label()).clicked {
+                                        *selected_environment = Some(preset);
+                                    }
+                                });
+                            }
+                        });
+                        yakui::row(|| {
+                            let on_off = |on: bool| if on { "ON" } else { "OFF" };
+                            if yakui::button(format!(
+                                "F5 Skylight visibility: {}",
+                                on_off(view.sky_visibility_on)
+                            ))
+                            .clicked
+                            {
+                                actions.toggle_sky_visibility = true;
+                            }
+                            yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+                                // Bounce lives in the skylight cache: with F5 off
+                                // there is no cache, so F6 has nothing to show.
+                                let note = if view.sky_visibility_on {
+                                    ""
+                                } else {
+                                    " (needs F5)"
+                                };
+                                if yakui::button(format!(
+                                    "F6 Bounce: {}{note}",
+                                    on_off(view.bounce_on)
+                                ))
+                                .clicked
+                                {
+                                    actions.toggle_bounce = true;
+                                }
+                            });
+                        });
+                        muted(
+                            12.0,
+                            "F5 off = legacy flat ambient (no interior darkening, no bounce).",
+                        );
+                        muted(12.0, "Render view (F4 cycles)");
+                        for row in LIGHTING_VIEWS.chunks(5) {
+                            yakui::row(|| {
+                                for &view_kind in row {
+                                    let name = view_kind.stem();
+                                    // Say when a view cannot show anything in the
+                                    // current F5/F6 state instead of leaving it blank.
+                                    let needs = match view_kind {
+                                        DebugView::SkyVisibility if !view.sky_visibility_on => {
+                                            " (needs F5)"
+                                        }
+                                        DebugView::IndirectOnly
+                                            if !view.sky_visibility_on || !view.bounce_on =>
+                                        {
+                                            " (needs F5+F6)"
+                                        }
+                                        _ => "",
+                                    };
+                                    let label = if *debug_view == view_kind {
+                                        format!("[{name}]{needs}")
+                                    } else {
+                                        format!("{name}{needs}")
+                                    };
+                                    yakui::pad(yakui::widgets::Pad::horizontal(2.0), || {
+                                        if yakui::button(label).clicked {
+                                            *debug_view = view_kind;
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                        let elevation = (-environment.sun_dir.y)
+                            .clamp(-1.0, 1.0)
+                            .asin()
+                            .to_degrees();
+                        let azimuth = environment
+                            .sun_dir
+                            .z
+                            .atan2(environment.sun_dir.x)
+                            .to_degrees();
+                        let (mut d_elevation, mut d_azimuth) = (0.0_f32, 0.0_f32);
+                        let (mut d_exposure, mut d_sun, mut d_sky, mut d_size) =
+                            (1.0_f32, 1.0, 1.0, 1.0);
+                        yakui::row(|| {
+                            stepper_row(
+                                &format!("Sun elevation {elevation:.0} deg"),
+                                &mut d_elevation,
+                                -10.0,
+                                10.0,
+                            );
+                            yakui::pad(yakui::widgets::Pad::horizontal(16.0), || {
+                                stepper_row(
+                                    &format!("Sun azimuth {azimuth:.0} deg"),
+                                    &mut d_azimuth,
+                                    -15.0,
+                                    15.0,
+                                );
+                            });
+                        });
+                        yakui::row(|| {
+                            stepper_scale_row(
+                                &format!("Sun intensity {:.2}", environment.sun_intensity),
+                                &mut d_sun,
+                            );
+                            yakui::pad(yakui::widgets::Pad::horizontal(16.0), || {
+                                stepper_scale_row(
+                                    &format!("Exposure {:.2}", environment.exposure),
+                                    &mut d_exposure,
+                                );
+                            });
+                        });
+                        yakui::row(|| {
+                            stepper_scale_row(
+                                &format!(
+                                    "Sky {:.2} / ground {:.2}",
+                                    environment.sky[1], environment.ground[1]
+                                ),
+                                &mut d_sky,
+                            );
+                            yakui::pad(yakui::widgets::Pad::horizontal(16.0), || {
+                                stepper_scale_row(
+                                    &format!(
+                                        "Sun size {:.1} deg",
+                                        environment.sun_angular_diameter_deg
+                                    ),
+                                    &mut d_size,
+                                );
+                            });
+                        });
+                        if d_elevation != 0.0 || d_azimuth != 0.0 {
+                            let el = (elevation + d_elevation).clamp(-89.0, 89.0).to_radians();
+                            let az = (azimuth + d_azimuth).to_radians();
+                            environment.sun_dir =
+                                Vec3::new(el.cos() * az.cos(), -el.sin(), el.cos() * az.sin());
+                        }
+                        environment.sun_intensity =
+                            (environment.sun_intensity * d_sun).clamp(0.0, 40.0);
+                        environment.exposure =
+                            (environment.exposure * d_exposure).clamp(0.05, 20.0);
+                        environment.sun_angular_diameter_deg =
+                            (environment.sun_angular_diameter_deg * d_size).clamp(0.05, 20.0);
+                        for channel in environment
+                            .sky
+                            .iter_mut()
+                            .chain(environment.ground.iter_mut())
+                        {
+                            *channel *= d_sky;
+                        }
                     });
                 });
             });
@@ -3548,18 +4062,54 @@ fn admin_menu_panel(
     });
 }
 
+/// Every render view the Lighting panel offers, in `F4` order.
+const LIGHTING_VIEWS: [DebugView; 9] = [
+    DebugView::Shaded,
+    DebugView::IndirectOnly,
+    DebugView::SkyVisibility,
+    DebugView::ShadowVisibility,
+    DebugView::ShadowCascades,
+    DebugView::Albedo,
+    DebugView::Normals,
+    DebugView::Depth,
+    DebugView::Roughness,
+];
+
+/// A `-`/`+` button pair that adds `minus`/`plus` to `delta`, then a label.
+fn stepper_row(label: &str, delta: &mut f32, minus: f32, plus: f32) {
+    yakui::row(|| {
+        if yakui::button("-").clicked {
+            *delta += minus;
+        }
+        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+            if yakui::button("+").clicked {
+                *delta += plus;
+            }
+        });
+        yakui::text(13.0, label.to_owned());
+    });
+}
+
+/// A `-`/`+` button pair that scales `scale` (starting at 1) by 1/1.25 or
+/// 1.25, then a label.
+fn stepper_scale_row(label: &str, scale: &mut f32) {
+    yakui::row(|| {
+        if yakui::button("-").clicked {
+            *scale /= 1.25;
+        }
+        yakui::pad(yakui::widgets::Pad::horizontal(6.0), || {
+            if yakui::button("+").clicked {
+                *scale *= 1.25;
+            }
+        });
+        yakui::text(13.0, label.to_owned());
+    });
+}
+
 /// The next debug view in the `F4` cycle, wrapping back to shaded.
 fn next_debug_view(view: DebugView) -> DebugView {
-    match view {
-        DebugView::Shaded => DebugView::Albedo,
-        DebugView::Albedo => DebugView::Normals,
-        DebugView::Normals => DebugView::Depth,
-        DebugView::Depth => DebugView::ShadowCascades,
-        DebugView::ShadowCascades => DebugView::ShadowVisibility,
-        DebugView::ShadowVisibility => DebugView::SkyVisibility,
-        DebugView::SkyVisibility => DebugView::Roughness,
-        DebugView::Roughness | DebugView::IndirectOnly => DebugView::Shaded,
-    }
+    let at = LIGHTING_VIEWS.iter().position(|v| *v == view).unwrap_or(0);
+    LIGHTING_VIEWS[(at + 1) % LIGHTING_VIEWS.len()]
 }
 
 /// How far (metres) the player may move from where the lighting cache was
@@ -4078,8 +4628,10 @@ impl WorldRenderer {
     /// One report-line fragment: the shared renderer's per-pass GPU time
     /// (previous completed frames) and resident instance memory.
     fn scene_report(&self) -> String {
-        let (terrain, bodies, overlay) = self.scene.instance_counts();
-        let memory = self.scene.instance_bytes() as f64 / (1024.0 * 1024.0);
+        let (_, _, overlay) = self.scene.instance_counts();
+        let (terrain_chunks, terrain_triangles, body_meshes, body_triangles, mesh_bytes) =
+            self.scene.mesh_stats();
+        let memory = (self.scene.instance_bytes() + mesh_bytes) as f64 / (1024.0 * 1024.0);
         let sky_memory = self.scene.sky_bytes() as f64 / (1024.0 * 1024.0);
         let sweep = self.scene.lighting_sweep_frames().unwrap_or(0);
         let lit_after = self
@@ -4088,7 +4640,7 @@ impl WorldRenderer {
             .map_or("n/a".to_owned(), |ms| format!("{ms:.0} ms"));
         match self.scene.pass_timings() {
             Some(t) => format!(
-                "scene GPU {:.2} ms (shadow {:.2} / opaque {:.2} / tone {:.2}; sky visibility {} / bounce {} last recompute, {sky_memory:.0} MiB) | lighting sweep {sweep} frames (cache update to last slice recorded {lit_after}, not presented) | cubes {terrain} terrain + {bodies} body + {overlay} overlay ({memory:.1} MiB)",
+                "scene GPU {:.2} ms (shadow {:.2} / opaque {:.2} / tone {:.2}; sky visibility {} / bounce {} last recompute, {sky_memory:.0} MiB) | lighting sweep {sweep} frames (cache update to last slice recorded {lit_after}, not presented) | greedy {terrain_chunks} terrain chunks / {terrain_triangles} tris + {body_meshes} body meshes / {body_triangles} tris + {overlay} debug cubes ({memory:.1} MiB)",
                 t.total_ms(),
                 t.shadow_ms,
                 t.opaque_ms,
@@ -4099,7 +4651,7 @@ impl WorldRenderer {
                     .map_or("n/a".to_owned(), |ms| format!("{ms:.2} ms"))
             ),
             None => format!(
-                "scene GPU timing unavailable | cubes {terrain} terrain + {bodies} body + {overlay} overlay ({memory:.1} MiB)"
+                "scene GPU timing unavailable | greedy {terrain_chunks} terrain chunks / {terrain_triangles} tris + {body_meshes} body meshes / {body_triangles} tris + {overlay} debug cubes ({memory:.1} MiB)"
             ),
         }
     }
@@ -4202,7 +4754,8 @@ impl WorldRenderer {
         &mut self,
         acquired: AcquiredFrame,
         cam: Option<&(Vec3, Vec3)>,
-        bodies: &[Instance],
+        body_meshes: &[(u64, Vec<spall_render::GpuVertex>, Vec<u32>)],
+        live_body_meshes: &[u64],
         demo_hud: Option<(&str, &str, &str)>,
         admin_menu: Option<(&AdminMenuView, &mut AdminMenuActions)>,
     ) -> Result<FrameTiming, ClientError> {
@@ -4215,7 +4768,10 @@ impl WorldRenderer {
             acquire_ms,
         } = acquired;
 
-        self.scene.set_bodies(&self.device, &self.queue, bodies);
+        self.scene.set_bodies(&self.device, &self.queue, &[]);
+        self.scene
+            .set_body_meshes(&self.device, &self.queue, body_meshes, live_body_meshes)
+            .map_err(|error| ClientError::Render(error.to_string()))?;
         self.clip_water();
         if let Some((eye, _)) = cam {
             self.debug_water_instances.sort_by(|a, b| {
@@ -4298,7 +4854,13 @@ impl WorldRenderer {
                             yakui::text(12.0, status.to_owned());
                         });
                     } else if let Some((view, actions)) = admin_menu.as_mut() {
-                        admin_menu_panel(view, actions, &mut selected_environment);
+                        admin_menu_panel(
+                            view,
+                            actions,
+                            &mut selected_environment,
+                            &mut self.environment,
+                            &mut self.debug_view,
+                        );
                     } else {
                         yakui::colored_box_container(PANEL_BG.with_alpha(0.55), || {
                             yakui::pad(yakui::widgets::Pad::balanced(10.0, 6.0), || {
@@ -4382,6 +4944,33 @@ mod input_tests {
     use spall_core::BUTTON_JUMP;
 
     use super::*;
+
+    #[test]
+    fn reports_incremental_mesh_and_edit_to_mesh_latency() {
+        let mut volume = spall_mesh::fixtures::cube([0, 0, 0], 8);
+        let center = [1.0, 1.0, 1.0];
+        let mut cache = TerrainMeshCache::default();
+        let started = Instant::now();
+        let (initial, _) =
+            update_terrain_mesh_cache(&volume, center, &mut cache, &Default::default());
+        let initial_elapsed = started.elapsed();
+        assert_eq!(initial.len(), 1);
+
+        let mut edit = spall_voxel::EditPlan::new(volume.id());
+        edit.set(GlobalCell::new(0, 0, 0), MaterialId::AIR);
+        volume.apply_edit(&edit).expect("fixture edit should apply");
+        let started = Instant::now();
+        let (changed, _) =
+            update_terrain_mesh_cache(&volume, center, &mut cache, &Default::default());
+        let edit_to_mesh = started.elapsed();
+        assert_eq!(changed.len(), 1, "only the edited brick should be rebuilt");
+        eprintln!(
+            "incremental_rebuild_ms={:.3} edit_to_mesh_ms={:.3} updated_bricks={}",
+            initial_elapsed.as_secs_f64() * 1000.0,
+            edit_to_mesh.as_secs_f64() * 1000.0,
+            changed.len()
+        );
+    }
 
     fn view(
         position_m: [f64; 3],
@@ -4473,15 +5062,15 @@ mod input_tests {
     fn the_debug_view_cycle_visits_every_window_view_and_wraps_to_shaded() {
         let mut view = DebugView::Shaded;
         let mut seen = vec![view];
-        for _ in 0..8 {
+        for _ in 0..9 {
             view = next_debug_view(view);
             seen.push(view);
         }
-        assert_eq!(seen.first(), seen.last(), "wraps after eight presses");
+        assert_eq!(seen.first(), seen.last(), "wraps after nine presses");
         seen.pop();
         seen.sort_by_key(|v| v.stem());
         seen.dedup();
-        assert_eq!(seen.len(), 8, "no view repeats within a cycle");
+        assert_eq!(seen.len(), 9, "no view repeats within a cycle");
     }
 
     #[test]
@@ -4499,16 +5088,21 @@ mod input_tests {
     }
 
     #[test]
-    fn locally_simulated_pose_reaches_body_render_instances() {
+    fn locally_simulated_pose_transforms_body_mesh_vertices() {
         let now = Instant::now();
         let draws = [BodyDraw {
             entity: 7,
-            template: Arc::new(vec![Instance::new(
-                [0.0, 0.0, 0.0],
-                1,
-                [CELL_M; 3],
-                [0.0, 0.0, 0.0, 1.0],
-            )]),
+            template: Arc::new(Vec::new()),
+            mesh: Arc::new(spall_mesh::Mesh {
+                vertices: vec![spall_mesh::Vertex {
+                    position: [0.0; 3],
+                    normal: [0.0, 1.0, 0.0],
+                    material: 1,
+                    ao: 1.0,
+                    local_uv: [0.0; 2],
+                }],
+                indices: Vec::new(),
+            }),
             translation_m: [2.0, 0.0, 0.0],
             rotation: [0.0, 0.0, 0.0, 1.0],
             net: None,
@@ -4523,17 +5117,12 @@ mod input_tests {
             curr_at: now,
             step: Duration::from_millis(16),
         };
-        let mut instances = Vec::new();
-        pose_body_instances(
-            &draws,
-            Some(&local),
-            now,
-            &mut PoseStats::default(),
-            &mut instances,
-        );
+        let (meshes, live) = pose_body_meshes(&draws, Some(&local), now, &mut PoseStats::default());
 
-        assert_eq!(instances.len(), 1);
-        assert_eq!(instances[0].offset, [8.0, 1.0, 3.0]);
+        assert_eq!(live, vec![7]);
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(meshes[0].0, 7);
+        assert_eq!(meshes[0].1[0].position, [8.0, 1.0, 3.0]);
     }
 }
 
@@ -5049,6 +5638,61 @@ mod perf_probe {
         }];
         apply_pending_cuts(&mut volume.clone(), &mut stale, now + PENDING_CUT_LIFETIME);
         assert!(stale.is_empty());
+    }
+
+    /// The live terrain path: an unconfirmed swing re-meshes only its bricks, is
+    /// never remembered by the mesh cache, and the real mesh returns once the
+    /// preview is gone.
+    #[test]
+    fn pending_cut_remeshes_without_poisoning_the_mesh_cache() {
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+        let center = [2.0, 13.5, 2.0];
+        let (cell, _) = visible_cells(&volume, center)
+            .into_iter()
+            .map(|(m, c)| (GlobalCell::new(c[0], c[1], c[2]), m))
+            .next()
+            .expect("the fixture has terrain");
+        let none = std::collections::HashSet::new();
+        let mut cache = TerrainMeshCache::default();
+        let (initial, removed) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
+        assert!(!initial.is_empty() && removed.is_empty());
+        let (quiet, _) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
+        assert!(quiet.is_empty(), "nothing changed, nothing re-meshed");
+
+        let now = Instant::now();
+        let mut preview = volume.clone();
+        let mut pending = vec![PendingCut {
+            cell,
+            radius_cells: 1,
+            at: now,
+        }];
+        let volatile = apply_pending_cuts(&mut preview, &mut pending, now);
+        let (carved, _) = update_terrain_mesh_cache(&preview, center, &mut cache, &volatile);
+        assert!(!carved.is_empty(), "the preview changes what is drawn");
+        assert!(
+            carved.len() <= volatile.len(),
+            "only the carved bricks and their neighbours are re-meshed"
+        );
+
+        // The preview is gone: the real bricks come back, identical to before.
+        let (restored, _) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
+        assert!(
+            !restored.is_empty(),
+            "the real meshes replace the preview's"
+        );
+        let by_coord = |updates: &[MeshUpdate<BrickCoord>]| {
+            updates
+                .iter()
+                .map(|(c, v, i)| (c.sort_key(), v.len(), i.clone()))
+                .collect::<Vec<_>>()
+        };
+        let original: Vec<_> = by_coord(&initial)
+            .into_iter()
+            .filter(|(key, _, _)| by_coord(&restored).iter().any(|(k, _, _)| k == key))
+            .collect();
+        assert_eq!(by_coord(&restored), original);
+        let (settled, _) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
+        assert!(settled.is_empty());
     }
 
     /// Greedy boxes cover every input cell exactly once, never merge across

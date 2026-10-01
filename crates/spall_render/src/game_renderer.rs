@@ -12,6 +12,7 @@
 //! called when a rebuild lands, [`GameRenderer::set_bodies`] when poses change,
 //! and neither allocates while the data fits the existing buffer.
 
+use std::collections::HashMap;
 use wgpu::util::DeviceExt as _;
 
 use crate::camera::Camera;
@@ -22,6 +23,9 @@ use crate::pipeline::{CASCADE_COUNT, DebugView, ScenePipeline};
 use crate::scene::Material;
 use crate::sky_visibility::SkyVisibility;
 use crate::target::OffscreenTarget;
+use crate::upload::{GpuMesh, UploadBudget};
+use crate::vertex::GpuVertex;
+use spall_core::BrickCoord;
 
 /// GPU time of a recent frame's passes, from timestamp queries.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -202,6 +206,11 @@ pub struct GameRenderer {
     cube_indices: wgpu::Buffer,
     cube_index_count: u32,
     terrain: InstanceSet,
+    /// Independently resident greedy terrain chunks. Replacing one brick never
+    /// reallocates the buffers for its unchanged neighbours.
+    terrain_meshes: HashMap<BrickCoord, GpuMesh>,
+    terrain_meshes_visible: bool,
+    body_meshes: HashMap<u64, DynamicMesh>,
     bodies: InstanceSet,
     /// Drawn lit but never shadow-casting (debug overlays).
     overlay: InstanceSet,
@@ -211,6 +220,72 @@ pub struct GameRenderer {
     sky: Option<SkyVisibility>,
     timer: Option<PassTimer>,
     timed_slot: Option<usize>,
+}
+
+struct DynamicMesh {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    vertex_capacity: u64,
+    index_capacity: u64,
+    index_count: u32,
+}
+
+impl DynamicMesh {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            vertices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spall-body-mesh-vertices"),
+                size: 4,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            indices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spall-body-mesh-indices"),
+                size: 4,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            vertex_capacity: 4,
+            index_capacity: 4,
+            index_count: 0,
+        }
+    }
+
+    fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[GpuVertex],
+        indices: &[u32],
+    ) {
+        let vb = std::mem::size_of_val(vertices) as u64;
+        let ib = std::mem::size_of_val(indices) as u64;
+        if vb > self.vertex_capacity {
+            self.vertex_capacity = vb.next_power_of_two();
+            self.vertices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spall-body-mesh-vertices"),
+                size: self.vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if ib > self.index_capacity {
+            self.index_capacity = ib.next_power_of_two();
+            self.indices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spall-body-mesh-indices"),
+                size: self.index_capacity,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if vb > 0 {
+            queue.write_buffer(&self.vertices, 0, bytemuck::cast_slice(vertices));
+        }
+        if ib > 0 {
+            queue.write_buffer(&self.indices, 0, bytemuck::cast_slice(indices));
+        }
+        self.index_count = indices.len() as u32;
+    }
 }
 
 impl GameRenderer {
@@ -247,6 +322,9 @@ impl GameRenderer {
             }),
             cube_index_count: indices.len() as u32,
             terrain: InstanceSet::new(),
+            terrain_meshes: HashMap::new(),
+            terrain_meshes_visible: true,
+            body_meshes: HashMap::new(),
             bodies: InstanceSet::new(),
             overlay: InstanceSet::new(),
             transparent: InstanceSet::new(),
@@ -276,6 +354,79 @@ impl GameRenderer {
         self.terrain.set(device, queue, instances)
     }
 
+    /// Install changed brick meshes and evict chunks that left render
+    /// residency. A fresh GPU allocation is made only for a changed chunk.
+    pub fn update_terrain_meshes(
+        &mut self,
+        device: &wgpu::Device,
+        updates: &[(BrickCoord, Vec<GpuVertex>, Vec<u32>)],
+        removed: &[BrickCoord],
+    ) -> Result<(), crate::context::RenderError> {
+        for coord in removed {
+            self.terrain_meshes.remove(coord);
+        }
+        const BUDGET: UploadBudget = UploadBudget {
+            max_vertex_bytes: 128 << 20,
+            max_index_bytes: 64 << 20,
+        };
+        for (coord, vertices, indices) in updates {
+            let mesh = GpuMesh::create(device, vertices, indices, BUDGET)?;
+            if mesh.index_count == 0 {
+                self.terrain_meshes.remove(coord);
+            } else {
+                self.terrain_meshes.insert(*coord, mesh);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_terrain_meshes_visible(&mut self, visible: bool) {
+        self.terrain_meshes_visible = visible;
+    }
+
+    /// Replace the moving bodies' transformed mesh buffers. The CPU templates
+    /// remain cached by topology revision; only their per-frame transforms are
+    /// applied before upload.
+    pub fn set_body_meshes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        updates: &[(u64, Vec<GpuVertex>, Vec<u32>)],
+        live: &[u64],
+    ) -> Result<(), crate::context::RenderError> {
+        const BUDGET: UploadBudget = UploadBudget {
+            max_vertex_bytes: 128 << 20,
+            max_index_bytes: 64 << 20,
+        };
+        let live: std::collections::HashSet<_> = live.iter().copied().collect();
+        self.body_meshes.retain(|entity, _| live.contains(entity));
+        for (entity, vertices, indices) in updates {
+            let v_bytes = std::mem::size_of_val(vertices) as u64;
+            let i_bytes = std::mem::size_of_val(indices) as u64;
+            if v_bytes > BUDGET.max_vertex_bytes {
+                return Err(crate::context::RenderError::UploadBudgetExceeded {
+                    bytes: v_bytes,
+                    budget: BUDGET.max_vertex_bytes,
+                });
+            }
+            if i_bytes > BUDGET.max_index_bytes {
+                return Err(crate::context::RenderError::UploadBudgetExceeded {
+                    bytes: i_bytes,
+                    budget: BUDGET.max_index_bytes,
+                });
+            }
+            if vertices.is_empty() || indices.is_empty() {
+                self.body_meshes.remove(entity);
+                continue;
+            }
+            self.body_meshes
+                .entry(*entity)
+                .or_insert_with(|| DynamicMesh::new(device))
+                .update(device, queue, vertices, indices);
+        }
+        Ok(())
+    }
+
     /// Replace the body instances (re-posed as bodies move). Bodies also block
     /// skylight and act as bounce sources: when sky occupancy exists they are
     /// laid over it as an exact cell diff and a time-sliced lighting sweep
@@ -290,6 +441,37 @@ impl GameRenderer {
             sky.set_bodies(queue, instances);
         }
         self.bodies.set(device, queue, instances)
+    }
+
+    /// Resident chunk/body mesh counts, triangle totals and allocated bytes.
+    pub fn mesh_stats(&self) -> (usize, u64, usize, u64, u64) {
+        let terrain_triangles: u64 = self
+            .terrain_meshes
+            .values()
+            .map(|m| u64::from(m.index_count / 3))
+            .sum();
+        let terrain_bytes: u64 = self
+            .terrain_meshes
+            .values()
+            .map(|m| m.vertex_bytes + m.index_bytes)
+            .sum();
+        let body_triangles: u64 = self
+            .body_meshes
+            .values()
+            .map(|m| u64::from(m.index_count / 3))
+            .sum();
+        let body_bytes: u64 = self
+            .body_meshes
+            .values()
+            .map(|m| m.vertex_capacity + m.index_capacity)
+            .sum();
+        (
+            self.terrain_meshes.len(),
+            terrain_triangles,
+            self.body_meshes.len(),
+            body_triangles,
+            terrain_bytes + body_bytes,
+        )
     }
 
     /// Frames the last completed lighting sweep took (see
@@ -447,6 +629,16 @@ impl GameRenderer {
             });
             pass.set_pipeline(self.pipeline.shadow_cube());
             pass.set_bind_group(0, &bind, &[]);
+            if self.terrain_meshes_visible {
+                pass.set_pipeline(self.pipeline.shadow());
+                self.draw_terrain_meshes(&mut pass);
+                pass.set_pipeline(self.pipeline.shadow_cube());
+            }
+            if !self.body_meshes.is_empty() {
+                pass.set_pipeline(self.pipeline.shadow());
+                self.draw_body_meshes(&mut pass);
+                pass.set_pipeline(self.pipeline.shadow_cube());
+            }
             self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies]);
         }
 
@@ -520,6 +712,34 @@ impl GameRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if self.terrain_meshes_visible {
+                pass.set_pipeline(self.pipeline.opaque_terrain());
+                pass.set_bind_group(0, &scene_bind, &[]);
+                pass.set_bind_group(1, &self.indirect.display_bind, &[]);
+                pass.set_bind_group(
+                    2,
+                    self.sky.as_ref().map_or(
+                        self.pipeline.sky_disabled_bind(),
+                        SkyVisibility::display_bind,
+                    ),
+                    &[],
+                );
+                self.draw_terrain_meshes(&mut pass);
+            }
+            if !self.body_meshes.is_empty() {
+                pass.set_pipeline(self.pipeline.opaque());
+                pass.set_bind_group(0, &scene_bind, &[]);
+                pass.set_bind_group(1, &self.indirect.display_bind, &[]);
+                pass.set_bind_group(
+                    2,
+                    self.sky.as_ref().map_or(
+                        self.pipeline.sky_disabled_bind(),
+                        SkyVisibility::display_bind,
+                    ),
+                    &[],
+                );
+                self.draw_body_meshes(&mut pass);
+            }
             pass.set_pipeline(self.pipeline.opaque_cube());
             pass.set_bind_group(0, &scene_bind, &[]);
             pass.set_bind_group(1, &self.indirect.display_bind, &[]);
@@ -616,6 +836,26 @@ impl GameRenderer {
                 pass.set_vertex_buffer(1, buffer.slice(..));
                 pass.draw_indexed(0..self.cube_index_count, 0, 0..set.count());
             }
+        }
+    }
+
+    fn draw_terrain_meshes<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        let mut chunks: Vec<_> = self.terrain_meshes.iter().collect();
+        chunks.sort_by_key(|(coord, _)| coord.sort_key());
+        for (_, mesh) in chunks {
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+    }
+
+    fn draw_body_meshes<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        let mut meshes: Vec<_> = self.body_meshes.iter().collect();
+        meshes.sort_by_key(|(entity, _)| **entity);
+        for (_, mesh) in meshes {
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
         }
     }
 }

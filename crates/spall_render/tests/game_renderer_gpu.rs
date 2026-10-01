@@ -10,7 +10,7 @@ use spall_render::instances::unit_cube;
 use spall_render::pipeline::COLOR_FORMAT;
 use spall_render::{
     Camera, CubeInstance, DebugView, Environment, EnvironmentPreset, GameRenderer, GpuVertex,
-    Material, MeshChunk, OffscreenTarget, RenderContext, ViewportFrame, ViewportRenderer,
+    Material, MeshChunk, OffscreenTarget, RenderContext, ViewportFrame, ViewportRenderer, to_gpu,
 };
 
 const SIZE: (u32, u32) = (320, 240);
@@ -184,6 +184,97 @@ fn render_mesh(
     viewport.target().copy_to_readback(&mut encoder);
     ctx.queue.submit([encoder.finish()]);
     viewport.target().read_rgba(ctx).expect("readback")
+}
+
+#[test]
+#[ignore = "requires a real GPU adapter; run with --ignored"]
+fn game_resident_greedy_mesh_matches_the_shared_viewport_pipeline() {
+    let ctx = RenderContext::headless().expect("a GPU adapter for the --ignored test");
+    let environment = EnvironmentPreset::Daylight.environment();
+    let materials = materials();
+    let volume = spall_mesh::fixtures::cube([0, 0, 0], 4);
+    let built = spall_mesh::build_volume_mesh(
+        &volume,
+        spall_jobs::Generation::START,
+        spall_jobs::TopologyEpoch::START,
+        Default::default(),
+    )
+    .expect("greedy terrain mesh");
+    let (vertices, indices) = to_gpu(&built.mesh, glam::Mat4::IDENTITY);
+    let target = OffscreenTarget::new(&ctx.device, SIZE.0, SIZE.1);
+    let mut game = GameRenderer::new(
+        &ctx.device,
+        &ctx.queue,
+        COLOR_FORMAT,
+        &materials,
+        SIZE,
+        ctx.supports_gpu_timestamps()
+            .then(|| ctx.timestamp_period_ns()),
+    );
+    game.update_terrain_meshes(
+        &ctx.device,
+        &[(
+            spall_core::BrickCoord::new(0, 0, 0),
+            vertices.clone(),
+            indices.clone(),
+        )],
+        &[],
+    )
+    .expect("terrain chunk upload");
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    game.render(
+        &ctx.device,
+        &ctx.queue,
+        &mut encoder,
+        target.color_view(),
+        &camera(),
+        &environment,
+        DebugView::Shaded,
+    );
+    target.copy_to_readback(&mut encoder);
+    ctx.queue.submit([encoder.finish()]);
+    let game_pixels = target.read_rgba(&ctx).expect("game mesh readback");
+
+    let mut viewport = ViewportRenderer::new(&ctx, &materials);
+    viewport.resize(&ctx, SIZE.0, SIZE.1);
+    viewport
+        .set_meshes(
+            &ctx,
+            &[MeshChunk {
+                vertices: &vertices,
+                indices: &indices,
+            }],
+        )
+        .expect("viewport upload");
+    viewport.render(
+        &ctx,
+        &ViewportFrame {
+            camera: camera(),
+            environment,
+        },
+    );
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    viewport.target().copy_to_readback(&mut encoder);
+    ctx.queue.submit([encoder.finish()]);
+    let viewport_pixels = viewport
+        .target()
+        .read_rgba(&ctx)
+        .expect("viewport readback");
+
+    let mean = game_pixels
+        .iter()
+        .zip(&viewport_pixels)
+        .map(|(a, b)| a.abs_diff(*b) as u64)
+        .sum::<u64>() as f64
+        / game_pixels.len() as f64;
+    assert_eq!(
+        mean, 0.0,
+        "game and viewport greedy geometry must remain pixel-identical"
+    );
 }
 
 fn luma(rgba: &[u8], x: u32, y: u32) -> f32 {

@@ -440,8 +440,8 @@ pub struct ClientSummary {
     #[serde(default)]
     pub baseline_transfer_failures: u64,
     /// A sent `ActionRequest` the server declined to admit or stage
-    /// (`ActionOutcome::Rejected`) — the scripted-action retrier only retries
-    /// a `"throttled"` reason, so anything else is a lost scripted action.
+    /// (`ActionOutcome::Rejected`) and the client exhausted its bounded retry
+    /// budget, or the reason was not retryable (`throttled` / `overloaded`).
     /// `0` unless the server actually rejected one.
     #[serde(default)]
     pub action_requests_rejected: u64,
@@ -599,8 +599,8 @@ struct Counters {
     /// `1` when the installed baseline carries at least one body volume, so
     /// "ready" waits for a motion keyframe before it is declared.
     late_join_has_bodies: AtomicU64,
-    /// A sent `ActionRequest` that came back `ActionOutcome::Rejected` for any
-    /// reason (the retrier only resends a `"throttled"` one).
+    /// A sent `ActionRequest` that came back rejected for a non-retryable reason,
+    /// or whose bounded throttle/overload retry budget was exhausted.
     action_rejected: AtomicU64,
     /// Bounded log of `action_rejected` reasons, most recent last (see
     /// `MAX_RECORDED_ACTION_REJECT_REASONS`). Diagnostic only — never read to
@@ -621,6 +621,26 @@ struct Counters {
     /// session -- the summary must not report "passed" on the strength of a
     /// baseline installed before that happened.
     disconnect_reason: std::sync::Mutex<Option<String>>,
+}
+
+/// Bounded resend schedule for rejected actions. Queue overload gets exponential
+/// backoff; per-tick throttling retains the short fixed delay.
+pub(crate) fn retry_backoff(overloaded: bool, tries_done: u8) -> Option<Duration> {
+    if overloaded {
+        (tries_done < 5).then(|| Duration::from_millis(100u64 << tries_done))
+    } else {
+        (tries_done < 4).then(|| Duration::from_millis(40))
+    }
+}
+
+fn retry_kind(reason: &str) -> Option<bool> {
+    if reason.starts_with("throttled") {
+        Some(false)
+    } else if reason.starts_with("overloaded") {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Cap on `Counters::action_reject_reasons` — a diagnostic log, not something
@@ -1195,17 +1215,18 @@ async fn run_async(
     // Bounded resend of `ActionRequest`s the server throttled (its per-tick
     // admission quota was exceeded — an explicitly retryable rejection). The
     // scripter records each request it sends; the control reader forwards
-    // throttled request ids here; the retrier re-sends, capped per request.
-    let sent_actions: Arc<Mutex<HashMap<u64, (WireRecord, u8)>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let (throttle_tx, mut throttle_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    // retryable rejection kinds here; the retrier resends each request within
+    // its throttle and overload budgets.
+    type SentActions = Arc<Mutex<HashMap<u64, (WireRecord, u8, u8)>>>;
+    let sent_actions: SentActions = Arc::new(Mutex::new(HashMap::new()));
+    let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
 
     // Control reader: apply transactions, answer repair gaps.
     let control = {
         let conn = conn.clone();
         let replica = replica.clone();
         let counters = counters.clone();
-        let throttle_tx = throttle_tx.clone();
+        let retry_tx = retry_tx.clone();
         let progression_responses = progression_responses.clone();
         let interactive = config.interactive.clone();
         let admin_statuses = admin_statuses.clone();
@@ -1424,13 +1445,12 @@ async fn run_async(
                     }
                     Ok(Some(WireRecord::ActionStatus(st))) => {
                         if let ActionOutcome::Rejected { reason } = &st.outcome {
-                            if reason.starts_with("throttled") {
-                                let _ = throttle_tx.send(st.request_id.0);
+                            if let Some(overloaded) = retry_kind(reason) {
+                                let _ = retry_tx.send((st.request_id.0, overloaded));
                             } else {
-                                // Anything other than "throttled" is not
-                                // retried (see the retrier below) — record it
-                                // so a lost scripted action is visible in the
-                                // summary instead of silently vanishing.
+                                // Permanent rejections are recorded immediately;
+                                // retryable ones are counted if their budget is
+                                // exhausted in the retrier below.
                                 counters.action_rejected.fetch_add(1, Ordering::Relaxed);
                                 let mut reasons = counters
                                     .action_reject_reasons
@@ -1469,32 +1489,54 @@ async fn run_async(
         })
     };
 
-    // Retrier: re-send a throttled `ActionRequest` after a short back-off, at
-    // most a few times per request, so a scripted gate action still lands under
-    // an impaired transport that bunches retransmits into one server tick.
+    // Retrier: bounded independently for throttles and server queue overload.
     let retrier = {
         let conn = conn.clone();
         let sent_actions = sent_actions.clone();
         let stop_rx = stop_rx.clone();
+        let counters = counters.clone();
         tokio::spawn(async move {
-            const MAX_ACTION_RETRIES: u8 = 4;
-            while let Some(id) = throttle_rx.recv().await {
+            while let Some((id, overloaded)) = retry_rx.recv().await {
                 if *stop_rx.borrow() {
                     break;
                 }
-                let record = {
+                let attempt = {
                     let mut g = sent_actions.lock().unwrap_or_else(|e| e.into_inner());
-                    match g.get_mut(&id) {
-                        Some((rec, tries)) if *tries < MAX_ACTION_RETRIES => {
+                    g.get_mut(&id)
+                        .and_then(|(rec, throttle_tries, overload_tries)| {
+                            let tries = if overloaded {
+                                overload_tries
+                            } else {
+                                throttle_tries
+                            };
+                            let delay = retry_backoff(overloaded, *tries)?;
                             *tries += 1;
-                            Some(rec.clone())
-                        }
-                        _ => None,
-                    }
+                            Some((rec.clone(), delay))
+                        })
                 };
-                if let Some(rec) = record {
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    let _ = conn.send_record(rec).await;
+                match attempt {
+                    Some((record, delay)) => {
+                        let conn = conn.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = conn.send_record(record).await;
+                        });
+                    }
+                    None => {
+                        counters.action_rejected.fetch_add(1, Ordering::Relaxed);
+                        let mut reasons = counters
+                            .action_reject_reasons
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if reasons.len() >= MAX_RECORDED_ACTION_REJECT_REASONS {
+                            reasons.remove(0);
+                        }
+                        reasons.push(if overloaded {
+                            "overloaded: retries exhausted".to_string()
+                        } else {
+                            "throttled: retries exhausted".to_string()
+                        });
+                    }
                 }
             }
         })
@@ -2248,14 +2290,19 @@ async fn run_async(
 
                 let request_id = request.request_id.0;
                 let record = WireRecord::ActionRequest(request);
-                if conn.send_record(record.clone()).await.is_ok() {
+                // Publish retry state before yielding on the send so a fast
+                // rejection cannot beat its entry into `sent_actions`.
+                sent_actions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(request_id, (record.clone(), 0, 0));
+                if conn.send_record(record).await.is_ok() {
                     counters.actions.fetch_add(1, Ordering::Relaxed);
-                    // Keep the exact record (a body cut carries its retargeted
-                    // `claimed_target`) so the retrier can resend it verbatim.
+                } else {
                     sent_actions
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(request_id, (record, 0));
+                        .remove(&request_id);
                 }
             }
         })
@@ -2521,4 +2568,41 @@ async fn run_async(
         )?;
     }
     Ok(summary)
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::{retry_backoff, retry_kind};
+    use std::time::Duration;
+
+    #[test]
+    fn overload_retries_back_off_exponentially_and_are_bounded() {
+        let delays: Vec<_> = (0..7).map(|tries| retry_backoff(true, tries)).collect();
+        assert_eq!(
+            delays,
+            vec![
+                Some(Duration::from_millis(100)),
+                Some(Duration::from_millis(200)),
+                Some(Duration::from_millis(400)),
+                Some(Duration::from_millis(800)),
+                Some(Duration::from_millis(1600)),
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn throttle_retries_keep_their_short_bounded_schedule() {
+        assert_eq!(retry_backoff(false, 0), Some(Duration::from_millis(40)));
+        assert_eq!(retry_backoff(false, 3), Some(Duration::from_millis(40)));
+        assert_eq!(retry_backoff(false, 4), None);
+    }
+
+    #[test]
+    fn only_explicit_overload_and_throttle_rejections_are_retried() {
+        assert_eq!(retry_kind("overloaded: queue full"), Some(true));
+        assert_eq!(retry_kind("throttled: retry shortly"), Some(false));
+        assert_eq!(retry_kind("invalid target"), None);
+    }
 }

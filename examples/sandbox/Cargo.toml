@@ -59,4 +59,5 @@ zstd.workspace = true
 
 [dev-dependencies]
 image.workspace = true
+spall_jobs.workspace = true
 wgpu.workspace = true

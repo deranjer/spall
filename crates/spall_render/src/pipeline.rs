@@ -146,6 +146,7 @@ pub struct ScenePipeline {
     opaque: wgpu::RenderPipeline,
     shadow: wgpu::RenderPipeline,
     opaque_cube: wgpu::RenderPipeline,
+    opaque_terrain: wgpu::RenderPipeline,
     transparent_cube: wgpu::RenderPipeline,
     shadow_cube: wgpu::RenderPipeline,
     tone_map: wgpu::RenderPipeline,
@@ -283,6 +284,16 @@ impl ScenePipeline {
             "vs_main",
             &[Some(GpuVertex::LAYOUT)],
         );
+        // Terrain meshes: the mesh layout with the static-terrain vertex entry.
+        let opaque_terrain = create_opaque_pipeline(
+            device,
+            &opaque_shader,
+            &scene_layout,
+            indirect.display_layout(),
+            sky.display_layout(),
+            "vs_terrain",
+            &[Some(GpuVertex::LAYOUT)],
+        );
         let opaque_cube = create_opaque_pipeline(
             device,
             &opaque_shader,
@@ -373,6 +384,7 @@ impl ScenePipeline {
             opaque,
             shadow,
             opaque_cube,
+            opaque_terrain,
             transparent_cube,
             shadow_cube,
             tone_map,
@@ -416,6 +428,10 @@ impl ScenePipeline {
         materials: &wgpu::Buffer,
     ) -> SkyVisibility {
         self.sky.create(device, materials)
+    }
+    /// [`Self::opaque`] for static terrain meshes: per-voxel colour jitter on.
+    pub fn opaque_terrain(&self) -> &wgpu::RenderPipeline {
+        &self.opaque_terrain
     }
     /// Instanced-cube variant of [`Self::opaque`] (same bind groups).
     pub fn opaque_cube(&self) -> &wgpu::RenderPipeline {

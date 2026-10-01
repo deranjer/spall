@@ -12,7 +12,7 @@
 use sandbox::game::{self, materials};
 use sandbox::worldgen_scene;
 use spall_client::sky::build_sky_occupancy;
-use spall_client::window::{build_instances, emitter_point_lights};
+use spall_client::window::{emitter_point_lights, live_terrain_for_render};
 use spall_core::GlobalCell;
 use spall_render::{
     Camera, DebugView, EnvironmentPreset, GameRenderer, OffscreenTarget, RenderContext,
@@ -63,29 +63,18 @@ fn render(
         SIZE,
         None,
     );
-    let instances = build_instances(volume, center_m);
-    renderer.set_terrain(&ctx.device, &ctx.queue, &instances);
-    // The window lights emissive voxels with point lights; so does this.
+    // The live window path: greedy terrain meshes plus emitter point lights.
+    let (meshes, emitters) = live_terrain_for_render(volume, center_m, &materials);
+    renderer
+        .update_terrain_meshes(&ctx.device, &meshes, &[])
+        .expect("upload terrain meshes");
     let eye = glam::Vec3::new(center_m[0] as f32, center_m[1] as f32, center_m[2] as f32);
+    let lights = emitter_point_lights(&emitters, &materials, eye);
     println!(
-        "lamp instances: {} of {}; first few materials {:?}",
-        instances
-            .iter()
-            .filter(|i| i.material == u32::from(materials::LAMP.0))
-            .count(),
-        instances.len(),
-        instances
-            .iter()
-            .map(|i| i.material)
-            .take(5)
-            .collect::<Vec<_>>()
-    );
-    let lights = emitter_point_lights(&instances, &materials, eye);
-    println!(
-        "point lights: {} ({} emissive materials, lamp emissive {})",
-        lights.len(),
-        materials.iter().filter(|m| m.emissive > 0.0).count(),
-        materials[usize::from(materials::LAMP.0)].emissive
+        "{} terrain chunks, {} emitter cells, {} point lights",
+        meshes.len(),
+        emitters.len(),
+        lights.len()
     );
     renderer.set_point_lights(&lights);
     let (sky, _) = build_sky_occupancy(volume, center_m, true);
