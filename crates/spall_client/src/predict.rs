@@ -242,6 +242,15 @@ pub struct ClientPhysics {
     /// `spall_sim::world::SimWorld` can track the same shape server-side —
     /// see its own `window_stats` field.
     window_stats: WindowStats,
+    /// Large worlds only: where the player is, for [`Self::set_terrain`] to
+    /// centre the collision window on (see [`Self::set_focus`]).
+    focus_m: Option<[f64; 3]>,
+    /// The inclusive cell box the installed collider was built over, when the
+    /// world was too large to build in full (`None` for a whole-world build).
+    window: Option<(GlobalCell, GlobalCell)>,
+    /// A large world is resident but no focus existed yet, so no collider was
+    /// built: [`Self::needs_window_move`] stays true until one is.
+    window_pending: bool,
     /// Testing-only mode: detached bodies are dynamic and stepped here; server
     /// motion snapshots seed topology/initial poses but never correct them.
     client_authoritative: bool,
@@ -271,6 +280,9 @@ impl ClientPhysics {
             query_cache: CharacterQueryCache::new(),
             revision: 0,
             window_stats: WindowStats::default(),
+            focus_m: None,
+            window: None,
+            window_pending: false,
             client_authoritative: false,
             local_tick: 0,
         }
@@ -341,8 +353,29 @@ impl ClientPhysics {
     /// resident-cell ceiling, and correctness here matters more than shaving
     /// that cost.
     pub fn set_terrain(&mut self, volume: &Volume) {
-        self.resident_bricks = volume.resident_brick_coords().into_iter().collect();
-        match lenient_occupancy(volume) {
+        let grid = if too_large_to_mirror(volume) {
+            // Too large to mirror whole (the dense grid is capped at
+            // `MAX_GRID_CELLS`, and finding its bounds would sample every cell
+            // of every brick): build a window around the player instead.
+            let Some(focus) = self.focus_m else {
+                self.resident_bricks.clear();
+                self.window = None;
+                self.window_pending = true;
+                self.revision = self.revision.wrapping_add(1);
+                return;
+            };
+            let (lo, hi) = window_around(focus);
+            self.resident_bricks = resident_bricks_in(volume, lo, hi);
+            self.window = Some((lo, hi));
+            self.window_pending = false;
+            windowed_occupancy(volume, lo, hi)
+        } else {
+            self.resident_bricks = volume.resident_brick_coords().into_iter().collect();
+            self.window = None;
+            self.window_pending = false;
+            lenient_occupancy(volume)
+        };
+        match grid {
             Some(grid) => match self.terrain {
                 Some(id) => {
                     self.world
@@ -690,6 +723,33 @@ impl ClientPhysics {
         }
     }
 
+    /// Tells large-world windowing where the player is. Call before
+    /// [`Self::set_terrain`]; ignored by worlds small enough to mirror whole.
+    pub fn set_focus(&mut self, feet_m: [f64; 3]) {
+        self.focus_m = Some(feet_m);
+    }
+
+    /// Whether the collision window must be rebuilt for a player at `feet_m`:
+    /// none exists yet, or the player has come within the margin of its edge.
+    /// Always `false` for a world mirrored whole.
+    pub fn needs_window_move(&self, feet_m: [f64; 3]) -> bool {
+        if self.window_pending {
+            return true;
+        }
+        let Some((lo, hi)) = self.window else {
+            return false;
+        };
+        let cell_m = f64::from(CELL_M);
+        let cell = |v: f64| (v / cell_m).floor() as i64;
+        let (x, y, z) = (cell(feet_m[0]), cell(feet_m[1]), cell(feet_m[2]));
+        x < lo.x + WINDOW_MARGIN_XZ
+            || x > hi.x - WINDOW_MARGIN_XZ
+            || z < lo.z + WINDOW_MARGIN_XZ
+            || z > hi.z - WINDOW_MARGIN_XZ
+            || y < lo.y + WINDOW_MARGIN_Y
+            || y > hi.y - WINDOW_MARGIN_Y
+    }
+
     pub fn has_terrain(&self) -> bool {
         self.terrain.is_some()
     }
@@ -712,6 +772,137 @@ impl ClientPhysics {
         );
         self.resident_bricks.contains(&cell.split().0)
     }
+}
+
+/// Whether the resident bricks' bounding box is bigger than the physics grid
+/// cap (`spall_physics::occupancy::MAX_GRID_CELLS`): a whole-world dense grid
+/// cannot be built then, so the client mirrors a window around the player.
+/// Judged from brick coordinates alone, never by sampling cells.
+fn too_large_to_mirror(volume: &Volume) -> bool {
+    let coords = volume.resident_brick_coords();
+    let mut min = [i64::MAX; 3];
+    let mut max = [i64::MIN; 3];
+    for c in &coords {
+        for (axis, v) in [c.x, c.y, c.z].into_iter().enumerate() {
+            min[axis] = min[axis].min(v);
+            max[axis] = max[axis].max(v);
+        }
+    }
+    if coords.is_empty() {
+        return false;
+    }
+    let cells: u128 = (0..3)
+        .map(|a| ((max[a] - min[a] + 1) * BRICK_CELLS) as u128)
+        .product();
+    cells > spall_physics::occupancy::MAX_GRID_CELLS
+}
+
+/// The collision window around the player, in cells: 49 x 41 x 49 = 98k, a few
+/// milliseconds to build. The character sweeps against the volume itself (the
+/// query window); this collider is only the fallback and the has-terrain gate,
+/// so a few metres around the player is all it must cover. A 193 x 129 x 193
+/// window took 124 ms to rebuild on the thread that publishes the predicted
+/// position, a visible hitch every time the player neared its edge or edited
+/// the terrain. Rebuilt when the player comes within the margins.
+const WINDOW_HALF_XZ: i64 = 24;
+const WINDOW_BELOW: i64 = 16;
+const WINDOW_ABOVE: i64 = 24;
+const WINDOW_MARGIN_XZ: i64 = 10;
+const WINDOW_MARGIN_Y: i64 = 6;
+
+fn window_around(feet_m: [f64; 3]) -> (GlobalCell, GlobalCell) {
+    let cell_m = f64::from(CELL_M);
+    let c = |v: f64| (v / cell_m).floor() as i64;
+    let (x, y, z) = (c(feet_m[0]), c(feet_m[1]), c(feet_m[2]));
+    (
+        GlobalCell::new(x - WINDOW_HALF_XZ, y - WINDOW_BELOW, z - WINDOW_HALF_XZ),
+        GlobalCell::new(x + WINDOW_HALF_XZ, y + WINDOW_ABOVE, z + WINDOW_HALF_XZ),
+    )
+}
+
+fn resident_bricks_in(volume: &Volume, lo: GlobalCell, hi: GlobalCell) -> BTreeSet<BrickCoord> {
+    let (lo_b, hi_b) = (lo.split().0, hi.split().0);
+    let mut out = BTreeSet::new();
+    for z in lo_b.z..=hi_b.z {
+        for y in lo_b.y..=hi_b.y {
+            for x in lo_b.x..=hi_b.x {
+                let coord = BrickCoord::new(x, y, z);
+                if matches!(volume.snapshot_brick(coord), Ok(Some(_))) {
+                    out.insert(coord);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The solid cells of `volume` inside the inclusive box `lo..=hi`, scanned a
+/// brick at a time (uniform bricks fill ranges, dense ones read cells); cells
+/// of bricks that are not resident stay empty, like [`lenient_occupancy`].
+/// `None` when the window holds no solid cell.
+fn windowed_occupancy(volume: &Volume, lo: GlobalCell, hi: GlobalCell) -> Option<OccupancyGrid> {
+    let dims = [
+        (hi.x - lo.x + 1) as u32,
+        (hi.y - lo.y + 1) as u32,
+        (hi.z - lo.z + 1) as u32,
+    ];
+    let cells = dims[0] as usize * dims[1] as usize * dims[2] as usize;
+    let mut solid = vec![false; cells];
+    let mut material = vec![MaterialId::AIR; cells];
+    let index = |x: i64, y: i64, z: i64| {
+        ((x - lo.x) as usize)
+            + dims[0] as usize * (((y - lo.y) as usize) + dims[1] as usize * ((z - lo.z) as usize))
+    };
+    let (lo_b, hi_b) = (lo.split().0, hi.split().0);
+    let mut any = false;
+    for bz in lo_b.z..=hi_b.z {
+        for by in lo_b.y..=hi_b.y {
+            for bx in lo_b.x..=hi_b.x {
+                let Ok(Some(brick)) = volume.snapshot_brick(BrickCoord::new(bx, by, bz)) else {
+                    continue;
+                };
+                let base = [bx * BRICK_CELLS, by * BRICK_CELLS, bz * BRICK_CELLS];
+                let from = [lo.x.max(base[0]), lo.y.max(base[1]), lo.z.max(base[2])];
+                let to = [
+                    hi.x.min(base[0] + BRICK_CELLS - 1),
+                    hi.y.min(base[1] + BRICK_CELLS - 1),
+                    hi.z.min(base[2] + BRICK_CELLS - 1),
+                ];
+                let uniform = (!brick.is_dense())
+                    .then(|| brick.get(spall_core::LocalCell::new(0, 0, 0).expect("origin")));
+                if uniform == Some(MaterialId::AIR) {
+                    continue;
+                }
+                for z in from[2]..=to[2] {
+                    for y in from[1]..=to[1] {
+                        for x in from[0]..=to[0] {
+                            let m = match uniform {
+                                Some(m) => m,
+                                None => brick.get(
+                                    spall_core::LocalCell::new(
+                                        (x - base[0]) as u8,
+                                        (y - base[1]) as u8,
+                                        (z - base[2]) as u8,
+                                    )
+                                    .expect("in-brick cell"),
+                                ),
+                            };
+                            if m != MaterialId::AIR {
+                                let i = index(x, y, z);
+                                solid[i] = true;
+                                material[i] = m;
+                                any = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    OccupancyGrid::from_solid_mask(lo, dims, solid, material).ok()
 }
 
 /// See [`ClientPhysics::set_terrain`]. `None` when no resident brick holds a
@@ -1771,6 +1962,83 @@ mod moving_body_replay_tests {
         assert!(
             later > at_snapshot + 1.0,
             "cube moved away by tick 6: {later}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod large_world_window_tests {
+    use super::*;
+    use spall_core::{CellSizeCode, Revision, VolumeId};
+    use spall_voxel::brick::Brick;
+
+    /// A flat stone floor `bricks x bricks` wide, one brick thick (top face at
+    /// cell y = 32 = 8 m), under one brick of resident air.
+    fn floor(bricks: i64) -> Volume {
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        for bz in 0..bricks {
+            for bx in 0..bricks {
+                volume
+                    .insert_brick(
+                        BrickCoord::new(bx, 0, bz),
+                        Brick::uniform(MaterialId(1), Revision::ZERO),
+                    )
+                    .unwrap();
+                volume
+                    .insert_brick(
+                        BrickCoord::new(bx, 1, bz),
+                        Brick::uniform(MaterialId::AIR, Revision::ZERO),
+                    )
+                    .unwrap();
+            }
+        }
+        volume
+    }
+
+    #[test]
+    fn a_world_over_the_grid_cap_is_mirrored_as_a_window_around_the_player() {
+        // 20 x 2 x 20 bricks = 640 x 64 x 640 cells = 26M > the 8M grid cap.
+        let volume = floor(20);
+        assert!(too_large_to_mirror(&volume));
+        let mut phys = ClientPhysics::new();
+
+        // No player yet: nothing is built, and a window is wanted once there is one.
+        phys.set_terrain(&volume);
+        assert!(!phys.has_terrain());
+        assert!(phys.needs_window_move([40.0, 9.0, 40.0]));
+
+        // With a player the window exists around them and covers their feet.
+        let spawn = [40.0, 8.5, 40.0];
+        phys.set_focus(spawn);
+        phys.set_terrain(&volume);
+        assert!(phys.has_terrain());
+        assert!(phys.covers(spawn));
+        assert!(!phys.needs_window_move(spawn));
+        // Far outside the window, nothing covers them and a rebuild is due.
+        let far = [140.0, 8.5, 140.0];
+        assert!(!phys.covers(far));
+        assert!(phys.needs_window_move(far));
+        // Walking toward the window's edge asks for a rebuild before leaving it.
+        assert!(phys.needs_window_move([40.0 + 4.0, 8.5, 40.0]));
+
+        // Rebuilt around the new position, the player is covered again.
+        phys.set_focus(far);
+        phys.set_terrain(&volume);
+        assert!(phys.has_terrain() && phys.covers(far) && !phys.needs_window_move(far));
+    }
+
+    #[test]
+    fn a_world_under_the_cap_is_still_mirrored_whole() {
+        let volume = floor(4); // 128 x 64 x 128 cells
+        assert!(!too_large_to_mirror(&volume));
+        let mut phys = ClientPhysics::new();
+        phys.set_terrain(&volume); // no focus needed
+        assert!(phys.has_terrain());
+        assert!(phys.covers([2.0, 8.5, 2.0]));
+        assert!(!phys.needs_window_move([2.0, 8.5, 2.0]));
+        assert!(
+            !phys.needs_window_move([1000.0, 8.5, 1000.0]),
+            "never windowed"
         );
     }
 }

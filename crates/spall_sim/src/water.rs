@@ -570,6 +570,21 @@ impl AuthoritativeWater {
     }
 
     /// Refresh committed terrain geometry and advance by one server tick.
+    /// Whether an edit that changed terrain brick `coord` can change this
+    /// region's solid boundary: the brick overlaps the fluid domain or is within
+    /// one brick of it. An edit anywhere else cannot, so it need not wake the
+    /// solver or re-capture the boundary over the whole domain.
+    pub fn boundary_touched_by(&self, coord: spall_core::BrickCoord) -> bool {
+        let origin = self.domain.origin();
+        let dims = self.domain.dimensions();
+        let lo = [origin.x, origin.y, origin.z];
+        let near = |axis: usize, brick: i64| {
+            let hi = lo[axis] + i64::from(dims[axis]) - 1;
+            brick >= lo[axis].div_euclid(32) - 1 && brick <= hi.div_euclid(32) + 1
+        };
+        near(0, coord.x) && near(1, coord.y) && near(2, coord.z)
+    }
+
     pub fn tick(
         &mut self,
         terrain: &Volume,

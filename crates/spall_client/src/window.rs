@@ -61,7 +61,9 @@ use spall_core::MaterialManifest;
 /// window is tall enough for valley walls and a flying camera.
 const VIEW_RADIUS_M: f32 = 64.0;
 const VIEW_HEIGHT_UP_M: f32 = 32.0;
-const VIEW_HEIGHT_DOWN_M: f32 = 32.0;
+/// Reaches the floor of a 96 m generated world from its highest peaks, so a
+/// flying camera keeps the ground in view. Buried rock is skipped cheaply.
+const VIEW_HEIGHT_DOWN_M: f32 = 96.0;
 /// Rebuild the instanced terrain draw once the player has moved this far
 /// (metres) from where it was last built, or the resident terrain changes.
 pub const REBUILD_DISTANCE_M: f64 = 1.0;
@@ -242,7 +244,12 @@ pub fn run_interactive_window_with_options(
     // so colour, roughness, metalness and emission match the editor and the
     // capture tools. One extra entry past the manifest ids draws debug
     // overlays.
-    let mut render_materials = materials_from_manifest(&materials);
+    let material_names: std::collections::BTreeMap<u16, String> = materials
+        .entries()
+        .iter()
+        .map(|def| (def.id.0, def.name.clone()))
+        .collect();
+    let mut render_materials = terrain_render_materials(&materials);
     let debug_material = render_materials.len() as u32;
     render_materials.push(spall_render::Material::new([0.02, 0.9, 0.9], 0.5, 0.0).emissive(2.0));
 
@@ -267,6 +274,7 @@ pub fn run_interactive_window_with_options(
         // is genuinely unknown; otherwise absent means empty.
         !net_config_streams_residency,
     )?;
+    app.material_names = material_names;
 
     let net_thread = std::thread::Builder::new()
         .name("spall-client-net".into())
@@ -383,6 +391,10 @@ struct InteractiveApp {
     /// the centre of the most recent request, which may still be in flight.
     last_built_pos: Option<[f64; 3]>,
     last_dispatch_at: Option<Instant>,
+    /// The replica terrain generation the last rebuild request was issued for.
+    last_dispatch_generation: Option<u64>,
+    /// A hammer swing was just previewed: rebuild at once, not at the next timer.
+    force_rebuild: bool,
     /// One-sample-delayed camera interpolation and correction smoothing.
     /// Keeping the two newest mover publications prevents forward
     /// extrapolation from overshooting the actual stop point.
@@ -415,6 +427,22 @@ struct InteractiveApp {
     admin_menu_open: bool,
     fly_eye: Option<Vec3>,
     last_fly_update: Option<Instant>,
+    /// Hammer state: the button is down / a click has not been sent yet / when
+    /// the last swing went out / the radius in cells (mouse wheel).
+    hammer_held: bool,
+    hammer_pending: bool,
+    /// `T` was pressed and the torch has not been sent yet.
+    torch_pending: bool,
+    last_hammer_at: Option<Instant>,
+    hammer_radius: i64,
+    next_action_id: u64,
+    /// Emissive terrain boxes of the last rebuild (torches, lamps), for the
+    /// per-frame point-light selection.
+    emitter_instances: Vec<Instance>,
+    /// The solid cell under the crosshair, refreshed every frame.
+    hammer_target: Option<(GlobalCell, MaterialId)>,
+    /// Material names by id, for the crosshair label.
+    material_names: std::collections::BTreeMap<u16, String>,
     /// ENG-105: `(frame_seq, server_tick)` of the water keyframe on the GPU.
     water_key: Option<(u64, u64)>,
     /// An admin command was sent and its `AdminStatus` has not arrived.
@@ -457,16 +485,25 @@ struct RebuildWorker {
     request_tx: mpsc::Sender<[f64; 3]>,
     result_rx: mpsc::Receiver<RebuildOutcome>,
     in_flight: bool,
+    /// Hammer swings awaiting the server, shared with the worker thread.
+    pending: Arc<Mutex<Vec<PendingCut>>>,
 }
 
 pub struct RebuildOutcome {
     pub center_m: [f64; 3],
+    /// `true` for the terrain result of a pass; `false` for the lighting
+    /// result that follows it (emitters and sky only).
+    pub terrain_included: bool,
+    /// Legacy instanced terrain; only [`rebuild_pass`] fills it.
     pub instances: Vec<Instance>,
     /// Changed greedy terrain chunks; unchanged chunks retain their GPU buffers.
     pub mesh_updates: Vec<(BrickCoord, Vec<spall_render::GpuVertex>, Vec<u32>)>,
     /// Chunks that left render residency or became empty.
     pub mesh_removed: Vec<BrickCoord>,
     pub mesh_elapsed: Duration,
+    /// Emissive cells of the visible terrain (torches and lamps), for the
+    /// point lights; sent with the lighting result.
+    pub emitters: Option<Vec<Instance>>,
     /// Sky occupancy built from the same volume snapshot as `instances`, or
     /// `None` when it is identical to the last one sent (nothing to recompute).
     pub sky: Option<spall_render::indirect::LightingVolume>,
@@ -524,12 +561,18 @@ fn visible_terrain_bricks(volume: &Volume, center_m: [f64; 3]) -> Vec<BrickCoord
     coords
 }
 
-type MeshUpdate<K> = (K, Vec<spall_render::GpuVertex>, Vec<u32>);
+pub type MeshUpdate<K> = (K, Vec<spall_render::GpuVertex>, Vec<u32>);
 
+/// Brings `cache` up to date with `volume` around `center_m` and returns the
+/// chunks to upload and to drop. Bricks in `volatile` are carved by unconfirmed
+/// previews: a revision number identifies contents only along the server's
+/// history, so they are always rebuilt and never remembered (a stale mesh could
+/// otherwise survive under a colliding revision).
 fn update_terrain_mesh_cache(
     volume: &Volume,
     center_m: [f64; 3],
     cache: &mut TerrainMeshCache,
+    volatile: &std::collections::HashSet<BrickCoord>,
 ) -> (Vec<MeshUpdate<BrickCoord>>, Vec<BrickCoord>) {
     let started = Instant::now();
     let visible = visible_terrain_bricks(volume, center_m);
@@ -537,10 +580,12 @@ fn update_terrain_mesh_cache(
     let mut updates = Vec::new();
     let mut removed = Vec::new();
     for coord in &visible {
-        if cache
-            .0
-            .get(coord)
-            .is_some_and(|mesh| mesh.token.is_fresh(&world))
+        let is_volatile = volatile.contains(coord);
+        if !is_volatile
+            && cache
+                .0
+                .get(coord)
+                .is_some_and(|mesh| mesh.token.is_fresh(&world))
         {
             continue;
         }
@@ -551,11 +596,16 @@ fn update_terrain_mesh_cache(
         };
         let (vertices, indices) = spall_render::to_gpu(&mesh.mesh, glam::Mat4::IDENTITY);
         if mesh.mesh.is_empty() {
-            if cache.0.remove(coord).is_some() {
+            // A preview's empty mesh must clear whatever the GPU still holds.
+            if cache.0.remove(coord).is_some() || is_volatile {
                 removed.push(*coord);
             }
         } else {
-            cache.0.insert(*coord, mesh);
+            if is_volatile {
+                cache.0.remove(coord);
+            } else {
+                cache.0.insert(*coord, mesh);
+            }
             updates.push((*coord, vertices, indices));
         }
     }
@@ -578,11 +628,11 @@ fn update_terrain_mesh_cache(
 
 /// One rebuild pass: terrain instances plus a sky occupancy grid (only when it
 /// actually changed) from `replica`'s current terrain volume around `center_m`.
-/// This is exactly what [`RebuildWorker`]'s background thread runs per request
-/// — extracted so latency instrumentation can time and drive the real pipeline
-/// stage by stage instead of re-implementing it. `sky_anchor` / `last_sky` carry
-/// state across calls, same as the worker's loop locals. Returns `None` only
-/// when the replica has no terrain yet.
+/// This is the legacy instanced-cube terrain path, kept for latency
+/// instrumentation and as a reference; the window's worker draws terrain from
+/// greedy meshes (see [`RebuildWorker`]). `sky_anchor` / `last_sky` carry state
+/// across calls, same as the worker's loop locals. Returns `None` only when the
+/// replica has no terrain yet.
 pub fn rebuild_pass(
     replica: &Arc<Mutex<ReplicaWorld>>,
     center_m: [f64; 3],
@@ -590,44 +640,66 @@ pub fn rebuild_pass(
     last_sky: &mut Option<spall_render::indirect::LightingVolume>,
     absent_is_open: bool,
 ) -> Option<RebuildOutcome> {
-    rebuild_pass_inner(
-        replica,
-        center_m,
-        sky_anchor,
-        last_sky,
-        absent_is_open,
-        true,
-    )
-}
-
-fn rebuild_pass_inner(
-    replica: &Arc<Mutex<ReplicaWorld>>,
-    center_m: [f64; 3],
-    sky_anchor: &mut Option<[f64; 3]>,
-    last_sky: &mut Option<spall_render::indirect::LightingVolume>,
-    absent_is_open: bool,
-    include_legacy_instances: bool,
-) -> Option<RebuildOutcome> {
     let volume = replica
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .terrain_volume()
         .cloned()?;
     let start = Instant::now();
-    let instances = if include_legacy_instances {
-        build_instances(&volume, center_m)
-    } else {
-        Vec::new()
-    };
-    // Keep the cache where it is until the player has moved far enough to
-    // matter, so a stationary or slowly moving player produces an identical
-    // grid and no lighting recompute.
+    let instances = build_instances(&volume, center_m);
+    let (sky, sky_stats, _) = rebuild_sky(&volume, center_m, sky_anchor, last_sky, absent_is_open);
+    Some(RebuildOutcome {
+        center_m,
+        terrain_included: true,
+        instances,
+        mesh_updates: Vec::new(),
+        mesh_removed: Vec::new(),
+        mesh_elapsed: Duration::ZERO,
+        emitters: None,
+        sky,
+        sky_stats,
+        elapsed: start.elapsed(),
+    })
+}
+
+/// The greedy terrain chunks the window draws around `center_m` and the
+/// emissive cells (as unit cubes) that light it with point lights: exactly what
+/// the rebuild worker produces on its first pass. For renders in tests and
+/// measurements that must exercise the live terrain path.
+pub fn live_terrain_for_render(
+    volume: &Volume,
+    center_m: [f64; 3],
+    materials: &[spall_render::Material],
+) -> (Vec<MeshUpdate<BrickCoord>>, Vec<Instance>) {
+    let none = std::collections::HashSet::new();
+    let (meshes, _) =
+        update_terrain_mesh_cache(volume, center_m, &mut TerrainMeshCache::default(), &none);
+    let emissive: Vec<bool> = materials.iter().map(|m| m.emissive > 0.0).collect();
+    let emitters = EmitterCache::default().update(volume, center_m, &emissive, &none);
+    (meshes, emitters)
+}
+
+/// The sky occupancy grid around `center_m` (kept where it is until the player
+/// has moved far enough to matter, so a slowly moving player produces an
+/// identical grid), or `None` when it is identical to the last one sent.
+pub fn rebuild_sky(
+    volume: &Volume,
+    center_m: [f64; 3],
+    sky_anchor: &mut Option<[f64; 3]>,
+    last_sky: &mut Option<spall_render::indirect::LightingVolume>,
+    absent_is_open: bool,
+) -> (
+    Option<spall_render::indirect::LightingVolume>,
+    crate::sky::SkyOccupancyStats,
+    Duration,
+) {
+    let start = Instant::now();
     let sky_center = match *sky_anchor {
         Some(anchor) if within_sky_anchor(anchor, center_m) => anchor,
         _ => center_m,
     };
     *sky_anchor = Some(sky_center);
-    let (grid, sky_stats) = crate::sky::build_sky_occupancy(&volume, sky_center, absent_is_open);
+    let (grid, sky_stats) = crate::sky::build_sky_occupancy(volume, sky_center, absent_is_open);
     let changed = last_sky
         .as_ref()
         .is_none_or(|last| last.origin() != grid.origin() || last.cells() != grid.cells());
@@ -635,58 +707,203 @@ fn rebuild_pass_inner(
         *last_sky = Some(grid.clone());
         grid
     });
-    Some(RebuildOutcome {
-        center_m,
-        instances,
-        mesh_updates: Vec::new(),
-        mesh_removed: Vec::new(),
-        mesh_elapsed: Duration::ZERO,
-        sky,
-        sky_stats,
-        elapsed: start.elapsed(),
-    })
+    (sky, sky_stats, start.elapsed())
+}
+
+/// Per-brick emissive cells of the visible terrain, keyed by the brick's
+/// revision: only changed bricks are rescanned. Uniform bricks are skipped (a
+/// solid emissive block is a wall, not a torch).
+#[derive(Default)]
+struct EmitterCache(HashMap<BrickCoord, (spall_core::Revision, Vec<Instance>)>);
+
+/// Most emissive cells kept per brick and overall, so a glowing wall cannot
+/// flood the point-light selection.
+const MAX_EMITTERS_PER_BRICK: usize = 64;
+const MAX_EMITTERS: usize = 2048;
+
+impl EmitterCache {
+    /// The emissive cells (as unit cubes at their centres) of every visible
+    /// brick of `volume`. `emissive[id]` says whether material `id` emits.
+    fn update(
+        &mut self,
+        volume: &Volume,
+        center_m: [f64; 3],
+        emissive: &[bool],
+        volatile: &std::collections::HashSet<BrickCoord>,
+    ) -> Vec<Instance> {
+        use spall_core::LocalCell;
+        if !emissive.iter().any(|&e| e) {
+            return Vec::new();
+        }
+        let cell_m = CELL_M;
+        let visible = visible_terrain_bricks(volume, center_m);
+        let keep: std::collections::HashSet<_> = visible.iter().copied().collect();
+        self.0.retain(|coord, _| keep.contains(coord));
+        let mut out = Vec::new();
+        for coord in visible {
+            let Ok(Some(snap)) = volume.snapshot_brick(coord) else {
+                continue;
+            };
+            if !snap.is_dense() {
+                self.0.remove(&coord);
+                continue;
+            }
+            let revision = snap.revision();
+            let is_volatile = volatile.contains(&coord);
+            if !is_volatile
+                && let Some((cached, found)) = self.0.get(&coord)
+                && *cached == revision
+            {
+                out.extend_from_slice(found);
+                continue;
+            }
+            let mut found = Vec::new();
+            'scan: for z in 0..32u8 {
+                for y in 0..32u8 {
+                    for x in 0..32u8 {
+                        let local = LocalCell::new(x, y, z).expect("in-brick");
+                        let material = snap.get(local).0;
+                        if !emissive
+                            .get(usize::from(material))
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let centre = [
+                            ((coord.x * 32 + i64::from(x)) as f32 + 0.5) * cell_m,
+                            ((coord.y * 32 + i64::from(y)) as f32 + 0.5) * cell_m,
+                            ((coord.z * 32 + i64::from(z)) as f32 + 0.5) * cell_m,
+                        ];
+                        found.push(Instance::new(
+                            centre,
+                            u32::from(material),
+                            [cell_m; 3],
+                            IDENTITY_ROTATION,
+                        ));
+                        if found.len() >= MAX_EMITTERS_PER_BRICK {
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+            out.extend_from_slice(&found);
+            if is_volatile {
+                // A preview's revision is not the server's: never remember it.
+                self.0.remove(&coord);
+            } else {
+                self.0.insert(coord, (revision, found));
+            }
+        }
+        out.truncate(MAX_EMITTERS);
+        out
+    }
 }
 
 impl RebuildWorker {
     /// Spawns the worker thread. It exits on its own once `request_tx`'s
-    /// last sender (owned by the `InteractiveApp` this returns into) drops —
-    /// no explicit shutdown signal or join needed.
-    fn spawn(session: Arc<InteractiveSession>, absent_is_open: bool) -> Result<Self, ClientError> {
+    /// last sender (owned by the `InteractiveApp` this returns into) drops --
+    /// no explicit shutdown signal or join needed. `emissive[id]` says which
+    /// materials emit light (for the torch point lights).
+    fn spawn(
+        session: Arc<InteractiveSession>,
+        absent_is_open: bool,
+        emissive: Vec<bool>,
+    ) -> Result<Self, ClientError> {
         let (request_tx, request_rx) = mpsc::channel::<[f64; 3]>();
         let (result_tx, result_rx) = mpsc::channel();
+        let pending: Arc<Mutex<Vec<PendingCut>>> = Arc::new(Mutex::new(Vec::new()));
+        let worker_pending = pending.clone();
         std::thread::Builder::new()
             .name("spall-client-rebuild".into())
             .spawn(move || {
                 let mut sky_anchor: Option<[f64; 3]> = None;
                 let mut last_sky: Option<spall_render::indirect::LightingVolume> = None;
                 let mut mesh_cache = TerrainMeshCache::default();
+                let mut emitter_cache = EmitterCache::default();
+                let mut last_sky_generation: Option<u64> = None;
                 for center_m in request_rx {
                     let Some(replica) = session.replica.get() else {
                         continue;
                     };
-                    let Some(mut outcome) = rebuild_pass_inner(
-                        replica,
-                        center_m,
-                        &mut sky_anchor,
-                        &mut last_sky,
-                        absent_is_open,
-                        false,
-                    ) else {
-                        continue;
+                    let (mut volume, generation) = {
+                        let replica = replica.lock().unwrap_or_else(|e| e.into_inner());
+                        let Some(volume) = replica.terrain_volume().cloned() else {
+                            continue;
+                        };
+                        (volume, replica.terrain_generation())
                     };
-                    if let Some(volume) = replica
+                    // Unconfirmed hammer swings are drawn on this private copy
+                    // (never on the replica); their bricks bypass the caches.
+                    let mut previews = worker_pending
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .terrain_volume()
-                        .cloned()
-                    {
-                        let mesh_started = Instant::now();
-                        (outcome.mesh_updates, outcome.mesh_removed) =
-                            update_terrain_mesh_cache(&volume, center_m, &mut mesh_cache);
-                        outcome.mesh_elapsed = mesh_started.elapsed();
-                    }
-                    if result_tx.send(outcome).is_err() {
+                        .clone();
+                    let volatile = apply_pending_cuts(&mut volume, &mut previews, Instant::now());
+                    worker_pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .retain(|p| p.at.elapsed() < PENDING_CUT_LIFETIME);
+
+                    // Geometry first: it is what an edit or a step changes on
+                    // screen, and it is cheap once the mesh cache is warm.
+                    let started = Instant::now();
+                    let (mesh_updates, mesh_removed) =
+                        update_terrain_mesh_cache(&volume, center_m, &mut mesh_cache, &volatile);
+                    let mesh_elapsed = started.elapsed();
+                    let geometry = RebuildOutcome {
+                        center_m,
+                        terrain_included: true,
+                        instances: Vec::new(),
+                        mesh_updates,
+                        mesh_removed,
+                        mesh_elapsed,
+                        emitters: None,
+                        sky: None,
+                        sky_stats: crate::sky::SkyOccupancyStats::default(),
+                        elapsed: mesh_elapsed,
+                    };
+                    if result_tx.send(geometry).is_err() {
                         return; // the window is gone
+                    }
+
+                    // Then the lighting: emitters and sky. The sky grid is only
+                    // rebuilt when the terrain changed or the player left the
+                    // area the last grid was built around; rebuilding it on every
+                    // step cost 15-40 ms for an identical result.
+                    let anchored = sky_anchor.is_some_and(|a| within_sky_anchor(a, center_m));
+                    let emitters = emitter_cache.update(&volume, center_m, &emissive, &volatile);
+                    let (sky, sky_stats, elapsed) =
+                        if last_sky_generation == Some(generation) && anchored {
+                            (
+                                None,
+                                crate::sky::SkyOccupancyStats::default(),
+                                Duration::ZERO,
+                            )
+                        } else {
+                            last_sky_generation = Some(generation);
+                            rebuild_sky(
+                                &volume,
+                                center_m,
+                                &mut sky_anchor,
+                                &mut last_sky,
+                                absent_is_open,
+                            )
+                        };
+                    let lighting = RebuildOutcome {
+                        center_m,
+                        terrain_included: false,
+                        instances: Vec::new(),
+                        mesh_updates: Vec::new(),
+                        mesh_removed: Vec::new(),
+                        mesh_elapsed: Duration::ZERO,
+                        emitters: Some(emitters),
+                        sky,
+                        sky_stats,
+                        elapsed,
+                    };
+                    if result_tx.send(lighting).is_err() {
+                        return;
                     }
                 }
             })
@@ -695,6 +912,7 @@ impl RebuildWorker {
             request_tx,
             result_rx,
             in_flight: false,
+            pending,
         })
     }
 }
@@ -990,7 +1208,8 @@ impl InteractiveApp {
         options: InteractiveOptions,
         absent_is_open: bool,
     ) -> Result<Self, ClientError> {
-        let rebuild = RebuildWorker::spawn(session.clone(), absent_is_open)?;
+        let emissive: Vec<bool> = render_materials.iter().map(|m| m.emissive > 0.0).collect();
+        let rebuild = RebuildWorker::spawn(session.clone(), absent_is_open, emissive)?;
         let body_worker = BodyWorker::spawn(session.clone())?;
         Ok(Self {
             session,
@@ -1019,6 +1238,8 @@ impl InteractiveApp {
             body_worker,
             last_built_pos: None,
             last_dispatch_at: None,
+            last_dispatch_generation: None,
+            force_rebuild: false,
             camera_follow: CameraFollow::default(),
             hud: Hud::default(),
             pending_mesh_updates: Vec::new(),
@@ -1031,6 +1252,15 @@ impl InteractiveApp {
             admin_menu_open: false,
             fly_eye: None,
             last_fly_update: None,
+            hammer_held: false,
+            hammer_pending: false,
+            torch_pending: false,
+            last_hammer_at: None,
+            hammer_radius: HAMMER_RADIUS_DEFAULT,
+            next_action_id: HAMMER_REQUEST_BASE,
+            emitter_instances: Vec::new(),
+            hammer_target: None,
+            material_names: std::collections::BTreeMap::new(),
             water_key: None,
             admin_request_pending: false,
             seen_world_resets: 0,
@@ -1229,6 +1459,9 @@ impl InteractiveApp {
     /// keys/buttons that were down at focus loss, so carrying `held` across
     /// that boundary could make the server receive a stale walk or jump.
     fn clear_held_actions(&mut self) {
+        self.hammer_held = false;
+        self.hammer_pending = false;
+        self.torch_pending = false;
         self.held.clear_on_focus_loss(&self.session.input);
     }
 
@@ -1311,6 +1544,27 @@ impl ApplicationHandler for InteractiveApp {
             } if !self.cursor_locked && !ui_consumed => {
                 self.set_cursor_locked(true);
             }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } if self.cursor_locked && !ui_consumed => {
+                self.hammer_held = state == ElementState::Pressed;
+                self.hammer_pending |= self.hammer_held;
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.cursor_locked && !ui_consumed => {
+                let steps = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y.round() as i64,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.y / 40.0).round() as i64,
+                };
+                if steps != 0 {
+                    self.hammer_radius = (self.hammer_radius + steps).clamp(0, HAMMER_RADIUS_MAX);
+                    eprintln!(
+                        "spall-interactive: hammer radius {} cells",
+                        self.hammer_radius
+                    );
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if ui_consumed {
                     return;
@@ -1354,6 +1608,10 @@ impl ApplicationHandler for InteractiveApp {
                     }
                     KeyCode::KeyR if held && !event.repeat => {
                         self.recentre_view();
+                        return;
+                    }
+                    KeyCode::KeyT if held && !event.repeat => {
+                        self.torch_pending = true;
                         return;
                     }
                     KeyCode::Escape if held && !event.repeat => {
@@ -1414,17 +1672,23 @@ impl ApplicationHandler for InteractiveApp {
                 // landed since the last frame (never blocks — `try_recv`).
                 // Only the newest matters if somehow more than one queued up.
                 while let Ok(outcome) = self.rebuild.result_rx.try_recv() {
-                    self.hud
-                        .record_rebuild(outcome.mesh_elapsed, outcome.mesh_updates.len());
-                    self.last_built_pos = Some(outcome.center_m);
-                    self.pending_mesh_updates.extend(outcome.mesh_updates);
-                    self.pending_mesh_removed.extend(outcome.mesh_removed);
+                    if outcome.terrain_included {
+                        self.hud
+                            .record_rebuild(outcome.mesh_elapsed, outcome.mesh_updates.len());
+                        self.last_built_pos = Some(outcome.center_m);
+                        self.pending_mesh_updates.extend(outcome.mesh_updates);
+                        self.pending_mesh_removed.extend(outcome.mesh_removed);
+                        self.rebuild.in_flight = false;
+                    } else {
+                        self.hud.record_sky(outcome.sky_stats);
+                    }
+                    if let Some(emitters) = outcome.emitters {
+                        self.emitter_instances = emitters;
+                    }
                     if let Some(sky) = outcome.sky {
                         self.last_sky = Some(sky);
                         self.sky_dirty = true;
                     }
-                    self.hud.record_sky(outcome.sky_stats);
-                    self.rebuild.in_flight = false;
                 }
 
                 let view = *self.session.view.lock().unwrap_or_else(|e| e.into_inner());
@@ -1445,12 +1709,28 @@ impl ApplicationHandler for InteractiveApp {
                     // At most one request in flight — a faster player than the
                     // worker can keep up with just rides on a slightly stale
                     // draw rather than queuing requests it'll never need.
+                    // An edit landing (the replica's terrain generation moved)
+                    // redraws at once: the per-brick cache makes that cheap, and
+                    // waiting for the recheck timer made a hammer swing take
+                    // most of a second to show.
+                    let generation = self
+                        .session
+                        .replica
+                        .get()
+                        .and_then(|r| r.try_lock().ok().map(|g| g.terrain_generation()));
+                    let terrain_changed =
+                        generation.is_some() && generation != self.last_dispatch_generation;
                     if !self.rebuild.in_flight
-                        && (moved_far_enough || due_for_recheck)
+                        && (moved_far_enough
+                            || due_for_recheck
+                            || terrain_changed
+                            || self.force_rebuild)
                         && self.rebuild.request_tx.send(feet).is_ok()
                     {
+                        self.force_rebuild = false;
                         self.rebuild.in_flight = true;
                         self.last_dispatch_at = Some(now);
+                        self.last_dispatch_generation = generation;
                     }
                 }
 
@@ -1467,13 +1747,23 @@ impl ApplicationHandler for InteractiveApp {
                 while let Ok(draws) = self.body_worker.result_rx.try_recv() {
                     self.last_body_draws = draws;
                 }
-                let overlay = if self.show_capsule
+                let mut overlay = if self.show_capsule
                     && let Some(v) = view
                 {
                     build_capsule_debug_instances(v.predicted.position_m, self.debug_material)
                 } else {
                     Vec::new()
                 };
+                // The cells the hammer would break (last frame's target).
+                if let Some((cell, _)) = self.hammer_target
+                    && !self.admin_menu_open
+                {
+                    overlay.extend(hammer_outline(
+                        cell,
+                        self.hammer_radius,
+                        self.debug_material,
+                    ));
+                }
                 // Terrain lives in a resident GPU buffer and is re-uploaded
                 // only when a rebuild landed or its visibility toggled --
                 // not every frame. Bodies move continuously, so they are
@@ -1510,6 +1800,7 @@ impl ApplicationHandler for InteractiveApp {
                     None
                 };
                 let mut menu_actions = AdminMenuActions::default();
+                let water_window = self.last_built_pos;
                 let Some(renderer) = &mut self.renderer else {
                     return;
                 };
@@ -1527,6 +1818,7 @@ impl ApplicationHandler for InteractiveApp {
                 if let Some(instances) = &water_update {
                     renderer.set_debug_water(instances);
                 }
+                renderer.set_water_window(water_window);
                 if self.sky_dirty {
                     let occupancy = self.last_sky.as_ref().filter(|_| self.sky_visibility_on);
                     // Nothing to upload yet (no rebuild has landed) keeps the
@@ -1638,6 +1930,93 @@ impl ApplicationHandler for InteractiveApp {
                                 (followed, look_dir)
                             }
                         });
+                        self.hammer_target = match cam {
+                            Some((eye, dir)) => {
+                                match self.session.replica.get().and_then(|r| r.try_lock().ok()) {
+                                    Some(replica) => replica
+                                        .terrain_volume()
+                                        .and_then(|volume| cast_hammer_ray(volume, eye, dir)),
+                                    // The network thread holds the replica: keep
+                                    // last frame's target rather than flicker.
+                                    None => self.hammer_target,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some((eye, _)) = cam {
+                            renderer.scene.set_point_lights(&emitter_point_lights(
+                                &self.emitter_instances,
+                                &self.render_materials,
+                                eye,
+                            ));
+                        }
+                        renderer.set_crosshair((!self.admin_menu_open && cam.is_some()).then(
+                            || CrosshairView {
+                                in_reach: self.hammer_target.is_some(),
+                                label: match self.hammer_target {
+                                    // A click only captures the mouse until it is.
+                                    _ if !self.cursor_locked => {
+                                        "click to capture the mouse, then click to break".to_owned()
+                                    }
+                                    Some((_, material)) => format!(
+                                            "hammer r{}  {}",
+                                            self.hammer_radius,
+                                            self.material_names
+                                                .get(&material.0)
+                                                .map_or("?", String::as_str)
+                                        ),
+                                    None => {
+                                        format!("hammer r{}  out of reach", self.hammer_radius)
+                                    }
+                                },
+                            },
+                        ));
+                        if let Some((eye, dir)) = cam
+                            && self.cursor_locked
+                            && hammer_due(
+                                self.hammer_pending,
+                                self.hammer_held,
+                                self.last_hammer_at,
+                                render_now,
+                            )
+                        {
+                            self.hammer_pending = false;
+                            self.last_hammer_at = Some(render_now);
+                            let id = self.next_action_id;
+                            self.next_action_id += 1;
+                            // Draw the cut now, a round trip before the server's.
+                            if let Some((cell, _)) = self.hammer_target {
+                                let mut pending = self
+                                    .rebuild
+                                    .pending
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if pending.len() < MAX_PENDING_CUTS {
+                                    pending.push(PendingCut {
+                                        cell,
+                                        radius_cells: self.hammer_radius,
+                                        at: render_now,
+                                    });
+                                }
+                                self.force_rebuild = true;
+                            }
+                            self.session.push_action(hammer_request(
+                                id,
+                                eye,
+                                dir,
+                                self.hammer_radius,
+                            ));
+                        }
+                        if self.torch_pending {
+                            self.torch_pending = false;
+                            if let Some((eye, dir)) = cam
+                                && self.cursor_locked
+                            {
+                                let id = self.next_action_id;
+                                self.next_action_id += 1;
+                                self.session.push_action(torch_request(id, eye, dir));
+                            }
+                        }
                         if let Some(path) = self.pending_capture.take() {
                             renderer.screenshot_request = Some(path);
                         }
@@ -1930,6 +2309,47 @@ fn view_dir_from(yaw: f32, pitch: f32) -> [f32; 3] {
 /// reason: instrumentation that needs the real geometry-building pipeline
 /// without a background worker.
 pub fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
+    build_instances_cached(volume, center_m, &mut TerrainInstanceCache::new())
+}
+
+/// Per-brick results of [`build_instances_cached`], keyed by the brick's own
+/// revision and its six neighbours' (the buried test reads their faces). An edit changes one brick's revision,
+/// so the next rebuild recomputes that brick and its neighbours and reuses the
+/// rest: a hammer swing costs milliseconds, not a full window walk.
+pub struct TerrainInstanceCache {
+    bricks: std::collections::HashMap<spall_core::BrickCoord, (u64, Vec<Instance>)>,
+    grid: BrickGrid,
+}
+
+impl TerrainInstanceCache {
+    pub fn new() -> Self {
+        Self {
+            bricks: std::collections::HashMap::new(),
+            grid: BrickGrid::new(),
+        }
+    }
+
+    /// Bricks currently cached (tests and diagnostics).
+    pub fn len(&self) -> usize {
+        self.bricks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bricks.is_empty()
+    }
+}
+
+impl Default for TerrainInstanceCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The inclusive cell window the terrain draw covers around `center_m`,
+/// widened to whole bricks: a brick is drawn entirely or not at all, so its
+/// cached boxes do not depend on where the window's edge falls and walking does
+/// not invalidate every brick along the edge each metre.
+fn view_window(center_m: [f64; 3]) -> (GlobalCell, GlobalCell) {
     let cell_m = f64::from(CELL_M);
     let center_cell = GlobalCell::new(
         (center_m[0] / cell_m).floor() as i64,
@@ -1939,95 +2359,457 @@ pub fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
     let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
     let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
     let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
-    let min = GlobalCell::new(
-        center_cell.x - horiz,
-        center_cell.y - down,
-        center_cell.z - horiz,
-    );
-    let max = GlobalCell::new(
-        center_cell.x + horiz,
-        center_cell.y + up,
-        center_cell.z + horiz,
-    );
-    let (min_brick, _) = min.split();
-    let (max_brick, _) = max.split();
     let edge = i64::from(spall_core::BRICK_EDGE);
+    let floor = |v: i64| v.div_euclid(edge) * edge;
+    let ceil = |v: i64| v.div_euclid(edge) * edge + edge - 1;
+    (
+        GlobalCell::new(
+            floor(center_cell.x - horiz),
+            floor(center_cell.y - down),
+            floor(center_cell.z - horiz),
+        ),
+        GlobalCell::new(
+            ceil(center_cell.x + horiz),
+            ceil(center_cell.y + up),
+            ceil(center_cell.z + horiz),
+        ),
+    )
+}
 
-    let mut instances = Vec::new();
-    let mut emit = |cell: GlobalCell, material: MaterialId| {
-        if is_buried(volume, cell) {
-            return;
-        }
-        instances.push(Instance {
-            offset: [
-                ((cell.x as f64 + 0.5) * cell_m) as f32,
-                ((cell.y as f64 + 0.5) * cell_m) as f32,
-                ((cell.z as f64 + 0.5) * cell_m) as f32,
-            ],
-            material: u32::from(material.0),
-            size: [CELL_M; 3],
-            _pad: 0.0,
-            rotation: IDENTITY_ROTATION,
-        });
-    };
-    // Walk whole bricks: uniform air is skipped outright and a uniform solid
-    // brick can only expose its shell, so the view window can be tall enough
-    // for hills and flight without sampling every empty cell in it.
-    for bz in min_brick.z..=max_brick.z {
-        for by in min_brick.y..=max_brick.y {
-            for bx in min_brick.x..=max_brick.x {
-                let coord = spall_core::BrickCoord::new(bx, by, bz);
-                let Ok(Some(brick)) = volume.snapshot_brick(coord) else {
-                    continue;
-                };
-                let base = GlobalCell::new(bx * edge, by * edge, bz * edge);
-                let lo = [
-                    (min.x - base.x).max(0),
-                    (min.y - base.y).max(0),
-                    (min.z - base.z).max(0),
-                ];
-                let hi = [
-                    (max.x - base.x).min(edge - 1),
-                    (max.y - base.y).min(edge - 1),
-                    (max.z - base.z).min(edge - 1),
-                ];
-                let uniform = (!brick.is_dense())
-                    .then(|| brick.get(spall_core::LocalCell::new(0, 0, 0).expect("origin")));
-                if uniform == Some(MaterialId::AIR) {
-                    continue;
-                }
-                for z in lo[2]..=hi[2] {
-                    for y in lo[1]..=hi[1] {
-                        let shell_row = z == 0 || z == edge - 1 || y == 0 || y == edge - 1;
-                        let mut x = lo[0];
-                        while x <= hi[0] {
-                            let cell = GlobalCell::new(base.x + x, base.y + y, base.z + z);
-                            match uniform {
-                                Some(material) => emit(cell, material),
-                                None => {
-                                    let local =
-                                        spall_core::LocalCell::new(x as u8, y as u8, z as u8)
-                                            .expect("in-brick cell");
-                                    let material = brick.get(local);
-                                    if material != MaterialId::AIR {
-                                        emit(cell, material);
-                                    }
-                                }
-                            }
-                            // Inside a uniform solid brick only x = 0 / 31 can
-                            // be exposed on an interior row.
-                            x = if uniform.is_some() && !shell_row && x < edge - 1 {
-                                edge - 1
-                            } else {
-                                x + 1
-                            };
-                        }
+/// A hammer swing the client has sent but the server has not yet confirmed. It
+/// is drawn at once on a private copy of the terrain so a carved trench appears
+/// at the crosshair, not a round trip behind it, and dropped when the replica
+/// shows the cut or after [`PENDING_CUT_LIFETIME`] (a refused swing disappears).
+/// The replica itself is never touched, so integrity hashes are unaffected.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingCut {
+    pub cell: GlobalCell,
+    pub radius_cells: i64,
+    pub at: Instant,
+}
+
+/// How long an unconfirmed swing stays drawn.
+const PENDING_CUT_LIFETIME: Duration = Duration::from_millis(800);
+/// Most previews kept at once.
+const MAX_PENDING_CUTS: usize = 64;
+
+/// Drops previews the replica already shows (their centre cell is air in
+/// `volume`) or that have expired, then carves the rest out of `volume`.
+/// Returns the bricks whose boxes must not be cached: every brick a preview
+/// changed and its face neighbours (their buried tests read those faces).
+pub fn apply_pending_cuts(
+    volume: &mut Volume,
+    pending: &mut Vec<PendingCut>,
+    now: Instant,
+) -> std::collections::HashSet<spall_core::BrickCoord> {
+    pending.retain(|p| {
+        now.saturating_duration_since(p.at) < PENDING_CUT_LIFETIME
+            && !matches!(volume.sample(p.cell), Ok(Sample::Empty { .. }))
+    });
+    let mut volatile = std::collections::HashSet::new();
+    for p in pending.iter() {
+        let r = p.radius_cells.clamp(0, HAMMER_RADIUS_MAX);
+        let mut plan = spall_voxel::EditPlan::new(volume.id());
+        for dz in -r..=r {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx * dx + dy * dy + dz * dz > r * r {
+                        continue;
+                    }
+                    let cell = GlobalCell::new(p.cell.x + dx, p.cell.y + dy, p.cell.z + dz);
+                    if matches!(volume.sample(cell), Ok(Sample::Filled(_))) {
+                        plan.set(cell, MaterialId::AIR);
                     }
                 }
             }
         }
+        if let Ok(outcome) = volume.apply_edit(&plan) {
+            for b in &outcome.bricks {
+                volatile.insert(b.coord);
+                for [dx, dy, dz] in BRICK_NEIGHBOURS {
+                    volatile.insert(spall_core::BrickCoord::new(
+                        b.coord.x + dx,
+                        b.coord.y + dy,
+                        b.coord.z + dz,
+                    ));
+                }
+            }
+        }
     }
+    volatile
+}
+
+/// [`build_instances`], reusing the boxes of every brick whose cache key is
+/// unchanged. Boxes are merged within a brick (not across bricks), so a flat
+/// surface costs one box per brick it crosses.
+pub fn build_instances_cached(
+    volume: &Volume,
+    center_m: [f64; 3],
+    cache: &mut TerrainInstanceCache,
+) -> Vec<Instance> {
+    build_instances_volatile(volume, center_m, cache, &std::collections::HashSet::new())
+}
+
+/// [`build_instances_cached`] where bricks in `volatile` neither read nor write
+/// the cache: they are rebuilt from `volume` every time. For a volume that
+/// carries local, unconfirmed edits (see [`PendingCut`]): a revision number
+/// identifies a brick's contents only along the server's history, so boxes
+/// built from a preview must never be stored under it.
+pub fn build_instances_volatile(
+    volume: &Volume,
+    center_m: [f64; 3],
+    cache: &mut TerrainInstanceCache,
+    volatile: &std::collections::HashSet<spall_core::BrickCoord>,
+) -> Vec<Instance> {
+    use std::hash::{Hash, Hasher};
+    let cell_m = f64::from(CELL_M);
+    let (min, max) = view_window(center_m);
+    let (min_brick, _) = min.split();
+    let (max_brick, _) = max.split();
+    let revision = |c: spall_core::BrickCoord| {
+        volume
+            .brick_revision(c)
+            .ok()
+            .flatten()
+            .map_or(0, |r| r.get() + 1)
+    };
+    let mut instances = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    for bz in min_brick.z..=max_brick.z {
+        for by in min_brick.y..=max_brick.y {
+            for bx in min_brick.x..=max_brick.x {
+                let coord = spall_core::BrickCoord::new(bx, by, bz);
+                let own = revision(coord);
+                if own == 0 {
+                    continue; // not resident: nothing to draw, nothing cached
+                }
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                own.hash(&mut hasher);
+                for [dx, dy, dz] in BRICK_NEIGHBOURS {
+                    revision(spall_core::BrickCoord::new(bx + dx, by + dy, bz + dz))
+                        .hash(&mut hasher);
+                }
+                let key = hasher.finish();
+                visited.insert(coord);
+                let is_volatile = volatile.contains(&coord);
+                if !is_volatile
+                    && let Some((cached_key, boxes)) = cache.bricks.get(&coord)
+                    && *cached_key == key
+                {
+                    instances.extend_from_slice(boxes);
+                    continue;
+                }
+                let mut cells = Vec::new();
+                brick_visible_cells(volume, &mut cache.grid, coord, min, max, &mut cells);
+                let boxes: Vec<Instance> = greedy_boxes(cells)
+                    .into_iter()
+                    .map(|(material, bmin, size)| Instance {
+                        offset: [0, 1, 2]
+                            .map(|a| ((bmin[a] as f64 + size[a] as f64 * 0.5) * cell_m) as f32),
+                        material: u32::from(material.0),
+                        size: [0, 1, 2].map(|a| (size[a] as f64 * cell_m) as f32),
+                        _pad: 0.0,
+                        rotation: IDENTITY_ROTATION,
+                    })
+                    .collect();
+                instances.extend_from_slice(&boxes);
+                if is_volatile {
+                    // Forget any entry too: its key may now match a preview.
+                    cache.bricks.remove(&coord);
+                } else {
+                    cache.bricks.insert(coord, (key, boxes));
+                }
+            }
+        }
+    }
+    cache.bricks.retain(|coord, _| visited.contains(coord));
     instances
+}
+
+const BRICK_NEIGHBOURS: [[i64; 3]; 6] = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1],
+];
+
+/// Merges unit cells into as few axis-aligned boxes as a greedy pass finds:
+/// runs along `x`, then runs of equal rows along `z`, then equal slabs along
+/// `y`. Cells merge only with the same key (the material). Returns
+/// `(key, min cell, size in cells)`; every input cell is covered exactly once.
+/// The renderer draws a box as one instance, so a flat or terraced surface
+/// costs a few boxes instead of one cube per cell.
+fn greedy_boxes<K: Ord + Copy>(mut cells: Vec<(K, [i64; 3])>) -> Vec<(K, [i64; 3], [i64; 3])> {
+    cells.sort_unstable_by_key(|&(key, [x, y, z])| (key, y, z, x));
+    // Runs along x: (key, y, z, x0, len).
+    let mut runs: Vec<(K, i64, i64, i64, i64)> = Vec::new();
+    for (key, [x, y, z]) in cells {
+        match runs.last_mut() {
+            Some(run) if run.0 == key && run.1 == y && run.2 == z && run.3 + run.4 == x => {
+                run.4 += 1;
+            }
+            _ => runs.push((key, y, z, x, 1)),
+        }
+    }
+    // Equal runs on consecutive rows: (key, y, x0, len, z0, dz).
+    runs.sort_unstable_by_key(|&(key, y, z, x0, len)| (key, y, x0, len, z));
+    let mut rects: Vec<(K, i64, i64, i64, i64, i64)> = Vec::new();
+    for (key, y, z, x0, len) in runs {
+        match rects.last_mut() {
+            Some(r) if (r.0, r.1, r.2, r.3) == (key, y, x0, len) && r.4 + r.5 == z => r.5 += 1,
+            _ => rects.push((key, y, x0, len, z, 1)),
+        }
+    }
+    // Equal rectangles on consecutive layers: (key, min, size).
+    rects.sort_unstable_by_key(|&(key, y, x0, len, z0, dz)| (key, x0, len, z0, dz, y));
+    let mut boxes: Vec<(K, [i64; 3], [i64; 3])> = Vec::new();
+    for (key, y, x0, len, z0, dz) in rects {
+        match boxes.last_mut() {
+            Some((k, min, size))
+                if *k == key
+                    && (min[0], size[0], min[2], size[2]) == (x0, len, z0, dz)
+                    && min[1] + size[1] == y =>
+            {
+                size[1] += 1;
+            }
+            _ => boxes.push((key, [x0, y, z0], [len, 1, dz])),
+        }
+    }
+    boxes
+}
+
+/// Whether the brick at `coord` is resident and one material throughout.
+fn uniform_solid(volume: &Volume, coord: spall_core::BrickCoord) -> bool {
+    matches!(volume.snapshot_brick(coord), Ok(Some(brick))
+        if !brick.is_dense()
+            && brick.get(spall_core::LocalCell::new(0, 0, 0).expect("origin")) != MaterialId::AIR)
+}
+
+/// A uniform solid brick with a uniform solid brick on all six sides has no
+/// exposed cell: its whole shell is buried.
+fn brick_is_interior(volume: &Volume, coord: spall_core::BrickCoord) -> bool {
+    uniform_solid(volume, coord)
+        && [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ]
+        .iter()
+        .all(|[dx, dy, dz]| {
+            uniform_solid(
+                volume,
+                spall_core::BrickCoord::new(coord.x + dx, coord.y + dy, coord.z + dz),
+            )
+        })
+}
+
+/// Every exposed solid cell of `volume` inside the view window around
+/// `center_m`, with its material.
+#[cfg(test)]
+fn visible_cells(volume: &Volume, center_m: [f64; 3]) -> Vec<(MaterialId, [i64; 3])> {
+    let (min, max) = view_window(center_m);
+    let (min_brick, _) = min.split();
+    let (max_brick, _) = max.split();
+    let mut cells = Vec::new();
+    let mut grid = BrickGrid::new();
+    for bz in min_brick.z..=max_brick.z {
+        for by in min_brick.y..=max_brick.y {
+            for bx in min_brick.x..=max_brick.x {
+                let coord = spall_core::BrickCoord::new(bx, by, bz);
+                brick_visible_cells(volume, &mut grid, coord, min, max, &mut cells);
+            }
+        }
+    }
+    cells
+}
+
+/// Appends the exposed solid cells of one brick that lie inside the window
+/// `min..=max`. Uniform air and fully buried uniform rock are skipped outright;
+/// every other brick is scanned from a padded in-memory copy (see
+/// [`BrickGrid`]) rather than six volume lookups per solid cell.
+fn brick_visible_cells(
+    volume: &Volume,
+    grid: &mut BrickGrid,
+    coord: spall_core::BrickCoord,
+    min: GlobalCell,
+    max: GlobalCell,
+    cells: &mut Vec<(MaterialId, [i64; 3])>,
+) {
+    let edge = i64::from(spall_core::BRICK_EDGE);
+    let Ok(Some(brick)) = volume.snapshot_brick(coord) else {
+        return;
+    };
+    if !brick.is_dense()
+        && brick.get(spall_core::LocalCell::new(0, 0, 0).expect("origin")) == MaterialId::AIR
+    {
+        return;
+    }
+    if brick_is_interior(volume, coord) {
+        return;
+    }
+    let base = GlobalCell::new(coord.x * edge, coord.y * edge, coord.z * edge);
+    let lo = [
+        (min.x - base.x).max(0),
+        (min.y - base.y).max(0),
+        (min.z - base.z).max(0),
+    ];
+    let hi = [
+        (max.x - base.x).min(edge - 1),
+        (max.y - base.y).min(edge - 1),
+        (max.z - base.z).min(edge - 1),
+    ];
+    grid.load(volume, coord, &brick);
+    for z in lo[2]..=hi[2] {
+        for y in lo[1]..=hi[1] {
+            for x in lo[0]..=hi[0] {
+                let material = grid.material(x, y, z);
+                if material != 0 && !grid.buried(x, y, z) {
+                    cells.push((MaterialId(material), [base.x + x, base.y + y, base.z + z]));
+                }
+            }
+        }
+    }
+}
+
+/// One brick's materials plus a one-cell solid halo from its six face
+/// neighbours, in plain arrays: a cell's buried test is then six array reads
+/// instead of six `Volume` lookups (a `BTreeMap` walk each).
+struct BrickGrid {
+    /// Material id per cell, `x + 32 * (y + 32 * z)`.
+    materials: Vec<u16>,
+    /// Solid flag over the `34^3` halo box, `(x + 1) + 34 * ((y + 1) + 34 * (z + 1))`.
+    solid: Vec<bool>,
+}
+
+impl BrickGrid {
+    const EDGE: i64 = 32;
+    const PAD: i64 = 34;
+
+    fn new() -> Self {
+        Self {
+            materials: vec![0; 32 * 32 * 32],
+            solid: vec![false; 34 * 34 * 34],
+        }
+    }
+
+    #[inline]
+    fn cell_index(x: i64, y: i64, z: i64) -> usize {
+        (x + Self::EDGE * (y + Self::EDGE * z)) as usize
+    }
+
+    #[inline]
+    fn pad_index(x: i64, y: i64, z: i64) -> usize {
+        ((x + 1) + Self::PAD * ((y + 1) + Self::PAD * (z + 1))) as usize
+    }
+
+    #[inline]
+    fn material(&self, x: i64, y: i64, z: i64) -> u16 {
+        self.materials[Self::cell_index(x, y, z)]
+    }
+
+    /// Whether all six face neighbours are solid. A neighbour in a missing
+    /// brick counts as not solid, exactly like [`is_buried`].
+    #[inline]
+    fn buried(&self, x: i64, y: i64, z: i64) -> bool {
+        let s = |x, y, z| self.solid[Self::pad_index(x, y, z)];
+        s(x + 1, y, z)
+            && s(x - 1, y, z)
+            && s(x, y + 1, z)
+            && s(x, y - 1, z)
+            && s(x, y, z + 1)
+            && s(x, y, z - 1)
+    }
+
+    fn load(
+        &mut self,
+        volume: &Volume,
+        coord: spall_core::BrickCoord,
+        brick: &spall_voxel::BrickSnapshot,
+    ) {
+        use spall_core::LocalCell;
+        let edge = Self::EDGE;
+        if brick.is_dense() {
+            for z in 0..edge {
+                for y in 0..edge {
+                    for x in 0..edge {
+                        let local = LocalCell::new(x as u8, y as u8, z as u8).expect("in-brick");
+                        self.materials[Self::cell_index(x, y, z)] = brick.get(local).0;
+                    }
+                }
+            }
+        } else {
+            let m = brick.get(LocalCell::new(0, 0, 0).expect("origin")).0;
+            self.materials.fill(m);
+        }
+        self.solid.fill(false);
+        for z in 0..edge {
+            for y in 0..edge {
+                for x in 0..edge {
+                    self.solid[Self::pad_index(x, y, z)] =
+                        self.materials[Self::cell_index(x, y, z)] != 0;
+                }
+            }
+        }
+        // Halo faces from the neighbouring bricks' adjacent layers.
+        for [dx, dy, dz] in [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ]
+        .into_iter()
+        {
+            let neighbour = spall_core::BrickCoord::new(coord.x + dx, coord.y + dy, coord.z + dz);
+            let Ok(Some(n)) = volume.snapshot_brick(neighbour) else {
+                continue;
+            };
+            let dense = n.is_dense();
+            let uniform_solid =
+                !dense && n.get(LocalCell::new(0, 0, 0).expect("origin")) != MaterialId::AIR;
+            for a in 0..edge {
+                for b in 0..edge {
+                    // `(a, b)` runs over the two axes in the face; the face axis is fixed.
+                    let (face_halo, face_src) = if dx != 0 {
+                        (
+                            if dx > 0 { edge } else { -1 },
+                            if dx > 0 { 0 } else { edge - 1 },
+                        )
+                    } else if dy != 0 {
+                        (
+                            if dy > 0 { edge } else { -1 },
+                            if dy > 0 { 0 } else { edge - 1 },
+                        )
+                    } else {
+                        (
+                            if dz > 0 { edge } else { -1 },
+                            if dz > 0 { 0 } else { edge - 1 },
+                        )
+                    };
+                    let (hx, hy, hz, sx, sy, sz) = if dx != 0 {
+                        (face_halo, a, b, face_src, a, b)
+                    } else if dy != 0 {
+                        (a, face_halo, b, a, face_src, b)
+                    } else {
+                        (a, b, face_halo, a, b, face_src)
+                    };
+                    let solid = if dense {
+                        n.get(LocalCell::new(sx as u8, sy as u8, sz as u8).expect("face cell"))
+                            != MaterialId::AIR
+                    } else {
+                        uniform_solid
+                    };
+                    self.solid[Self::pad_index(hx, hy, hz)] = solid;
+                }
+            }
+        }
+    }
 }
 
 /// One body as [`BodyWorker`] sees it for a single pass: identity, the
@@ -2392,9 +3174,18 @@ impl PoseStats {
 /// axis aligned, so this gives the cube-only debug renderer true continuous
 /// wire-like strokes without adding a separate line pipeline.
 fn debug_line(a: Vec3, b: Vec3, material: u32) -> impl Iterator<Item = Instance> {
-    const THICKNESS_M: f32 = 0.0125;
+    debug_line_thick(a, b, material, 0.0125)
+}
+
+/// [`debug_line`] with an explicit stroke thickness in metres.
+fn debug_line_thick(
+    a: Vec3,
+    b: Vec3,
+    material: u32,
+    thickness_m: f32,
+) -> impl Iterator<Item = Instance> {
     let delta = (b - a).abs();
-    let mut dimensions = [THICKNESS_M; 3];
+    let mut dimensions = [thickness_m; 3];
     let axis = if delta.x >= delta.y && delta.x >= delta.z {
         0
     } else if delta.y >= delta.z {
@@ -2402,7 +3193,7 @@ fn debug_line(a: Vec3, b: Vec3, material: u32) -> impl Iterator<Item = Instance>
     } else {
         2
     };
-    dimensions[axis] = delta[axis] + THICKNESS_M;
+    dimensions[axis] = delta[axis] + thickness_m;
     let midpoint = (a + b) * 0.5;
     std::iter::once(Instance {
         offset: midpoint.to_array(),
@@ -2466,6 +3257,7 @@ fn build_capsule_debug_instances(feet_m: [f64; 3], material: u32) -> Vec<Instanc
 /// A cell whose six face neighbours are all solid contributes no visible
 /// surface; skipping it keeps the instance count near the visible shell
 /// instead of the whole solid volume.
+#[cfg(test)]
 fn is_buried(volume: &Volume, cell: GlobalCell) -> bool {
     const NEIGHBORS: [[i64; 3]; 6] = [
         [1, 0, 0],
@@ -2487,12 +3279,330 @@ fn is_buried(volume: &Volume, cell: GlobalCell) -> bool {
 const WATER_MATERIAL: spall_render::Material =
     spall_render::Material::new([0.03, 0.16, 0.26], 0.08, 0.0).opacity(0.62);
 
+/// The render table for a manifest, as the interactive window draws it:
+/// [`materials_from_manifest`] plus per-voxel colour variation on every opaque,
+/// non-emissive material, so terrain is not one flat colour per material. The
+/// variation is computed in the shader, client-side and cosmetic only.
+pub fn terrain_render_materials(manifest: &MaterialManifest) -> Vec<spall_render::Material> {
+    let mut table = materials_from_manifest(manifest);
+    for material in &mut table {
+        if material.emissive == 0.0 && material.opacity >= 1.0 {
+            *material = material.jitter(TERRAIN_COLOR_JITTER);
+        }
+    }
+    table
+}
+
+/// Metres a torch's light reaches, and its intensity (colour x intensity).
+const TORCH_RADIUS_M: f32 = 14.0;
+const TORCH_INTENSITY: f32 = 26.0;
+/// Emitters farther than this from the camera are not considered.
+const TORCH_CONSIDER_M: f32 = 60.0;
+
+/// The point lights for the emissive voxels among `instances`: every instance
+/// whose material emits, as a warm light at its centre, the
+/// [`spall_render::MAX_POINT_LIGHTS`] nearest `eye` first. The lighting cache
+/// cannot resolve an emitter smaller than about a metre, so a lone torch voxel
+/// lights its surroundings through these instead.
+pub fn emitter_point_lights(
+    instances: &[Instance],
+    materials: &[spall_render::Material],
+    eye: Vec3,
+) -> Vec<spall_render::PointLight> {
+    let mut found: Vec<(f32, spall_render::PointLight)> = instances
+        .iter()
+        .filter_map(|i| {
+            let m = materials.get(i.material as usize)?;
+            (m.emissive > 0.0).then(|| {
+                let p = Vec3::from_array(i.offset);
+                let peak = m
+                    .base_color
+                    .iter()
+                    .copied()
+                    .fold(f32::MIN, f32::max)
+                    .max(1e-3);
+                (
+                    (p - eye).length_squared(),
+                    spall_render::PointLight {
+                        position: i.offset,
+                        color: m.base_color.map(|c| c / peak * TORCH_INTENSITY),
+                        radius: TORCH_RADIUS_M,
+                    },
+                )
+            })
+        })
+        .filter(|(d2, _)| *d2 <= TORCH_CONSIDER_M * TORCH_CONSIDER_M)
+        .collect();
+    found.sort_by(|a, b| a.0.total_cmp(&b.0));
+    found
+        .into_iter()
+        .take(spall_render::MAX_POINT_LIGHTS)
+        .map(|(_, light)| light)
+        .collect()
+}
+
+/// Per-voxel colour variation of terrain materials: brightness up to about
+/// +-18%, with a smaller per-channel drift (see `Material::jitter`).
+const TERRAIN_COLOR_JITTER: f32 = 0.18;
+
 /// Spectator flight speed, metres per second (`Shift` for the fast one).
 const FLY_SPEED_M_S: f32 = 12.0;
 const FLY_FAST_SPEED_M_S: f32 = 36.0;
 
+/// The hammer: left click sends the game's `DIG` tool along the camera ray
+/// (the server finds the hit cell itself and caps the radius). Holding the
+/// button repeats at this interval.
+const HAMMER_TOOL: u16 = 0;
+const HAMMER_REPEAT: Duration = Duration::from_millis(140);
+/// Radius 0 breaks exactly the struck voxel; 1, 2, 3 break 7, 33, 123 cells.
+const HAMMER_RADIUS_DEFAULT: i64 = 2;
+/// The game's `DIG` tool reach (`sandbox::game::tool_catalog`): past this the
+/// server refuses the swing, so the crosshair shows no target.
+const HAMMER_REACH_M: f64 = 12.0;
+/// Stroke thickness of the target outline: a tenth of a voxel, visible at range.
+const HAMMER_STROKE_M: f32 = 0.025;
+const HAMMER_RADIUS_MAX: i64 = 8;
+/// Request ids for window-fired tools start here, clear of the scripted (low)
+/// and review-cut (`1_000_000 + n`) ranges.
+const HAMMER_REQUEST_BASE: u64 = 2_000_000;
+
+/// The torch: the game's `PLACE_LAMP` tool, bound to `T`. It places a small
+/// emissive lamp ball against the surface under the crosshair.
+const TORCH_TOOL: u16 = 4;
+/// Radius in cells: 0 = exactly one voxel, so a torch fits in a crack and does
+/// not fill the hole it lights.
+pub const TORCH_RADIUS_CELLS: i64 = 0;
+
+/// The `Cut` a hammer swing sends: aimed from the eye along the view. The
+/// claimed brush centre is ignored by the server (it uses its own hit cell);
+/// only the radius is kept, after the tool's cap.
+pub fn hammer_request(
+    id: u64,
+    eye: Vec3,
+    dir: Vec3,
+    radius_cells: i64,
+) -> spall_protocol::ActionRequest {
+    tool_request(
+        id,
+        HAMMER_TOOL,
+        spall_protocol::ActionKind::Cut,
+        eye,
+        dir,
+        radius_cells,
+    )
+}
+
+/// The `Place` a torch sends: aimed like a swing; the server places the lamp
+/// in the empty cell against the struck face.
+pub fn torch_request(id: u64, eye: Vec3, dir: Vec3) -> spall_protocol::ActionRequest {
+    tool_request(
+        id,
+        TORCH_TOOL,
+        spall_protocol::ActionKind::Place,
+        eye,
+        dir,
+        TORCH_RADIUS_CELLS,
+    )
+}
+
+/// An aimed tool use: the game tool `tool`, `action`, from `eye` along `dir`.
+fn tool_request(
+    id: u64,
+    tool: u16,
+    action: spall_protocol::ActionKind,
+    eye: Vec3,
+    dir: Vec3,
+    radius_cells: i64,
+) -> spall_protocol::ActionRequest {
+    use spall_core::units::{BRUSH_UNIT, BrushPoint};
+    use spall_protocol::{ActionRequest, ClaimedTarget, InputSeq, RequestId};
+    let brush = spall_core::SphereBrush::new(
+        BrushPoint::from_units(0, 0, 0),
+        radius_cells.clamp(0, HAMMER_RADIUS_MAX) * BRUSH_UNIT,
+    )
+    .expect("hammer radius is within brush limits");
+    ActionRequest {
+        request_id: RequestId(id),
+        input_seq: InputSeq(id),
+        action,
+        tool,
+        aim_origin_m: [f64::from(eye.x), f64::from(eye.y), f64::from(eye.z)],
+        aim_dir: [dir.x, dir.y, dir.z],
+        claimed_target: ClaimedTarget::Terrain,
+        claimed_brush: brush,
+    }
+}
+
+/// The solid cell the camera ray meets within the hammer's reach, and its
+/// material, found in the client's own replica of the terrain. The server does
+/// the authoritative version of this from the same eye and direction.
+fn cast_hammer_ray(volume: &Volume, eye: Vec3, dir: Vec3) -> Option<(GlobalCell, MaterialId)> {
+    use spall_voxel::query::{Ray, RayConfig, RayOutcome, cast_ray};
+    let cell_m = f64::from(CELL_M);
+    let origin = glam::DVec3::new(f64::from(eye.x), f64::from(eye.y), f64::from(eye.z)) / cell_m;
+    let heading = glam::DVec3::new(f64::from(dir.x), f64::from(dir.y), f64::from(dir.z));
+    match cast_ray(
+        volume,
+        Ray::new(origin, heading),
+        RayConfig::new(HAMMER_REACH_M / cell_m),
+    ) {
+        Ok(RayOutcome::Hit(hit)) => Some((hit.cell, hit.material)),
+        _ => None,
+    }
+}
+
+/// Wireframe of the cells a swing at `cell` with `radius_cells` can remove: the
+/// sphere's bounding box (one voxel at radius 0), as thin strokes.
+fn hammer_outline(cell: GlobalCell, radius_cells: i64, material: u32) -> Vec<Instance> {
+    let cell_m = CELL_M;
+    let lo = Vec3::new(
+        (cell.x - radius_cells) as f32,
+        (cell.y - radius_cells) as f32,
+        (cell.z - radius_cells) as f32,
+    ) * cell_m;
+    let hi = Vec3::new(
+        (cell.x + radius_cells + 1) as f32,
+        (cell.y + radius_cells + 1) as f32,
+        (cell.z + radius_cells + 1) as f32,
+    ) * cell_m;
+    let corner = |x: bool, y: bool, z: bool| {
+        Vec3::new(
+            if x { hi.x } else { lo.x },
+            if y { hi.y } else { lo.y },
+            if z { hi.z } else { lo.z },
+        )
+    };
+    let mut out = Vec::with_capacity(12);
+    for y in [false, true] {
+        for z in [false, true] {
+            out.extend(debug_line_thick(
+                corner(false, y, z),
+                corner(true, y, z),
+                material,
+                HAMMER_STROKE_M,
+            ));
+        }
+    }
+    for x in [false, true] {
+        for z in [false, true] {
+            out.extend(debug_line_thick(
+                corner(x, false, z),
+                corner(x, true, z),
+                material,
+                HAMMER_STROKE_M,
+            ));
+        }
+    }
+    for x in [false, true] {
+        for y in [false, true] {
+            out.extend(debug_line_thick(
+                corner(x, y, false),
+                corner(x, y, true),
+                material,
+                HAMMER_STROKE_M,
+            ));
+        }
+    }
+    out
+}
+
+/// What the crosshair shows: whether the hammer has a target in reach, and a
+/// one-line label (radius and what is being hit).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct CrosshairView {
+    pub in_reach: bool,
+    pub label: String,
+}
+
+/// Whether a swing is due: a fresh click always is; a held button repeats
+/// once [`HAMMER_REPEAT`] has passed since the last one.
+fn hammer_due(pending: bool, held: bool, last: Option<Instant>, now: Instant) -> bool {
+    pending || (held && last.is_none_or(|at| now.saturating_duration_since(at) >= HAMMER_REPEAT))
+}
+
 /// Water under this fraction of a cell is not drawn (thin films and spray).
 const WATER_DRAW_MIN: u8 = 6;
+
+/// Merges the water columns of a keyframe (all one cell wide, same-height runs
+/// side by side) into as few boxes as possible and assigns the water material:
+/// a flat lake is a handful of boxes, not one per fluid column.
+fn merge_water_columns(columns: &[Instance], material: u32) -> Vec<Instance> {
+    let mut cells = Vec::with_capacity(columns.len());
+    for c in columns {
+        let cell = c.size[0];
+        if cell <= 0.0 {
+            continue;
+        }
+        let ix = (c.offset[0] / cell - 0.5).round() as i64;
+        let iz = (c.offset[2] / cell - 0.5).round() as i64;
+        let bottom = c.offset[1] - c.size[1] * 0.5;
+        // Columns merge only if cell size, bottom and height all agree (0.1 mm).
+        let key = (
+            cell.to_bits(),
+            (f64::from(bottom) * 1e4).round() as i64,
+            (f64::from(c.size[1]) * 1e4).round() as i64,
+        );
+        cells.push((key, [ix, 0, iz]));
+    }
+    greedy_boxes(cells)
+        .into_iter()
+        .map(|((cell_bits, bottom_q, height_q), min, size)| {
+            let cell = f64::from(f32::from_bits(cell_bits));
+            let height = height_q as f64 / 1e4;
+            let bottom = bottom_q as f64 / 1e4;
+            Instance {
+                offset: [
+                    ((min[0] as f64 + size[0] as f64 * 0.5) * cell) as f32,
+                    (bottom + height * 0.5) as f32,
+                    ((min[2] as f64 + size[2] as f64 * 0.5) * cell) as f32,
+                ],
+                material,
+                size: [
+                    (size[0] as f64 * cell) as f32,
+                    height as f32,
+                    (size[2] as f64 * cell) as f32,
+                ],
+                _pad: 0.0,
+                rotation: IDENTITY_ROTATION,
+            }
+        })
+        .collect()
+}
+
+/// Appends each box clipped to the terrain view window around `center_m`
+/// (the same extent [`build_instances`] draws); boxes outside it are dropped.
+fn clip_water_to_window(boxes: &[Instance], center_m: [f64; 3], out: &mut Vec<Instance>) {
+    let below = [
+        f64::from(VIEW_RADIUS_M),
+        f64::from(VIEW_HEIGHT_DOWN_M),
+        f64::from(VIEW_RADIUS_M),
+    ];
+    let above = [
+        f64::from(VIEW_RADIUS_M),
+        f64::from(VIEW_HEIGHT_UP_M),
+        f64::from(VIEW_RADIUS_M),
+    ];
+    for b in boxes {
+        let mut offset = b.offset;
+        let mut size = b.size;
+        let mut visible = true;
+        for a in 0..3 {
+            let lo =
+                (f64::from(b.offset[a]) - f64::from(b.size[a]) * 0.5).max(center_m[a] - below[a]);
+            let hi =
+                (f64::from(b.offset[a]) + f64::from(b.size[a]) * 0.5).min(center_m[a] + above[a]);
+            if hi <= lo {
+                visible = false;
+                break;
+            }
+            offset[a] = ((lo + hi) * 0.5) as f32;
+            size[a] = (hi - lo) as f32;
+        }
+        if visible {
+            out.push(Instance { offset, size, ..*b });
+        }
+    }
+}
 
 /// Translucent water columns for one replicated keyframe: each vertical run
 /// of wet fluid cells becomes one box as tall as the run's summed fractions,
@@ -2590,6 +3700,35 @@ fn admin_menu_view(
     }
 }
 
+/// A plus at the centre of the screen, white with a target in reach and red
+/// without, and the hammer label just under it.
+fn draw_crosshair(view: &CrosshairView) {
+    let color = if view.in_reach {
+        yakui::Color::rgb(255, 255, 255)
+    } else {
+        yakui::Color::rgb(255, 90, 80)
+    };
+    yakui::align(yakui::Alignment::CENTER, || {
+        yakui::stack(|| {
+            yakui::align(yakui::Alignment::CENTER, || {
+                yakui::colored_box(color, yakui::Vec2::new(18.0, 2.0));
+            });
+            yakui::align(yakui::Alignment::CENTER, || {
+                yakui::colored_box(color, yakui::Vec2::new(2.0, 18.0));
+            });
+        });
+    });
+    yakui::align(yakui::Alignment::BOTTOM_CENTER, || {
+        yakui::pad(yakui::widgets::Pad::all(28.0), || {
+            yakui::colored_box_container(PANEL_BG.with_alpha(0.55), || {
+                yakui::pad(yakui::widgets::Pad::balanced(10.0, 4.0), || {
+                    yakui::text(13.0, view.label.clone());
+                });
+            });
+        });
+    });
+}
+
 /// Background of HUD panels.
 const PANEL_BG: yakui::Color = yakui::Color::rgb(16, 20, 28);
 const PANEL_ACCENT: yakui::Color = yakui::Color::rgb(120, 190, 255);
@@ -2599,6 +3738,12 @@ const PANEL_MUTED: yakui::Color = yakui::Color::rgb(160, 170, 185);
 const KEYBINDS: &[(&str, &str)] = &[
     ("W A S D", "Walk / fly"),
     ("Mouse", "Look (left click captures the cursor)"),
+    (
+        "Left click",
+        "Hammer: break voxels where you aim (hold to repeat)",
+    ),
+    ("T", "Torch: place a light where you aim"),
+    ("Wheel", "Hammer radius 0-8 cells (0 = one voxel)"),
     ("Space", "Jump (walking) / rise (flying)"),
     ("Ctrl", "Descend (flying)"),
     ("Shift", "Fly faster"),
@@ -3003,6 +4148,12 @@ pub(super) struct WorldRenderer {
     /// Reserved material and instances used only by the ENG-103 inspection
     /// viewer; the normal game material table remains opaque.
     debug_water_material: u32,
+    /// Water as merged boxes, unclipped; the per-frame draw list in
+    /// `debug_water_instances` is this clipped to the terrain window.
+    /// The hammer crosshair and its label; `None` hides it (cursor not captured).
+    crosshair: Option<CrosshairView>,
+    debug_water_source: Vec<Instance>,
+    water_window: Option<[f64; 3]>,
     debug_water_instances: Vec<Instance>,
     /// `F4` cycles this through the renderer's debug views.
     debug_view: DebugView,
@@ -3206,12 +4357,29 @@ pub(super) enum AcquireOutcome {
 impl WorldRenderer {
     /// Queue translucent cells for the local fluid inspection view.
     pub(super) fn set_debug_water(&mut self, instances: &[Instance]) {
+        self.debug_water_source = merge_water_columns(instances, self.debug_water_material);
+    }
+
+    pub(super) fn set_crosshair(&mut self, view: Option<CrosshairView>) {
+        self.crosshair = view;
+    }
+
+    /// Centre of the terrain window water is drawn in, or `None` before any
+    /// terrain has landed (then no water is drawn: it would float in the sky).
+    pub(super) fn set_water_window(&mut self, center_m: Option<[f64; 3]>) {
+        self.water_window = center_m;
+    }
+
+    /// Rebuilds the draw list: the water boxes clipped to the terrain window.
+    fn clip_water(&mut self) {
         self.debug_water_instances.clear();
-        self.debug_water_instances
-            .extend(instances.iter().copied().map(|mut instance| {
-                instance.material = self.debug_water_material;
-                instance
-            }));
+        if let Some(center) = self.water_window {
+            clip_water_to_window(
+                &self.debug_water_source,
+                center,
+                &mut self.debug_water_instances,
+            );
+        }
     }
 
     pub(super) fn new(
@@ -3329,6 +4497,9 @@ impl WorldRenderer {
             surface_config,
             scene,
             debug_water_material,
+            crosshair: None,
+            debug_water_source: Vec::new(),
+            water_window: None,
             debug_water_instances: Vec::new(),
             debug_view: DebugView::Shaded,
             aspect,
@@ -3601,6 +4772,7 @@ impl WorldRenderer {
         self.scene
             .set_body_meshes(&self.device, &self.queue, body_meshes, live_body_meshes)
             .map_err(|error| ClientError::Render(error.to_string()))?;
+        self.clip_water();
         if let Some((eye, _)) = cam {
             self.debug_water_instances.sort_by(|a, b| {
                 let distance2 = |cube: &Instance| {
@@ -3699,6 +4871,9 @@ impl WorldRenderer {
                 });
             });
         }
+        if let Some(crosshair) = &self.crosshair {
+            draw_crosshair(crosshair);
+        }
         self.yakui.finish();
         if let Some(preset) = selected_environment {
             self.environment = preset.environment();
@@ -3776,7 +4951,8 @@ mod input_tests {
         let center = [1.0, 1.0, 1.0];
         let mut cache = TerrainMeshCache::default();
         let started = Instant::now();
-        let (initial, _) = update_terrain_mesh_cache(&volume, center, &mut cache);
+        let (initial, _) =
+            update_terrain_mesh_cache(&volume, center, &mut cache, &Default::default());
         let initial_elapsed = started.elapsed();
         assert_eq!(initial.len(), 1);
 
@@ -3784,7 +4960,8 @@ mod input_tests {
         edit.set(GlobalCell::new(0, 0, 0), MaterialId::AIR);
         volume.apply_edit(&edit).expect("fixture edit should apply");
         let started = Instant::now();
-        let (changed, _) = update_terrain_mesh_cache(&volume, center, &mut cache);
+        let (changed, _) =
+            update_terrain_mesh_cache(&volume, center, &mut cache, &Default::default());
         let edit_to_mesh = started.elapsed();
         assert_eq!(changed.len(), 1, "only the edited brick should be rebuilt");
         eprintln!(
@@ -3960,6 +5137,382 @@ mod perf_probe {
     use crate::replica::{ReplicaConfig, ReplicaWorld};
     use spall_core::VolumeId;
 
+    /// The padded-array walk must agree with the per-cell `Volume` scan across
+    /// brick boundaries and on missing neighbours: random holes in dense bricks,
+    /// uniform rock and air bricks, and absent bricks at the edges.
+    #[test]
+    fn padded_walk_matches_the_per_cell_scan_on_a_random_volume() {
+        use spall_core::{BrickCoord, LocalCell, VolumeId};
+        use spall_voxel::brick::Brick;
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), spall_core::CellSizeCode::Quarter);
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for bz in 0..3 {
+            for by in 0..3 {
+                for bx in 0..3 {
+                    let coord = BrickCoord::new(bx, by, bz);
+                    match next() % 6 {
+                        0 => {} // absent
+                        1 => volume
+                            .insert_brick(
+                                coord,
+                                Brick::uniform(MaterialId::AIR, spall_core::Revision::ZERO),
+                            )
+                            .unwrap(),
+                        2 | 3 => volume
+                            .insert_brick(
+                                coord,
+                                Brick::uniform(MaterialId(2), spall_core::Revision::ZERO),
+                            )
+                            .unwrap(),
+                        _ => {
+                            let mut brick =
+                                Brick::uniform(MaterialId(3), spall_core::Revision::ZERO);
+                            for _ in 0..4000 {
+                                let r = next();
+                                let local = LocalCell::new(
+                                    (r % 32) as u8,
+                                    ((r >> 8) % 32) as u8,
+                                    ((r >> 16) % 32) as u8,
+                                )
+                                .unwrap();
+                                brick.set_cell(
+                                    local,
+                                    if r >> 30 & 1 == 0 {
+                                        MaterialId::AIR
+                                    } else {
+                                        MaterialId(4)
+                                    },
+                                );
+                            }
+                            volume.insert_brick(coord, brick).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+        let mut fast: Vec<_> = visible_cells(&volume, [12.0, 12.0, 12.0])
+            .into_iter()
+            .map(|(m, c)| (c, m.0))
+            .collect();
+        let mut slow = Vec::new();
+        for z in 0..96 {
+            for y in 0..96 {
+                for x in 0..96 {
+                    let cell = GlobalCell::new(x, y, z);
+                    if let Ok(Sample::Filled(m)) = volume.sample(cell)
+                        && !is_buried(&volume, cell)
+                    {
+                        slow.push(([x, y, z], m.0));
+                    }
+                }
+            }
+        }
+        fast.sort_unstable();
+        slow.sort_unstable();
+        assert!(
+            slow.len() > 5000,
+            "a real test needs exposed cells: {}",
+            slow.len()
+        );
+        assert_eq!(fast, slow);
+    }
+
+    fn water_column(ix: i64, iz: i64, bottom: f32, height: f32) -> Instance {
+        let cell = 0.5_f32;
+        Instance {
+            offset: [
+                (ix as f32 + 0.5) * cell,
+                bottom + height * 0.5,
+                (iz as f32 + 0.5) * cell,
+            ],
+            material: 0,
+            size: [cell, height, cell],
+            _pad: 0.0,
+            rotation: IDENTITY_ROTATION,
+        }
+    }
+
+    fn volume_of(boxes: &[Instance]) -> f64 {
+        boxes
+            .iter()
+            .map(|b| f64::from(b.size[0]) * f64::from(b.size[1]) * f64::from(b.size[2]))
+            .sum()
+    }
+
+    #[test]
+    fn a_flat_lake_merges_to_a_few_boxes_and_keeps_its_volume() {
+        let mut columns = Vec::new();
+        for iz in 0..200 {
+            for ix in 0..300 {
+                if (ix, iz) != (5, 5) {
+                    columns.push(water_column(ix, iz, 10.0, 0.5));
+                }
+            }
+        }
+        columns.push(water_column(5, 5, 10.0, 0.25)); // a shallower column
+        let merged = merge_water_columns(&columns, 77);
+        assert!(merged.len() <= 6, "{} boxes", merged.len());
+        assert!(merged.iter().all(|b| b.material == 77));
+        let diff = (volume_of(&columns) - volume_of(&merged)).abs();
+        assert!(diff < 1e-2, "volume changed by {diff}");
+    }
+
+    #[test]
+    fn water_is_clipped_to_the_terrain_window_and_dropped_beyond_it() {
+        let mut columns = Vec::new();
+        for iz in 0..400 {
+            for ix in 0..400 {
+                columns.push(water_column(ix, iz, 10.0, 0.5));
+            }
+        }
+        let lake = merge_water_columns(&columns, 0); // 200 m x 200 m
+        let mut near = Vec::new();
+        clip_water_to_window(&lake, [100.0, 10.0, 100.0], &mut near);
+        assert!(!near.is_empty());
+        for b in &near {
+            for (a, c) in [0, 1, 2].into_iter().zip([100.0, 10.0, 100.0]) {
+                let half = f64::from(if a == 1 {
+                    VIEW_HEIGHT_UP_M
+                } else {
+                    VIEW_RADIUS_M
+                });
+                assert!(f64::from(b.offset[a]) - f64::from(b.size[a]) * 0.5 >= c - half - 1e-3);
+                assert!(f64::from(b.offset[a]) + f64::from(b.size[a]) * 0.5 <= c + half + 1e-3);
+            }
+        }
+        // A window centred far from the lake sees none of it.
+        let mut far = Vec::new();
+        clip_water_to_window(&lake, [900.0, 10.0, 900.0], &mut far);
+        assert!(far.is_empty());
+        // A clipped lake is smaller than the whole lake.
+        assert!(volume_of(&near) < volume_of(&lake) * 0.5);
+    }
+
+    fn sorted(mut v: Vec<Instance>) -> Vec<([u32; 3], [u32; 3], u32)> {
+        let mut out: Vec<_> = v
+            .drain(..)
+            .map(|i| {
+                (
+                    i.offset.map(f32::to_bits),
+                    i.size.map(f32::to_bits),
+                    i.material,
+                )
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// The per-brick cache must give exactly what a fresh build gives, before
+    /// and after an edit, and an edit must invalidate only the brick it touched
+    /// and its face neighbours.
+    #[test]
+    fn the_terrain_cache_matches_a_fresh_build_and_an_edit_invalidates_only_its_bricks() {
+        use spall_core::{BrickCoord, CellSizeCode, VolumeId};
+        use spall_voxel::EditPlan;
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        for bz in 0..4 {
+            for bx in 0..4 {
+                volume
+                    .insert_brick(
+                        BrickCoord::new(bx, 0, bz),
+                        spall_voxel::brick::Brick::uniform(
+                            MaterialId(1),
+                            spall_core::Revision::ZERO,
+                        ),
+                    )
+                    .unwrap();
+                volume
+                    .insert_brick(
+                        BrickCoord::new(bx, 1, bz),
+                        spall_voxel::brick::Brick::uniform(
+                            MaterialId::AIR,
+                            spall_core::Revision::ZERO,
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+        let center = [16.0, 8.0, 16.0];
+        let mut cache = TerrainInstanceCache::new();
+        let first = build_instances_cached(&volume, center, &mut cache);
+        assert_eq!(sorted(first), sorted(build_instances(&volume, center)));
+        let keys_before: std::collections::HashMap<_, _> =
+            cache.bricks.iter().map(|(c, (k, _))| (*c, *k)).collect();
+        assert!(!keys_before.is_empty());
+
+        // Dig a pit in the middle of brick (2, 0, 2)'s top face.
+        let mut plan = EditPlan::new(volume.id());
+        for dz in 0..3 {
+            for dx in 0..3 {
+                plan.set(GlobalCell::new(70 + dx, 31, 70 + dz), MaterialId::AIR);
+            }
+        }
+        volume.apply_edit(&plan).expect("dig");
+        let second = build_instances_cached(&volume, center, &mut cache);
+        assert_eq!(sorted(second), sorted(build_instances(&volume, center)));
+        let changed: Vec<_> = cache
+            .bricks
+            .iter()
+            .filter(|(c, (k, _))| keys_before.get(*c) != Some(k))
+            .map(|(c, _)| *c)
+            .collect();
+        assert!(!changed.is_empty(), "the edit must be seen");
+        // The edited brick and at most its six face neighbours.
+        assert!(changed.len() <= 7, "{changed:?}");
+        assert!(changed.contains(&BrickCoord::new(2, 0, 2)));
+        assert_eq!(
+            cache.len(),
+            keys_before.len(),
+            "no brick appeared or vanished"
+        );
+    }
+
+    #[test]
+    fn hammer_request_aims_along_the_view_and_clamps_the_radius() {
+        let r = hammer_request(
+            2_000_005,
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(0.0, -0.6, 0.8),
+            99,
+        );
+        assert_eq!(r.request_id.0, 2_000_005);
+        assert_eq!(r.tool, HAMMER_TOOL);
+        assert_eq!(r.action, spall_protocol::ActionKind::Cut);
+        assert_eq!(r.claimed_target, spall_protocol::ClaimedTarget::Terrain);
+        assert_eq!(r.aim_origin_m, [1.0, 2.0, 3.0]);
+        assert_eq!(r.aim_dir, [0.0, -0.6, 0.8]);
+        assert_eq!(
+            r.claimed_brush.radius_units(),
+            HAMMER_RADIUS_MAX * spall_core::units::BRUSH_UNIT
+        );
+        let single = hammer_request(1, Vec3::ZERO, Vec3::Z, 0);
+        assert_eq!(
+            single.claimed_brush.radius_units(),
+            0,
+            "radius 0 breaks one voxel"
+        );
+        let below = hammer_request(1, Vec3::ZERO, Vec3::Z, -5);
+        assert_eq!(below.claimed_brush.radius_units(), 0);
+    }
+
+    /// A 32x32x32-cell stone block whose top face is at cell y = 32 (8 m), under
+    /// three bricks of air.
+    fn stone_block() -> Volume {
+        use spall_core::{BrickCoord, VolumeId};
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), spall_core::CellSizeCode::Quarter);
+        volume
+            .insert_brick(
+                BrickCoord::new(0, 0, 0),
+                spall_voxel::brick::Brick::uniform(MaterialId(1), spall_core::Revision::ZERO),
+            )
+            .unwrap();
+        // Resident air above, so a ray never crosses an unloaded brick.
+        for by in 1..=3 {
+            volume
+                .insert_brick(
+                    BrickCoord::new(0, by, 0),
+                    spall_voxel::brick::Brick::uniform(MaterialId::AIR, spall_core::Revision::ZERO),
+                )
+                .unwrap();
+        }
+        volume
+    }
+
+    #[test]
+    fn the_crosshair_ray_finds_the_struck_cell_within_reach_only() {
+        let volume = stone_block();
+        // 1 m above the block's top face (y = 8 m), looking straight down at x=z=4.1 m.
+        let hit = cast_hammer_ray(&volume, Vec3::new(4.1, 9.0, 4.1), Vec3::NEG_Y);
+        assert_eq!(hit, Some((GlobalCell::new(16, 31, 16), MaterialId(1))));
+        // Looking up or sideways into open air: nothing.
+        assert_eq!(
+            cast_hammer_ray(&volume, Vec3::new(4.1, 9.0, 4.1), Vec3::Y),
+            None
+        );
+        // Beyond the 12 m reach of the dig tool: no target, matching the server.
+        assert_eq!(
+            cast_hammer_ray(&volume, Vec3::new(4.1, 8.0 + 13.0, 4.1), Vec3::NEG_Y),
+            None
+        );
+        // Just inside reach still hits.
+        assert!(cast_hammer_ray(&volume, Vec3::new(4.1, 8.0 + 11.0, 4.1), Vec3::NEG_Y).is_some());
+    }
+
+    #[test]
+    fn the_hammer_outline_is_a_twelve_edge_box_of_the_brush_extent() {
+        // Strokes are `HAMMER_STROKE_M` thick and overhang the box by up to that.
+        const STROKE: f32 = HAMMER_STROKE_M + 0.0001;
+        let cell = GlobalCell::new(10, 20, 30);
+        for radius in [0, 2, 8] {
+            let edges = hammer_outline(cell, radius, 9);
+            assert_eq!(edges.len(), 12, "radius {radius}");
+            assert!(edges.iter().all(|e| e.material == 9));
+            // Every stroke lies within the brush's bounding box (plus stroke width).
+            let lo = Vec3::new(
+                (10 - radius) as f32,
+                (20 - radius) as f32,
+                (30 - radius) as f32,
+            ) * CELL_M;
+            let hi = Vec3::new(
+                (11 + radius) as f32,
+                (21 + radius) as f32,
+                (31 + radius) as f32,
+            ) * CELL_M;
+            for e in &edges {
+                for a in 0..3 {
+                    let half = e.size[a] * 0.5;
+                    assert!(
+                        e.offset[a] - half >= lo[a] - STROKE,
+                        "radius {radius} axis {a}"
+                    );
+                    assert!(
+                        e.offset[a] + half <= hi[a] + STROKE,
+                        "radius {radius} axis {a}"
+                    );
+                }
+            }
+            // The strokes together span the whole box on every axis.
+            for a in 0..3 {
+                let min = edges
+                    .iter()
+                    .map(|e| e.offset[a] - e.size[a] * 0.5)
+                    .fold(f32::MAX, f32::min);
+                let max = edges
+                    .iter()
+                    .map(|e| e.offset[a] + e.size[a] * 0.5)
+                    .fold(f32::MIN, f32::max);
+                assert!((min - lo[a]).abs() <= STROKE && (max - hi[a]).abs() <= STROKE);
+            }
+        }
+    }
+
+    #[test]
+    fn hammer_swings_on_click_then_repeats_only_while_held() {
+        let t0 = Instant::now();
+        assert!(!hammer_due(false, false, None, t0));
+        assert!(
+            hammer_due(true, false, None, t0),
+            "a fresh click always swings"
+        );
+        assert!(
+            hammer_due(false, true, None, t0),
+            "held with no swing yet swings"
+        );
+        assert!(!hammer_due(false, true, Some(t0), t0 + HAMMER_REPEAT / 2));
+        assert!(hammer_due(false, true, Some(t0), t0 + HAMMER_REPEAT));
+        assert!(
+            !hammer_due(false, false, Some(t0), t0 + HAMMER_REPEAT * 4),
+            "released: no repeat"
+        );
+    }
+
     #[test]
     fn build_instances_timing_walk_arena() {
         let volume = spall_voxel::fixtures::walk_arena(VolumeId::new(1).unwrap());
@@ -3979,15 +5532,19 @@ mod perf_probe {
     fn brick_walk_matches_per_cell_scan() {
         let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
         let center = [2.0, 13.5, 2.0];
-        let mut fast: Vec<_> = build_instances(&volume, center)
-            .into_iter()
-            .map(|i| (i.offset.map(f32::to_bits), i.material))
-            .collect();
         let cell_m = f64::from(CELL_M);
-        let c = center.map(|v| (v / cell_m).floor() as i64);
-        let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
-        let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
-        let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
+        let mut fast: Vec<_> = visible_cells(&volume, center)
+            .into_iter()
+            .map(|(m, c)| {
+                (
+                    c.map(|v| ((v as f64 + 0.5) * cell_m) as f32)
+                        .map(f32::to_bits),
+                    u32::from(m.0),
+                )
+            })
+            .collect();
+        // The draw window is whole bricks (see `view_window`).
+        let (window_min, window_max) = view_window(center);
         let mut slow = Vec::new();
         for coord in volume.resident_brick_coords() {
             let edge = i64::from(spall_core::BRICK_EDGE);
@@ -3999,10 +5556,9 @@ mod perf_probe {
                             coord.y * edge + y,
                             coord.z * edge + z,
                         );
-                        let inside = (cell.x - c[0]).abs() <= horiz
-                            && (cell.z - c[2]).abs() <= horiz
-                            && cell.y >= c[1] - down
-                            && cell.y <= c[1] + up;
+                        let inside = (window_min.x..=window_max.x).contains(&cell.x)
+                            && (window_min.y..=window_max.y).contains(&cell.y)
+                            && (window_min.z..=window_max.z).contains(&cell.z);
                         if !inside {
                             continue;
                         }
@@ -4021,6 +5577,203 @@ mod perf_probe {
         slow.sort_unstable();
         assert!(!slow.is_empty());
         assert_eq!(fast, slow);
+    }
+
+    /// An unconfirmed swing carves a private copy at once, never enters the
+    /// cache, and is dropped once the volume shows the cut or it expires.
+    #[test]
+    fn pending_cut_previews_without_poisoning_the_cache() {
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+        let center = [2.0, 13.5, 2.0];
+        let (cell, _) = visible_cells(&volume, center)
+            .into_iter()
+            .map(|(m, c)| (GlobalCell::new(c[0], c[1], c[2]), m))
+            .next()
+            .expect("the fixture has terrain");
+        let mut cache = TerrainInstanceCache::new();
+        let base = build_instances_cached(&volume, center, &mut cache);
+
+        let now = Instant::now();
+        let mut preview = volume.clone();
+        let mut pending = vec![PendingCut {
+            cell,
+            radius_cells: 1,
+            at: now,
+        }];
+        let volatile = apply_pending_cuts(&mut preview, &mut pending, now);
+        assert!(!volatile.is_empty());
+        assert!(matches!(preview.sample(cell), Ok(Sample::Empty { .. })));
+        assert!(
+            matches!(volume.sample(cell), Ok(Sample::Filled(_))),
+            "the original is untouched"
+        );
+        let carved = build_instances_volatile(&preview, center, &mut cache, &volatile);
+        assert_ne!(
+            carved.len(),
+            base.len(),
+            "the preview changes what is drawn"
+        );
+
+        // Nothing from the preview leaked into the cache: the real volume still
+        // draws exactly what it did before.
+        let mut again = build_instances_cached(&volume, center, &mut cache);
+        let mut base_sorted = base.clone();
+        let key = |i: &Instance| (i.offset.map(f32::to_bits), i.material);
+        again.sort_by_key(key);
+        base_sorted.sort_by_key(key);
+        assert_eq!(again, base_sorted);
+
+        // Confirmed (the volume already shows it) or expired previews are dropped.
+        let mut confirmed = vec![PendingCut {
+            cell,
+            radius_cells: 1,
+            at: now,
+        }];
+        apply_pending_cuts(&mut preview.clone(), &mut confirmed, now);
+        assert!(confirmed.is_empty());
+        let mut stale = vec![PendingCut {
+            cell,
+            radius_cells: 1,
+            at: now,
+        }];
+        apply_pending_cuts(&mut volume.clone(), &mut stale, now + PENDING_CUT_LIFETIME);
+        assert!(stale.is_empty());
+    }
+
+    /// The live terrain path: an unconfirmed swing re-meshes only its bricks, is
+    /// never remembered by the mesh cache, and the real mesh returns once the
+    /// preview is gone.
+    #[test]
+    fn pending_cut_remeshes_without_poisoning_the_mesh_cache() {
+        let volume = spall_voxel::fixtures::g1_full_envelope_scene(VolumeId::new(1).unwrap());
+        let center = [2.0, 13.5, 2.0];
+        let (cell, _) = visible_cells(&volume, center)
+            .into_iter()
+            .map(|(m, c)| (GlobalCell::new(c[0], c[1], c[2]), m))
+            .next()
+            .expect("the fixture has terrain");
+        let none = std::collections::HashSet::new();
+        let mut cache = TerrainMeshCache::default();
+        let (initial, removed) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
+        assert!(!initial.is_empty() && removed.is_empty());
+        let (quiet, _) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
+        assert!(quiet.is_empty(), "nothing changed, nothing re-meshed");
+
+        let now = Instant::now();
+        let mut preview = volume.clone();
+        let mut pending = vec![PendingCut {
+            cell,
+            radius_cells: 1,
+            at: now,
+        }];
+        let volatile = apply_pending_cuts(&mut preview, &mut pending, now);
+        let (carved, _) = update_terrain_mesh_cache(&preview, center, &mut cache, &volatile);
+        assert!(!carved.is_empty(), "the preview changes what is drawn");
+        assert!(
+            carved.len() <= volatile.len(),
+            "only the carved bricks and their neighbours are re-meshed"
+        );
+
+        // The preview is gone: the real bricks come back, identical to before.
+        let (restored, _) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
+        assert!(
+            !restored.is_empty(),
+            "the real meshes replace the preview's"
+        );
+        let by_coord = |updates: &[MeshUpdate<BrickCoord>]| {
+            updates
+                .iter()
+                .map(|(c, v, i)| (c.sort_key(), v.len(), i.clone()))
+                .collect::<Vec<_>>()
+        };
+        let original: Vec<_> = by_coord(&initial)
+            .into_iter()
+            .filter(|(key, _, _)| by_coord(&restored).iter().any(|(k, _, _)| k == key))
+            .collect();
+        assert_eq!(by_coord(&restored), original);
+        let (settled, _) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
+        assert!(settled.is_empty());
+    }
+
+    /// Greedy boxes cover every input cell exactly once, never merge across
+    /// keys, and collapse flat slabs to one box.
+    #[test]
+    fn greedy_boxes_cover_each_cell_once_and_merge_flat_slabs() {
+        // A 6x3x5 slab of key 1, with a key-2 cell and a hole cut in it.
+        let mut cells = Vec::new();
+        for z in 0..5 {
+            for y in 0..3 {
+                for x in 0..6 {
+                    match (x, y, z) {
+                        (2, 1, 2) => cells.push((2u8, [x, y, z])),
+                        (4, 0, 3) => {}
+                        _ => cells.push((1u8, [x, y, z])),
+                    }
+                }
+            }
+        }
+        let mut shuffled = cells.clone();
+        shuffled.reverse();
+        let boxes = greedy_boxes(shuffled);
+        let mut covered = std::collections::BTreeMap::new();
+        for (key, min, size) in &boxes {
+            for z in min[2]..min[2] + size[2] {
+                for y in min[1]..min[1] + size[1] {
+                    for x in min[0]..min[0] + size[0] {
+                        assert!(
+                            covered.insert([x, y, z], *key).is_none(),
+                            "overlap at {x},{y},{z}"
+                        );
+                    }
+                }
+            }
+        }
+        let expected: std::collections::BTreeMap<_, _> =
+            cells.iter().map(|(k, c)| (*c, *k)).collect();
+        assert_eq!(covered, expected);
+        assert!(
+            boxes.len() < cells.len() / 4,
+            "{} boxes for {} cells",
+            boxes.len(),
+            cells.len()
+        );
+
+        let flat: Vec<_> = (0..40)
+            .flat_map(|z| (0..70).map(move |x| (7u8, [x, 3, z])))
+            .collect();
+        assert_eq!(greedy_boxes(flat), vec![(7u8, [0, 3, 0], [70, 1, 40])]);
+        assert!(greedy_boxes(Vec::<(u8, [i64; 3])>::new()).is_empty());
+    }
+
+    /// Skipping buried interior bricks must not change what is drawn: the
+    /// brick walk still equals a per-cell scan (see the test above), and a
+    /// solid block with solid neighbours emits nothing for its interior.
+    #[test]
+    fn interior_bricks_are_skipped_but_the_block_surface_remains() {
+        use spall_core::{BrickCoord, VolumeId};
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), spall_core::CellSizeCode::Quarter);
+        let stone = MaterialId(1);
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    volume
+                        .insert_brick(
+                            BrickCoord::new(x, y, z),
+                            spall_voxel::brick::Brick::uniform(stone, spall_core::Revision::ZERO),
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        assert!(brick_is_interior(&volume, BrickCoord::new(1, 1, 1)));
+        assert!(
+            !brick_is_interior(&volume, BrickCoord::new(0, 1, 1)),
+            "edge brick has a missing neighbour"
+        );
+        // A 96-cell cube's surface is 6 flat faces of 3 x 3 bricks: one box per
+        // brick face (54), not ~55k cubes.
+        let boxes = build_instances(&volume, [12.0, 12.0, 12.0]);
+        assert_eq!(boxes.len(), 54, "{boxes:?}");
     }
 
     #[test]

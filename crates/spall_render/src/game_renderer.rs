@@ -568,6 +568,12 @@ impl GameRenderer {
         self.timer.as_ref().and_then(|timer| timer.latest)
     }
 
+    /// Sets the point lights the following frames are shaded with (the nearest
+    /// [`crate::MAX_POINT_LIGHTS`]; see [`crate::PointLight`]).
+    pub fn set_point_lights(&self, lights: &[crate::PointLight]) {
+        self.pipeline.set_point_lights(lights);
+    }
+
     /// Record shadows, HDR shading and the tone map into `encoder`, writing the
     /// tone-mapped frame to `output` (which must match the size given to
     /// [`Self::new`]/[`Self::resize`]). The host draws its UI afterwards.
@@ -707,7 +713,7 @@ impl GameRenderer {
                 multiview_mask: None,
             });
             if self.terrain_meshes_visible {
-                pass.set_pipeline(self.pipeline.opaque());
+                pass.set_pipeline(self.pipeline.opaque_terrain());
                 pass.set_bind_group(0, &scene_bind, &[]);
                 pass.set_bind_group(1, &self.indirect.display_bind, &[]);
                 pass.set_bind_group(

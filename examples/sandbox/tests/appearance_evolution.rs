@@ -39,6 +39,11 @@ const V4: [u8; 32] = [
     40, 16, 99, 13, 147, 82, 3, 243, 80, 101, 216,
 ];
 
+const V5: [u8; 32] = [
+    225, 233, 220, 161, 175, 206, 205, 226, 66, 255, 247, 91, 214, 189, 2, 234, 84, 46, 156, 244,
+    88, 19, 39, 246, 75, 44, 203, 218, 186, 119, 22, 110,
+];
+
 fn forest() -> &'static Path {
     Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -83,6 +88,11 @@ fn shipped_manifests_are_frozen() {
         "the v3 variants come from the frozen table, never the mutable palette"
     );
     assert_eq!(hash_bytes(&game::manifest_v4_lamp()), V4);
+    assert_eq!(
+        hash_bytes(&game::manifest_v5_terrain()),
+        V5,
+        "the v5 terrain materials (ENG-114) are frozen once shipped"
+    );
 
     // The frozen rows are what the v3 manifest holds, by explicit id.
     let v3 = game::manifest_v3_variants();
@@ -92,9 +102,9 @@ fn shipped_manifests_are_frozen() {
         assert_eq!(variant.id.0, 100 + offset as u16);
         assert_eq!(v3.get(variant.id).unwrap().name, variant.name);
     }
-    // No extensions are committed yet, so the current manifest is v4.
+    // No extensions are committed yet, so the current manifest is v5.
     assert!(appearance::extension_variants().is_empty());
-    assert_eq!(hash_bytes(&game::manifest()), V4);
+    assert_eq!(hash_bytes(&game::manifest()), V5);
 }
 
 #[test]

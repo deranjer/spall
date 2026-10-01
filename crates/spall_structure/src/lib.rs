@@ -46,7 +46,7 @@ pub use graph::{
     AnchorPlane, CancelToken, GlobalComponent, GlobalComponentId, Interrupted, NodeKey,
     ResidencyMode, SearchBudget, SupportGraph,
 };
-pub use label::{BrickLabels, LocalComponent, label_brick};
+pub use label::{BrickLabels, LabelCache, LocalComponent, label_brick};
 pub use split::{CellSpanX, ComponentMembership, ConservationError, ConservationLedger};
 pub use strength::{
     BondFailure, BrokenBond, DamageState, DetachedComponent, STRENGTH_ALGO_VERSION, StrengthParams,

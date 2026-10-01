@@ -136,6 +136,26 @@ impl StructureIndex {
         })
     }
 
+    /// [`Self::build`] reusing `cache` for bricks whose revision it holds. Only
+    /// for the live volume (see [`crate::LabelCache`]).
+    pub fn build_cached(
+        volume: &Volume,
+        anchor: AnchorPlane,
+        residency: ResidencyMode,
+        generation: Generation,
+        topology_epoch: TopologyEpoch,
+        cancel: &CancelToken,
+        cache: &crate::label::LabelCache,
+    ) -> Result<Self, Interrupted> {
+        let graph = SupportGraph::build_cached(volume, anchor, residency, cancel, cache)?;
+        Ok(Self {
+            volume: volume.id(),
+            generation,
+            topology_epoch,
+            graph,
+        })
+    }
+
     pub fn volume(&self) -> VolumeId {
         self.volume
     }

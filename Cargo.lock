@@ -2711,6 +2711,7 @@ dependencies = [
  "spall_store",
  "spall_structure",
  "spall_voxel",
+ "spall_worldgen",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
@@ -3001,6 +3002,7 @@ dependencies = [
  "serde",
  "spall_render",
  "spall_voxel",
+ "spall_worldgen",
  "thiserror 2.0.20",
  "wgpu",
  "winit",
@@ -3174,6 +3176,15 @@ dependencies = [
  "blake3",
  "glam 0.33.6",
  "spall_core",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "spall_worldgen"
+version = "0.1.0"
+dependencies = [
+ "spall_core",
+ "spall_voxel",
  "thiserror 2.0.20",
 ]
 

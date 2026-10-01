@@ -1,0 +1,10 @@
+[package]
+name = "spall_worldgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+spall_core.workspace = true
+spall_voxel.workspace = true
+thiserror.workspace = true

@@ -65,19 +65,19 @@ const WATER_BASIN_MATERIAL: MaterialId = MaterialId(u16::MAX - 5);
 /// [`spall_protocol::AdminCommand::SetDamGate`].
 const DAM_GATE_MARKER_MATERIAL: MaterialId = MaterialId(u16::MAX - 6);
 /// Voxel cells in the fluid domain before coarsening.
-const MAX_SCENE_WATER_CELLS: usize = 4_000_000;
+pub(crate) const MAX_SCENE_WATER_CELLS: usize = 4_000_000;
 /// Scene water is solved on 0.5 m cells (2³ voxels): a valley-sized domain at
 /// voxel resolution is far over the solver's per-tick budget.
-const WATER_COARSEN: u32 = 2;
+pub(crate) const WATER_COARSEN: u32 = 2;
 /// Fixed fluid step on the server's water worker (20 Hz): a valley domain
 /// costs ~15-20 ms per step on 16 threads, and this leaves the host room to
 /// run the server tick and a local client beside it.
-const WATER_STEP_S: f64 = 1.0 / 20.0;
+pub(crate) const WATER_STEP_S: f64 = 1.0 / 20.0;
 /// Open space kept around authored water inside the fluid domain, in voxels:
 /// sideways room to spread, and air above the highest surface.
-const WATER_MARGIN_XZ: i64 = 4;
-const WATER_MARGIN_ABOVE: i64 = 4;
-const WATER_MARGIN_BELOW: i64 = 2;
+pub(crate) const WATER_MARGIN_XZ: i64 = 4;
+pub(crate) const WATER_MARGIN_ABOVE: i64 = 4;
+pub(crate) const WATER_MARGIN_BELOW: i64 = 2;
 const RUNTIME_CELL_M: f32 = 0.25;
 /// Editor translations are stored in metres.
 const MAX_PLAYER_SPAWNS: usize = 4;

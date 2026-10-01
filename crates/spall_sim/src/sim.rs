@@ -159,6 +159,7 @@ impl Simulation {
                     })?,
             );
         }
+        simulation.pipeline.warm_labels(&simulation.world);
         Ok(simulation)
     }
 
@@ -168,7 +169,7 @@ impl Simulation {
     /// `spall_store` — and control-stream sequencing restarts at 1 for the fresh
     /// post-restart session.
     pub fn from_restored(world: SimWorld, tick: Tick) -> Self {
-        Self {
+        let simulation = Self {
             world,
             pipeline: EditPipeline::new(
                 SimulationConfig::DEFAULT_MAX_PENDING_INTENTS,
@@ -182,7 +183,9 @@ impl Simulation {
             // increment 3; recovered simulations do not claim water yet.
             water: None,
             additional_water: Vec::new(),
-        }
+        };
+        simulation.pipeline.warm_labels(&simulation.world);
+        simulation
     }
 
     pub fn world(&self) -> &SimWorld {
@@ -491,25 +494,39 @@ impl Simulation {
             &mut self.next_control_seq,
         )?;
         let mut report = report;
+        // Only a committed change to a terrain brick at or next to a region's
+        // fluid domain can change that region's boundary.
+        let terrain_id = self.world.terrain_volume_id();
+        let edited_terrain_bricks: Vec<spall_core::BrickCoord> = report
+            .committed
+            .iter()
+            .flat_map(|(_, committed)| {
+                committed
+                    .topology
+                    .before
+                    .iter()
+                    .chain(&committed.topology.after)
+                    .filter(|b| b.volume == terrain_id)
+                    .map(|b| b.coord)
+            })
+            .collect();
         if let Some(water) = &mut self.water {
+            let dirty = edited_terrain_bricks
+                .iter()
+                .any(|&b| water.boundary_touched_by(b));
             report.water = Some(
                 water
-                    .tick(
-                        &self.world.terrain().volume,
-                        !report.committed.is_empty(),
-                        f64::from(TICK_DT_S),
-                    )
+                    .tick(&self.world.terrain().volume, dirty, f64::from(TICK_DT_S))
                     .map_err(|error| TickError::Water(error.to_string()))?,
             );
         }
         for water in &mut self.additional_water {
+            let dirty = edited_terrain_bricks
+                .iter()
+                .any(|&b| water.boundary_touched_by(b));
             report.water_regions.push(
                 water
-                    .tick(
-                        &self.world.terrain().volume,
-                        !report.committed.is_empty(),
-                        f64::from(TICK_DT_S),
-                    )
+                    .tick(&self.world.terrain().volume, dirty, f64::from(TICK_DT_S))
                     .map_err(|e| TickError::Water(e.to_string()))?,
             );
         }

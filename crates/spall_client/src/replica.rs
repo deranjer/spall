@@ -980,6 +980,21 @@ impl ReplicaWorld {
         self.volume_hash(self.terrain_id)
     }
 
+    /// Computes and remembers every terrain brick's content hash and solid
+    /// count (each brick memoizes them), so the first transaction's result-hash
+    /// check after a baseline does not hash the whole terrain on the player's
+    /// click. Call once after installing a baseline.
+    pub fn warm_caches(&self) {
+        let Some(volume) = self.volume(self.terrain_id) else {
+            return;
+        };
+        for coord in volume.resident_brick_coords() {
+            if let Ok(Some(brick)) = volume.snapshot_brick(coord) {
+                let _ = (brick.content_hash(), brick.solid_cells());
+            }
+        }
+    }
+
     /// Canonical hash of the terrain bricks that are resident *right now*.
     /// Unlike [`Self::terrain_hash`], this intentionally changes on cache
     /// eviction/reload and is used only to invalidate derived client collision.

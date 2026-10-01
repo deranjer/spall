@@ -37,6 +37,18 @@ pub struct PlayArgs {
     /// editor's Run button launches.
     #[arg(long, conflicts_with = "scene")]
     editor_scene: Option<PathBuf>,
+    /// Play a procedurally generated world: a `spall_worldgen` preset name
+    /// (`showcase`) generated from `--seed`. Conflicts with `--scene` and
+    /// `--editor-scene`.
+    #[arg(long, conflicts_with_all = ["scene", "editor_scene"])]
+    worldgen: Option<String>,
+    /// World seed for `--worldgen`; the same seed always generates the same world.
+    #[arg(long = "seed", default_value_t = 1, requires = "worldgen")]
+    world_seed: u64,
+    /// Arena edge in cells (0.25 m each) for `--worldgen`: a multiple of 32
+    /// from 128 to 4096. Defaults to the preset's 1024 (256 m).
+    #[arg(long, requires = "worldgen")]
+    worldgen_size: Option<u32>,
     /// Lighting environment for the window: studio, daylight, overcast,
     /// sunset or night. Defaults to the environment saved in the
     /// `--editor-scene` file, else daylight.
@@ -91,6 +103,7 @@ pub struct PlayArgs {
 pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskError> {
     let needs_server_baseline = args.late_join
         || args.editor_scene.is_some()
+        || args.worldgen.is_some()
         || matches!(
             args.scene.as_str(),
             "playground" | "play" | "sandbox-playground"
@@ -158,9 +171,18 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         // may reset the world.
         "--allow-admin-commands",
     ]);
-    match &args.editor_scene {
-        Some(path) => server_cmd.arg("--editor-scene").arg(path),
-        None => server_cmd.args(["--scene", &args.scene]),
+    match (&args.editor_scene, &args.worldgen) {
+        (Some(path), _) => server_cmd.arg("--editor-scene").arg(path),
+        (None, Some(preset)) => {
+            server_cmd
+                .args(["--worldgen", preset])
+                .args(["--seed", &args.world_seed.to_string()]);
+            if let Some(size) = args.worldgen_size {
+                server_cmd.args(["--worldgen-size", &size.to_string()]);
+            }
+            &mut server_cmd
+        }
+        (None, None) => server_cmd.args(["--scene", &args.scene]),
     };
     hide_console(&mut server_cmd);
     let mut guard = ChildGuard::default();
@@ -181,9 +203,11 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     eprintln!(
         "xtask play: server listening on {bound} (scene={}, ticks={}); opening the window \
          (WASD to move, mouse to look, Space to jump, Escape releases the cursor)...",
-        args.editor_scene
-            .as_ref()
-            .map_or_else(|| args.scene.clone(), |path| path.display().to_string()),
+        match (&args.editor_scene, &args.worldgen) {
+            (Some(path), _) => path.display().to_string(),
+            (None, Some(preset)) => format!("worldgen:{preset} seed={}", args.world_seed),
+            (None, None) => args.scene.clone(),
+        },
         args.ticks
     );
 

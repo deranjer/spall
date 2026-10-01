@@ -120,7 +120,7 @@ At a tick boundary:
 
 A job token contains world/session generation, volume ID, affected brick revisions, topology epoch, and the exact read dependency set. Meshing includes a one-cell halo with all needed face/edge/corner neighbors for ambient occlusion. Missing-neighbor sentinels have revisions invalidated when data arrives. A stale result is discarded/requeued, including after unload/reload of the same coordinates.
 
-CPU jobs operate outside the tick on immutable data. GPU submission stays on the render owner thread. Network and disk runtimes cannot hold simulation locks or await inside a tick. Separate priority and byte budgets for generation, edits, collision, topology, and visuals prevent background work starving player actions.
+CPU jobs operate outside the tick on immutable data. GPU submission stays on the render owner thread. Network and disk runtimes cannot hold simulation locks or await inside a tick. Separate priority and byte budgets for generation, edits, collision, topology, and visuals prevent background work starving player actions. Terrain generation is specified in `docs/worldgen.md` (`spall_worldgen`: deterministic, versioned, never regenerated over modified bricks).
 
 ## Editing and cross-brick atomicity
 

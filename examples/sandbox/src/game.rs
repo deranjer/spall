@@ -26,10 +26,23 @@ pub mod materials {
     /// A warm emissive block (ENG-102). Above every earlier id so the manifest
     /// extends cleanly.
     pub const LAMP: MaterialId = MaterialId(200);
+
+    // Terrain materials for generated worlds (ENG-114). Appended above the
+    // lamp because a manifest extension may only add ids above the previous
+    // highest; below 256, which later appearance variants use. Grass, sandstone
+    // and slate already exist as ids 10, 13 and 14 (the playground palette).
+    pub const BEDROCK: MaterialId = MaterialId(210);
+    pub const DEEP_STONE: MaterialId = MaterialId(211);
+    pub const SAND: MaterialId = MaterialId(212);
+    pub const MUD: MaterialId = MaterialId(213);
+    pub const MOSS: MaterialId = MaterialId(214);
+    pub const GRAVEL: MaterialId = MaterialId(215);
+    pub const CLAY: MaterialId = MaterialId(216);
+    pub const SNOW: MaterialId = MaterialId(217);
 }
 
 /// Version of the sandbox's server-authoritative content rules.
-pub const GAME_RULES_VERSION: u32 = 2;
+pub const GAME_RULES_VERSION: u32 = 3;
 
 /// Version of the sandbox-owned collision damage values below.
 pub const DAMAGE_RULES_VERSION: u32 = 2;
@@ -603,6 +616,8 @@ pub mod tool_ids {
     pub const PLACE_STONE: u16 = 1;
     pub const PLACE_WOOD: u16 = 2;
     pub const PLACE_DIRT: u16 = 3;
+    /// The torch: places the emissive lamp where the player aims.
+    pub const PLACE_LAMP: u16 = 4;
 }
 
 fn def(id: MaterialId, name: &str, density: f32, albedo: [f32; 3]) -> MaterialDef {
@@ -767,15 +782,73 @@ pub fn extend_with_variants(
     MaterialManifest::validated(entries)?.superseding_extension(previous)
 }
 
-/// The sandbox world's validated material manifest: [`manifest_v4_lamp`] plus
+/// The terrain materials of generated worlds (ENG-114): `(id, name, density,
+/// display sRGB albedo)`. Linear albedo is derived, like the v2 manifest.
+const TERRAIN_MATERIALS: [(MaterialId, &str, f32, [f32; 3]); 8] = [
+    (materials::BEDROCK, "bedrock", 3000.0, [0.16, 0.16, 0.18]),
+    (
+        materials::DEEP_STONE,
+        "deep-stone",
+        2800.0,
+        [0.30, 0.30, 0.35],
+    ),
+    (materials::SAND, "sand", 1600.0, [0.85, 0.76, 0.52]),
+    (materials::MUD, "mud", 1700.0, [0.33, 0.25, 0.17]),
+    (materials::MOSS, "moss", 1300.0, [0.25, 0.36, 0.17]),
+    (materials::GRAVEL, "gravel", 1800.0, [0.50, 0.47, 0.43]),
+    (materials::CLAY, "clay", 1900.0, [0.62, 0.42, 0.32]),
+    (materials::SNOW, "snow", 300.0, [0.93, 0.95, 0.98]),
+];
+
+/// The manifest with the generated-world terrain materials (ENG-114), before
+/// any later appearance variants. [`manifest_v4_lamp`] plus
+/// [`TERRAIN_MATERIALS`]; an extension, so worlds saved under v4 or earlier
+/// still restore. Clients and servers built before this change no longer match
+/// the handshake hash.
+pub fn manifest_v5_terrain() -> MaterialManifest {
+    let previous = manifest_v4_lamp();
+    let mut entries = previous.entries().to_vec();
+    entries.extend(
+        TERRAIN_MATERIALS
+            .iter()
+            .map(|&(id, name, density, srgb)| def(id, name, density, srgb.map(srgb_to_linear))),
+    );
+    MaterialManifest::validated(entries)
+        .and_then(|manifest| manifest.superseding_extension(&previous))
+        .expect("sandbox manifest extends v4 by terrain materials only")
+}
+
+/// The material ids generated worlds are painted with.
+pub fn terrain_palette() -> spall_worldgen::WorldgenPalette {
+    spall_worldgen::WorldgenPalette {
+        bedrock: materials::BEDROCK,
+        deep_stone: materials::DEEP_STONE,
+        stone: materials::STONE,
+        slate: MaterialId(14),
+        dirt: materials::DIRT,
+        grass: MaterialId(10),
+        sand: materials::SAND,
+        sandstone: MaterialId(13),
+        mud: materials::MUD,
+        moss: materials::MOSS,
+        gravel: materials::GRAVEL,
+        clay: materials::CLAY,
+        snow: materials::SNOW,
+    }
+}
+
+/// The sandbox world's validated material manifest: [`manifest_v5_terrain`] plus
 /// every appearance variant in `appearance_extensions.rs` (none yet, so it
-/// equals v4). Extending the palette appends variants under new ids, so it
+/// equals v5). Extending the palette appends variants under new ids, so it
 /// extends this manifest chain and worlds saved under any earlier manifest still
 /// restore with unchanged meaning. Clients and servers built with a different
 /// palette do not match the handshake hash.
 pub fn manifest() -> MaterialManifest {
-    extend_with_variants(&manifest_v4_lamp(), crate::appearance::extension_variants())
-        .expect("sandbox palette extensions extend the lamp manifest")
+    extend_with_variants(
+        &manifest_v5_terrain(),
+        crate::appearance::extension_variants(),
+    )
+    .expect("sandbox palette extensions extend the terrain manifest")
 }
 
 /// Server policy for the example's network-visible tools. The server owns the
@@ -808,6 +881,15 @@ pub fn tool_catalog() -> spall_server::ToolCatalog {
                 kind: EditKind::Place(materials::DIRT),
                 max_radius_cells: 2,
                 reach_m: 8.0,
+            },
+            // The torch: one emissive lamp voxel in the empty cell against the
+            // struck surface (radius 0), at the same reach as digging. The
+            // client lights the area around emissive voxels with a point light.
+            ToolRule {
+                id: tool_ids::PLACE_LAMP,
+                kind: EditKind::Place(materials::LAMP),
+                max_radius_cells: 0,
+                reach_m: 12.0,
             },
         ],
     )

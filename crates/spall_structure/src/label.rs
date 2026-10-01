@@ -10,7 +10,10 @@
 //! brick contents always produce the same labelling. Label `0` means
 //! air / empty; solid cells receive labels `1..=count`.
 
-use spall_core::{BRICK_EDGE, CELLS_PER_BRICK, LocalCell};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use spall_core::{BRICK_EDGE, CELLS_PER_BRICK, LocalCell, Revision, VolumeId};
 use spall_voxel::BrickSnapshot;
 
 const EDGE: usize = BRICK_EDGE as usize;
@@ -31,13 +34,44 @@ impl LocalComponent {
     }
 }
 
+/// How one brick's labels are stored. Most bricks are uniform rock or a single
+/// connected surface layer, so a per-cell `u16` array (64 KiB) is the exception.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Repr {
+    /// No solid cell.
+    Empty,
+    /// Every cell solid, one component (label 1).
+    Full,
+    /// Exactly one component (label 1): the solid cells are the set bits.
+    Single(Box<[u64]>),
+    /// General case: one label per cell, indexed by `LocalCell::linear_index`.
+    Many(Box<[u16]>),
+}
+
+/// What the graph needs to know about one component without scanning its cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComponentInfo {
+    cell_count: u32,
+    /// Whether any cell touches the `-x, +x, -y, +y, -z, +z` face of the brick.
+    faces: [bool; 6],
+    /// Bit `y` is set when the component has a cell at local height `y`.
+    layers: u32,
+}
+
 /// The connected-component labelling of one brick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrickLabels {
-    /// One label per cell, indexed by [`LocalCell::linear_index`]. `0` == air.
-    labels: Box<[u16]>,
+    repr: Repr,
     /// Number of distinct solid components (labels `1..=count`).
     count: u16,
+    /// Per component, in label order (`info[label - 1]`).
+    info: Vec<ComponentInfo>,
+    /// Which boundary cells are solid, per face (`-x, +x, -y, +y, -z, +z`): row
+    /// `v`, bit `u` is the cell at face coordinates `(u, v)` — `(y, z)` on the
+    /// x faces, `(x, z)` on the y faces, `(x, y)` on the z faces. Opposite faces
+    /// of neighbouring bricks use the same `(u, v)`, so linking two bricks
+    /// whose bricks are single components is a few dozen `AND`s.
+    face_masks: [[u32; EDGE]; 6],
 }
 
 impl BrickLabels {
@@ -53,31 +87,72 @@ impl BrickLabels {
         self.count == 0
     }
 
+    /// Raw label at a linear index (`0` == air). Panics if `index >= 32768`.
+    #[inline]
+    pub fn label_at_index(&self, index: usize) -> u16 {
+        assert!(index < CELLS_PER_BRICK, "cell index out of range");
+        match &self.repr {
+            Repr::Empty => 0,
+            Repr::Full => 1,
+            Repr::Single(bits) => u16::from(bits[index / 64] >> (index % 64) & 1 == 1),
+            Repr::Many(labels) => labels[index],
+        }
+    }
+
     /// The component a cell belongs to, or `None` for air.
     #[inline]
     pub fn component_at(&self, cell: LocalCell) -> Option<LocalComponent> {
-        match self.labels[cell.linear_index() as usize] {
+        match self.label_at_index(cell.linear_index() as usize) {
             0 => None,
             n => Some(LocalComponent(n)),
         }
     }
 
-    /// Raw label at a linear index (`0` == air). Panics if `index >= 32768`.
-    #[inline]
-    pub fn label_at_index(&self, index: usize) -> u16 {
-        self.labels[index]
+    fn info_of(&self, component: LocalComponent) -> Option<&ComponentInfo> {
+        usize::from(component.0)
+            .checked_sub(1)
+            .and_then(|i| self.info.get(i))
     }
 
-    /// Number of cells in one component.
+    /// Number of cells in one component (`0` for an id that does not exist).
     pub fn cell_count(&self, component: LocalComponent) -> u32 {
-        self.labels.iter().filter(|&&l| l == component.0).count() as u32
+        self.info_of(component).map_or(0, |i| i.cell_count)
+    }
+
+    /// Whether `component` has a cell on each brick face, in the order
+    /// `-x, +x, -y, +y, -z, +z`.
+    pub fn faces(&self, component: LocalComponent) -> [bool; 6] {
+        self.info_of(component).map_or([false; 6], |i| i.faces)
+    }
+
+    /// Whether `component` has a cell at brick-local height `y` (`0..32`).
+    pub fn has_layer(&self, component: LocalComponent, y: u8) -> bool {
+        y < BRICK_EDGE as u8
+            && self
+                .info_of(component)
+                .is_some_and(|i| i.layers >> y & 1 == 1)
+    }
+
+    /// The solid boundary cells of one face (see the field doc), `face` in
+    /// `0..6` as `-x, +x, -y, +y, -z, +z`.
+    pub fn face_mask(&self, face: usize) -> &[u32; EDGE] {
+        &self.face_masks[face]
+    }
+
+    /// `true` when every cell of the brick is one component (a uniform solid
+    /// brick): its boundary matches any solid boundary cell.
+    pub fn is_full(&self) -> bool {
+        matches!(self.repr, Repr::Full)
     }
 
     /// Every cell belonging to `component`, in canonical linear-index order.
     pub fn cells(&self, component: LocalComponent) -> Vec<LocalCell> {
         let mut out = Vec::new();
-        for (index, &label) in self.labels.iter().enumerate() {
-            if label == component.0 {
+        if self.info_of(component).is_none() {
+            return out;
+        }
+        for index in 0..CELLS_PER_BRICK {
+            if self.label_at_index(index) == component.0 {
                 out.push(
                     LocalCell::from_linear_index(index as u16)
                         .expect("index derived from a 0..32768 enumeration"),
@@ -91,6 +166,16 @@ impl BrickLabels {
     pub fn components(&self) -> impl Iterator<Item = LocalComponent> + '_ {
         (1..=self.count).map(LocalComponent)
     }
+
+    /// Heap bytes held (diagnostics).
+    pub fn heap_bytes(&self) -> usize {
+        let labels = match &self.repr {
+            Repr::Empty | Repr::Full => 0,
+            Repr::Single(bits) => bits.len() * 8,
+            Repr::Many(labels) => labels.len() * 2,
+        };
+        labels + self.info.len() * std::mem::size_of::<ComponentInfo>()
+    }
 }
 
 #[inline]
@@ -100,6 +185,29 @@ fn idx(x: usize, y: usize, z: usize) -> usize {
 
 /// Six-face-connected component labelling of `brick`.
 pub fn label_brick(brick: &BrickSnapshot) -> BrickLabels {
+    // A uniform brick needs no scan at all.
+    if !brick.is_dense() {
+        let origin = LocalCell::new(0, 0, 0).expect("origin");
+        if brick.get(origin).is_air() {
+            return BrickLabels {
+                repr: Repr::Empty,
+                count: 0,
+                info: Vec::new(),
+                face_masks: [[0; EDGE]; 6],
+            };
+        }
+        return BrickLabels {
+            repr: Repr::Full,
+            count: 1,
+            info: vec![ComponentInfo {
+                cell_count: CELLS_PER_BRICK as u32,
+                faces: [true; 6],
+                layers: u32::MAX,
+            }],
+            face_masks: [[u32::MAX; EDGE]; 6],
+        };
+    }
+
     // Solid mask first, so the flood fill never re-reads the snapshot.
     let mut solid = vec![false; CELLS_PER_BRICK];
     for z in 0..EDGE {
@@ -158,9 +266,144 @@ pub fn label_brick(brick: &BrickSnapshot) -> BrickLabels {
         }
     }
 
+    // Per-component facts, so graph assembly never rescans cells.
+    let mut info = vec![
+        ComponentInfo {
+            cell_count: 0,
+            faces: [false; 6],
+            layers: 0,
+        };
+        usize::from(count)
+    ];
+    for (index, &label) in labels.iter().enumerate() {
+        if label == 0 {
+            continue;
+        }
+        let (x, y, z) = (index % EDGE, (index / EDGE) % EDGE, index / (EDGE * EDGE));
+        let c = &mut info[usize::from(label) - 1];
+        c.cell_count += 1;
+        c.layers |= 1 << y;
+        c.faces[0] |= x == 0;
+        c.faces[1] |= x == EDGE - 1;
+        c.faces[2] |= y == 0;
+        c.faces[3] |= y == EDGE - 1;
+        c.faces[4] |= z == 0;
+        c.faces[5] |= z == EDGE - 1;
+    }
+
+    // Solid boundary cells per face, from the label array.
+    let mut face_masks = [[0u32; EDGE]; 6];
+    for (index, &label) in labels.iter().enumerate() {
+        if label == 0 {
+            continue;
+        }
+        let (x, y, z) = (index % EDGE, (index / EDGE) % EDGE, index / (EDGE * EDGE));
+        if x == 0 {
+            face_masks[0][z] |= 1 << y;
+        }
+        if x == EDGE - 1 {
+            face_masks[1][z] |= 1 << y;
+        }
+        if y == 0 {
+            face_masks[2][z] |= 1 << x;
+        }
+        if y == EDGE - 1 {
+            face_masks[3][z] |= 1 << x;
+        }
+        if z == 0 {
+            face_masks[4][y] |= 1 << x;
+        }
+        if z == EDGE - 1 {
+            face_masks[5][y] |= 1 << x;
+        }
+    }
+    let repr = match count {
+        0 => Repr::Empty,
+        1 => {
+            // One component: a bit mask is 16x smaller than the label array.
+            let mut bits = vec![0u64; CELLS_PER_BRICK / 64];
+            for (index, &label) in labels.iter().enumerate() {
+                if label != 0 {
+                    bits[index / 64] |= 1 << (index % 64);
+                }
+            }
+            if info[0].cell_count as usize == CELLS_PER_BRICK {
+                Repr::Full
+            } else {
+                Repr::Single(bits.into_boxed_slice())
+            }
+        }
+        _ => Repr::Many(labels.into_boxed_slice()),
+    };
     BrickLabels {
-        labels: labels.into_boxed_slice(),
+        repr,
         count,
+        info,
+        face_masks,
+    }
+}
+
+/// `(volume id, brick x, y, z)` to the brick's revision and its labels.
+type CacheMap = BTreeMap<(u64, i64, i64, i64), (Revision, Arc<BrickLabels>)>;
+
+/// Memoized brick labellings of one or more volumes, shared between staging
+/// passes. Labels are a pure function of a brick's cells, so an entry is reused
+/// while the brick's revision is unchanged: building the structural index of a
+/// large world then relabels only the bricks an edit touched, not all of them.
+///
+/// Entries are written only from builds over the *live* volume, never from a
+/// dry run: a revision number identifies a brick's contents along one history,
+/// and a discarded dry run is a history that never happened.
+#[derive(Debug, Clone, Default)]
+pub struct LabelCache(Arc<Mutex<CacheMap>>);
+
+impl LabelCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheMap> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn get(
+        &self,
+        volume: VolumeId,
+        key: (i64, i64, i64),
+        revision: Revision,
+    ) -> Option<Arc<BrickLabels>> {
+        let entry = self
+            .lock()
+            .get(&(volume.get(), key.0, key.1, key.2))
+            .cloned()?;
+        (entry.0 == revision).then_some(entry.1)
+    }
+
+    pub(crate) fn put(
+        &self,
+        volume: VolumeId,
+        key: (i64, i64, i64),
+        revision: Revision,
+        labels: Arc<BrickLabels>,
+    ) {
+        self.lock()
+            .insert((volume.get(), key.0, key.1, key.2), (revision, labels));
+    }
+
+    /// Drops every entry of `volume` whose brick is not in `keep`.
+    pub(crate) fn retain_volume(&self, volume: VolumeId, keep: impl Fn(&(i64, i64, i64)) -> bool) {
+        let id = volume.get();
+        self.lock()
+            .retain(|(v, x, y, z), _| *v != id || keep(&(*x, *y, *z)));
+    }
+
+    /// Cached bricks (diagnostics and tests).
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
     }
 }
 
@@ -281,5 +524,156 @@ mod tests {
             1,
             "the shell is a single connected component"
         );
+    }
+
+    /// The compact representations must label exactly like a plain per-cell
+    /// flood fill, including every per-component fact the graph relies on.
+    #[test]
+    fn compact_labels_match_a_reference_flood_fill_on_random_bricks() {
+        fn reference(solid: &[bool]) -> (Vec<u16>, u16) {
+            let mut labels = vec![0u16; CELLS_PER_BRICK];
+            let mut count = 0u16;
+            for start in 0..CELLS_PER_BRICK {
+                if !solid[start] || labels[start] != 0 {
+                    continue;
+                }
+                count += 1;
+                labels[start] = count;
+                let mut stack = vec![start];
+                while let Some(here) = stack.pop() {
+                    let (x, y, z) = (here % EDGE, (here / EDGE) % EDGE, here / (EDGE * EDGE));
+                    let mut push = |n: usize| {
+                        if solid[n] && labels[n] == 0 {
+                            labels[n] = count;
+                            stack.push(n);
+                        }
+                    };
+                    if x > 0 {
+                        push(idx(x - 1, y, z));
+                    }
+                    if x + 1 < EDGE {
+                        push(idx(x + 1, y, z));
+                    }
+                    if y > 0 {
+                        push(idx(x, y - 1, z));
+                    }
+                    if y + 1 < EDGE {
+                        push(idx(x, y + 1, z));
+                    }
+                    if z > 0 {
+                        push(idx(x, y, z - 1));
+                    }
+                    if z + 1 < EDGE {
+                        push(idx(x, y, z + 1));
+                    }
+                }
+            }
+            (labels, count)
+        }
+
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Fill fractions from sparse specks to nearly solid, so single-component,
+        // multi-component, full and empty representations all occur.
+        for (round, fill) in [0u64, 1, 5, 20, 50, 80, 95, 99, 100]
+            .into_iter()
+            .cycle()
+            .take(27)
+            .enumerate()
+        {
+            let mut b = Brick::uniform(MaterialId::AIR, Revision(1));
+            let mut solid = vec![false; CELLS_PER_BRICK];
+            for (i, cell_solid) in solid.iter_mut().enumerate() {
+                let on = if fill == 100 {
+                    true
+                } else {
+                    next() % 100 < fill
+                };
+                if on {
+                    let cell = LocalCell::from_linear_index(i as u16).unwrap();
+                    b.set_cell(cell, STONE);
+                    *cell_solid = true;
+                }
+            }
+            b.collapse();
+            let labels = label_brick(&b.snapshot());
+            let (expected, count) = reference(&solid);
+            assert_eq!(labels.count(), count, "round {round} fill {fill}");
+            for (i, &want) in expected.iter().enumerate() {
+                assert_eq!(labels.label_at_index(i), want, "round {round} cell {i}");
+            }
+            // Face masks: bit `u` of row `v` is a solid boundary cell at `(u, v)`.
+            for (face, mask) in (0..6).map(|f| (f, labels.face_mask(f))) {
+                for (v, row) in mask.iter().enumerate() {
+                    for u in 0..EDGE {
+                        let (x, y, z) = match face {
+                            0 => (0, u, v),
+                            1 => (EDGE - 1, u, v),
+                            2 => (u, 0, v),
+                            3 => (u, EDGE - 1, v),
+                            4 => (u, v, 0),
+                            _ => (u, v, EDGE - 1),
+                        };
+                        assert_eq!(
+                            row >> u & 1 == 1,
+                            solid[idx(x, y, z)],
+                            "round {round} face {face} ({u},{v})"
+                        );
+                    }
+                }
+            }
+            for c in 1..=count {
+                let comp = LocalComponent(c);
+                let cells: Vec<usize> =
+                    (0..CELLS_PER_BRICK).filter(|&i| expected[i] == c).collect();
+                assert_eq!(labels.cell_count(comp) as usize, cells.len());
+                assert_eq!(
+                    labels
+                        .cells(comp)
+                        .iter()
+                        .map(|l| usize::from(l.linear_index()))
+                        .collect::<Vec<_>>(),
+                    cells
+                );
+                let on = |f: &dyn Fn(usize, usize, usize) -> bool| {
+                    cells
+                        .iter()
+                        .any(|&i| f(i % EDGE, (i / EDGE) % EDGE, i / (EDGE * EDGE)))
+                };
+                assert_eq!(
+                    labels.faces(comp),
+                    [
+                        on(&|x, _, _| x == 0),
+                        on(&|x, _, _| x == EDGE - 1),
+                        on(&|_, y, _| y == 0),
+                        on(&|_, y, _| y == EDGE - 1),
+                        on(&|_, _, z| z == 0),
+                        on(&|_, _, z| z == EDGE - 1),
+                    ]
+                );
+                for y in 0..EDGE as u8 {
+                    assert_eq!(
+                        labels.has_layer(comp, y),
+                        cells.iter().any(|&i| (i / EDGE) % EDGE == usize::from(y))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_and_single_component_bricks_use_compact_storage() {
+        let full = label_brick(&Brick::uniform(STONE, Revision(1)).snapshot());
+        assert!(full.is_full());
+        assert_eq!(full.heap_bytes(), std::mem::size_of::<ComponentInfo>());
+        let one = brick_from(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)]);
+        let labels = label_brick(&one);
+        assert_eq!(labels.count(), 1);
+        assert!(labels.heap_bytes() < 8 * 1024, "{}", labels.heap_bytes());
     }
 }
