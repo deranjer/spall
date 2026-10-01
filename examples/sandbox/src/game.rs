@@ -882,15 +882,13 @@ pub fn tool_catalog() -> spall_server::ToolCatalog {
                 max_radius_cells: 2,
                 reach_m: 8.0,
             },
-            // The torch: a small emissive lamp ball (radius 2 = 33 voxels, about
-            // 1.25 m across) against the struck surface, at the same reach as
-            // digging. Smaller emitters do not light anything: the lighting
-            // cache cannot resolve a lamp under about 1 m (see
-            // `tests/worldgen_torch_light.rs`).
+            // The torch: one emissive lamp voxel in the empty cell against the
+            // struck surface (radius 0), at the same reach as digging. The
+            // client lights the area around emissive voxels with a point light.
             ToolRule {
                 id: tool_ids::PLACE_LAMP,
                 kind: EditKind::Place(materials::LAMP),
-                max_radius_cells: 2,
+                max_radius_cells: 0,
                 reach_m: 12.0,
             },
         ],

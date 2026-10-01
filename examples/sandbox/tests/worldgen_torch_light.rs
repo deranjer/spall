@@ -1,6 +1,7 @@
 #![cfg(feature = "client")]
 //! Does a torch (one emissive lamp voxel) actually light the generated terrain
-//! around it? Renders the meadow at night through the same pipeline the
+//! around it, and without filling the hole it sits in? Renders the meadow at
+//! night through the same pipeline the
 //! interactive window uses (`build_instances` + sky occupancy + `GameRenderer`),
 //! once without and once with a lamp on the ground, and compares the brightness
 //! of the ground a metre from it. Writes both images to
@@ -11,11 +12,10 @@
 use sandbox::game::{self, materials};
 use sandbox::worldgen_scene;
 use spall_client::sky::build_sky_occupancy;
-use spall_client::window::build_instances;
+use spall_client::window::{build_instances, emitter_point_lights};
 use spall_core::GlobalCell;
 use spall_render::{
     Camera, DebugView, EnvironmentPreset, GameRenderer, OffscreenTarget, RenderContext,
-    materials_from_manifest,
 };
 use spall_voxel::EditPlan;
 
@@ -51,9 +51,10 @@ fn render(
     volume: &spall_voxel::Volume,
     center_m: [f64; 3],
     camera: &Camera,
+    preset: EnvironmentPreset,
 ) -> Vec<u8> {
     let manifest = game::manifest();
-    let materials = materials_from_manifest(&manifest);
+    let materials = spall_client::window::terrain_render_materials(&manifest);
     let mut renderer = GameRenderer::new(
         &ctx.device,
         &ctx.queue,
@@ -62,11 +63,35 @@ fn render(
         SIZE,
         None,
     );
-    renderer.set_terrain(&ctx.device, &ctx.queue, &build_instances(volume, center_m));
+    let instances = build_instances(volume, center_m);
+    renderer.set_terrain(&ctx.device, &ctx.queue, &instances);
+    // The window lights emissive voxels with point lights; so does this.
+    let eye = glam::Vec3::new(center_m[0] as f32, center_m[1] as f32, center_m[2] as f32);
+    println!(
+        "lamp instances: {} of {}; first few materials {:?}",
+        instances
+            .iter()
+            .filter(|i| i.material == u32::from(materials::LAMP.0))
+            .count(),
+        instances.len(),
+        instances
+            .iter()
+            .map(|i| i.material)
+            .take(5)
+            .collect::<Vec<_>>()
+    );
+    let lights = emitter_point_lights(&instances, &materials, eye);
+    println!(
+        "point lights: {} ({} emissive materials, lamp emissive {})",
+        lights.len(),
+        materials.iter().filter(|m| m.emissive > 0.0).count(),
+        materials[usize::from(materials::LAMP.0)].emissive
+    );
+    renderer.set_point_lights(&lights);
     let (sky, _) = build_sky_occupancy(volume, center_m, true);
     renderer.set_sky_occupancy(&ctx.device, &ctx.queue, Some(&sky));
     let target = OffscreenTarget::new(&ctx.device, SIZE.0, SIZE.1);
-    let environment = EnvironmentPreset::Night.environment();
+    let environment = preset.environment();
     let mut rgba = Vec::new();
     let mut frames = 0;
     // A few frames, and until the lighting cache has finished sweeping.
@@ -108,11 +133,17 @@ fn a_torch_lights_the_ground_around_it() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(spall_client::window::TORCH_RADIUS_CELLS);
+    // Centred on the cell, like the server's placement brush.
+    let unit = spall_core::units::BRUSH_UNIT;
     let plan = EditPlan::sphere(
         lit.id(),
         spall_core::SphereBrush::new(
-            spall_core::units::BrushPoint::from_cells(torch.x, torch.y, torch.z).expect("in range"),
-            radius * spall_core::units::BRUSH_UNIT,
+            spall_core::units::BrushPoint::from_units(
+                torch.x * unit + unit / 2,
+                torch.y * unit + unit / 2,
+                torch.z * unit + unit / 2,
+            ),
+            radius * unit,
         )
         .expect("brush"),
         materials::LAMP,
@@ -135,8 +166,8 @@ fn a_torch_lights_the_ground_around_it() {
     let center = [f64::from(eye.x), f64::from(eye.y), f64::from(eye.z)];
 
     let ctx = RenderContext::headless().expect("a GPU adapter");
-    let before = render(&ctx, &dark, center, &camera);
-    let after = render(&ctx, &lit, center, &camera);
+    let before = render(&ctx, &dark, center, &camera, EnvironmentPreset::Night);
+    let after = render(&ctx, &lit, center, &camera, EnvironmentPreset::Night);
 
     let dir =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/runs/torch-light");
@@ -173,4 +204,82 @@ fn a_torch_lights_the_ground_around_it() {
         worst_ratio > 1.3,
         "a torch must visibly light the ground a metre away (worst ratio {worst_ratio})"
     );
+}
+
+/// Looks into a hammered pit in daylight: the layers under the grass, the
+/// pockets in them, and the per-voxel colour variation. Writes
+/// `.local/runs/torch-light/pit.png` for a look; asserts that the pit wall
+/// shows several materials.
+#[test]
+fn a_dug_pit_shows_layers_and_colour_variation() {
+    let scene = worldgen_scene::generate("showcase", 1, 256).expect("generate");
+    let spawn = scene.player_spawns()[0];
+    let (x, z) = (
+        (spawn[0] / 0.25).floor() as i64,
+        (spawn[2] / 0.25).floor() as i64,
+    );
+    let ground_y = (spawn[1] / 0.25).round() as i64 - 1;
+    let mut dug = scene.world().terrain.clone();
+    let unit = spall_core::units::BRUSH_UNIT;
+    // Two hammer swings deep: a radius-8 pit centred on the surface, then one 6 cells down.
+    for dy in [0, -6] {
+        let plan = EditPlan::sphere(
+            dug.id(),
+            spall_core::SphereBrush::new(
+                spall_core::units::BrushPoint::from_units(
+                    x * unit + unit / 2,
+                    (ground_y + dy) * unit + unit / 2,
+                    z * unit + unit / 2,
+                ),
+                8 * unit,
+            )
+            .expect("brush"),
+            spall_core::MaterialId::AIR,
+        );
+        dug.apply_edit(&plan).expect("dig");
+    }
+    let centre = glam::Vec3::new(
+        (x as f32 + 0.5) * 0.25,
+        (ground_y as f32 - 4.0) * 0.25,
+        (z as f32 + 0.5) * 0.25,
+    );
+    let eye = centre + glam::Vec3::new(1.2, 2.2, 3.4);
+    let camera = Camera::looking_along(
+        eye,
+        centre - eye,
+        60_f32.to_radians(),
+        SIZE.0 as f32 / SIZE.1 as f32,
+    );
+    let ctx = RenderContext::headless().expect("a GPU adapter");
+    let rgba = render(
+        &ctx,
+        &dug,
+        [f64::from(eye.x), f64::from(eye.y), f64::from(eye.z)],
+        &camera,
+        EnvironmentPreset::Daylight,
+    );
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/runs/torch-light");
+    std::fs::create_dir_all(&dir).unwrap();
+    image::save_buffer(
+        dir.join("pit.png"),
+        &rgba,
+        SIZE.0,
+        SIZE.1,
+        image::ColorType::Rgba8,
+    )
+    .unwrap();
+
+    // The pit wall exposes more than one material down its depth.
+    let mut seen = std::collections::BTreeSet::new();
+    for dy in 0..=10 {
+        for dx in [-8, 8] {
+            if let Ok(spall_voxel::Sample::Filled(m)) =
+                dug.sample(GlobalCell::new(x + dx + dx.signum(), ground_y - dy, z))
+            {
+                seen.insert(m);
+            }
+        }
+    }
+    assert!(seen.len() >= 2, "a pit wall should show layers: {seen:?}");
 }

@@ -2,6 +2,7 @@
 
 use crate::caves::{CaveField, CornerGrid, MOUTH_RADIUS};
 use crate::columns::{Biome, ColumnMap, Stack};
+use crate::noise::fbm3;
 use crate::spec::{
     BORDER_CELLS, BRICK, GEN_VERSION, GenError, HEIGHT_BRICKS, HEIGHT_CELLS, SEA_LEVEL, WALL_TOP,
     WorldGenSpec,
@@ -15,6 +16,10 @@ const CELL_M: f64 = 0.25;
 /// Deepest surface stack (sand over sandstone): below this under the lowest
 /// surface cell of a brick footprint, the brick is pure rock.
 const MAX_STACK: i64 = 40;
+// Noise streams for subsurface pockets. Changing one changes the world: bump
+// GEN_VERSION.
+const S_POCKET_A: u64 = 0x81;
+const S_POCKET_B: u64 = 0x82;
 /// Rock bands by height: bedrock below, deep stone up to, then stone.
 const BEDROCK_TOP: i64 = BRICK;
 const DEEP_TOP: i64 = 3 * BRICK;
@@ -81,6 +86,9 @@ fn base_material(spec: &WorldGenSpec, y: i64) -> MaterialId {
 }
 
 struct Footprint {
+    /// Global cell `x` / `z` of the footprint's first column.
+    x0: i64,
+    z0: i64,
     heights: Vec<i32>,
     stacks: Vec<Stack>,
     lowland: Vec<u8>,
@@ -108,11 +116,44 @@ fn footprint(spec: &WorldGenSpec, columns: &ColumnMap, bx: i64, bz: i64) -> Foot
         }
     }
     Footprint {
+        x0: bx * BRICK,
+        z0: bz * BRICK,
         heights,
         stacks,
         lowland,
         hmin,
         hmax,
+    }
+}
+
+/// Pockets of other rock inside the rock near the surface, so a cut shows
+/// strata and not one flat colour all the way down. Only within `MAX_STACK`
+/// cells of the surface: deeper bricks stay uniform and cheap. `subsoil` is the
+/// softer layer under the topsoil (mostly dirt), which only gets gravel and
+/// stone pebbles.
+fn pocket(spec: &WorldGenSpec, x: i64, y: i64, z: i64, subsoil: bool) -> Option<MaterialId> {
+    let (xf, yf, zf) = (x as f64, y as f64, z as f64);
+    let a = fbm3(spec.seed ^ S_POCKET_A, xf / 14.0, yf / 5.0, zf / 14.0, 2);
+    let b = fbm3(spec.seed ^ S_POCKET_B, xf / 11.0, yf / 6.0, zf / 11.0, 2);
+    let p = &spec.palette;
+    if subsoil {
+        if a > 0.5 {
+            Some(p.gravel)
+        } else if b > 0.5 {
+            Some(p.stone)
+        } else {
+            None
+        }
+    } else if a > 0.38 {
+        Some(p.gravel)
+    } else if a < -0.42 {
+        Some(p.clay)
+    } else if b > 0.42 {
+        Some(p.slate)
+    } else if b < -0.48 {
+        Some(p.dirt)
+    } else {
+        None
     }
 }
 
@@ -137,10 +178,16 @@ fn fill_dense(spec: &WorldGenSpec, fp: &Footprint, corners: Option<&CornerGrid>,
                     }
                 }
                 let depth = h - y;
+                let (x, z) = (fp.x0 + lx, fp.z0 + lz);
                 let material = if depth < i64::from(stack.top_cells) {
                     stack.top
                 } else if depth < i64::from(stack.depth()) {
-                    stack.sub
+                    let soft = stack.sub == spec.palette.dirt || stack.sub == spec.palette.mud;
+                    soft.then(|| pocket(spec, x, y, z, true))
+                        .flatten()
+                        .unwrap_or(stack.sub)
+                } else if depth < MAX_STACK && y >= BEDROCK_TOP {
+                    pocket(spec, x, y, z, false).unwrap_or_else(|| base_material(spec, y))
                 } else {
                     base_material(spec, y)
                 };

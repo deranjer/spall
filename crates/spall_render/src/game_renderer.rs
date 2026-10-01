@@ -392,6 +392,12 @@ impl GameRenderer {
     ///
     /// Call [`Self::finish_timing`] after submitting `encoder`.
     #[allow(clippy::too_many_arguments)]
+    /// Sets the point lights the following frames are shaded with (the nearest
+    /// [`crate::MAX_POINT_LIGHTS`]; see [`crate::PointLight`]).
+    pub fn set_point_lights(&self, lights: &[crate::PointLight]) {
+        self.pipeline.set_point_lights(lights);
+    }
+
     pub fn render(
         &mut self,
         device: &wgpu::Device,

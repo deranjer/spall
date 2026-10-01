@@ -12,6 +12,10 @@ struct Globals {
     sun: vec4<f32>,
     sky_color: vec4<f32>,
     ground_color: vec4<f32>,
+    // Point lights (xyz position, w range) and colour x intensity; count in x.
+    point_lights: array<vec4<f32>, 8>,
+    point_colors: array<vec4<f32>, 8>,
+    point_count: vec4<f32>,
 };
 struct Material { base_color: vec4<f32>, params: vec4<f32>, };
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -55,6 +59,9 @@ struct VsOut {
     @location(2) local_uv: vec2<f32>,
     @location(3) ao: f32,
     @location(4) @interpolate(flat) material: u32,
+    // 1 for axis-aligned cube instances (terrain), where per-voxel colour
+    // jitter is stable; 0 for meshes and rotated bodies, whose cells move.
+    @location(5) @interpolate(flat) jitter_on: f32,
 };
 
 @vertex fn vs_main(in: VsIn) -> VsOut {
@@ -65,6 +72,7 @@ struct VsOut {
     out.local_uv = in.local_uv;
     out.ao = in.ao;
     out.material = in.material;
+    out.jitter_on = 0.0;
     return out;
 }
 
@@ -93,7 +101,15 @@ fn quat_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     // No baked AO on this path; full ambient (see docs/reports/ENG-94.md).
     out.ao = 1.0;
     out.material = in.material;
+    out.jitter_on = select(0.0, 1.0, abs(in.rotation.w) > 0.99999);
     return out;
+}
+
+// Three decorrelated values in [0, 1) from a voxel's integer cell (Hoskins hash).
+fn hash_cell(c: vec3<f32>) -> vec3<f32> {
+    var p = fract(c * vec3<f32>(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yxz + 33.33);
+    return fract((p.xxy + p.yyx) * p.zyx);
 }
 
 fn get_material(id: u32) -> Material {
@@ -289,6 +305,14 @@ fn sample_indirect(world_pos: vec3<f32>, normal: vec3<f32>, base: vec3<f32>) -> 
     let grid = fract(in.local_uv);
     let line = min(min(grid.x, grid.y), min(1.0 - grid.x, 1.0 - grid.y));
     base *= 0.92 + 0.08 * smoothstep(0.0, 0.06, line);
+    // Per-voxel colour jitter: the cell just inside this face (boxes merge many
+    // voxels, so the variation comes from position, not from the instance).
+    let jitter = mat.params.w * in.jitter_on;
+    if jitter > 0.0 {
+        let cell = floor((in.world_pos - n * 0.02) / 0.25);
+        let h = hash_cell(cell) * 2.0 - vec3<f32>(1.0);
+        base = max(base * (vec3<f32>(1.0) + jitter * (vec3<f32>(h.x) + 0.45 * h.yzx)), vec3<f32>(0.0));
+    }
 
     if mode == 1 { return vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0); }
     let eye_depth = -(globals.view * vec4<f32>(in.world_pos, 1.0)).z;
@@ -331,5 +355,18 @@ fn sample_indirect(world_pos: vec3<f32>, normal: vec3<f32>, base: vec3<f32>) -> 
     // Bounce is reflected radiance: the receiver's albedo times the average
     // source radiance around it (furnace-calibrated, see bounce.wgsl).
     let bounced = base * skylight.bounce;
-    return vec4<f32>(ambient + direct + indirect + bounced + emission, mat.base_color.a);
+    // Real-time point lights (torches): inverse-square-ish falloff that reaches
+    // exactly zero at the light's range, cosine-weighted, no shadows.
+    var point = vec3<f32>(0.0);
+    let point_count = i32(globals.point_count.x);
+    for (var i = 0; i < point_count; i = i + 1) {
+        let light = globals.point_lights[i];
+        let to = light.xyz - in.world_pos;
+        let d2 = max(dot(to, to), 0.0004);
+        let falloff = clamp(1.0 - d2 / (light.w * light.w), 0.0, 1.0);
+        let ndl = max(dot(n, to * inverseSqrt(d2)), 0.0);
+        point += globals.point_colors[i].rgb * ndl * falloff * falloff / (1.0 + d2);
+    }
+    let torch_light = base * point / PI;
+    return vec4<f32>(ambient + direct + indirect + bounced + emission + torch_light, mat.base_color.a);
 }

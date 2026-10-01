@@ -124,6 +124,11 @@ pub struct Material {
     /// Surface opacity used by alpha-blended debug geometry. Opaque scene
     /// materials should keep this at `1.0`.
     pub opacity: f32,
+    /// Per-voxel colour variation, `0` for none: each 0.25 m cell of an
+    /// axis-aligned cube instance gets a deterministic brightness shift of up to
+    /// about `+-jitter` and a smaller per-channel drift, from a hash of the
+    /// cell. Cosmetic and client-side only (not part of the material manifest).
+    pub jitter: f32,
 }
 
 impl Material {
@@ -134,7 +139,13 @@ impl Material {
             metallic,
             emissive: 0.0,
             opacity: 1.0,
+            jitter: 0.0,
         }
+    }
+
+    pub const fn jitter(mut self, amount: f32) -> Self {
+        self.jitter = amount;
+        self
     }
 
     pub const fn emissive(mut self, radiance: f32) -> Self {
@@ -197,6 +208,7 @@ pub fn materials_from_manifest(manifest: &spall_core::MaterialManifest) -> Vec<M
             metallic: metalness,
             emissive: multiplier,
             opacity: 1.0,
+            jitter: 0.0,
         };
     }
     table

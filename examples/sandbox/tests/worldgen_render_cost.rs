@@ -33,5 +33,35 @@ fn measure_terrain_rebuild_on_the_showcase() {
             start.elapsed().as_secs_f64() * 1e3,
             instances.len()
         );
+        // The same window rebuilt after a hammer-sized cut, reusing the cache.
+        let mut cache = spall_client::window::TerrainInstanceCache::new();
+        let _ = spall_client::window::build_instances_cached(volume, center, &mut cache);
+        let mut edited = volume.clone();
+        let cell = spall_core::GlobalCell::new(
+            (center[0] / 0.25) as i64,
+            (center[1] / 0.25) as i64 - 8,
+            (center[2] / 0.25) as i64,
+        );
+        let mut plan = spall_voxel::EditPlan::new(edited.id());
+        for d in -2..=2 {
+            plan.set(
+                spall_core::GlobalCell::new(cell.x + d, cell.y, cell.z),
+                spall_core::MaterialId::AIR,
+            );
+        }
+        edited.apply_edit(&plan).unwrap();
+        let start = Instant::now();
+        let again = spall_client::window::build_instances_cached(&edited, center, &mut cache);
+        println!(
+            "{name:10} cached rebuild after an edit {:>6.1} ms, {:>8} instances",
+            start.elapsed().as_secs_f64() * 1e3,
+            again.len()
+        );
+        let start = Instant::now();
+        let _ = spall_client::sky::build_sky_occupancy(volume, center, true);
+        println!(
+            "{name:10} build_sky_occupancy {:>6.1} ms",
+            start.elapsed().as_secs_f64() * 1e3
+        );
     }
 }

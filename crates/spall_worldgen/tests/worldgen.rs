@@ -69,10 +69,10 @@ fn generation_is_deterministic_and_seed_sensitive() {
 /// different world: bump `GEN_VERSION` and update this value deliberately.
 #[test]
 fn golden_digest_for_version() {
-    assert_eq!(GEN_VERSION, 2);
+    assert_eq!(GEN_VERSION, 3);
     assert_eq!(
         digest_hex(&small().terrain),
-        "61e51043a9d7aa10fe7f46b292414a984c2c5c666c9d2755c8c431e221a1073f",
+        "9517095b20f83231a62b78245bbbcb7f5a1779207b726312c42da92bc4dc5ca4",
         "showcase seed 1 at {SMALL} cells"
     );
 }
@@ -383,4 +383,52 @@ fn a_bedrock_wall_one_brick_thick_encloses_the_arena() {
     for &(x, z) in &w.cave_mouths {
         assert!(!in_border(x, z, SMALL));
     }
+}
+
+#[test]
+fn rock_near_the_surface_has_pockets_but_deep_rock_stays_uniform() {
+    let w = small();
+    let p = palette();
+    let mut near = std::collections::BTreeSet::new();
+    let mut deep = std::collections::BTreeSet::new();
+    for z in (0..i64::from(SMALL)).step_by(2) {
+        for x in (0..i64::from(SMALL)).step_by(2) {
+            if in_border(x, z, SMALL) {
+                continue;
+            }
+            let h = i64::from(w.columns.height(x, z));
+            for depth in 12..40 {
+                if let Some(m) = filled(at(w, x, h - depth, z)) {
+                    near.insert(m);
+                }
+            }
+            if let Some(m) = filled(at(w, x, h - 41, z))
+                && h - 41 >= 96
+                && w.columns.lowland(x, z) == 0
+            {
+                deep.insert(m);
+            }
+        }
+    }
+    for (name, id) in [
+        ("gravel", p.gravel),
+        ("clay", p.clay),
+        ("slate", p.slate),
+        ("stone", p.stone),
+    ] {
+        assert!(
+            near.contains(&id),
+            "no {name} pockets near the surface: {near:?}"
+        );
+    }
+    assert!(
+        near.len() >= 5,
+        "near-surface rock should be varied: {near:?}"
+    );
+    // Below the pocket zone only the rock band itself (and cave air) remains.
+    assert!(
+        deep.iter()
+            .all(|m| *m == p.stone || *m == p.sand || *m == p.sandstone),
+        "pockets leaked below the stack: {deep:?}"
+    );
 }

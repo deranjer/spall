@@ -6,7 +6,7 @@ use thiserror::Error;
 /// Bumped whenever the same `(spec, seed)` would produce different voxels.
 /// A saved world must never be regenerated over with a different version:
 /// modified bricks (including all-air tombstones) win over generated ones.
-pub const GEN_VERSION: u32 = 2;
+pub const GEN_VERSION: u32 = 3;
 
 /// Edge of a brick in cells (mirrors `spall_core::BRICK_EDGE`).
 pub const BRICK: i64 = 32;

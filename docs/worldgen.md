@@ -150,12 +150,26 @@ structure tests) and digging reveals the layers.
   `worldgen_walk` (256 cells in CI, `WALK_SIZE=1024 --release` for the full
   arena) walks a scripted player: 34 m, 98% grounded, one 0.9 mm correction.
 - **Torch (`T`).** Places the game's emissive lamp, the new `PLACE_LAMP` tool
-  (`GAME_RULES_VERSION` 3, reach 12 m), as a radius-2 ball (33 voxels, about
-  1.25 m across) against the surface under the crosshair. Smaller lamps do not
-  light anything: measured offscreen at night (`worldgen_torch_light`), ground a
-  metre away is 1.0x at radius 0 or 1, 1.6-3.1x at radius 2 and 2.7-20x at
-  radius 3, because the lighting cache cannot resolve an emitter under about
-  1 m. `worldgen_torch` checks the placement end to end.
+  (`GAME_RULES_VERSION` 3, reach 12 m, radius 0), as one voxel in the empty cell
+  against the surface under the crosshair: it fits in a crack and does not fill
+  the hole it lights. The renderer's lighting cache cannot resolve an emitter
+  smaller than about a metre (a lone lamp voxel lit nothing, and boosting its
+  emission did not help), so the window turns the nearest 8 emissive voxels into
+  real-time **point lights** (`spall_render::PointLight`: warm, 14 m range,
+  smooth falloff, no shadows, so light also leaks through thin walls). Measured
+  offscreen at night (`worldgen_torch_light`): ground a metre away is 3.9-5.7x
+  brighter. `worldgen_torch` checks the placement end to end.
+- **Colour jitter.** Terrain used one flat colour per material. Opaque,
+  non-emissive materials now get per-voxel variation in the opaque shader
+  (`Material::jitter`, brightness about +-14% plus a smaller per-channel drift,
+  hashed from the voxel the fragment lies in, so merged boxes keep their speed).
+  It applies to axis-aligned cube instances only (terrain), not rotated bodies,
+  and is client-side and cosmetic: no material ids, replication or saves change.
+- **Hammer latency.** A swing took most of a second to appear (500 ms rebuild
+  timer plus a 105-165 ms full window walk). The terrain draw is now cached per
+  brick (`TerrainInstanceCache`, keyed by the brick's and its neighbours'
+  revisions and the window clip) and a rebuild is dispatched as soon as the
+  replica's terrain generation changes: an edit rebuild is 1-4 ms (was 90-150).
 
 ## Not included
 Trees, grass, props, flowing rivers (water is initially static, filled to sea

@@ -99,6 +99,26 @@ struct Globals {
     sun: [f32; 4],
     sky_color: [f32; 4],
     ground_color: [f32; 4],
+    /// Point lights: position in `xyz`, range in `w`.
+    point_lights: [[f32; 4]; MAX_POINT_LIGHTS],
+    /// Point light colour times intensity in `rgb`.
+    point_colors: [[f32; 4]; MAX_POINT_LIGHTS],
+    /// Light count in `x`.
+    point_count: [f32; 4],
+}
+
+/// Most point lights the opaque pass shades with at once (the nearest ones).
+pub const MAX_POINT_LIGHTS: usize = 8;
+
+/// A real-time light for the opaque pass: no shadows, smooth falloff to zero at
+/// `radius` metres. Independent of the lighting cache, which cannot resolve an
+/// emitter smaller than about a metre.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointLight {
+    pub position: [f32; 3],
+    /// Linear colour times intensity.
+    pub color: [f32; 3],
+    pub radius: f32,
 }
 
 #[repr(C)]
@@ -133,6 +153,7 @@ pub struct ScenePipeline {
     shadow_layout: wgpu::BindGroupLayout,
     tone_layout: wgpu::BindGroupLayout,
     globals_buffer: wgpu::Buffer,
+    point_lights: std::sync::Mutex<Vec<PointLight>>,
     shadow_globals_buffers: Vec<wgpu::Buffer>,
     tone_globals_buffer: wgpu::Buffer,
     _shadow_texture: wgpu::Texture,
@@ -150,6 +171,14 @@ pub struct ScenePipeline {
 }
 
 impl ScenePipeline {
+    /// Sets the point lights the next frames are shaded with (the first
+    /// [`MAX_POINT_LIGHTS`] are used; pass the nearest ones).
+    pub fn set_point_lights(&self, lights: &[PointLight]) {
+        let mut slot = self.point_lights.lock().unwrap_or_else(|e| e.into_inner());
+        slot.clear();
+        slot.extend(lights.iter().take(MAX_POINT_LIGHTS).copied());
+    }
+
     pub fn new(device: &wgpu::Device) -> Self {
         Self::new_for_output(device, COLOR_FORMAT)
     }
@@ -351,6 +380,7 @@ impl ScenePipeline {
             shadow_layout,
             tone_layout,
             globals_buffer,
+            point_lights: std::sync::Mutex::new(Vec::new()),
             shadow_globals_buffers,
             tone_globals_buffer,
             _shadow_texture: shadow_texture,
@@ -452,7 +482,7 @@ impl ScenePipeline {
                     m.roughness.clamp(0.04, 1.0),
                     m.metallic.clamp(0.0, 1.0),
                     m.emissive.max(0.0),
-                    0.0,
+                    m.jitter.clamp(0.0, 0.5),
                 ],
             })
             .collect();
@@ -500,6 +530,20 @@ impl ScenePipeline {
         let [sr, sg, sb] = environment.sun_color;
         let [kr, kg, kb] = environment.sky;
         let [gr, gg, gb] = environment.ground;
+        let mut point_lights = [[0.0; 4]; MAX_POINT_LIGHTS];
+        let mut point_colors = [[0.0; 4]; MAX_POINT_LIGHTS];
+        let lights = self.point_lights.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, light) in lights.iter().enumerate() {
+            point_lights[i] = [
+                light.position[0],
+                light.position[1],
+                light.position[2],
+                light.radius,
+            ];
+            point_colors[i] = [light.color[0], light.color[1], light.color[2], 0.0];
+        }
+        let point_count = [lights.len() as f32, 0.0, 0.0, 0.0];
+        drop(lights);
         let globals = Globals {
             view_proj: camera.view_projection().to_cols_array_2d(),
             view: camera.view().to_cols_array_2d(),
@@ -520,6 +564,9 @@ impl ScenePipeline {
             sun: [sr, sg, sb, environment.sun_intensity],
             sky_color: [kr, kg, kb, 0.0],
             ground_color: [gr, gg, gb, 0.0],
+            point_lights,
+            point_colors,
+            point_count,
         };
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
         device.create_bind_group(&wgpu::BindGroupDescriptor {

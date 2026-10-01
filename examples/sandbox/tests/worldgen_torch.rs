@@ -162,20 +162,18 @@ fn a_torch_places_a_lamp_the_client_replica_sees() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    // A radius-2 ball: its neighbours are lamp too, but a few cells away the
-    // ground and the air are untouched.
+    // One voxel: neighbours, the air above and the ground below are untouched.
     let at = |dx: i64, dy: i64, dz: i64| {
         sample(&replica, GlobalCell::new(x + dx, ground_y + 1 + dy, z + dz))
     };
-    assert_eq!(at(1, 0, 0), lamp, "one cell aside is lamp");
-    assert_ne!(at(3, 0, 0), lamp, "three cells aside is not");
+    assert_ne!(at(1, 0, 0), lamp, "a torch is one voxel");
     assert!(
-        matches!(at(0, 3, 0), Some(Sample::Empty { .. })),
+        matches!(at(0, 1, 0), Some(Sample::Empty { .. })),
         "air above the torch"
     );
     assert!(
-        matches!(at(0, -3, 0), Some(Sample::Filled(m)) if m != game::materials::LAMP),
-        "the ground under the ball is still ground"
+        matches!(sample(&replica, ground), Some(Sample::Filled(m)) if m != game::materials::LAMP),
+        "the ground under the torch is still ground"
     );
 
     session.request_stop();

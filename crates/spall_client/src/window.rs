@@ -223,7 +223,7 @@ pub fn run_interactive_window_with_options(
         .iter()
         .map(|def| (def.id.0, def.name.clone()))
         .collect();
-    let mut render_materials = materials_from_manifest(&materials);
+    let mut render_materials = terrain_render_materials(&materials);
     let debug_material = render_materials.len() as u32;
     render_materials.push(spall_render::Material::new([0.02, 0.9, 0.9], 0.5, 0.0).emissive(2.0));
 
@@ -368,6 +368,8 @@ struct InteractiveApp {
     /// the centre of the most recent request, which may still be in flight.
     last_built_pos: Option<[f64; 3]>,
     last_dispatch_at: Option<Instant>,
+    /// The replica terrain generation the last rebuild request was issued for.
+    last_dispatch_generation: Option<u64>,
     /// One-sample-delayed camera interpolation and correction smoothing.
     /// Keeping the two newest mover publications prevents forward
     /// extrapolation from overshooting the actual stop point.
@@ -408,6 +410,9 @@ struct InteractiveApp {
     last_hammer_at: Option<Instant>,
     hammer_radius: i64,
     next_action_id: u64,
+    /// Emissive terrain boxes of the last rebuild (torches, lamps), for the
+    /// per-frame point-light selection.
+    emitter_instances: Vec<Instance>,
     /// The solid cell under the crosshair, refreshed every frame.
     hammer_target: Option<(GlobalCell, MaterialId)>,
     /// Material names by id, for the crosshair label.
@@ -480,13 +485,33 @@ pub fn rebuild_pass(
     last_sky: &mut Option<spall_render::indirect::LightingVolume>,
     absent_is_open: bool,
 ) -> Option<RebuildOutcome> {
+    rebuild_pass_cached(
+        replica,
+        center_m,
+        sky_anchor,
+        last_sky,
+        absent_is_open,
+        &mut TerrainInstanceCache::new(),
+    )
+}
+
+/// [`rebuild_pass`] reusing `cache` across passes (what the rebuild worker
+/// does): only bricks whose revisions changed are recomputed.
+pub fn rebuild_pass_cached(
+    replica: &Arc<Mutex<ReplicaWorld>>,
+    center_m: [f64; 3],
+    sky_anchor: &mut Option<[f64; 3]>,
+    last_sky: &mut Option<spall_render::indirect::LightingVolume>,
+    absent_is_open: bool,
+    cache: &mut TerrainInstanceCache,
+) -> Option<RebuildOutcome> {
     let volume = replica
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .terrain_volume()
         .cloned()?;
     let start = Instant::now();
-    let instances = build_instances(&volume, center_m);
+    let instances = build_instances_cached(&volume, center_m, cache);
     // Keep the cache where it is until the player has moved far enough to
     // matter, so a stationary or slowly moving player produces an identical
     // grid and no lighting recompute.
@@ -524,16 +549,18 @@ impl RebuildWorker {
             .spawn(move || {
                 let mut sky_anchor: Option<[f64; 3]> = None;
                 let mut last_sky: Option<spall_render::indirect::LightingVolume> = None;
+                let mut terrain_cache = TerrainInstanceCache::new();
                 for center_m in request_rx {
                     let Some(replica) = session.replica.get() else {
                         continue;
                     };
-                    let Some(outcome) = rebuild_pass(
+                    let Some(outcome) = rebuild_pass_cached(
                         replica,
                         center_m,
                         &mut sky_anchor,
                         &mut last_sky,
                         absent_is_open,
+                        &mut terrain_cache,
                     ) else {
                         continue;
                     };
@@ -872,6 +899,7 @@ impl InteractiveApp {
             body_worker,
             last_built_pos: None,
             last_dispatch_at: None,
+            last_dispatch_generation: None,
             camera_follow: CameraFollow::default(),
             hud: Hud::default(),
             last_terrain_instances: Vec::new(),
@@ -889,6 +917,7 @@ impl InteractiveApp {
             last_hammer_at: None,
             hammer_radius: HAMMER_RADIUS_DEFAULT,
             next_action_id: HAMMER_REQUEST_BASE,
+            emitter_instances: Vec::new(),
             hammer_target: None,
             material_names: std::collections::BTreeMap::new(),
             water_key: None,
@@ -1265,6 +1294,16 @@ impl ApplicationHandler for InteractiveApp {
                     self.hud
                         .record_rebuild(outcome.elapsed, outcome.instances.len());
                     self.last_built_pos = Some(outcome.center_m);
+                    self.emitter_instances = outcome
+                        .instances
+                        .iter()
+                        .filter(|i| {
+                            self.render_materials
+                                .get(i.material as usize)
+                                .is_some_and(|m| m.emissive > 0.0)
+                        })
+                        .copied()
+                        .collect();
                     self.last_terrain_instances = outcome.instances;
                     self.terrain_dirty = true;
                     if let Some(sky) = outcome.sky {
@@ -1293,12 +1332,24 @@ impl ApplicationHandler for InteractiveApp {
                     // At most one request in flight — a faster player than the
                     // worker can keep up with just rides on a slightly stale
                     // draw rather than queuing requests it'll never need.
+                    // An edit landing (the replica's terrain generation moved)
+                    // redraws at once: the per-brick cache makes that cheap, and
+                    // waiting for the recheck timer made a hammer swing take
+                    // most of a second to show.
+                    let generation = self
+                        .session
+                        .replica
+                        .get()
+                        .and_then(|r| r.try_lock().ok().map(|g| g.terrain_generation()));
+                    let terrain_changed =
+                        generation.is_some() && generation != self.last_dispatch_generation;
                     if !self.rebuild.in_flight
-                        && (moved_far_enough || due_for_recheck)
+                        && (moved_far_enough || due_for_recheck || terrain_changed)
                         && self.rebuild.request_tx.send(feet).is_ok()
                     {
                         self.rebuild.in_flight = true;
                         self.last_dispatch_at = Some(now);
+                        self.last_dispatch_generation = generation;
                     }
                 }
 
@@ -1510,6 +1561,13 @@ impl ApplicationHandler for InteractiveApp {
                             }
                             _ => None,
                         };
+                        if let Some((eye, _)) = cam {
+                            renderer.scene.set_point_lights(&emitter_point_lights(
+                                &self.emitter_instances,
+                                &self.render_materials,
+                                eye,
+                            ));
+                        }
                         renderer.set_crosshair((!self.admin_menu_open && cam.is_some()).then(
                             || CrosshairView {
                                 in_reach: self.hammer_target.is_some(),
@@ -1844,18 +1902,150 @@ fn view_dir_from(yaw: f32, pitch: f32) -> [f32; 3] {
 /// reason: instrumentation that needs the real geometry-building pipeline
 /// without a background worker.
 pub fn build_instances(volume: &Volume, center_m: [f64; 3]) -> Vec<Instance> {
-    let cell_m = f64::from(CELL_M);
-    greedy_boxes(visible_cells(volume, center_m))
-        .into_iter()
-        .map(|(material, min, size)| Instance {
-            offset: [0, 1, 2].map(|a| ((min[a] as f64 + size[a] as f64 * 0.5) * cell_m) as f32),
-            material: u32::from(material.0),
-            size: [0, 1, 2].map(|a| (size[a] as f64 * cell_m) as f32),
-            _pad: 0.0,
-            rotation: IDENTITY_ROTATION,
-        })
-        .collect()
+    build_instances_cached(volume, center_m, &mut TerrainInstanceCache::new())
 }
+
+/// Per-brick results of [`build_instances_cached`], keyed by the brick's own
+/// revision and its six neighbours' (the buried test reads their faces) plus
+/// the part of it inside the view window. An edit changes one brick's revision,
+/// so the next rebuild recomputes that brick and its neighbours and reuses the
+/// rest: a hammer swing costs milliseconds, not a full window walk.
+pub struct TerrainInstanceCache {
+    bricks: std::collections::HashMap<spall_core::BrickCoord, (u64, Vec<Instance>)>,
+    grid: BrickGrid,
+}
+
+impl TerrainInstanceCache {
+    pub fn new() -> Self {
+        Self {
+            bricks: std::collections::HashMap::new(),
+            grid: BrickGrid::new(),
+        }
+    }
+
+    /// Bricks currently cached (tests and diagnostics).
+    pub fn len(&self) -> usize {
+        self.bricks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bricks.is_empty()
+    }
+}
+
+impl Default for TerrainInstanceCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The inclusive cell window the terrain draw covers around `center_m`.
+fn view_window(center_m: [f64; 3]) -> (GlobalCell, GlobalCell) {
+    let cell_m = f64::from(CELL_M);
+    let center_cell = GlobalCell::new(
+        (center_m[0] / cell_m).floor() as i64,
+        (center_m[1] / cell_m).floor() as i64,
+        (center_m[2] / cell_m).floor() as i64,
+    );
+    let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
+    let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
+    let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
+    (
+        GlobalCell::new(
+            center_cell.x - horiz,
+            center_cell.y - down,
+            center_cell.z - horiz,
+        ),
+        GlobalCell::new(
+            center_cell.x + horiz,
+            center_cell.y + up,
+            center_cell.z + horiz,
+        ),
+    )
+}
+
+/// [`build_instances`], reusing the boxes of every brick whose cache key is
+/// unchanged. Boxes are merged within a brick (not across bricks), so a flat
+/// surface costs one box per brick it crosses.
+pub fn build_instances_cached(
+    volume: &Volume,
+    center_m: [f64; 3],
+    cache: &mut TerrainInstanceCache,
+) -> Vec<Instance> {
+    use std::hash::{Hash, Hasher};
+    let cell_m = f64::from(CELL_M);
+    let edge = i64::from(spall_core::BRICK_EDGE);
+    let (min, max) = view_window(center_m);
+    let (min_brick, _) = min.split();
+    let (max_brick, _) = max.split();
+    let revision = |c: spall_core::BrickCoord| {
+        volume
+            .brick_revision(c)
+            .ok()
+            .flatten()
+            .map_or(0, |r| r.get() + 1)
+    };
+    let mut instances = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    for bz in min_brick.z..=max_brick.z {
+        for by in min_brick.y..=max_brick.y {
+            for bx in min_brick.x..=max_brick.x {
+                let coord = spall_core::BrickCoord::new(bx, by, bz);
+                let own = revision(coord);
+                if own == 0 {
+                    continue; // not resident: nothing to draw, nothing cached
+                }
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                own.hash(&mut hasher);
+                for [dx, dy, dz] in BRICK_NEIGHBOURS {
+                    revision(spall_core::BrickCoord::new(bx + dx, by + dy, bz + dz))
+                        .hash(&mut hasher);
+                }
+                // The window clips edge bricks differently as the centre moves.
+                for (m, v) in [(min.x, bx), (min.y, by), (min.z, bz)] {
+                    (m - v * edge).clamp(0, edge).hash(&mut hasher);
+                }
+                for (m, v) in [(max.x, bx), (max.y, by), (max.z, bz)] {
+                    (m - v * edge).clamp(-1, edge - 1).hash(&mut hasher);
+                }
+                let key = hasher.finish();
+                visited.insert(coord);
+                if let Some((cached_key, boxes)) = cache.bricks.get(&coord)
+                    && *cached_key == key
+                {
+                    instances.extend_from_slice(boxes);
+                    continue;
+                }
+                let mut cells = Vec::new();
+                brick_visible_cells(volume, &mut cache.grid, coord, min, max, &mut cells);
+                let boxes: Vec<Instance> = greedy_boxes(cells)
+                    .into_iter()
+                    .map(|(material, bmin, size)| Instance {
+                        offset: [0, 1, 2]
+                            .map(|a| ((bmin[a] as f64 + size[a] as f64 * 0.5) * cell_m) as f32),
+                        material: u32::from(material.0),
+                        size: [0, 1, 2].map(|a| (size[a] as f64 * cell_m) as f32),
+                        _pad: 0.0,
+                        rotation: IDENTITY_ROTATION,
+                    })
+                    .collect();
+                instances.extend_from_slice(&boxes);
+                cache.bricks.insert(coord, (key, boxes));
+            }
+        }
+    }
+    cache.bricks.retain(|coord, _| visited.contains(coord));
+    instances
+}
+
+const BRICK_NEIGHBOURS: [[i64; 3]; 6] = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1],
+];
 
 /// Merges unit cells into as few axis-aligned boxes as a greedy pass finds:
 /// runs along `x`, then runs of equal rows along `z`, then equal slabs along
@@ -1932,81 +2122,70 @@ fn brick_is_interior(volume: &Volume, coord: spall_core::BrickCoord) -> bool {
 
 /// Every exposed solid cell of `volume` inside the view window around
 /// `center_m`, with its material.
+#[cfg(test)]
 fn visible_cells(volume: &Volume, center_m: [f64; 3]) -> Vec<(MaterialId, [i64; 3])> {
-    let cell_m = f64::from(CELL_M);
-    let center_cell = GlobalCell::new(
-        (center_m[0] / cell_m).floor() as i64,
-        (center_m[1] / cell_m).floor() as i64,
-        (center_m[2] / cell_m).floor() as i64,
-    );
-    let horiz = (VIEW_RADIUS_M / CELL_M).ceil() as i64;
-    let up = (VIEW_HEIGHT_UP_M / CELL_M).ceil() as i64;
-    let down = (VIEW_HEIGHT_DOWN_M / CELL_M).ceil() as i64;
-    let min = GlobalCell::new(
-        center_cell.x - horiz,
-        center_cell.y - down,
-        center_cell.z - horiz,
-    );
-    let max = GlobalCell::new(
-        center_cell.x + horiz,
-        center_cell.y + up,
-        center_cell.z + horiz,
-    );
+    let (min, max) = view_window(center_m);
     let (min_brick, _) = min.split();
     let (max_brick, _) = max.split();
-    let edge = i64::from(spall_core::BRICK_EDGE);
-
     let mut cells = Vec::new();
     let mut grid = BrickGrid::new();
-    // Walk whole bricks: uniform air and fully buried uniform rock are skipped
-    // outright, and every other brick is scanned from a padded in-memory copy
-    // (see [`BrickGrid`]) rather than six volume lookups per solid cell, so the
-    // view window can be tall enough for hills and flight.
     for bz in min_brick.z..=max_brick.z {
         for by in min_brick.y..=max_brick.y {
             for bx in min_brick.x..=max_brick.x {
                 let coord = spall_core::BrickCoord::new(bx, by, bz);
-                let Ok(Some(brick)) = volume.snapshot_brick(coord) else {
-                    continue;
-                };
-                if !brick.is_dense()
-                    && brick.get(spall_core::LocalCell::new(0, 0, 0).expect("origin"))
-                        == MaterialId::AIR
-                {
-                    continue;
-                }
-                if brick_is_interior(volume, coord) {
-                    continue;
-                }
-                let base = GlobalCell::new(bx * edge, by * edge, bz * edge);
-                let lo = [
-                    (min.x - base.x).max(0),
-                    (min.y - base.y).max(0),
-                    (min.z - base.z).max(0),
-                ];
-                let hi = [
-                    (max.x - base.x).min(edge - 1),
-                    (max.y - base.y).min(edge - 1),
-                    (max.z - base.z).min(edge - 1),
-                ];
-                grid.load(volume, coord, &brick);
-                for z in lo[2]..=hi[2] {
-                    for y in lo[1]..=hi[1] {
-                        for x in lo[0]..=hi[0] {
-                            let material = grid.material(x, y, z);
-                            if material != 0 && !grid.buried(x, y, z) {
-                                cells.push((
-                                    MaterialId(material),
-                                    [base.x + x, base.y + y, base.z + z],
-                                ));
-                            }
-                        }
-                    }
-                }
+                brick_visible_cells(volume, &mut grid, coord, min, max, &mut cells);
             }
         }
     }
     cells
+}
+
+/// Appends the exposed solid cells of one brick that lie inside the window
+/// `min..=max`. Uniform air and fully buried uniform rock are skipped outright;
+/// every other brick is scanned from a padded in-memory copy (see
+/// [`BrickGrid`]) rather than six volume lookups per solid cell.
+fn brick_visible_cells(
+    volume: &Volume,
+    grid: &mut BrickGrid,
+    coord: spall_core::BrickCoord,
+    min: GlobalCell,
+    max: GlobalCell,
+    cells: &mut Vec<(MaterialId, [i64; 3])>,
+) {
+    let edge = i64::from(spall_core::BRICK_EDGE);
+    let Ok(Some(brick)) = volume.snapshot_brick(coord) else {
+        return;
+    };
+    if !brick.is_dense()
+        && brick.get(spall_core::LocalCell::new(0, 0, 0).expect("origin")) == MaterialId::AIR
+    {
+        return;
+    }
+    if brick_is_interior(volume, coord) {
+        return;
+    }
+    let base = GlobalCell::new(coord.x * edge, coord.y * edge, coord.z * edge);
+    let lo = [
+        (min.x - base.x).max(0),
+        (min.y - base.y).max(0),
+        (min.z - base.z).max(0),
+    ];
+    let hi = [
+        (max.x - base.x).min(edge - 1),
+        (max.y - base.y).min(edge - 1),
+        (max.z - base.z).min(edge - 1),
+    ];
+    grid.load(volume, coord, &brick);
+    for z in lo[2]..=hi[2] {
+        for y in lo[1]..=hi[1] {
+            for x in lo[0]..=hi[0] {
+                let material = grid.material(x, y, z);
+                if material != 0 && !grid.buried(x, y, z) {
+                    cells.push((MaterialId(material), [base.x + x, base.y + y, base.z + z]));
+                }
+            }
+        }
+    }
 }
 
 /// One brick's materials plus a one-cell solid halo from its six face
@@ -2551,6 +2730,72 @@ fn is_buried(volume: &Volume, cell: GlobalCell) -> bool {
 const WATER_MATERIAL: spall_render::Material =
     spall_render::Material::new([0.03, 0.16, 0.26], 0.08, 0.0).opacity(0.62);
 
+/// The render table for a manifest, as the interactive window draws it:
+/// [`materials_from_manifest`] plus per-voxel colour variation on every opaque,
+/// non-emissive material, so terrain is not one flat colour per material. The
+/// variation is computed in the shader, client-side and cosmetic only.
+pub fn terrain_render_materials(manifest: &MaterialManifest) -> Vec<spall_render::Material> {
+    let mut table = materials_from_manifest(manifest);
+    for material in &mut table {
+        if material.emissive == 0.0 && material.opacity >= 1.0 {
+            *material = material.jitter(TERRAIN_COLOR_JITTER);
+        }
+    }
+    table
+}
+
+/// Metres a torch's light reaches, and its intensity (colour x intensity).
+const TORCH_RADIUS_M: f32 = 14.0;
+const TORCH_INTENSITY: f32 = 26.0;
+/// Emitters farther than this from the camera are not considered.
+const TORCH_CONSIDER_M: f32 = 60.0;
+
+/// The point lights for the emissive voxels among `instances`: every instance
+/// whose material emits, as a warm light at its centre, the
+/// [`spall_render::MAX_POINT_LIGHTS`] nearest `eye` first. The lighting cache
+/// cannot resolve an emitter smaller than about a metre, so a lone torch voxel
+/// lights its surroundings through these instead.
+pub fn emitter_point_lights(
+    instances: &[Instance],
+    materials: &[spall_render::Material],
+    eye: Vec3,
+) -> Vec<spall_render::PointLight> {
+    let mut found: Vec<(f32, spall_render::PointLight)> = instances
+        .iter()
+        .filter_map(|i| {
+            let m = materials.get(i.material as usize)?;
+            (m.emissive > 0.0).then(|| {
+                let p = Vec3::from_array(i.offset);
+                let peak = m
+                    .base_color
+                    .iter()
+                    .copied()
+                    .fold(f32::MIN, f32::max)
+                    .max(1e-3);
+                (
+                    (p - eye).length_squared(),
+                    spall_render::PointLight {
+                        position: i.offset,
+                        color: m.base_color.map(|c| c / peak * TORCH_INTENSITY),
+                        radius: TORCH_RADIUS_M,
+                    },
+                )
+            })
+        })
+        .filter(|(d2, _)| *d2 <= TORCH_CONSIDER_M * TORCH_CONSIDER_M)
+        .collect();
+    found.sort_by(|a, b| a.0.total_cmp(&b.0));
+    found
+        .into_iter()
+        .take(spall_render::MAX_POINT_LIGHTS)
+        .map(|(_, light)| light)
+        .collect()
+}
+
+/// Per-voxel colour variation of terrain materials: brightness up to about
+/// +-18%, with a smaller per-channel drift (see `Material::jitter`).
+const TERRAIN_COLOR_JITTER: f32 = 0.18;
+
 /// Spectator flight speed, metres per second (`Shift` for the fast one).
 const FLY_SPEED_M_S: f32 = 12.0;
 const FLY_FAST_SPEED_M_S: f32 = 36.0;
@@ -2575,9 +2820,9 @@ const HAMMER_REQUEST_BASE: u64 = 2_000_000;
 /// The torch: the game's `PLACE_LAMP` tool, bound to `T`. It places a small
 /// emissive lamp ball against the surface under the crosshair.
 const TORCH_TOOL: u16 = 4;
-/// Radius in cells (2 = 33 voxels, about 1.25 m across): the smallest lamp the
-/// lighting cache resolves, so the smallest that actually lights its surroundings.
-pub const TORCH_RADIUS_CELLS: i64 = 2;
+/// Radius in cells: 0 = exactly one voxel, so a torch fits in a crack and does
+/// not fill the hole it lights.
+pub const TORCH_RADIUS_CELLS: i64 = 0;
 
 /// The `Cut` a hammer swing sends: aimed from the eye along the view. The
 /// claimed brush centre is ignored by the server (it uses its own hit cell);
@@ -4263,6 +4508,86 @@ mod perf_probe {
         assert!(volume_of(&near) < volume_of(&lake) * 0.5);
     }
 
+    fn sorted(mut v: Vec<Instance>) -> Vec<([u32; 3], [u32; 3], u32)> {
+        let mut out: Vec<_> = v
+            .drain(..)
+            .map(|i| {
+                (
+                    i.offset.map(f32::to_bits),
+                    i.size.map(f32::to_bits),
+                    i.material,
+                )
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// The per-brick cache must give exactly what a fresh build gives, before
+    /// and after an edit, and an edit must invalidate only the brick it touched
+    /// and its face neighbours.
+    #[test]
+    fn the_terrain_cache_matches_a_fresh_build_and_an_edit_invalidates_only_its_bricks() {
+        use spall_core::{BrickCoord, CellSizeCode, VolumeId};
+        use spall_voxel::EditPlan;
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        for bz in 0..4 {
+            for bx in 0..4 {
+                volume
+                    .insert_brick(
+                        BrickCoord::new(bx, 0, bz),
+                        spall_voxel::brick::Brick::uniform(
+                            MaterialId(1),
+                            spall_core::Revision::ZERO,
+                        ),
+                    )
+                    .unwrap();
+                volume
+                    .insert_brick(
+                        BrickCoord::new(bx, 1, bz),
+                        spall_voxel::brick::Brick::uniform(
+                            MaterialId::AIR,
+                            spall_core::Revision::ZERO,
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+        let center = [16.0, 8.0, 16.0];
+        let mut cache = TerrainInstanceCache::new();
+        let first = build_instances_cached(&volume, center, &mut cache);
+        assert_eq!(sorted(first), sorted(build_instances(&volume, center)));
+        let keys_before: std::collections::HashMap<_, _> =
+            cache.bricks.iter().map(|(c, (k, _))| (*c, *k)).collect();
+        assert!(!keys_before.is_empty());
+
+        // Dig a pit in the middle of brick (2, 0, 2)'s top face.
+        let mut plan = EditPlan::new(volume.id());
+        for dz in 0..3 {
+            for dx in 0..3 {
+                plan.set(GlobalCell::new(70 + dx, 31, 70 + dz), MaterialId::AIR);
+            }
+        }
+        volume.apply_edit(&plan).expect("dig");
+        let second = build_instances_cached(&volume, center, &mut cache);
+        assert_eq!(sorted(second), sorted(build_instances(&volume, center)));
+        let changed: Vec<_> = cache
+            .bricks
+            .iter()
+            .filter(|(c, (k, _))| keys_before.get(*c) != Some(k))
+            .map(|(c, _)| *c)
+            .collect();
+        assert!(!changed.is_empty(), "the edit must be seen");
+        // The edited brick and at most its six face neighbours.
+        assert!(changed.len() <= 7, "{changed:?}");
+        assert!(changed.contains(&BrickCoord::new(2, 0, 2)));
+        assert_eq!(
+            cache.len(),
+            keys_before.len(),
+            "no brick appeared or vanished"
+        );
+    }
+
     #[test]
     fn hammer_request_aims_along_the_view_and_clamps_the_radius() {
         let r = hammer_request(
@@ -4546,9 +4871,10 @@ mod perf_probe {
             !brick_is_interior(&volume, BrickCoord::new(0, 1, 1)),
             "edge brick has a missing neighbour"
         );
-        // A 96-cell cube's surface is 6 flat faces: 6 boxes, not ~55k cubes.
+        // A 96-cell cube's surface is 6 flat faces of 3 x 3 bricks: one box per
+        // brick face (54), not ~55k cubes.
         let boxes = build_instances(&volume, [12.0, 12.0, 12.0]);
-        assert_eq!(boxes.len(), 6, "{boxes:?}");
+        assert_eq!(boxes.len(), 54, "{boxes:?}");
     }
 
     #[test]

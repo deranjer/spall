@@ -46,7 +46,9 @@ pub use indirect::{
     LIGHT_CELL_SIZE_METRES, LIGHT_VOLUME_DIM, LightingRegion, LightingUpdate, LightingVolume,
 };
 pub use instances::{CubeInstance, CubeVertex, InstanceSet};
-pub use pipeline::{CASCADE_COUNT, DebugView, PassTiming, ScenePipeline};
+pub use pipeline::{
+    CASCADE_COUNT, DebugView, MAX_POINT_LIGHTS, PassTiming, PointLight, ScenePipeline,
+};
 pub use scene::{Material, Scene, SceneItem, default_materials, materials_from_manifest};
 pub use sky_visibility::{
     SKY_MAX_RAY_CELLS, SkyVisibility, UNKNOWN_CELL, cache_origin_around, mark_world_box,
