@@ -202,6 +202,36 @@ fn a_hammer_swing_digs_a_crater_the_client_replica_sees() {
             at.elapsed().as_secs_f64() * 1e3
         );
     }
+
+    // A second swing a few metres away, once the world is warm: what a player
+    // feels from the second click on. Detected by the replica's terrain hash.
+    std::thread::sleep(Duration::from_millis(500));
+    *committed_at.lock().unwrap() = None;
+    let before = replica.lock().unwrap().terrain_hash();
+    let swung = Instant::now();
+    session.push_action(hammer_request(
+        2_000_001,
+        eye + Vec3::new(4.0, 0.0, 1.0),
+        Vec3::NEG_Y,
+        3,
+    ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while replica.lock().unwrap().terrain_hash() == before {
+        assert!(Instant::now() < deadline, "the second swing never landed");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    println!(
+        "second swing, click to replica change: {:.0} ms",
+        swung.elapsed().as_secs_f64() * 1e3
+    );
+    if let Some(at) = *committed_at.lock().unwrap() {
+        println!(
+            "  server committed {:.0} ms after the click; the replica changed {:.0} ms after that",
+            at.saturating_duration_since(swung).as_secs_f64() * 1e3,
+            at.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
     // A crater of the brush's size: centre column down to the radius is gone,
     // well below it and well to the side are untouched.
     let at = |dx: i64, dy: i64, dz: i64| {

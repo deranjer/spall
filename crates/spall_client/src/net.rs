@@ -1154,6 +1154,11 @@ async fn run_async(
             conn.close("late join failed");
             return Err(e);
         }
+        // Hash every brick once now, off the first edit's critical path.
+        replica
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .warm_caches();
         log.write(&ProcessRecord::new(
             ProcessEvent::Ready,
             ProcessRole::Client,

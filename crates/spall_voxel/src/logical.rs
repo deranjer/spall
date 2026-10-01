@@ -356,12 +356,7 @@ pub fn logical_solid_cells(volume: &Volume, evicted: &EvictedBricks) -> Result<u
         let snap = volume
             .snapshot_brick(coord)?
             .expect("coord came from resident_brick_coords");
-        for index in 0..CELLS_PER_BRICK as u16 {
-            let cell = LocalCell::from_linear_index(index).expect("index < CELLS_PER_BRICK");
-            if !snap.get(cell).is_air() {
-                total += 1;
-            }
-        }
+        total += u64::from(snap.solid_cells());
     }
     Ok(total)
 }

@@ -7,7 +7,7 @@
 //! a dense layer whose cells are all equal hashes exactly like the uniform
 //! layer with that value.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use spall_core::{CELLS_PER_BRICK, LocalCell, MaterialId, Revision};
 
@@ -135,6 +135,17 @@ pub struct Brick {
     material: Layer,
     revision: Revision,
     edited: bool,
+    /// Memoized [`Brick::content_hash`] and [`Brick::solid_cells`]. Shared by
+    /// every clone and snapshot of the same contents, so a value computed on a
+    /// snapshot is remembered by the live brick; a mutation swaps in fresh,
+    /// empty cells, so no clone ever sees a value for different contents.
+    derived: Arc<Derived>,
+}
+
+#[derive(Debug, Default)]
+struct Derived {
+    hash: OnceLock<BrickHash>,
+    solid_cells: OnceLock<u32>,
 }
 
 impl Brick {
@@ -144,6 +155,7 @@ impl Brick {
             material: Layer::Uniform(material),
             revision,
             edited: false,
+            derived: Arc::default(),
         }
     }
 
@@ -223,6 +235,7 @@ impl Brick {
             return false;
         }
         self.material.make_dense_mut()[cell.linear_index() as usize] = material;
+        self.derived = Arc::default();
         true
     }
 
@@ -236,6 +249,10 @@ impl Brick {
     }
 
     pub(crate) fn mark_edited(&mut self) {
+        if !self.edited {
+            // The modified flag is part of the hash.
+            self.derived = Arc::default();
+        }
         self.edited = true;
     }
 
@@ -247,6 +264,31 @@ impl Brick {
     /// Representation-independent BLAKE3 hash over the authoritative layers and
     /// the modified flag. Dense-but-uniform hashes like uniform.
     pub fn content_hash(&self) -> BrickHash {
+        *self
+            .derived
+            .hash
+            .get_or_init(|| self.compute_content_hash())
+    }
+
+    /// Number of non-air cells. Uniform bricks answer without reading a cell;
+    /// dense bricks count once and remember the answer.
+    pub fn solid_cells(&self) -> u32 {
+        match &self.material {
+            Layer::Uniform(value) => {
+                if value.is_air() {
+                    0
+                } else {
+                    CELLS_PER_BRICK as u32
+                }
+            }
+            Layer::Dense(cells) => *self
+                .derived
+                .solid_cells
+                .get_or_init(|| cells.iter().filter(|c| !c.is_air()).count() as u32),
+        }
+    }
+
+    fn compute_content_hash(&self) -> BrickHash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&(BRICK_HASH_DOMAIN.len() as u32).to_le_bytes());
         hasher.update(BRICK_HASH_DOMAIN);
@@ -325,6 +367,11 @@ impl BrickSnapshot {
 
     pub fn content_hash(&self) -> BrickHash {
         self.0.content_hash()
+    }
+
+    /// Number of non-air cells (see [`Brick::solid_cells`]).
+    pub fn solid_cells(&self) -> u32 {
+        self.0.solid_cells()
     }
 }
 
@@ -478,5 +525,50 @@ mod tests {
         // High byte set too, so a byte-order mistake could not hide.
         brick.set_cell(cell(1, 2, 3), MaterialId(0xABCD));
         assert_eq!(brick.content_hash(), reference(&brick), "wide ids");
+    }
+
+    #[test]
+    fn cached_hash_and_solid_count_follow_every_change_and_survive_clones() {
+        let stone = MaterialId(1);
+        let mut brick = Brick::uniform(MaterialId::AIR, Revision(1));
+        assert_eq!(brick.solid_cells(), 0);
+        brick.set_cell(cell(1, 2, 3), stone);
+        brick.set_cell(cell(4, 5, 6), stone);
+        let first = (brick.content_hash(), brick.solid_cells());
+        assert_eq!(first.1, 2);
+        // A fresh brick with the same contents hashes the same without the cache.
+        let mut twin = Brick::uniform(MaterialId::AIR, Revision(9));
+        twin.set_cell(cell(1, 2, 3), stone);
+        twin.set_cell(cell(4, 5, 6), stone);
+        assert_eq!(twin.content_hash(), first.0);
+
+        // A snapshot shares the memoized values, and computing on it is
+        // remembered by the live brick.
+        let mut live = twin.clone();
+        let snap = live.snapshot();
+        assert_eq!(snap.content_hash(), first.0);
+
+        // Editing the live brick changes both values; the snapshot keeps its own.
+        live.set_cell(cell(7, 7, 7), stone);
+        assert_eq!(live.solid_cells(), 3);
+        assert_ne!(live.content_hash(), first.0);
+        assert_eq!(snap.solid_cells(), 2);
+        assert_eq!(snap.content_hash(), first.0);
+
+        // Removing the cell again restores the original hash.
+        live.set_cell(cell(7, 7, 7), MaterialId::AIR);
+        assert_eq!(live.content_hash(), first.0);
+        assert_eq!(live.solid_cells(), 2);
+
+        // The modified flag is part of the hash.
+        let before = live.content_hash();
+        live.mark_edited();
+        assert_ne!(live.content_hash(), before);
+
+        // Uniform bricks count without cells.
+        assert_eq!(
+            Brick::uniform(stone, Revision(1)).solid_cells(),
+            CELLS_PER_BRICK as u32
+        );
     }
 }

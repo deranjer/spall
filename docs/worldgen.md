@@ -179,10 +179,21 @@ structure tests) and digging reveals the layers.
   simulation is created; per-component facts (faces, anchor layer) are
   precomputed; and neighbouring bricks link through 32x32-bit face masks
   (`BrickLabels::face_mask`) instead of cell scans. Cut commit on the full arena:
-  3000 ms -> 135 ms (200-270 ms with the water region running); click to replica
-  change 3551 ms -> 358 ms (269 ms server + 89 ms client). What remains is the
-  whole-world result hash in the commit (~55 ms), a whole-world solid count
-  (~26 ms) and the water re-sync. On the client, the terrain draw is also cached
+  3000 ms -> 135 ms; then three more removals took it to 44-52 ms (60-70 ms
+  with the water running): (1) each brick memoizes its content hash and solid
+  count (`Brick::content_hash`/`solid_cells`, shared by clones and snapshots,
+  reset by any mutation), so a commit rehashes only the bricks it changed
+  instead of every brick, and `logical_solid_cells` no longer reads 32,768
+  cells per uniform brick; the client verifies each transaction with the same
+  hash, so its share fell from ~80 ms to ~7-12 ms; (2) the water region
+  re-captures its boundary (a scan of the whole fluid domain that also wakes the
+  solver) only when a committed terrain brick is at or within one brick of its
+  domain, not on every edit anywhere; (3) the server warms the label, hash and
+  count caches when the world is created and the client warms its hash caches
+  right after installing the baseline, so the first swing is not slower.
+  Measured click to replica change on the full arena (release, real server and
+  client): 3551 ms -> first swing 122 ms, later swings 91 ms (79 ms server +
+  12 ms client). The `worldgen_hammer` test prints both. On the client, the terrain draw is also cached
   per brick (`TerrainInstanceCache`, keyed by the revisions of the brick and its
   neighbours and the window clip) and rebuilt the moment the replica's terrain
   changes: 1-4 ms (was 90-150 ms). The topology contract is unchanged: the

@@ -252,3 +252,103 @@ fn measure_cut_latency_on_the_full_arena() {
         }
     }
 }
+
+/// The water boundary is re-captured (a scan of the whole fluid domain that
+/// also wakes the solver) exactly when a committed terrain brick is at or next
+/// to the domain; edits elsewhere leave the water alone.
+#[test]
+fn only_edits_near_the_water_refresh_its_boundary() {
+    use spall_core::units::{BRUSH_UNIT, BrushPoint};
+    use spall_core::{SphereBrush, player_entity_for};
+    use spall_protocol::RequestId;
+    use spall_sim::{EditIntent, EditTarget};
+
+    let scene = worldgen_scene::generate("showcase", 1, SMALL).expect("generate");
+    let spawn = scene.player_spawns()[0];
+    let columns = &scene.world().columns;
+    let water = scene.world().water.bounds.expect("the showcase has water");
+    let (lake_x, lake_z) = ((water.0.x + water.1.x) / 2, (water.0.z + water.1.z) / 2);
+
+    let mut config = SimulationConfig::new(scene.world_setup());
+    config.water = scene.water_setup().cloned();
+    let mut sim = Simulation::new(config).expect("stands up");
+    let player = player_entity_for(0);
+    sim.add_player(player, spawn);
+    for _ in 0..30 {
+        sim.tick().expect("tick");
+    }
+
+    // Cuts at the surface of the column `(x, z)`; returns (refreshed, any
+    // committed terrain brick near the domain).
+    let mut next_id = 1_u64;
+    let mut cut = |sim: &mut Simulation, x: i64, z: i64, depth: i64| -> (bool, bool) {
+        let y = i64::from(columns.height(x, z)) - depth;
+        let half = BRUSH_UNIT / 2;
+        let brush = SphereBrush::new(
+            BrushPoint::from_units(
+                x * BRUSH_UNIT + half,
+                y * BRUSH_UNIT + half,
+                z * BRUSH_UNIT + half,
+            ),
+            2 * BRUSH_UNIT,
+        )
+        .unwrap();
+        next_id += 1;
+        sim.submit(EditIntent::cut(
+            RequestId(next_id),
+            player,
+            EditTarget::Terrain,
+            brush,
+        ))
+        .expect("submit");
+        for _ in 0..60 {
+            let report = sim.tick().expect("tick");
+            if report.committed.is_empty() {
+                continue;
+            }
+            let terrain = sim.world().terrain_volume_id();
+            let region = sim.water().expect("water region installed");
+            let near = report.committed.iter().any(|(_, c)| {
+                c.topology
+                    .before
+                    .iter()
+                    .chain(&c.topology.after)
+                    .any(|b| b.volume == terrain && region.boundary_touched_by(b.coord))
+            });
+            let refreshed =
+                report.water.expect("water tick").boundary_refresh > std::time::Duration::ZERO;
+            return (refreshed, near);
+        }
+        panic!("cut at {x},{z} never committed");
+    };
+
+    // The invariant over several spots, and at least one cut that skipped the
+    // refresh because it was far from the lake.
+    let mut skipped = 0;
+    for (x, z) in [
+        (120, 120),
+        (150, 90),
+        (100, 150),
+        (200, 60),
+        (60, 70),
+        (180, 140),
+    ] {
+        let (refreshed, near) = cut(&mut sim, x, z, 1);
+        assert_eq!(
+            refreshed, near,
+            "cut at {x},{z}: refresh must follow nearness"
+        );
+        skipped += usize::from(!near);
+    }
+    assert!(
+        skipped >= 1,
+        "no cut was far enough from the lake to skip the refresh"
+    );
+
+    // A cut into the lake bed inside the fluid domain refreshes it.
+    let (refreshed, near) = cut(&mut sim, lake_x, lake_z, 1);
+    assert!(
+        near && refreshed,
+        "a cut at the lake must refresh the boundary"
+    );
+}

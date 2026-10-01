@@ -144,6 +144,14 @@ impl EditPipeline {
             &spall_structure::CancelToken::new(),
             &self.label_cache,
         );
+        // Also remember every brick's hash and solid count, which each commit
+        // (and a client verifying it) reads for the whole volume.
+        let terrain = &world.terrain().volume;
+        for coord in terrain.resident_brick_coords() {
+            if let Ok(Some(snapshot)) = terrain.snapshot_brick(coord) {
+                let _ = (snapshot.content_hash(), snapshot.solid_cells());
+            }
+        }
     }
 
     /// The committed [`Committed`] for `request_id`, if it has committed.
