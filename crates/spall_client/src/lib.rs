@@ -1,6 +1,7 @@
 //! Native render-window host and the client-side replica. GPU voxel extraction
 //! and transport wiring are added by later tasks.
 
+pub mod ecology_demo;
 pub mod grid_fluid_demo;
 pub mod interactive;
 pub mod net;
@@ -13,6 +14,7 @@ pub mod tick_accumulator;
 pub mod water_look;
 pub mod window;
 
+pub use ecology_demo::{EcologyDemoSetup, run_ecology_demo_window};
 pub use grid_fluid_demo::run_grid_fluid_demo_window;
 pub use interactive::{InteractiveSession, InteractiveView, LiveInput};
 pub use net::{

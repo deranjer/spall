@@ -2963,6 +2963,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spall_core",
+ "spall_ecology",
  "spall_fluid",
  "spall_jobs",
  "spall_mesh",

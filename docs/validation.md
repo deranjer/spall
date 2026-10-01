@@ -1042,3 +1042,12 @@ The headless example emits JSONL lifecycle events followed by one metrics record
 Report dimensions, plant/patch/seed counts, update interval, elapsed ecological time, work budget, final and peak deferred queue, accepted wood cells, per-step timing percentiles, generation/placement/run elapsed time, canonical encoded ecology-state bytes, and state digest. Encoded bytes exclude terrain storage and allocator overhead; do not describe them as process memory. Performance allocations remain targets until separately measured.
 
 Unknown and unloaded behavior, state continuation, deterministic proposals, seed expiry/region accounting, crowding, regrowth suitability, permanent branch damage, and stale/rejected acknowledgment are CPU tests. World persistence/journal recovery, networking, graphical vegetation, and production serving are not established here. See [ENG-116 report](reports/ENG-116.md).
+## ENG-117 interactive ecology showcase
+
+Run the local interactive ecology showcase with:
+
+```powershell
+cargo run -p sandbox --features client --bin sandbox-client -- --ecology-demo
+```
+
+The window uses generated showcase terrain and a private `Simulation` instance. It is an inspection fixture and does not connect to or save a server world. Controls: **Space** pause/resume ecological time; **.** advance one ecology interval while paused; **+/-** select 1x, 4x, or 16x; **H** harvest grass; **B** cut a grown branch; **X** destroy the root; **WASD/QE** fly; click to capture the mouse, **Esc** release it. The HUD reports ecology time, speed, grass biomass, plant stage/count, and seed count. `cargo test -p spall_client ecology_demo::tests` covers the deterministic clock controls. A real desktop GPU/window presentation pass must be recorded separately from the CPU checks.
