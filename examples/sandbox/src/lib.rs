@@ -20,3 +20,5 @@ pub fn init_tracing() {
 
 #[cfg(feature = "client")]
 pub mod ecology_scene;
+
+pub mod vegetation;

@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running tests\vegetation.rs (target\debug\deps\vegetation-550031b5bef0b92e.exe)
+
+running 6 tests
+test offspring_remain_on_allowed_biomes_and_survive_roundtrip ... ok
+test seasons_persist_and_deciduous_trees_drop_only_their_leaves ... ok
+test root_cuts_stop_reproduction_and_ground_plants_do_not_float_after_excavation ... ok
+test generated_world_is_deterministic_grounded_and_biome_filtered ... ok
+test authoritative_growth_and_checkpoint_recovery_keep_the_same_living_state ... ok
+test two_network_clients_receive_generated_vegetation_and_the_same_season ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.58s
+

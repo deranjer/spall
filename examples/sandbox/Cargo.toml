@@ -66,3 +66,8 @@ zstd.workspace = true
 image.workspace = true
 spall_jobs.workspace = true
 wgpu.workspace = true
+
+[[example]]
+name = "vegetation-gallery"
+path = "examples/vegetation_gallery.rs"
+required-features = ["client"]

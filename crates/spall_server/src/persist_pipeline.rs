@@ -575,6 +575,7 @@ mod tests {
     fn dummy_checkpoint() -> Checkpoint {
         use spall_store::{STORE_SCHEMA_VERSION, StoredWorldMeta};
         Checkpoint {
+            vegetation: Vec::new(),
             tick: 1,
             journal_cursor: 0,
             world_hash: [0; 32],

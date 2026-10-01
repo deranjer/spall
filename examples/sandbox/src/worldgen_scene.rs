@@ -30,6 +30,8 @@ pub enum WorldgenSceneError {
     UnknownPreset(String),
     #[error("world generation failed: {0}")]
     Generate(#[from] GenError),
+    #[error("vegetation: {0}")]
+    Vegetation(String),
     #[error("water domain: {0}")]
     WaterDomain(String),
 }
@@ -41,6 +43,7 @@ pub const DEFAULT_SIZE_CELLS: u32 = SHOWCASE_SIZE_CELLS;
 pub struct GeneratedScene {
     world: Arc<GeneratedWorld>,
     water: Option<WaterSetup>,
+    vegetation: spall_ecology::living::LivingState,
 }
 
 /// Generates the named preset. Deterministic in `(preset, seed, size_cells)`.
@@ -49,14 +52,43 @@ pub fn generate(
     seed: u64,
     size_cells: u32,
 ) -> Result<GeneratedScene, WorldgenSceneError> {
+    generate_with_season(
+        preset,
+        seed,
+        size_cells,
+        spall_ecology::living::Season::Summer,
+    )
+}
+
+pub fn generate_with_season(
+    preset: &str,
+    seed: u64,
+    size_cells: u32,
+    season: spall_ecology::living::Season,
+) -> Result<GeneratedScene, WorldgenSceneError> {
     let preset = Preset::from_name(preset)
         .ok_or_else(|| WorldgenSceneError::UnknownPreset(preset.into()))?;
     let spec = WorldGenSpec::new(preset, seed, size_cells, crate::game::terrain_palette());
-    let world = spall_worldgen::generate(&spec)?;
+    let mut world = spall_worldgen::generate(&spec)?;
+    let spawns = world
+        .spawns
+        .iter()
+        .map(|p| p.map(|v| (v / 0.25).floor() as i64))
+        .collect();
+    let vegetation = spall_ecology::living::LivingState::generate(
+        seed,
+        &world.columns,
+        &mut world.terrain,
+        crate::vegetation::catalogue(),
+        spawns,
+        season,
+    )
+    .map_err(WorldgenSceneError::Vegetation)?;
     let water = water_setup(&world.water)?;
     Ok(GeneratedScene {
         world: Arc::new(world),
         water,
+        vegetation,
     })
 }
 
@@ -94,6 +126,10 @@ pub fn water_setup(plan: &WaterPlan) -> Result<Option<WaterSetup>, WorldgenScene
 }
 
 impl GeneratedScene {
+    pub fn vegetation(&self) -> &spall_ecology::living::LivingState {
+        &self.vegetation
+    }
+
     pub fn world(&self) -> &GeneratedWorld {
         &self.world
     }
@@ -129,7 +165,9 @@ impl GeneratedScene {
     pub fn into_custom_world(self) -> CustomWorld {
         let spawns = self.world.spawns.clone();
         let water = self.water.clone();
+        let vegetation = self.vegetation.clone();
         let scene = Arc::new(self);
         CustomWorld::new_with_water(spawns, water, move || scene.world_setup())
+            .with_vegetation(vegetation)
     }
 }

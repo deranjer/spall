@@ -1824,6 +1824,12 @@ impl ApplicationHandler for InteractiveApp {
                 if let Some(look) = water_update {
                     renderer.set_water_look(look);
                 }
+                renderer.vegetation_frame = self
+                    .session
+                    .vegetation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 if self.sky_dirty {
                     let occupancy = self.last_sky.as_ref().filter(|_| self.sky_visibility_on);
                     // Nothing to upload yet (no rebuild has landed) keeps the
@@ -4106,6 +4112,10 @@ pub(super) struct WorldRenderer {
     /// Reserved material and instances used only by the ENG-103 inspection
     /// viewer; the normal game material table remains opaque.
     debug_water_material: u32,
+    vegetation_material: u32,
+    vegetation_frame: Option<Arc<spall_ecology::living::VisualFrame>>,
+    vegetation_key: Option<(u64, i64, i64)>,
+    vegetation_instances: Vec<Instance>,
     /// Water as merged boxes, unclipped; the per-frame draw list in
     /// `debug_water_instances` is this clipped to the terrain window.
     /// The hammer crosshair and its label; `None` hides it (cursor not captured).
@@ -4454,6 +4464,14 @@ impl WorldRenderer {
         let debug_water_material = render_materials.len() as u32;
         // Water is presentation-only and drawn alpha-blended over the scene.
         render_materials.push(WATER_MATERIAL);
+        let vegetation_material = render_materials.len() as u32;
+        for colour in spall_ecology::living::PALETTE {
+            render_materials.push(spall_render::Material::new(
+                colour.map(|c| (f32::from(c) / 255.).powf(2.2)),
+                0.9,
+                0.0,
+            ));
+        }
         let scene = GameRenderer::new(
             &device,
             &queue,
@@ -4473,6 +4491,10 @@ impl WorldRenderer {
             surface_config,
             scene,
             debug_water_material,
+            vegetation_material,
+            vegetation_frame: None,
+            vegetation_key: None,
+            vegetation_instances: Vec::new(),
             crosshair: None,
             debug_water_source: Vec::new(),
             water_window: None,
@@ -4751,6 +4773,37 @@ impl WorldRenderer {
             .map_err(|error| ClientError::Render(error.to_string()))?;
         self.scene
             .set_water_time(self.water_epoch.elapsed().as_secs_f32());
+        if let Some((eye, _)) = cam {
+            if let Some(frame) = &self.vegetation_frame {
+                let key = (
+                    frame.time_ms,
+                    (eye.x / 4.).floor() as i64,
+                    (eye.z / 4.).floor() as i64,
+                );
+                if self.vegetation_key != Some(key) {
+                    self.vegetation_key = Some(key);
+                    self.vegetation_instances = frame
+                        .parts(eye.to_array(), 48.)
+                        .into_iter()
+                        .map(|part| {
+                            Instance::new(
+                                part.center,
+                                self.vegetation_material + u32::from(part.colour),
+                                part.size,
+                                (glam::Quat::from_rotation_y(part.yaw)
+                                    * glam::Quat::from_rotation_z(part.lean))
+                                .to_array(),
+                            )
+                        })
+                        .collect();
+                }
+            } else {
+                self.vegetation_key = None;
+                self.vegetation_instances.clear();
+            }
+            self.scene
+                .set_vegetation(&self.device, &self.queue, &self.vegetation_instances);
+        }
         self.clip_water();
         if let Some((eye, _)) = cam {
             self.debug_water_instances.sort_by(|a, b| {

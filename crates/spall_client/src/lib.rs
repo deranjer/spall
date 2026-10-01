@@ -28,7 +28,7 @@ pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
 pub use residency::{ClientResidency, ClientResidencyPass, MAX_RELOAD_REQUESTS_PER_STEP};
 pub use spall_render::{Environment, EnvironmentPreset};
 pub use window::{
-    InteractiveOptions, ShotStep, parse_shots, run_interactive_window,
+    InteractiveOptions, ShotStep, build_instances, parse_shots, run_interactive_window,
     run_interactive_window_with_environment, run_interactive_window_with_game_content,
     run_interactive_window_with_manifest, run_interactive_window_with_options,
     run_interactive_window_with_progression,

@@ -1,0 +1,32 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running tests\durability.rs (target\debug\deps\durability-ffe45aeb918ef990.exe)
+
+running 25 tests
+test disk_full_on_checkpoint_poisons_and_keeps_prior_checkpoint ... ok
+test crash_after_checkpoint_commit_keeps_the_new_checkpoint ... ok
+test disk_fault_on_journal_prevents_false_success ... ok
+test disk_fault_on_checkpoint_prevents_false_success ... ok
+test crash_after_journal_commit_keeps_the_durable_prefix ... ok
+test journal_commit_is_durable_and_acknowledged ... ok
+test interior_journal_corruption_truncates_and_reports_with_fallback ... ok
+test an_empty_database_is_distinct_from_one_whose_checkpoints_do_not_decode ... ok
+test full_journal_prune_then_reopen_then_edit_never_reuses_sequences ... ok
+test crash_before_journal_commit_loses_the_batch_cleanly ... ok
+test open_verifies_wal_and_full_sync_and_reopen_is_clean ... ok
+test harvest_outbox_and_world_journal_share_one_crash_boundary ... ok
+test metrics_expose_bytes_and_commit_rate ... ok
+test crash_transfer_recovers_whole_split_or_none_never_partial ... ok
+test real_sqlite_write_failure_on_checkpoint_poisons_and_keeps_prior_checkpoint ... ok
+test save_air_brick_stays_empty_across_restart ... ok
+test legacy_schema_two_vegetation_backfill_preserves_world_and_detects_missing_rows ... ok
+test crash_around_checkpoint_publication_leaves_no_partial_checkpoint ... ok
+test retain_drops_old_checkpoints_and_covered_journal ... ok
+test real_sqlite_write_failure_on_journal_poisons_and_reports_no_success ... ok
+test review_retention_must_preserve_next_journal_sequence ... ok
+test schema_newer_than_supported_is_rejected_without_touching_data ... ok
+test missing_or_corrupt_water_checkpoint_never_restores_a_silent_dry_world ... ok
+test schema_one_water_migration_copies_and_verifies_without_editing_source ... ok
+test unsupported_save_versions_are_rejected_before_changing_rollback_journal_mode ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+

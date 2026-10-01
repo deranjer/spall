@@ -1069,3 +1069,10 @@ and structured state counts at 0, 3, 12, and 30 ecological seconds, then after
 branch/root cuts. It does not open a window or validate mouse/keyboard interaction.
 Grass and foliage remain visual instances, not solid occupancy or physics bodies.
 Wood retains 0.25 m cells; greedy merging changes draw boxes, never cell resolution.
+
+
+### ENG-118 seasonal generated-world vegetation
+
+Run cargo test -p sandbox --features client --test vegetation for deterministic biome/grounding, allowed offspring, four-season leaves, root/soil destruction, normal committed wood growth, exact checkpoint/journal recovery and two real QUIC clients including a late joiner. Run cargo test -p spall_protocol vegetation::tests for bounded chunk framing/repair, and cargo xtask check for the repository-wide gate.
+
+GPU evidence: cargo run -p sandbox --features client --example vegetation-gallery -- .local/vegetation-gallery produces ten generated tree and ten generated ground specimens in four seasons through production geometry/shadows. Live launch: cargo xtask play --worldgen showcase --seed 1 --worldgen-size 512 --season autumn. Every generated size and editor Run in game use the common factory. Hardware performance and manual traversal remain separate. Details: docs/reports/ENG-118-vegetation.md.

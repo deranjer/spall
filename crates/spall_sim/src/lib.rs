@@ -104,3 +104,5 @@ pub use world::{
     WorldSetup, canonical_logical_volume_for, canonical_volume_for, solid_cells,
     volume_topology_hash_for,
 };
+
+mod vegetation;

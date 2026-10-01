@@ -11,6 +11,8 @@ too_many_arguments = "allow"
 [dependencies]
 glam.workspace = true
 spall_core.workspace = true
+spall_ecology.workspace = true
+spall_worldgen.workspace = true
 spall_jobs.workspace = true
 spall_fluid = { path = "../spall_fluid" }
 spall_physics.workspace = true

@@ -426,3 +426,10 @@ it into the live replica instead of replacing it. Reconnect reuses the
 `spall_net` session slot with an incremented generation; the server tracks the
 highest generation seen per slot and rejects any `ActionRequest` /
 `RepairRequest` stamped with a lower one.
+
+
+### ENG-118 vegetation records
+
+Wire tag 19 is version-1 VegetationSnapshot under envelope schema 3: tick, ordered chunk index/count, BLAKE3 digest, up to 48 KiB payload, 4 MiB complete assembly bound. One-second self-contained presentation keyframes also repair late joiners. Replacing baselines clear plants and discard older frame ticks. Matched new client/server builds are required to display tag 19.
+
+Store schema 2 gains a checksummed checkpoint_vegetation auxiliary row in the same publication transaction. First-time table creation backfills old checkpoints with empty vegetation; recovery never reseeds an existing save. JournalPayload appends VegetationState and VegetationClock without changing previous discriminants. Full state follows committed topology; small time_ms/credit_ms records preserve the exact interval clock without writing a forest at 60 Hz. Pending uncommitted growth requests regenerate from acknowledged progress after recovery. DTO fields and limits: docs/reports/ENG-118-vegetation.md.

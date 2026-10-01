@@ -45,6 +45,7 @@ pub enum WireTag {
     AdminRequest = 16,
     AdminStatus = 17,
     WaterDelta = 18,
+    VegetationSnapshot = 19,
 }
 
 impl WireTag {
@@ -68,6 +69,7 @@ impl WireTag {
             16 => Self::AdminRequest,
             17 => Self::AdminStatus,
             18 => Self::WaterDelta,
+            19 => Self::VegetationSnapshot,
             _ => return None,
         })
     }

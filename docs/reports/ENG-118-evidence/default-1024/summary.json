@@ -1,0 +1,276 @@
+{
+  "counts": [
+    {
+      "count": 57,
+      "id": 1,
+      "name": "Oak"
+    },
+    {
+      "count": 66,
+      "id": 2,
+      "name": "Maple"
+    },
+    {
+      "count": 95,
+      "id": 3,
+      "name": "Birch"
+    },
+    {
+      "count": 110,
+      "id": 4,
+      "name": "Aspen"
+    },
+    {
+      "count": 55,
+      "id": 5,
+      "name": "Scots pine"
+    },
+    {
+      "count": 7,
+      "id": 6,
+      "name": "Spruce"
+    },
+    {
+      "count": 6,
+      "id": 7,
+      "name": "Larch"
+    },
+    {
+      "count": 11,
+      "id": 8,
+      "name": "Willow"
+    },
+    {
+      "count": 16,
+      "id": 9,
+      "name": "Cypress"
+    },
+    {
+      "count": 89,
+      "id": 10,
+      "name": "Acacia"
+    },
+    {
+      "count": 1204,
+      "id": 11,
+      "name": "Meadow grass"
+    },
+    {
+      "count": 1453,
+      "id": 12,
+      "name": "Fescue"
+    },
+    {
+      "count": 179,
+      "id": 13,
+      "name": "Alpine tussock"
+    },
+    {
+      "count": 176,
+      "id": 14,
+      "name": "Sedge"
+    },
+    {
+      "count": 140,
+      "id": 15,
+      "name": "Reed"
+    },
+    {
+      "count": 1010,
+      "id": 16,
+      "name": "Fern"
+    },
+    {
+      "count": 1191,
+      "id": 17,
+      "name": "Clover"
+    },
+    {
+      "count": 1092,
+      "id": 18,
+      "name": "Wildflower"
+    },
+    {
+      "count": 988,
+      "id": 19,
+      "name": "Desert bunchgrass"
+    },
+    {
+      "count": 410,
+      "id": 20,
+      "name": "Sage scrub"
+    }
+  ],
+  "frames": [
+    {
+      "group": "trees",
+      "instances": 37416,
+      "season": "spring",
+      "species": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    {
+      "group": "ground",
+      "instances": 175,
+      "season": "spring",
+      "species": [
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ]
+    },
+    {
+      "group": "trees",
+      "instances": 37416,
+      "season": "summer",
+      "species": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    {
+      "group": "ground",
+      "instances": 175,
+      "season": "summer",
+      "species": [
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ]
+    },
+    {
+      "group": "trees",
+      "instances": 37416,
+      "season": "autumn",
+      "species": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    {
+      "group": "ground",
+      "instances": 168,
+      "season": "autumn",
+      "species": [
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ]
+    },
+    {
+      "group": "trees",
+      "instances": 15505,
+      "season": "winter",
+      "species": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    {
+      "group": "ground",
+      "instances": 168,
+      "season": "winter",
+      "species": [
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ]
+    },
+    {
+      "eye": [
+        128.125,
+        42.20000076293945,
+        128.125
+      ],
+      "group": "generated-world",
+      "season": "summer",
+      "soft_instances": 149494,
+      "terrain_instances": 224287
+    },
+    {
+      "eye": [
+        128.125,
+        42.20000076293945,
+        128.125
+      ],
+      "group": "generated-world",
+      "season": "autumn",
+      "soft_instances": 149283,
+      "terrain_instances": 224287
+    },
+    {
+      "eye": [
+        128.125,
+        42.20000076293945,
+        128.125
+      ],
+      "group": "generated-world",
+      "season": "winter",
+      "soft_instances": 80318,
+      "terrain_instances": 224287
+    }
+  ],
+  "state_bytes": 556261
+}

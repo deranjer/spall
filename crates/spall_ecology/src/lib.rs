@@ -2031,3 +2031,6 @@ mod tests {
         );
     }
 }
+
+/// Biome-aware authoritative vegetation and seasonal presentation.
+pub mod living;

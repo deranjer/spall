@@ -151,6 +151,8 @@ pub struct StoredBrick {
 /// DB transaction is the checkpoint-publication contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Checkpoint {
+    /// Versioned ecology bytes; absent in older schema-2 checkpoints.
+    pub vegetation: Vec<u8>,
     /// Independently versioned water state in an auxiliary checkpoint row.
     pub water: Vec<spall_protocol::WaterState>,
     pub tick: u64,
@@ -218,6 +220,12 @@ pub enum JournalPayload {
     },
     /// Exact canonical water state after the topology records at this tick.
     WaterState(Vec<spall_protocol::WaterState>),
+    /// Appended: canonical vegetation after this tick's topology commits.
+    VegetationState(Vec<u8>),
+    VegetationClock {
+        time_ms: u64,
+        credit_ms: u64,
+    },
 }
 
 impl JournalPayload {
@@ -421,6 +429,7 @@ mod tests {
     #[test]
     fn checkpoint_postcard_round_trips() {
         let cp = Checkpoint {
+            vegetation: Vec::new(),
             tick: 120,
             journal_cursor: 5,
             world_hash: [3; 32],

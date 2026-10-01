@@ -23,6 +23,11 @@ use crate::dto::STORE_SCHEMA_VERSION;
 /// * `journal` — the ordered authoritative journal; `crc` is a BLAKE3-16 of
 ///   `payload` for interior-corruption detection.
 const SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS checkpoint_vegetation (
+    tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
+    state BLOB NOT NULL,
+    crc BLOB NOT NULL
+);
 CREATE TABLE checkpoint_water (
     tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE,
     state BLOB NOT NULL,
@@ -102,6 +107,20 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
                 return Err(StoreError::Corrupt(
                     "schema 2 is missing the water checkpoint table".into(),
                 ));
+            }
+            let has_vegetation: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='checkpoint_vegetation')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !has_vegetation {
+                // Creation and backfill must survive a crash together: an
+                // existing table with missing rows is deliberately corruption.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch("CREATE TABLE checkpoint_vegetation (tick INTEGER PRIMARY KEY REFERENCES checkpoints(tick) ON DELETE CASCADE, state BLOB NOT NULL, crc BLOB NOT NULL);")?;
+                let empty: Vec<u8> = Vec::new();
+                tx.execute("INSERT INTO checkpoint_vegetation (tick,state,crc) SELECT tick,?,? FROM checkpoints",rusqlite::params![&empty,crate::db::crc16(&empty).as_slice()])?;
+                tx.commit()?;
             }
             // Additive auxiliary table: does not alter any versioned world DTO.
             conn.execute_batch("CREATE TABLE IF NOT EXISTS game_outbox (event_id BLOB PRIMARY KEY CHECK (length(event_id) = 32), journal_seq INTEGER NOT NULL, payload BLOB NOT NULL) WITHOUT ROWID;")?;

@@ -10,3 +10,6 @@ spall_core.workspace = true
 spall_voxel.workspace = true
 spall_worldgen.workspace = true
 thiserror.workspace = true
+
+serde.workspace = true
+postcard.workspace = true

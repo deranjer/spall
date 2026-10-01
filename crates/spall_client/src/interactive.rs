@@ -325,6 +325,7 @@ pub struct InteractiveSession {
     /// ENG-105: newest replicated water keyframe (presentation only).
     pub water: Mutex<Option<Arc<spall_protocol::WaterKeyframe>>>,
     pub water_regions: Mutex<Vec<Arc<spall_protocol::WaterKeyframe>>>,
+    pub vegetation: Mutex<Option<Arc<spall_ecology::living::VisualFrame>>>,
     pub water_publications: std::sync::atomic::AtomicU64,
     /// Bumped each time an admin world reset replaced the replica.
     pub world_resets: std::sync::atomic::AtomicU64,
@@ -414,6 +415,7 @@ impl InteractiveSession {
     }
 
     pub fn clear_water(&self) {
+        *self.vegetation.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.water_regions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -454,6 +456,7 @@ impl InteractiveSession {
             action_queue: Mutex::new(Vec::new()),
             admin_queue: Mutex::new(Vec::new()),
             admin_status: Mutex::new(None),
+            vegetation: Mutex::new(None),
             water: Mutex::new(None),
             water_regions: Mutex::new(Vec::new()),
             water_publications: std::sync::atomic::AtomicU64::new(0),

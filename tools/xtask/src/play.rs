@@ -49,6 +49,8 @@ pub struct PlayArgs {
     /// from 128 to 4096. Defaults to the preset's 1024 (256 m).
     #[arg(long, requires = "worldgen")]
     worldgen_size: Option<u32>,
+    #[arg(long, default_value = "summer", value_parser = ["spring", "summer", "autumn", "winter"], requires = "worldgen")]
+    season: String,
     /// Lighting environment for the window: studio, daylight, overcast,
     /// sunset or night. Defaults to the environment saved in the
     /// `--editor-scene` file, else daylight.
@@ -177,6 +179,7 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             server_cmd
                 .args(["--worldgen", preset])
                 .args(["--seed", &args.world_seed.to_string()]);
+            server_cmd.args(["--season", &args.season]);
             if let Some(size) = args.worldgen_size {
                 server_cmd.args(["--worldgen-size", &size.to_string()]);
             }

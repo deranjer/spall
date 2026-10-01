@@ -69,6 +69,7 @@ pub struct SimulationConfig {
     /// Optional bounded, fully resident authoritative fluid region. `None`
     /// preserves non-fluid fixtures and existing worlds.
     pub water: Option<crate::water::WaterSetup>,
+    pub vegetation: Option<spall_ecology::living::LivingState>,
 }
 
 impl SimulationConfig {
@@ -84,6 +85,7 @@ impl SimulationConfig {
             max_pending_intents: Self::DEFAULT_MAX_PENDING_INTENTS,
             serialize_threshold: Self::DEFAULT_SERIALIZE_THRESHOLD,
             water: None,
+            vegetation: None,
         }
     }
 }
@@ -114,14 +116,15 @@ pub struct ContactDamageReport {
 
 /// The authoritative simulation.
 pub struct Simulation {
-    world: SimWorld,
+    pub(crate) world: SimWorld,
     pipeline: EditPipeline,
     journal: JournalSink,
-    tick: Tick,
+    pub(crate) tick: Tick,
     next_control_seq: u64,
     next_damage_seq: u64,
     water: Option<crate::water::AuthoritativeWater>,
     additional_water: Vec<crate::water::AuthoritativeWater>,
+    pub(crate) vegetation: Option<crate::vegetation::AuthoritativeVegetation>,
 }
 
 impl Simulation {
@@ -136,6 +139,7 @@ impl Simulation {
         physics_origin: PhysicsOrigin,
     ) -> Result<Self, crate::world::WorldError> {
         let water_setup = config.water;
+        let vegetation_setup = config.vegetation;
         let world = SimWorld::new_with_terrain_collider_mode_and_origin(
             config.world,
             config.terrain_collider_mode,
@@ -149,6 +153,7 @@ impl Simulation {
             next_control_seq: 1,
             next_damage_seq: 0,
             water: None,
+            vegetation: None,
             additional_water: Vec::new(),
         };
         if let Some(setup) = water_setup {
@@ -160,6 +165,11 @@ impl Simulation {
             );
         }
         simulation.pipeline.warm_labels(&simulation.world);
+        if let Some(state) = vegetation_setup {
+            simulation
+                .install_vegetation(state)
+                .map_err(crate::world::WorldError::VegetationInitialization)?;
+        }
         Ok(simulation)
     }
 
@@ -182,6 +192,7 @@ impl Simulation {
             // Canonical fluid state is added to checkpoints in ENG-105
             // increment 3; recovered simulations do not claim water yet.
             water: None,
+            vegetation: None,
             additional_water: Vec::new(),
         };
         simulation.pipeline.warm_labels(&simulation.world);
@@ -206,6 +217,7 @@ impl Simulation {
             pipeline,
             water,
             additional_water,
+            vegetation,
             ..
         } = fresh;
         let (f_entity, f_volume, f_transaction, f_journal_seq) = world.registry().counters();
@@ -219,6 +231,7 @@ impl Simulation {
         self.pipeline = pipeline;
         self.water = water;
         self.additional_water = additional_water;
+        self.vegetation = vegetation;
         Ok(())
     }
 
@@ -530,6 +543,7 @@ impl Simulation {
                     .map_err(|e| TickError::Water(e.to_string()))?,
             );
         }
+        self.advance_vegetation(&report)?;
         let physics_started = std::time::Instant::now();
         self.world.step_physics();
         let physics_duration = physics_started.elapsed();

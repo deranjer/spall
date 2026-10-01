@@ -220,6 +220,12 @@ pub(crate) fn capture_with_terrain_bricks(
     };
 
     Ok(Checkpoint {
+        vegetation: sim
+            .vegetation_state()
+            .map(|s| s.encode())
+            .transpose()
+            .map_err(|_| PersistError::BadField("vegetation capture"))?
+            .unwrap_or_default(),
         water: sim.water_regions().map(|w| w.canonical_state()).collect(),
         tick: sim.current_tick().get(),
         journal_cursor,
@@ -547,6 +553,8 @@ pub fn restore_with_terrain_collider_mode(
     // tick is strictly newer than every durable record (ENG-39).
     let mut durable_tick = cp.tick;
     let mut water_state = cp.water.clone();
+    let mut vegetation_state = cp.vegetation.clone();
+    let mut vegetation_clock = None;
 
     for record in &recovery.journal {
         // The durable suffix is seq-ordered; its record ticks must be
@@ -564,6 +572,17 @@ pub fn restore_with_terrain_collider_mode(
         // transaction plus an out-of-band `BaselineWorld`; ordinary topology
         // records replay with `None`.
         let topology = match &record.payload {
+            JournalPayload::VegetationClock { time_ms, credit_ms } => {
+                vegetation_clock = Some((*time_ms, *credit_ms));
+                last_seq = record.seq;
+                continue;
+            }
+            JournalPayload::VegetationState(state) => {
+                vegetation_clock = None;
+                vegetation_state = state.clone();
+                last_seq = record.seq;
+                continue;
+            }
             JournalPayload::WaterState(state) => {
                 for region in state {
                     region
@@ -636,6 +655,19 @@ pub fn restore_with_terrain_collider_mode(
     // Resume at the durable suffix tick, not `cp.tick`: the next `tick()` then
     // stamps events at `durable_tick + 1`, strictly after every durable record.
     let mut sim = Simulation::from_restored(world, Tick(durable_tick));
+    if let Some((time, credit)) = vegetation_clock {
+        let mut state = spall_ecology::living::LivingState::decode(&vegetation_state)
+            .map_err(|_| PersistError::BadField("vegetation clock without state"))?;
+        if credit >= 1000 || state.time_ms != time {
+            return Err(PersistError::BadField("vegetation clock mismatch"));
+        }
+        state.credit_ms = credit;
+        vegetation_state = state
+            .encode()
+            .map_err(|_| PersistError::BadField("vegetation clock encode"))?;
+    }
+    sim.restore_vegetation(&vegetation_state)
+        .map_err(|_| PersistError::BadField("vegetation recovery"))?;
     sim.restore_water_regions(&water_state)
         .map_err(|_| PersistError::BadField("water recovery"))?;
     Ok((sim, last_seq))

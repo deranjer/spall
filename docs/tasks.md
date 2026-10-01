@@ -1020,7 +1020,7 @@ The Salva particle backend was removed after selection. The grid scenarios now
 build their scene and bit-identical reference volume in
 `fixtures::ReservoirScene`. Production integration is tracked as ENG-105.
 
-### ENG-105 — Authoritative water integration
+### ENG-105 â€” Authoritative water integration
 
 Integration now includes owner-thread boundary displacement and validated
 immutable worker results, the user-approved trapped-volume ledger for sealed
@@ -1070,7 +1070,7 @@ Add a client-local rendered showcase for ENG-116's grass/tree lifecycle. Keep th
 
 Validation: `cargo test -p spall_client ecology_demo::tests`, `cargo check -p sandbox --features client --bin sandbox-client`, and `cargo xtask check`. Manual GPU presentation is separate from CPU checks. See `docs/validation.md` for the command and keys.
 
-### ENG-117 correction pass — 2026-10-01
+### ENG-117 correction pass â€” 2026-10-01
 
 User-requested audit after viewing the interactive result: replace the misleading
 thin generated-terrain crop with a completely resident 16 m clearing; show every
@@ -1084,3 +1084,10 @@ terrain generation/manifest versions. Capture seedling, juvenile, mature,
 dispersal and damage states using the interactive scene's actual geometry builder.
 Production server/network/persistence integration remains a separate assignment.
 See `docs/reports/ENG-117-corrections.md` for checks and visual evidence.
+
+
+## ENG-118 - Seasonal vegetation in generated worlds
+
+User-requested production follow-up to completed ENG-116/117. Define ten procedural trees and ten grasses/ground plants in sandbox, mapped to Meadow/Alpine/Swamp/Desert. Seed generated playable worlds through the common worldgen scene factory, including editor Run in game. Retain terrain-validated placement/dispersal, connected wood growth through server-authoritative edits, bounded fair work and stable IDs. Add plant-only seasons, autumn colour and deciduous winter leaf loss. Persist complete state and clock atomically and replicate soft plants to all clients and late joiners. Base terrain version 3 stays unchanged; vegetation owns its own version-1 schema. Earlier saves are not regenerated. ENG-113/114's broader statuses/performance gates remain separate; their available worldgen implementation is the input to this increment.
+
+Validation: catalogue/biome/grounding/offspring tests, four-season geometry, committed simulation growth, exact checkpoint/journal recovery, two network clients, legacy save upgrade/recovery, eight GPU specimen galleries plus actual generated-world captures at 512/default 1024 cells, cargo xtask check. Rules and measured evidence: docs/reports/ENG-118-vegetation.md.

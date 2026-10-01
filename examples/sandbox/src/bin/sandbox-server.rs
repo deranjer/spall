@@ -94,6 +94,9 @@ struct Args {
     /// 32 from 128 to 4096. The default is 1024 (256 m).
     #[arg(long, default_value_t = sandbox::worldgen_scene::DEFAULT_SIZE_CELLS, requires = "worldgen")]
     worldgen_size: u32,
+    /// Initial plant season; the saved plant clock advances every 15 minutes.
+    #[arg(long, default_value = "summer", value_parser = ["spring", "summer", "autumn", "winter"], requires = "worldgen")]
+    season: String,
     /// Use the legacy whole-terrain collider for a controlled comparison.
     /// Per-brick terrain collision is the normal mode.
     #[arg(long)]
@@ -429,7 +432,12 @@ fn run_serve(args: Args) -> ExitCode {
     let mut custom_world = None;
     let scene = if let Some(preset) = &args.worldgen {
         let started = std::time::Instant::now();
-        match sandbox::worldgen_scene::generate(preset, args.seed, args.worldgen_size) {
+        match sandbox::worldgen_scene::generate_with_season(
+            preset,
+            args.seed,
+            args.worldgen_size,
+            spall_ecology::living::Season::parse(&args.season).unwrap(),
+        ) {
             Ok(generated) => {
                 let world = generated.world();
                 tracing::info!(

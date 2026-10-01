@@ -214,6 +214,7 @@ pub struct GameRenderer {
     bodies: InstanceSet,
     /// Drawn lit but never shadow-casting (debug overlays).
     overlay: InstanceSet,
+    vegetation: InstanceSet,
     transparent: InstanceSet,
     /// The smoothed water surface sheet, drawn alpha-blended after the opaque
     /// scene.
@@ -330,6 +331,7 @@ impl GameRenderer {
             body_meshes: HashMap::new(),
             bodies: InstanceSet::new(),
             overlay: InstanceSet::new(),
+            vegetation: InstanceSet::new(),
             transparent: InstanceSet::new(),
             water_surface: DynamicMesh::new(device),
             sky: None,
@@ -495,6 +497,17 @@ impl GameRenderer {
         self.sky.as_ref().is_some_and(SkyVisibility::is_sweeping)
     }
 
+    /// Soft vegetation is nonphysical geometry, but participates in the same
+    /// opaque lighting and shadow passes as wood and terrain.
+    pub fn set_vegetation(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        instances: &[CubeInstance],
+    ) -> u64 {
+        self.vegetation.set(device, queue, instances)
+    }
+
     /// Replace the debug overlay instances (lit, not shadow-casting).
     pub fn set_overlay(
         &mut self,
@@ -581,7 +594,7 @@ impl GameRenderer {
     /// `(terrain, bodies, overlay)` instance counts.
     pub fn instance_counts(&self) -> (u32, u32, u32) {
         (
-            self.terrain.count(),
+            self.terrain.count() + self.vegetation.count(),
             self.bodies.count(),
             self.overlay.count(),
         )
@@ -592,6 +605,7 @@ impl GameRenderer {
         self.terrain.allocated_bytes()
             + self.bodies.allocated_bytes()
             + self.overlay.allocated_bytes()
+            + self.vegetation.allocated_bytes()
     }
 
     /// The freshest completed GPU pass timings, if timestamps are available.
@@ -670,7 +684,7 @@ impl GameRenderer {
                 self.draw_body_meshes(&mut pass);
                 pass.set_pipeline(self.pipeline.shadow_cube());
             }
-            self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies]);
+            self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies, &self.vegetation]);
         }
 
         // Recompute sky visibility / bounce when the occupancy, environment or
@@ -782,7 +796,10 @@ impl GameRenderer {
                 ),
                 &[],
             );
-            self.draw_cubes(&mut pass, &[&self.terrain, &self.bodies, &self.overlay]);
+            self.draw_cubes(
+                &mut pass,
+                &[&self.terrain, &self.bodies, &self.vegetation, &self.overlay],
+            );
         }
         if self.transparent.count() > 0 || self.water_surface.index_count > 0 {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
