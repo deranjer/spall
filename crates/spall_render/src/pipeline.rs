@@ -13,6 +13,7 @@ use crate::instances::{CubeInstance, CubeVertex};
 use crate::scene::Material;
 use crate::sky_visibility::{SkyPipeline, SkyVisibility};
 use crate::vertex::GpuVertex;
+use crate::water::WaterField;
 
 pub const CASCADE_COUNT: usize = 4;
 pub const SHADOW_MAP_SIZE: u32 = 2048;
@@ -105,6 +106,12 @@ struct Globals {
     point_colors: [[f32; 4]; MAX_POINT_LIGHTS],
     /// Light count in `x`.
     point_count: [f32; 4],
+    /// `x`: 1 when the camera is under the water surface; `y`: that surface's
+    /// height; `z`: water animation time in seconds; `w`: 1 when a water field
+    /// is bound at all.
+    water_cam: [f32; 4],
+    /// The water field's `xy` origin, cell size `z` and cells per side `w`.
+    water_field: [f32; 4],
 }
 
 /// Most point lights the opaque pass shades with at once (the nearest ones).
@@ -142,15 +149,28 @@ struct ToneGlobals {
     _pad: [f32; 2],
 }
 
+/// The water height field as last supplied, plus its GPU copy.
+#[derive(Default)]
+struct WaterState {
+    field: Option<WaterField>,
+    gpu: Option<(wgpu::Texture, wgpu::TextureView)>,
+    time_s: f32,
+}
+
 pub struct ScenePipeline {
     opaque: wgpu::RenderPipeline,
     shadow: wgpu::RenderPipeline,
     opaque_cube: wgpu::RenderPipeline,
     opaque_terrain: wgpu::RenderPipeline,
     transparent_cube: wgpu::RenderPipeline,
+    water_surface: wgpu::RenderPipeline,
     shadow_cube: wgpu::RenderPipeline,
     tone_map: wgpu::RenderPipeline,
     scene_layout: wgpu::BindGroupLayout,
+    water: std::sync::Mutex<WaterState>,
+    /// 1x1 "no water anywhere" height field bound until a real one is set.
+    _water_none_texture: wgpu::Texture,
+    water_none_view: wgpu::TextureView,
     shadow_layout: wgpu::BindGroupLayout,
     tone_layout: wgpu::BindGroupLayout,
     globals_buffer: wgpu::Buffer,
@@ -239,6 +259,17 @@ impl ScenePipeline {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                // Water surface heights, read with `textureLoad` only.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -304,6 +335,13 @@ impl ScenePipeline {
             &[Some(CubeVertex::LAYOUT), Some(CubeInstance::LAYOUT)],
         );
         let transparent_cube = create_transparent_cube_pipeline(
+            device,
+            &opaque_shader,
+            &scene_layout,
+            indirect.display_layout(),
+            sky.display_layout(),
+        );
+        let water_surface = create_water_surface_pipeline(
             device,
             &opaque_shader,
             &scene_layout,
@@ -380,15 +418,35 @@ impl ScenePipeline {
             ..Default::default()
         });
 
+        let water_none_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("spall-water-none"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let water_none_view = water_none_texture.create_view(&Default::default());
+
         Self {
             opaque,
             shadow,
             opaque_cube,
             opaque_terrain,
             transparent_cube,
+            water_surface,
             shadow_cube,
             tone_map,
             scene_layout,
+            water: std::sync::Mutex::new(WaterState::default()),
+            _water_none_texture: water_none_texture,
+            water_none_view,
             shadow_layout,
             tone_layout,
             globals_buffer,
@@ -560,6 +618,28 @@ impl ScenePipeline {
         }
         let point_count = [lights.len() as f32, 0.0, 0.0, 0.0];
         drop(lights);
+        let water = self.water.lock().unwrap_or_else(|e| e.into_inner());
+        let (water_cam, water_field) = match (&water.field, &water.gpu) {
+            (Some(field), Some(_)) => {
+                let eye = camera.position.to_array();
+                let surface = field.submerged_surface(eye);
+                (
+                    [
+                        f32::from(u8::from(surface.is_some())),
+                        surface.unwrap_or(0.0),
+                        water.time_s,
+                        1.0,
+                    ],
+                    [
+                        field.origin_xz[0],
+                        field.origin_xz[1],
+                        field.cell_m,
+                        field.dim as f32,
+                    ],
+                )
+            }
+            _ => ([0.0; 4], [0.0; 4]),
+        };
         let globals = Globals {
             view_proj: camera.view_projection().to_cols_array_2d(),
             view: camera.view().to_cols_array_2d(),
@@ -583,8 +663,14 @@ impl ScenePipeline {
             point_lights,
             point_colors,
             point_count,
+            water_cam,
+            water_field,
         };
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        let water_view = water
+            .gpu
+            .as_ref()
+            .map_or(&self.water_none_view, |(_, view)| view);
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("spall-t12-scene-bind-group"),
             layout: &self.scene_layout,
@@ -605,8 +691,80 @@ impl ScenePipeline {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&self.shadow_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(water_view),
+                },
             ],
         })
+    }
+
+    /// Supplies (or clears, with `None`) the water surface heights the opaque
+    /// shader uses for underwater fog, tint and caustics. The field is
+    /// presentation-only client data; it never feeds back into simulation.
+    pub fn set_water_field(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        field: Option<WaterField>,
+    ) {
+        let mut state = self.water.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(field) = field else {
+            state.field = None;
+            state.gpu = None;
+            return;
+        };
+        let size = wgpu::Extent3d {
+            width: field.dim,
+            height: field.dim,
+            depth_or_array_layers: 1,
+        };
+        let reusable = state
+            .gpu
+            .as_ref()
+            .is_some_and(|(texture, _)| texture.width() == field.dim);
+        if !reusable {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("spall-water-field"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            state.gpu = Some((texture, view));
+        }
+        if let Some((texture, _)) = &state.gpu {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&field.heights),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(field.dim * 4),
+                    rows_per_image: Some(field.dim),
+                },
+                size,
+            );
+        }
+        state.field = Some(field);
+    }
+
+    /// Animation clock for caustics, in seconds.
+    pub fn set_water_time(&self, seconds: f32) {
+        self.water.lock().unwrap_or_else(|e| e.into_inner()).time_s = seconds;
+    }
+
+    /// Alpha-blended water surface sheet (mesh vertex layout, no culling).
+    pub fn water_surface(&self) -> &wgpu::RenderPipeline {
+        &self.water_surface
     }
 
     pub fn shadow_bind_group(
@@ -781,6 +939,55 @@ fn create_transparent_cube_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_water_surface_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::BindGroupLayout,
+    indirect_layout: &wgpu::BindGroupLayout,
+    sky_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("spall-water-surface-layout"),
+        bind_group_layouts: &[Some(layout), Some(indirect_layout), Some(sky_layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("spall-water-surface-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[Some(GpuVertex::LAYOUT)],
+            compilation_options: Default::default(),
+        },
+        // Seen from above and from below (the Snell's-window ceiling).
+        primitive: wgpu::PrimitiveState {
+            cull_mode: None,
+            ..opaque_primitive()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_water"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: HDR_FORMAT,
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),

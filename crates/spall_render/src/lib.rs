@@ -22,6 +22,7 @@ pub mod target;
 pub mod upload;
 pub mod vertex;
 pub mod viewport;
+pub mod water;
 
 pub use camera::{Aabb, Camera, Frustum};
 pub use capture::{
@@ -57,3 +58,4 @@ pub use target::OffscreenTarget;
 pub use upload::{GpuMesh, MeshUploader, UploadBudget};
 pub use vertex::{GpuVertex, to_gpu};
 pub use viewport::{MeshChunk, ViewportFrame, ViewportRenderer};
+pub use water::{NO_WATER, WaterField};

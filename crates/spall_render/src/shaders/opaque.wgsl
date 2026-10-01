@@ -16,12 +16,19 @@ struct Globals {
     point_lights: array<vec4<f32>, 8>,
     point_colors: array<vec4<f32>, 8>,
     point_count: vec4<f32>,
+    // x: camera under the water surface, y: that surface's height, z: water
+    // clock in seconds, w: a water field is bound.
+    water_cam: vec4<f32>,
+    // Water field origin xz, cell size, cells per side.
+    water_field: vec4<f32>,
 };
 struct Material { base_color: vec4<f32>, params: vec4<f32>, };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var<storage, read> materials: array<Material>;
 @group(0) @binding(2) var shadow_maps: texture_depth_2d_array;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
+// Water surface height per horizontal cell; very negative where there is none.
+@group(0) @binding(4) var water_field_tex: texture_2d<f32>;
 struct IndirectGlobals {
     origin_cell_size: vec4<f32>,
     dimensions: vec4<u32>,
@@ -334,6 +341,95 @@ fn sample_indirect(world_pos: vec3<f32>, normal: vec3<f32>, base: vec3<f32>) -> 
     return base * indirect_radiance[index].rgb / PI;
 }
 
+// ---- Water look (presentation only; see spall_render::water) ----
+const WATER_NONE: f32 = -1.0e8;
+// Per-metre absorption in linear RGB: red dies first, blue last.
+const WATER_ABSORB: vec3<f32> = vec3<f32>(0.45, 0.11, 0.05);
+// Fog distance snaps to this many metres (one voxel is 0.25 m) so the
+// falloff stays chunky instead of reading as smooth volumetric haze.
+const WATER_BAND_M: f32 = 0.25;
+
+// Size of the faint grain cells on the water surface (one voxel) and how strong
+// they are: 0.0 is glass, 0.2 is plainly checkered.
+const WATER_VOXEL_M: f32 = 0.25;
+const WATER_VOXEL_HINT: f32 = 0.22;
+
+// Surface height of the water column at `xz`, or WATER_NONE.
+fn water_height_at(xz: vec2<f32>) -> f32 {
+    if globals.water_cam.w < 0.5 { return WATER_NONE; }
+    let c = vec2<i32>(floor((xz - globals.water_field.xy) / globals.water_field.z));
+    let dim = i32(globals.water_field.w);
+    if any(c < vec2<i32>(0)) || any(c >= vec2<i32>(dim)) { return WATER_NONE; }
+    let h = textureLoad(water_field_tex, c, 0).r;
+    return select(WATER_NONE, h, h > WATER_NONE);
+}
+
+// Light scattered back toward the viewer by water at `depth` below the surface.
+fn water_scatter(depth: f32) -> vec3<f32> {
+    let sky_lum = dot(globals.sky_color.rgb, vec3<f32>(0.3, 0.59, 0.11));
+    let sun_up = max(-globals.sun_dir.y, 0.0);
+    let available = 0.6 * sky_lum + 0.05 * globals.sun.w * sun_up;
+    let fade = max(exp(-0.08 * max(depth, 0.0)), 0.10);
+    return vec3<f32>(0.04, 0.34, 0.44) * available * fade;
+}
+
+// Blends `lit` toward the water's scatter colour over the stretch of the view
+// ray that runs through water, from `enter` to `leave`.
+fn water_fog(lit: vec3<f32>, enter: vec3<f32>, leave: vec3<f32>, surface_y: f32) -> vec3<f32> {
+    let path = floor(length(leave - enter) / WATER_BAND_M + 0.5) * WATER_BAND_M;
+    let t = exp(-WATER_ABSORB * path);
+    let depth = surface_y - 0.5 * (enter.y + leave.y);
+    return lit * t + water_scatter(depth) * (vec3<f32>(1.0) - t);
+}
+
+// Fog for a fragment at `p` seen from the camera, if the ray crosses water.
+fn apply_water_view(lit: vec3<f32>, p: vec3<f32>, probe_xz: vec2<f32>) -> vec3<f32> {
+    if globals.water_cam.w < 0.5 { return lit; }
+    let cam = globals.camera_pos.xyz;
+    let cam_in = globals.water_cam.x > 0.5;
+    var s = water_height_at(probe_xz);
+    if cam_in { s = globals.water_cam.y; }
+    if s <= WATER_NONE { return lit; }
+    let d = p - cam;
+    var enter = cam;
+    var leave = p;
+    if cam_in {
+        if p.y > s { leave = cam + d * ((s - cam.y) / max(d.y, 1.0e-5)); }
+    } else {
+        if p.y >= s { return lit; }
+        if cam.y > s { enter = cam + d * ((s - cam.y) / min(d.y, -1.0e-5)); }
+    }
+    return water_fog(lit, enter, leave, s);
+}
+
+// Drifting caustic veins (Worley F2-F1) sampled on a quarter-metre grid and
+// stepped at four frames a second, so the pattern is blocky like the world.
+fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
+    let time = floor(globals.water_cam.z * 4.0) * 0.25;
+    let q = (floor(p.xz * 4.0) + vec2<f32>(0.5)) * 0.25;
+    let g = q * 0.8 + vec2<f32>(time * 0.31, time * 0.19);
+    let cell = floor(g);
+    let f = g - cell;
+    var f1 = 8.0;
+    var f2 = 8.0;
+    for (var j = -1; j <= 1; j += 1) {
+        for (var i = -1; i <= 1; i += 1) {
+            let o = vec2<f32>(f32(i), f32(j));
+            let h = hash_cell(vec3<f32>(cell + o, 11.0)).xy;
+            let dd = length(o + h - f);
+            if dd < f1 {
+                f2 = f1;
+                f1 = dd;
+            } else if dd < f2 {
+                f2 = dd;
+            }
+        }
+    }
+    let vein = 1.0 - smoothstep(0.0, 0.22, f2 - f1);
+    let strength = exp(-0.12 * depth) * clamp(n.y, 0.0, 1.0);
+    return mix(1.0, 0.72 + 1.0 * vein, strength);
+}
+
 @fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
     let mode = i32(round(globals.params.x));
@@ -388,8 +484,20 @@ fn sample_indirect(world_pos: vec3<f32>, normal: vec3<f32>, base: vec3<f32>) -> 
     let g = geometry_schlick(n_dot_v, roughness) * geometry_schlick(n_dot_l, roughness);
     let specular = (d * g * f) / max(4.0 * n_dot_v * n_dot_l, 0.001);
     let diffuse = (vec3<f32>(1.0) - f) * (1.0 - metallic) * base / PI;
-    let direct = (diffuse + specular) * globals.sun.rgb * globals.sun.w * n_dot_l * visibility;
-    let ambient = base * skylight.radiance * mix(0.35, 1.0, clamp(in.ao, 0.0, 1.0));
+    var direct = (diffuse + specular) * globals.sun.rgb * globals.sun.w * n_dot_l * visibility;
+    var ambient = base * skylight.radiance * mix(0.35, 1.0, clamp(in.ao, 0.0, 1.0));
+    // Under water the light that reached this surface lost its reds on the way
+    // down, and the sun's share is broken into drifting caustic veins.
+    let probe_xz = in.world_pos.xz + n.xz * 0.06;
+    let wet_h = water_height_at(probe_xz);
+    var sub_light = vec3<f32>(1.0);
+    if in.world_pos.y < wet_h {
+        let depth = wet_h - in.world_pos.y;
+        let sun_path = depth / max(l.y, 0.3);
+        direct = direct * exp(-WATER_ABSORB * sun_path) * water_caustics(in.world_pos, depth, n);
+        ambient = ambient * exp(-WATER_ABSORB * 0.5 * depth);
+        sub_light = exp(-WATER_ABSORB * 0.5 * depth);
+    }
     let emission = mat.base_color.rgb * max(mat.params.z, 0.0);
     // Bounce is reflected radiance: the receiver's albedo times the average
     // source radiance around it (furnace-calibrated, see bounce.wgsl).
@@ -407,5 +515,47 @@ fn sample_indirect(world_pos: vec3<f32>, normal: vec3<f32>, base: vec3<f32>) -> 
         point += globals.point_colors[i].rgb * ndl * falloff * falloff / (1.0 + d2);
     }
     let torch_light = base * point / PI;
-    return vec4<f32>(ambient + direct + indirect + bounced + emission + torch_light, mat.base_color.a);
+    let lit = ambient + direct + (indirect + bounced) * sub_light + emission + torch_light;
+    return vec4<f32>(apply_water_view(lit, in.world_pos, probe_xz), mat.base_color.a);
+}
+
+// Water surface sheet: the smoothed heightfield mesh, flat-shaded per triangle.
+// From above it is a faint sky mirror with sun glints; from below, a Snell's
+// window onto the sky ringed by a mirror of the underwater scene.
+@fragment fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
+    let cam = globals.camera_pos.xyz;
+    let to_cam = cam - in.world_pos;
+    let dist = max(length(to_cam), 0.0001);
+    let v = to_cam / dist;
+    var n = normalize(in.normal);
+    if dot(n, v) < 0.0 { n = -n; }
+    let cos_t = clamp(dot(n, v), 0.0, 1.0);
+    let l = normalize(-globals.sun_dir.xyz);
+    let below = cam.y < in.world_pos.y;
+    // A faint voxel grain so still water never reads as a sheet of glass: each
+    // quarter-metre cell is a touch lighter or darker, with a hairline between
+    // cells. World-aligned, so it matches the terrain's voxels and holds still.
+    let grid = in.world_pos.xz / WATER_VOXEL_M;
+    let rnd = hash_cell(vec3<f32>(floor(grid), 5.0)).x * 2.0 - 1.0;
+    let g = fract(grid);
+    let edge = min(min(g.x, g.y), min(1.0 - g.x, 1.0 - g.y));
+    let seam = 1.0 - smoothstep(0.0, 0.07, edge);
+    let voxel = 1.0 + WATER_VOXEL_HINT * (rnd - 0.8 * seam);
+    if below {
+        let window = smoothstep(0.60, 0.72, cos_t);
+        let depth = max(in.world_pos.y - cam.y, 0.0);
+        // Outside the window: total internal reflection shows the water itself.
+        let mirror = water_scatter(depth);
+        let sky = hemisphere_radiance(1.0) * vec3<f32>(0.55, 0.85, 1.0);
+        var color = mix(mirror, sky, window) * voxel;
+        color = water_fog(color, cam, in.world_pos, in.world_pos.y);
+        return vec4<f32>(color, clamp(mix(0.92, 0.18, window) * voxel, 0.0, 1.0));
+    }
+    let fresnel = 0.02 + 0.98 * pow(1.0 - cos_t, 5.0);
+    let r = reflect(-v, n);
+    let sky = hemisphere_radiance(max(r.y, 0.0));
+    let glint = pow(max(dot(r, l), 0.0), 220.0) * globals.sun.w * 0.5;
+    let tint = vec3<f32>(0.03, 0.17, 0.22) * (0.5 * dot(globals.sky_color.rgb, vec3<f32>(0.3, 0.59, 0.11)) + 0.1);
+    let color = (sky * fresnel + globals.sun.rgb * glint + tint * (1.0 - fresnel)) * voxel;
+    return vec4<f32>(color, clamp((0.16 + fresnel * 0.8 + glint) * voxel, 0.0, 1.0));
 }
