@@ -774,6 +774,7 @@ impl VisualFrame {
                 if self.season == Season::Winter && !s.evergreen {
                     continue;
                 }
+                let mut leaves = std::collections::HashSet::new();
                 for tip in &p.tips {
                     let juvenile = tip == &p.root;
                     let r = if juvenile {
@@ -804,23 +805,42 @@ impl VisualFrame {
                                 {
                                     continue;
                                 }
-                                if out.len() >= 150_000 {
-                                    return out;
-                                }
-                                out.push(SoftPart {
-                                    center: [
-                                        (tip[0] + x) as f32 * 0.25 + 0.125,
-                                        (tip[1] + y + 1) as f32 * 0.25 + 0.125,
-                                        (tip[2] + z) as f32 * 0.25 + 0.125,
-                                    ],
-                                    size: [0.25; 3],
-                                    colour,
-                                    yaw: 0.,
-                                    lean: 0.,
-                                });
+                                leaves.insert([tip[0] + x, tip[1] + y + 1, tip[2] + z]);
                             }
                         }
                     }
+                }
+                // Shared/fully enclosed opaque leaf cells contribute no visible
+                // surface. Keep the exact exterior (including noise holes), but
+                // avoid drawing duplicate crowns and hidden interior cubes.
+                let mut surface: Vec<_> = leaves
+                    .iter()
+                    .copied()
+                    .filter(|at| {
+                        [
+                            (1, 0, 0),
+                            (-1, 0, 0),
+                            (0, 1, 0),
+                            (0, -1, 0),
+                            (0, 0, 1),
+                            (0, 0, -1),
+                        ]
+                        .into_iter()
+                        .any(|(x, y, z)| !leaves.contains(&[at[0] + x, at[1] + y, at[2] + z]))
+                    })
+                    .collect();
+                surface.sort_unstable();
+                for at in surface {
+                    if out.len() >= 150_000 {
+                        return out;
+                    }
+                    out.push(SoftPart {
+                        center: at.map(|v| v as f32 * 0.25 + 0.125),
+                        size: [0.25; 3],
+                        colour,
+                        yaw: 0.,
+                        lean: 0.,
+                    });
                 }
             } else if p.biomass > 0 {
                 let height = f32::from(s.height) * 0.25 * f32::from(p.biomass) / 1000.;

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use wgpu::util::DeviceExt as _;
 
-use crate::camera::Camera;
+use crate::camera::{Aabb, Camera, Frustum};
 use crate::environment::Environment;
 use crate::indirect::{IndirectResources, LightingVolume};
 use crate::instances::{CubeInstance, InstanceSet, unit_cube};
@@ -209,6 +209,8 @@ pub struct GameRenderer {
     /// Independently resident greedy terrain chunks. Replacing one brick never
     /// reallocates the buffers for its unchanged neighbours.
     terrain_meshes: HashMap<BrickCoord, GpuMesh>,
+    terrain_bounds: HashMap<BrickCoord, Aabb>,
+    terrain_generation: u64,
     terrain_meshes_visible: bool,
     body_meshes: HashMap<u64, DynamicMesh>,
     bodies: InstanceSet,
@@ -327,6 +329,8 @@ impl GameRenderer {
             cube_index_count: indices.len() as u32,
             terrain: InstanceSet::new(),
             terrain_meshes: HashMap::new(),
+            terrain_bounds: HashMap::new(),
+            terrain_generation: 0,
             terrain_meshes_visible: true,
             body_meshes: HashMap::new(),
             bodies: InstanceSet::new(),
@@ -368,8 +372,12 @@ impl GameRenderer {
         updates: &[(BrickCoord, Vec<GpuVertex>, Vec<u32>)],
         removed: &[BrickCoord],
     ) -> Result<(), crate::context::RenderError> {
+        if !updates.is_empty() || !removed.is_empty() {
+            self.terrain_generation = self.terrain_generation.wrapping_add(1);
+        }
         for coord in removed {
             self.terrain_meshes.remove(coord);
+            self.terrain_bounds.remove(coord);
         }
         const BUDGET: UploadBudget = UploadBudget {
             max_vertex_bytes: 128 << 20,
@@ -379,7 +387,16 @@ impl GameRenderer {
             let mesh = GpuMesh::create(device, vertices, indices, BUDGET)?;
             if mesh.index_count == 0 {
                 self.terrain_meshes.remove(coord);
+                self.terrain_bounds.remove(coord);
             } else {
+                let mut min = glam::Vec3::splat(f32::INFINITY);
+                let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
+                for vertex in vertices {
+                    let p = glam::Vec3::from_array(vertex.position);
+                    min = min.min(p);
+                    max = max.max(p);
+                }
+                self.terrain_bounds.insert(*coord, Aabb::new(min, max));
                 self.terrain_meshes.insert(*coord, mesh);
             }
         }
@@ -388,6 +405,13 @@ impl GameRenderer {
 
     pub fn set_terrain_meshes_visible(&mut self, visible: bool) {
         self.terrain_meshes_visible = visible;
+    }
+
+    pub fn terrain_geometry_generation(&self) -> u64 {
+        self.terrain_generation
+    }
+    pub fn terrain_mesh_coords(&self) -> impl Iterator<Item = BrickCoord> + '_ {
+        self.terrain_meshes.keys().copied()
     }
 
     /// Replace the moving bodies' transformed mesh buffers. The CPU templates
@@ -676,7 +700,7 @@ impl GameRenderer {
             pass.set_bind_group(0, &bind, &[]);
             if self.terrain_meshes_visible {
                 pass.set_pipeline(self.pipeline.shadow());
-                self.draw_terrain_meshes(&mut pass);
+                self.draw_terrain_meshes(&mut pass, &Frustum::from_view_projection(matrix));
                 pass.set_pipeline(self.pipeline.shadow_cube());
             }
             if !self.body_meshes.is_empty() {
@@ -769,7 +793,7 @@ impl GameRenderer {
                     ),
                     &[],
                 );
-                self.draw_terrain_meshes(&mut pass);
+                self.draw_terrain_meshes(&mut pass, &camera.frustum());
             }
             if !self.body_meshes.is_empty() {
                 pass.set_pipeline(self.pipeline.opaque());
@@ -897,8 +921,22 @@ impl GameRenderer {
         }
     }
 
-    fn draw_terrain_meshes<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        let mut chunks: Vec<_> = self.terrain_meshes.iter().collect();
+    fn draw_terrain_meshes<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        frustum: &Frustum,
+    ) {
+        // Use each pass's own frustum: an off-camera caster can still be in
+        // a sun cascade. No terrain residency or authoritative voxels change.
+        let mut chunks: Vec<_> = self
+            .terrain_meshes
+            .iter()
+            .filter(|(coord, _)| {
+                self.terrain_bounds
+                    .get(coord)
+                    .is_none_or(|bounds| frustum.intersects_aabb(*bounds))
+            })
+            .collect();
         chunks.sort_by_key(|(coord, _)| coord.sort_key());
         for (_, mesh) in chunks {
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));

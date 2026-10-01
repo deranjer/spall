@@ -929,6 +929,7 @@ impl Predictor {
 /// past readability.
 #[derive(Debug, Clone, Copy, Default)]
 struct CorrectionStats {
+    presentation_correction_total: [f64; 3],
     corrections: u64,
     max_correction_m: f64,
     idle_corrections: u64,
@@ -2175,6 +2176,7 @@ async fn run_async(
                     let predicted_state = p.player.as_ref().map(PredictedPlayer::predicted);
                     let feet = predicted_state.map(|st| st.position_m);
                     let correction_stats = p.player.as_ref().map(|pl| CorrectionStats {
+                        presentation_correction_total: pl.presentation_correction_total,
                         corrections: pl.corrections,
                         max_correction_m: pl.max_correction_m,
                         idle_corrections: pl.idle_corrections,
@@ -2209,6 +2211,7 @@ async fn run_async(
                         _ => (predicted, std::time::Instant::now()),
                     };
                     *slot = Some(InteractiveView {
+                            presentation_correction_total: stats.presentation_correction_total,
                             predicted,
                             server_tick: tick,
                             published_at,

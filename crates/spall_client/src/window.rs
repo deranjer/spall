@@ -142,6 +142,8 @@ pub enum ShotStep {
     },
     /// Land and look from the player.
     Walk,
+    /// Hold actual player input for a bounded walking/rendering measurement.
+    Move { seconds: f32, movement: [f32; 3] },
     /// Toggle the admin menu.
     Menu,
     /// Ask the server for an admin world reset.
@@ -170,6 +172,32 @@ pub fn parse_shots(spec: &str) -> Result<Vec<ShotStep>, String> {
             "walk" => Ok(ShotStep::Walk),
             "menu" => Ok(ShotStep::Menu),
             "reset" => Ok(ShotStep::Reset),
+            _ if step.starts_with("move:") => {
+                let v = step[5..]
+                    .split(',')
+                    .map(str::parse::<f32>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| format!("bad move `{step}`"))?;
+                match v.as_slice() {
+                    [seconds, x, z]
+                        if seconds.is_finite()
+                            && *seconds > 0.
+                            && *seconds <= 120.
+                            && x.is_finite()
+                            && z.is_finite()
+                            && x.abs() <= 1.
+                            && z.abs() <= 1. =>
+                    {
+                        Ok(ShotStep::Move {
+                            seconds: *seconds,
+                            movement: [*x, 0., *z],
+                        })
+                    }
+                    _ => Err(format!(
+                        "move needs seconds (0..120), x and z (-1..1): `{step}`"
+                    )),
+                }
+            }
             _ if step.starts_with("wait:") => step[5..]
                 .parse()
                 .map(ShotStep::Wait)
@@ -496,6 +524,8 @@ pub struct RebuildOutcome {
     /// `true` for the terrain result of a pass; `false` for the lighting
     /// result that follows it (emitters and sky only).
     pub terrain_included: bool,
+    /// Partial mesh batches keep the current request in flight until complete.
+    pub terrain_complete: bool,
     /// Legacy instanced terrain; only [`rebuild_pass`] fills it.
     pub instances: Vec<Instance>,
     /// Changed greedy terrain chunks; unchanged chunks retain their GPU buffers.
@@ -576,8 +606,45 @@ fn update_terrain_mesh_cache(
     cache: &mut TerrainMeshCache,
     volatile: &std::collections::HashSet<BrickCoord>,
 ) -> (Vec<MeshUpdate<BrickCoord>>, Vec<BrickCoord>) {
+    let mut all_updates = Vec::new();
+    let mut all_removed = Vec::new();
+    let (updates, removed) = update_terrain_mesh_cache_progressive(
+        volume,
+        center_m,
+        cache,
+        volatile,
+        |updates, removed| {
+            all_updates.extend(updates);
+            all_removed.extend(removed);
+            true
+        },
+    );
+    all_updates.extend(updates);
+    all_removed.extend(removed);
+    (all_updates, all_removed)
+}
+
+fn update_terrain_mesh_cache_progressive(
+    volume: &Volume,
+    center_m: [f64; 3],
+    cache: &mut TerrainMeshCache,
+    volatile: &std::collections::HashSet<BrickCoord>,
+    mut publish: impl FnMut(Vec<MeshUpdate<BrickCoord>>, Vec<BrickCoord>) -> bool,
+) -> (Vec<MeshUpdate<BrickCoord>>, Vec<BrickCoord>) {
     let started = Instant::now();
-    let visible = visible_terrain_bricks(volume, center_m);
+    let mut visible = visible_terrain_bricks(volume, center_m);
+    visible.sort_by(|a, b| {
+        let distance = |c: &BrickCoord| {
+            [c.x, c.y, c.z]
+                .into_iter()
+                .zip(center_m)
+                .map(|(v, eye)| ((v as f64 + 0.5) * 8.0 - eye).powi(2))
+                .sum::<f64>()
+        };
+        distance(a)
+            .total_cmp(&distance(b))
+            .then(a.sort_key().cmp(&b.sort_key()))
+    });
     let world = VolumeMeshWorld(volume);
     let mut updates = Vec::new();
     let mut removed = Vec::new();
@@ -599,8 +666,13 @@ fn update_terrain_mesh_cache(
         let (vertices, indices) = spall_render::to_gpu(&mesh.mesh, glam::Mat4::IDENTITY);
         if mesh.mesh.is_empty() {
             // A preview's empty mesh must clear whatever the GPU still holds.
-            if cache.0.remove(coord).is_some() || is_volatile {
+            if cache.0.get(coord).is_some_and(|old| !old.mesh.is_empty()) || is_volatile {
                 removed.push(*coord);
+            }
+            if is_volatile {
+                cache.0.remove(coord);
+            } else {
+                cache.0.insert(*coord, mesh);
             }
         } else {
             if is_volatile {
@@ -609,6 +681,11 @@ fn update_terrain_mesh_cache(
                 cache.0.insert(*coord, mesh);
             }
             updates.push((*coord, vertices, indices));
+        }
+        if updates.len() >= 4
+            && !publish(std::mem::take(&mut updates), std::mem::take(&mut removed))
+        {
+            break;
         }
     }
     let visible: std::collections::HashSet<_> = visible.into_iter().collect();
@@ -653,6 +730,7 @@ pub fn rebuild_pass(
     Some(RebuildOutcome {
         center_m,
         terrain_included: true,
+        terrain_complete: true,
         instances,
         mesh_updates: Vec::new(),
         mesh_removed: Vec::new(),
@@ -850,12 +928,40 @@ impl RebuildWorker {
                     // Geometry first: it is what an edit or a step changes on
                     // screen, and it is cheap once the mesh cache is warm.
                     let started = Instant::now();
-                    let (mesh_updates, mesh_removed) =
-                        update_terrain_mesh_cache(&volume, center_m, &mut mesh_cache, &volatile);
+                    let (mesh_updates, mesh_removed) = update_terrain_mesh_cache_progressive(
+                        &volume,
+                        center_m,
+                        &mut mesh_cache,
+                        &volatile,
+                        |mesh_updates, mesh_removed| {
+                            let elapsed = started.elapsed();
+                            let _ = result_tx.send(RebuildOutcome {
+                                center_m,
+                                terrain_included: true,
+                                terrain_complete: false,
+                                instances: Vec::new(),
+                                mesh_updates,
+                                mesh_removed,
+                                mesh_elapsed: elapsed,
+                                emitters: None,
+                                sky: None,
+                                sky_stats: crate::sky::SkyOccupancyStats::default(),
+                                elapsed,
+                            });
+                            // Do not finish a minute-long pass over an old
+                            // replica while new authoritative edits are arriving.
+                            session
+                                .replica
+                                .get()
+                                .and_then(|r| r.try_lock().ok().map(|r| r.terrain_generation()))
+                                .is_none_or(|current| current == generation)
+                        },
+                    );
                     let mesh_elapsed = started.elapsed();
                     let geometry = RebuildOutcome {
                         center_m,
                         terrain_included: true,
+                        terrain_complete: true,
                         instances: Vec::new(),
                         mesh_updates,
                         mesh_removed,
@@ -895,6 +1001,7 @@ impl RebuildWorker {
                     let lighting = RebuildOutcome {
                         center_m,
                         terrain_included: false,
+                        terrain_complete: false,
                         instances: Vec::new(),
                         mesh_updates: Vec::new(),
                         mesh_removed: Vec::new(),
@@ -1302,6 +1409,7 @@ impl InteractiveApp {
         }
         if self.capture_due {
             self.capture_due = false;
+            self.session.input.set_movement([0.; 3]);
             self.pending_capture = Some(
                 self.shots_dir
                     .join(format!("shot-{:02}.png", self.shot_index)),
@@ -1342,6 +1450,13 @@ impl InteractiveApp {
                     self.toggle_flight();
                 }
                 2.0
+            }
+            ShotStep::Move { seconds, movement } => {
+                if self.fly_eye.is_some() {
+                    self.toggle_flight();
+                }
+                self.session.input.set_movement(movement);
+                seconds
             }
             ShotStep::Menu => {
                 self.admin_menu_open = !self.admin_menu_open;
@@ -1681,7 +1796,9 @@ impl ApplicationHandler for InteractiveApp {
                         self.last_built_pos = Some(outcome.center_m);
                         self.pending_mesh_updates.extend(outcome.mesh_updates);
                         self.pending_mesh_removed.extend(outcome.mesh_removed);
-                        self.rebuild.in_flight = false;
+                        if outcome.terrain_complete {
+                            self.rebuild.in_flight = false;
+                        }
                     } else {
                         self.hud.record_sky(outcome.sky_stats);
                     }
@@ -2243,6 +2360,7 @@ const CORRECTION_SMOOTHING_TAU_S: f32 = 0.05;
 /// beyond a position the predictor actually reached.
 #[derive(Default)]
 struct CameraFollow {
+    correction_presented: Option<[f64; 3]>,
     previous: Option<InteractiveView>,
     current: Option<InteractiveView>,
     displayed: Option<([f64; 3], Instant)>,
@@ -2283,7 +2401,50 @@ impl CameraFollow {
     /// client-authoritative sessions, which have no corrections to hide and
     /// would otherwise show the camera lagging the bodies it pushes.
     fn eye(&mut self, view: InteractiveView, now: Instant, smooth: bool) -> Vec3 {
-        let target = self.target(view, now);
+        let mut target = self.target(view, now);
+        // Interpolate ordinary movement independently from reconciliation.
+        // A correction should catch up smoothly instead of reversing a moving
+        // camera for one frame. Large teleports still apply immediately.
+        let total = view.presentation_correction_total;
+        let prior = self.correction_presented.unwrap_or(total);
+        let distance = (0..3)
+            .map(|i| (prior[i] - total[i]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let dt = self.displayed.map_or(0., |(_, at)| {
+            now.saturating_duration_since(at).as_secs_f64()
+        });
+        let factor = if !smooth || distance > 1. {
+            1.
+        } else {
+            1. - (-dt / 0.12).exp()
+        };
+        let presented = std::array::from_fn(|i| prior[i] + (total[i] - prior[i]) * factor);
+        self.correction_presented = Some(presented);
+        // target() interpolates corrected positions with the same timestamps.
+        let interpolated_total = match (self.previous, self.current) {
+            (Some(a), Some(b)) => {
+                let span = b
+                    .published_at
+                    .saturating_duration_since(a.published_at)
+                    .as_secs_f64();
+                let t = if span > 0. {
+                    (now.saturating_duration_since(b.published_at).as_secs_f64() / span)
+                        .clamp(0., 1.)
+                } else {
+                    1.
+                };
+                std::array::from_fn(|i| {
+                    a.presentation_correction_total[i]
+                        + (b.presentation_correction_total[i] - a.presentation_correction_total[i])
+                            * t
+                })
+            }
+            _ => total,
+        };
+        for i in 0..3 {
+            target[i] += presented[i] - interpolated_total[i];
+        }
         let feet = match self.displayed {
             Some((prev, prev_at)) if smooth => {
                 let dt = now.saturating_duration_since(prev_at).as_secs_f32();
@@ -2436,13 +2597,18 @@ pub fn apply_pending_cuts(
         }
         if let Ok(outcome) = volume.apply_edit(&plan) {
             for b in &outcome.bricks {
-                volatile.insert(b.coord);
-                for [dx, dy, dz] in BRICK_NEIGHBOURS {
-                    volatile.insert(spall_core::BrickCoord::new(
-                        b.coord.x + dx,
-                        b.coord.y + dy,
-                        b.coord.z + dz,
-                    ));
+                // Greedy AO samples edge/corner halos too. A preview must
+                // never cache any of those 26 neighbours under real revisions.
+                for dz in -1..=1 {
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            volatile.insert(spall_core::BrickCoord::new(
+                                b.coord.x + dx,
+                                b.coord.y + dy,
+                                b.coord.z + dz,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -4099,6 +4265,74 @@ const CAMERA_FOV_Y_DEG: f32 = 75.0;
 const CAMERA_Z_NEAR_M: f32 = 0.05;
 const CAMERA_Z_FAR_M: f32 = 300.0;
 
+type VegetationKey = (u64, i64, i64, u64);
+type VegetationRequest = (
+    u64,
+    Arc<spall_ecology::living::VisualFrame>,
+    [f32; 3],
+    std::collections::HashSet<BrickCoord>,
+);
+/// Soft foliage waits for the same solid geometry that supports it. Network
+/// vegetation can arrive before the progressive terrain/trunk mesh batches.
+fn foliage_support_ready(
+    plant: &spall_ecology::living::VisualPlant,
+    tree: bool,
+    ready: &std::collections::HashSet<BrickCoord>,
+) -> bool {
+    let soil = GlobalCell::new(plant.root[0], plant.root[1] - 1, plant.root[2])
+        .split()
+        .0;
+    ready.contains(&soil)
+        && (!tree
+            || plant.tips.as_slice() == [plant.root]
+            || plant
+                .tips
+                .iter()
+                .all(|at| ready.contains(&GlobalCell::new(at[0], at[1], at[2]).split().0)))
+}
+
+struct VegetationWorker {
+    tx: mpsc::SyncSender<VegetationRequest>,
+    rx: mpsc::Receiver<(u64, Vec<Instance>)>,
+}
+impl VegetationWorker {
+    fn spawn(material: u32) -> Result<Self, ClientError> {
+        let (tx, requests) = mpsc::sync_channel::<VegetationRequest>(1);
+        let (results, rx) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("spall-client-foliage".into())
+            .spawn(move || {
+                for (id, frame, eye, ready) in requests {
+                    let mut frame = (*frame).clone();
+                    frame.plants.retain(|p| {
+                        let tree = frame.species.iter().any(|s| s.id == p.species && s.tree);
+                        foliage_support_ready(p, tree, &ready)
+                    });
+                    let instances = frame
+                        .parts(eye, 48.)
+                        .into_iter()
+                        .map(|p| {
+                            Instance::new(
+                                p.center,
+                                material + u32::from(p.colour),
+                                p.size,
+                                (glam::Quat::from_rotation_y(p.yaw)
+                                    * glam::Quat::from_rotation_z(p.lean))
+                                .to_array(),
+                            )
+                        })
+                        .collect();
+                    let compact = spall_render::compact_vegetation_instances(instances);
+                    if results.send((id, compact)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| ClientError::Render(format!("foliage worker: {e}")))?;
+        Ok(Self { tx, rx })
+    }
+}
+
 pub(super) struct WorldRenderer {
     environment: Environment,
     device: wgpu::Device,
@@ -4112,10 +4346,11 @@ pub(super) struct WorldRenderer {
     /// Reserved material and instances used only by the ENG-103 inspection
     /// viewer; the normal game material table remains opaque.
     debug_water_material: u32,
-    vegetation_material: u32,
     vegetation_frame: Option<Arc<spall_ecology::living::VisualFrame>>,
-    vegetation_key: Option<(u64, i64, i64)>,
-    vegetation_instances: Vec<Instance>,
+    vegetation_key: Option<VegetationKey>,
+    vegetation_worker: VegetationWorker,
+    vegetation_job: Option<u64>,
+    vegetation_seq: u64,
     /// Water as merged boxes, unclipped; the per-frame draw list in
     /// `debug_water_instances` is this clipped to the terrain window.
     /// The hammer crosshair and its label; `None` hides it (cursor not captured).
@@ -4491,10 +4726,11 @@ impl WorldRenderer {
             surface_config,
             scene,
             debug_water_material,
-            vegetation_material,
             vegetation_frame: None,
             vegetation_key: None,
-            vegetation_instances: Vec::new(),
+            vegetation_worker: VegetationWorker::spawn(vegetation_material)?,
+            vegetation_job: None,
+            vegetation_seq: 0,
             crosshair: None,
             debug_water_source: Vec::new(),
             water_window: None,
@@ -4773,36 +5009,44 @@ impl WorldRenderer {
             .map_err(|error| ClientError::Render(error.to_string()))?;
         self.scene
             .set_water_time(self.water_epoch.elapsed().as_secs_f32());
+        while let Ok((id, instances)) = self.vegetation_worker.rx.try_recv() {
+            if self.vegetation_job == Some(id) {
+                self.vegetation_job = None;
+                self.scene
+                    .set_vegetation(&self.device, &self.queue, &instances);
+            }
+        }
         if let Some((eye, _)) = cam {
             if let Some(frame) = &self.vegetation_frame {
                 let key = (
                     frame.time_ms,
                     (eye.x / 4.).floor() as i64,
                     (eye.z / 4.).floor() as i64,
+                    self.scene.terrain_geometry_generation(),
                 );
-                if self.vegetation_key != Some(key) {
-                    self.vegetation_key = Some(key);
-                    self.vegetation_instances = frame
-                        .parts(eye.to_array(), 48.)
-                        .into_iter()
-                        .map(|part| {
-                            Instance::new(
-                                part.center,
-                                self.vegetation_material + u32::from(part.colour),
-                                part.size,
-                                (glam::Quat::from_rotation_y(part.yaw)
-                                    * glam::Quat::from_rotation_z(part.lean))
-                                .to_array(),
-                            )
-                        })
-                        .collect();
+                if self.vegetation_job.is_none() && self.vegetation_key != Some(key) {
+                    self.vegetation_seq = self.vegetation_seq.wrapping_add(1);
+                    let id = self.vegetation_seq;
+                    if self
+                        .vegetation_worker
+                        .tx
+                        .try_send((
+                            id,
+                            frame.clone(),
+                            eye.to_array(),
+                            self.scene.terrain_mesh_coords().collect(),
+                        ))
+                        .is_ok()
+                    {
+                        self.vegetation_job = Some(id);
+                        self.vegetation_key = Some(key);
+                    }
                 }
             } else {
                 self.vegetation_key = None;
-                self.vegetation_instances.clear();
+                self.vegetation_job = None;
+                self.scene.set_vegetation(&self.device, &self.queue, &[]);
             }
-            self.scene
-                .set_vegetation(&self.device, &self.queue, &self.vegetation_instances);
         }
         self.clip_water();
         if let Some((eye, _)) = cam {
@@ -4978,6 +5222,74 @@ mod input_tests {
     use super::*;
 
     #[test]
+    fn vegetation_arriving_before_solid_batches_waits_for_ground_and_trunks() {
+        let mut plant = spall_ecology::living::VisualPlant {
+            id: 1,
+            species: 1,
+            root: [0, 31, 0],
+            biomass: 100,
+            tips: vec![[0, 34, 0]],
+        };
+        let mut ready = std::collections::HashSet::new();
+        assert!(!foliage_support_ready(&plant, false, &ready));
+        assert!(!foliage_support_ready(&plant, true, &ready));
+        ready.insert(GlobalCell::new(0, 30, 0).split().0);
+        assert!(foliage_support_ready(&plant, false, &ready));
+        assert!(!foliage_support_ready(&plant, true, &ready));
+        ready.insert(GlobalCell::new(0, 34, 0).split().0);
+        assert!(foliage_support_ready(&plant, true, &ready));
+        ready.remove(&GlobalCell::new(0, 30, 0).split().0);
+        assert!(!foliage_support_ready(&plant, true, &ready));
+        plant.tips = vec![plant.root];
+        ready.insert(GlobalCell::new(0, 30, 0).split().0);
+        assert!(foliage_support_ready(&plant, true, &ready));
+    }
+
+    #[test]
+    fn progressive_mesh_batches_cover_the_same_world_and_start_nearby() {
+        let mut volume = Volume::new(
+            spall_core::VolumeId::new(1).unwrap(),
+            spall_core::CellSizeCode::Quarter,
+        );
+        let mut edit = spall_voxel::EditPlan::new(volume.id());
+        for x in 0..9 {
+            edit.set(GlobalCell::new(x * 32 + 16, 16, 16), MaterialId(1));
+        }
+        volume.apply_edit(&edit).unwrap();
+        let mut cache = TerrainMeshCache::default();
+        let mut published = Vec::new();
+        let (remaining, _) = update_terrain_mesh_cache_progressive(
+            &volume,
+            [4.; 3],
+            &mut cache,
+            &Default::default(),
+            |updates, _| {
+                published.push(updates);
+                true
+            },
+        );
+        assert_eq!(published[0].len(), 4);
+        assert_eq!(
+            published[0].iter().map(|u| u.0.x).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        let mut all: Vec<_> = published
+            .into_iter()
+            .flatten()
+            .chain(remaining)
+            .map(|u| u.0)
+            .collect();
+        all.sort_by_key(|c| c.sort_key());
+        all.dedup();
+        assert_eq!(all.len(), 9);
+        let (warm, removed) =
+            update_terrain_mesh_cache(&volume, [4.; 3], &mut cache, &Default::default());
+        assert!(warm.is_empty() && removed.is_empty());
+        assert!(parse_shots("move:10,0,-1;move:10,0,1").is_ok());
+        assert!(parse_shots("move:NaN,0,1").is_err());
+    }
+
+    #[test]
     fn reports_incremental_mesh_and_edit_to_mesh_latency() {
         let mut volume = spall_mesh::fixtures::cube([0, 0, 0], 8);
         let center = [1.0, 1.0, 1.0];
@@ -5010,6 +5322,7 @@ mod input_tests {
         published_at: Instant,
     ) -> InteractiveView {
         InteractiveView {
+            presentation_correction_total: [0.; 3],
             predicted: spall_physics::CharacterState {
                 position_m,
                 velocity_m_s,
@@ -5076,6 +5389,37 @@ mod input_tests {
                 last = x;
             }
         }
+    }
+
+    #[test]
+    fn applied_corrections_do_not_reverse_forward_camera_motion_and_settle() {
+        let start = Instant::now();
+        let tick = Duration::from_millis(16);
+        let mut follow = CameraFollow::default();
+        let mut last = f32::NEG_INFINITY;
+        for n in 0..60 {
+            let correction = if n >= 10 { -0.23 } else { 0. };
+            let mut sample = view(
+                [n as f64 * 0.0768 + correction, 0., 0.],
+                [4.8, 0., 0.],
+                start + tick * n,
+            );
+            sample.presentation_correction_total = [correction, 0., 0.];
+            let eye = follow.eye(sample, start + tick * n, true);
+            assert!(
+                eye.x >= last,
+                "camera reversed at tick {n}: {last} -> {}",
+                eye.x
+            );
+            last = eye.x;
+        }
+        let final_x = 59. * 0.0768 - 0.23;
+        for n in 60..150 {
+            let mut sample = view([final_x, 0., 0.], [0.; 3], start + tick * n);
+            sample.presentation_correction_total = [-0.23, 0., 0.];
+            last = follow.eye(sample, start + tick * n, true).x;
+        }
+        assert!((f64::from(last) - final_x).abs() < 0.001);
     }
 
     #[test]

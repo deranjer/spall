@@ -1,0 +1,313 @@
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.44
+   Compiling rustls-webpki v0.103.15
+   Compiling rcgen v0.13.2
+   Compiling quinn-proto v0.11.17 (https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f2)
+   Compiling quinn v0.11.11
+   Compiling spall_net v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_net)
+   Compiling xtask v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\tools\xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.48s
+     Running `target\debug\xtask.exe check`
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.44
+    Checking rustls-webpki v0.103.15
+    Checking rcgen v0.13.2
+    Checking quinn-proto v0.11.17 (https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f2)
+    Checking quinn v0.11.11
+    Checking spall_net v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_net)
+    Checking spall_client v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_client)
+    Checking spall_server v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_server)
+    Checking xtask v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\tools\xtask)
+    Checking sandbox v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\examples\sandbox)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.71s
+   Compiling spall_ecology v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_ecology)
+   Compiling spall_mesh v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_mesh)
+   Compiling ring v0.17.14
+   Compiling spall_sim v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_sim)
+   Compiling spall_render v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_render)
+   Compiling rustls v0.23.44
+   Compiling spall_editor v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\tools\spall_editor)
+   Compiling rustls-webpki v0.103.15
+   Compiling rcgen v0.13.2
+   Compiling quinn-proto v0.11.17 (https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f2)
+   Compiling quinn v0.11.11
+   Compiling spall_net v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_net)
+   Compiling spall_client v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_client)
+   Compiling spall_server v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\crates\spall_server)
+   Compiling xtask v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\tools\xtask)
+   Compiling sandbox v0.1.0 (C:\Users\deran\.codex\visualizations\2026\10\01\01a0f823-9722-7382-8ed6-efba1335861f\spall-seasonal-vegetation\examples\sandbox)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 32.35s
+     Running unittests src\main.rs (target\debug\deps\poc_local-eb86789e54816f14.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\sandbox-072c815e630f2b9f.exe)
+
+running 11 tests
+test game::tests::a_tool_use_becomes_a_matching_edit_intent ... ok
+test content::layer_tests::static_import_uses_voxl_and_accepts_layer_metadata ... ok
+test editor_scene::tests::placement_translates_and_quarter_turns_like_the_editor ... ok
+test vegetation::tests::catalogue_has_stable_twenty_species_and_every_biome ... ok
+test game::tests::the_linear_manifest_supersedes_v1_by_appearance_and_keeps_authored_looks ... ok
+test game::tests::manifest_is_valid_and_ids_are_fixed ... ok
+test editor_scene::tests::spawn_avoids_columns_with_overhead_geometry ... ok
+test progression_store::tests::committed_harvest_is_player_scoped_durable_and_idempotent ... ok
+test ecology_scene::tests::clearing_is_fully_resident_and_initial_vegetation_touches_soil ... ok
+test progression_store::tests::crafting_commit_and_exact_retry_survive_database_reopen ... ok
+test progression_store::tests::an_evicted_old_request_cannot_be_applied_again ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running unittests src\bin\sandbox-capture.rs (target\debug\deps\sandbox_capture-a2b245272fb15e88.exe)
+
+running 9 tests
+test tests::capture_aspect_follows_the_requested_dimensions ... ok
+test tests::g2_frame_scenes_are_distinct_lit_and_framed ... ok
+test tests::a_fixed_16_9_projection_distorts_a_4_3_target ... ok
+test tests::four_by_three_target_keeps_world_proportions ... ok
+test tests::square_target_keeps_world_proportions ... ok
+test tests::the_framed_shape_stays_inside_the_view ... ok
+test tests::sim_light_volume_tracks_terrain_occupancy_and_cuts ... ok
+test tests::destruction_scene_meshes_the_live_world_and_frames_it ... ok
+test tests::bounded_collapse_update_tracks_the_full_resample ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.64s
+
+     Running unittests src\bin\sandbox-client.rs (target\debug\deps\sandbox_client-00477728ee751e76.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\sandbox-server.rs (target\debug\deps\sandbox_server-9742a236a306ce3a.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\appearance.rs (target\debug\deps\appearance-076d73727a764200.exe)
+
+running 4 tests
+test wood_variants_still_drop_wood ... ok
+test the_manifest_extends_the_linear_one_and_variants_keep_their_bases_rules ... ok
+test forest_tints_map_to_variants_within_the_measured_error ... ok
+test variants_survive_an_edit_a_body_split_and_a_save ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+
+     Running tests\appearance_evolution.rs (target\debug\deps\appearance_evolution-d15422b8062bc653.exe)
+
+running 5 tests
+test a_reused_lower_or_recoloured_row_is_refused ... ok
+test extending_the_palette_keeps_every_earlier_meaning_and_colour ... ok
+test variant_ids_are_unique_and_never_collide_with_reserved_materials ... ok
+test shipped_manifests_are_frozen ... ok
+test a_saved_world_restores_under_an_extended_palette_unchanged ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.15s
+
+     Running tests\dam_gate_replication.rs (target\debug\deps\dam_gate_replication-8aa518f54520e4e9.exe)
+
+running 1 test
+test a_real_client_sees_the_dam_gate_open_after_the_admin_command ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.22s
+
+     Running tests\editor_scene.rs (target\debug\deps\editor_scene-702a7787fa1920d3.exe)
+
+running 10 tests
+test water_actually_flows_through_an_open_gate_more_than_a_closed_one ... ignored, simulates real fluid ticks over the full valley domain; slow
+test a_directory_without_a_project_reports_the_missing_file ... ok
+test forest_project_loads_into_a_walkable_world_with_trees ... ok
+test forest_world_stands_up_and_a_player_stays_on_the_lawn ... ok
+test authored_valley_water_is_server_state_not_solid_terrain ... ok
+test valley_has_few_disconnected_fragments ... ok
+test valley_has_a_tiered_gated_spring_and_a_closed_solid_gate ... ok
+test open_dam_gate_clears_a_passage_in_the_fluid_solvers_own_boundary ... ok
+test dam_gate_opens_and_closes_through_the_normal_edit_pipeline ... ok
+test valley_water_region_is_bounded_and_seeds_fully ... ok
+
+test result: ok. 9 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 20.65s
+
+     Running tests\lighting_latency.rs (target\debug\deps\lighting_latency-20e920f058ebcf9c.exe)
+
+running 4 tests
+test sealed_house_geometry_is_where_this_test_assumes ... ok
+test diag_minimal_skylight_sanity ... ok
+test edit_to_presented_latency_player_stationary ... ok
+test edit_to_presented_latency_player_moving ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.70s
+
+     Running tests\progression_network.rs (target\debug\deps\progression_network-b7727f2b8385b721.exe)
+
+running 1 test
+test authenticated_crafting_retries_disconnects_isolates_players_and_survives_restart ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.08s
+
+     Running tests\tint_replication.rs (target\debug\deps\tint_replication-333645a1788d8999.exe)
+
+running 1 test
+test tinted_terrain_and_detached_bodies_replicate_to_early_and_late_clients ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.64s
+
+     Running tests\vegetation.rs (target\debug\deps\vegetation-069498f8c2887c08.exe)
+
+running 6 tests
+test root_cuts_stop_reproduction_and_ground_plants_do_not_float_after_excavation ... ok
+test offspring_remain_on_allowed_biomes_and_survive_roundtrip ... ok
+test generated_world_is_deterministic_grounded_and_biome_filtered ... ok
+test seasons_persist_and_deciduous_trees_drop_only_their_leaves ... ok
+test authoritative_growth_and_checkpoint_recovery_keep_the_same_living_state ... ok
+test two_network_clients_receive_generated_vegetation_and_the_same_season ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.23s
+
+     Running tests\worldgen_hammer.rs (target\debug\deps\worldgen_hammer-a60e8df992556a8e.exe)
+
+running 1 test
+test a_hammer_swing_digs_a_crater_the_client_replica_sees ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.53s
+
+     Running tests\worldgen_render_cost.rs (target\debug\deps\worldgen_render_cost-111190dfee860aa7.exe)
+
+running 3 tests
+test measure_client_physics_window_and_sky ... ignored
+test measure_rebuild_while_walking ... ignored
+test measure_terrain_rebuild_on_the_showcase ... ignored
+
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\worldgen_scene.rs (target\debug\deps\worldgen_scene-2b69a6df6b89c4b2.exe)
+
+running 8 tests
+test measure_cut_latency_on_the_full_arena ... ignored
+test measure_full_arena_stand_up ... ignored
+test bad_requests_fail_loudly ... ok
+test every_terrain_role_is_a_distinct_solid_material_in_the_manifest ... ok
+test water_is_one_server_fluid_region_inside_the_arena ... ok
+test generated_terrain_only_uses_defined_materials ... ok
+test a_player_at_a_generated_spawn_stands_on_the_ground_with_water_running ... ok
+test only_edits_near_the_water_refresh_its_boundary ... ok
+
+test result: ok. 6 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.16s
+
+     Running tests\worldgen_torch.rs (target\debug\deps\worldgen_torch-c76e09e71d2c85bc.exe)
+
+running 1 test
+test a_torch_places_a_lamp_the_client_replica_sees ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.41s
+
+     Running tests\worldgen_torch_light.rs (target\debug\deps\worldgen_torch_light-63aba08d300fea91.exe)
+
+running 2 tests
+test a_dug_pit_shows_layers_and_colour_variation ... ok
+test a_torch_lights_the_ground_around_it ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 59.99s
+
+     Running tests\worldgen_walk.rs (target\debug\deps\worldgen_walk-a218fb59e199a5fc.exe)
+
+running 1 test
+test a_walking_player_travels_across_the_generated_meadow ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.66s
+
+     Running unittests src\lib.rs (target\debug\deps\spall_client-ef4df3c5d42fd705.exe)
+
+running 71 tests
+test net::retry_tests::only_explicit_overload_and_throttle_rejections_are_retried ... ok
+test ecology_demo::tests::pause_and_speed_controls_produce_expected_ecological_time ... ok
+test net::retry_tests::overload_retries_back_off_exponentially_and_are_bounded ... ok
+test net::retry_tests::throttle_retries_keep_their_short_bounded_schedule ... ok
+test predict::restitution_parity_tests::local_playground_restitution_matches_the_servers ... ok
+test predict::moving_body_replay_tests::pose_at_advances_translation_and_orientation_and_is_bounded ... ok
+test replica::tests::a_before_revision_mismatch_asks_for_repair_without_touching_state ... ok
+test replica::tests::a_repeated_gap_is_rate_limited_and_the_transaction_is_deduped ... ok
+test replica::tests::a_snapshot_for_a_tombstoned_body_is_ignored ... ok
+test replica::tests::a_result_hash_mismatch_rejects_the_whole_transaction ... ok
+test replica::tests::body_rotation_is_interpolated_not_stepped ... ok
+test replica::tests::a_duplicate_transaction_id_is_a_no_op ... ok
+test replica::tests::a_snapshot_for_an_unknown_body_is_held_then_applied ... ok
+test replica::tests::render_clock_is_continuous_and_never_runs_backwards ... ok
+test replica::tests::bodies_near_the_player_are_drawn_at_the_present_far_ones_delayed ... ok
+test predict::body_collision_tests::client_authority_integrates_body_and_ignores_server_pose_updates ... ok
+test predict::body_collision_tests::client_authority_player_sweep_pushes_a_light_body ... ok
+test replica::tests::interpolation_is_continuous_at_the_normal_snapshot_spacing ... ok
+test predict::moving_body_replay_tests::sync_bodies_at_parks_each_body_at_the_requested_tick ... ok
+test sky::tests::a_solid_brick_marks_its_cells_and_a_resident_air_brick_stays_open ... ok
+test replica::tests::the_pending_repair_hold_is_bounded ... ok
+test tick_accumulator::tests::a_catastrophic_stall_is_capped_and_does_not_leak_into_later_calls ... ok
+test predict::body_collision_tests::replicated_body_blocks_prediction_and_tracks_its_new_pose ... ok
+test tick_accumulator::tests::a_lead_far_past_the_target_slows_the_timeline_without_dropping_ticks ... ok
+test tick_accumulator::tests::a_slow_iteration_reports_multiple_ticks_to_catch_up ... ok
+test tick_accumulator::tests::catch_up_bursts_stop_at_the_rtt_relative_lead_ceiling ... ok
+test replica::tests::body_sampler_poses_at_each_frame_time_like_the_replica ... ok
+test replica::tests::install_baseline_world_replaces_prior_state_and_leaves_transactions_appliable ... ok
+test tick_accumulator::tests::fractional_time_accumulates_across_calls_instead_of_being_lost ... ok
+test tick_accumulator::tests::zero_elapsed_time_reports_no_ticks ... ok
+test tick_accumulator::tests::a_1_7_percent_clock_mismatch_leaves_the_lead_bounded_over_ten_minutes ... ok
+test predict::body_collision_tests::client_authority_refreshes_mass_after_server_topology_update ... ok
+test window::input_tests::applied_corrections_do_not_reverse_forward_camera_motion_and_settle ... ok
+test window::input_tests::focus_loss_clears_window_keys_and_shared_actions_but_keeps_look ... ok
+test window::input_tests::capsule_debug_edges_are_thin_continuous_wire_strokes ... ok
+test tick_accumulator::tests::steady_cadence_returns_one_tick_per_call ... ok
+test predict::body_collision_tests::client_authority_releases_both_playground_emitters_on_local_schedule ... ok
+test window::input_tests::camera_interpolation_does_not_overshoot_and_jerk_back_at_a_stop ... ok
+test window::input_tests::locally_simulated_pose_transforms_body_mesh_vertices ... ok
+test tick_accumulator::tests::unavailable_zero_transport_rtt_does_not_replace_a_valid_sample ... ok
+test window::input_tests::the_debug_view_cycle_visits_every_window_view_and_wraps_to_shaded ... ok
+test window::input_tests::the_lighting_cache_only_recentres_after_real_movement ... ok
+test window::input_tests::vegetation_arriving_before_solid_batches_waits_for_ground_and_trunks ... ok
+test sky::tests::identical_inputs_build_identical_grids_so_idle_rebuilds_cost_nothing ... ok
+test window::perf_probe::greedy_boxes_cover_each_cell_once_and_merge_flat_slabs ... ok
+test sky::tests::a_single_voxel_wall_marks_exactly_one_cache_cell ... ok
+test replica::tests::terrain_generation_tracks_only_published_resident_terrain_mutations ... ok
+test window::perf_probe::hammer_request_aims_along_the_view_and_clamps_the_radius ... ok
+test window::perf_probe::hammer_swings_on_click_then_repeats_only_while_held ... ok
+test window::perf_probe::build_instances_timing_walk_arena ... ok
+test window::input_tests::reports_incremental_mesh_and_edit_to_mesh_latency ... ok
+test window::perf_probe::a_flat_lake_merges_to_a_few_boxes_and_keeps_its_volume ... ok
+test window::perf_probe::the_crosshair_ray_finds_the_struck_cell_within_reach_only ... ok
+test window::perf_probe::the_hammer_outline_is_a_twelve_edge_box_of_the_brush_extent ... ok
+test window::perf_probe::terrain_resident_hash_timing_walk_arena ... ok
+test ecology_demo::tests::soft_vegetation_bases_are_on_the_soil_surface_and_holes_are_not_drawn ... ok
+test window::perf_probe::water_is_clipped_to_the_terrain_window_and_dropped_beyond_it ... ok
+test predict::moving_body_replay_tests::replay_meets_a_moving_body_where_it_is_at_each_replayed_tick ... ok
+test window::perf_probe::terrain_resident_hash_timing_g1_full_envelope ... ok
+test sky::tests::absent_bricks_are_open_only_when_the_world_is_complete ... ok
+test window::perf_probe::interior_bricks_are_skipped_but_the_block_surface_remains ... ok
+test window::input_tests::progressive_mesh_batches_cover_the_same_world_and_start_nearby ... ok
+test predict::large_world_window_tests::a_world_over_the_grid_cap_is_mirrored_as_a_window_around_the_player ... ok
+test window::perf_probe::the_terrain_cache_matches_a_fresh_build_and_an_edit_invalidates_only_its_bricks ... ok
+test window::perf_probe::build_instances_timing_g1_full_envelope ... ok
+test ecology_demo::tests::full_growth_has_foliage_correct_wood_volume_and_branch_cut_preserves_trunk ... ok
+test window::perf_probe::padded_walk_matches_the_per_cell_scan_on_a_random_volume ... ok
+test window::perf_probe::pending_cut_previews_without_poisoning_the_cache ... ok
+test predict::large_world_window_tests::a_world_under_the_cap_is_still_mirrored_whole ... ok
+test window::perf_probe::brick_walk_matches_per_cell_scan ... ok
+test window::perf_probe::pending_cut_remeshes_without_poisoning_the_mesh_cache ... FAILED
+
+failures:
+
+---- window::perf_probe::pending_cut_remeshes_without_poisoning_the_mesh_cache stdout ----
+
+thread 'window::perf_probe::pending_cut_remeshes_without_poisoning_the_mesh_cache' (55796) panicked at crates\spall_client\src\window.rs:6064:9:
+only the carved bricks and their neighbours are re-meshed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    window::perf_probe::pending_cut_remeshes_without_poisoning_the_mesh_cache
+
+test result: FAILED. 70 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.90s
+
+error: test failed, to rerun pass `-p spall_client --lib`
+xtask: cargo subcommand ["test", "--workspace", "--all-features"] failed with 101
+error: process didn't exit successfully: `target\debug\xtask.exe check` (exit code: 1)

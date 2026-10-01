@@ -128,10 +128,13 @@ available directly on `sandbox-server --worldgen showcase`.
 
 Validation and final evidence are recorded in the adjacent
 `ENG-118-evidence` directory. Specimen galleries use generated seed-1, 512-cell
-world specimens and the production geometry/shadow path, in stable ID order
+world specimens and the instanced-cube renderer/shadow path, in stable ID order
 from left to right. They are deliberately arranged for comparison; they are not
 screenshots of natural forest distribution. Three additional `world-*.png` captures
-use the actual generated terrain, spawn viewpoint and production geometry.
+use the actual generated terrain and spawn viewpoint, but originally used the
+legacy terrain-cube builder. They did not exercise the window's progressive
+live greedy terrain path. See `ENG-118-loading-performance.md` for the corrected
+live-path captures and measured follow-up.
 `default-1024` includes captures and counts for the default arena size.
 
 Measured seed-1 results:

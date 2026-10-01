@@ -81,6 +81,7 @@ impl LiveInput {
 /// render window can place its camera without locking the predictor itself.
 #[derive(Debug, Clone, Copy)]
 pub struct InteractiveView {
+    pub presentation_correction_total: [f64; 3],
     pub predicted: CharacterState,
     /// Last server tick observed when this pose was published.
     pub server_tick: u64,

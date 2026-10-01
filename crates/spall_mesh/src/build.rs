@@ -137,7 +137,60 @@ pub fn build_brick_mesh(
     topology_epoch: TopologyEpoch,
 ) -> Result<VolumeMesh, MeshError> {
     let cells = crate::sample::ResidentCells::one_brick(coord)?;
-    let sampler = VolumeSampler::new(volume);
+    // Air has no surface. A completely solid brick enclosed by six completely
+    // solid neighbours has no surface either. Keep exact revision/halo tokens
+    // so a later excavation or residency change still invalidates the result.
+    let hidden = volume
+        .snapshot_brick(coord)
+        .ok()
+        .flatten()
+        .is_some_and(|b| {
+            b.solid_cells() == 0
+                || (b.solid_cells() == spall_core::CELLS_PER_BRICK as u32
+                    && [
+                        (1, 0, 0),
+                        (-1, 0, 0),
+                        (0, 1, 0),
+                        (0, -1, 0),
+                        (0, 0, 1),
+                        (0, 0, -1),
+                    ]
+                    .into_iter()
+                    .all(|(x, y, z)| {
+                        let Some(nx) = coord.x.checked_add(x) else {
+                            return false;
+                        };
+                        let Some(ny) = coord.y.checked_add(y) else {
+                            return false;
+                        };
+                        let Some(nz) = coord.z.checked_add(z) else {
+                            return false;
+                        };
+                        volume
+                            .snapshot_brick(BrickCoord::new(nx, ny, nz))
+                            .ok()
+                            .flatten()
+                            .is_some_and(|n| n.solid_cells() == spall_core::CELLS_PER_BRICK as u32)
+                    }))
+        });
+    if hidden {
+        return Ok(VolumeMesh {
+            mesh: Mesh::from_quads(&[], volume.cell_size().metres()),
+            quads: Vec::new(),
+            stats: MeshStats {
+                strategy: MeshStrategy::Greedy,
+                quad_count: 0,
+                vertex_count: 0,
+                triangle_count: 0,
+                surface_area_m2: 0.0,
+                exposed_unit_faces: 0,
+                unresolved_halo_faces: 0,
+            },
+            token: build_token(volume, &[coord], generation, topology_epoch),
+        });
+    }
+    let padded = crate::sample::PaddedBrick::new(volume, coord);
+    let sampler = VolumeSampler::with_padded(volume, padded.as_ref());
     let quads = emit_greedy(&sampler, &cells);
     let mesh = Mesh::from_quads(&quads, volume.cell_size().metres());
     let mut exposed_unit_faces = 0u64;
@@ -204,6 +257,9 @@ fn build_token(
     for (x, y, z) in halo {
         let coord = BrickCoord::new(x, y, z);
         match volume.brick_state(coord) {
+            Ok(BrickState::Resident { revision, .. }) => {
+                token = token.reading(volume_id, coord, revision);
+            }
             Ok(BrickState::Absent) => token = token.reading_absent(volume_id, coord),
             Ok(BrickState::Failed) => token = token.reading_failed(volume_id, coord),
             // Resident (can't happen — filtered) or out of a bounded volume:
@@ -224,6 +280,71 @@ mod tests {
     use spall_voxel::{Brick, EditPlan};
 
     const STONE: MaterialId = MaterialId(1);
+
+    #[test]
+    fn enclosed_brick_cache_invalidates_when_a_resident_neighbour_is_cut() {
+        let mut volume = Volume::new(vid(), CellSizeCode::Quarter);
+        let mut current = MapWorld::new(gen1());
+        for (x, y, z) in [
+            (0, 0, 0),
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let at = BrickCoord::new(x, y, z);
+            volume
+                .insert_brick(at, Brick::uniform(STONE, Revision(1)))
+                .unwrap();
+            current.set_brick(vid(), at, Revision(1));
+        }
+        let center = BrickCoord::new(0, 0, 0);
+        let before = build_brick_mesh(&volume, center, gen1(), TopologyEpoch::START).unwrap();
+        assert!(before.mesh.is_empty());
+        assert!(!before.is_stale(&current));
+        let mut cut = EditPlan::new(vid());
+        cut.set(GlobalCell::new(32, 1, 1), MaterialId::AIR);
+        volume.apply_edit(&cut).unwrap();
+        current.set_brick(vid(), BrickCoord::new(1, 0, 0), Revision(2));
+        assert!(before.is_stale(&current));
+        let after = build_brick_mesh(&volume, center, gen1(), TopologyEpoch::START).unwrap();
+        assert_eq!(after.stats.exposed_unit_faces, 1);
+    }
+
+    #[test]
+    fn padded_incremental_sampler_matches_reference_faces_and_ao() {
+        let mut volume = Volume::new(vid(), CellSizeCode::Quarter);
+        let mut edit = EditPlan::new(vid());
+        for x in [0, 1, 30, 31] {
+            for y in [0, 1, 30, 31] {
+                for z in [0, 1, 30, 31] {
+                    edit.set(GlobalCell::new(x, y, z), STONE);
+                }
+            }
+        }
+        volume.apply_edit(&edit).unwrap();
+        volume
+            .insert_brick(BrickCoord::new(1, 0, 0), Brick::uniform(STONE, Revision(1)))
+            .unwrap();
+        volume
+            .insert_brick(
+                BrickCoord::new(0, 1, 0),
+                Brick::uniform(MaterialId::AIR, Revision(1)),
+            )
+            .unwrap();
+        let cells = ResidentCells::one_brick(BrickCoord::new(0, 0, 0)).unwrap();
+        let reference = emit_greedy(&VolumeSampler::new(&volume), &cells);
+        let fast = build_brick_mesh(
+            &volume,
+            BrickCoord::new(0, 0, 0),
+            gen1(),
+            TopologyEpoch::START,
+        )
+        .unwrap();
+        assert_eq!(fast.quads, reference);
+    }
 
     fn vid() -> VolumeId {
         VolumeId::new(1).unwrap()

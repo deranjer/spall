@@ -1091,3 +1091,19 @@ See `docs/reports/ENG-117-corrections.md` for checks and visual evidence.
 User-requested production follow-up to completed ENG-116/117. Define ten procedural trees and ten grasses/ground plants in sandbox, mapped to Meadow/Alpine/Swamp/Desert. Seed generated playable worlds through the common worldgen scene factory, including editor Run in game. Retain terrain-validated placement/dispersal, connected wood growth through server-authoritative edits, bounded fair work and stable IDs. Add plant-only seasons, autumn colour and deciduous winter leaf loss. Persist complete state and clock atomically and replicate soft plants to all clients and late joiners. Base terrain version 3 stays unchanged; vegetation owns its own version-1 schema. Earlier saves are not regenerated. ENG-113/114's broader statuses/performance gates remain separate; their available worldgen implementation is the input to this increment.
 
 Validation: catalogue/biome/grounding/offspring tests, four-season geometry, committed simulation growth, exact checkpoint/journal recovery, two network clients, legacy save upgrade/recovery, eight GPU specimen galleries plus actual generated-world captures at 512/default 1024 cells, cargo xtask check. Rules and measured evidence: docs/reports/ENG-118-vegetation.md.
+
+
+### ENG-118 loading and walking correction pass — 2026-10-01
+
+User reported ground/trunks arriving minutes after foliage, jerking during walking,
+and roughly 50 FPS. Exercise the actual live greedy terrain path, publish nearby
+mesh batches immediately, cache empty/enclosed results with complete halo revision
+validation, and preserve voxel/AO/unknown semantics while reducing meshing lookup
+cost. Move soft-plant generation off the render thread, upload only changed
+instances, omit enclosed foliage cells and compact adjacent quarter-metre cells
+without changing their occupied surface. Cull terrain against each camera/shadow
+pass separately. Gate soft plants on resident supporting meshes and smooth the
+camera's response to applied prediction corrections without altering authority,
+collision/replay, or raw correction telemetry. Add bounded real-input traversal
+capture support and regression tests. Full-world performance gates remain open.
+See `reports/ENG-118-loading-performance.md` for measurements and checks.

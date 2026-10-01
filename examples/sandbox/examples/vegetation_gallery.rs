@@ -106,6 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .copied()
                 .partition(|part| part.material < colour_base);
             renderer.set_terrain(&ctx.device, &ctx.queue, &solid);
+            let soft = spall_render::compact_vegetation_instances(soft);
             renderer.set_vegetation(&ctx.device, &ctx.queue, &soft);
             let mut encoder = ctx
                 .device
@@ -154,9 +155,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         65_f32.to_radians(),
         width as f32 / height as f32,
     );
-    let terrain =
-        spall_client::build_instances(&scene.world().terrain, eye.to_array().map(f64::from));
-    renderer.set_terrain(&ctx.device, &ctx.queue, &terrain);
+    let mesh_started = std::time::Instant::now();
+    let (terrain_meshes, emitters) = spall_client::window::live_terrain_for_render(
+        &scene.world().terrain,
+        eye.to_array().map(f64::from),
+        &materials,
+    );
+    let terrain_mesh_ms = mesh_started.elapsed().as_secs_f64() * 1000.;
+    renderer.set_terrain(&ctx.device, &ctx.queue, &emitters);
+    renderer.update_terrain_meshes(&ctx.device, &terrain_meshes, &[])?;
+    eprintln!(
+        "live terrain meshes: {} in {terrain_mesh_ms:.1} ms",
+        terrain_meshes.len()
+    );
     for (season, name) in [
         (Season::Summer, "summer"),
         (Season::Autumn, "autumn"),
@@ -176,6 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             })
             .collect();
+        let soft = spall_render::compact_vegetation_instances(soft);
         renderer.set_vegetation(&ctx.device, &ctx.queue, &soft);
         let mut encoder = ctx
             .device
@@ -200,7 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             height,
             image::ColorType::Rgba8,
         )?;
-        summary.push(serde_json::json!({"group":"generated-world","season":name,"terrain_instances":terrain.len(),"soft_instances":soft.len(),"eye":eye.to_array()}));
+        summary.push(serde_json::json!({"group":"generated-world","season":name,"terrain_meshes":terrain_meshes.len(),"terrain_mesh_ms":terrain_mesh_ms,"soft_instances":soft.len(),"eye":eye.to_array()}));
     }
     let counts:Vec<_>=state.species.iter().map(|s|serde_json::json!({"id":s.id,"name":sandbox::vegetation::NAMES[usize::from(s.id)-1],"count":state.organisms.iter().filter(|p|p.species==s.id).count()})).collect();
     std::fs::write(
