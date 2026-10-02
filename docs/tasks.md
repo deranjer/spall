@@ -1107,3 +1107,33 @@ camera's response to applied prediction corrections without altering authority,
 collision/replay, or raw correction telemetry. Add bounded real-input traversal
 capture support and regression tests. Full-world performance gates remain open.
 See `reports/ENG-118-loading-performance.md` for measurements and checks.
+
+## ENG-120 - Water domain growth
+
+Opt-in authoritative growth after committed nearby terrain edits. Preserve
+exact amounts, trapped ledger, sources and frame continuity; validate residency,
+overlap and caps. Velocity/pressure restart at rest. Replace superseded client
+regions and recover grown dimensions. Implemented on main through PR182;
+interactive acceptance remains open. See reports/ENG-120.md and ENG-121 for
+subsequent capture/cap corrections and adaptive growth budget.
+
+## ENG-121 - Adaptive water resolution and bounded active work
+
+Choose the finest generated-world grid fitting 50,000 fluid cells, restrict
+transport limiting to active cells, capture boundaries brick-wise, and avoid
+duplicate capture/repeated cap-limited growth. Looser tolerance, CFL/dt changes
+and surface-only sleep were rejected. Thin-wall leaks and dropped seed volume
+are reported limitations. See reports/ENG-121.md for 512/1024 measurements and
+reports/ENG-121-rest-state.md for integration checks and rest-state diagnosis.
+
+## ENG-122 - Preserve submerged solid capacity during water coarsening
+
+Dependencies: implemented ENG-105/120/121 interfaces. First design/test a
+conservative coarse solid-capacity and face-boundary representation. Unaligned
+submerged stairs create water/air interfaces in omitted solid space and drive
+currents, while resolved stairs remain still. Preserve volume, thin walls and
+openings, displacement/trapped water, sealed air and durable recovery. Make
+wire/save contract changes explicit before integration. Validate hydrostatic
+rest and real trench/dam-break response, then measure the same generated
+512/1024 release workload. No sleep heuristic that stalls flow, body coupling
+or GPU solver. Evidence: reports/ENG-121-rest-state.md.
