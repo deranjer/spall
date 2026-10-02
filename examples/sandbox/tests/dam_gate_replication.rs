@@ -96,7 +96,11 @@ fn a_real_client_sees_the_dam_gate_open_after_the_admin_command() {
         movement_script: Vec::new(),
         late_join: true,
         baseline_scene: BaselineScene::BridgeCut,
-        run_ticks: 200,
+        // Final hashes must describe the same end of the run. Stopping at
+        // tick 200 while the server continues to 300 races later topology
+        // commits (including detached-body damage). Wait for server shutdown;
+        // its max_ticks and our overall_timeout still bound the test.
+        run_ticks: 0,
         idle_grace: Duration::from_secs(25),
         overall_timeout: Duration::from_secs(60),
         log_json: dir.join("client.jsonl"),

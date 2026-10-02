@@ -773,6 +773,36 @@ pub fn rebuild_sky(
     crate::sky::SkyOccupancyStats,
     Duration,
 ) {
+    let (sky, stats, elapsed, _held) = rebuild_sky_deferring(
+        volume,
+        center_m,
+        sky_anchor,
+        last_sky,
+        absent_is_open,
+        false,
+    );
+    (sky, stats, elapsed)
+}
+
+/// Same as [`rebuild_sky`], but with `defer_minor` a *small* occupancy change
+/// (see [`sky_change_is_minor`]) is withheld: `last_sky` is left untouched and
+/// the final flag reports that, so the caller retries on a later pass. Every
+/// accepted sky grid costs the GPU a full time-sliced visibility and bounce
+/// sweep, so slow background edits (growing trees add a cell or two) must not
+/// each trigger one.
+fn rebuild_sky_deferring(
+    volume: &Volume,
+    center_m: [f64; 3],
+    sky_anchor: &mut Option<[f64; 3]>,
+    last_sky: &mut Option<spall_render::indirect::LightingVolume>,
+    absent_is_open: bool,
+    defer_minor: bool,
+) -> (
+    Option<spall_render::indirect::LightingVolume>,
+    crate::sky::SkyOccupancyStats,
+    Duration,
+    bool,
+) {
     let start = Instant::now();
     let sky_center = match *sky_anchor {
         Some(anchor) if within_sky_anchor(anchor, center_m) => anchor,
@@ -783,11 +813,45 @@ pub fn rebuild_sky(
     let changed = last_sky
         .as_ref()
         .is_none_or(|last| last.origin() != grid.origin() || last.cells() != grid.cells());
+    if changed
+        && defer_minor
+        && last_sky
+            .as_ref()
+            .is_some_and(|last| sky_change_is_minor(last, &grid))
+    {
+        return (None, sky_stats, start.elapsed(), true);
+    }
     let sky = changed.then(|| {
         *last_sky = Some(grid.clone());
         grid
     });
-    (sky, sky_stats, start.elapsed())
+    (sky, sky_stats, start.elapsed(), false)
+}
+
+/// Most differing light cells still treated as a "minor" sky change.
+const MINOR_SKY_CHANGE_CELLS: usize = 128;
+/// Longest a minor sky change is held back before it is applied anyway.
+const MINOR_SKY_CHANGE_MAX_DEFER: Duration = Duration::from_secs(4);
+
+/// `true` when `new` is the same grid as `last` apart from at most
+/// [`MINOR_SKY_CHANGE_CELLS`] cells. A moved origin is never minor.
+fn sky_change_is_minor(
+    last: &spall_render::indirect::LightingVolume,
+    new: &spall_render::indirect::LightingVolume,
+) -> bool {
+    if last.origin() != new.origin() {
+        return false;
+    }
+    let mut differing = 0;
+    for (a, b) in last.cells().iter().zip(new.cells()) {
+        if a != b {
+            differing += 1;
+            if differing > MINOR_SKY_CHANGE_CELLS {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Per-brick emissive cells of the visible terrain, keyed by the brick's
@@ -902,6 +966,7 @@ impl RebuildWorker {
                 let mut mesh_cache = TerrainMeshCache::default();
                 let mut emitter_cache = EmitterCache::default();
                 let mut last_sky_generation: Option<u64> = None;
+                let mut last_sky_sent_at = Instant::now();
                 for center_m in request_rx {
                     let Some(replica) = session.replica.get() else {
                         continue;
@@ -989,14 +1054,27 @@ impl RebuildWorker {
                                 Duration::ZERO,
                             )
                         } else {
-                            last_sky_generation = Some(generation);
-                            rebuild_sky(
+                            // A preview (pending hammer swing) is the player's own
+                            // edit and must light immediately; only slow background
+                            // growth is deferred, and never for longer than the cap.
+                            let defer_minor = volatile.is_empty()
+                                && last_sky_sent_at.elapsed() < MINOR_SKY_CHANGE_MAX_DEFER;
+                            let (sky, stats, elapsed, held) = rebuild_sky_deferring(
                                 &volume,
                                 center_m,
                                 &mut sky_anchor,
                                 &mut last_sky,
                                 absent_is_open,
-                            )
+                                defer_minor,
+                            );
+                            // Held: retry next pass instead of recording this generation.
+                            if !held {
+                                last_sky_generation = Some(generation);
+                            }
+                            if sky.is_some() {
+                                last_sky_sent_at = Instant::now();
+                            }
+                            (sky, stats, elapsed)
                         };
                     let lighting = RebuildOutcome {
                         center_m,
@@ -3022,7 +3100,8 @@ impl NetPose {
 }
 
 /// Per-body greedy mesh templates, keyed by topology revision.
-type BodyTemplates = std::collections::HashMap<u64, (u64, Arc<spall_mesh::Mesh>)>;
+/// The third field is the body-local pivot ([`body_pivot_m`]) poses move about.
+type BodyTemplates = std::collections::HashMap<u64, (u64, Arc<spall_mesh::Mesh>, [f64; 3])>;
 
 /// A body's cached mesh plus the pose the worker last saw for it.
 struct BodyDraw {
@@ -3031,6 +3110,8 @@ struct BodyDraw {
     #[allow(dead_code)]
     template: Arc<Vec<Instance>>,
     mesh: Arc<spall_mesh::Mesh>,
+    /// Body-local point near the centre of mass; see [`body_pivot_m`].
+    pivot_m: [f64; 3],
     translation_m: [f64; 3],
     rotation: [f32; 4],
     net: Option<NetPose>,
@@ -3072,7 +3153,8 @@ fn snapshot_bodies(
                     Some(pose) => (pose.translation_m, pose.rotation),
                     None => {
                         let sampler = replica.body_sampler(entity)?;
-                        let pose = sampler.presented(render_tick, focus_m)?;
+                        let pivot_m = templates.get(&raw).map_or([0.0; 3], |t| t.2);
+                        let pose = sampler.presented_about(render_tick, focus_m, pivot_m)?;
                         net = Some(NetPose {
                             sampler,
                             tick_at_sample: render_tick,
@@ -3086,7 +3168,9 @@ fn snapshot_bodies(
                     }
                 };
             let revision = volume.next_revision().get();
-            let cached = templates.get(&raw).is_some_and(|(rev, _)| *rev == revision);
+            let cached = templates
+                .get(&raw)
+                .is_some_and(|(rev, _, _)| *rev == revision);
             Some(BodyView {
                 entity: raw,
                 revision,
@@ -3184,9 +3268,12 @@ fn collect_body_draws(views: &[BodyView], templates: &mut BodyTemplates) -> Vec<
     for view in views {
         if let Some(volume) = &view.volume {
             let mesh = Arc::new(build_body_mesh_template(volume));
-            templates.insert(view.entity, (view.revision, mesh));
+            templates.insert(
+                view.entity,
+                (view.revision, mesh, crate::replica::body_pivot_m(volume)),
+            );
         }
-        let Some((_, mesh)) = templates.get(&view.entity) else {
+        let Some((_, mesh, pivot_m)) = templates.get(&view.entity) else {
             continue;
         };
         draws.push(BodyDraw {
@@ -3194,6 +3281,7 @@ fn collect_body_draws(views: &[BodyView], templates: &mut BodyTemplates) -> Vec<
             #[cfg(test)]
             template: Arc::new(Vec::new()),
             mesh: mesh.clone(),
+            pivot_m: *pivot_m,
             translation_m: view.translation_m,
             rotation: view.rotation,
             net: view.net.clone(),
@@ -3269,7 +3357,7 @@ fn pose_body_meshes(
             None => match &draw.net {
                 Some(net) => {
                     let tick = net.render_tick(now);
-                    match net.sampler.presented(tick, net.focus_m) {
+                    match net.sampler.presented_about(tick, net.focus_m, draw.pivot_m) {
                         Some(pose) => {
                             if net.sampler.is_moving() {
                                 let age_ms = net.sampler.latest_age_ticks(tick).unwrap_or(0.0)
@@ -5479,6 +5567,7 @@ mod input_tests {
                 }],
                 indices: Vec::new(),
             }),
+            pivot_m: [0.0; 3],
             translation_m: [2.0, 0.0, 0.0],
             rotation: [0.0, 0.0, 0.0, 1.0],
             net: None,
@@ -6069,6 +6158,24 @@ mod perf_probe {
         assert_eq!(by_coord(&restored), original);
         let (settled, _) = update_terrain_mesh_cache(&volume, center, &mut cache, &none);
         assert!(settled.is_empty());
+    }
+
+    /// A few changed light cells (a growing tree) are deferrable; a carve-sized
+    /// change or a moved grid origin is not.
+    #[test]
+    fn sky_change_minor_only_for_few_cells_at_the_same_origin() {
+        use spall_render::indirect::LightingVolume;
+        let origin = glam::Vec3::ZERO;
+        let base = LightingVolume::empty(origin);
+        let mut few = base.clone();
+        for x in 0..MINOR_SKY_CHANGE_CELLS as i32 {
+            few.set(glam::IVec3::new(x, 0, 0), 1);
+        }
+        assert!(sky_change_is_minor(&base, &few));
+        few.set(glam::IVec3::new(0, 1, 0), 1);
+        assert!(!sky_change_is_minor(&base, &few));
+        let moved = LightingVolume::empty(glam::Vec3::new(8., 0., 0.));
+        assert!(!sky_change_is_minor(&base, &moved));
     }
 
     /// Greedy boxes cover every input cell exactly once, never merge across

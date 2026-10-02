@@ -166,6 +166,12 @@ impl MotionTrack {
     /// `target` precedes them all, and extrapolated up to `max_extra_ticks`
     /// past the newest.
     fn sample(&self, target: f64, max_extra_ticks: f64) -> Option<Pose> {
+        self.sample_about(target, max_extra_ticks, [0.0; 3])
+    }
+
+    /// [`Self::sample`], interpolating the point `pivot_m` (body-local metres,
+    /// see [`pivot_world`]) instead of the body origin.
+    fn sample_about(&self, target: f64, max_extra_ticks: f64, pivot_m: [f64; 3]) -> Option<Pose> {
         let latest = self.latest?;
         let idx = self
             .history
@@ -187,7 +193,7 @@ impl MotionTrack {
         };
         let span = (b.server_tick - a.server_tick) as f64;
         let t = ((target - a.server_tick as f64) / span).clamp(0.0, 1.0 + max_extra_ticks / span);
-        Some(lerp_pose(&a.pose, &b.pose, t))
+        Some(lerp_pose_about(&a.pose, &b.pose, t, pivot_m))
     }
 
     /// The newest accepted server tick, if any.
@@ -242,23 +248,41 @@ impl BodySampler {
 
     /// Same result as [`ReplicaWorld::presented_pose`] at `render_tick`.
     pub fn presented(&self, render_tick: f64, focus_m: Option<[f64; 3]>) -> Option<Pose> {
-        let delayed = self
-            .track
-            .sample(render_tick - self.delay_ticks, self.max_extra_ticks)?;
+        self.presented_about(render_tick, focus_m, [0.0; 3])
+    }
+
+    /// [`Self::presented`] for a body whose geometry sits far from its pose
+    /// origin. A body's local frame is the world cell grid, so a felled tree's
+    /// origin can be 100 m from the tree. Interpolating or extrapolating the
+    /// *origin* then swings the tree by `radius * angle^2 / 8` per snapshot
+    /// interval (and extrapolation with the centre-of-mass velocity is wrong by
+    /// `angular_velocity x lever_arm`). `pivot_m` is a body-local point near
+    /// the geometry's centre of mass; the motion is applied to that point.
+    pub fn presented_about(
+        &self,
+        render_tick: f64,
+        focus_m: Option<[f64; 3]>,
+        pivot_m: [f64; 3],
+    ) -> Option<Pose> {
+        let delayed = self.track.sample_about(
+            render_tick - self.delay_ticks,
+            self.max_extra_ticks,
+            pivot_m,
+        )?;
         let Some(focus) = focus_m else {
             return Some(delayed);
         };
         let latest = self.track.latest?;
-        let present = advance_pose(
+        let present = advance_pose_about(
             &latest.pose,
             latest.linear_velocity,
             latest.angular_velocity,
             latest.sleeping,
             (render_tick - latest.server_tick as f64).clamp(0.0, self.max_extra_ticks),
             self.hz,
+            pivot_m,
         );
-        let d = present
-            .translation_m
+        let d = pivot_world(&present, pivot_m)
             .iter()
             .zip(focus)
             .map(|(p, f)| (p - f) * (p - f))
@@ -268,7 +292,7 @@ impl BodySampler {
             / (ReplicaWorld::PRESENT_NONE_BEYOND_M - ReplicaWorld::PRESENT_FULL_WITHIN_M))
             .clamp(0.0, 1.0);
         let smooth = x * x * (3.0 - 2.0 * x);
-        Some(lerp_pose(&present, &delayed, smooth))
+        Some(lerp_pose_about(&present, &delayed, smooth, pivot_m))
     }
 }
 
@@ -1816,6 +1840,94 @@ fn latest_revision(v: &Volume) -> Revision {
     Revision(v.next_revision().get().saturating_sub(1))
 }
 
+/// The centroid (body-local metres, same frame as the mesh) of every solid
+/// cell of a body: an estimate of its centre of mass. A body's local frame is
+/// the world cell grid, so its pose origin can be 100 m from its geometry and
+/// motion applied to the origin is amplified by that lever arm; poses are
+/// interpolated and extrapolated about this point instead. Zero when empty.
+pub(crate) fn body_pivot_m(volume: &Volume) -> [f64; 3] {
+    use spall_core::{BRICK_EDGE, LocalCell};
+    let cell_m = volume.cell_size().metres();
+    let edge = i64::from(BRICK_EDGE);
+    let (mut sum, mut count) = ([0.0_f64; 3], 0_u64);
+    for coord in volume.resident_brick_coords() {
+        let Ok(Some(snap)) = volume.snapshot_brick(coord) else {
+            continue;
+        };
+        for z in 0..BRICK_EDGE {
+            for y in 0..BRICK_EDGE {
+                for x in 0..BRICK_EDGE {
+                    let local = LocalCell::new(x as u8, y as u8, z as u8).expect("in-brick");
+                    if snap.get(local) == spall_core::MaterialId::AIR {
+                        continue;
+                    }
+                    sum[0] += (coord.x * edge + i64::from(x)) as f64 + 0.5;
+                    sum[1] += (coord.y * edge + i64::from(y)) as f64 + 0.5;
+                    sum[2] += (coord.z * edge + i64::from(z)) as f64 + 0.5;
+                    count += 1;
+                }
+            }
+        }
+    }
+    if count == 0 {
+        return [0.0; 3];
+    }
+    sum.map(|s| s / count as f64 * cell_m)
+}
+
+/// `rotation` applied to the body-local vector `v`.
+fn rotate_local(rotation: &spall_core::QuantizedQuat, v: [f64; 3]) -> [f64; 3] {
+    let r = rotation
+        .to_unit()
+        .map_or(glam::DQuat::IDENTITY, |[x, y, z, w]| {
+            glam::DQuat::from_xyzw(f64::from(x), f64::from(y), f64::from(z), f64::from(w))
+        });
+    (r * glam::DVec3::from_array(v)).to_array()
+}
+
+/// World position of the body-local point `pivot_m` under `pose`.
+pub(crate) fn pivot_world(pose: &Pose, pivot_m: [f64; 3]) -> [f64; 3] {
+    let r = rotate_local(&pose.rotation, pivot_m);
+    [
+        pose.translation_m[0] + r[0],
+        pose.translation_m[1] + r[1],
+        pose.translation_m[2] + r[2],
+    ]
+}
+
+/// `template` with `rotation`, translated so the body-local point `pivot_m`
+/// sits at the world position `pivot_pos`.
+fn pose_with_pivot_at(
+    pivot_pos: [f64; 3],
+    rotation: spall_core::QuantizedQuat,
+    pivot_m: [f64; 3],
+    template: &Pose,
+) -> Pose {
+    let r = rotate_local(&rotation, pivot_m);
+    let mut out = *template;
+    out.rotation = rotation;
+    for i in 0..3 {
+        out.translation_m[i] = pivot_pos[i] - r[i];
+    }
+    out
+}
+
+/// [`lerp_pose`] moving the body-local point `pivot_m` in a straight line (and
+/// the orientation by shortest-arc nlerp) instead of the origin. With a zero
+/// pivot this is exactly [`lerp_pose`].
+fn lerp_pose_about(a: &Pose, b: &Pose, t: f64, pivot_m: [f64; 3]) -> Pose {
+    if pivot_m == [0.0; 3] {
+        return lerp_pose(a, b, t);
+    }
+    let (pa, pb) = (pivot_world(a, pivot_m), pivot_world(b, pivot_m));
+    let rotation = nlerp_rotation(&a.rotation, &b.rotation, t).unwrap_or(b.rotation);
+    let mut pos = [0.0; 3];
+    for i in 0..3 {
+        pos[i] = pa[i] + (pb[i] - pa[i]) * t;
+    }
+    pose_with_pivot_at(pos, rotation, pivot_m, b)
+}
+
 fn lerp_pose(a: &Pose, b: &Pose, t: f64) -> Pose {
     let mut out = *b;
     for i in 0..3 {
@@ -1846,33 +1958,41 @@ fn nlerp_rotation(
 /// `pose` advanced by `ticks` server ticks (either sign) along constant linear
 /// and angular velocity; a sleeping body does not move. No contact response:
 /// callers bound `ticks` themselves.
-pub(crate) fn advance_pose(
+///
+/// The reported linear velocity is the centre of mass's, so it moves the
+/// body-local point `pivot_m` (an estimate of the centre of mass) and the
+/// orientation turns about that point. A body's frame is the world cell grid,
+/// so its origin can be 100 m from its geometry; advancing the origin instead
+/// is wrong by `angular_velocity x lever_arm`. A zero pivot is the origin model.
+pub(crate) fn advance_pose_about(
     pose: &Pose,
     linear_velocity_m_s: [f32; 3],
     angular_velocity_rad_s: [f32; 3],
     sleeping: bool,
     ticks: f64,
     server_tick_hz: f64,
+    pivot_m: [f64; 3],
 ) -> Pose {
     if sleeping {
         return *pose;
     }
     let dt = ticks / server_tick_hz;
-    let mut out = *pose;
-    for (t, v) in out.translation_m.iter_mut().zip(linear_velocity_m_s) {
+    let mut pivot_pos = pivot_world(pose, pivot_m);
+    for (t, v) in pivot_pos.iter_mut().zip(linear_velocity_m_s) {
         *t += f64::from(v) * dt;
     }
+    let mut rotation = pose.rotation;
     let w = glam::Vec3::from_array(angular_velocity_rad_s);
     if w.length_squared() > 1.0e-12
         && let Ok([x, y, z, wq]) = pose.rotation.to_unit()
     {
         let q = (glam::Quat::from_scaled_axis(w * dt as f32) * glam::Quat::from_xyzw(x, y, z, wq))
             .normalize();
-        if let Ok(rotation) = spall_core::QuantizedQuat::from_unit(q.x, q.y, q.z, q.w) {
-            out.rotation = rotation;
+        if let Ok(turned) = spall_core::QuantizedQuat::from_unit(q.x, q.y, q.z, q.w) {
+            rotation = turned;
         }
     }
-    out
+    pose_with_pivot_at(pivot_pos, rotation, pivot_m, pose)
 }
 
 #[cfg(test)]
@@ -2218,6 +2338,66 @@ mod tests {
             assert!(cur - prev < 1.0, "no snapshot-sized jump: {}", cur - prev);
             prev = cur;
         }
+    }
+
+    /// A body whose pose origin is 100 m from its geometry (its frame is the
+    /// world cell grid) spinning in place: drawing must keep the centre of
+    /// mass still. Moving the *origin* along chords / by the centre-of-mass
+    /// velocity swings the geometry by metres.
+    #[test]
+    fn far_from_origin_spinning_body_keeps_its_centre_still_when_posed_about_a_pivot() {
+        let local_com = [100.0_f64, 0.0, 0.0];
+        let centre = glam::DVec3::new(50.0, 10.0, 50.0);
+        let omega = 3.0_f64; // rad/s about +y
+        let state = |tick: u64| {
+            let theta = omega * tick as f64 / 60.0;
+            let q = glam::DQuat::from_rotation_y(theta);
+            let origin = centre - q * glam::DVec3::from_array(local_com);
+            MotionState {
+                server_tick: tick,
+                topology_revision: Revision(0),
+                pose: Pose {
+                    translation_m: origin.to_array(),
+                    rotation: spall_core::QuantizedQuat::from_unit(
+                        q.x as f32, q.y as f32, q.z as f32, q.w as f32,
+                    )
+                    .unwrap(),
+                },
+                linear_velocity: [0.0; 3],
+                angular_velocity: [0.0, omega as f32, 0.0],
+                sleeping: false,
+            }
+        };
+        let mut track = MotionTrack::default();
+        for tick in (0..=30).step_by(3) {
+            track.accept(state(tick));
+        }
+        let sampler = BodySampler {
+            track,
+            delay_ticks: 6.0,
+            max_extra_ticks: 6.0,
+            hz: 60.0,
+        };
+        let centre_error =
+            |pose: &Pose| (glam::DVec3::from_array(pivot_world(pose, local_com)) - centre).length();
+        let (mut worst_pivot, mut worst_origin) = (0.0_f64, 0.0_f64);
+        // Interpolated (far) and extrapolated-forward (near) draws.
+        for step in 0..=60 {
+            let render_tick = 12.0 + f64::from(step) * 0.3;
+            for focus in [None, Some(centre.to_array())] {
+                let about = sampler
+                    .presented_about(render_tick, focus, local_com)
+                    .unwrap();
+                let plain = sampler.presented(render_tick, focus).unwrap();
+                worst_pivot = worst_pivot.max(centre_error(&about));
+                worst_origin = worst_origin.max(centre_error(&plain));
+            }
+        }
+        assert!(worst_pivot < 0.03, "pivot-based error {worst_pivot} m");
+        assert!(
+            worst_origin > 0.2,
+            "origin-based error {worst_origin} m should show the problem"
+        );
     }
 
     #[test]
