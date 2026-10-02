@@ -65,6 +65,13 @@ pub struct ProjectionMetrics {
     pub max_connection_speed_m_s: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransportMetrics {
+    pub limiter_passes: u32,
+    pub limited_water_m3: f64,
+    pub moved_water_m3: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ComponentFluid {
     geometry: Arc<CutCellGeometry>,
@@ -80,6 +87,7 @@ pub struct ComponentFluid {
     height_deltas: Vec<[f64; 3]>,
     top_distance: Vec<f64>,
     pinned: Vec<bool>,
+    regions: Vec<Vec<usize>>,
     outflow: f64,
 }
 
@@ -167,6 +175,7 @@ impl ComponentFluid {
         }
         let mut seen = vec![false; n];
         let mut pinned = vec![false; n];
+        let mut regions = Vec::new();
         for root in 0..n {
             if seen[root] {
                 continue;
@@ -174,7 +183,9 @@ impl ComponentFluid {
             let mut queue = VecDeque::from([root]);
             seen[root] = true;
             let mut anchored = false;
+            let mut region = Vec::new();
             while let Some(i) = queue.pop_front() {
+                region.push(i);
                 anchored |= top_area[i] > 0.0;
                 for &next in &adjacency[i] {
                     if !seen[next] {
@@ -186,6 +197,7 @@ impl ComponentFluid {
             // One explicit pressure gauge per all-Neumann connected region.
             // No coupling is added across walls or isolated domains.
             pinned[root] = !anchored;
+            regions.push(region);
         }
         let edge_count = geometry.portals().len();
         Ok(Self {
@@ -201,6 +213,7 @@ impl ComponentFluid {
             height_deltas,
             top_distance,
             pinned,
+            regions,
             outflow: 0.0,
         })
     }
@@ -221,6 +234,63 @@ impl ComponentFluid {
         self.outflow
     }
 
+    /// Horizontal hydrostatic reference per connected open region. Inverting
+    /// exact open-layer capacity does not alter amounts or transport fluxes.
+    /// The pressure split retains density departures as buoyancy; it is not a
+    /// still-water detector and never skips a requested operator iteration.
+    fn hydrostatic_reference(&self) -> Result<(Vec<f64>, Vec<f64>), ComponentError> {
+        let size = self.config.voxel_size_m;
+        let voxel_volume = size.powi(3);
+        let ny = self.geometry.fine_spec().dimensions()[1] as usize;
+        let coarse_nx = self.geometry.coarse_dimensions()[0] as usize;
+        let coarse_ny = self.geometry.coarse_dimensions()[1] as usize;
+        let factor = self.geometry.factor() as usize;
+        let mut reference_density = vec![self.config.air_density; self.amounts.len()];
+        let mut pressure = vec![0.0; self.amounts.len()];
+        for region in &self.regions {
+            let mut layers = vec![0u64; ny];
+            let water = region.iter().map(|&i| self.amounts[i]).sum::<f64>() / voxel_volume;
+            if !water.is_finite() {
+                return Err(ComponentError::InvalidState);
+            }
+            for &i in region {
+                let c = &self.geometry.components()[i];
+                let base = c.coarse_index / coarse_nx % coarse_ny * factor;
+                for (y, &count) in c.layer_counts[..factor].iter().enumerate() {
+                    layers[base + y] += u64::from(count);
+                }
+            }
+            let mut remaining = water;
+            let mut height = ny as f64;
+            for (y, &count) in layers.iter().enumerate() {
+                if count > 0 && remaining < count as f64 {
+                    height = y as f64 + remaining / count as f64;
+                    break;
+                }
+                remaining -= count as f64;
+            }
+            for &i in region {
+                let c = &self.geometry.components()[i];
+                let base = c.coarse_index / coarse_nx % coarse_ny * factor;
+                let fraction = c.volume_below(height - base as f64) / f64::from(c.voxel_count);
+                reference_density[i] = self.config.air_density
+                    + fraction * (self.config.water_density - self.config.air_density);
+                let y = self.geometry.component_centroid(i)[1] * size;
+                pressure[i] = -self.config.gravity[1]
+                    * (self.config.air_density * (ny as f64 * size - y)
+                        + (self.config.water_density - self.config.air_density)
+                            * (height * size - y).max(0.0));
+            }
+            if let Some(&root) = region.first().filter(|&&root| self.pinned[root]) {
+                let gauge = pressure[root];
+                for &i in region {
+                    pressure[i] -= gauge;
+                }
+            }
+        }
+        Ok((reference_density, pressure))
+    }
+
     /// Inject a bounded predicted volume-flux field for operator tests or a
     /// future velocity-advection stage. Positive flux goes lower -> upper.
     pub fn set_predicted_flux(&mut self, flux: &[f64]) -> Result<(), ComponentError> {
@@ -233,7 +303,9 @@ impl ComponentFluid {
 
     /// Two-phase finite-volume pressure projection. Each component owns a
     /// pressure row; density uses water/open capacity, never water/whole box.
-    /// Gravity is projected along the component-centroid connection. A failed
+    /// Vertical gravity uses a hydrostatic pressure-reference split; density
+    /// departures and horizontal forces drive the perturbation projection.
+    /// The centroid approximation is still experimental. A failed
     /// solve installs no pressure or flux. Sealed-air compression is not yet
     /// implemented: closed regions here enforce incompressibility.
     pub fn project(&mut self, dt: f64, gravity: bool) -> Result<ProjectionMetrics, ComponentError> {
@@ -251,6 +323,11 @@ impl ComponentFluid {
             })
             .collect();
         let mut candidate = self.flux.clone();
+        let (reference_density, reference_pressure) = if gravity {
+            self.hydrostatic_reference()?
+        } else {
+            (density.clone(), vec![0.0; n])
+        };
         let mut top = self.top_flux.clone();
         let mut weights = Vec::new();
         let mut diag = vec![0.0; n];
@@ -265,13 +342,16 @@ impl ComponentFluid {
             diag[a] += weight;
             diag[b] += weight;
             if gravity {
-                let g = self
-                    .config
-                    .gravity
-                    .iter()
-                    .zip(self.height_deltas[i])
-                    .map(|(g, d)| g * d)
-                    .sum::<f64>();
+                // Analytically cancel the hydrostatic reference gradient with
+                // its pressure correction before solving for perturbations.
+                // Residual buoyancy and horizontal forces still drive motion.
+                let residual_density = 0.5
+                    * ((density[a] - reference_density[a]) + (density[b] - reference_density[b]));
+                let mean_density = 0.5 * (density[a] + density[b]);
+                let delta = self.height_deltas[i];
+                let g = self.config.gravity[0] * delta[0]
+                    + self.config.gravity[2] * delta[2]
+                    + residual_density / mean_density * self.config.gravity[1] * delta[1];
                 candidate[i] += area * dt * g / self.distances[i];
             }
         }
@@ -285,7 +365,11 @@ impl ComponentFluid {
                 top_weights[i] = w;
                 diag[i] += w;
                 if gravity {
-                    top[i] += dt * self.top_area[i] * self.config.gravity[1];
+                    top[i] += dt
+                        * self.top_area[i]
+                        * self.config.gravity[1]
+                        * (density[i] - reference_density[i])
+                        / density[i];
                 }
             }
             if self.pinned[i] {
@@ -412,6 +496,12 @@ impl ComponentFluid {
         if !max_divergence.is_finite() || !speed.is_finite() {
             return Err(ComponentError::InvalidState);
         }
+        for (p, reference) in p.iter_mut().zip(reference_pressure) {
+            *p += reference;
+        }
+        if p.iter().any(|p| !p.is_finite()) {
+            return Err(ComponentError::InvalidState);
+        }
         self.pressure = p;
         self.flux = candidate;
         self.top_flux = top;
@@ -426,7 +516,9 @@ impl ComponentFluid {
     /// First-order donor transport over matched portals. Rejects a requested
     /// CFL above the budget; no hidden clipping, retries or lost fluid time.
     /// Pairwise equal/opposite transfers conserve water, including top outflow.
-    pub fn transport(&mut self, dt: f64) -> Result<(), ComponentError> {
+    /// An iterative paired-flux limiter enforces capacity; after 64 reductions
+    /// an unresolved violation is an atomic failure. Amounts are never clipped.
+    pub fn transport(&mut self, dt: f64) -> Result<TransportMetrics, ComponentError> {
         if !dt.is_finite() || dt <= 0.0 {
             return Err(ComponentError::InvalidConfig);
         }
@@ -459,32 +551,91 @@ impl ComponentFluid {
             .zip(&self.capacity)
             .map(|(v, c)| v / c)
             .collect();
-        let mut next = self.amounts.clone();
+        let mut transfers = Vec::with_capacity(self.flux.len());
         for (edge, &q) in self.geometry.portals().iter().zip(&self.flux) {
             let (a, b) = (edge.lower_component as usize, edge.upper_component as usize);
             let water = dt * q * if q >= 0.0 { fractions[a] } else { fractions[b] };
-            next[a] -= water;
-            next[b] += water;
+            transfers.push(water);
         }
-        let mut outflow = 0.0;
-        for i in 0..next.len() {
-            let exported = dt * self.top_flux[i].max(0.0) * fractions[i];
-            next[i] -= exported;
-            outflow += exported;
-            if !next[i].is_finite() || next[i] < 0.0 || next[i] > self.capacity[i] {
-                return Err(ComponentError::Capacity {
-                    component: i,
-                    amount_m3: next[i],
-                    capacity_m3: self.capacity[i],
+        let mut exports: Vec<_> = self
+            .top_flux
+            .iter()
+            .zip(&fractions)
+            .map(|(q, f)| dt * q.max(0.0) * f)
+            .collect();
+        let requested =
+            transfers.iter().map(|v| v.abs()).sum::<f64>() + exports.iter().sum::<f64>();
+        let mut incoming = vec![0.0; self.amounts.len()];
+        let mut leaving = vec![0.0; self.amounts.len()];
+        let mut next = vec![0.0; self.amounts.len()];
+        let mut in_scale = vec![1.0; self.amounts.len()];
+        let mut out_scale = vec![1.0; self.amounts.len()];
+        for pass in 0..=64 {
+            incoming.fill(0.0);
+            leaving.copy_from_slice(&exports);
+            for (edge, &water) in self.geometry.portals().iter().zip(&transfers) {
+                let (a, b) = (edge.lower_component as usize, edge.upper_component as usize);
+                let (donor, receiver) = if water >= 0.0 { (a, b) } else { (b, a) };
+                leaving[donor] += water.abs();
+                incoming[receiver] += water.abs();
+            }
+            in_scale.fill(1.0);
+            out_scale.fill(1.0);
+            let mut bad = None;
+            for i in 0..next.len() {
+                next[i] = self.amounts[i] + (incoming[i] - leaving[i]);
+                if !next[i].is_finite() {
+                    return Err(ComponentError::InvalidState);
+                }
+                if next[i] > self.capacity[i] {
+                    in_scale[i] = ((self.capacity[i] - self.amounts[i] + leaving[i]) / incoming[i])
+                        .clamp(0.0, 1.0)
+                        * (1.0 - 32.0 * f64::EPSILON);
+                    bad = Some(i);
+                } else if next[i] < 0.0 {
+                    out_scale[i] = ((self.amounts[i] + incoming[i]) / leaving[i]).clamp(0.0, 1.0)
+                        * (1.0 - 32.0 * f64::EPSILON);
+                    bad = Some(i);
+                }
+            }
+            if let Some(i) = bad {
+                if pass == 64 {
+                    return Err(ComponentError::Capacity {
+                        component: i,
+                        amount_m3: next[i],
+                        capacity_m3: self.capacity[i],
+                    });
+                }
+                // Reduce each paired transfer once, with the same value used on
+                // both sides. Outgoing capacity remains available to incoming
+                // flow, so saturated chains/cycles are not globally blocked.
+                for (edge, water) in self.geometry.portals().iter().zip(&mut transfers) {
+                    let (a, b) = (edge.lower_component as usize, edge.upper_component as usize);
+                    let (donor, receiver) = if *water >= 0.0 { (a, b) } else { (b, a) };
+                    *water *= out_scale[donor].min(in_scale[receiver]);
+                }
+                for (i, export) in exports.iter_mut().enumerate() {
+                    *export *= out_scale[i];
+                }
+            } else {
+                let outflow = exports.iter().sum::<f64>();
+                let moved = transfers.iter().map(|v| v.abs()).sum::<f64>() + outflow;
+                if !(self.outflow + outflow).is_finite()
+                    || !moved.is_finite()
+                    || !requested.is_finite()
+                {
+                    return Err(ComponentError::InvalidState);
+                }
+                self.amounts = next;
+                self.outflow += outflow;
+                return Ok(TransportMetrics {
+                    limiter_passes: pass,
+                    limited_water_m3: (requested - moved).max(0.0),
+                    moved_water_m3: moved,
                 });
             }
         }
-        if !(self.outflow + outflow).is_finite() {
-            return Err(ComponentError::InvalidState);
-        }
-        self.amounts = next;
-        self.outflow += outflow;
-        Ok(())
+        unreachable!("bounded limiter returns accepted state or explicit failure")
     }
 
     /// Atomic experimental force/projection/transport iteration. Velocity

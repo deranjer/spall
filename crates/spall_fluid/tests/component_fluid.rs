@@ -205,7 +205,7 @@ fn partial_flat_surface_is_hydrostatic_without_treating_solid_capacity_as_air() 
 }
 
 #[test]
-fn small_flux_into_full_capacity_is_rejected_without_clipping_or_installation() {
+fn flux_into_full_capacity_is_limited_without_losing_mass() {
     let (_, mut f) = fixture(
         [2, 1, 1],
         1,
@@ -219,9 +219,194 @@ fn small_flux_into_full_capacity_is_rejected_without_clipping_or_installation() 
     f.set_predicted_flux(&[0.001]).unwrap();
     let before = f.amounts_m3().to_vec();
     let before_flux = f.flux_m3_s().to_vec();
+    let metrics = f.transport(0.05).unwrap();
+    assert_eq!(metrics.limited_water_m3, 0.00005);
+    assert!(metrics.limiter_passes > 0);
+    assert_eq!(f.amounts_m3(), before);
+    assert_eq!(f.flux_m3_s(), before_flux);
+    assert_eq!(f.outflow_m3(), 0.0);
+}
+
+#[test]
+fn saturated_chain_passes_incoming_water_using_simultaneous_outgoing_capacity() {
+    let (_, mut f) = fixture(
+        [3, 1, 1],
+        1,
+        |_| false,
+        |c| if c.x < 2 { 1.0 } else { 0.0 },
+        ComponentConfig {
+            open_top: false,
+            ..ComponentConfig::default()
+        },
+    );
+    let before = f.amounts_m3().to_vec();
+    f.set_predicted_flux(&[0.006, 0.006]).unwrap();
+    let metrics = f.transport(0.1).unwrap();
+    assert_eq!(metrics.limiter_passes, 0);
+    assert_eq!(f.amounts_m3()[1], before[1]);
+    assert!((f.amounts_m3()[0] - (before[0] - 0.0006)).abs() < 1e-16);
+    assert!((f.amounts_m3()[2] - 0.0006).abs() < 1e-16);
+    assert!((f.water_volume_m3() - before.iter().sum::<f64>()).abs() < 1e-16);
+}
+
+#[test]
+fn full_cycle_transports_without_clipping_or_artificial_blocking() {
+    let (g, mut f) = fixture(
+        [2, 1, 2],
+        1,
+        |_| false,
+        |_| 1.0,
+        ComponentConfig {
+            open_top: false,
+            ..ComponentConfig::default()
+        },
+    );
+    let flux: Vec<_> = g
+        .portals()
+        .iter()
+        .map(|e| match (e.lower_component, e.upper_component) {
+            (0, 1) | (1, 3) => 0.001,
+            (0, 2) | (2, 3) => -0.001,
+            other => panic!("unexpected square edge {other:?}"),
+        })
+        .collect();
+    f.set_predicted_flux(&flux).unwrap();
+    let p = f.project(0.1, true).unwrap();
+    assert_eq!(f.flux_m3_s(), flux);
+    assert_eq!(p.iterations, 0);
+    let before = f.amounts_m3().to_vec();
+    let m = f.transport(0.1).unwrap();
+    assert_eq!(m.limiter_passes, 0);
+    assert_eq!(m.limited_water_m3, 0.0);
+    assert!((m.moved_water_m3 - 0.0004).abs() < 1e-16);
+    assert_eq!(f.amounts_m3(), before);
+}
+
+#[test]
+fn near_full_receiver_limits_paired_transfer_conservatively() {
+    let (_, mut f) = fixture(
+        [2, 1, 1],
+        1,
+        |_| false,
+        |c| if c.x == 0 { 1.0 } else { 0.9 },
+        ComponentConfig {
+            open_top: false,
+            ..ComponentConfig::default()
+        },
+    );
+    let before = f.water_volume_m3();
+    f.set_predicted_flux(&[0.02]).unwrap();
+    let m = f.transport(0.1).unwrap();
+    assert!(m.limiter_passes > 0 && m.limited_water_m3 > 0.0);
+    assert!(f.amounts_m3().iter().all(|v| *v >= 0.0 && *v <= 0.015625));
+    assert!((f.water_volume_m3() - before).abs() < 1e-16);
+    assert!((m.moved_water_m3 - 0.0015625).abs() < 1e-15);
+}
+
+#[test]
+fn hydrostatic_split_still_drives_level_difference_flow() {
+    let (g, mut f) = fixture(
+        [12, 12, 6],
+        3,
+        |c| c.y < 2,
+        |c| {
+            if c.y < if c.x < 6 { 8 } else { 4 } {
+                1.0
+            } else {
+                0.0
+            }
+        },
+        ComponentConfig::default(),
+    );
+    let left = |f: &ComponentFluid| {
+        g.components()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.anchor.x < 6)
+            .map(|(i, _)| f.amounts_m3()[i])
+            .sum::<f64>()
+    };
+    let before_left = left(&f);
+    let before_total = f.water_volume_m3();
+    let mut peak = 0.0_f64;
+    for _ in 0..600 {
+        peak = peak.max(f.advance_operators(0.05).unwrap().max_connection_speed_m_s);
+    }
+    assert!(peak > 0.01, "perturbation did not drive flow: {peak}");
+    assert!(
+        left(&f) < before_left - 0.01,
+        "left pool did not drain toward lower pool"
+    );
+    assert!((f.water_volume_m3() + f.outflow_m3() - before_total).abs() < 1e-12);
+}
+
+#[test]
+fn reference_pressure_matches_two_phase_hydrostatic_column() {
+    let (_, mut f) = fixture(
+        [1, 2, 1],
+        1,
+        |_| false,
+        |c| if c.y == 0 { 1.0 } else { 0.0 },
+        ComponentConfig::default(),
+    );
+    let m = f.project(0.05, true).unwrap();
+    assert_eq!(m.iterations, 0);
+    assert_eq!(m.max_connection_speed_m_s, 0.0);
+    assert!((f.pressure_pa()[0] - (1000.0 * 9.81 * 0.125 + 1.2 * 9.81 * 0.25)).abs() < 1e-10);
+    assert!((f.pressure_pa()[1] - 1.2 * 9.81 * 0.125).abs() < 1e-10);
+}
+
+#[test]
+fn partial_surface_across_irregular_submerged_geometry_stays_at_rest_for_one_minute() {
+    for surface_fraction in [0.5, 0.3] {
+        let (_, mut f) = fixture(
+            [12, 12, 6],
+            3,
+            |c| c.y < 2 + c.x % 5 || ((c.x == 4 || c.x == 8) && c.y < 8),
+            |c| {
+                if c.y < 7 {
+                    1.0
+                } else if c.y == 7 {
+                    surface_fraction
+                } else {
+                    0.0
+                }
+            },
+            ComponentConfig::default(),
+        );
+        let initial = f.amounts_m3().to_vec();
+        for _ in 0..1200 {
+            let m = f.advance_operators(0.05).unwrap();
+            assert!(m.max_connection_speed_m_s < 1e-10, "{m:?}");
+        }
+        assert!(
+            f.amounts_m3()
+                .iter()
+                .zip(initial)
+                .all(|(a, b)| (*a - b).abs() < 1e-12)
+        );
+        assert_eq!(f.outflow_m3(), 0.0);
+    }
+}
+
+#[test]
+fn limiter_pass_exhaustion_is_atomic() {
+    let (_, mut f) = fixture(
+        [100, 1, 1],
+        1,
+        |_| false,
+        |_| 1.0,
+        ComponentConfig {
+            open_top: false,
+            ..ComponentConfig::default()
+        },
+    );
+    f.set_predicted_flux(&[0.001; 99]).unwrap();
+    let before = f.amounts_m3().to_vec();
+    let before_flux = f.flux_m3_s().to_vec();
     assert!(matches!(
         f.transport(0.05),
-        Err(ComponentError::Capacity { component: 1, .. })
+        Err(ComponentError::Capacity { .. })
     ));
     assert_eq!(f.amounts_m3(), before);
     assert_eq!(f.flux_m3_s(), before_flux);

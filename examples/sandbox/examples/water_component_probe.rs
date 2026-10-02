@@ -9,6 +9,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let size = std::env::args()
         .nth(1)
         .map_or(Ok(512), |v| v.parse::<u32>())?;
+    let requested_iterations = std::env::args()
+        .nth(2)
+        .map_or(Ok(20), |v| v.parse::<u32>())?;
+    if requested_iterations == 0 || requested_iterations > 10_000 {
+        return Err("iteration count must be 1..=10000".into());
+    }
     let scene = worldgen_scene::generate_with_season(
         "showcase",
         1,
@@ -50,7 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut peak_divergence = 0.0_f64;
     let mut max_iterations = 0;
     let mut failure = None;
-    for _ in 0..20 {
+    let mut max_limiter_passes = 0;
+    let mut limited_water = 0.0;
+    let mut moved_water = 0.0;
+    for _ in 0..requested_iterations {
         let mut candidate = fluid.clone();
         let start = Instant::now();
         let metrics = match candidate.project(0.05, true) {
@@ -66,7 +75,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_iterations = max_iterations.max(metrics.iterations);
         let start = Instant::now();
         match candidate.transport(0.05) {
-            Ok(()) => {}
+            Ok(m) => {
+                max_limiter_passes = max_limiter_passes.max(m.limiter_passes);
+                limited_water += m.limited_water_m3;
+                moved_water += m.moved_water_m3;
+            }
             Err(e) => {
                 failure = Some(e.to_string());
                 break;
@@ -86,9 +99,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or_else(|| "null".to_owned(), ToString::to_string);
     let failure_json = failure.map_or_else(|| "null".to_owned(), |e| format!("{e:?}"));
     println!(
-        "{{\"size\":{size},\"seed\":1,\"season\":\"autumn\",\"components\":{},\"portals\":{},\"accepted_operator_iterations\":{accepted},\"requested_iterations\":20,\"dt_s\":0.05,\"peak_speed_m_s\":{peak_speed},\"peak_divergence_per_s\":{peak_divergence},\"max_pressure_iterations\":{max_iterations},\"projection_median_us\":{projection_median},\"transport_median_us\":{transport_median},\"accounting_error_m3\":{},\"failure\":{failure_json},\"production_fluid_steps\":0}}",
+        "{{\"size\":{size},\"seed\":1,\"season\":\"autumn\",\"components\":{},\"portals\":{},\"accepted_operator_iterations\":{accepted},\"requested_iterations\":{requested_iterations},\"dt_s\":0.05,\"advanced_operator_time_s\":{},\"peak_speed_m_s\":{peak_speed},\"peak_divergence_per_s\":{peak_divergence},\"max_pressure_iterations\":{max_iterations},\"projection_median_us\":{projection_median},\"transport_median_us\":{transport_median},\"max_limiter_passes\":{max_limiter_passes},\"limited_water_m3\":{limited_water},\"moved_water_m3\":{moved_water},\"accounting_error_m3\":{},\"failure\":{failure_json},\"production_fluid_steps\":0}}",
         geometry.components().len(),
         geometry.portals().len(),
+        f64::from(accepted) * 0.05,
         fluid.water_volume_m3() + fluid.outflow_m3() - initial.water_volume_m3()
     );
     Ok(())
