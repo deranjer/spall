@@ -22,6 +22,7 @@
 pub mod baseline;
 pub mod canonical;
 pub mod codec;
+pub mod component_water;
 pub mod handshake;
 pub mod input;
 pub mod limits;

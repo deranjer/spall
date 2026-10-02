@@ -91,6 +91,36 @@ pub struct CutCellGeometry {
 }
 
 impl CutCellGeometry {
+    pub fn fine_spec(&self) -> DomainSpec {
+        self.fine_spec
+    }
+
+    /// Component centroid in domain-local fine-voxel units. Keeping the
+    /// origin separate avoids losing precision at large global coordinates.
+    pub fn component_centroid(&self, index: usize) -> [f64; 3] {
+        let component = &self.components[index];
+        let [nx, ny, _] = self.coarse_dimensions.map(|v| v as usize);
+        let cell = component.coarse_index;
+        let base = [cell % nx, cell / nx % ny, cell / (nx * ny)];
+        let centre = component.centroid();
+        std::array::from_fn(|axis| base[axis] as f64 * f64::from(self.factor) + centre[axis])
+    }
+
+    /// Open fine-voxel faces on the upper Y domain side for each component.
+    /// Other domain sides remain closed unless a caller defines another policy.
+    pub fn open_top_faces(&self) -> Vec<u32> {
+        let [nx, ny, nz] = self.fine_spec.dimensions().map(|v| v as usize);
+        let mut counts = vec![0; self.components.len()];
+        for z in 0..nz {
+            for x in 0..nx {
+                let id = self.fine_component[x + nx * (ny - 1 + ny * z)];
+                if id != SOLID {
+                    counts[id as usize] += 1;
+                }
+            }
+        }
+        counts
+    }
     pub fn build(
         boundary: &SolidBoundary,
         factor: u32,
