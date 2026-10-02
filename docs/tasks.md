@@ -1137,3 +1137,18 @@ wire/save contract changes explicit before integration. Validate hydrostatic
 rest and real trench/dam-break response, then measure the same generated
 512/1024 release workload. No sleep heuristic that stalls flow, body coupling
 or GPU solver. Evidence: reports/ENG-121-rest-state.md.
+
+### ENG-122 increment 1 - exact coarse open-space geometry (2026-10-02)
+
+Experimental cut_cell geometry retains every six-connected open component within
+coarse cells, integer solid-excluding capacity, vertical layer counts and matched
+open fine-face portals. Seven geometry tests cover thin internal walls/openings,
+misaligned apertures, seed-volume preservation, exact horizontal capacity,
+256-pattern connectivity against fine flood fill, and bounded build/input errors.
+Actual seed-1 autumn worlds retain all authored water (512: 674 m3; 1024:
+2400.546875 m3). Geometry build medians: 8.39 / 39.42 ms; no fluid steps measured.
+Integration decision: keep experimental until component-aware pressure/transport,
+conservative edit remapping and an explicitly versioned component-amount/ledger
+canonical state pass acceptance. Current one-amount-per-coarse-cell state cannot
+recover independent spaces. No production solver or save/wire change in this
+increment. Full design, checks and remaining risks: reports/ENG-122.md.

@@ -6,6 +6,7 @@
 //! Rapier coupling, persistence, and network replication are not yet
 //! integrated (ENG-105).
 
+pub mod cut_cell;
 pub mod fixtures;
 pub mod grid_mac;
 
