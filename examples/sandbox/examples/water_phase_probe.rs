@@ -1,4 +1,4 @@
-//! ENG-122 phase-placement construction cost only; no coupled fluid steps.
+//! ENG-122 phase construction and prescribed-flux memory; no coupled steps.
 use sandbox::worldgen_scene;
 use spall_fluid::SolidBoundary;
 use spall_fluid::cut_cell::{CutCellGeometry, GeometryLimits};
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state = Some(phase);
     }
     times.sort_unstable();
-    let phase = state.ok_or("missing phase state")?;
+    let mut phase = state.ok_or("missing phase state")?;
     let start = Instant::now();
     let basins = phase.basins()?;
     let basin_us = start.elapsed().as_micros();
@@ -72,9 +72,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .count();
     let error = basin_total - authored;
     let component_error = components - authored;
-    let gate_pass = error.abs() < 1e-9 && component_error.abs() < 1e-9;
+    let mut flux = vec![0.0; phase.faces().len()];
+    let zero = phase.transport(0.01, &flux, 0.45)?;
+    // Memory exercise only: prescribed inflow into an already full neighbour
+    // must be limited to zero. It is not a pressure-derived world scenario.
+    let blocked = phase
+        .faces()
+        .iter()
+        .position(|f| {
+            f.axis == 0 && phase.fractions()[f.lower] == 1.0 && phase.fractions()[f.upper] == 1.0
+        })
+        .ok_or("no fully wet horizontal face for memory exercise")?;
+    flux[blocked] = 0.01;
+    let mut transport_times = Vec::new();
+    let mut scratch_bytes = 0;
+    let mut limiter_passes = 0;
+    for _ in 0..5 {
+        let start = Instant::now();
+        let metrics = phase.transport(0.01, &flux, 0.45)?;
+        transport_times.push(start.elapsed().as_micros());
+        scratch_bytes = scratch_bytes.max(metrics.numeric_scratch_bytes);
+        limiter_passes = limiter_passes.max(metrics.limiter_passes);
+        if metrics.moved_water_m3 != 0.0 || metrics.limiter_passes == 0 {
+            return Err("blocked prescribed transfer was not limited to zero".into());
+        }
+    }
+    transport_times.sort_unstable();
+    let unchanged = phase
+        .fractions()
+        .iter()
+        .zip(&fractions)
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    let gate_pass = error.abs() < 1e-9 && component_error.abs() < 1e-9 && unchanged;
     println!(
-        "{{\"worldgen\":\"showcase\",\"seed\":1,\"season\":\"autumn\",\"size\":{size},\"factor\":{},\"fine_cells\":{},\"fine_faces\":{},\"wet_faces\":{wet_faces},\"water_basins\":{},\"authored_water_m3\":{authored},\"phase_water_m3\":{},\"basin_accounting_error_m3\":{error},\"component_accounting_error_m3\":{component_error},\"phase_build_median_us\":{},\"basin_query_us\":{basin_us},\"phase_array_storage_bytes\":{},\"coupled_steps\":0,\"production_steps\":0,\"gate_pass\":{gate_pass}}}",
+        "{{\"worldgen\":\"showcase\",\"seed\":1,\"season\":\"autumn\",\"size\":{size},\"factor\":{},\"fine_cells\":{},\"fine_faces\":{},\"wet_faces\":{wet_faces},\"water_basins\":{},\"authored_water_m3\":{authored},\"phase_water_m3\":{},\"basin_accounting_error_m3\":{error},\"component_accounting_error_m3\":{component_error},\"phase_build_median_us\":{},\"basin_query_us\":{basin_us},\"phase_array_storage_bytes\":{},\"zero_flux_numeric_scratch_bytes\":{},\"limited_flux_numeric_scratch_bytes\":{scratch_bytes},\"blocked_transfer_limiter_passes\":{limiter_passes},\"blocked_transfer_median_us\":{},\"phase_amount_bits_unchanged\":{unchanged},\"prescribed_memory_exercises\":6,\"coupled_steps\":0,\"production_steps\":0,\"gate_pass\":{gate_pass}}}",
         setup.coarsen,
         fractions.len(),
         phase.faces().len(),
@@ -82,6 +113,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         phase.water_volume_m3(),
         times[2],
         phase.array_storage_bytes(),
+        zero.numeric_scratch_bytes,
+        transport_times[2],
     );
     if !gate_pass {
         return Err("phase seed accounting gate failed".into());

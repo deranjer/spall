@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use spall_core::{BrickCoord, CellSizeCode, GlobalCell, MaterialId, Revision, VolumeId};
 use spall_fluid::cut_cell::{CutCellGeometry, GeometryLimits};
-use spall_fluid::phase_water::{PhaseError, PhaseLimits, PhaseWater};
+use spall_fluid::phase_water::{PhaseError, PhaseFace, PhaseLimits, PhaseWater};
 use spall_fluid::{DomainSpec, SolidBoundary};
 use spall_voxel::{Brick, EditPlan, Volume};
 
@@ -424,4 +424,236 @@ fn coarse_portal_summary_preserves_partial_donor_aperture_without_air_averaging(
             assert_eq!(area, 0.0);
         }
     }
+}
+
+#[test]
+fn packed_faces_preserve_dense_geometry_endpoints_order_and_storage() {
+    let dims = [6usize, 3, 3];
+    let state = fixture(
+        dims.map(|n| n as u32),
+        |x, y, z| (x + 3 * y + 5 * z) % 7 == 0,
+        |_, _, _| 0.0,
+        100,
+    );
+    let mut expected = Vec::new();
+    let strides = [1, dims[0], dims[0] * dims[1]];
+    let spec = state.geometry().fine_spec();
+    for lower in 0..54 {
+        let xyz = [
+            lower % dims[0],
+            lower / dims[0] % dims[1],
+            lower / strides[2],
+        ];
+        let cell = |p: [usize; 3]| GlobalCell::new(p[0] as i64, p[1] as i64, p[2] as i64);
+        if state.geometry().component_at(cell(xyz)).is_none() {
+            continue;
+        }
+        for axis in 0..3 {
+            let mut next = xyz;
+            next[axis] += 1;
+            if next[axis] < dims[axis] && state.geometry().component_at(cell(next)).is_some() {
+                expected.push(PhaseFace {
+                    lower,
+                    upper: lower + strides[axis],
+                    axis: axis as u8,
+                });
+            }
+        }
+    }
+    assert_eq!(state.faces().iter().collect::<Vec<_>>(), expected);
+    assert_eq!(
+        state.faces().iter().rev().collect::<Vec<_>>(),
+        expected.iter().rev().copied().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        state.array_storage_bytes(),
+        spec.cell_count() * 8 + expected.len() * 4
+    );
+}
+
+// Frozen numerical reference from 6690a58, before buffer reuse. It deliberately
+// retains the original candidate/donor/receiver arrays to detect changes in
+// arithmetic order and limiter propagation, rather than sharing new helpers.
+fn original_transport(
+    fractions: &[f64],
+    faces: &[PhaseFace],
+    dt: f64,
+    flux: &[f64],
+) -> Result<(Vec<f64>, f64, f64, u32), PhaseError> {
+    let volume = 0.25_f64.powi(3);
+    let mut outgoing = vec![0.0; fractions.len()];
+    let mut transfers = Vec::new();
+    for (&f, &q) in faces.iter().zip(flux) {
+        let donor = if q >= 0.0 { f.lower } else { f.upper };
+        outgoing[donor] += dt * q.abs() / volume;
+        let wet = if f.axis != 1 {
+            fractions[donor]
+        } else if q >= 0.0 {
+            f64::from(fractions[donor] == 1.0)
+        } else {
+            f64::from(fractions[donor] > 0.0)
+        };
+        transfers.push(dt * q / volume * wet);
+    }
+    let measured = outgoing.into_iter().fold(0.0, f64::max);
+    if measured > 0.45 * (1.0 + 32.0 * f64::EPSILON) {
+        return Err(PhaseError::Cfl {
+            measured,
+            limit: 0.45,
+        });
+    }
+    let original_moved: f64 = transfers.iter().map(|t| t.abs()).sum();
+    let mut passes = 0;
+    let next = loop {
+        let mut incoming = vec![0.0; fractions.len()];
+        let mut outgoing = vec![0.0; fractions.len()];
+        for (&f, &t) in faces.iter().zip(&transfers) {
+            let (a, b) = if t >= 0.0 {
+                (f.lower, f.upper)
+            } else {
+                (f.upper, f.lower)
+            };
+            outgoing[a] += t.abs();
+            incoming[b] += t.abs();
+        }
+        let next: Vec<_> = fractions
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v + incoming[i]) - outgoing[i])
+            .collect();
+        if next
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        {
+            break next;
+        }
+        if passes == 64 {
+            return Err(PhaseError::LimiterExhausted);
+        }
+        let mut donor = vec![1.0_f64; next.len()];
+        let mut receiver = vec![1.0_f64; next.len()];
+        for (i, &v) in next.iter().enumerate() {
+            if v < 0.0 {
+                donor[i] = ((fractions[i] + incoming[i]) / outgoing[i]).clamp(0.0, 1.0)
+                    * (1.0 - 32.0 * f64::EPSILON);
+            } else if v > 1.0 {
+                receiver[i] = ((1.0 - fractions[i] + outgoing[i]) / incoming[i]).clamp(0.0, 1.0)
+                    * (1.0 - 32.0 * f64::EPSILON);
+            }
+        }
+        for (&f, t) in faces.iter().zip(&mut transfers) {
+            let (a, b) = if *t >= 0.0 {
+                (f.lower, f.upper)
+            } else {
+                (f.upper, f.lower)
+            };
+            *t *= donor[a].min(receiver[b]);
+        }
+        passes += 1;
+    };
+    let moved: f64 = transfers.iter().map(|t| t.abs()).sum();
+    Ok((
+        next,
+        moved * volume,
+        (original_moved - moved).max(0.0) * volume,
+        passes,
+    ))
+}
+
+#[test]
+fn two_buffer_transport_is_bit_identical_to_original_limiter() {
+    let mut accepted = 0;
+    let mut limited = 0;
+    for seed in 0..64_u64 {
+        let mut state = fixture(
+            [6, 3, 3],
+            |x, y, z| (x + 3 * y + 5 * z) % 11 == 0,
+            |x, y, z| {
+                [0.0, 0.001, 0.3, 0.999, 1.0][((u64::from(x + 6 * y + 18 * z) + seed) % 5) as usize]
+            },
+            100,
+        );
+        let faces: Vec<_> = state.faces().iter().collect();
+        let mut reference = state.fractions().to_vec();
+        for step in 0..8_u64 {
+            let flux: Vec<_> = (0..faces.len())
+                .map(|i| (((i as u64 * 17 + seed * 13 + step * 19) % 11) as f64 - 5.0) * 0.002)
+                .collect();
+            let expected = original_transport(&reference, &faces, 0.1, &flux);
+            let result = state.transport(0.1, &flux, 0.45);
+            match (expected, result) {
+                (Ok((next, moved, reduced, passes)), Ok(metrics)) => {
+                    assert_eq!(metrics.moved_water_m3.to_bits(), moved.to_bits());
+                    assert_eq!(metrics.limited_water_m3.to_bits(), reduced.to_bits());
+                    assert_eq!(metrics.limiter_passes, passes);
+                    assert_eq!(
+                        metrics.numeric_scratch_bytes,
+                        (2 * reference.len() + faces.len()) * 8
+                    );
+                    reference = next;
+                    accepted += 1;
+                    limited += usize::from(passes > 0);
+                }
+                (Err(expected), Err(actual)) => assert_eq!(expected, actual),
+                results => {
+                    panic!("reference/new result differs at seed {seed}, step {step}: {results:?}")
+                }
+            }
+            assert_eq!(
+                state
+                    .fractions()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+    assert!(accepted > 0 && limited > 0);
+}
+
+#[test]
+fn two_buffer_limiter_exhaustion_preserves_all_amount_bits() {
+    let mut state = fixture([12, 3, 3], |_, _, _| false, |_, _, _| 1.0, 100);
+    let mut chain = Vec::new();
+    for z in 0..3 {
+        for row in 0..3 {
+            let y = if z % 2 == 0 { row } else { 2 - row };
+            for column in 0..12 {
+                let x = if (z * 3 + row) % 2 == 0 {
+                    column
+                } else {
+                    11 - column
+                };
+                chain.push(index([12, 3, 3], x, y, z));
+            }
+        }
+    }
+    let faces: Vec<_> = state.faces().iter().collect();
+    let mut q = vec![0.0; faces.len()];
+    for pair in chain.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let f = faces
+            .iter()
+            .position(|f| f.lower == a.min(b) && f.upper == a.max(b))
+            .unwrap();
+        q[f] = if a < b { 0.01 } else { -0.01 };
+    }
+    let initial: Vec<_> = state.fractions().iter().map(|v| v.to_bits()).collect();
+    assert_eq!(
+        original_transport(state.fractions(), &faces, 0.01, &q),
+        Err(PhaseError::LimiterExhausted)
+    );
+    assert!(matches!(
+        state.transport(0.01, &q, 0.45),
+        Err(PhaseError::LimiterExhausted)
+    ));
+    assert_eq!(
+        state
+            .fractions()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        initial
+    );
 }

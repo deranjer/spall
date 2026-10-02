@@ -44,6 +44,50 @@ pub struct PhaseFace {
     pub axis: u8,
 }
 
+// Two axis bits and thirty lower-index bits. Endpoints are never persistent IDs.
+const MAX_PACKED_FINE_CELLS: usize = 1 << 30;
+
+fn pack_face(lower: usize, axis: u8) -> Result<u32, PhaseError> {
+    if lower >= MAX_PACKED_FINE_CELLS || axis > 2 {
+        return Err(PhaseError::InvalidState);
+    }
+    Ok(((lower as u32) << 2) | u32::from(axis))
+}
+
+fn decode_face(packed: u32, strides: [usize; 3]) -> PhaseFace {
+    let lower = (packed >> 2) as usize;
+    let axis = (packed & 3) as u8;
+    PhaseFace {
+        lower,
+        upper: lower + strides[axis as usize],
+        axis,
+    }
+}
+
+/// Allocation-free decoded view. Ordering and endpoints match the original
+/// fine-face list; iteration returns values instead of stored record references.
+#[derive(Debug, Clone, Copy)]
+pub struct PhaseFaces<'a> {
+    packed: &'a [u32],
+    strides: [usize; 3],
+}
+
+impl<'a> PhaseFaces<'a> {
+    pub fn len(self) -> usize {
+        self.packed.len()
+    }
+    pub fn is_empty(self) -> bool {
+        self.packed.is_empty()
+    }
+    pub fn iter(
+        self,
+    ) -> impl ExactSizeIterator<Item = PhaseFace> + DoubleEndedIterator + Clone + 'a {
+        self.packed
+            .iter()
+            .map(move |&packed| decode_face(packed, self.strides))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PortalPhaseAreas {
     pub overlap_m2: f64,
@@ -65,13 +109,17 @@ pub struct PhaseTransportMetrics {
     pub moved_water_m3: f64,
     pub limited_water_m3: f64,
     pub limiter_passes: u32,
+    /// Allocated transfer/incoming/outgoing array bytes at numeric workspace
+    /// peak. Excludes state, caller flux, and the subsequent basin-check scratch.
+    pub numeric_scratch_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct PhaseWater {
     geometry: Arc<CutCellGeometry>,
     fractions: Vec<f64>,
-    faces: Vec<PhaseFace>,
+    faces: Vec<u32>,
+    strides: [usize; 3],
     voxel_size_m: f64,
     limits: PhaseLimits,
 }
@@ -85,6 +133,11 @@ impl PhaseWater {
     ) -> Result<Self, PhaseError> {
         let spec = geometry.fine_spec();
         check_limit("fine cells", spec.cell_count(), limits.max_fine_cells)?;
+        check_limit(
+            "packed fine cells",
+            spec.cell_count(),
+            MAX_PACKED_FINE_CELLS,
+        )?;
         if !voxel_size_m.is_finite()
             || voxel_size_m <= 0.0
             || !voxel_size_m.powi(3).is_finite()
@@ -112,11 +165,7 @@ impl PhaseWater {
                     && geometry.component_at(spec.cell_at(upper)).is_some()
                 {
                     check_limit("faces", faces.len() + 1, limits.max_faces)?;
-                    faces.push(PhaseFace {
-                        lower,
-                        upper,
-                        axis: axis as u8,
-                    });
+                    faces.push(pack_face(lower, axis as u8)?);
                 }
             }
         }
@@ -127,6 +176,7 @@ impl PhaseWater {
             geometry,
             fractions: fractions.to_vec(),
             faces,
+            strides,
             voxel_size_m,
             limits,
         };
@@ -140,14 +190,16 @@ impl PhaseWater {
     pub fn geometry(&self) -> &Arc<CutCellGeometry> {
         &self.geometry
     }
-    pub fn faces(&self) -> &[PhaseFace] {
-        &self.faces
+    pub fn faces(&self) -> PhaseFaces<'_> {
+        PhaseFaces {
+            packed: &self.faces,
+            strides: self.strides,
+        }
     }
     /// Allocated fraction/face array storage; excludes shared geometry and
     /// temporary basin/transport scratch space. This fine reference is costly.
     pub fn array_storage_bytes(&self) -> usize {
-        self.fractions.capacity() * size_of::<f64>()
-            + self.faces.capacity() * size_of::<PhaseFace>()
+        self.fractions.capacity() * size_of::<f64>() + self.faces.capacity() * size_of::<u32>()
     }
     pub fn water_volume_m3(&self) -> f64 {
         self.fractions.iter().sum::<f64>() * self.voxel_size_m.powi(3)
@@ -166,9 +218,9 @@ impl PhaseWater {
     /// by min(fill); a vertical face is wet only if its lower voxel reaches the
     /// top and its upper voxel contains water at its bottom. No sleep threshold.
     pub fn wet_face_areas_m2(&self) -> Vec<f64> {
-        self.faces
+        self.faces()
             .iter()
-            .map(|&f| self.overlap(f) * self.voxel_size_m.powi(2))
+            .map(|f| self.overlap(f) * self.voxel_size_m.powi(2))
             .collect()
     }
 
@@ -179,7 +231,7 @@ impl PhaseWater {
         let mut areas = vec![PortalPhaseAreas::default(); self.geometry.portals().len()];
         let spec = self.geometry.fine_spec();
         let face_area = self.voxel_size_m.powi(2);
-        for &face in &self.faces {
+        for face in self.faces().iter() {
             let a = self
                 .geometry
                 .component_at(spec.cell_at(face.lower))
@@ -306,7 +358,7 @@ impl PhaseWater {
         let volume = self.voxel_size_m.powi(3);
         let mut outgoing = vec![0.0; self.fractions.len()];
         let mut transfers = Vec::with_capacity(self.faces.len());
-        for (&f, &q) in self.faces.iter().zip(flux_m3_s) {
+        for (f, &q) in self.faces().iter().zip(flux_m3_s) {
             let donor = if q >= 0.0 { f.lower } else { f.upper };
             let swept = dt * q.abs() / volume;
             if !swept.is_finite() {
@@ -316,7 +368,7 @@ impl PhaseWater {
             let wet = self.donor_fraction(f, q >= 0.0);
             transfers.push(dt * q / volume * wet);
         }
-        let measured = outgoing.into_iter().fold(0.0, f64::max);
+        let measured = outgoing.iter().copied().fold(0.0, f64::max);
         if !measured.is_finite() || measured > cfl * (1.0 + 32.0 * f64::EPSILON) {
             return Err(PhaseError::Cfl {
                 measured,
@@ -325,10 +377,13 @@ impl PhaseWater {
         }
         let original_moved: f64 = transfers.iter().map(|t| t.abs()).sum();
         let mut passes = 0;
+        let mut incoming = vec![0.0; self.fractions.len()];
+        let numeric_scratch_bytes =
+            (incoming.capacity() + outgoing.capacity() + transfers.capacity()) * size_of::<f64>();
         let next = loop {
-            let mut incoming = vec![0.0; self.fractions.len()];
-            let mut outgoing = vec![0.0; self.fractions.len()];
-            for (&f, &t) in self.faces.iter().zip(&transfers) {
+            incoming.fill(0.0);
+            outgoing.fill(0.0);
+            for (f, &t) in self.faces().iter().zip(&transfers) {
                 let (a, b) = if t >= 0.0 {
                     (f.lower, f.upper)
                 } else {
@@ -337,44 +392,48 @@ impl PhaseWater {
                 outgoing[a] += t.abs();
                 incoming[b] += t.abs();
             }
-            let next: Vec<_> = self
-                .fractions
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| (v + incoming[i]) - outgoing[i])
-                .collect();
-            if next
-                .iter()
-                .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            {
-                break next;
+            if self.fractions.iter().enumerate().all(|(i, &amount)| {
+                let v = (amount + incoming[i]) - outgoing[i];
+                v.is_finite() && (0.0..=1.0).contains(&v)
+            }) {
+                for (i, amount) in incoming.iter_mut().enumerate() {
+                    *amount = (self.fractions[i] + *amount) - outgoing[i];
+                }
+                break incoming;
             }
             if passes == 64 {
                 return Err(PhaseError::LimiterExhausted);
             }
-            let mut donor = vec![1.0_f64; next.len()];
-            let mut receiver = vec![1.0_f64; next.len()];
-            for (i, &v) in next.iter().enumerate() {
+            // Reuse the two sum arrays as receiver/donor scales. Preserve the
+            // old sums locally and retain exactly the previous arithmetic order.
+            for i in 0..self.fractions.len() {
+                let inc = incoming[i];
+                let out = outgoing[i];
+                let v = (self.fractions[i] + inc) - out;
+                incoming[i] = 1.0;
+                outgoing[i] = 1.0;
                 if v < 0.0 {
-                    donor[i] = ((self.fractions[i] + incoming[i]) / outgoing[i]).clamp(0.0, 1.0)
+                    outgoing[i] = ((self.fractions[i] + inc) / out).clamp(0.0, 1.0)
                         * (1.0 - 32.0 * f64::EPSILON);
                 } else if v > 1.0 {
-                    receiver[i] = ((1.0 - self.fractions[i] + outgoing[i]) / incoming[i])
-                        .clamp(0.0, 1.0)
+                    incoming[i] = ((1.0 - self.fractions[i] + out) / inc).clamp(0.0, 1.0)
                         * (1.0 - 32.0 * f64::EPSILON);
                 }
             }
-            for (&f, t) in self.faces.iter().zip(&mut transfers) {
+            for (f, t) in self.faces().iter().zip(&mut transfers) {
                 let (a, b) = if *t >= 0.0 {
                     (f.lower, f.upper)
                 } else {
                     (f.upper, f.lower)
                 };
-                *t *= donor[a].min(receiver[b]);
+                *t *= outgoing[a].min(incoming[b]);
             }
             passes += 1;
         };
         let moved: f64 = transfers.iter().map(|t| t.abs()).sum();
+        // Neither numeric buffer is needed while validating candidate basins.
+        drop(outgoing);
+        drop(transfers);
         // Basin limit is part of atomic acceptance, including fragmentation.
         self.basins_for(&next)?;
         self.fractions = next;
@@ -382,6 +441,7 @@ impl PhaseWater {
             moved_water_m3: moved * volume,
             limited_water_m3: (original_moved - moved).max(0.0) * volume,
             limiter_passes: passes,
+            numeric_scratch_bytes,
         })
     }
 }
@@ -395,5 +455,30 @@ fn check_limit(kind: &'static str, requested: usize, limit: usize) -> Result<(),
         })
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_index_ceiling_does_not_wrap_or_alias_axes() {
+        let lower = MAX_PACKED_FINE_CELLS - 2;
+        for axis in 0..3 {
+            let code = pack_face(lower, axis).unwrap();
+            assert_eq!(decode_face(code, [1, 3, 9]).lower, lower);
+            assert_eq!(decode_face(code, [1, 3, 9]).axis, axis);
+        }
+        assert!(pack_face(MAX_PACKED_FINE_CELLS, 0).is_err());
+        assert!(pack_face(0, 3).is_err());
+        assert!(
+            check_limit(
+                "packed fine cells",
+                MAX_PACKED_FINE_CELLS + 1,
+                MAX_PACKED_FINE_CELLS
+            )
+            .is_err()
+        );
     }
 }
