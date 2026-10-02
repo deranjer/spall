@@ -2189,6 +2189,8 @@ async fn serve_async(
         > = HashMap::new();
         let mut water_keyframes_sent = 0u64;
         let mut water_bytes_queued = 0u64;
+        let mut water_growths_seen = 0u64;
+        let mut water_growth_refused_seen = 0u64;
         let mut pending_admin: Vec<(SessionId, spall_protocol::AdminRequest)> = Vec::new();
         // A dam-gate edit only reports `Queued` immediately; its real
         // outcome (committed, or rejected — e.g. the terrain-size "giant
@@ -2676,6 +2678,28 @@ async fn serve_async(
                     }
                 }
             }
+            // ENG-120: say when an authored fluid domain grows or growth is refused.
+            {
+                let (growths, refused) = report
+                    .water
+                    .iter()
+                    .chain(report.water_regions.iter())
+                    .fold((0u64, 0u64), |(g, r), m| {
+                        (g + m.domain_growths, r + m.growth_refused)
+                    });
+                if growths != water_growths_seen || refused != water_growth_refused_seen {
+                    let domain = sim.water().map(|w| {
+                        let d = w.domain();
+                        (d.origin(), d.dimensions())
+                    });
+                    tracing::info!(growths, refused, ?domain, "water domain growth");
+                    eprintln!(
+                        "sandbox-server: water domain growths {growths}, refused {refused}, first region {domain:?}"
+                    );
+                    water_growths_seen = growths;
+                    water_growth_refused_seen = refused;
+                }
+            }
             // ENG-105: a periodic water line, so an operator can see whether
             // the fluid worker keeps up with real time.
             if tick.get() % WATER_STATUS_INTERVAL_TICKS == 0
@@ -2928,6 +2952,13 @@ async fn serve_async(
                 for session in lj.live_sessions().collect::<Vec<_>>() {
                     send_to(&clients_for_sim, session, Outbound::Water(records.clone()));
                 }
+            }
+            // ENG-120: a grown region may have moved its origin; forget the
+            // publisher state of origins that no longer exist.
+            let live_origins: Vec<GlobalCell> =
+                sim.water_regions().map(|w| w.domain().origin()).collect();
+            for per_session in water_sent.values_mut() {
+                per_session.retain(|origin, _| live_origins.contains(origin));
             }
             // Budget water independently per live session. Keyframes are
             // periodic repair; changed bricks reference the last queued frame.
@@ -4375,6 +4406,11 @@ fn setup_persistence_with_game_content(
                 terrain_collider_mode,
             )
             .map_err(|e| e.to_string())?;
+            let mut sim = sim;
+            // Domain growth is scene configuration, not saved state.
+            if let Some(setup) = custom_world.and_then(CustomWorld::water_setup) {
+                sim.set_water_growth(setup.growth);
+            }
             (sim, seq, 0)
         }
         // A genuinely new/empty database: seed it with the built-in scene.

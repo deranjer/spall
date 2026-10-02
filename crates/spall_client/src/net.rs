@@ -1284,6 +1284,23 @@ async fn run_async(
                             water.entry(chunk.origin).or_default().push(chunk)
                         } {
                             Ok(Some(frame)) => {
+                                // A region that grew may have moved its origin
+                                // (ENG-120): drop any other region this frame
+                                // overlaps, or its stale water would stay drawn.
+                                let superseded: Vec<_> = water_deltas
+                                    .iter()
+                                    .filter(|(origin, assembler)| {
+                                        **origin != frame.origin
+                                            && assembler.current().is_some_and(|old| {
+                                                frame.overlaps(old.origin, old.dimensions)
+                                            })
+                                    })
+                                    .map(|(origin, _)| *origin)
+                                    .collect();
+                                for origin in &superseded {
+                                    water_deltas.remove(origin);
+                                    water.remove(origin);
+                                }
                                 water_deltas
                                     .entry(frame.origin)
                                     .or_default()

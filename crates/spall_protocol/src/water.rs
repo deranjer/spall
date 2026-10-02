@@ -337,6 +337,25 @@ pub struct WaterKeyframe {
     pub fractions: Vec<u8>,
 }
 
+impl WaterKeyframe {
+    /// Whether this frame's voxel box overlaps the box `origin`/`dimensions`.
+    /// A region that grows (ENG-120) may move its origin; the viewer replaces
+    /// any region of a different origin that the new frame overlaps.
+    pub fn overlaps(&self, origin: GlobalCell, dimensions: [u32; 3]) -> bool {
+        let (a, b) = (self.origin, origin);
+        [
+            (a.x, b.x, self.dimensions[0], dimensions[0]),
+            (a.y, b.y, self.dimensions[1], dimensions[1]),
+            (a.z, b.z, self.dimensions[2], dimensions[2]),
+        ]
+        .iter()
+        .all(|(x, y, dx, dy)| {
+            i128::from(*x) < i128::from(*y) + i128::from(*dy)
+                && i128::from(*y) < i128::from(*x) + i128::from(*dx)
+        })
+    }
+}
+
 /// Reassembles keyframe chunks arriving in order on the control stream. A
 /// chunk from a different frame than the one in progress abandons it: the
 /// server sends whole frames back to back. Missing chunks or mismatched
@@ -470,6 +489,26 @@ impl Record for AdminStatus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyframe_overlap_is_a_strict_box_intersection() {
+        let frame = |o: [i64; 3], d: [u32; 3]| WaterKeyframe {
+            server_tick: Tick(0),
+            frame_seq: 1,
+            origin: GlobalCell::new(o[0], o[1], o[2]),
+            dimensions: d,
+            coarsen: 1,
+            fractions: Vec::new(),
+        };
+        let a = frame([0, 0, 0], [10, 10, 10]);
+        assert!(a.overlaps(GlobalCell::new(9, 9, 9), [5, 5, 5]));
+        assert!(a.overlaps(GlobalCell::new(-4, 2, 2), [5, 5, 5]));
+        assert!(
+            !a.overlaps(GlobalCell::new(10, 0, 0), [5, 5, 5]),
+            "touching is not overlapping"
+        );
+        assert!(!a.overlaps(GlobalCell::new(-5, 0, 0), [5, 10, 10]));
+    }
+
     use super::*;
 
     fn frame(cells: usize, seed: u64) -> Vec<u8> {

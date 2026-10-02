@@ -73,7 +73,9 @@ pub use contact_damage::{
 pub use dormancy::{ActiveRegion, BodyDormancyInput, DormancyConfig, DormancyPlan, DormancyPolicy};
 pub use intent::{EditIntent, EditKind, EditTarget, ExplosionImpulse, IntentError};
 pub use journal::{JournalEntry, JournalSink};
-pub use player::{HELD_INPUT_TIMEOUT_TICKS, Player, transaction_world_box};
+pub use player::{
+    HELD_INPUT_TIMEOUT_TICKS, Player, transaction_world_box, transaction_world_boxes,
+};
 pub use playground::{
     DropSchedule, DropZone, PLAYGROUND_DEBRIS_COUNT, PLAYGROUND_PLINKO_COUNT,
     PLAYGROUND_SHOWCASE_COUNT, PLINKO_RESTITUTION, PlaygroundDropPools, SHOWCASE_RESTITUTION,
@@ -96,8 +98,8 @@ pub use sim::{
 pub use stage::{StageError, StageInput, StagedEdit, stage_edit};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
 pub use water::{
-    AuthoritativeWater, MAX_GATED_SOURCE_RATE, WaterError, WaterExecution, WaterFrame,
-    WaterSeedReport, WaterSetup, WaterTickMetrics,
+    AuthoritativeWater, CellBox, GrowthPlan, GrowthRefusal, MAX_GATED_SOURCE_RATE, WaterError,
+    WaterExecution, WaterFrame, WaterGrowth, WaterSeedReport, WaterSetup, WaterTickMetrics,
 };
 pub use world::{RestoredBody, SimWorld, WorldError};
 pub use world::{

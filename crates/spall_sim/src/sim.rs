@@ -24,7 +24,7 @@ use crate::contact_damage::{ContactDamagePlan, ContactDamagePolicy, ContactEvent
 use crate::dormancy::{ActiveRegion, BodyDormancyInput, DormancyPlan, DormancyPolicy};
 use crate::intent::{EditIntent, EditKind, EditTarget, IntentError};
 use crate::journal::JournalSink;
-use crate::player::transaction_world_box;
+use crate::player::{transaction_world_box, transaction_world_boxes};
 use crate::schedule::{EditPipeline, TickReport};
 use crate::world::{SimWorld, TerrainColliderMode, WorldSetup};
 use spall_voxel::Sample;
@@ -270,6 +270,72 @@ impl Simulation {
             self.additional_water.push(water);
         }
         Ok(())
+    }
+
+    /// ENG-120: grows each region whose [`crate::WaterGrowth`] policy asks for
+    /// it, after this tick's terrain commits and before the water step. The
+    /// replacement is built from the owner's committed state; a refusal (cap,
+    /// overlap, residency, world edge) or build failure leaves the region as it
+    /// was and is counted, never fatal to the tick.
+    fn grow_water_regions(&mut self, report: &TickReport) {
+        if self.water.is_none() && self.additional_water.is_empty() {
+            return;
+        }
+        let terrain_id = self.world.terrain_volume_id();
+        let cell_m = self.world.terrain().cell_size().metres();
+        let boxes: Vec<crate::CellBox> = report
+            .committed
+            .iter()
+            .flat_map(|(_, c)| transaction_world_boxes(&c.topology, terrain_id, cell_m))
+            .map(|(lo, hi)| {
+                (
+                    lo.map(|v| (v / cell_m).floor() as i64),
+                    hi.map(|v| (v / cell_m).ceil() as i64 - 1),
+                )
+            })
+            .collect();
+        if boxes.is_empty() {
+            return;
+        }
+        let mut domains: Vec<spall_fluid::DomainSpec> =
+            self.water_regions().map(|w| w.domain()).collect();
+        let terrain = &self.world.terrain().volume;
+        for (index, water) in self
+            .water
+            .iter_mut()
+            .chain(self.additional_water.iter_mut())
+            .enumerate()
+        {
+            let others: Vec<_> = domains
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index)
+                .map(|(_, d)| *d)
+                .collect();
+            match water.plan_growth(terrain, &boxes, &others) {
+                crate::GrowthPlan::NotNeeded => {}
+                crate::GrowthPlan::Refused(_) => water.note_growth_refused(),
+                crate::GrowthPlan::Grow(domain) => match water.grown(terrain, domain) {
+                    Ok(grown) => {
+                        domains[index] = grown.domain();
+                        *water = grown;
+                    }
+                    Err(_) => water.note_growth_refused(),
+                },
+            }
+        }
+    }
+
+    /// Sets the growth policy of every region (see [`crate::WaterGrowth`]).
+    /// Recovery does not persist it: the owning scene reapplies it.
+    pub fn set_water_growth(&mut self, growth: Option<crate::WaterGrowth>) {
+        for water in self
+            .water
+            .iter_mut()
+            .chain(self.additional_water.iter_mut())
+        {
+            water.set_growth(growth);
+        }
     }
 
     fn validate_water_region(
@@ -523,6 +589,7 @@ impl Simulation {
                     .map(|b| b.coord)
             })
             .collect();
+        self.grow_water_regions(&report);
         if let Some(water) = &mut self.water {
             let dirty = edited_terrain_bricks
                 .iter()

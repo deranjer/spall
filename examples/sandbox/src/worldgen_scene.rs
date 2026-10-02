@@ -121,6 +121,7 @@ pub fn water_setup(plan: &WaterPlan) -> Result<Option<WaterSetup>, WorldgenScene
     Ok(Some(
         WaterSetup::new(domain, plan.cells.iter().map(|cell| (*cell, 1.0)).collect())
             .with_coarsening(WATER_COARSEN)
+            .with_growth(spall_sim::WaterGrowth::default())
             .on_worker(WATER_STEP_S),
     ))
 }

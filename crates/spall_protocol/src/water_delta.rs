@@ -192,6 +192,11 @@ pub struct WaterDeltaAssembler {
 }
 
 impl WaterDeltaAssembler {
+    /// The last installed full frame, if any.
+    pub fn current(&self) -> Option<&WaterKeyframe> {
+        self.current.as_ref()
+    }
+
     pub fn install(&mut self, frame: WaterKeyframe) {
         self.current = Some(frame);
         self.partial = None;

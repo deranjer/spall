@@ -37,6 +37,64 @@ pub enum WaterExecution {
     Worker { step_dt_s: f64 },
 }
 
+/// Opt-in policy that lets an authored domain grow when terrain is edited near
+/// its boundary (ENG-120). Without it a domain is fixed for its lifetime and its
+/// sides are closed, so water cannot follow a canal dug past the box.
+///
+/// All distances are voxel cells. A committed edit whose box lies within
+/// `trigger_voxels` of the domain but is not wholly inside it grows the domain
+/// to cover the edit plus `margin_voxels` on every axis it extends past (the
+/// margin amortizes a trench being dug outward over many swings). Growth is
+/// refused, never truncated, when the result would exceed `max_voxel_cells`,
+/// the protocol limits, the resident world, or another region.
+///
+/// `max_voxel_cells` also bounds the cost: the owner captures the solid
+/// boundary of the whole domain for every nearby edit and when growing, at
+/// about 70 ns per voxel cell (measured, release), so a grown domain makes each
+/// nearby edit tick proportionally slower. The 3M default keeps that near 0.2 s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaterGrowth {
+    pub trigger_voxels: u32,
+    pub margin_voxels: u32,
+    pub max_voxel_cells: usize,
+}
+
+impl Default for WaterGrowth {
+    fn default() -> Self {
+        Self {
+            trigger_voxels: 16,
+            margin_voxels: 32,
+            max_voxel_cells: 3_000_000,
+        }
+    }
+}
+
+/// Why a wanted growth was not performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowthRefusal {
+    /// The grown box would overlap another region; merging needs a joint
+    /// pressure domain, which is out of scope.
+    OverlapsRegion,
+    /// Over `max_voxel_cells` or a protocol limit even with no margin.
+    TooLarge,
+    /// The grown box includes terrain bricks that are not resident; growing now
+    /// would pause the whole region. Retried on a later edit.
+    WaitingForResidency,
+    /// The edit lies beyond the world's brick bounds.
+    OutsideWorld,
+}
+
+/// What [`AuthoritativeWater::plan_growth`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowthPlan {
+    NotNeeded,
+    Grow(DomainSpec),
+    Refused(GrowthRefusal),
+}
+
+/// An inclusive voxel-cell box `(min, max)`.
+pub type CellBox = ([i64; 3], [i64; 3]);
+
 /// Initial, bounded water state installed when an authoritative simulation is
 /// created. Fractions are attached to global voxel-cell coordinates.
 #[derive(Debug, Clone)]
@@ -65,6 +123,8 @@ pub struct WaterSetup {
     pub gated_sources: [Vec<GlobalCell>; 3],
     /// Drains: voxel cells whose fluid cell is emptied after every step.
     pub sinks: Vec<GlobalCell>,
+    /// Domain growth policy; `None` keeps the declared domain fixed.
+    pub growth: Option<WaterGrowth>,
 }
 
 /// How fast a [`WaterSetup::gated_sources`] spring fills, or off. Higher
@@ -88,7 +148,14 @@ impl WaterSetup {
             sources: Vec::new(),
             gated_sources: [Vec::new(), Vec::new(), Vec::new()],
             sinks: Vec::new(),
+            growth: None,
         }
+    }
+
+    /// Let the domain grow with nearby terrain edits (see [`WaterGrowth`]).
+    pub fn with_growth(mut self, growth: WaterGrowth) -> Self {
+        self.growth = Some(growth);
+        self
     }
 
     /// Use fluid cells `factor` voxels wide (and sets the matching cell size).
@@ -188,6 +255,10 @@ pub struct WaterTickMetrics {
     pub skipped_duration: Duration,
     /// Newest published frame sequence.
     pub frame_seq: u64,
+    /// Times this region's domain has grown since the world started (ENG-120).
+    pub domain_growths: u64,
+    /// Wanted growths that were refused (cap, overlap, residency, world edge).
+    pub growth_refused: u64,
 }
 
 /// A failed strict boundary snapshot or solver step stops the owning tick.
@@ -311,6 +382,8 @@ pub struct AuthoritativeWater {
     boundary_pending: bool,
     residency_skips: u64,
     residency_skipped_s: f64,
+    growths: u64,
+    growth_refused: u64,
 }
 
 enum Engine {
@@ -372,7 +445,32 @@ impl AuthoritativeWater {
         let gated_rate = Arc::new(AtomicU8::new(0));
         let exchange = Exchange::new(&setup, coarsen, Arc::clone(&gated_rate));
         let frame = Arc::new(WaterFrame::capture(1, 0.0, coarsen, &grid, &exchange));
-        let engine = match setup.execution {
+        let engine = Self::make_engine(setup.execution, grid, frame, exchange, coarsen)?;
+        Ok(Self {
+            domain: setup.domain,
+            coarsen,
+            seed,
+            engine,
+            gated_rate,
+            setup,
+            sleeping: false,
+            quiet_steps: 0,
+            boundary_pending: false,
+            residency_skips: 0,
+            residency_skipped_s: 0.0,
+            growths: 0,
+            growth_refused: 0,
+        })
+    }
+
+    fn make_engine(
+        execution: WaterExecution,
+        grid: MacGridWorld,
+        frame: Arc<WaterFrame>,
+        exchange: Exchange,
+        coarsen: u32,
+    ) -> Result<Engine, WaterError> {
+        Ok(match execution {
             WaterExecution::Inline => Engine::Inline {
                 grid: Box::new(grid),
                 frame,
@@ -388,20 +486,15 @@ impl AuthoritativeWater {
                     grid, frame, exchange, coarsen, step_dt_s,
                 )?)
             }
-        };
-        Ok(Self {
-            domain: setup.domain,
-            coarsen,
-            seed,
-            engine,
-            gated_rate,
-            setup,
-            sleeping: false,
-            quiet_steps: 0,
-            boundary_pending: false,
-            residency_skips: 0,
-            residency_skipped_s: 0.0,
         })
+    }
+
+    /// The owner's committed grid and exchange ledger (never a worker candidate).
+    fn committed(&self) -> (&MacGridWorld, &Exchange) {
+        match &self.engine {
+            Engine::Inline { grid, exchange, .. } => (grid, exchange),
+            Engine::Worker(w) => (&w.grid, &w.exchange),
+        }
     }
 
     pub fn canonical_state(&self) -> spall_protocol::WaterState {
@@ -585,6 +678,272 @@ impl AuthoritativeWater {
         near(0, coord.x) && near(1, coord.y) && near(2, coord.z)
     }
 
+    /// Decides whether committed terrain edits (`edits`, inclusive voxel-cell
+    /// boxes) call for growing this region, and to what. `others` are the other
+    /// regions' domains, which the grown box must not overlap. Pure: nothing is
+    /// changed until [`Self::grown`] is applied by the owner.
+    pub fn plan_growth(
+        &self,
+        terrain: &Volume,
+        edits: &[CellBox],
+        others: &[DomainSpec],
+    ) -> GrowthPlan {
+        let Some(growth) = self.setup.growth else {
+            return GrowthPlan::NotNeeded;
+        };
+        let o = self.domain.origin();
+        let dims = self.domain.dimensions();
+        let lo = [o.x, o.y, o.z];
+        let hi: [i64; 3] = std::array::from_fn(|i| lo[i] + i64::from(dims[i]) - 1);
+        let trigger = i64::from(growth.trigger_voxels);
+        let (mut want_lo, mut want_hi) = (lo, hi);
+        let mut wanted = false;
+        for (elo, ehi) in edits {
+            if (0..3).all(|i| elo[i] >= lo[i] && ehi[i] <= hi[i]) {
+                continue;
+            }
+            if !(0..3).all(|i| elo[i] - trigger <= hi[i] && ehi[i] + trigger >= lo[i]) {
+                continue;
+            }
+            wanted = true;
+            for i in 0..3 {
+                want_lo[i] = want_lo[i].min(elo[i]);
+                want_hi[i] = want_hi[i].max(ehi[i]);
+            }
+        }
+        if !wanted {
+            return GrowthPlan::NotNeeded;
+        }
+        let c = i64::from(self.coarsen);
+        let bounds = terrain.bounds().map(|b| {
+            (
+                [b.min.x * 32, b.min.y * 32, b.min.z * 32],
+                [(b.max.x + 1) * 32, (b.max.y + 1) * 32, (b.max.z + 1) * 32],
+            )
+        });
+        let mut refusal = GrowthRefusal::TooLarge;
+        for margin in [i64::from(growth.margin_voxels), 0] {
+            // Fluid-cell offsets relative to the current origin keep the grown
+            // grid aligned with the old one.
+            let mut lo_f = [0i64; 3];
+            let mut hi_f = [0i64; 3];
+            for i in 0..3 {
+                let wl = if want_lo[i] < lo[i] {
+                    want_lo[i] - margin
+                } else {
+                    lo[i]
+                };
+                let wh = if want_hi[i] > hi[i] {
+                    want_hi[i] + margin
+                } else {
+                    hi[i]
+                };
+                lo_f[i] = (wl - lo[i]).div_euclid(c);
+                hi_f[i] = (wh + 1 - lo[i] + c - 1).div_euclid(c);
+                if let Some((b_lo, b_hi)) = bounds {
+                    lo_f[i] = lo_f[i].max((b_lo[i] - lo[i] + c - 1).div_euclid(c));
+                    hi_f[i] = hi_f[i].min((b_hi[i] - lo[i]).div_euclid(c));
+                }
+                // Never shrink: clipping can only stop growth at the world edge.
+                lo_f[i] = lo_f[i].min(0);
+                hi_f[i] = hi_f[i].max(i64::from(dims[i]) / c);
+            }
+            let new_dims: [i64; 3] = std::array::from_fn(|i| (hi_f[i] - lo_f[i]) * c);
+            if new_dims == dims.map(i64::from) {
+                // The only wanted direction is past the world edge.
+                refusal = GrowthRefusal::OutsideWorld;
+                continue;
+            }
+            let voxels = new_dims
+                .iter()
+                .try_fold(1u128, |n, d| n.checked_mul(*d as u128));
+            let fluid = voxels.map(|v| v / (c as u128).pow(3));
+            if voxels.is_none_or(|v| v > growth.max_voxel_cells as u128 || v > 32 * 1024 * 1024)
+                || fluid.is_none_or(|f| f > spall_protocol::water::MAX_WATER_CELLS as u128)
+            {
+                refusal = GrowthRefusal::TooLarge;
+                continue;
+            }
+            let origin = GlobalCell::new(
+                lo[0] + lo_f[0] * c,
+                lo[1] + lo_f[1] * c,
+                lo[2] + lo_f[2] * c,
+            );
+            let Ok(domain) =
+                DomainSpec::new(origin, new_dims.map(|d| d as u32), growth.max_voxel_cells)
+            else {
+                refusal = GrowthRefusal::TooLarge;
+                continue;
+            };
+            if others
+                .iter()
+                .any(|other| Self::domains_overlap(domain, *other))
+            {
+                refusal = GrowthRefusal::OverlapsRegion;
+                continue;
+            }
+            return match Self::domain_resident(terrain, domain) {
+                Ok(true) => GrowthPlan::Grow(domain),
+                _ => GrowthPlan::Refused(GrowthRefusal::WaitingForResidency),
+            };
+        }
+        GrowthPlan::Refused(refusal)
+    }
+
+    fn domains_overlap(a: DomainSpec, b: DomainSpec) -> bool {
+        let (p, d) = (a.origin(), a.dimensions());
+        let (q, e) = (b.origin(), b.dimensions());
+        [
+            (p.x, q.x, d[0], e[0]),
+            (p.y, q.y, d[1], e[1]),
+            (p.z, q.z, d[2], e[2]),
+        ]
+        .iter()
+        .all(|(x, y, dx, dy)| {
+            i128::from(*x) < i128::from(*y) + i128::from(*dy)
+                && i128::from(*y) < i128::from(*x) + i128::from(*dx)
+        })
+    }
+
+    /// Whether every terrain brick overlapping `domain` is resident (a corner
+    /// sample per brick: an absent brick reports `Unknown`).
+    fn domain_resident(terrain: &Volume, domain: DomainSpec) -> Result<bool, WaterError> {
+        let origin = domain.origin();
+        let dims = domain.dimensions();
+        let lo = [origin.x, origin.y, origin.z];
+        let hi = std::array::from_fn::<_, 3, _>(|i| lo[i] + i64::from(dims[i]) - 1);
+        for bz in lo[2].div_euclid(32)..=hi[2].div_euclid(32) {
+            for by in lo[1].div_euclid(32)..=hi[1].div_euclid(32) {
+                for bx in lo[0].div_euclid(32)..=hi[0].div_euclid(32) {
+                    let cell = GlobalCell::new(
+                        (bx * 32).max(lo[0]),
+                        (by * 32).max(lo[1]),
+                        (bz * 32).max(lo[2]),
+                    );
+                    let sample = terrain
+                        .sample(cell)
+                        .map_err(|e| WaterError::Boundary(e.to_string()))?;
+                    if matches!(sample, spall_voxel::Sample::Unknown(_)) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Replaces the growth policy (recovered regions carry none: it is scene
+    /// configuration, not saved state).
+    pub fn set_growth(&mut self, growth: Option<WaterGrowth>) {
+        self.setup.growth = growth;
+    }
+
+    /// Records a wanted growth that was not performed.
+    pub fn note_growth_refused(&mut self) {
+        self.growth_refused = self.growth_refused.saturating_add(1);
+    }
+
+    /// Where this region's solver runs.
+    pub fn execution(&self) -> WaterExecution {
+        self.setup.execution
+    }
+
+    /// Times this domain has grown.
+    pub fn growths(&self) -> u64 {
+        self.growths
+    }
+
+    /// A copy of this region over the larger `domain`, built from the owner's
+    /// committed state. Every fluid cell's exact fraction and trapped ledger,
+    /// the cumulative outflow and the spring/drain accounting carry over
+    /// unchanged, so volume is conserved exactly; new cells start dry.
+    /// Velocity and pressure restart at rest (as after recovery). Execution
+    /// mode, sources, sinks, gated rate and the published frame sequence
+    /// continue. `domain` must contain the current one on the same fluid grid.
+    pub fn grown(&self, terrain: &Volume, domain: DomainSpec) -> Result<Self, WaterError> {
+        let c = self.coarsen;
+        let ci = i64::from(c);
+        let (old_o, old_d) = (self.domain.origin(), self.domain.dimensions());
+        let (new_o, new_d) = (domain.origin(), domain.dimensions());
+        let off = [new_o.x - old_o.x, new_o.y - old_o.y, new_o.z - old_o.z];
+        let aligned = (0..3).all(|i| {
+            off[i] <= 0
+                && off[i] % ci == 0
+                && new_d[i] % c == 0
+                && off[i] + i64::from(new_d[i]) >= i64::from(old_d[i])
+        });
+        let cells = new_d
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul((*d / c) as usize));
+        let voxels = new_d
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul(*d as usize));
+        if !aligned
+            || cells.is_none_or(|n| n > spall_protocol::water::MAX_WATER_CELLS)
+            || voxels.is_none_or(|n| n > 32 * 1024 * 1024)
+        {
+            return Err(WaterError::Boundary(
+                "grown water domain must contain the old one on its fluid grid within limits"
+                    .into(),
+            ));
+        }
+        let mut setup = self.setup.clone();
+        setup.domain = domain;
+        let boundary = capture_boundary(terrain, domain, c)?;
+        let mut grid = MacGridWorld::new(&boundary, setup.config).map_err(WaterError::Solver)?;
+        grid.set_pressure_preconditioner(PressurePreconditioner::Multigrid);
+        grid.set_ambient_density(1.2).map_err(WaterError::Solver)?;
+
+        let (old_grid, old_exchange) = self.committed();
+        let old_f = old_d.map(|d| (d / c) as usize);
+        let new_f = new_d.map(|d| (d / c) as usize);
+        let shift = off.map(|v| (-v / ci) as usize);
+        let remap = |old: &[f64]| {
+            let mut out = vec![0.0; new_f[0] * new_f[1] * new_f[2]];
+            for k in 0..old_f[2] {
+                for j in 0..old_f[1] {
+                    let src = (k * old_f[1] + j) * old_f[0];
+                    let dst = ((k + shift[2]) * new_f[1] + j + shift[1]) * new_f[0] + shift[0];
+                    out[dst..dst + old_f[0]].copy_from_slice(&old[src..src + old_f[0]]);
+                }
+            }
+            out
+        };
+        grid.restore_trapped(&remap(old_grid.trapped_fractions()))
+            .map_err(WaterError::Solver)?;
+        grid.restore_displacing(&remap(old_grid.fractions()), &boundary)
+            .map_err(WaterError::Solver)?;
+        grid.restore_outflow(old_grid.cumulative_open_outflow_m3())
+            .map_err(WaterError::Solver)?;
+        let mut exchange = Exchange::new(&setup, c, Arc::clone(&self.gated_rate));
+        exchange.added_m3 = old_exchange.added_m3;
+        exchange.removed_m3 = old_exchange.removed_m3;
+        let old_frame = self.frame();
+        let frame = Arc::new(WaterFrame::capture(
+            old_frame.seq + 1,
+            old_frame.fluid_time_s,
+            c,
+            &grid,
+            &exchange,
+        ));
+        let engine = Self::make_engine(setup.execution, grid, frame, exchange, c)?;
+        Ok(Self {
+            setup,
+            domain,
+            coarsen: c,
+            seed: self.seed,
+            engine,
+            gated_rate: Arc::clone(&self.gated_rate),
+            sleeping: false,
+            quiet_steps: 0,
+            boundary_pending: false,
+            residency_skips: self.residency_skips,
+            residency_skipped_s: self.residency_skipped_s,
+            growths: self.growths + 1,
+            growth_refused: self.growth_refused,
+        })
+    }
+
     pub fn tick(
         &mut self,
         terrain: &Volume,
@@ -607,6 +966,8 @@ impl AuthoritativeWater {
             volume_m3: frame.volume_m3,
             open_outflow_m3: frame.open_outflow_m3,
             trapped_volume_m3: self.grid().map_or(0.0, MacGridWorld::trapped_volume_m3),
+            domain_growths: self.growths,
+            growth_refused: self.growth_refused,
             ..WaterTickMetrics::default()
         };
         self.boundary_pending |= boundary_dirty;
