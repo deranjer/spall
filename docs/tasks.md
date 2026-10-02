@@ -1053,3 +1053,14 @@ ENG-103's failed feasibility gates. Launch instructions and implementation
 evidence are recorded in `docs/reports/ENG-104.md`; tracked in Loopira ENG-104.
 The original particle view (`--fluid-demo`) was removed with the Salva backend;
 the MAC grid viewer (`--grid-fluid-demo`) is the remaining water view.
+
+
+## ENG-116 - Ecology A: deterministic grass and trees
+
+Build `spall_ecology` as a CPU-only engine library over immutable terrain snapshots. Keep the vegetation plan separate from `spall_worldgen` output and keep initial species/material choices in `sandbox`. Use versioned, bounded, canonical state for grass patches, plants, persistent branch skeletons, and regional seed availability. Persist ecological time, interval remainder, random progress, and pending work in the ecology encoding; world checkpoint and journal integration is a later task.
+
+Implement terrain-validated initial placement, grass harvest/regrowth, staged tree growth, deterministic seed dispersal/expiry/germination, crowding, and unsuitable-condition behavior. Use only authored soil suitability, explicit moisture snapshots, CPU sky exposure, and spacing in this increment. Generate incremental connected wood proposals from retained branch records. Cut branches stay removed; root destruction stops growth/reproduction; detached geometry stays under existing voxel destruction ownership.
+
+Read dependencies carry exact brick revisions plus the ecology input revision. The caller applies proposals at an owner-thread boundary and acknowledges only accepted edits; rejection and staleness leave committed geometry progress unchanged. Bound and fairly resume work; Unknown suspends decisions and an unloaded region pauses ecological time. Add a real-terrain headless clearing example and measurements. Production server ownership, durable checkpoint/journal integration, and vegetation rendering are explicitly deferred.
+
+Validation: `cargo test -p spall_ecology`, `cargo run -p sandbox --example ecology-clearing`, `cargo run -p sandbox --example ecology-clearing -- --large`, and `cargo xtask check`. See [ENG-116 evidence](reports/ENG-116.md). ENG-116 does not close ENG-113 or ENG-114; those Loopira tickets remain `in_progress` despite the implementation notes in `docs/worldgen.md`.

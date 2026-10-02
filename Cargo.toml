@@ -5,6 +5,7 @@ members = [
     "crates/spall_voxel",
     "crates/spall_fluid",
     "crates/spall_worldgen",
+    "crates/spall_ecology",
     "crates/spall_jobs",
     "crates/spall_structure",
     "crates/spall_net",
@@ -57,6 +58,7 @@ spall_store = { path = "crates/spall_store" }
 spall_structure = { path = "crates/spall_structure" }
 spall_voxel = { path = "crates/spall_voxel" }
 spall_worldgen = { path = "crates/spall_worldgen" }
+spall_ecology = { path = "crates/spall_ecology" }
 thiserror = "2.0.17"
 zstd = "0.13"
 tokio = { version = "1.52.3", default-features = false }

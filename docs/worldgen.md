@@ -244,3 +244,8 @@ preview, and Run in game.
 Trees, grass, props, flowing rivers (water is initially static, filled to sea
 level; springs/sinks are a consumer decision), streaming/infinite worlds, 3D
 editor preview, persistence of spec/version in `StoredWorldMeta`.
+
+
+## Vegetation plan boundary (ENG-116)
+
+`spall_ecology` consumes terrain and explicit ecology inputs to produce a separately versioned plan. It does not modify `GeneratedWorld`, the worldgen version, or the terrain golden digest. The sandbox supplies its initial species and material mappings. The bounded clearing example routes accepted wood proposals through the existing simulation edit/staging surface, but production server ownership, checkpoint/journal recovery, and replication remain a subsequent assignment. Grass remains patch state; no blades or foliage voxels are generated. The existing worldgen pipeline still has no vegetation pass.
