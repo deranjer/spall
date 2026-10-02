@@ -121,6 +121,35 @@ impl CutCellGeometry {
         }
         counts
     }
+
+    /// Solid/domain boundary fine faces by normal axis. Open top faces are
+    /// included here; the caller subtracts them if using an open-top policy.
+    pub fn wall_faces(&self) -> Vec<[u32; 3]> {
+        let dims = self.fine_spec.dimensions().map(|v| v as usize);
+        let strides = [1, dims[0], dims[0] * dims[1]];
+        let mut counts = vec![[0; 3]; self.components.len()];
+        for (index, &id) in self.fine_component.iter().enumerate() {
+            if id == SOLID {
+                continue;
+            }
+            let pos = [
+                index % dims[0],
+                index / dims[0] % dims[1],
+                index / strides[2],
+            ];
+            for axis in 0..3 {
+                if pos[axis] == 0 || self.fine_component[index - strides[axis]] == SOLID {
+                    counts[id as usize][axis] += 1;
+                }
+                if pos[axis] + 1 == dims[axis]
+                    || self.fine_component[index + strides[axis]] == SOLID
+                {
+                    counts[id as usize][axis] += 1;
+                }
+            }
+        }
+        counts
+    }
     pub fn build(
         boundary: &SolidBoundary,
         factor: u32,

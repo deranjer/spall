@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::cut_cell::{CutCellGeometry, GeometryError};
+mod momentum;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ComponentConfig {
@@ -72,6 +73,28 @@ pub struct TransportMetrics {
     pub moved_water_m3: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MomentumMetrics {
+    /// Advection-stage balance only; subsequent pressure/gravity impulses are
+    /// separate, and are not claimed as physical wall-force validation here.
+    pub before_kg_m_s: [f64; 3],
+    pub after_kg_m_s: [f64; 3],
+    pub wall_impulse_kg_m_s: [f64; 3],
+    pub boundary_outflow_kg_m_s: [f64; 3],
+    pub balance_error_kg_m_s: [f64; 3],
+    pub kinetic_before_j: f64,
+    pub kinetic_after_j: f64,
+    pub max_dual_mass_error_kg: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MomentumStepMetrics {
+    pub force_projection: ProjectionMetrics,
+    pub transport: TransportMetrics,
+    pub advection: MomentumMetrics,
+    pub final_projection: ProjectionMetrics,
+}
+
 #[derive(Debug, Clone)]
 pub struct ComponentFluid {
     geometry: Arc<CutCellGeometry>,
@@ -85,9 +108,9 @@ pub struct ComponentFluid {
     top_area: Vec<f64>,
     distances: Vec<f64>,
     height_deltas: Vec<[f64; 3]>,
-    top_distance: Vec<f64>,
     pinned: Vec<bool>,
     regions: Vec<Vec<usize>>,
+    momentum_weights: Vec<[Vec<(usize, f64)>; 3]>,
     outflow: f64,
 }
 
@@ -162,8 +185,6 @@ impl ComponentFluid {
                 }
             })
             .collect();
-        let top_y = f64::from(geometry.fine_spec().dimensions()[1]) * config.voxel_size_m;
-        let top_distance: Vec<_> = centers.iter().map(|c| top_y - c[1]).collect();
         let mut adjacency = vec![Vec::new(); n];
         for portal in geometry.portals() {
             let (a, b) = (
@@ -200,6 +221,7 @@ impl ComponentFluid {
             regions.push(region);
         }
         let edge_count = geometry.portals().len();
+        let momentum_weights = momentum::build_weights(&geometry, config.open_top);
         Ok(Self {
             geometry,
             config,
@@ -211,9 +233,9 @@ impl ComponentFluid {
             top_area,
             distances,
             height_deltas,
-            top_distance,
             pinned,
             regions,
+            momentum_weights,
             outflow: 0.0,
         })
     }
@@ -226,6 +248,9 @@ impl ComponentFluid {
     }
     pub fn flux_m3_s(&self) -> &[f64] {
         &self.flux
+    }
+    pub fn top_flux_m3_s(&self) -> &[f64] {
+        &self.top_flux
     }
     pub fn water_volume_m3(&self) -> f64 {
         self.amounts.iter().sum()
@@ -301,6 +326,26 @@ impl ComponentFluid {
         Ok(())
     }
 
+    pub fn set_predicted_fluxes(
+        &mut self,
+        flux: &[f64],
+        top: &[f64],
+    ) -> Result<(), ComponentError> {
+        if flux.len() != self.flux.len()
+            || top.len() != self.top_flux.len()
+            || flux.iter().chain(top).any(|q| !q.is_finite())
+            || top
+                .iter()
+                .zip(&self.top_area)
+                .any(|(q, a)| *a == 0.0 && *q != 0.0)
+        {
+            return Err(ComponentError::InvalidState);
+        }
+        self.flux.copy_from_slice(flux);
+        self.top_flux.copy_from_slice(top);
+        Ok(())
+    }
+
     /// Two-phase finite-volume pressure projection. Each component owns a
     /// pressure row; density uses water/open capacity, never water/whole box.
     /// Vertical gravity uses a hydrostatic pressure-reference split; density
@@ -330,11 +375,14 @@ impl ComponentFluid {
         };
         let mut top = self.top_flux.clone();
         let mut weights = Vec::new();
+        let dual_mass = self.dual_mass(&self.amounts);
         let mut diag = vec![0.0; n];
         for (i, edge) in self.geometry.portals().iter().enumerate() {
             let (a, b) = (edge.lower_component as usize, edge.upper_component as usize);
             let area = f64::from(edge.voxel_faces) * self.config.voxel_size_m.powi(2);
-            let weight = dt * area / (0.5 * (density[a] + density[b]) * self.distances[i]);
+            // Match advection/kinetic-energy inertia, so divergence projection
+            // cannot add energy in a closed domain.
+            let weight = dt * area.powi(2) / dual_mass[i];
             if !weight.is_finite() || weight <= 0.0 {
                 return Err(ComponentError::InvalidState);
             }
@@ -358,7 +406,7 @@ impl ComponentFluid {
         let mut top_weights = vec![0.0; n];
         for i in 0..n {
             if self.top_area[i] > 0.0 {
-                let w = dt * self.top_area[i] / (density[i] * self.top_distance[i]);
+                let w = dt * self.top_area[i].powi(2) / dual_mass[self.flux.len() + i];
                 if !w.is_finite() || w <= 0.0 {
                     return Err(ComponentError::InvalidState);
                 }
@@ -519,6 +567,23 @@ impl ComponentFluid {
     /// An iterative paired-flux limiter enforces capacity; after 64 reductions
     /// an unresolved violation is an atomic failure. Amounts are never clipped.
     pub fn transport(&mut self, dt: f64) -> Result<TransportMetrics, ComponentError> {
+        self.transport_internal(dt, false).map(|(t, _)| t)
+    }
+
+    /// Mass-consistent staggered donor momentum advection with the same limited
+    /// phase transfers as water transport. Wall/boundary impulses are explicit.
+    pub fn transport_and_advect(
+        &mut self,
+        dt: f64,
+    ) -> Result<(TransportMetrics, MomentumMetrics), ComponentError> {
+        self.transport_internal(dt, true)
+    }
+
+    fn transport_internal(
+        &mut self,
+        dt: f64,
+        advect: bool,
+    ) -> Result<(TransportMetrics, MomentumMetrics), ComponentError> {
         if !dt.is_finite() || dt <= 0.0 {
             return Err(ComponentError::InvalidConfig);
         }
@@ -626,13 +691,25 @@ impl ComponentFluid {
                 {
                     return Err(ComponentError::InvalidState);
                 }
+                let advection = if advect {
+                    let (flux, top, metrics) =
+                        self.advect_momentum(dt, &transfers, &exports, &next)?;
+                    self.flux = flux;
+                    self.top_flux = top;
+                    metrics
+                } else {
+                    MomentumMetrics::default()
+                };
                 self.amounts = next;
                 self.outflow += outflow;
-                return Ok(TransportMetrics {
-                    limiter_passes: pass,
-                    limited_water_m3: (requested - moved).max(0.0),
-                    moved_water_m3: moved,
-                });
+                return Ok((
+                    TransportMetrics {
+                        limiter_passes: pass,
+                        limited_water_m3: (requested - moved).max(0.0),
+                        moved_water_m3: moved,
+                    },
+                    advection,
+                ));
             }
         }
         unreachable!("bounded limiter returns accepted state or explicit failure")
@@ -647,6 +724,26 @@ impl ComponentFluid {
         candidate.transport(dt)?;
         *self = candidate;
         Ok(metrics)
+    }
+
+    /// Experimental force projection, shared mass/momentum transport and final
+    /// divergence projection. No step time is credited if any stage fails.
+    /// Sealed air, edit remapping and interface accuracy remain separate gates.
+    pub fn advance_momentum_operators(
+        &mut self,
+        dt: f64,
+    ) -> Result<MomentumStepMetrics, ComponentError> {
+        let mut candidate = self.clone();
+        let force_projection = candidate.project(dt, true)?;
+        let (transport, advection) = candidate.transport_and_advect(dt)?;
+        let final_projection = candidate.project(dt, false)?;
+        *self = candidate;
+        Ok(MomentumStepMetrics {
+            force_projection,
+            transport,
+            advection,
+            final_projection,
+        })
     }
 }
 

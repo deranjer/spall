@@ -15,6 +15,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if requested_iterations == 0 || requested_iterations > 10_000 {
         return Err("iteration count must be 1..=10000".into());
     }
+    let mode = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "transport".into());
+    if !["transport", "momentum"].contains(&mode.as_str()) {
+        return Err("mode must be transport or momentum".into());
+    }
+    let momentum = mode == "momentum";
     let scene = worldgen_scene::generate_with_season(
         "showcase",
         1,
@@ -52,6 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut accepted = 0;
     let mut projection_us = Vec::new();
     let mut transport_us = Vec::new();
+    let mut final_projection_us = Vec::new();
+    let mut max_momentum_error = 0.0_f64;
     let mut peak_speed = 0.0_f64;
     let mut peak_divergence = 0.0_f64;
     let mut max_iterations = 0;
@@ -74,7 +83,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         peak_divergence = peak_divergence.max(metrics.max_divergence_per_s);
         max_iterations = max_iterations.max(metrics.iterations);
         let start = Instant::now();
-        match candidate.transport(0.05) {
+        let transported = if momentum {
+            candidate.transport_and_advect(0.05).map(|(t, m)| {
+                max_momentum_error = max_momentum_error.max(
+                    m.balance_error_kg_m_s
+                        .into_iter()
+                        .map(f64::abs)
+                        .fold(0.0, f64::max),
+                );
+                t
+            })
+        } else {
+            candidate.transport(0.05)
+        };
+        match transported {
             Ok(m) => {
                 max_limiter_passes = max_limiter_passes.max(m.limiter_passes);
                 limited_water += m.limited_water_m3;
@@ -86,11 +108,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         transport_us.push(start.elapsed().as_micros());
+        if momentum {
+            let start = Instant::now();
+            match candidate.project(0.05, false) {
+                Ok(m) => {
+                    peak_speed = peak_speed.max(m.max_connection_speed_m_s);
+                    peak_divergence = peak_divergence.max(m.max_divergence_per_s);
+                    max_iterations = max_iterations.max(m.iterations);
+                }
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            }
+            final_projection_us.push(start.elapsed().as_micros());
+        }
         fluid = candidate;
         accepted += 1;
     }
     projection_us.sort_unstable();
     transport_us.sort_unstable();
+    final_projection_us.sort_unstable();
+    let final_projection_median = final_projection_us
+        .get(final_projection_us.len() / 2)
+        .map_or_else(|| "null".to_owned(), ToString::to_string);
     let projection_median = projection_us
         .get(projection_us.len() / 2)
         .map_or_else(|| "null".to_owned(), ToString::to_string);
@@ -98,12 +139,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(transport_us.len() / 2)
         .map_or_else(|| "null".to_owned(), ToString::to_string);
     let failure_json = failure.map_or_else(|| "null".to_owned(), |e| format!("{e:?}"));
-    println!(
+    let record = format!(
         "{{\"size\":{size},\"seed\":1,\"season\":\"autumn\",\"components\":{},\"portals\":{},\"accepted_operator_iterations\":{accepted},\"requested_iterations\":{requested_iterations},\"dt_s\":0.05,\"advanced_operator_time_s\":{},\"peak_speed_m_s\":{peak_speed},\"peak_divergence_per_s\":{peak_divergence},\"max_pressure_iterations\":{max_iterations},\"projection_median_us\":{projection_median},\"transport_median_us\":{transport_median},\"max_limiter_passes\":{max_limiter_passes},\"limited_water_m3\":{limited_water},\"moved_water_m3\":{moved_water},\"accounting_error_m3\":{},\"failure\":{failure_json},\"production_fluid_steps\":0}}",
         geometry.components().len(),
         geometry.portals().len(),
         f64::from(accepted) * 0.05,
         fluid.water_volume_m3() + fluid.outflow_m3() - initial.water_volume_m3()
+    );
+    println!(
+        "{},\"momentum_advection\":{momentum},\"final_projection_median_us\":{final_projection_median},\"max_advection_momentum_error_kg_m_s\":{max_momentum_error}}}",
+        &record[..record.len() - 1]
     );
     Ok(())
 }

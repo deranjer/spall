@@ -412,3 +412,274 @@ fn limiter_pass_exhaustion_is_atomic() {
     assert_eq!(f.flux_m3_s(), before_flux);
     assert_eq!(f.outflow_m3(), 0.0);
 }
+
+fn square_flux(g: &CutCellGeometry, q: f64) -> Vec<f64> {
+    g.portals()
+        .iter()
+        .map(|e| match (e.lower_component, e.upper_component) {
+            (0, 1) | (1, 3) => q,
+            (0, 2) | (2, 3) => -q,
+            other => panic!("unexpected square edge {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn staggered_upwind_advection_matches_analytic_square_cycle_and_dissipates_energy() {
+    let (g, mut f) = fixture(
+        [2, 1, 2],
+        1,
+        |_| false,
+        |_| 1.0,
+        ComponentConfig {
+            open_top: false,
+            gravity: [0.0; 3],
+            ..ComponentConfig::default()
+        },
+    );
+    let flux = square_flux(&g, 0.001);
+    f.set_predicted_flux(&flux).unwrap();
+    let initial = f.water_volume_m3();
+    let before_energy = f.kinetic_energy_j();
+    let (_, m) = f.transport_and_advect(0.1).unwrap();
+    let expected_factor = 1.0 - 0.001 * 0.1 / 0.015625;
+    for (&q, &old) in f.flux_m3_s().iter().zip(&flux) {
+        assert!((q - old * expected_factor).abs() < 1e-15);
+    }
+    assert!((m.kinetic_before_j - before_energy).abs() < 1e-15);
+    assert!((m.kinetic_after_j - before_energy * expected_factor.powi(2)).abs() < 1e-15);
+    assert!(m.kinetic_after_j < m.kinetic_before_j);
+    assert!(m.balance_error_kg_m_s.iter().all(|v| v.abs() < 1e-14));
+    assert!(m.max_dual_mass_error_kg < 1e-14);
+    assert_eq!(f.water_volume_m3(), initial);
+}
+
+#[test]
+fn variable_density_advection_accounts_for_wall_and_boundary_momentum() {
+    let (_, mut f) = fixture(
+        [2, 1, 1],
+        1,
+        |_| false,
+        |c| if c.x == 0 { 1.0 } else { 0.0 },
+        ComponentConfig {
+            gravity: [0.0; 3],
+            ..ComponentConfig::default()
+        },
+    );
+    f.set_predicted_fluxes(&[-0.001], &[0.001, -0.001]).unwrap();
+    let before = f.water_volume_m3();
+    let before_momentum = f.momentum_kg_m_s();
+    let (_, m) = f.transport_and_advect(0.1).unwrap();
+    assert!(m.wall_impulse_kg_m_s.iter().any(|v| v.abs() > 1e-8));
+    assert!(m.boundary_outflow_kg_m_s.iter().any(|v| v.abs() > 1e-8));
+    assert!(
+        m.balance_error_kg_m_s.iter().all(|v| v.abs() < 1e-12),
+        "{m:?}"
+    );
+    assert!(m.max_dual_mass_error_kg < 1e-12);
+    assert_eq!(m.before_kg_m_s, before_momentum);
+    for (after, reported) in f.momentum_kg_m_s().into_iter().zip(m.after_kg_m_s) {
+        assert!((after - reported).abs() < 1e-12);
+    }
+    assert!((f.water_volume_m3() + f.outflow_m3() - before).abs() < 1e-16);
+    let flux = f.flux_m3_s().to_vec();
+    let top = f.top_flux_m3_s().to_vec();
+    assert!(f.set_predicted_fluxes(&[0.0], &[f64::NAN, 0.0]).is_err());
+    assert_eq!(f.flux_m3_s(), flux);
+    assert_eq!(f.top_flux_m3_s(), top);
+}
+
+#[test]
+fn failed_coupled_momentum_step_preserves_all_state() {
+    let (g, mut f) = fixture(
+        [2, 1, 2],
+        1,
+        |_| false,
+        |_| 1.0,
+        ComponentConfig {
+            open_top: false,
+            gravity: [0.0; 3],
+            ..ComponentConfig::default()
+        },
+    );
+    f.set_predicted_flux(&square_flux(&g, 10.0)).unwrap();
+    let amounts = f.amounts_m3().to_vec();
+    let pressure = f.pressure_pa().to_vec();
+    let flux = f.flux_m3_s().to_vec();
+    assert!(matches!(
+        f.advance_momentum_operators(0.1),
+        Err(ComponentError::Cfl { .. })
+    ));
+    assert_eq!(f.amounts_m3(), amounts);
+    assert_eq!(f.pressure_pa(), pressure);
+    assert_eq!(f.flux_m3_s(), flux);
+    assert_eq!(f.outflow_m3(), 0.0);
+}
+
+#[test]
+fn coupled_momentum_keeps_decimal_surface_at_rest() {
+    let (_, mut f) = fixture(
+        [12, 12, 6],
+        3,
+        |c| c.y < 2 + c.x % 5,
+        |c| {
+            if c.y < 7 {
+                1.0
+            } else if c.y == 7 {
+                0.3
+            } else {
+                0.0
+            }
+        },
+        ComponentConfig::default(),
+    );
+    let before = f.water_volume_m3();
+    for _ in 0..1200 {
+        let m = f.advance_momentum_operators(0.05).unwrap();
+        assert!(m.final_projection.max_connection_speed_m_s < 1e-10);
+        assert!(
+            m.advection
+                .balance_error_kg_m_s
+                .iter()
+                .all(|v| v.abs() < 1e-12)
+        );
+    }
+    assert!((f.water_volume_m3() + f.outflow_m3() - before).abs() < 1e-12);
+}
+
+#[test]
+fn wall_surface_counts_match_fine_faces_including_internal_thin_walls() {
+    let (g, _) = fixture([6, 3, 3], 3, |_| false, |_| 0.0, ComponentConfig::default());
+    assert_eq!(g.wall_faces(), vec![[9, 18, 18], [9, 18, 18]]);
+    let (g, _) = fixture(
+        [6, 3, 3],
+        3,
+        |c| c.x == 1,
+        |_| 0.0,
+        ComponentConfig::default(),
+    );
+    assert_eq!(g.wall_faces(), vec![[18, 6, 6], [9, 6, 6], [9, 18, 18]]);
+}
+
+#[test]
+fn released_reservoir_carries_downstream_momentum_into_a_narrow_channel() {
+    let (g, mut f) = fixture(
+        [48, 18, 12],
+        3,
+        |c| c.y < 3 || (c.x >= 18 && !(3..9).contains(&c.z) && c.y < 12),
+        |c| if c.x < 18 && c.y < 9 { 1.0 } else { 0.0 },
+        ComponentConfig::default(),
+    );
+    let initial = f.water_volume_m3();
+    let initial_energy = f.vertical_potential_energy_j() + f.kinetic_energy_j();
+    let channel = |f: &ComponentFluid| {
+        g.components()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.anchor.x >= 18 && (3..9).contains(&c.anchor.z))
+            .map(|(i, _)| f.amounts_m3()[i])
+            .sum::<f64>()
+    };
+    let mut peak_momentum = 0.0_f64;
+    let mut peak_speed = 0.0_f64;
+    let mut max_balance = 0.0_f64;
+    let mut max_energy = initial_energy;
+    for _ in 0..600 {
+        let m = f.advance_momentum_operators(0.01).unwrap();
+        peak_momentum = peak_momentum.max(f.momentum_kg_m_s()[0]);
+        peak_speed = peak_speed.max(m.final_projection.max_connection_speed_m_s);
+        max_balance = max_balance.max(
+            m.advection
+                .balance_error_kg_m_s
+                .into_iter()
+                .map(f64::abs)
+                .fold(0.0, f64::max),
+        );
+        max_energy = max_energy.max(f.vertical_potential_energy_j() + f.kinetic_energy_j());
+    }
+    eprintln!(
+        "released channel: water={} initial={initial} peak_momentum={peak_momentum} peak_speed={peak_speed} balance={max_balance} initial_energy={initial_energy} max_energy={max_energy}",
+        channel(&f)
+    );
+    assert!(
+        channel(&f) > 0.5,
+        "channel received too little water: {}",
+        channel(&f)
+    );
+    assert!(
+        peak_momentum > 0.1,
+        "no downstream surge momentum: {peak_momentum}"
+    );
+    assert!(max_balance < 1e-9);
+    assert!(
+        max_energy <= initial_energy * 1.05,
+        "energy creation exceeds diagnostic budget: {max_energy} / {initial_energy}"
+    );
+    assert!((f.water_volume_m3() + f.outflow_m3() - initial).abs() < 1e-10);
+}
+
+#[test]
+fn pressure_projection_cannot_increase_staggered_energy_in_irregular_closed_geometry() {
+    let (g, mut f) = fixture(
+        [12, 9, 6],
+        3,
+        |c| c.y < c.x % 4 || (c.x == 4 && c.z < 3),
+        |c| if c.x < 5 { 0.9 } else { 0.1 },
+        ComponentConfig {
+            open_top: false,
+            gravity: [0.0; 3],
+            ..ComponentConfig::default()
+        },
+    );
+    let q: Vec<_> = g
+        .portals()
+        .iter()
+        .enumerate()
+        .map(|(i, _)| ((i * 17 % 31) as f64 - 15.0) * 0.0001)
+        .collect();
+    f.set_predicted_flux(&q).unwrap();
+    let before = f.kinetic_energy_j();
+    let m = f.project(0.05, false).unwrap();
+    assert!(m.max_divergence_per_s < 1e-6);
+    assert!(f.kinetic_energy_j() <= before * (1.0 + 1e-12));
+}
+
+#[test]
+fn failed_final_projection_discards_completed_mass_and_momentum_advection() {
+    let (g, mut f) = fixture(
+        [2, 1, 2],
+        1,
+        |_| false,
+        |c| match (c.x, c.z) {
+            (0, 0) => 0.9,
+            (1, 0) => 0.2,
+            (0, 1) => 0.4,
+            _ => 0.0,
+        },
+        ComponentConfig {
+            open_top: false,
+            gravity: [0.0; 3],
+            max_iterations: 1,
+            ..ComponentConfig::default()
+        },
+    );
+    f.set_predicted_flux(&square_flux(&g, 0.001)).unwrap();
+    let mut stage = f.clone();
+    assert_eq!(stage.project(0.05, true).unwrap().iterations, 0);
+    stage.transport_and_advect(0.05).unwrap();
+    assert!(matches!(
+        stage.project(0.05, false),
+        Err(ComponentError::PressureNotConverged { .. })
+    ));
+    let amounts = f.amounts_m3().to_vec();
+    let pressure = f.pressure_pa().to_vec();
+    let flux = f.flux_m3_s().to_vec();
+    assert!(matches!(
+        f.advance_momentum_operators(0.05),
+        Err(ComponentError::PressureNotConverged { .. })
+    ));
+    assert_eq!(f.amounts_m3(), amounts);
+    assert_eq!(f.pressure_pa(), pressure);
+    assert_eq!(f.flux_m3_s(), flux);
+    assert_eq!(f.outflow_m3(), 0.0);
+}
