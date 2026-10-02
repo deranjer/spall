@@ -139,6 +139,9 @@ pub(crate) struct BodyMotion {
     pub linear_velocity_m_s: [f32; 3],
     pub angular_velocity_rad_s: [f32; 3],
     pub sleeping: bool,
+    /// Body-local point near the centre of mass that the pose is advanced
+    /// about ([`crate::replica::body_pivot_m`]); zero advances the origin.
+    pub pivot_m: [f64; 3],
 }
 
 impl BodyMotion {
@@ -149,6 +152,7 @@ impl BodyMotion {
         linear_velocity_m_s: [0.0; 3],
         angular_velocity_rad_s: [0.0; 3],
         sleeping: false,
+        pivot_m: [0.0; 3],
     };
 }
 
@@ -172,13 +176,14 @@ impl ClientBodyCollision {
         let m = self.motion;
         let ticks = (tick - m.snapshot_tick as f64)
             .clamp(-MAX_BODY_EXTRAPOLATION_TICKS, MAX_BODY_EXTRAPOLATION_TICKS);
-        crate::replica::advance_pose(
+        crate::replica::advance_pose_about(
             &self.pose,
             m.linear_velocity_m_s,
             m.angular_velocity_rad_s,
             m.sleeping,
             ticks,
             60.0,
+            m.pivot_m,
         )
     }
 }
@@ -1866,6 +1871,7 @@ mod moving_body_replay_tests {
                 linear_velocity_m_s: [vx, 0.0, 0.0],
                 angular_velocity_rad_s: [0.0; 3],
                 sleeping,
+                pivot_m: [0.0; 3],
             },
         }
     }

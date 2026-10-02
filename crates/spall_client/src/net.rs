@@ -1887,7 +1887,7 @@ async fn run_async(
             // Geometry changes rarely; motion snapshots do not. Remember the
             // last topology version so ordinary 60 Hz pose refreshes do not
             // clone every replicated voxel volume under the replica lock.
-            let mut body_collision_versions = HashMap::<u64, u64>::new();
+            let mut body_collision_versions = HashMap::<u64, (u64, [f64; 3])>::new();
             let trace_bodies = !script.is_empty();
             loop {
                 if *stop_rx.borrow() {
@@ -1937,8 +1937,14 @@ async fn run_async(
                         let raw_entity = entity.get();
                         let topology_version = volume.next_revision().get();
                         live.insert(raw_entity);
-                        let changed = body_collision_versions.get(&raw_entity).copied()
-                            != Some(topology_version);
+                        let known = body_collision_versions.get(&raw_entity).copied();
+                        let changed = known.map(|(version, _)| version) != Some(topology_version);
+                        // Poses advance about the geometry's centroid, not the
+                        // far-away frame origin; recomputed only on a topology change.
+                        let pivot_m = match known {
+                            Some((_, pivot)) if !changed => pivot,
+                            _ => crate::replica::body_pivot_m(volume),
+                        };
                         bodies.push(ClientBodyCollision {
                             entity,
                             topology_version,
@@ -1949,9 +1955,10 @@ async fn run_async(
                                 linear_velocity_m_s: latest.linear_velocity_m_s,
                                 angular_velocity_rad_s: latest.angular_velocity_rad_s,
                                 sleeping: latest.sleeping,
+                                pivot_m,
                             },
                         });
-                        body_collision_versions.insert(raw_entity, topology_version);
+                        body_collision_versions.insert(raw_entity, (topology_version, pivot_m));
                     }
                     body_collision_versions.retain(|entity, _| live.contains(entity));
                     (bodies, traced_samplers)
