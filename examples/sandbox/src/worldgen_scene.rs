@@ -20,9 +20,56 @@ use spall_worldgen::{
 use thiserror::Error;
 
 use crate::editor_scene::{
-    MAX_SCENE_WATER_CELLS, WATER_COARSEN, WATER_MARGIN_ABOVE, WATER_MARGIN_BELOW, WATER_MARGIN_XZ,
-    WATER_STEP_S,
+    MAX_SCENE_WATER_CELLS, WATER_MARGIN_ABOVE, WATER_MARGIN_BELOW, WATER_MARGIN_XZ, WATER_STEP_S,
 };
+
+/// Fluid cells a generated world's water domain may start with. The solver
+/// costs roughly 0.5-2 microseconds per fluid cell per step and the water worker
+/// has 50 ms per 1/20 s step, so a domain much over this runs slower than real
+/// time. Measured on the seed-1 showcase (release): 512-cell arena, 87,000 cells
+/// (0.5 m) = median 102 ms per step flowing, 27,500 cells (0.75 m) = 15 ms;
+/// 1024-cell arena, 347,000 cells = 700 ms (water at 0.06x real time), 107,000
+/// (0.75 m) = 64 ms, 46,000 (1 m) = 16 ms. See `docs/reports/ENG-121.md`.
+pub const WATER_FLUID_CELL_BUDGET: usize = 50_000;
+
+/// Domain growth may take a region to this multiple of the budget.
+const WATER_GROWTH_BUDGET_FACTOR: usize = 2;
+
+/// The domain box for water bounds `lo`..=`hi` at coarsening `c`: the bounds plus
+/// the sandbox margins, snapped outward to whole fluid cells.
+fn water_domain_box(lo: GlobalCell, hi: GlobalCell, c: i64) -> ([i64; 3], [i64; 3]) {
+    let snap_down = |v: i64| v.div_euclid(c) * c;
+    let snap_up = |v: i64| (v + c).div_euclid(c) * c; // exclusive end
+    (
+        [
+            snap_down(lo.x - WATER_MARGIN_XZ),
+            snap_down(lo.y - WATER_MARGIN_BELOW),
+            snap_down(lo.z - WATER_MARGIN_XZ),
+        ],
+        [
+            snap_up(hi.x + WATER_MARGIN_XZ),
+            snap_up(hi.y + WATER_MARGIN_ABOVE),
+            snap_up(hi.z + WATER_MARGIN_XZ),
+        ],
+    )
+}
+
+/// The finest coarsening (2..=8 voxels per fluid cell) whose domain fits
+/// [`WATER_FLUID_CELL_BUDGET`]; 8 if none does. Coarser cells lose resolution:
+/// a coarse cell is solid when at least half its voxels are, so walls thinner
+/// than half a cell (a one-voxel wall at 0.75 m or 1 m) no longer block water,
+/// and trenches a couple of cells wide fill unevenly. Hand-authored scenes keep
+/// `editor_scene::WATER_COARSEN`.
+pub fn pick_water_coarsening(lo: GlobalCell, hi: GlobalCell) -> u32 {
+    for c in 2..=8u32 {
+        let (min, max) = water_domain_box(lo, hi, i64::from(c));
+        let voxels: u128 = (0..3).map(|a| (max[a] - min[a]) as u128).product();
+        if voxels / u128::from(c).pow(3) <= WATER_FLUID_CELL_BUDGET as u128 {
+            return c;
+        }
+    }
+    8
+}
 
 #[derive(Debug, Error)]
 pub enum WorldgenSceneError {
@@ -98,19 +145,8 @@ pub fn water_setup(plan: &WaterPlan) -> Result<Option<WaterSetup>, WorldgenScene
     let Some((lo, hi)) = plan.bounds else {
         return Ok(None);
     };
-    let c = i64::from(WATER_COARSEN);
-    let snap_down = |v: i64| v.div_euclid(c) * c;
-    let snap_up = |v: i64| (v + c).div_euclid(c) * c; // exclusive end
-    let min = [
-        snap_down(lo.x - WATER_MARGIN_XZ),
-        snap_down(lo.y - WATER_MARGIN_BELOW),
-        snap_down(lo.z - WATER_MARGIN_XZ),
-    ];
-    let max = [
-        snap_up(hi.x + WATER_MARGIN_XZ),
-        snap_up(hi.y + WATER_MARGIN_ABOVE),
-        snap_up(hi.z + WATER_MARGIN_XZ),
-    ];
+    let coarsen = pick_water_coarsening(lo, hi);
+    let (min, max) = water_domain_box(lo, hi, i64::from(coarsen));
     let dimensions = [0, 1, 2].map(|a| (max[a] - min[a]) as u32);
     let domain = DomainSpec::new(
         GlobalCell::new(min[0], min[1], min[2]),
@@ -120,8 +156,13 @@ pub fn water_setup(plan: &WaterPlan) -> Result<Option<WaterSetup>, WorldgenScene
     .map_err(|e| WorldgenSceneError::WaterDomain(e.to_string()))?;
     Ok(Some(
         WaterSetup::new(domain, plan.cells.iter().map(|cell| (*cell, 1.0)).collect())
-            .with_coarsening(WATER_COARSEN)
-            .with_growth(spall_sim::WaterGrowth::default())
+            .with_coarsening(coarsen)
+            .with_growth(spall_sim::WaterGrowth {
+                max_voxel_cells: WATER_GROWTH_BUDGET_FACTOR
+                    * WATER_FLUID_CELL_BUDGET
+                    * (coarsen as usize).pow(3),
+                ..spall_sim::WaterGrowth::default()
+            })
             .on_worker(WATER_STEP_S),
     ))
 }

@@ -384,6 +384,10 @@ pub struct AuthoritativeWater {
     residency_skipped_s: f64,
     growths: u64,
     growth_refused: u64,
+    /// Set by [`Self::grown`]: the grid was built from the terrain as of this
+    /// tick's commits, so this tick's boundary-dirty flag is already satisfied
+    /// and capturing the boundary again would only repeat the work.
+    boundary_current: bool,
 }
 
 enum Engine {
@@ -460,6 +464,7 @@ impl AuthoritativeWater {
             residency_skipped_s: 0.0,
             growths: 0,
             growth_refused: 0,
+            boundary_current: false,
         })
     }
 
@@ -722,7 +727,12 @@ impl AuthoritativeWater {
             )
         });
         let mut refusal = GrowthRefusal::TooLarge;
-        for margin in [i64::from(growth.margin_voxels), 0] {
+        let full_margin = i64::from(growth.margin_voxels);
+        // Smaller margins are tried when the full one is too large or runs into
+        // a neighbour. Margin 0 only for a neighbour: when the cap is what stops
+        // growth, a bare edit box would regrow the domain on every swing, each
+        // time paying a full rebuild.
+        for margin in [full_margin, full_margin / 2, full_margin / 4, 0] {
             // Fluid-cell offsets relative to the current origin keep the grown
             // grid aligned with the old one.
             let mut lo_f = [0i64; 3];
@@ -762,6 +772,9 @@ impl AuthoritativeWater {
                 || fluid.is_none_or(|f| f > spall_protocol::water::MAX_WATER_CELLS as u128)
             {
                 refusal = GrowthRefusal::TooLarge;
+                if margin <= full_margin / 4 {
+                    break;
+                }
                 continue;
             }
             let origin = GlobalCell::new(
@@ -941,6 +954,7 @@ impl AuthoritativeWater {
             residency_skipped_s: self.residency_skipped_s,
             growths: self.growths + 1,
             growth_refused: self.growth_refused,
+            boundary_current: true,
         })
     }
 
@@ -970,7 +984,8 @@ impl AuthoritativeWater {
             growth_refused: self.growth_refused,
             ..WaterTickMetrics::default()
         };
-        self.boundary_pending |= boundary_dirty;
+        self.boundary_pending |= boundary_dirty && !std::mem::take(&mut self.boundary_current);
+        self.boundary_current = false;
         // Check every domain's declared residency even while sleeping. Missing
         // geometry suspends time instead of guessing an air/drain/wall boundary.
         let origin = self.domain.origin();

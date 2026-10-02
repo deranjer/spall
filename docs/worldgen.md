@@ -75,8 +75,8 @@ to smaller arenas (tests use 256 cells).
   The v5 content hash is pinned in `tests/appearance_evolution.rs`; clients and
   servers built before this no longer match the handshake hash.
 - `sandbox::worldgen_scene` maps a `GeneratedWorld` to `WorldSetup` (terrain
-  cloned, sharing dense payloads), a `WaterSetup` (box + margins, coarsen 2,
-  worker at 20 Hz, same constants as editor scenes) and spawns.
+  cloned, sharing dense payloads), a `WaterSetup` (box + margins, coarsening picked per world to fit a
+  50,000 fluid-cell budget (3 at 512 cells, 4 at 1024), worker at 20 Hz) and spawns.
 - Water starts static (no springs or sinks); it is solver state from then on.
 
 ## Measured (1024-cell arena, seed 1, release, this machine)

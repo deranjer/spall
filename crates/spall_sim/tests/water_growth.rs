@@ -241,6 +241,25 @@ fn growth_refused_over_the_cap_is_counted_and_changes_nothing() {
 }
 
 #[test]
+fn a_cap_that_only_fits_a_sliver_refuses_instead_of_regrowing_every_swing() {
+    // Room for one extra x column only: the 8/4/2-voxel margins all need more,
+    // and margin 0 is not tried when the cap is the limit, so a trench dug at
+    // the cap cannot trigger a full rebuild per swing.
+    let mut sim = world(
+        Some(WaterGrowth {
+            max_voxel_cells: 24 * 16 * 32 + 600,
+            ..default_growth()
+        }),
+        WaterExecution::Inline,
+    );
+    run(&mut sim, 5);
+    cut(&mut sim, 1, 26, 6, 16, 3);
+    let metrics = sim.tick().unwrap().water.unwrap();
+    assert_eq!((metrics.domain_growths, metrics.growth_refused), (0, 1));
+    assert_eq!(sim.water().unwrap().domain().dimensions(), [24, 16, 32]);
+}
+
+#[test]
 fn growth_shrinks_its_margin_to_avoid_a_neighbour_and_refuses_when_it_cannot() {
     let setup = |origin_x: i64| {
         let mut sim = world(Some(default_growth()), WaterExecution::Inline);

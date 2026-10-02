@@ -117,7 +117,13 @@ fn water_is_one_server_fluid_region_inside_the_arena() {
         assert!(cell.y >= o.y && cell.y < o.y + i64::from(dims[1]));
         assert!(cell.z >= o.z && cell.z < o.z + i64::from(dims[2]));
     }
-    assert_eq!(water.coarsen, 2);
+    assert!((2..=8).contains(&water.coarsen));
+    let fluid_cells = water.domain.cell_count() / (water.coarsen as usize).pow(3);
+    assert!(
+        fluid_cells <= sandbox::worldgen_scene::WATER_FLUID_CELL_BUDGET || water.coarsen == 8,
+        "{fluid_cells} fluid cells at coarsening {}",
+        water.coarsen
+    );
     assert!(
         water.sources.is_empty() && water.sinks.is_empty(),
         "static water"
@@ -350,5 +356,32 @@ fn only_edits_near_the_water_refresh_its_boundary() {
     assert!(
         near && refreshed,
         "a cut at the lake must refresh the boundary"
+    );
+}
+
+#[test]
+fn water_coarsening_is_the_finest_that_fits_the_fluid_cell_budget() {
+    use sandbox::worldgen_scene::{WATER_FLUID_CELL_BUDGET, pick_water_coarsening};
+    use spall_core::GlobalCell;
+    // A pond 20 x 6 x 20 voxels: fine resolution fits.
+    assert_eq!(
+        pick_water_coarsening(GlobalCell::new(0, 0, 0), GlobalCell::new(19, 5, 19)),
+        2
+    );
+    // Valley-sized water: coarser, and the result fits the budget.
+    let (lo, hi) = (GlobalCell::new(0, 0, 0), GlobalCell::new(259, 41, 227));
+    let c = pick_water_coarsening(lo, hi);
+    assert!((3..=8).contains(&c), "coarsening {c}");
+    let fine = u128::from(c - 1);
+    let voxels = |c: u128| (260 + 8 + c) * (42 + 6 + c) * (228 + 8 + c);
+    assert!(voxels(u128::from(c)) / u128::from(c).pow(3) <= WATER_FLUID_CELL_BUDGET as u128);
+    assert!(
+        voxels(fine) / fine.pow(3) > WATER_FLUID_CELL_BUDGET as u128,
+        "{fine} would also have fit, so {c} is not the finest"
+    );
+    // Absurdly large water falls back to the coarsest supported factor.
+    assert_eq!(
+        pick_water_coarsening(GlobalCell::new(0, 0, 0), GlobalCell::new(4000, 400, 4000)),
+        8
     );
 }

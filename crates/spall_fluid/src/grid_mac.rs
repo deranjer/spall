@@ -2336,15 +2336,36 @@ impl MacGridWorld {
                 .collect();
             raw_fluxes.extend(faces);
         }
+        // Only cells with a non-trivial face can change. Every limiter pass and
+        // the FCT bounds below work on this list: an earlier version swept the
+        // whole domain (and re-allocated four domain-sized vectors) up to 64
+        // times per substep, which cost more than the pressure solve once the
+        // projection residual was loosened. Cells off the list keep `old`
+        // (inside [0, 1] by invariant), so results are identical.
+        let mut touched: Vec<usize> = Vec::with_capacity(raw_fluxes.len() * 2);
+        for (left, right, _, _) in &raw_fluxes {
+            touched.extend(left.iter().copied());
+            touched.extend(right.iter().copied());
+        }
+        touched.sort_unstable();
+        touched.dedup();
         // Shared-face donor flux limiter. Divergence errors at newly-wetted
         // cells may compress the low-order update; rejected inflow remains in
         // its source cell because one common face flux is scaled on both sides.
         let mut low_fluxes: Vec<f64> = raw_fluxes.iter().map(|(_, _, donor, _)| *donor).collect();
         let mut low = old.clone();
+        let mut outgoing = vec![0.0; n];
+        let mut incoming = vec![0.0; n];
+        let mut source_scale = vec![1.0; n];
+        let mut destination_scale = vec![1.0; n];
         for _ in 0..64 {
-            low.clone_from(&old);
-            let mut outgoing = vec![0.0; n];
-            let mut incoming = vec![0.0; n];
+            for &i in &touched {
+                low[i] = old[i];
+                outgoing[i] = 0.0;
+                incoming[i] = 0.0;
+                source_scale[i] = 1.0;
+                destination_scale[i] = 1.0;
+            }
             for (edge, (left, right, _, _)) in raw_fluxes.iter().enumerate() {
                 let flux = low_fluxes[edge];
                 let (source, destination) = if flux >= 0.0 {
@@ -2365,14 +2386,12 @@ impl MacGridWorld {
                     low[*i] += flux;
                 }
             }
-            let mut source_scale = vec![1.0; n];
-            let mut destination_scale = vec![1.0; n];
             let mut changed = false;
             // Only scale genuine CFL/divergence overshoots. Roundoff-level
             // excursions (pressure residual on full cells, ~1e-13) are far
             // inside the hard 1e-10 bound check below; chasing them used to
             // exhaust all 64 passes every substep without changing physics.
-            for i in 0..n {
+            for &i in &touched {
                 if low[i] < -DONOR_LIMIT_TOLERANCE && outgoing[i] > 0.0 {
                     source_scale[i] = (old[i] / outgoing[i]).clamp(0.0, 1.0);
                     changed = true;
@@ -2401,7 +2420,9 @@ impl MacGridWorld {
                 }
             }
         }
-        low.clone_from(&old);
+        for &i in &touched {
+            low[i] = old[i];
+        }
         let mut outflow_fraction = 0.0;
         let mut region_outflow_fraction = 0.0;
         let mut region_inflow_fraction = 0.0;
@@ -2429,17 +2450,25 @@ impl MacGridWorld {
             }
             anti.push((left, right, high - donor, false));
         }
-        let low_min = low.iter().copied().fold(f64::INFINITY, f64::min);
-        let low_max = low.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        if low_min < -1.0e-10 || low_max > 1.0 + 1.0e-10 {
+        let (low_min, low_max) = touched
+            .iter()
+            .map(|&i| low[i])
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            });
+        if !touched.is_empty() && (low_min < -1.0e-10 || low_max > 1.0 + 1.0e-10) {
             return Err(MacError::LowOrderCflViolation {
                 minimum: low_min,
                 maximum: low_max,
             });
         }
         // FCT/Zalesak bounds are computed from all shared face antidiffusive fluxes.
-        let mut p_plus = vec![0.0; n];
-        let mut p_minus = vec![0.0; n];
+        // The accumulators reuse the limiter's scratch vectors (reset on `touched`).
+        let (mut p_plus, mut p_minus) = (outgoing, incoming);
+        for &i in &touched {
+            p_plus[i] = 0.0;
+            p_minus[i] = 0.0;
+        }
         for (left, right, a, _) in &anti {
             if let Some(i) = left {
                 let delta = -*a;
@@ -2458,9 +2487,10 @@ impl MacGridWorld {
                 }
             }
         }
-        let mut r_plus = vec![1.0; n];
-        let mut r_minus = vec![1.0; n];
-        for i in 0..n {
+        let (mut r_plus, mut r_minus) = (source_scale, destination_scale);
+        for &i in &touched {
+            r_plus[i] = 1.0;
+            r_minus[i] = 1.0;
             if p_plus[i] > 0.0 {
                 r_plus[i] = ((1.0 - low[i]) / p_plus[i]).clamp(0.0, 1.0)
             }
@@ -2503,9 +2533,13 @@ impl MacGridWorld {
         }
         // The low-order flux is CFL bounded. Any failure indicates an algorithmic
         // defect; do not hide it with clamping or renormalization.
-        let minimum = low.iter().copied().fold(f64::INFINITY, f64::min);
-        let maximum = low.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        if minimum < -1.0e-10 || maximum > 1.0 + 1.0e-10 {
+        let (minimum, maximum) = touched
+            .iter()
+            .map(|&i| low[i])
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            });
+        if !touched.is_empty() && (minimum < -1.0e-10 || maximum > 1.0 + 1.0e-10) {
             return Err(MacError::TransportBoundsViolation { minimum, maximum });
         }
         let volume = self.cell_volume();
