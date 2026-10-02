@@ -64,6 +64,8 @@ pub enum WorldError {
     ReplayResultHash(String),
     #[error("authoritative water initialization failed: {0}")]
     WaterInitialization(String),
+    #[error("vegetation initialization: {0}")]
+    VegetationInitialization(String),
 }
 
 /// A detached body being reinstated from a persisted checkpoint record.

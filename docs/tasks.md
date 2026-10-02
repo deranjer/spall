@@ -1020,7 +1020,7 @@ The Salva particle backend was removed after selection. The grid scenarios now
 build their scene and bit-identical reference volume in
 `fixtures::ReservoirScene`. Production integration is tracked as ENG-105.
 
-### ENG-105 — Authoritative water integration
+### ENG-105 â€” Authoritative water integration
 
 Integration now includes owner-thread boundary displacement and validated
 immutable worker results, the user-approved trapped-volume ledger for sealed
@@ -1064,3 +1064,46 @@ Implement terrain-validated initial placement, grass harvest/regrowth, staged tr
 Read dependencies carry exact brick revisions plus the ecology input revision. The caller applies proposals at an owner-thread boundary and acknowledges only accepted edits; rejection and staleness leave committed geometry progress unchanged. Bound and fairly resume work; Unknown suspends decisions and an unloaded region pauses ecological time. Add a real-terrain headless clearing example and measurements. Production server ownership, durable checkpoint/journal integration, and vegetation rendering are explicitly deferred.
 
 Validation: `cargo test -p spall_ecology`, `cargo run -p sandbox --example ecology-clearing`, `cargo run -p sandbox --example ecology-clearing -- --large`, and `cargo xtask check`. See [ENG-116 evidence](reports/ENG-116.md). ENG-116 does not close ENG-113 or ENG-114; those Loopira tickets remain `in_progress` despite the implementation notes in `docs/worldgen.md`.
+## ENG-117 - Ecology B: interactive growth showcase
+
+Add a client-local rendered showcase for ENG-116's grass/tree lifecycle. Keep the ecology clock independently controllable: pause/resume, one-interval stepping, and bounded speed presets. Make accepted tree growth visible in the actual sandbox voxel renderer; show seeds, seedlings and the grass biomass patch; allow grass harvest, branch cutting, and root destruction through the showcase. It is a private local Simulation fixture, not a production world, server persistence, or network feature.
+
+Validation: `cargo test -p spall_client ecology_demo::tests`, `cargo check -p sandbox --features client --bin sandbox-client`, and `cargo xtask check`. Manual GPU presentation is separate from CPU checks. See `docs/validation.md` for the command and keys.
+
+### ENG-117 correction pass â€” 2026-10-01
+
+User-requested audit after viewing the interactive result: replace the misleading
+thin generated-terrain crop with a completely resident 16 m clearing; show every
+live terrain/body cell through the shared renderer; ground seeds, seedlings and
+grass on current voxel surfaces; reject germination through rock roofs; use
+horizontal crowding; require committed growth before maturity; improve new
+connected tree skeletons and attach soft foliage to live growth tips. Correct
+side-branch cutting, root destruction and partial single-cell growth acknowledgment.
+Bump ecology plan version to 2 without regenerating persisted skeletons or changing
+terrain generation/manifest versions. Capture seedling, juvenile, mature,
+dispersal and damage states using the interactive scene's actual geometry builder.
+Production server/network/persistence integration remains a separate assignment.
+See `docs/reports/ENG-117-corrections.md` for checks and visual evidence.
+
+
+## ENG-118 - Seasonal vegetation in generated worlds
+
+User-requested production follow-up to completed ENG-116/117. Define ten procedural trees and ten grasses/ground plants in sandbox, mapped to Meadow/Alpine/Swamp/Desert. Seed generated playable worlds through the common worldgen scene factory, including editor Run in game. Retain terrain-validated placement/dispersal, connected wood growth through server-authoritative edits, bounded fair work and stable IDs. Add plant-only seasons, autumn colour and deciduous winter leaf loss. Persist complete state and clock atomically and replicate soft plants to all clients and late joiners. Base terrain version 3 stays unchanged; vegetation owns its own version-1 schema. Earlier saves are not regenerated. ENG-113/114's broader statuses/performance gates remain separate; their available worldgen implementation is the input to this increment.
+
+Validation: catalogue/biome/grounding/offspring tests, four-season geometry, committed simulation growth, exact checkpoint/journal recovery, two network clients, legacy save upgrade/recovery, eight GPU specimen galleries plus actual generated-world captures at 512/default 1024 cells, cargo xtask check. Rules and measured evidence: docs/reports/ENG-118-vegetation.md.
+
+
+### ENG-118 loading and walking correction pass — 2026-10-01
+
+User reported ground/trunks arriving minutes after foliage, jerking during walking,
+and roughly 50 FPS. Exercise the actual live greedy terrain path, publish nearby
+mesh batches immediately, cache empty/enclosed results with complete halo revision
+validation, and preserve voxel/AO/unknown semantics while reducing meshing lookup
+cost. Move soft-plant generation off the render thread, upload only changed
+instances, omit enclosed foliage cells and compact adjacent quarter-metre cells
+without changing their occupied surface. Cull terrain against each camera/shadow
+pass separately. Gate soft plants on resident supporting meshes and smooth the
+camera's response to applied prediction corrections without altering authority,
+collision/replay, or raw correction telemetry. Add bounded real-input traversal
+capture support and regression tests. Full-world performance gates remain open.
+See `reports/ENG-118-loading-performance.md` for measurements and checks.

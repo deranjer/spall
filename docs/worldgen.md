@@ -29,6 +29,14 @@ sandbox-server --serve ... --worldgen showcase --seed 1 [--worldgen-size 512]
   fluid solver's `WaterSetup` from it. Generation fails with
   `GenError::WaterBudget` rather than truncating when the fluid domain
   (water box plus sandbox margins) exceeds `WATER_DOMAIN_BUDGET` (4M voxel cells).
+- **The fluid domain grows with digging (ENG-120).** The generated domain is the
+  water box plus 1 m margins with closed sides, so water cannot leave it. The
+  worldgen scene enables `WaterGrowth`: a committed terrain edit within 16
+  voxels (4 m) of the domain that is not wholly inside it replaces the region
+  with a larger one covering the edit plus 32 voxels (8 m), preserving every
+  fluid cell's exact amount. Growth is capped at 3M voxel cells and refused (and
+  counted) beyond that, over another region or non-resident bricks.
+  See `docs/reports/ENG-120.md`.
 - Every brick of the arena is resident (air included), so nothing inside it
   reads as `Unknown`. Outside the arena is absent, so the generator builds a
   **border wall**: the outermost brick ring (`BORDER_CELLS` = 32 cells = 8 m) is
@@ -67,8 +75,8 @@ to smaller arenas (tests use 256 cells).
   The v5 content hash is pinned in `tests/appearance_evolution.rs`; clients and
   servers built before this no longer match the handshake hash.
 - `sandbox::worldgen_scene` maps a `GeneratedWorld` to `WorldSetup` (terrain
-  cloned, sharing dense payloads), a `WaterSetup` (box + margins, coarsen 2,
-  worker at 20 Hz, same constants as editor scenes) and spawns.
+  cloned, sharing dense payloads), a `WaterSetup` (box + margins, coarsening picked per world to fit a
+  50,000 fluid-cell budget (3 at 512 cells, 4 at 1024), worker at 20 Hz) and spawns.
 - Water starts static (no springs or sinks); it is solver state from then on.
 
 ## Measured (1024-cell arena, seed 1, release, this machine)

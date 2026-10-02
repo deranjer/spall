@@ -81,6 +81,7 @@ impl LiveInput {
 /// render window can place its camera without locking the predictor itself.
 #[derive(Debug, Clone, Copy)]
 pub struct InteractiveView {
+    pub presentation_correction_total: [f64; 3],
     pub predicted: CharacterState,
     /// Last server tick observed when this pose was published.
     pub server_tick: u64,
@@ -325,6 +326,7 @@ pub struct InteractiveSession {
     /// ENG-105: newest replicated water keyframe (presentation only).
     pub water: Mutex<Option<Arc<spall_protocol::WaterKeyframe>>>,
     pub water_regions: Mutex<Vec<Arc<spall_protocol::WaterKeyframe>>>,
+    pub vegetation: Mutex<Option<Arc<spall_ecology::living::VisualFrame>>>,
     pub water_publications: std::sync::atomic::AtomicU64,
     /// Bumped each time an admin world reset replaced the replica.
     pub world_resets: std::sync::atomic::AtomicU64,
@@ -398,10 +400,22 @@ const CORRECTION_LOG_PATH: &str = ".local/runs/interactive-corrections.jsonl";
 /// Where `FrameLog` writes — same rationale as `CORRECTION_LOG_PATH`.
 const FRAME_LOG_PATH: &str = ".local/runs/interactive-frames.jsonl";
 
+/// Removes regions that `frame` supersedes: a different origin whose box it
+/// overlaps (a domain that grew, ENG-120).
+fn drop_superseded_regions(
+    regions: &mut Vec<Arc<spall_protocol::WaterKeyframe>>,
+    frame: &spall_protocol::WaterKeyframe,
+) {
+    regions.retain(|old| old.origin == frame.origin || !frame.overlaps(old.origin, old.dimensions));
+}
+
 impl InteractiveSession {
     pub fn publish_water(&self, frame: spall_protocol::WaterKeyframe) {
         let frame = Arc::new(frame);
         let mut regions = self.water_regions.lock().unwrap_or_else(|e| e.into_inner());
+        // A grown region (ENG-120) may have a new origin: replace the region it
+        // supersedes instead of keeping both.
+        drop_superseded_regions(&mut regions, &frame);
         if let Some(slot) = regions.iter_mut().find(|f| f.origin == frame.origin) {
             *slot = Arc::clone(&frame);
         } else if regions.len() < 8 {
@@ -414,6 +428,7 @@ impl InteractiveSession {
     }
 
     pub fn clear_water(&self) {
+        *self.vegetation.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.water_regions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -454,6 +469,7 @@ impl InteractiveSession {
             action_queue: Mutex::new(Vec::new()),
             admin_queue: Mutex::new(Vec::new()),
             admin_status: Mutex::new(None),
+            vegetation: Mutex::new(None),
             water: Mutex::new(None),
             water_regions: Mutex::new(Vec::new()),
             water_publications: std::sync::atomic::AtomicU64::new(0),
@@ -577,4 +593,50 @@ pub fn pick_review_lever(bodies: &[(spall_core::EntityId, u64)]) -> Option<spall
         .iter()
         .min_by_key(|(_, n)| n.abs_diff(REVIEW_LEVER_CELLS))
         .map(|(e, _)| *e)
+}
+
+#[cfg(test)]
+mod water_region_tests {
+    use super::*;
+    use spall_core::{GlobalCell, Tick};
+    use spall_protocol::WaterKeyframe;
+
+    fn frame(origin: [i64; 3], dimensions: [u32; 3], seq: u64) -> Arc<WaterKeyframe> {
+        let n = dimensions.iter().map(|d| *d as usize).product();
+        Arc::new(WaterKeyframe {
+            server_tick: Tick(seq),
+            frame_seq: seq,
+            origin: GlobalCell::new(origin[0], origin[1], origin[2]),
+            dimensions,
+            coarsen: 1,
+            fractions: vec![0; n],
+        })
+    }
+
+    #[test]
+    fn a_grown_region_with_a_moved_origin_replaces_the_old_one_not_joins_it() {
+        let mut regions = vec![
+            frame([10, 0, 0], [4, 4, 4], 1),
+            frame([100, 0, 0], [4, 4, 4], 1),
+        ];
+        // The first region grew toward -x: new origin, overlapping box.
+        let grown = frame([2, 0, 0], [12, 4, 4], 2);
+        drop_superseded_regions(&mut regions, &grown);
+        assert_eq!(regions.len(), 1, "only the unrelated region remains");
+        assert_eq!(regions[0].origin, GlobalCell::new(100, 0, 0));
+    }
+
+    #[test]
+    fn the_same_origin_and_disjoint_regions_are_kept() {
+        let mut regions = vec![
+            frame([10, 0, 0], [4, 4, 4], 1),
+            frame([20, 0, 0], [4, 4, 4], 1),
+        ];
+        drop_superseded_regions(&mut regions, &frame([10, 0, 0], [8, 4, 4], 2));
+        assert_eq!(
+            regions.len(),
+            2,
+            "same origin is replaced in place later; disjoint stays"
+        );
+    }
 }

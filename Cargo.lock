@@ -2963,6 +2963,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spall_core",
+ "spall_ecology",
  "spall_fluid",
  "spall_jobs",
  "spall_mesh",
@@ -2996,6 +2997,8 @@ name = "spall_ecology"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "postcard",
+ "serde",
  "spall_core",
  "spall_voxel",
  "spall_worldgen",
@@ -3125,6 +3128,7 @@ dependencies = [
  "serde_json",
  "spall_client",
  "spall_core",
+ "spall_ecology",
  "spall_fluid",
  "spall_jobs",
  "spall_net",
@@ -3147,12 +3151,14 @@ dependencies = [
  "serde",
  "serde_json",
  "spall_core",
+ "spall_ecology",
  "spall_fluid",
  "spall_jobs",
  "spall_physics",
  "spall_protocol",
  "spall_structure",
  "spall_voxel",
+ "spall_worldgen",
  "thiserror 2.0.20",
 ]
 

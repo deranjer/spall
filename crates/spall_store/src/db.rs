@@ -380,6 +380,11 @@ impl Writer {
             });
         }
 
+        if checkpoint.vegetation.len() > 16 * 1024 * 1024 {
+            return Err(StoreError::Corrupt(
+                "vegetation checkpoint byte limit".into(),
+            ));
+        }
         let meta_blob = dto::encode(&checkpoint.meta)?;
         spall_protocol::water::validate_water_states(&checkpoint.water)
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
@@ -427,6 +432,15 @@ impl Writer {
                 ],
             )?;
             payload_bytes += water_blob.len() as u64;
+            tx.execute(
+                "INSERT OR REPLACE INTO checkpoint_vegetation (tick,state,crc) VALUES (?,?,?)",
+                params![
+                    checkpoint.tick as i64,
+                    &checkpoint.vegetation,
+                    crc16(&checkpoint.vegetation).as_slice()
+                ],
+            )?;
+            payload_bytes += checkpoint.vegetation.len() as u64;
             tx.execute(
                 "DELETE FROM checkpoint_bodies WHERE tick = ?",
                 params![checkpoint.tick as i64],

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+spall_ecology.workspace = true
 spall_core = { path = "../spall_core" }
 spall_protocol = { path = "../spall_protocol" }
 spall_net = { path = "../spall_net" }

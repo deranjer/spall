@@ -331,6 +331,7 @@ fn body_pos(sim: &Simulation, entity: spall_core::EntityId) -> DVec3 {
 fn dummy_checkpoint(tick: u64, cursor: u64) -> Checkpoint {
     use spall_store::{STORE_SCHEMA_VERSION, StoredWorldMeta};
     Checkpoint {
+        vegetation: Vec::new(),
         tick,
         journal_cursor: cursor,
         world_hash: [0; 32],

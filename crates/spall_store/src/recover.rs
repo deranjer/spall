@@ -286,6 +286,7 @@ fn load_checkpoint(conn: &Connection, tick: i64) -> Result<Checkpoint, StoreErro
     };
 
     Ok(Checkpoint {
+        vegetation: load_vegetation(conn, tick)?,
         water: load_water(conn, tick)?,
         tick: tick as u64,
         journal_cursor: journal_cursor as u64,
@@ -325,4 +326,33 @@ fn load_water(conn: &Connection, tick: i64) -> Result<Vec<spall_protocol::WaterS
     spall_protocol::water::validate_water_states(&water)
         .map_err(|e| StoreError::Corrupt(e.to_string()))?;
     Ok(water)
+}
+
+fn load_vegetation(conn: &Connection, tick: i64) -> Result<Vec<u8>, StoreError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'checkpoint_vegetation')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let row: Option<(Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT state,crc FROM checkpoint_vegetation WHERE tick=?",
+            [tick],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((bytes, crc)) = row else {
+        return Err(StoreError::Corrupt(
+            "vegetation checkpoint row missing".into(),
+        ));
+    };
+    if bytes.len() > 16 * 1024 * 1024 || crc.as_slice() != crc16(&bytes).as_slice() {
+        return Err(StoreError::Corrupt(
+            "vegetation checkpoint checksum/limit".into(),
+        ));
+    }
+    Ok(bytes)
 }

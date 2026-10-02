@@ -41,6 +41,7 @@ pub enum WireRecord {
     ProgressionResponse(ProgressionResponse),
     WaterSnapshot(WaterSnapshot),
     WaterDelta(spall_protocol::WaterDelta),
+    VegetationSnapshot(spall_protocol::vegetation::VegetationSnapshot),
     AdminRequest(AdminRequest),
     AdminStatus(AdminStatus),
 }
@@ -63,6 +64,7 @@ impl WireRecord {
             Self::ProgressionResponse(_) => WireTag::ProgressionResponse,
             Self::WaterSnapshot(_) => WireTag::WaterSnapshot,
             Self::WaterDelta(_) => WireTag::WaterDelta,
+            Self::VegetationSnapshot(_) => WireTag::VegetationSnapshot,
             Self::AdminRequest(_) => WireTag::AdminRequest,
             Self::AdminStatus(_) => WireTag::AdminStatus,
         }
@@ -86,6 +88,7 @@ impl WireRecord {
             Self::ProgressionResponse(r) => encode_control(r),
             Self::WaterSnapshot(r) => encode_control(r),
             Self::WaterDelta(r) => encode_control(r),
+            Self::VegetationSnapshot(r) => encode_control(r),
             Self::AdminRequest(r) => encode_control(r),
             Self::AdminStatus(r) => encode_control(r),
         }
@@ -118,6 +121,7 @@ impl WireRecord {
             WireTag::ProgressionResponse => Self::ProgressionResponse(decode_control(bytes)?),
             WireTag::WaterSnapshot => Self::WaterSnapshot(decode_control(bytes)?),
             WireTag::WaterDelta => Self::WaterDelta(decode_control(bytes)?),
+            WireTag::VegetationSnapshot => Self::VegetationSnapshot(decode_control(bytes)?),
             WireTag::AdminRequest => Self::AdminRequest(decode_control(bytes)?),
             WireTag::AdminStatus => Self::AdminStatus(decode_control(bytes)?),
             WireTag::InputFrame | WireTag::MotionSnapshot => {

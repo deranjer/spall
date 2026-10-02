@@ -363,6 +363,9 @@ pub struct ClientSummary {
     /// T17: hash-repair baseline patches applied mid-session.
     pub repairs_applied: u64,
     /// ENG-105: complete water keyframes received and decoded.
+    pub vegetation_keyframes_received: u64,
+    pub vegetation_plants_received: u64,
+    pub vegetation_season_received: u64,
     pub water_keyframes_received: u64,
     pub water_delta_frames_received: u64,
     pub water_regions_received: u64,
@@ -560,6 +563,9 @@ struct Counters {
     /// Giant bulk-split `BaselineWorld`s received and applied mid-session
     /// (T17 increment 2).
     bulk_splits: AtomicU64,
+    vegetation_keyframes: AtomicU64,
+    vegetation_plants: AtomicU64,
+    vegetation_season: AtomicU64,
     water_keyframes: AtomicU64,
     water_delta_frames: AtomicU64,
     water_regions: AtomicU64,
@@ -923,6 +929,7 @@ impl Predictor {
 /// past readability.
 #[derive(Debug, Clone, Copy, Default)]
 struct CorrectionStats {
+    presentation_correction_total: [f64; 3],
     corrections: u64,
     max_correction_m: f64,
     idle_corrections: u64,
@@ -1231,12 +1238,43 @@ async fn run_async(
         let interactive = config.interactive.clone();
         let admin_statuses = admin_statuses.clone();
         tokio::spawn(async move {
+            let mut vegetation_floor = 0_u64;
+            let mut vegetation = spall_protocol::vegetation::VegetationAssembler::default();
             let mut water =
                 HashMap::<spall_core::GlobalCell, spall_protocol::WaterAssembler>::new();
             let mut water_deltas =
                 HashMap::<spall_core::GlobalCell, spall_protocol::WaterDeltaAssembler>::new();
             loop {
                 match conn.recv_record().await {
+                    Ok(Some(WireRecord::VegetationSnapshot(chunk))) => {
+                        if chunk.tick < vegetation_floor {
+                            continue;
+                        }
+                        match vegetation.push(chunk).and_then(|b| {
+                            b.map(|bytes| spall_ecology::living::VisualFrame::decode(&bytes))
+                                .transpose()
+                        }) {
+                            Ok(Some(frame)) => {
+                                counters
+                                    .vegetation_keyframes
+                                    .fetch_add(1, Ordering::Relaxed);
+                                counters
+                                    .vegetation_plants
+                                    .store(frame.plants.len() as u64, Ordering::Relaxed);
+                                counters
+                                    .vegetation_season
+                                    .store(frame.season as u64, Ordering::Relaxed);
+                                if let Some(session) = &interactive {
+                                    *session.vegetation.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(Arc::new(frame));
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                eprintln!("spall-client: rejected vegetation frame: {error}")
+                            }
+                        }
+                    }
                     Ok(Some(WireRecord::WaterSnapshot(chunk))) => {
                         match if water.len() >= 8 && !water.contains_key(&chunk.origin) {
                             Err(spall_protocol::WaterCodecError::InvalidChunk(
@@ -1246,6 +1284,23 @@ async fn run_async(
                             water.entry(chunk.origin).or_default().push(chunk)
                         } {
                             Ok(Some(frame)) => {
+                                // A region that grew may have moved its origin
+                                // (ENG-120): drop any other region this frame
+                                // overlaps, or its stale water would stay drawn.
+                                let superseded: Vec<_> = water_deltas
+                                    .iter()
+                                    .filter(|(origin, assembler)| {
+                                        **origin != frame.origin
+                                            && assembler.current().is_some_and(|old| {
+                                                frame.overlaps(old.origin, old.dimensions)
+                                            })
+                                    })
+                                    .map(|(origin, _)| *origin)
+                                    .collect();
+                                for origin in &superseded {
+                                    water_deltas.remove(origin);
+                                    water.remove(origin);
+                                }
                                 water_deltas
                                     .entry(frame.origin)
                                     .or_default()
@@ -1322,10 +1377,15 @@ async fn run_async(
                         // the old world standing, which would silently diverge
                         // from the server, so it ends the session instead.
                         let installed = match receive_baseline_body(&conn).await {
-                            Some(world) => replica
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .install_baseline_world(&world),
+                            Some(world) => {
+                                vegetation_floor = world.checkpoint_tick;
+                                vegetation =
+                                    spall_protocol::vegetation::VegetationAssembler::default();
+                                replica
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .install_baseline_world(&world)
+                            }
                             None => Err("reset baseline failed to assemble / verify".into()),
                         };
                         match installed {
@@ -2133,6 +2193,7 @@ async fn run_async(
                     let predicted_state = p.player.as_ref().map(PredictedPlayer::predicted);
                     let feet = predicted_state.map(|st| st.position_m);
                     let correction_stats = p.player.as_ref().map(|pl| CorrectionStats {
+                        presentation_correction_total: pl.presentation_correction_total,
                         corrections: pl.corrections,
                         max_correction_m: pl.max_correction_m,
                         idle_corrections: pl.idle_corrections,
@@ -2167,6 +2228,7 @@ async fn run_async(
                         _ => (predicted, std::time::Instant::now()),
                     };
                     *slot = Some(InteractiveView {
+                            presentation_correction_total: stats.presentation_correction_total,
                             predicted,
                             server_tick: tick,
                             published_at,
@@ -2502,6 +2564,9 @@ async fn run_async(
         late_join: config.late_join,
         baseline_bricks,
         repairs_applied: counters.patches.load(Ordering::Relaxed),
+        vegetation_keyframes_received: counters.vegetation_keyframes.load(Ordering::Relaxed),
+        vegetation_plants_received: counters.vegetation_plants.load(Ordering::Relaxed),
+        vegetation_season_received: counters.vegetation_season.load(Ordering::Relaxed),
         water_keyframes_received: counters.water_keyframes.load(Ordering::Relaxed),
         water_delta_frames_received: counters.water_delta_frames.load(Ordering::Relaxed),
         water_regions_received: counters.water_regions.load(Ordering::Relaxed),

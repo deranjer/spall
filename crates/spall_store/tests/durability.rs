@@ -64,6 +64,30 @@ struct Scratch {
     dir: PathBuf,
 }
 
+#[test]
+fn legacy_schema_two_vegetation_backfill_preserves_world_and_detects_missing_rows() {
+    let scratch = Scratch::new("vegetation-upgrade");
+    let cp = checkpoint(0, 0);
+    let mut writer = Writer::open(scratch.db()).unwrap();
+    writer.publish_checkpoint(&cp).unwrap();
+    drop(writer);
+    let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+    conn.execute_batch("DROP TABLE checkpoint_vegetation;")
+        .unwrap();
+    drop(conn);
+    // Read-only recovery of an old save does not rewrite the world.
+    assert_eq!(recover(scratch.db()).unwrap().checkpoint, cp);
+    // Opening the writer atomically installs empty rows for old checkpoints.
+    drop(Writer::open(scratch.db()).unwrap());
+    assert_eq!(recover(scratch.db()).unwrap().checkpoint, cp);
+    let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+    conn.execute("DELETE FROM checkpoint_vegetation", [])
+        .unwrap();
+    drop(conn);
+    drop(Writer::open(scratch.db()).unwrap());
+    assert!(recover(scratch.db()).is_err());
+}
+
 impl Scratch {
     fn new(tag: &str) -> Self {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -116,6 +140,7 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
     let mut m = meta();
     m.next_journal_seq = cursor + 1;
     Checkpoint {
+        vegetation: Vec::new(),
         tick,
         journal_cursor: cursor,
         world_hash: [tick as u8; 32],

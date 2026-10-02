@@ -24,7 +24,7 @@ use crate::contact_damage::{ContactDamagePlan, ContactDamagePolicy, ContactEvent
 use crate::dormancy::{ActiveRegion, BodyDormancyInput, DormancyPlan, DormancyPolicy};
 use crate::intent::{EditIntent, EditKind, EditTarget, IntentError};
 use crate::journal::JournalSink;
-use crate::player::transaction_world_box;
+use crate::player::{transaction_world_box, transaction_world_boxes};
 use crate::schedule::{EditPipeline, TickReport};
 use crate::world::{SimWorld, TerrainColliderMode, WorldSetup};
 use spall_voxel::Sample;
@@ -69,6 +69,7 @@ pub struct SimulationConfig {
     /// Optional bounded, fully resident authoritative fluid region. `None`
     /// preserves non-fluid fixtures and existing worlds.
     pub water: Option<crate::water::WaterSetup>,
+    pub vegetation: Option<spall_ecology::living::LivingState>,
 }
 
 impl SimulationConfig {
@@ -84,6 +85,7 @@ impl SimulationConfig {
             max_pending_intents: Self::DEFAULT_MAX_PENDING_INTENTS,
             serialize_threshold: Self::DEFAULT_SERIALIZE_THRESHOLD,
             water: None,
+            vegetation: None,
         }
     }
 }
@@ -114,14 +116,15 @@ pub struct ContactDamageReport {
 
 /// The authoritative simulation.
 pub struct Simulation {
-    world: SimWorld,
+    pub(crate) world: SimWorld,
     pipeline: EditPipeline,
     journal: JournalSink,
-    tick: Tick,
+    pub(crate) tick: Tick,
     next_control_seq: u64,
     next_damage_seq: u64,
     water: Option<crate::water::AuthoritativeWater>,
     additional_water: Vec<crate::water::AuthoritativeWater>,
+    pub(crate) vegetation: Option<crate::vegetation::AuthoritativeVegetation>,
 }
 
 impl Simulation {
@@ -136,6 +139,7 @@ impl Simulation {
         physics_origin: PhysicsOrigin,
     ) -> Result<Self, crate::world::WorldError> {
         let water_setup = config.water;
+        let vegetation_setup = config.vegetation;
         let world = SimWorld::new_with_terrain_collider_mode_and_origin(
             config.world,
             config.terrain_collider_mode,
@@ -149,6 +153,7 @@ impl Simulation {
             next_control_seq: 1,
             next_damage_seq: 0,
             water: None,
+            vegetation: None,
             additional_water: Vec::new(),
         };
         if let Some(setup) = water_setup {
@@ -160,6 +165,11 @@ impl Simulation {
             );
         }
         simulation.pipeline.warm_labels(&simulation.world);
+        if let Some(state) = vegetation_setup {
+            simulation
+                .install_vegetation(state)
+                .map_err(crate::world::WorldError::VegetationInitialization)?;
+        }
         Ok(simulation)
     }
 
@@ -182,6 +192,7 @@ impl Simulation {
             // Canonical fluid state is added to checkpoints in ENG-105
             // increment 3; recovered simulations do not claim water yet.
             water: None,
+            vegetation: None,
             additional_water: Vec::new(),
         };
         simulation.pipeline.warm_labels(&simulation.world);
@@ -206,6 +217,7 @@ impl Simulation {
             pipeline,
             water,
             additional_water,
+            vegetation,
             ..
         } = fresh;
         let (f_entity, f_volume, f_transaction, f_journal_seq) = world.registry().counters();
@@ -219,6 +231,7 @@ impl Simulation {
         self.pipeline = pipeline;
         self.water = water;
         self.additional_water = additional_water;
+        self.vegetation = vegetation;
         Ok(())
     }
 
@@ -257,6 +270,72 @@ impl Simulation {
             self.additional_water.push(water);
         }
         Ok(())
+    }
+
+    /// ENG-120: grows each region whose [`crate::WaterGrowth`] policy asks for
+    /// it, after this tick's terrain commits and before the water step. The
+    /// replacement is built from the owner's committed state; a refusal (cap,
+    /// overlap, residency, world edge) or build failure leaves the region as it
+    /// was and is counted, never fatal to the tick.
+    fn grow_water_regions(&mut self, report: &TickReport) {
+        if self.water.is_none() && self.additional_water.is_empty() {
+            return;
+        }
+        let terrain_id = self.world.terrain_volume_id();
+        let cell_m = self.world.terrain().cell_size().metres();
+        let boxes: Vec<crate::CellBox> = report
+            .committed
+            .iter()
+            .flat_map(|(_, c)| transaction_world_boxes(&c.topology, terrain_id, cell_m))
+            .map(|(lo, hi)| {
+                (
+                    lo.map(|v| (v / cell_m).floor() as i64),
+                    hi.map(|v| (v / cell_m).ceil() as i64 - 1),
+                )
+            })
+            .collect();
+        if boxes.is_empty() {
+            return;
+        }
+        let mut domains: Vec<spall_fluid::DomainSpec> =
+            self.water_regions().map(|w| w.domain()).collect();
+        let terrain = &self.world.terrain().volume;
+        for (index, water) in self
+            .water
+            .iter_mut()
+            .chain(self.additional_water.iter_mut())
+            .enumerate()
+        {
+            let others: Vec<_> = domains
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index)
+                .map(|(_, d)| *d)
+                .collect();
+            match water.plan_growth(terrain, &boxes, &others) {
+                crate::GrowthPlan::NotNeeded => {}
+                crate::GrowthPlan::Refused(_) => water.note_growth_refused(),
+                crate::GrowthPlan::Grow(domain) => match water.grown(terrain, domain) {
+                    Ok(grown) => {
+                        domains[index] = grown.domain();
+                        *water = grown;
+                    }
+                    Err(_) => water.note_growth_refused(),
+                },
+            }
+        }
+    }
+
+    /// Sets the growth policy of every region (see [`crate::WaterGrowth`]).
+    /// Recovery does not persist it: the owning scene reapplies it.
+    pub fn set_water_growth(&mut self, growth: Option<crate::WaterGrowth>) {
+        for water in self
+            .water
+            .iter_mut()
+            .chain(self.additional_water.iter_mut())
+        {
+            water.set_growth(growth);
+        }
     }
 
     fn validate_water_region(
@@ -510,6 +589,7 @@ impl Simulation {
                     .map(|b| b.coord)
             })
             .collect();
+        self.grow_water_regions(&report);
         if let Some(water) = &mut self.water {
             let dirty = edited_terrain_bricks
                 .iter()
@@ -530,6 +610,7 @@ impl Simulation {
                     .map_err(|e| TickError::Water(e.to_string()))?,
             );
         }
+        self.advance_vegetation(&report)?;
         let physics_started = std::time::Instant::now();
         self.world.step_physics();
         let physics_duration = physics_started.elapsed();

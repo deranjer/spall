@@ -46,7 +46,7 @@ pub use game_renderer::{GamePassTimings, GameRenderer};
 pub use indirect::{
     LIGHT_CELL_SIZE_METRES, LIGHT_VOLUME_DIM, LightingRegion, LightingUpdate, LightingVolume,
 };
-pub use instances::{CubeInstance, CubeVertex, InstanceSet};
+pub use instances::{CubeInstance, CubeVertex, InstanceSet, compact_vegetation_instances};
 pub use pipeline::{
     CASCADE_COUNT, DebugView, MAX_POINT_LIGHTS, PassTiming, PointLight, ScenePipeline,
 };

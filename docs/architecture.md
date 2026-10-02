@@ -355,3 +355,8 @@ tracks the highest session generation per connection slot, and an
 the bulk transfer before touching the replication stream and applies a
 mid-session `BaselineBegin` as a repair patch. No new external dependency; no
 change to the frozen wire record set (the sentinel reuses `BaselineAck`).
+
+
+### ENG-118 implemented vegetation ownership
+
+The sandbox worldgen factory adds game-authored procedural vegetation after base terrain generation, before authoritative collision/world creation. CPU-only spall_ecology::living owns stable-ID plants, biome/soil eligibility, retained connected wood paths and a plant season clock. Simulation owns it; growth is acknowledged only through the normal edit pipeline. Wood remains ordinary destructible terrain/body cells. Non-solid leaf/ground geometry is derived from server keyframes and shares opaque lighting/shadows. Atomic persistence includes full state after topology plus small clock rows. No hidden supports, per-voxel entities or alternate physics. Rules, budgets and remaining global-season/moisture work: docs/reports/ENG-118-vegetation.md.

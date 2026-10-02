@@ -1,0 +1,56 @@
+[
+  {
+    "ecology_ms": 0,
+    "frame": "seedling",
+    "instances": 270,
+    "message": "Showcase ready",
+    "plants": 1,
+    "seeds": 0,
+    "wood_cells": 0
+  },
+  {
+    "ecology_ms": 3000,
+    "frame": "juvenile",
+    "instances": 472,
+    "message": "Tree grew 5 connected 25 cm wood cells",
+    "plants": 1,
+    "seeds": 0,
+    "wood_cells": 15
+  },
+  {
+    "ecology_ms": 12000,
+    "frame": "mature",
+    "instances": 800,
+    "message": "Tree grew 5 connected 25 cm wood cells",
+    "plants": 3,
+    "seeds": 0,
+    "wood_cells": 52
+  },
+  {
+    "ecology_ms": 30000,
+    "frame": "dispersal",
+    "instances": 3842,
+    "message": "Tree grew 5 connected 25 cm wood cells",
+    "plants": 8,
+    "seeds": 11,
+    "wood_cells": 285
+  },
+  {
+    "ecology_ms": 30000,
+    "frame": "branch-cut",
+    "instances": 3739,
+    "message": "Branch cut; removed branch stays removed",
+    "plants": 8,
+    "seeds": 11,
+    "wood_cells": 285
+  },
+  {
+    "ecology_ms": 30000,
+    "frame": "root-cut",
+    "instances": 3337,
+    "message": "Root destroyed; this tree stops growing and seeding",
+    "plants": 8,
+    "seeds": 11,
+    "wood_cells": 285
+  }
+]

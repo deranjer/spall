@@ -17,6 +17,12 @@ struct Args {
     /// debug simulation is separate from the authoritative game tick.
     #[arg(long, conflicts_with_all = ["offline", "connect", "interactive"])]
     grid_fluid_demo: bool,
+    /// Open the client-local interactive ecology growth showcase.
+    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "grid_fluid_demo"])]
+    ecology_demo: bool,
+    /// Save a bounded sequence from the ecology showcase through the real renderer.
+    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "grid_fluid_demo", "ecology_demo"])]
+    ecology_capture: Option<PathBuf>,
     /// T00 offline render host (no transport).
     #[arg(long)]
     offline: bool,
@@ -328,6 +334,22 @@ fn main() -> ExitCode {
         };
     }
 
+    if let Some(output) = &args.ecology_capture {
+        return match spall_client::ecology_demo::capture_ecology_demo(
+            sandbox::ecology_scene::setup(),
+            output,
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("ecology capture: {error}");
+                ExitCode::from(3)
+            }
+        };
+    }
+    if args.ecology_demo {
+        return run_ecology_demo();
+    }
+
     if args.connect.is_some() && args.interactive {
         return run_interactive(args);
     }
@@ -354,6 +376,21 @@ fn main() -> ExitCode {
         }
         Err(error) => {
             eprintln!("sandbox-client: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_ecology_demo() -> ExitCode {
+    let setup = sandbox::ecology_scene::setup();
+    match spall_client::run_ecology_demo_window(setup) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error @ spall_client::ClientError::Gpu(_)) => {
+            eprintln!("sandbox-client ecology demo: {error}");
+            ExitCode::from(3)
+        }
+        Err(error) => {
+            eprintln!("sandbox-client ecology demo: {error}");
             ExitCode::from(1)
         }
     }

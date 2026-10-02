@@ -13,7 +13,7 @@ use spall_worldgen::{Biome, ColumnMap};
 use thiserror::Error;
 
 pub const ECOLOGY_STATE_VERSION: u16 = 1;
-pub const ECOLOGY_PLAN_VERSION: u16 = 1;
+pub const ECOLOGY_PLAN_VERSION: u16 = 2;
 pub const SPECIES_DEFINITION_VERSION: u16 = 1;
 pub const MAX_PATCHES: usize = 65_536;
 pub const MAX_PLANTS: usize = 16_384;
@@ -326,28 +326,75 @@ pub fn initial_placement(
         {
             continue;
         }
-        let id = allocate_id(state);
-        let skeleton = tree_skeleton(root);
-        state.plants.insert(
-            id,
-            Plant {
-                id,
-                species: species.id,
-                root,
-                stage: PlantStage::Seedling,
-                age_ms: 0,
-                health: u16::MAX,
-                root_alive: true,
-                skeleton,
-                committed_cells: 0,
-                growth_credit_ms: 0,
-                last_seed_ms: 0,
-            },
+        placed += usize::from(
+            place_tree(state, terrain, species, moisture, placement.ecology, root).is_some(),
         );
-        placed += 1;
     }
     state.rng_progress = state.rng_progress.wrapping_add(candidate_count as u64);
     placed
+}
+
+/// Establish a plant on current, known soil. Root is the first air cell above
+/// the soil, not the soil cell itself. Returns None for unsuitable habitat.
+pub fn place_tree(
+    state: &mut EcologyState,
+    terrain: &Volume,
+    species: SpeciesDefinition,
+    inputs: &EcologyInputs,
+    config: EcologyConfig,
+    root: GlobalCell,
+) -> Option<u64> {
+    let soil = GlobalCell::new(root.x, root.y - 1, root.z);
+    if species.version != SPECIES_DEFINITION_VERSION
+        || species.cell_growth_ms == 0
+        || state.plants.len() >= config.max_plants.min(MAX_PLANTS)
+        || config.bounds.is_some_and(|b| !within(root, b))
+        || !inputs.unloaded_regions.is_empty()
+        || !matches!(terrain.sample(soil), Ok(Sample::Filled(m)) if species.accepts_soil(m))
+        || inputs
+            .moisture
+            .get(&soil)
+            .is_none_or(|m| *m < species.min_moisture || *m > species.max_moisture)
+        || !clear_above(terrain, root, 16)
+        || (0..16).any(|dy| {
+            inputs
+                .prohibited
+                .contains(&GlobalCell::new(root.x, root.y + dy, root.z))
+        })
+        || !clear_spacing(state, root, species.min_spacing_cells)
+        || sky_exposure(terrain, root, 64, None).is_none_or(|n| n < species.min_sky_exposure)
+    {
+        return None;
+    }
+    let skeleton = tree_skeleton(root);
+    if state
+        .plants
+        .values()
+        .map(|p| p.skeleton.len())
+        .sum::<usize>()
+        + skeleton.len()
+        > MAX_TOTAL_SKELETON_CELLS
+    {
+        return None;
+    }
+    let id = allocate_id(state);
+    state.plants.insert(
+        id,
+        Plant {
+            id,
+            species: species.id,
+            root,
+            stage: PlantStage::Seedling,
+            age_ms: 0,
+            health: u16::MAX,
+            root_alive: true,
+            skeleton,
+            committed_cells: 0,
+            growth_credit_ms: 0,
+            last_seed_ms: 0,
+        },
+    );
+    Some(id)
 }
 
 pub fn place_grass_patch(
@@ -478,6 +525,17 @@ pub fn update(
         };
         let soil = GlobalCell::new(plant.root.x, plant.root.y - 1, plant.root.z);
         let mut terrain_reads = BTreeSet::from([soil.split().0]);
+        if plant.committed_cells > 0
+            && !matches!(terrain.sample(plant.root), Ok(Sample::Filled(m)) if m == def.wood)
+        {
+            if matches!(terrain.sample(plant.root), Ok(Sample::Unknown(_))) {
+                report.suspended_unknown += 1;
+                deferred.push_back(id);
+                continue;
+            }
+            plant.root_alive = false;
+            plant.health = 0;
+        }
         if !plant.root_alive {
             plant.health = plant.health.saturating_sub(1);
             report.processed += 1;
@@ -522,7 +580,13 @@ pub fn update(
         }
         plant.age_ms = plant.age_ms.saturating_add(advance);
         plant.growth_credit_ms = plant.growth_credit_ms.saturating_add(advance);
-        if plant.age_ms >= def.seedling_ms.saturating_add(def.juvenile_ms) {
+        if plant.age_ms >= def.seedling_ms.saturating_add(def.juvenile_ms)
+            && plant
+                .skeleton
+                .iter()
+                .skip(plant.committed_cells as usize)
+                .all(|c| c.removed)
+        {
             plant.stage = PlantStage::Mature
         } else if plant.age_ms >= def.seedling_ms {
             plant.stage = PlantStage::Juvenile
@@ -564,6 +628,31 @@ pub fn update(
                     }
                     continue;
                 }
+                if plant.skeleton[idx].removed {
+                    continue;
+                }
+                if let Some(parent) = plant.skeleton[idx].parent {
+                    let parent_cell = plant.skeleton[parent as usize].cell;
+                    let parent_brick = parent_cell.split().0;
+                    deps.insert(
+                        parent_brick,
+                        terrain.brick_revision(parent_brick).ok().flatten(),
+                    );
+                    if !cells.iter().any(|(c, _)| *c == parent_cell) {
+                        match terrain.sample(parent_cell) {
+                            Ok(Sample::Filled(m)) if m == def.wood => {}
+                            Ok(Sample::Unknown(_)) => {
+                                valid = false;
+                                report.suspended_unknown += 1;
+                                break;
+                            }
+                            _ => {
+                                mark_subtree_removed(&mut plant.skeleton, idx);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 match terrain.sample(cell) {
                     Ok(Sample::Empty { .. }) => cells.push((cell, def.wood)),
                     Ok(Sample::Unknown(_)) => {
@@ -584,7 +673,13 @@ pub fn update(
                 deps.insert(brick, terrain.brick_revision(brick).ok().flatten());
             }
             if valid && !cells.is_empty() {
-                let next = selected_end(&plant.skeleton, plant.committed_cells as usize, count);
+                let last_cell = cells.last().expect("nonempty accepted growth").0;
+                let next = plant
+                    .skeleton
+                    .iter()
+                    .position(|c| c.cell == last_cell)
+                    .expect("proposal cell belongs to skeleton") as u32
+                    + 1;
                 let required_growth_ms = (cells.len() as u64).saturating_mul(def.cell_growth_ms);
                 proposals.push(WoodProposal {
                     id: proposal_id(id, plant.committed_cells, target),
@@ -615,7 +710,25 @@ pub fn update(
         }
         report.processed += 1;
     }
-    for (species, cell, lifetime) in seed_deposits {
+    for (species, candidate, lifetime) in seed_deposits {
+        // Seeds settle on the first known surface, never float at the parent height
+        // or tunnel through a rock roof to reach buried soil.
+        let (Some(cell), _) = surface_root(terrain, candidate, config.bounds) else {
+            continue;
+        };
+        let Some(def) = definitions.get(&species) else {
+            continue;
+        };
+        let soil = GlobalCell::new(cell.x, cell.y - 1, cell.z);
+        if !matches!(terrain.sample(soil), Ok(Sample::Filled(m)) if def.accepts_soil(m))
+            || inputs.prohibited.contains(&cell)
+            || inputs
+                .moisture
+                .get(&soil)
+                .is_none_or(|m| *m < def.min_moisture || *m > def.max_moisture)
+        {
+            continue;
+        }
         if state.seeds.len() >= config.max_seed_records {
             break;
         }
@@ -711,50 +824,68 @@ fn germination_root(
     seed: &SeedRecord,
     species: SpeciesDefinition,
 ) -> (Option<GlobalCell>, bool) {
-    let mut unknown = false;
-    for dy in -32..=32 {
-        let Some(y) = seed.cell.y.checked_add(dy) else {
-            continue;
-        };
-        let soil = GlobalCell::new(seed.cell.x, y, seed.cell.z);
-        let material = match terrain.sample(soil) {
-            Ok(Sample::Filled(m)) => m,
-            Ok(Sample::Unknown(_)) => {
-                unknown = true;
-                continue;
+    let (root, unknown) = surface_root(terrain, seed.cell, config.bounds);
+    let Some(root) = root else {
+        return (None, unknown);
+    };
+    let soil = GlobalCell::new(root.x, root.y - 1, root.z);
+    if !matches!(terrain.sample(soil), Ok(Sample::Filled(m)) if species.accepts_soil(m))
+        || inputs
+            .moisture
+            .get(&soil)
+            .is_none_or(|m| *m < species.min_moisture || *m > species.max_moisture)
+        || !clear_above(terrain, root, 16)
+        || (0..16).any(|dy| {
+            inputs
+                .prohibited
+                .contains(&GlobalCell::new(root.x, root.y + dy, root.z))
+        })
+        || !clear_spacing(state, root, species.min_spacing_cells)
+    {
+        return (None, unknown);
+    }
+    match sky_exposure(terrain, root, 64, None) {
+        Some(n) if n >= species.min_sky_exposure => (Some(root), unknown),
+        None => (None, true),
+        _ => (None, unknown),
+    }
+}
+
+/// Resolve a deposited seed to the first exposed solid surface within 8 m
+/// above/below its reference height. Unknown residency suspends the query.
+/// This queries current voxel occupancy, never an old worldgen heightmap.
+pub fn surface_root(
+    terrain: &Volume,
+    reference: GlobalCell,
+    bounds: Option<(GlobalCell, GlobalCell)>,
+) -> (Option<GlobalCell>, bool) {
+    let mut top = reference.y.saturating_add(32);
+    let mut bottom = reference.y.saturating_sub(32);
+    if let Some((lo, hi)) = bounds {
+        if reference.x < lo.x || reference.x > hi.x || reference.z < lo.z || reference.z > hi.z {
+            return (None, false);
+        }
+        top = top.min(hi.y);
+        bottom = bottom.max(lo.y);
+    }
+    for y in (bottom..=top).rev() {
+        let at = GlobalCell::new(reference.x, y, reference.z);
+        match terrain.sample(at) {
+            Ok(Sample::Filled(_)) => {
+                let root = GlobalCell::new(at.x, y.saturating_add(1), at.z);
+                return match terrain.sample(root) {
+                    Ok(Sample::Empty { .. }) if bounds.is_none_or(|b| within(root, b)) => {
+                        (Some(root), false)
+                    }
+                    Ok(Sample::Unknown(_)) => (None, true),
+                    _ => (None, false),
+                };
             }
-            _ => continue,
-        };
-        if !species.accepts_soil(material) {
-            continue;
-        }
-        let Some(moisture) = inputs.moisture.get(&soil) else {
-            unknown = true;
-            continue;
-        };
-        if *moisture < species.min_moisture || *moisture > species.max_moisture {
-            continue;
-        }
-        let Some(root_y) = soil.y.checked_add(1) else {
-            continue;
-        };
-        let root = GlobalCell::new(soil.x, root_y, soil.z);
-        if config.bounds.is_some_and(|b| !within(root, b))
-            || inputs.prohibited.contains(&root)
-            || !clear_above(terrain, root, 8)
-        {
-            continue;
-        }
-        if !clear_spacing(state, root, species.min_spacing_cells) {
-            continue;
-        }
-        match sky_exposure(terrain, root, 64, None) {
-            Some(n) if n >= species.min_sky_exposure => return (Some(root), unknown),
-            None => unknown = true,
-            _ => {}
+            Ok(Sample::Empty { .. }) => {}
+            _ => return (None, true),
         }
     }
-    (None, unknown)
+    (None, false)
 }
 
 fn decrement_region(state: &mut EcologyState, seed: &SeedRecord) {
@@ -1040,40 +1171,39 @@ fn validate_limits(s: &EcologyState) -> Result<(), EcologyError> {
     Ok(())
 }
 fn tree_skeleton(root: GlobalCell) -> Vec<BranchCell> {
+    // Parent-before-child growth order; every link is face-adjacent. Saved
+    // skeletons remain unchanged: this v2 plan affects newly established trees.
     let mut cells = Vec::new();
-    for y in 0..6 {
+    let height = 12 + (mix(root.x as u64 ^ (root.z as u64).rotate_left(23)) % 3) as i64;
+    for y in 0..height {
         cells.push(BranchCell {
             cell: GlobalCell::new(root.x, root.y + y, root.z),
             parent: (y > 0).then_some((y - 1) as u32),
             removed: false,
         });
     }
-    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-        let parent = 4;
-        let first = cells.len() as u32;
-        cells.push(BranchCell {
-            cell: GlobalCell::new(root.x + dx, root.y + 4, root.z + dz),
-            parent: Some(parent),
-            removed: false,
-        });
-        cells.push(BranchCell {
-            cell: GlobalCell::new(root.x + 2 * dx, root.y + 4, root.z + 2 * dz),
-            parent: Some(first),
-            removed: false,
-        });
+    for (arm, (dx, dz)) in [(1, 0), (0, -1), (-1, 0), (0, 1)].into_iter().enumerate() {
+        let fork_y = height - 6 + arm as i64;
+        let mut parent = fork_y as u32;
+        let mut at = GlobalCell::new(root.x, root.y + fork_y, root.z);
+        for step in 0..7 {
+            if step % 3 == 1 {
+                at.y += 1;
+            } else if arm % 2 == 0 {
+                at.x += dx;
+            } else {
+                at.z += dz;
+            }
+            let index = cells.len() as u32;
+            cells.push(BranchCell {
+                cell: at,
+                parent: Some(parent),
+                removed: false,
+            });
+            parent = index;
+        }
     }
     cells
-}
-fn selected_end(skeleton: &[BranchCell], start: usize, count: usize) -> u32 {
-    skeleton
-        .iter()
-        .enumerate()
-        .skip(start)
-        .filter(|(_, c)| !c.removed)
-        .take(count)
-        .map(|(i, _)| i as u32 + 1)
-        .last()
-        .unwrap_or(start as u32)
 }
 fn clear_above(v: &Volume, root: GlobalCell, n: i64) -> bool {
     (0..n).all(|i| {
@@ -1137,7 +1267,7 @@ fn manhattan(a: GlobalCell, b: GlobalCell) -> i64 {
 fn clear_spacing(s: &EcologyState, c: GlobalCell, d: u16) -> bool {
     s.plants
         .values()
-        .all(|p| manhattan(p.root, c) >= i64::from(d))
+        .all(|p| (p.root.x - c.x).pow(2) + (p.root.z - c.z).pow(2) >= i64::from(d).pow(2))
 }
 fn allocate_id(s: &mut EcologyState) -> u64 {
     let id = s.next_id;
@@ -1648,6 +1778,17 @@ mod tests {
                 growth_credit_ms: 0,
             },
         );
+        let skeleton = s.plants[&pid].skeleton.clone();
+        for branch in &skeleton {
+            v.apply_edit(&EditPlan::filled_box(
+                v.id(),
+                branch.cell,
+                branch.cell,
+                species().wood,
+            ))
+            .unwrap();
+        }
+        s.plants.get_mut(&pid).unwrap().committed_cells = skeleton.len() as u32;
         let d = species();
         let mut key = 0;
         while seed_offset(
@@ -1655,7 +1796,7 @@ mod tests {
             d.seed_radius_cells,
             d.min_spacing_cells,
         )
-        .0 < 2
+        .0 < 6
         {
             key += 1;
             s.rng_progress = key;
@@ -1663,9 +1804,15 @@ mod tests {
         let mut defs = BTreeMap::new();
         defs.insert(d.id, d);
         let mut i = EcologyInputs::default();
+        for x in 480..544 {
+            for z in 0..32 {
+                i.moisture.insert(GlobalCell::new(x, 0, z), 100);
+            }
+        }
         i.moisture.insert(GlobalCell::new(root.x, 0, root.z), 100);
         let cfg = EcologyConfig {
             update_interval_ms: 1000,
+            max_plants: 1,
             ..Default::default()
         };
         update(&mut s, &v, &defs, &i, cfg, 1000).unwrap();
@@ -1690,4 +1837,200 @@ mod tests {
         assert!(s.seeds.is_empty());
         assert!(!s.regional_seed_availability.contains_key(&region));
     }
+    #[test]
+    fn seeds_land_on_current_surface_and_never_germinate_through_a_rock_roof() {
+        let mut v = terrain();
+        let at = GlobalCell::new(8, 1, 8);
+        assert_eq!(
+            surface_root(&v, GlobalCell::new(8, 9, 8), None),
+            (Some(at), false)
+        );
+        let roof = GlobalCell::new(8, 12, 8);
+        v.apply_edit(&EditPlan::filled_box(v.id(), roof, roof, MaterialId(9)))
+            .unwrap();
+        let seed = SeedRecord {
+            id: 1,
+            species: SpeciesId(1),
+            cell: at,
+            expires_at_ms: 10_000,
+        };
+        assert_eq!(
+            surface_root(&v, at, None),
+            (Some(GlobalCell::new(8, 13, 8)), false)
+        );
+        assert_eq!(
+            germination_root(
+                &v,
+                &inputs(),
+                EcologyConfig::default(),
+                &EcologyState::default(),
+                &seed,
+                species()
+            )
+            .0,
+            None
+        );
+        v.apply_edit(&EditPlan::filled_box(v.id(), roof, roof, MaterialId::AIR))
+            .unwrap();
+        v.apply_edit(&EditPlan::filled_box(
+            v.id(),
+            GlobalCell::new(8, 0, 8),
+            GlobalCell::new(8, 0, 8),
+            MaterialId::AIR,
+        ))
+        .unwrap();
+        assert_eq!(
+            surface_root(
+                &v,
+                at,
+                Some((GlobalCell::new(0, 0, 0), GlobalCell::new(31, 80, 31)))
+            ),
+            (None, false)
+        );
+    }
+
+    #[test]
+    fn terrain_validated_placement_rejects_air_and_rock_and_spacing_is_horizontal() {
+        let mut v = terrain();
+        let mut s = EcologyState::default();
+        let cfg = EcologyConfig::default();
+        assert!(
+            place_tree(
+                &mut s,
+                &v,
+                species(),
+                &inputs(),
+                cfg,
+                GlobalCell::new(10, 1, 10)
+            )
+            .is_some()
+        );
+        assert!(!clear_spacing(&s, GlobalCell::new(11, 50, 10), 4));
+        assert!(
+            place_tree(
+                &mut s,
+                &v,
+                species(),
+                &inputs(),
+                cfg,
+                GlobalCell::new(18, 2, 10)
+            )
+            .is_none()
+        );
+        v.apply_edit(&EditPlan::filled_box(
+            v.id(),
+            GlobalCell::new(18, 0, 10),
+            GlobalCell::new(18, 0, 10),
+            MaterialId(9),
+        ))
+        .unwrap();
+        assert!(
+            place_tree(
+                &mut s,
+                &v,
+                species(),
+                &inputs(),
+                cfg,
+                GlobalCell::new(18, 1, 10)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn age_alone_cannot_make_an_unbuilt_tree_reproductive() {
+        let v = terrain();
+        let mut s = EcologyState::default();
+        let id = place_tree(
+            &mut s,
+            &v,
+            species(),
+            &inputs(),
+            EcologyConfig::default(),
+            GlobalCell::new(10, 1, 10),
+        )
+        .unwrap();
+        let defs = BTreeMap::from([(SpeciesId(1), species())]);
+        update(
+            &mut s,
+            &v,
+            &defs,
+            &inputs(),
+            EcologyConfig {
+                update_interval_ms: 100,
+                ..Default::default()
+            },
+            10_000,
+        )
+        .unwrap();
+        assert_eq!(s.plants[&id].stage, PlantStage::Juvenile);
+        assert!(s.seeds.is_empty());
+        assert_eq!(s.plants[&id].committed_cells, 0);
+    }
+    #[test]
+    fn obstructed_branch_never_proposes_its_removed_descendants() {
+        let mut v = terrain();
+        let mut s = EcologyState::default();
+        let root = GlobalCell::new(12, 1, 12);
+        let id = place_tree(
+            &mut s,
+            &v,
+            species(),
+            &inputs(),
+            EcologyConfig::default(),
+            root,
+        )
+        .unwrap();
+        let first_side = s.plants[&id]
+            .skeleton
+            .iter()
+            .position(|b| b.cell.x != root.x || b.cell.z != root.z)
+            .unwrap();
+        let obstacle = s.plants[&id].skeleton[first_side].cell;
+        v.apply_edit(&EditPlan::filled_box(
+            v.id(),
+            obstacle,
+            obstacle,
+            MaterialId(9),
+        ))
+        .unwrap();
+        let defs = BTreeMap::from([(SpeciesId(1), species())]);
+        let (_, proposals) = update(
+            &mut s,
+            &v,
+            &defs,
+            &inputs(),
+            EcologyConfig {
+                update_interval_ms: 100,
+                ..Default::default()
+            },
+            5000,
+        )
+        .unwrap();
+        let proposal = &proposals[0];
+        assert!(!proposal.cells.iter().any(|(c, _)| *c == obstacle));
+        for (cell, _) in &proposal.cells {
+            let branch = s.plants[&id]
+                .skeleton
+                .iter()
+                .find(|b| b.cell == *cell)
+                .unwrap();
+            assert!(!branch.removed);
+            if let Some(parent) = branch.parent {
+                let parent_cell = s.plants[&id].skeleton[parent as usize].cell;
+                assert!(
+                    proposal.cells.iter().any(|(c, _)| *c == parent_cell)
+                        || matches!(v.sample(parent_cell), Ok(Sample::Filled(m)) if m == species().wood)
+                );
+            }
+        }
+        let last = proposal.cells.last().unwrap().0;
+        assert_eq!(
+            s.plants[&id].skeleton[proposal.next_committed_cells as usize - 1].cell,
+            last
+        );
+    }
 }
+
+/// Biome-aware authoritative vegetation and seasonal presentation.
+pub mod living;

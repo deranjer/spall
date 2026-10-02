@@ -145,11 +145,31 @@ pub fn transaction_world_box(
     terrain: VolumeId,
     cell_m: f64,
 ) -> Option<([f64; 3], [f64; 3])> {
-    let unit = spall_core::BRUSH_UNIT as f64;
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
     let mut hit = false;
+    for (lo, hi) in transaction_world_boxes(tx, terrain, cell_m) {
+        for i in 0..3 {
+            min[i] = min[i].min(lo[i]);
+            max[i] = max[i].max(hi[i]);
+        }
+        hit = true;
+    }
+    hit.then_some((min, max))
+}
 
+/// One world-space AABB (metres) per terrain-editing op of `tx`: the player's
+/// brush, and each run of cells a split removed. Unlike the union
+/// [`transaction_world_box`], this keeps a collapse far from a brush from
+/// stretching one box across the world (the water domain growth trigger needs
+/// to tell "near this lake" from "somewhere in the arena").
+pub fn transaction_world_boxes(
+    tx: &TopologyTransaction,
+    terrain: VolumeId,
+    cell_m: f64,
+) -> Vec<([f64; 3], [f64; 3])> {
+    let unit = spall_core::BRUSH_UNIT as f64;
+    let mut boxes = Vec::new();
     for op in &tx.ops {
         let (lo, hi) = match op {
             TopologyOp::IntegerBrush { volume, brush, .. } if *volume == terrain => {
@@ -180,14 +200,9 @@ pub fn transaction_world_box(
             ),
             _ => continue,
         };
-        for i in 0..3 {
-            min[i] = min[i].min(lo[i]);
-            max[i] = max[i].max(hi[i]);
-        }
-        hit = true;
+        boxes.push((lo, hi));
     }
-
-    hit.then_some((min, max))
+    boxes
 }
 
 #[cfg(test)]

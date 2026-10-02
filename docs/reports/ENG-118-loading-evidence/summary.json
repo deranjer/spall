@@ -1,0 +1,26 @@
+{
+  "frame_final_20sec_ms": {
+    "n": 2663,
+    "mean": 9.073516334960571,
+    "p95": 11.7,
+    "max": 52.936
+  },
+  "moving_raw_correction_m": {
+    "n": 69,
+    "mean": 0.0012318840579710146,
+    "p95": 0.0,
+    "max": 0.085
+  },
+  "all_raw_reconcile_displacement_m": {
+    "n": 1063,
+    "mean": 0.004242257761053622,
+    "p95": 0.0003,
+    "max": 0.238799
+  },
+  "moving_snapshot_interval_ms": {
+    "n": 69,
+    "mean": 49.53623188405797,
+    "p95": 76,
+    "max": 144
+  }
+}

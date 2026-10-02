@@ -7,6 +7,53 @@
 
 use bytemuck::{Pod, Zeroable};
 
+/// Merge adjacent quarter-metre foliage cells into exact opaque boxes.
+/// Rotated blades and other non-grid details pass through unchanged.
+pub fn compact_vegetation_instances(instances: Vec<CubeInstance>) -> Vec<CubeInstance> {
+    let mut rows = std::collections::BTreeMap::<(u32, i64, i64), Vec<i64>>::new();
+    let mut out = Vec::new();
+    for instance in instances {
+        let cells = instance.offset.map(|v| (v - 0.125) / 0.25);
+        if instance.size == [0.25; 3]
+            && instance.rotation == CubeInstance::IDENTITY_ROTATION
+            && cells
+                .iter()
+                .all(|v| v.is_finite() && v.fract() == 0. && v.abs() < 1_000_000.)
+        {
+            rows.entry((instance.material, cells[2] as i64, cells[1] as i64))
+                .or_default()
+                .push(cells[0] as i64);
+        } else {
+            out.push(instance);
+        }
+    }
+    for ((material, z, y), mut xs) in rows {
+        xs.sort_unstable();
+        xs.dedup();
+        let mut i = 0;
+        while i < xs.len() {
+            let first = xs[i];
+            let mut last = first;
+            i += 1;
+            while i < xs.len() && xs[i] == last + 1 {
+                last = xs[i];
+                i += 1;
+            }
+            out.push(CubeInstance::new(
+                [
+                    (first + last + 1) as f32 * 0.125,
+                    y as f32 * 0.25 + 0.125,
+                    z as f32 * 0.25 + 0.125,
+                ],
+                material,
+                [(last - first + 1) as f32 * 0.25, 0.25, 0.25],
+                CubeInstance::IDENTITY_ROTATION,
+            ));
+        }
+    }
+    out
+}
+
 /// One cube. 48 bytes; `#[repr(C)]` and `Pod` so a slice casts to bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
@@ -210,6 +257,44 @@ impl InstanceSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foliage_compaction_preserves_grid_occupancy_materials_and_rotated_details() {
+        let leaf = |x: f32, material| {
+            CubeInstance::new(
+                [x, 0.125, 0.125],
+                material,
+                [0.25; 3],
+                CubeInstance::IDENTITY_ROTATION,
+            )
+        };
+        let blade = CubeInstance::new([0., 1., 0.], 2, [0.02, 0.4, 0.02], [0., 0., 0.2, 0.98]);
+        let original = vec![
+            leaf(0.125, 1),
+            leaf(0.375, 1),
+            leaf(0.375, 1),
+            leaf(0.625, 2),
+            leaf(1.125, 1),
+            blade,
+        ];
+        let compact = compact_vegetation_instances(original.clone());
+        assert!(compact.contains(&blade));
+        let occupied = |items: &[CubeInstance]| {
+            let mut cells = std::collections::BTreeSet::new();
+            for item in items
+                .iter()
+                .filter(|v| v.rotation == CubeInstance::IDENTITY_ROTATION)
+            {
+                let first = ((item.offset[0] - item.size[0] / 2.) / 0.25).round() as i64;
+                for x in first..first + (item.size[0] / 0.25).round() as i64 {
+                    cells.insert((x, item.material));
+                }
+            }
+            cells
+        };
+        assert_eq!(occupied(&compact), occupied(&original));
+        assert_eq!(compact.len(), 4);
+    }
 
     #[test]
     fn instance_and_vertex_layouts_match_their_rust_structs() {

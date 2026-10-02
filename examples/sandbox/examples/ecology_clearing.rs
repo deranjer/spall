@@ -34,12 +34,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_moisture: 20,
         max_moisture: 220,
         min_sky_exposure: 12,
-        min_spacing_cells: 4,
-        seed_radius_cells: 4,
+        min_spacing_cells: if large { 4 } else { 12 },
+        seed_radius_cells: if large { 4 } else { 16 },
         seed_lifetime_ms: 20_000,
         seedling_ms: 1_000,
         juvenile_ms: 1_000,
-        cell_growth_ms: 1_000,
+        cell_growth_ms: 200,
     };
     let bounds = scene.world().region;
     let config = EcologyConfig {
@@ -197,39 +197,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     continue;
                 }
-                for (cell, material) in &proposal.cells {
+                let mut accepted = proposal.clone();
+                accepted.cells.clear();
+                for &(cell, material) in &proposal.cells {
                     let center = BrushPoint::from_units(
                         cell.x * BRUSH_UNIT + BRUSH_UNIT / 2,
                         cell.y * BRUSH_UNIT + BRUSH_UNIT / 2,
                         cell.z * BRUSH_UNIT + BRUSH_UNIT / 2,
                     );
-                    let intent = EditIntent {
-                        request_id: RequestId(next_request),
+                    let request = RequestId(next_request);
+                    next_request += 1;
+                    sim.submit(EditIntent {
+                        request_id: request,
                         actor: EntityId::new(1)?,
                         target: EditTarget::Terrain,
-                        kind: EditKind::Place(*material),
+                        kind: EditKind::Place(material),
                         brush: SphereBrush::new(center, 0)?,
                         explosion: None,
-                    };
-                    next_request += 1;
-                    sim.submit(intent)?;
+                    })?;
+                    let tick = sim.tick()?;
+                    if !tick.committed.iter().any(|(id, _)| *id == request) {
+                        break;
+                    }
+                    accepted.cells.push((cell, material));
                 }
-                let tick = sim.tick()?;
-                let committed = tick.committed.len() == proposal.cells.len();
-                let ack = if committed {
-                    CommitAck::Accepted
-                } else {
-                    CommitAck::Rejected
-                };
-                if committed {
-                    proposal_cells += proposal.cells.len() as u64;
+                if !accepted.cells.is_empty() {
+                    let plant = &state.plants[&proposal.plant_id];
+                    let last = accepted.cells.last().unwrap().0;
+                    accepted.next_committed_cells =
+                        plant.skeleton.iter().position(|b| b.cell == last).unwrap() as u32 + 1;
+                    accepted.acknowledged_elapsed_ms =
+                        accepted.cells.len() as u64 * species.cell_growth_ms;
+                    proposal_cells += accepted.cells.len() as u64;
                     println!(
                         "{{\"event\":\"wood_growth_committed\",\"time_ms\":{},\"cells\":{}}}",
                         state.ecological_time_ms,
-                        proposal.cells.len()
+                        accepted.cells.len()
                     );
+                    acknowledge(&mut state, &accepted, CommitAck::Accepted);
+                } else {
+                    acknowledge(&mut state, &proposal, CommitAck::Rejected);
                 }
-                acknowledge(&mut state, &proposal, ack);
             } else {
                 acknowledge(&mut state, &proposal, CommitAck::Stale);
             }
@@ -238,10 +246,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         step_micros.push(elapsed);
         last_update_ms = state.ecological_time_ms;
         if !cut_done
+            && last_update_ms >= 12_000
             && let Some((&plant_id, plant)) =
                 state.plants.iter().find(|(_, p)| p.committed_cells > 10)
             && let Some((index, branch)) = plant.skeleton.iter().enumerate().find(|(i, c)| {
                 *i > 5
+                    && (c.cell.x != plant.root.x || c.cell.z != plant.root.z)
                     && !c.removed
                     && matches!(
                         sim.world().terrain().volume.sample(c.cell),

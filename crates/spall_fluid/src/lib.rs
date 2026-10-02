@@ -138,19 +138,95 @@ pub struct SolidBoundary {
 }
 
 impl SolidBoundary {
+    /// Reads the solid mask brick by brick: one snapshot per brick overlapping
+    /// the domain instead of one hash lookup per cell (about 30 ns per cell,
+    /// which made a 3 M-voxel capture ~90 ms on the simulation thread). A brick
+    /// that is not resident is reported exactly as a per-cell sample would.
     pub fn capture(volume: &Volume, spec: DomainSpec) -> Result<Self, BoundaryError> {
-        let mut solid = Vec::with_capacity(spec.cell_count);
-        for index in 0..spec.cell_count {
-            let cell = spec.cell_at(index);
-            match volume.sample(cell).map_err(BoundaryError::Access)? {
-                Sample::Filled(material) => solid.push(material != MaterialId::AIR),
-                Sample::Empty { .. } => solid.push(false),
-                Sample::Unknown(residency) => {
-                    return Err(BoundaryError::UnknownCell { cell, residency });
+        let [nx, ny, nz] = spec.dimensions.map(|d| d as usize);
+        let origin = spec.origin;
+        let lo = [origin.x, origin.y, origin.z];
+        let hi = [
+            origin.x + nx as i64 - 1,
+            origin.y + ny as i64 - 1,
+            origin.z + nz as i64 - 1,
+        ];
+        let edge = i64::from(spall_core::BRICK_EDGE);
+        let mut solid = vec![false; spec.cell_count];
+        for bz in lo[2].div_euclid(edge)..=hi[2].div_euclid(edge) {
+            for by in lo[1].div_euclid(edge)..=hi[1].div_euclid(edge) {
+                for bx in lo[0].div_euclid(edge)..=hi[0].div_euclid(edge) {
+                    let coord = spall_core::BrickCoord::new(bx, by, bz);
+                    let from = [
+                        (bx * edge).max(lo[0]),
+                        (by * edge).max(lo[1]),
+                        (bz * edge).max(lo[2]),
+                    ];
+                    let to = [
+                        (bx * edge + edge - 1).min(hi[0]),
+                        (by * edge + edge - 1).min(hi[1]),
+                        (bz * edge + edge - 1).min(hi[2]),
+                    ];
+                    let snapshot = match volume.snapshot_brick(coord) {
+                        Ok(Some(snapshot)) => snapshot,
+                        // Not resident (or outside bounds): sample the cells so
+                        // the error is the one the per-cell path reports.
+                        _ => {
+                            Self::capture_cells_slowly(volume, spec, from, to, &mut solid)?;
+                            continue;
+                        }
+                    };
+                    let uniform = (!snapshot.is_dense()).then(|| {
+                        let zero = spall_core::LocalCell::new(0, 0, 0).expect("in-brick");
+                        snapshot.get(zero) != MaterialId::AIR
+                    });
+                    for z in from[2]..=to[2] {
+                        for y in from[1]..=to[1] {
+                            let row = (from[0] - origin.x) as usize
+                                + nx * ((y - origin.y) as usize + ny * (z - origin.z) as usize);
+                            let span = (to[0] - from[0] + 1) as usize;
+                            if let Some(is_solid) = uniform {
+                                solid[row..row + span].fill(is_solid);
+                                continue;
+                            }
+                            let (ly, lz) = ((y - by * edge) as u8, (z - bz * edge) as u8);
+                            for (i, x) in (from[0]..=to[0]).enumerate() {
+                                let local =
+                                    spall_core::LocalCell::new((x - bx * edge) as u8, ly, lz)
+                                        .expect("in-brick");
+                                solid[row + i] = snapshot.get(local) != MaterialId::AIR;
+                            }
+                        }
+                    }
                 }
             }
         }
         Ok(Self { spec, solid })
+    }
+
+    fn capture_cells_slowly(
+        volume: &Volume,
+        spec: DomainSpec,
+        from: [i64; 3],
+        to: [i64; 3],
+        solid: &mut [bool],
+    ) -> Result<(), BoundaryError> {
+        for z in from[2]..=to[2] {
+            for y in from[1]..=to[1] {
+                for x in from[0]..=to[0] {
+                    let cell = GlobalCell::new(x, y, z);
+                    let index = spec.index_of(cell).expect("cell inside the domain");
+                    solid[index] = match volume.sample(cell).map_err(BoundaryError::Access)? {
+                        Sample::Filled(material) => material != MaterialId::AIR,
+                        Sample::Empty { .. } => false,
+                        Sample::Unknown(residency) => {
+                            return Err(BoundaryError::UnknownCell { cell, residency });
+                        }
+                    };
+                }
+            }
+        }
+        Ok(())
     }
 
     pub const fn spec(&self) -> DomainSpec {
@@ -335,6 +411,62 @@ mod tests {
     use super::*;
     use spall_core::{BrickCoord, CELLS_PER_BRICK, CellSizeCode, LocalCell, Revision, VolumeId};
     use spall_voxel::Brick;
+
+    /// The brick-wise capture equals a per-cell reference over a domain that
+    /// straddles uniform solid, uniform air, and dense bricks, and reports a
+    /// non-resident brick as unknown.
+    #[test]
+    fn brick_wise_capture_matches_the_per_cell_reference() {
+        let id = VolumeId::new(1).unwrap();
+        let mut volume = Volume::new(id, CellSizeCode::Quarter);
+        let stone = MaterialId(1);
+        // (0,0,0) uniform stone, (1,0,0) uniform air, (0,1,0) dense mixed.
+        volume
+            .insert_brick(BrickCoord::new(0, 0, 0), Brick::uniform(stone, Revision(1)))
+            .unwrap();
+        volume
+            .insert_brick(
+                BrickCoord::new(1, 0, 0),
+                Brick::uniform(MaterialId::AIR, Revision(1)),
+            )
+            .unwrap();
+        volume
+            .insert_brick(
+                BrickCoord::new(0, 1, 0),
+                Brick::uniform(MaterialId::AIR, Revision(1)),
+            )
+            .unwrap();
+        let mut plan = spall_voxel::EditPlan::new(id);
+        for z in 0..32 {
+            for x in 0..32 {
+                if (x * 7 + z * 3) % 5 < 2 {
+                    plan.set(GlobalCell::new(x, 32 + (x + z) % 9, z), stone);
+                }
+            }
+        }
+        volume.apply_edit(&plan).unwrap();
+        let spec = DomainSpec::new(GlobalCell::new(-0, 10, 3), [60, 40, 20], 1 << 20).unwrap();
+        // Brick (1,1,0) is absent: capture must fail like the per-cell path.
+        assert!(matches!(
+            SolidBoundary::capture(&volume, spec),
+            Err(BoundaryError::UnknownCell { .. })
+        ));
+        volume
+            .insert_brick(BrickCoord::new(1, 1, 0), Brick::uniform(stone, Revision(1)))
+            .unwrap();
+        // Bricks in z=-1 and z=1 do not overlap this domain (z 3..=22).
+        let fast = SolidBoundary::capture(&volume, spec).unwrap();
+        let mut reference = Vec::with_capacity(spec.cell_count());
+        for index in 0..spec.cell_count() {
+            reference.push(match volume.sample(spec.cell_at(index)).unwrap() {
+                Sample::Filled(material) => material != MaterialId::AIR,
+                Sample::Empty { .. } => false,
+                Sample::Unknown(_) => unreachable!("all overlapping bricks are resident"),
+            });
+        }
+        assert_eq!(fast.solid, reference);
+        assert!(reference.iter().any(|s| *s) && reference.iter().any(|s| !*s));
+    }
 
     fn air_volume_for(spec: DomainSpec) -> Volume {
         let mut volume = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);

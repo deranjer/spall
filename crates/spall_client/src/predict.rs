@@ -1088,6 +1088,9 @@ struct Record {
 
 /// The local player's predicted state plus the history needed to reconcile it.
 pub struct PredictedPlayer {
+    /// Cumulative applied correction vector for presentation only. Authority,
+    /// replay, collision and raw correction telemetry remain unchanged.
+    pub presentation_correction_total: [f64; 3],
     pub params: CharacterParams,
     predicted: CharacterState,
     authoritative: CharacterState,
@@ -1179,6 +1182,7 @@ impl PredictedPlayer {
     /// mis-selected record and the current tick).
     pub fn new(params: CharacterParams, spawn: CharacterState, spawn_tick: Tick) -> Self {
         Self {
+            presentation_correction_total: [0.; 3],
             params,
             predicted: spawn,
             authoritative: spawn,
@@ -1425,6 +1429,9 @@ impl PredictedPlayer {
         }
 
         let reconcile_displacement_m = predicted_before.distance_m(&self.predicted);
+        for (axis, total) in self.presentation_correction_total.iter_mut().enumerate() {
+            *total += self.predicted.position_m[axis] - predicted_before.position_m[axis];
+        }
         self.reconciles += 1;
         self.reconcile_displacement_sum_m += reconcile_displacement_m;
         self.max_reconcile_displacement_m = self

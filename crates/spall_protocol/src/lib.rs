@@ -68,3 +68,5 @@ pub use water::{
 };
 pub mod water_delta;
 pub use water_delta::{WaterDelta, WaterDeltaAssembler, water_deltas};
+
+pub mod vegetation;

@@ -1042,3 +1042,37 @@ The headless example emits JSONL lifecycle events followed by one metrics record
 Report dimensions, plant/patch/seed counts, update interval, elapsed ecological time, work budget, final and peak deferred queue, accepted wood cells, per-step timing percentiles, generation/placement/run elapsed time, canonical encoded ecology-state bytes, and state digest. Encoded bytes exclude terrain storage and allocator overhead; do not describe them as process memory. Performance allocations remain targets until separately measured.
 
 Unknown and unloaded behavior, state continuation, deterministic proposals, seed expiry/region accounting, crowding, regrowth suitability, permanent branch damage, and stale/rejected acknowledgment are CPU tests. World persistence/journal recovery, networking, graphical vegetation, and production serving are not established here. See [ENG-116 report](reports/ENG-116.md).
+## ENG-117 interactive ecology showcase
+
+Run the local interactive ecology showcase with:
+
+```powershell
+cargo run -p sandbox --features client --bin sandbox-client -- --ecology-demo
+```
+
+The window uses a fully resident 16 m stepped clearing and a private `Simulation` instance. The earlier generated-terrain crop is superseded by the ENG-117 correction pass. It is an inspection fixture and does not connect to or save a server world. Controls: **Space** pause/resume ecological time; **.** advance one ecology interval while paused; **+/-** select 1x, 4x, or 16x; **H** harvest grass; **B** cut a grown branch; **X** destroy the root; **WASD/QE** fly; click to capture the mouse, **Esc** release it. The HUD reports ecology time, speed, grass biomass, plant stage/count, and seed count. `cargo test -p spall_client ecology_demo::tests` covers the deterministic clock controls. A real desktop GPU/window presentation pass must be recorded separately from the CPU checks.
+
+ENG-117 correction validation adds terrain contact, exact 25 cm wood-volume,
+foliage, side-branch/root damage and clearing-residency checks:
+
+```powershell
+cargo test -p spall_ecology
+cargo test -p spall_client ecology_demo::tests
+cargo test -p sandbox --features client ecology_scene::tests
+cargo run -p sandbox --features client --bin sandbox-client -- --ecology-capture .local/runs/ecology-corrections
+cargo xtask check
+```
+
+The capture command runs the same private Simulation, growth acknowledgment,
+instance builder, camera and GameRenderer as the showcase. It saves six PNGs
+and structured state counts at 0, 3, 12, and 30 ecological seconds, then after
+branch/root cuts. It does not open a window or validate mouse/keyboard interaction.
+Grass and foliage remain visual instances, not solid occupancy or physics bodies.
+Wood retains 0.25 m cells; greedy merging changes draw boxes, never cell resolution.
+
+
+### ENG-118 seasonal generated-world vegetation
+
+Run cargo test -p sandbox --features client --test vegetation for deterministic biome/grounding, allowed offspring, four-season leaves, root/soil destruction, normal committed wood growth, exact checkpoint/journal recovery and two real QUIC clients including a late joiner. Run cargo test -p spall_protocol vegetation::tests for bounded chunk framing/repair, and cargo xtask check for the repository-wide gate.
+
+GPU evidence: cargo run -p sandbox --features client --example vegetation-gallery -- .local/vegetation-gallery produces ten generated tree and ten generated ground specimens in four seasons through production geometry/shadows. Live launch: cargo xtask play --worldgen showcase --seed 1 --worldgen-size 512 --season autumn. Every generated size and editor Run in game use the common factory. Hardware performance and manual traversal remain separate. Details: docs/reports/ENG-118-vegetation.md.

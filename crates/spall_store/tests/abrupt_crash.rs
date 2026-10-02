@@ -99,6 +99,7 @@ fn checkpoint(tick: u64, cursor: u64) -> Checkpoint {
     let mut m = meta();
     m.next_journal_seq = cursor + 1;
     Checkpoint {
+        vegetation: Vec::new(),
         tick,
         journal_cursor: cursor,
         world_hash: [tick as u8; 32],

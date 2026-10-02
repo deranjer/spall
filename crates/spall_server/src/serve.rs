@@ -264,6 +264,7 @@ pub struct CustomWorld {
     water: Option<spall_sim::WaterSetup>,
     additional_water: Vec<spall_sim::WaterSetup>,
     dam_gate: Option<DamGate>,
+    vegetation: Option<spall_ecology::living::LivingState>,
 }
 
 /// A scene-authored dam gate an admin can open or close at runtime: the cells
@@ -296,6 +297,7 @@ impl CustomWorld {
             water,
             additional_water: Vec::new(),
             dam_gate: None,
+            vegetation: None,
         }
     }
 
@@ -309,6 +311,11 @@ impl CustomWorld {
 
     pub fn with_additional_water(mut self, regions: Vec<spall_sim::WaterSetup>) -> Self {
         self.additional_water = regions;
+        self
+    }
+
+    pub fn with_vegetation(mut self, vegetation: spall_ecology::living::LivingState) -> Self {
+        self.vegetation = Some(vegetation);
         self
     }
 
@@ -456,6 +463,7 @@ impl Scene {
         let mut sim_config = SimulationConfig::new(setup);
         sim_config.terrain_collider_mode = mode;
         sim_config.water = custom.and_then(CustomWorld::water_setup).cloned();
+        sim_config.vegetation = custom.and_then(|c| c.vegetation.clone());
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
         if let Some(custom) = custom {
             for setup in &custom.additional_water {
@@ -2181,6 +2189,8 @@ async fn serve_async(
         > = HashMap::new();
         let mut water_keyframes_sent = 0u64;
         let mut water_bytes_queued = 0u64;
+        let mut water_growths_seen = 0u64;
+        let mut water_growth_refused_seen = 0u64;
         let mut pending_admin: Vec<(SessionId, spall_protocol::AdminRequest)> = Vec::new();
         // A dam-gate edit only reports `Queued` immediately; its real
         // outcome (committed, or rejected — e.g. the terrain-size "giant
@@ -2668,6 +2678,28 @@ async fn serve_async(
                     }
                 }
             }
+            // ENG-120: say when an authored fluid domain grows or growth is refused.
+            {
+                let (growths, refused) = report
+                    .water
+                    .iter()
+                    .chain(report.water_regions.iter())
+                    .fold((0u64, 0u64), |(g, r), m| {
+                        (g + m.domain_growths, r + m.growth_refused)
+                    });
+                if growths != water_growths_seen || refused != water_growth_refused_seen {
+                    let domain = sim.water().map(|w| {
+                        let d = w.domain();
+                        (d.origin(), d.dimensions())
+                    });
+                    tracing::info!(growths, refused, ?domain, "water domain growth");
+                    eprintln!(
+                        "sandbox-server: water domain growths {growths}, refused {refused}, first region {domain:?}"
+                    );
+                    water_growths_seen = growths;
+                    water_growth_refused_seen = refused;
+                }
+            }
             // ENG-105: a periodic water line, so an operator can see whether
             // the fluid worker keeps up with real time.
             if tick.get() % WATER_STATUS_INTERVAL_TICKS == 0
@@ -2901,6 +2933,33 @@ async fn serve_async(
                 lj.answer_repair(session, &req, &sim, &clients_for_sim);
             }
 
+            if tick.get().is_multiple_of(60)
+                && let Some(frame) = sim.vegetation_visual()
+            {
+                let encoded = match frame.encode() {
+                    Ok(bytes) => bytes,
+                    Err(e) => return SimResult::error(e, ticks_run),
+                };
+                let records: Vec<WireRecord> =
+                    match spall_protocol::vegetation::chunks(tick.get(), &encoded) {
+                        Ok(chunks) => chunks
+                            .into_iter()
+                            .map(WireRecord::VegetationSnapshot)
+                            .collect(),
+                        Err(e) => return SimResult::error(e, ticks_run),
+                    };
+                let records = Arc::new(records);
+                for session in lj.live_sessions().collect::<Vec<_>>() {
+                    send_to(&clients_for_sim, session, Outbound::Water(records.clone()));
+                }
+            }
+            // ENG-120: a grown region may have moved its origin; forget the
+            // publisher state of origins that no longer exist.
+            let live_origins: Vec<GlobalCell> =
+                sim.water_regions().map(|w| w.domain().origin()).collect();
+            for per_session in water_sent.values_mut() {
+                per_session.retain(|origin, _| live_origins.contains(origin));
+            }
             // Budget water independently per live session. Keyframes are
             // periodic repair; changed bricks reference the last queued frame.
             for water in sim.water_regions() {
@@ -4347,6 +4406,11 @@ fn setup_persistence_with_game_content(
                 terrain_collider_mode,
             )
             .map_err(|e| e.to_string())?;
+            let mut sim = sim;
+            // Domain growth is scene configuration, not saved state.
+            if let Some(setup) = custom_world.and_then(CustomWorld::water_setup) {
+                sim.set_water_growth(setup.growth);
+            }
             (sim, seq, 0)
         }
         // A genuinely new/empty database: seed it with the built-in scene.
@@ -4430,6 +4494,25 @@ fn tick_journal_batch(
             seq: seq.0,
             tick,
             payload: spall_store::JournalPayload::WaterState(state),
+        });
+        *journalled_through = seq.0;
+    }
+    if let Some(bytes) = sim.take_vegetation_journal()? {
+        let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
+        batch.push(spall_store::JournalRecord {
+            seq: seq.0,
+            tick,
+            payload: spall_store::JournalPayload::VegetationState(bytes),
+        });
+        *journalled_through = seq.0;
+    }
+    if let Some(state) = sim.vegetation_state() {
+        let (time_ms, credit_ms) = (state.time_ms, state.credit_ms);
+        let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
+        batch.push(spall_store::JournalRecord {
+            seq: seq.0,
+            tick,
+            payload: spall_store::JournalPayload::VegetationClock { time_ms, credit_ms },
         });
         *journalled_through = seq.0;
     }

@@ -54,11 +54,58 @@ impl Occupancy {
 #[derive(Debug, Clone, Copy)]
 pub struct VolumeSampler<'a> {
     volume: &'a Volume,
+    padded: Option<&'a PaddedBrick>,
+}
+
+/// One immutable 34^3 occupancy snapshot, including face/edge/corner AO halos.
+/// Greedy meshing otherwise repeats a volume-map lookup for every face and AO
+/// sample. This changes sampling cost, never unknown/residency semantics.
+#[derive(Debug)]
+pub(crate) struct PaddedBrick {
+    origin: [i64; 3],
+    cells: Vec<Occupancy>,
+}
+impl PaddedBrick {
+    pub(crate) fn new(volume: &Volume, coord: BrickCoord) -> Option<Self> {
+        let origin = [coord.x, coord.y, coord.z].map(|c| c.checked_mul(32));
+        let origin = [origin[0]?, origin[1]?, origin[2]?];
+        for v in origin {
+            v.checked_sub(1)?;
+            v.checked_add(32)?;
+        }
+        let sampler = VolumeSampler::new(volume);
+        let mut cells = Vec::with_capacity(34 * 34 * 34);
+        for z in -1..=32 {
+            for y in -1..=32 {
+                for x in -1..=32 {
+                    cells.push(sampler.at([origin[0] + x, origin[1] + y, origin[2] + z]));
+                }
+            }
+        }
+        Some(Self { origin, cells })
+    }
+    fn at(&self, at: [i64; 3]) -> Option<Occupancy> {
+        let x = at[0].checked_sub(self.origin[0])?;
+        let y = at[1].checked_sub(self.origin[1])?;
+        let z = at[2].checked_sub(self.origin[2])?;
+        if [x, y, z].into_iter().all(|v| (-1..=32).contains(&v)) {
+            Some(self.cells[((x + 1) + 34 * ((y + 1) + 34 * (z + 1))) as usize])
+        } else {
+            None
+        }
+    }
 }
 
 impl<'a> VolumeSampler<'a> {
     pub fn new(volume: &'a Volume) -> Self {
-        Self { volume }
+        Self {
+            volume,
+            padded: None,
+        }
+    }
+
+    pub(crate) fn with_padded(volume: &'a Volume, padded: Option<&'a PaddedBrick>) -> Self {
+        Self { volume, padded }
     }
 
     pub fn volume(&self) -> &'a Volume {
@@ -68,6 +115,9 @@ impl<'a> VolumeSampler<'a> {
     /// Occupancy of one global cell.
     #[inline]
     pub fn at(&self, cell: [i64; 3]) -> Occupancy {
+        if let Some(sample) = self.padded.and_then(|p| p.at(cell)) {
+            return sample;
+        }
         match self
             .volume
             .sample(GlobalCell::new(cell[0], cell[1], cell[2]))

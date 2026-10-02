@@ -17,3 +17,8 @@ pub fn init_tracing() {
         .with_target(false)
         .try_init();
 }
+
+#[cfg(feature = "client")]
+pub mod ecology_scene;
+
+pub mod vegetation;
