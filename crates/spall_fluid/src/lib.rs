@@ -10,6 +10,7 @@ pub mod component_fluid;
 pub mod cut_cell;
 pub mod fixtures;
 pub mod grid_mac;
+pub mod phase_water;
 
 use spall_core::{GlobalCell, MaterialId};
 use spall_voxel::{AccessError, Residency, Sample, Volume};

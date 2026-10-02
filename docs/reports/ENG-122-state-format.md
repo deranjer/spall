@@ -4,6 +4,29 @@ Experimental, not registered in `WireTag`, `WaterState`, store checkpoints or
 journals. This payload is only a proposed replacement for the amount/ledger
 arrays within a future explicitly versioned canonical restart state.
 
+## Increment 5: component totals cannot recover phase placement
+
+The new experimental `PhaseWater` retains horizontal water fractions at fine
+voxel locations. Opposite pools inside the same open coarse component can have
+identical component amounts, yet different wet basins and directional face
+apertures. Tests demonstrate both ambiguities. Consequently the SCWA version-1
+candidate described below is **insufficient to recover this phase state**,
+even when its geometry hash and every amount/capacity are valid.
+
+Do not reconstruct fine fractions from this payload by bottom filling, splitting
+by capacity, or treating a shared air connection as a shared water level. Coarse
+amounts remain a useful summary, but phase placement is canonical information.
+A future restart contract must explicitly version and losslessly retain the
+accepted phase representation (including its geometry/coordinate identity),
+alongside amounts, trapped ledgers and the other full-domain recovery state.
+Dynamic basin anchors are derived snapshot labels, not stable persistent IDs.
+
+No new codec, implicit SCWA conversion, wire tag or production/save integration
+is implemented in increment 5. The phase reference is experimental; pressure,
+momentum and interface accuracy must pass before freezing its restart format.
+
+## Original experimental component amount payload
+
 `spall_protocol::component_water` owns the pure codec. Simulation algorithms
 do not depend on protocol. Component keys are fine global anchor coordinates,
 sorted strictly by (z,y,x), with separate water and trapped amounts in m3.

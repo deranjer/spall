@@ -1,0 +1,427 @@
+use std::sync::Arc;
+
+use spall_core::{BrickCoord, CellSizeCode, GlobalCell, MaterialId, Revision, VolumeId};
+use spall_fluid::cut_cell::{CutCellGeometry, GeometryLimits};
+use spall_fluid::phase_water::{PhaseError, PhaseLimits, PhaseWater};
+use spall_fluid::{DomainSpec, SolidBoundary};
+use spall_voxel::{Brick, EditPlan, Volume};
+
+fn fixture(
+    dims: [u32; 3],
+    solid: impl Fn(u32, u32, u32) -> bool,
+    water: impl Fn(u32, u32, u32) -> f64,
+    max_basins: usize,
+) -> PhaseWater {
+    let id = VolumeId::new(7).unwrap();
+    let mut terrain = Volume::new(id, CellSizeCode::Quarter);
+    terrain
+        .insert_brick(
+            BrickCoord::new(0, 0, 0),
+            Brick::uniform(MaterialId::AIR, Revision(1)),
+        )
+        .unwrap();
+    let mut edits = EditPlan::new(id);
+    let mut fractions = Vec::new();
+    for z in 0..dims[2] {
+        for y in 0..dims[1] {
+            for x in 0..dims[0] {
+                if solid(x, y, z) {
+                    edits.set(GlobalCell::new(x as i64, y as i64, z as i64), MaterialId(1));
+                    fractions.push(0.0);
+                } else {
+                    fractions.push(water(x, y, z));
+                }
+            }
+        }
+    }
+    terrain.apply_edit(&edits).unwrap();
+    let boundary = SolidBoundary::capture(
+        &terrain,
+        DomainSpec::new(GlobalCell::new(0, 0, 0), dims, 30_000).unwrap(),
+    )
+    .unwrap();
+    let geometry = Arc::new(
+        CutCellGeometry::build(
+            &boundary,
+            3,
+            GeometryLimits {
+                max_fine_cells: 30_000,
+                max_components: 30_000,
+                max_portals: 90_000,
+            },
+        )
+        .unwrap(),
+    );
+    PhaseWater::new(
+        geometry,
+        &fractions,
+        0.25,
+        PhaseLimits {
+            max_fine_cells: 30_000,
+            max_faces: 90_000,
+            max_basins,
+        },
+    )
+    .unwrap()
+}
+
+fn index(dims: [usize; 3], x: usize, y: usize, z: usize) -> usize {
+    x + dims[0] * (y + dims[1] * z)
+}
+
+#[test]
+fn same_coarse_total_retains_opposite_pool_provenance() {
+    let state = |side| {
+        fixture(
+            [3; 3],
+            |x, y, _| x == 1 && y < 2,
+            |x, y, _| if x == side && y == 0 { 0.3 } else { 0.0 },
+            100,
+        )
+    };
+    let left = state(0);
+    let right = state(2);
+    assert_eq!(left.component_amounts_m3(), right.component_amounts_m3());
+    assert_eq!(left.component_amounts_m3().len(), 1);
+    assert_ne!(left.fractions(), right.fractions());
+    assert_ne!(
+        left.basins().unwrap()[0].anchor,
+        right.basins().unwrap()[0].anchor
+    );
+    assert_eq!(
+        left.basins().unwrap()[0].water_m3,
+        right.basins().unwrap()[0].water_m3
+    );
+}
+
+#[test]
+fn below_crest_pools_separate_but_overtopped_pools_join() {
+    let state = |height: f64| {
+        fixture(
+            [3; 3],
+            |x, y, _| x == 1 && y < 2,
+            |_, y, _| (height - y as f64).clamp(0.0, 1.0),
+            100,
+        )
+    };
+    let below = state(1.3);
+    assert_eq!(below.basins().unwrap().len(), 2);
+    let above = state(2.3);
+    assert_eq!(above.basins().unwrap().len(), 1);
+    let basin_total: f64 = below.basins().unwrap().iter().map(|b| b.water_m3).sum();
+    assert!((basin_total - below.water_volume_m3()).abs() < 1e-15);
+}
+
+#[test]
+fn partial_horizontal_overlap_and_dry_vertical_gap_are_exact() {
+    let state = fixture(
+        [3; 3],
+        |_, _, _| false,
+        |x, y, z| {
+            if z == 0 && y <= 1 && x <= 1 {
+                if x == 0 { 0.3 } else { 0.7 }
+            } else {
+                0.0
+            }
+        },
+        100,
+    );
+    let areas = state.wet_face_areas_m2();
+    let horizontal = state
+        .faces()
+        .iter()
+        .position(|f| f.lower == 0 && f.upper == 1)
+        .unwrap();
+    let vertical = state
+        .faces()
+        .iter()
+        .position(|f| f.lower == 0 && f.upper == 3)
+        .unwrap();
+    assert_eq!(areas[horizontal], 0.3 * 0.25_f64.powi(2));
+    assert_eq!(areas[vertical], 0.0);
+    assert_eq!(state.basins().unwrap().len(), 2);
+}
+
+#[test]
+fn tiny_water_is_retained_and_not_slept_or_merged_through_air() {
+    let state = fixture(
+        [3; 3],
+        |_, _, _| false,
+        |x, y, z| {
+            if y == 0 && z == 0 && x != 1 {
+                1e-20
+            } else {
+                0.0
+            }
+        },
+        100,
+    );
+    assert_eq!(state.basins().unwrap().len(), 2);
+    assert_eq!(state.water_volume_m3(), 2e-20 * 0.25_f64.powi(3));
+}
+
+#[test]
+fn donor_wet_area_admits_flow_into_dry_receiver_and_conserves_water() {
+    let mut state = fixture(
+        [3; 3],
+        |_, _, _| false,
+        |x, y, z| if x == 0 && y == 0 && z == 0 { 0.3 } else { 0.0 },
+        100,
+    );
+    let initial = state.water_volume_m3();
+    let mut q = vec![0.0; state.faces().len()];
+    let face = state
+        .faces()
+        .iter()
+        .position(|f| f.lower == 0 && f.upper == 1)
+        .unwrap();
+    assert_eq!(state.wet_face_areas_m2()[face], 0.0);
+    q[face] = 0.01;
+    let m = state.transport(0.1, &q, 0.45).unwrap();
+    assert!((m.moved_water_m3 - 0.0003).abs() < 1e-16);
+    assert!((state.fractions()[1] - 0.0003 / 0.25_f64.powi(3)).abs() < 1e-15);
+    assert!((state.water_volume_m3() - initial).abs() < 1e-16);
+}
+
+#[test]
+fn saturated_chain_retains_simultaneous_throughflow() {
+    let mut state = fixture(
+        [3; 3],
+        |_, _, _| false,
+        |x, y, z| if x < 2 && y == 0 && z == 0 { 1.0 } else { 0.0 },
+        100,
+    );
+    let initial = state.water_volume_m3();
+    let mut q = vec![0.0; state.faces().len()];
+    for (i, f) in state.faces().iter().enumerate() {
+        if f.axis == 0 && f.lower < 2 {
+            q[i] = 0.01;
+        }
+    }
+    let m = state.transport(0.1, &q, 0.45).unwrap();
+    assert_eq!(m.limiter_passes, 0);
+    assert_eq!(state.fractions()[1], 1.0);
+    assert!((state.water_volume_m3() - initial).abs() < 1e-16);
+    assert!(state.fractions()[2] > 0.0);
+}
+
+#[test]
+fn vertical_downflow_limits_available_water_without_clipping() {
+    let mut state = fixture(
+        [3; 3],
+        |_, _, _| false,
+        |x, y, z| {
+            if x == 0 && y == 1 && z == 0 {
+                0.01
+            } else {
+                0.0
+            }
+        },
+        100,
+    );
+    let initial = state.water_volume_m3();
+    let mut q = vec![0.0; state.faces().len()];
+    let face = state
+        .faces()
+        .iter()
+        .position(|f| f.lower == 0 && f.upper == 3)
+        .unwrap();
+    q[face] = -0.01;
+    let m = state.transport(0.1, &q, 0.45).unwrap();
+    assert!(m.limiter_passes > 0 && m.limited_water_m3 > 0.0);
+    assert!(state.fractions()[0] > 0.0);
+    assert!(state.fractions()[3] >= 0.0);
+    assert!((state.water_volume_m3() - initial).abs() < 1e-16);
+}
+
+#[test]
+fn dry_crest_air_circulation_does_not_transport_water() {
+    let mut state = fixture(
+        [9, 6, 3],
+        |x, y, _| x == 4 && y < 5,
+        |x, y, _| if x < 4 && y < 2 { 1.0 } else { 0.0 },
+        100,
+    );
+    let initial = state.fractions().to_vec();
+    // Divergence-free square circulation entirely in air above the dam crest.
+    let cycle = [
+        index([9, 6, 3], 3, 5, 0),
+        index([9, 6, 3], 4, 5, 0),
+        index([9, 6, 3], 4, 5, 1),
+        index([9, 6, 3], 3, 5, 1),
+    ];
+    let mut q = vec![0.0; state.faces().len()];
+    for edge in 0..4 {
+        let a = cycle[edge];
+        let b = cycle[(edge + 1) % 4];
+        let face = state
+            .faces()
+            .iter()
+            .position(|f| f.lower == a.min(b) && f.upper == a.max(b))
+            .unwrap();
+        q[face] = if a < b { 0.001 } else { -0.001 };
+    }
+    for _ in 0..600 {
+        let metrics = state.transport(0.01, &q, 0.45).unwrap();
+        assert_eq!(metrics.moved_water_m3, 0.0);
+    }
+    assert_eq!(state.fractions(), initial);
+    assert_eq!(state.basins().unwrap().len(), 1);
+}
+
+#[test]
+fn rejected_flux_and_fragmentation_leave_phase_state_unchanged() {
+    let mut state = fixture(
+        [3; 3],
+        |_, _, _| false,
+        |x, y, z| {
+            if y == 0 && z == 0 {
+                if x == 1 { 1.0 } else { 0.2 }
+            } else {
+                0.0
+            }
+        },
+        1,
+    );
+    let initial = state.fractions().to_vec();
+    let mut q = vec![0.0; state.faces().len()];
+    let face = state
+        .faces()
+        .iter()
+        .position(|f| f.lower == 1 && f.upper == 4)
+        .unwrap();
+    q[face] = f64::NAN;
+    assert!(matches!(
+        state.transport(1.0, &q, 1.0),
+        Err(PhaseError::InvalidState)
+    ));
+    q[face] = 1.0;
+    assert!(matches!(
+        state.transport(1.0, &q, 1.0),
+        Err(PhaseError::Cfl { .. })
+    ));
+    q[face] = 0.25_f64.powi(3);
+    assert!(matches!(
+        state.transport(1.0, &q, 1.0),
+        Err(PhaseError::Limit { kind: "basins", .. })
+    ));
+    assert_eq!(state.fractions(), initial);
+}
+
+#[test]
+fn explicit_phase_allocation_limits_and_invalid_seed_fail() {
+    let state = fixture([3; 3], |_, _, _| false, |_, _, _| 0.0, 100);
+    let geometry = state.geometry().clone();
+    let normal = PhaseLimits {
+        max_fine_cells: 27,
+        max_faces: 54,
+        max_basins: 1,
+    };
+    assert!(matches!(
+        PhaseWater::new(
+            geometry.clone(),
+            state.fractions(),
+            0.25,
+            PhaseLimits {
+                max_fine_cells: 26,
+                ..normal
+            }
+        ),
+        Err(PhaseError::Limit {
+            kind: "fine cells",
+            ..
+        })
+    ));
+    assert!(matches!(
+        PhaseWater::new(
+            geometry.clone(),
+            state.fractions(),
+            0.25,
+            PhaseLimits {
+                max_faces: 53,
+                ..normal
+            }
+        ),
+        Err(PhaseError::Limit { kind: "faces", .. })
+    ));
+    for scale in [0.0, f64::NAN, f64::INFINITY, 1e-200, 1e200] {
+        assert!(matches!(
+            PhaseWater::new(geometry.clone(), state.fractions(), scale, normal),
+            Err(PhaseError::InvalidState)
+        ));
+    }
+    let mut bad = state.fractions().to_vec();
+    for value in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+        bad[0] = value;
+        assert!(PhaseWater::new(geometry.clone(), &bad, 0.25, normal).is_err());
+    }
+    let solid = fixture(
+        [3; 3],
+        |x, y, z| x == 1 && y == 1 && z == 1,
+        |_, _, _| 0.0,
+        100,
+    );
+    let mut bad = solid.fractions().to_vec();
+    bad[13] = 0.1;
+    assert!(PhaseWater::new(solid.geometry().clone(), &bad, 0.25, normal).is_err());
+}
+
+#[test]
+fn fine_opening_passes_water_while_intact_wall_has_no_transport_face() {
+    let state = |opening| {
+        fixture(
+            [3; 3],
+            |x, y, z| x == 1 && !(opening && y == 0 && z == 1),
+            |x, y, _| if x == 0 && y == 0 { 1.0 } else { 0.0 },
+            100,
+        )
+    };
+    let intact = state(false);
+    assert!(intact.faces().iter().all(|f| f.axis != 0));
+    let mut opened = state(true);
+    let initial = opened.water_volume_m3();
+    let a = index([3; 3], 0, 0, 1);
+    let b = index([3; 3], 1, 0, 1);
+    let c = index([3; 3], 2, 0, 1);
+    let mut q = vec![0.0; opened.faces().len()];
+    for (i, f) in opened.faces().iter().enumerate() {
+        if f.lower == a && f.upper == b || f.lower == b && f.upper == c {
+            q[i] = 0.01;
+        }
+    }
+    for _ in 0..60 {
+        opened.transport(0.01, &q, 0.45).unwrap();
+    }
+    assert!(opened.fractions()[c] > 0.0);
+    assert!((opened.water_volume_m3() - initial).abs() < 1e-14);
+}
+
+#[test]
+fn coarse_portal_summary_preserves_partial_donor_aperture_without_air_averaging() {
+    let state = fixture(
+        [6, 3, 3],
+        |_, _, _| false,
+        |x, y, _| if x == 2 && y == 0 { 0.3 } else { 0.0 },
+        100,
+    );
+    let areas = state.portal_phase_areas_m2();
+    assert_eq!(areas.len(), 1);
+    assert_eq!(areas[0].overlap_m2, 0.0);
+    assert_eq!(areas[0].upper_donor_m2, 0.0);
+    assert!((areas[0].lower_donor_m2 - 3.0 * 0.3 * 0.25_f64.powi(2)).abs() < 1e-16);
+    let far = fixture(
+        [6, 3, 3],
+        |_, _, _| false,
+        |x, y, _| if x == 0 && y == 0 { 0.3 } else { 0.0 },
+        100,
+    );
+    assert_eq!(state.component_amounts_m3(), far.component_amounts_m3());
+    assert_eq!(far.portal_phase_areas_m2()[0].lower_donor_m2, 0.0);
+    // Equal coarse totals have different directional wetted apertures.
+    let fine_areas = state.wet_face_areas_m2();
+    for (face, area) in state.faces().iter().zip(fine_areas) {
+        if face.axis == 0 && face.lower % 6 == 2 {
+            assert_eq!(area, 0.0);
+        }
+    }
+}
