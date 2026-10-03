@@ -1,8 +1,9 @@
 //! Experimental fine-grid reference coupling for ENG-122 phase placement.
 //! Reuses the existing two-phase MAC/PLIC backend at the actual voxel size.
 //! This is not the coarsened component solver or a production activation.
-//! MAC velocity advection is semi-Lagrangian: this adapter does not establish
-//! the conservative staggered-momentum accuracy gate of component_fluid.
+//! Velocity advection defaults to semi-Lagrangian. An opt-in first-order
+//! conservative staggered mixture transport is available; sealed-gas mass and
+//! full interface accuracy remain acceptance gates.
 
 use crate::SolidBoundary;
 use crate::grid_mac::{MacConfig, MacError, MacGridWorld, MacStepMetrics, PressurePreconditioner};
@@ -88,6 +89,24 @@ impl PhasePressureWorld {
     }
     pub fn solver(&self) -> &MacGridWorld {
         &self.solver
+    }
+
+    /// Opt into accepted-flux staggered mixture momentum transport followed by
+    /// a fine projection on the new phase. First-order experimental advection;
+    /// no production/save/wire activation or full interface accuracy claim.
+    pub fn enable_conservative_momentum(&mut self) -> Result<(), PhasePressureError> {
+        self.solver.set_conservative_momentum()?;
+        Ok(())
+    }
+
+    /// Existing fine-reference air-model comparison. Explicitly selecting
+    /// incompressible air is not acceptance of the sealed-gas model.
+    pub fn set_compressible_enclosed_air(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), PhasePressureError> {
+        self.solver.set_compressible_enclosed_air(enabled)?;
+        Ok(())
     }
 
     /// Experimental physical Galerkin pressure predictor. Fine pressure

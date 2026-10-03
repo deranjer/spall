@@ -9,6 +9,7 @@ use spall_core::GlobalCell;
 use crate::phase_graph::{GraphError, GraphLimits, PhaseGraph, PressureSmoother};
 use crate::phase_water::PhaseWater;
 use crate::{DomainSpec, SolidBoundary};
+mod momentum;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MacConfig {
@@ -55,6 +56,14 @@ impl Default for MacConfig {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MacStepMetrics {
+    /// Advection-only mixture momentum ledger, excluding gravity/pressure.
+    pub momentum_transport_error_kg_m_s: [f64; 3],
+    pub momentum_wall_impulse_kg_m_s: [f64; 3],
+    pub momentum_open_outflow_kg_m_s: [f64; 3],
+    pub momentum_dual_mass_defect_kg: f64,
+    pub momentum_transport_subcycles: u32,
+    /// Additional momentum numerical payload, not whole peak/RSS.
+    pub momentum_scratch_bytes: usize,
     pub substeps: u32,
     /// Sum of pressure matrix rows assembled across this outer tick's
     /// projections; partial cells participate under the documented C > 0 rule.
@@ -115,6 +124,10 @@ pub struct FractionBandDiagnostic {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MacError {
+    MomentumPressureNotConverged { residual: f64 },
+    MomentumInvalidState,
+    MomentumMassMismatch { face: usize, defect_kg: f64 },
+    MomentumSubcycleBudget { required: u64 },
     PhaseGraph(GraphError),
     InvalidConfig,
     InvalidTimeStep,
@@ -133,6 +146,18 @@ pub enum MacError {
 impl std::fmt::Display for MacError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MomentumPressureNotConverged { residual } => write!(
+                f,
+                "momentum projection did not converge: residual {residual}"
+            ),
+            Self::MomentumInvalidState => write!(f, "nonfinite staggered momentum candidate"),
+            Self::MomentumMassMismatch { face, defect_kg } => {
+                write!(f, "dual mass mismatch at face {face}: {defect_kg} kg")
+            }
+            Self::MomentumSubcycleBudget { required } => write!(
+                f,
+                "momentum requires {required} subcycles, above 1024 budget"
+            ),
             Self::PhaseGraph(error) => write!(f, "phase pressure predictor: {error}"),
             Self::InvalidConfig => write!(f, "invalid MAC grid configuration"),
             Self::InvalidTimeStep => write!(f, "outer timestep must be finite and positive"),
@@ -198,6 +223,7 @@ pub struct MacGridWorld {
     stage_diagnostics: bool,
     diagnostic_outer_step: u64,
     strict_phase_bounds: bool,
+    conservative_momentum: bool,
     phase_predictor: Option<PhasePredictor>,
 }
 
@@ -262,6 +288,7 @@ impl MacGridWorld {
             stage_diagnostics: false,
             diagnostic_outer_step: 0,
             strict_phase_bounds: false,
+            conservative_momentum: false,
             phase_predictor: None,
         })
     }
@@ -278,6 +305,19 @@ impl MacGridWorld {
     /// Legacy replay retains its existing roundoff-tolerant transport path.
     pub(crate) fn set_strict_phase_bounds(&mut self) {
         self.strict_phase_bounds = true;
+    }
+
+    pub(crate) fn set_conservative_momentum(&mut self) -> Result<(), MacError> {
+        if self.ambient_density_kg_m3.is_none() || !self.strict_phase_bounds {
+            return Err(MacError::InvalidConfig);
+        }
+        self.conservative_momentum = true;
+        // Mixture mass needs a more accurate incompressible volume flux than
+        // the historical velocity-only reference. Tighten, never loosen, CG.
+        self.config.pressure_relative_tolerance =
+            self.config.pressure_relative_tolerance.min(1e-12);
+        self.config.pressure_absolute_tolerance = self.config.pressure_absolute_tolerance.min(1e-8);
+        Ok(())
     }
 
     pub fn set_pressure_preconditioner(&mut self, value: PressurePreconditioner) {
@@ -1191,7 +1231,7 @@ impl MacGridWorld {
         for substep in 0..required {
             // Preserve the historical single-phase backend for matched replay.
             // In the two-phase candidate, advect before applying forces.
-            if self.ambient_density_kg_m3.is_some() {
+            if self.ambient_density_kg_m3.is_some() && !self.conservative_momentum {
                 let stage = Instant::now();
                 self.advect_velocity(sub_dt);
                 metrics.velocity_advection_micros += stage.elapsed().as_micros() as u64;
@@ -1236,6 +1276,11 @@ impl MacGridWorld {
 
             let stage = Instant::now();
             let p = self.project(sub_dt)?;
+            if self.conservative_momentum && !p.converged {
+                return Err(MacError::MomentumPressureNotConverged {
+                    residual: p.residual_final,
+                });
+            }
             metrics.pressure_solve_micros += stage.elapsed().as_micros() as u64;
             metrics.pressure_iterations += p.iterations as u64;
             metrics.phase_predictor_rows_total += p.phase_rows as u64;
@@ -1269,10 +1314,68 @@ impl MacGridWorld {
             metrics.strict_path_repair_count += strict.path_repairs;
             metrics.strict_path_scratch_bytes =
                 metrics.strict_path_scratch_bytes.max(strict.scratch_bytes);
+            for axis in 0..3 {
+                metrics.momentum_transport_error_kg_m_s[axis] += strict.momentum.error[axis];
+                metrics.momentum_wall_impulse_kg_m_s[axis] += strict.momentum.wall[axis];
+                metrics.momentum_open_outflow_kg_m_s[axis] += strict.momentum.exterior[axis];
+            }
+            metrics.momentum_dual_mass_defect_kg = metrics
+                .momentum_dual_mass_defect_kg
+                .max(strict.momentum.mass_defect);
+            metrics.momentum_transport_subcycles = metrics
+                .momentum_transport_subcycles
+                .max(strict.momentum.sweeps);
+            metrics.momentum_scratch_bytes =
+                metrics.momentum_scratch_bytes.max(strict.momentum.bytes);
             outflow += permitted_outflow;
             region_outflow += tracked_out;
             region_inflow += tracked_in;
             metrics.transport_micros += stage.elapsed().as_micros() as u64;
+            if self.conservative_momentum {
+                // Density and momentum just moved together. Restore the fine
+                // incompressibility constraint on the new phase before commit.
+                let stage = Instant::now();
+                let force_pressure = self.pressure_pa.clone();
+                metrics.momentum_scratch_bytes = metrics
+                    .momentum_scratch_bytes
+                    .max(force_pressure.capacity() * size_of::<f64>());
+                let post = self.project(sub_dt)?;
+                if !post.converged {
+                    return Err(MacError::MomentumPressureNotConverged {
+                        residual: post.residual_final,
+                    });
+                }
+                // The second projection is an incremental pressure impulse.
+                // Retain force + correction pressure for diagnostics/warm start.
+                for (pressure, force) in self.pressure_pa.iter_mut().zip(force_pressure) {
+                    *pressure += force;
+                }
+                metrics.pressure_solve_micros += stage.elapsed().as_micros() as u64;
+                metrics.pressure_iterations += post.iterations as u64;
+                metrics.pressure_active_rows_total += post.active_cells as u64;
+                metrics.pressure_residual_initial_max = metrics
+                    .pressure_residual_initial_max
+                    .max(post.residual_initial);
+                metrics.pressure_residual_final_max =
+                    metrics.pressure_residual_final_max.max(post.residual_final);
+                metrics.divergence_before_max_s =
+                    metrics.divergence_before_max_s.max(post.divergence_before);
+                metrics.divergence_after_max_s =
+                    metrics.divergence_after_max_s.max(post.divergence_after);
+                metrics.phase_predictor_rows_total += post.phase_rows as u64;
+                metrics.phase_predictor_reuses += u32::from(post.phase_reused);
+                metrics.phase_predictor_rebuilds +=
+                    u32::from(post.phase_rows > 0 && !post.phase_reused);
+                metrics.phase_predictor_micros += post.phase_micros;
+                metrics.phase_preconditioner_applications += post.phase_applications;
+                metrics.phase_preconditioner_micros += post.phase_apply_micros;
+                metrics.phase_preconditioner_scratch_bytes = metrics
+                    .phase_preconditioner_scratch_bytes
+                    .max(post.phase_scratch_bytes);
+                if p.converged && !post.converged {
+                    metrics.pressure_converged_substeps -= 1;
+                }
+            }
             metrics.active_cells = self.active_cells();
             if self.stage_diagnostics {
                 self.print_stage_diagnostic(
@@ -2485,7 +2588,10 @@ impl MacGridWorld {
             // A face between two dry cells (or a dry cell and the
             // exterior) carries exactly zero donor and high-order
             // flux, so skipping it cannot change the result.
-            if left.is_none_or(|i| old[i] == 0.0) && right.is_none_or(|i| old[i] == 0.0) {
+            if !self.conservative_momentum
+                && left.is_none_or(|i| old[i] == 0.0)
+                && right.is_none_or(|i| old[i] == 0.0)
+            {
                 return None;
             }
             let upstream = if vel >= 0.0 { left } else { right };
@@ -2533,9 +2639,10 @@ impl MacGridWorld {
             } else {
                 courant * reconstructed
             };
-            Some((left, right, donor, high))
+            Some((left, right, donor, high, courant))
         };
         let mut raw_fluxes: Vec<(Option<usize>, Option<usize>, f64, f64)> = Vec::new();
+        let mut full_fluxes = Vec::new();
         for axis in 0..3 {
             let ext = match axis {
                 0 => [nx + 1, ny, nz],
@@ -2551,7 +2658,12 @@ impl MacGridWorld {
                     (0..ext[0]).filter_map(move |xf| face_flux(axis, xf, yf, zf))
                 })
                 .collect();
-            raw_fluxes.extend(faces);
+            for (left, right, donor, high, full) in faces {
+                raw_fluxes.push((left, right, donor, high));
+                if self.conservative_momentum {
+                    full_fluxes.push(full);
+                }
+            }
         }
         // Only cells with a non-trivial face can change. Every limiter pass and
         // the FCT bounds below work on this list: an earlier version swept the
@@ -2802,6 +2914,13 @@ impl MacGridWorld {
                 volume_fraction: net_open_outflow_fraction,
             });
         }
+        if self.conservative_momentum {
+            let candidate =
+                momentum::transport(self, &old, &low, &anti, &low_fluxes, &full_fluxes)?;
+            [self.u, self.v, self.w] = candidate.velocity;
+            strict.momentum = candidate.metrics;
+            strict.momentum.bytes += full_fluxes.capacity() * size_of::<f64>();
+        }
         self.fraction = low;
         Ok((
             net_open_outflow_fraction * volume,
@@ -2821,6 +2940,7 @@ const DONOR_LIMIT_TOLERANCE: f64 = 1.0e-12;
 
 #[derive(Debug, Default)]
 struct StrictTransferMetrics {
+    momentum: momentum::MomentumMetrics,
     path_repairs: u64,
     scratch_bytes: usize,
 }
@@ -2960,6 +3080,7 @@ fn repair_strict_transfer_paths(
     parents.fill(usize::MAX);
     let mut queue = Vec::with_capacity(touched.len());
     let mut metrics = StrictTransferMetrics {
+        momentum: momentum::MomentumMetrics::default(),
         path_repairs: 0,
         scratch_bytes: (offsets.capacity()
             + adjacency.capacity()

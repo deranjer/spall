@@ -61,6 +61,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("mode must be baseline, predictor or balanced".into()),
     };
     let balanced = std::env::args().nth(2).as_deref() == Some("balanced");
+    let momentum = match std::env::args().nth(3).as_deref() {
+        None => false,
+        Some("momentum") => true,
+        _ => return Err("optional third argument must be momentum".into()),
+    };
     let mut world = spall_fluid::phase_pressure::PhasePressureWorld::new(
         phase,
         spall_fluid::phase_pressure::PhasePressureConfig {
@@ -103,6 +108,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rebuilds = 0;
     let mut coarse_us = 0;
     let mut balanced_applications = 0;
+    if momentum {
+        world.enable_conservative_momentum()?;
+    }
+    let mut momentum_scratch = 0;
+    let mut momentum_subcycles = 0;
+    let mut momentum_error = [0.0_f64; 3];
+    let mut mass_defect = 0.0_f64;
     let mut balanced_us = 0;
     let mut balanced_scratch = 0;
     let mut times = Vec::new();
@@ -121,6 +133,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         times.push(start.elapsed().as_micros());
         pressure_times.push(m.pressure_solve_micros);
         accepted += 1;
+        momentum_scratch = momentum_scratch.max(m.momentum_scratch_bytes);
+        momentum_subcycles = momentum_subcycles.max(m.momentum_transport_subcycles);
+        mass_defect = mass_defect.max(m.momentum_dual_mass_defect_kg);
+        for (axis, error) in momentum_error.iter_mut().enumerate() {
+            *error += m.momentum_transport_error_kg_m_s[axis];
+        }
         substeps += m.substeps;
         fine_rows += m.pressure_active_rows_total;
         fine_iterations += m.pressure_iterations;
@@ -140,7 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or_else(|| "null".into(), |e| format!("{e:?}"));
     let gate = accepted == 2 && error.abs() < 1e-9;
     println!(
-        "{{\"size\":{size},\"seed\":1,\"season\":\"autumn\",\"backend\":\"fine_mac_phase_reference\",\"predictor\":{predictor},\"requested_steps\":2,\"accepted_steps\":{accepted},\"dt_s\":0.05,\"substeps\":{substeps},\"fine_pressure_rows_total\":{fine_rows},\"fine_pressure_iterations\":{fine_iterations},\"phase_balanced_preconditioner\":{balanced},\"balanced_applications\":{balanced_applications},\"balanced_scratch_peak_bytes\":{balanced_scratch},\"predictor_rows_total\":{coarse_rows},\"predictor_reuses\":{reuses},\"predictor_rebuilds\":{rebuilds},\"predictor_total_us\":{coarse_us},\"balanced_application_total_us\":{balanced_us},\"all_in_step_us\":{times:?},\"pressure_step_us\":{pressure_times:?},\"peak_liquid_speed_m_s\":{max_speed},\"accounting_error_m3\":{error},\"retained_array_upper_bound_bytes\":{},\"failure\":{failure_json},\"startup_gate_pass\":{gate},\"minute_rest_gate_accepted\":false,\"generated_trench_gate_accepted\":false,\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
+        "{{\"size\":{size},\"seed\":1,\"season\":\"autumn\",\"backend\":\"fine_mac_phase_reference\",\"predictor\":{predictor},\"requested_steps\":2,\"accepted_steps\":{accepted},\"dt_s\":0.05,\"substeps\":{substeps},\"fine_pressure_rows_total\":{fine_rows},\"fine_pressure_iterations\":{fine_iterations},\"phase_balanced_preconditioner\":{balanced},\"balanced_applications\":{balanced_applications},\"balanced_scratch_peak_bytes\":{balanced_scratch},\"predictor_rows_total\":{coarse_rows},\"predictor_reuses\":{reuses},\"predictor_rebuilds\":{rebuilds},\"predictor_total_us\":{coarse_us},\"balanced_application_total_us\":{balanced_us},\"all_in_step_us\":{times:?},\"pressure_step_us\":{pressure_times:?},\"peak_liquid_speed_m_s\":{max_speed},\"accounting_error_m3\":{error},\"retained_array_upper_bound_bytes\":{},\"failure\":{failure_json},\"startup_gate_pass\":{gate},\"minute_rest_gate_accepted\":false,\"generated_trench_gate_accepted\":false,\"conservative_momentum_enabled\":{momentum},\"momentum_scratch_peak_bytes\":{momentum_scratch},\"momentum_subcycles_max\":{momentum_subcycles},\"momentum_transport_error_kg_m_s\":{momentum_error:?},\"momentum_dual_mass_defect_peak_kg\":{mass_defect},\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
         world.retained_array_bytes()
     );
     if !gate {

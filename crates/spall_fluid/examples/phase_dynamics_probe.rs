@@ -27,6 +27,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("optional pressure mode must be baseline, predictor or balanced".into()),
     };
     let balanced = std::env::args().nth(3).as_deref() == Some("balanced");
+    let momentum = match std::env::args().nth(4).as_deref() {
+        None => false,
+        Some("momentum") => true,
+        _ => return Err("optional fourth argument must be momentum".into()),
+    };
+    let compressible_air = match std::env::args().nth(5).as_deref() {
+        None => true,
+        Some("incompressible-air") => false,
+        _ => return Err("optional fifth argument must be incompressible-air".into()),
+    };
     let dims: [u32; 3] = if mode == "channel" {
         [48, 18, 12]
     } else {
@@ -134,6 +144,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_divergence = 0.0_f64;
     let mut accepted = 0;
     let mut substeps = 0;
+    if momentum {
+        world.enable_conservative_momentum()?;
+    }
+    world.set_compressible_enclosed_air(compressible_air)?;
+    let mut momentum_error = [0.0_f64; 3];
+    let mut momentum_wall = [0.0_f64; 3];
+    let mut momentum_exterior = [0.0_f64; 3];
+    let mut momentum_scratch = 0;
+    let mut momentum_subcycles = 0;
+    let mut mass_defect = 0.0_f64;
     let mut pressure_rows = 0;
     let mut pressure_iterations = 0;
     let mut predictor_rows = 0;
@@ -159,6 +179,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         times.push(start.elapsed().as_micros());
         accepted += 1;
         substeps += metrics.substeps;
+        for axis in 0..3 {
+            momentum_error[axis] += metrics.momentum_transport_error_kg_m_s[axis];
+            momentum_wall[axis] += metrics.momentum_wall_impulse_kg_m_s[axis];
+            momentum_exterior[axis] += metrics.momentum_open_outflow_kg_m_s[axis];
+        }
+        momentum_scratch = momentum_scratch.max(metrics.momentum_scratch_bytes);
+        momentum_subcycles = momentum_subcycles.max(metrics.momentum_transport_subcycles);
+        mass_defect = mass_defect.max(metrics.momentum_dual_mass_defect_kg);
         pressure_rows += metrics.pressure_active_rows_total;
         pressure_iterations += metrics.pressure_iterations;
         predictor_rows += metrics.phase_predictor_rows_total;
@@ -219,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map_or_else(|| "null".into(), |e| format!("{e:?}"));
     println!(
-        "{{\"fixture\":{mode:?},\"backend\":\"fine_mac_phase_reference\",\"fine_dimensions\":{dims:?},\"phase_geometry_factor\":3,\"solver_cell_size_m\":0.25,\"requested_steps\":{steps},\"accepted_steps\":{accepted},\"accepted_substeps\":{substeps},\"dt_s\":0.01,\"advanced_time_s\":{},\"initial_water_m3\":{initial},\"downstream_water_m3\":{downstream},\"peak_eastward_liquid_momentum_kg_m_s\":{peak_momentum},\"peak_liquid_speed_m_s\":{peak_liquid_speed},\"peak_all_face_speed_m_s\":{peak_all_speed},\"peak_divergence_per_s\":{max_divergence},\"pressure_rows_total\":{pressure_rows},\"pressure_iterations_total\":{pressure_iterations},\"phase_pressure_predictor\":{predictor},\"phase_balanced_preconditioner\":{balanced},\"balanced_applications\":{balanced_applications},\"balanced_scratch_peak_bytes\":{balanced_scratch},\"predictor_rows_total\":{predictor_rows},\"predictor_reuses\":{predictor_reuses},\"predictor_rebuilds\":{predictor_rebuilds},\"predictor_total_us\":{predictor_micros},\"balanced_application_total_us\":{balanced_micros},\"initial_liquid_energy_j\":{initial_energy},\"peak_liquid_energy_j\":{peak_energy},\"accounting_error_m3\":{accounting},\"retained_phase_solver_array_bytes\":{},\"coupled_iteration_median_us\":{median},\"coupled_iteration_p99_us\":{p99},\"coupled_iteration_max_us\":{maximum},\"strict_path_repairs\":{path_repairs},\"strict_path_scratch_peak_bytes\":{path_scratch_bytes},\"failure\":{failure_json},\"motion_gate_pass\":{gate},\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
+        "{{\"fixture\":{mode:?},\"backend\":\"fine_mac_phase_reference\",\"fine_dimensions\":{dims:?},\"phase_geometry_factor\":3,\"solver_cell_size_m\":0.25,\"requested_steps\":{steps},\"accepted_steps\":{accepted},\"accepted_substeps\":{substeps},\"dt_s\":0.01,\"advanced_time_s\":{},\"initial_water_m3\":{initial},\"downstream_water_m3\":{downstream},\"peak_eastward_liquid_momentum_kg_m_s\":{peak_momentum},\"peak_liquid_speed_m_s\":{peak_liquid_speed},\"peak_all_face_speed_m_s\":{peak_all_speed},\"peak_divergence_per_s\":{max_divergence},\"pressure_rows_total\":{pressure_rows},\"pressure_iterations_total\":{pressure_iterations},\"phase_pressure_predictor\":{predictor},\"phase_balanced_preconditioner\":{balanced},\"balanced_applications\":{balanced_applications},\"balanced_scratch_peak_bytes\":{balanced_scratch},\"predictor_rows_total\":{predictor_rows},\"predictor_reuses\":{predictor_reuses},\"predictor_rebuilds\":{predictor_rebuilds},\"predictor_total_us\":{predictor_micros},\"balanced_application_total_us\":{balanced_micros},\"initial_liquid_energy_j\":{initial_energy},\"peak_liquid_energy_j\":{peak_energy},\"accounting_error_m3\":{accounting},\"retained_phase_solver_array_bytes\":{},\"coupled_iteration_median_us\":{median},\"coupled_iteration_p99_us\":{p99},\"coupled_iteration_max_us\":{maximum},\"strict_path_repairs\":{path_repairs},\"strict_path_scratch_peak_bytes\":{path_scratch_bytes},\"failure\":{failure_json},\"motion_gate_pass\":{gate},\"compressible_enclosed_air\":{compressible_air},\"conservative_momentum_enabled\":{momentum},\"momentum_transport_error_kg_m_s\":{momentum_error:?},\"momentum_wall_impulse_kg_m_s\":{momentum_wall:?},\"momentum_open_outflow_kg_m_s\":{momentum_exterior:?},\"momentum_scratch_peak_bytes\":{momentum_scratch},\"momentum_subcycles_max\":{momentum_subcycles},\"momentum_dual_mass_defect_peak_kg\":{mass_defect},\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
         f64::from(accepted) * 0.01,
         world.retained_array_bytes()
     );
