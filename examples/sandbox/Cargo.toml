@@ -64,6 +64,7 @@ zstd.workspace = true
 
 [dev-dependencies]
 image.workspace = true
+serde_json.workspace = true
 spall_jobs.workspace = true
 wgpu.workspace = true
 

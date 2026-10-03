@@ -3,9 +3,10 @@
 ## Generated-world water default
 
 The selected performance default is adaptive coarse MAC water with original
-velocity sampling, existing multigrid pressure, bounded conservative water
-transport and the current game water look. Generated scenes already select
-this path; this decision retains it explicitly. Normal `cargo xtask play`
+velocity sampling, multigrid pressure, bounded conservative water transport,
+freely displaced air and the current game water look. Air is atmospheric at
+water surfaces even inside enclosed pockets; no gas mass or compression is
+simulated. Normal `cargo xtask play`
 needs no water-method flag. Seed-1 showcase uses 0.75 m cells at 512 and 1 m
 at 1024, a 50,000-cell initial target, growth capped at twice that budget and
 a 20 Hz worker. The maximum coarsening fallback can exceed the initial target;
@@ -16,7 +17,9 @@ Historical trench measurements: median 15.0/25.5 ms per water step and
 not a fresh benchmark or a guaranteed frame rate. Thin walls may leak, narrow
 trenches diffuse, some shoreline seed water is dropped and reported, and
 parasitic rest currents remain. These accepted default tradeoffs do not mark
-ENG-122's exact-geometry/hydrostatic/sealed-air gates passed. The fine-phase
+ENG-122's full exact-geometry/hydrostatic gates passed. Sealed-air compression
+is now deliberately outside the gameplay model; historical two-phase failures
+remain recorded. The fine-phase
 comparison and conservative momentum remain experimental options in the local
 demo. Details and replacement criteria: `docs/reports/ENG-122.md`.
 
@@ -31,9 +34,12 @@ cargo run -p sandbox --features client --bin sandbox-client --release -- --phase
 
 This local experimental viewer uses the same quarter-metre channel, low-dam
 and full-wall fixtures as `phase_dynamics_probe`. It starts paused with the
-original velocity sampling and **incompressible air comparison**, explicitly
-shown on screen. Space runs/pauses, N advances 10 ms, M switches momentum method,
-G switches air model, R resets, and 1/2/3 select the scene. Switching resets and
+original velocity sampling and **water-only freely displaced air**, explicitly
+shown on screen. Space runs/pauses, N advances 10 ms, G cycles water-only,
+incompressible air and compressible air, R resets, and 1/2/3 select the scene.
+M switches momentum method in the air comparisons only. Conservative momentum
+keeps G within the two air comparisons; returning to original sampling permits
+water-only again. Switching resets and
 pauses the water while preserving the camera for the same scene. Click for
 mouse look, WASD/QE fly, Escape releases the cursor, and F12 saves
 `.local/screenshots/phase-water.png`.
@@ -49,6 +55,10 @@ from the authoritative generated game, with no save/wire activation.
 For bounded graphical checks, use `--frames 60 --phase-fluid-demo-autoplay
 --phase-fluid-demo-capture PATH.png`; add `--phase-fluid-demo-momentum` and/or
 `--phase-fluid-demo-compressible-air` to select the initial configuration.
+`--phase-fluid-demo-two-phase-air` explicitly selects the old incompressible
+air comparison; momentum also selects an air comparison. No flag is needed for
+the new water-only default. Gameplay construction, growth and recovery use it;
+no canonical save/wire format change is made.
 The viewer limits work to two fixed steps per frame and drops backlog;
 displayed simulation time counts only accepted steps, not wall-clock time.
 

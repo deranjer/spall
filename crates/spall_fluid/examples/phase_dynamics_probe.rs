@@ -16,20 +16,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("steps must be 1..=6000".into());
     }
     let predictor = match std::env::args().nth(3).as_deref() {
-        None | Some("baseline") => false,
+        None | Some("baseline") | Some("water-only") => false,
         Some("predictor") => true,
         Some("balanced") => false,
-        _ => return Err("optional pressure mode must be baseline, predictor or balanced".into()),
+        _ => {
+            return Err("optional mode must be baseline, predictor, balanced or water-only".into());
+        }
     };
     let balanced = std::env::args().nth(3).as_deref() == Some("balanced");
+    let water_only = std::env::args().nth(3).as_deref() == Some("water-only");
     let momentum = match std::env::args().nth(4).as_deref() {
         None => false,
-        Some("momentum") => true,
+        Some("momentum") if !water_only => true,
         _ => return Err("optional fourth argument must be momentum".into()),
     };
     let compressible_air = match std::env::args().nth(5).as_deref() {
-        None => true,
-        Some("incompressible-air") => false,
+        None => !water_only,
+        Some("incompressible-air") if !water_only => false,
         _ => return Err("optional fifth argument must be incompressible-air".into()),
     };
     let scene = match mode.as_str() {
@@ -39,18 +42,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let dims = scene.dimensions();
     let phase = scene.build()?;
-    let mut world = PhasePressureWorld::new(
-        phase,
-        PhasePressureConfig {
-            mac: MacConfig {
-                pressure_max_iterations: 1000,
-                ..MacConfig::default()
-            },
-            air_density_kg_m3: 1.2,
-            preconditioner: PressurePreconditioner::Multigrid,
-            max_retained_array_bytes: 100_000_000,
+    let config = PhasePressureConfig {
+        mac: MacConfig {
+            pressure_max_iterations: 1000,
+            ..MacConfig::default()
         },
-    )?;
+        air_density_kg_m3: 1.2,
+        preconditioner: PressurePreconditioner::Multigrid,
+        max_retained_array_bytes: 100_000_000,
+    };
+    let mut world = if water_only {
+        PhasePressureWorld::new_water_only(phase, config)
+    } else {
+        PhasePressureWorld::new(phase, config)
+    }?;
     if predictor {
         world.enable_pressure_predictor(
             spall_fluid::phase_graph::GraphLimits {
@@ -184,7 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map_or_else(|| "null".into(), |e| format!("{e:?}"));
     println!(
-        "{{\"fixture\":{mode:?},\"backend\":\"fine_mac_phase_reference\",\"fine_dimensions\":{dims:?},\"phase_geometry_factor\":3,\"solver_cell_size_m\":0.25,\"requested_steps\":{steps},\"accepted_steps\":{accepted},\"accepted_substeps\":{substeps},\"dt_s\":0.01,\"advanced_time_s\":{},\"initial_water_m3\":{initial},\"downstream_water_m3\":{downstream},\"peak_eastward_liquid_momentum_kg_m_s\":{peak_momentum},\"peak_liquid_speed_m_s\":{peak_liquid_speed},\"peak_all_face_speed_m_s\":{peak_all_speed},\"peak_divergence_per_s\":{max_divergence},\"pressure_rows_total\":{pressure_rows},\"pressure_iterations_total\":{pressure_iterations},\"phase_pressure_predictor\":{predictor},\"phase_balanced_preconditioner\":{balanced},\"balanced_applications\":{balanced_applications},\"balanced_scratch_peak_bytes\":{balanced_scratch},\"predictor_rows_total\":{predictor_rows},\"predictor_reuses\":{predictor_reuses},\"predictor_rebuilds\":{predictor_rebuilds},\"predictor_total_us\":{predictor_micros},\"balanced_application_total_us\":{balanced_micros},\"initial_liquid_energy_j\":{initial_energy},\"peak_liquid_energy_j\":{peak_energy},\"accounting_error_m3\":{accounting},\"retained_phase_solver_array_bytes\":{},\"coupled_iteration_median_us\":{median},\"coupled_iteration_p99_us\":{p99},\"coupled_iteration_max_us\":{maximum},\"strict_path_repairs\":{path_repairs},\"strict_path_scratch_peak_bytes\":{path_scratch_bytes},\"failure\":{failure_json},\"motion_gate_pass\":{gate},\"compressible_enclosed_air\":{compressible_air},\"conservative_momentum_enabled\":{momentum},\"momentum_transport_error_kg_m_s\":{momentum_error:?},\"momentum_wall_impulse_kg_m_s\":{momentum_wall:?},\"momentum_open_outflow_kg_m_s\":{momentum_exterior:?},\"momentum_scratch_peak_bytes\":{momentum_scratch},\"momentum_subcycles_max\":{momentum_subcycles},\"momentum_dual_mass_defect_peak_kg\":{mass_defect},\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
+        "{{\"water_only\":{water_only},\"fixture\":{mode:?},\"backend\":\"fine_mac_phase_reference\",\"fine_dimensions\":{dims:?},\"phase_geometry_factor\":3,\"solver_cell_size_m\":0.25,\"requested_steps\":{steps},\"accepted_steps\":{accepted},\"accepted_substeps\":{substeps},\"dt_s\":0.01,\"advanced_time_s\":{},\"initial_water_m3\":{initial},\"downstream_water_m3\":{downstream},\"peak_eastward_liquid_momentum_kg_m_s\":{peak_momentum},\"peak_liquid_speed_m_s\":{peak_liquid_speed},\"peak_all_face_speed_m_s\":{peak_all_speed},\"peak_divergence_per_s\":{max_divergence},\"pressure_rows_total\":{pressure_rows},\"pressure_iterations_total\":{pressure_iterations},\"phase_pressure_predictor\":{predictor},\"phase_balanced_preconditioner\":{balanced},\"balanced_applications\":{balanced_applications},\"balanced_scratch_peak_bytes\":{balanced_scratch},\"predictor_rows_total\":{predictor_rows},\"predictor_reuses\":{predictor_reuses},\"predictor_rebuilds\":{predictor_rebuilds},\"predictor_total_us\":{predictor_micros},\"balanced_application_total_us\":{balanced_micros},\"initial_liquid_energy_j\":{initial_energy},\"peak_liquid_energy_j\":{peak_energy},\"accounting_error_m3\":{accounting},\"retained_phase_solver_array_bytes\":{},\"coupled_iteration_median_us\":{median},\"coupled_iteration_p99_us\":{p99},\"coupled_iteration_max_us\":{maximum},\"strict_path_repairs\":{path_repairs},\"strict_path_scratch_peak_bytes\":{path_scratch_bytes},\"failure\":{failure_json},\"motion_gate_pass\":{gate},\"compressible_enclosed_air\":{compressible_air},\"conservative_momentum_enabled\":{momentum},\"momentum_transport_error_kg_m_s\":{momentum_error:?},\"momentum_wall_impulse_kg_m_s\":{momentum_wall:?},\"momentum_open_outflow_kg_m_s\":{momentum_exterior:?},\"momentum_scratch_peak_bytes\":{momentum_scratch},\"momentum_subcycles_max\":{momentum_subcycles},\"momentum_dual_mass_defect_peak_kg\":{mass_defect},\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
         f64::from(accepted) * 0.01,
         world.retained_array_bytes()
     );

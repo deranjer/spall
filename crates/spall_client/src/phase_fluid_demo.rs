@@ -30,6 +30,7 @@ const MAX_STEPS_PER_FRAME: usize = 2;
 pub struct PhaseFluidDemoOptions {
     pub conservative_momentum: bool,
     pub compressible_air: bool,
+    pub two_phase_air: bool,
     pub autoplay: bool,
     pub max_frames: Option<u64>,
     pub capture: Option<PathBuf>,
@@ -42,11 +43,27 @@ pub fn run_phase_fluid_demo_window(options: PhaseFluidDemoOptions) -> Result<(),
     app.result
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AirModel {
+    FreelyDisplaced,
+    Incompressible,
+    Compressible,
+}
+impl AirModel {
+    fn next(self, conservative: bool) -> Self {
+        match self {
+            Self::FreelyDisplaced => Self::Incompressible,
+            Self::Incompressible => Self::Compressible,
+            Self::Compressible if conservative => Self::Incompressible,
+            Self::Compressible => Self::FreelyDisplaced,
+        }
+    }
+}
 struct Comparison {
     world: PhasePressureWorld,
     scene: PhaseReferenceScene,
     conservative: bool,
-    compressible: bool,
+    air_model: AirModel,
     accepted_steps: u64,
     initial_volume: f64,
     failure: Option<String>,
@@ -55,25 +72,27 @@ impl Comparison {
     fn new(
         scene: PhaseReferenceScene,
         conservative: bool,
-        compressible: bool,
+        air_model: AirModel,
     ) -> Result<Self, ClientError> {
         let phase = scene.build().map_err(render_error)?;
         let initial_volume = phase.water_volume_m3();
-        let mut world = PhasePressureWorld::new(
-            phase,
-            PhasePressureConfig {
-                mac: MacConfig {
-                    pressure_max_iterations: 1000,
-                    ..Default::default()
-                },
-                air_density_kg_m3: 1.2,
-                preconditioner: PressurePreconditioner::Multigrid,
-                max_retained_array_bytes: 100_000_000,
+        let config = PhasePressureConfig {
+            mac: MacConfig {
+                pressure_max_iterations: 1000,
+                ..Default::default()
             },
-        )
+            air_density_kg_m3: 1.2,
+            preconditioner: PressurePreconditioner::Multigrid,
+            max_retained_array_bytes: 100_000_000,
+        };
+        let mut world = if air_model == AirModel::FreelyDisplaced {
+            PhasePressureWorld::new_water_only(phase, config)
+        } else {
+            PhasePressureWorld::new(phase, config)
+        }
         .map_err(render_error)?;
         world
-            .set_compressible_enclosed_air(compressible)
+            .set_compressible_enclosed_air(air_model == AirModel::Compressible)
             .map_err(render_error)?;
         if conservative {
             world.enable_conservative_momentum().map_err(render_error)?;
@@ -82,7 +101,7 @@ impl Comparison {
             world,
             scene,
             conservative,
-            compressible,
+            air_model,
             accepted_steps: 0,
             initial_volume,
             failure: None,
@@ -112,10 +131,10 @@ impl Comparison {
         }
     }
     fn air(&self) -> &'static str {
-        if self.compressible {
-            "Compressible air (experimental)"
-        } else {
-            "Incompressible air comparison"
+        match self.air_model {
+            AirModel::FreelyDisplaced => "Water only - freely displaced air (default)",
+            AirModel::Compressible => "Compressible air (experimental)",
+            AirModel::Incompressible => "Incompressible air comparison",
         }
     }
 }
@@ -144,7 +163,13 @@ impl PhaseDemoApp {
         let state = Comparison::new(
             PhaseReferenceScene::Channel,
             options.conservative_momentum,
-            options.compressible_air,
+            if options.compressible_air {
+                AirModel::Compressible
+            } else if options.two_phase_air || options.conservative_momentum {
+                AirModel::Incompressible
+            } else {
+                AirModel::FreelyDisplaced
+            },
         )?;
         let terrain = build_terrain(&state.world);
         let camera = scene_camera(state.scene);
@@ -185,8 +210,8 @@ impl PhaseDemoApp {
             self.cursor_locked = locked;
         }
     }
-    fn reset(&mut self, scene: PhaseReferenceScene, conservative: bool, compressible: bool) {
-        match Comparison::new(scene, conservative, compressible) {
+    fn reset(&mut self, scene: PhaseReferenceScene, conservative: bool, air: AirModel) {
+        match Comparison::new(scene, conservative, air) {
             Ok(state) => {
                 if scene != self.state.scene {
                     self.camera = scene_camera(scene);
@@ -208,14 +233,14 @@ impl PhaseDemoApp {
         let (scene, method, air) = (
             self.state.scene,
             self.state.conservative,
-            self.state.compressible,
+            self.state.air_model,
         );
         match key {
             KeyCode::Digit1 => self.reset(PhaseReferenceScene::Channel, method, air),
             KeyCode::Digit2 => self.reset(PhaseReferenceScene::LowDam, method, air),
             KeyCode::Digit3 => self.reset(PhaseReferenceScene::FullWall, method, air),
-            KeyCode::KeyM => self.reset(scene, !method, air),
-            KeyCode::KeyG => self.reset(scene, method, !air),
+            KeyCode::KeyM if air != AirModel::FreelyDisplaced => self.reset(scene, !method, air),
+            KeyCode::KeyG => self.reset(scene, method, air.next(method)),
             KeyCode::KeyR => self.reset(scene, method, air),
             KeyCode::Space if self.state.failure.is_none() => {
                 self.paused = !self.paused;
@@ -337,7 +362,7 @@ impl PhaseDemoApp {
             ));
         }
         if let Err(e)=renderer.finish_frame(frame,Some(&(self.camera.position,self.camera.forward())),&[],&[],
-            Some((&heading,"M switch method | G switch air | 1 channel / 2 low dam / 3 wall\nSpace play/pause | N one step | R reset | Click + mouse look | WASD/QE move | Esc release | F12 screenshot",&status)),None) {
+            Some((&heading,"G switch air | M momentum (air comparisons only) | 1 channel / 2 low dam / 3 wall\nSpace play/pause | N one step | R reset | Click + mouse look | WASD/QE move | Esc release | F12 screenshot",&status)),None) {
             return self.fail(event_loop,e);
         }
         if self.options.max_frames.is_some_and(|n| self.frames >= n) {
@@ -514,6 +539,33 @@ fn build_water(world: &PhasePressureWorld) -> crate::water_look::WaterLook {
 mod tests {
     use super::*;
     #[test]
+    fn default_water_only_and_explicit_air_comparisons_reset_without_silent_model_changes() {
+        let mut app = PhaseDemoApp::new(PhaseFluidDemoOptions::default()).unwrap();
+        let initial = app.state.world.phase().fractions().to_vec();
+        assert_eq!(app.state.air_model, AirModel::FreelyDisplaced);
+        app.action(KeyCode::KeyM);
+        assert!(!app.state.conservative);
+        assert_eq!(app.state.air_model, AirModel::FreelyDisplaced);
+        app.action(KeyCode::KeyN);
+        assert_eq!(app.state.accepted_steps, 1);
+        app.action(KeyCode::KeyG);
+        assert_eq!(app.state.air_model, AirModel::Incompressible);
+        assert_eq!(app.state.accepted_steps, 0);
+        assert_eq!(app.state.world.phase().fractions(), initial);
+        app.action(KeyCode::KeyM);
+        app.action(KeyCode::KeyG);
+        assert_eq!(app.state.air_model, AirModel::Compressible);
+        app.action(KeyCode::KeyG);
+        assert_eq!(app.state.air_model, AirModel::Incompressible);
+        assert!(app.state.conservative);
+        app.action(KeyCode::KeyM);
+        app.action(KeyCode::KeyG);
+        app.action(KeyCode::KeyG);
+        assert_eq!(app.state.air_model, AirModel::FreelyDisplaced);
+        assert_eq!(app.state.world.phase().fractions(), initial);
+        assert!(app.paused);
+    }
+    #[test]
     fn game_water_look_tracks_fixture_resets_without_mutating_phase() {
         let mut app = PhaseDemoApp::new(PhaseFluidDemoOptions::default()).unwrap();
         let fractions = app.state.world.phase().fractions().to_vec();
@@ -530,29 +582,34 @@ mod tests {
     }
     #[test]
     fn switching_method_restarts_identical_phase_without_changing_air_or_camera() {
-        let mut app = PhaseDemoApp::new(PhaseFluidDemoOptions::default()).unwrap();
+        let mut app = PhaseDemoApp::new(PhaseFluidDemoOptions {
+            two_phase_air: true,
+            ..Default::default()
+        })
+        .unwrap();
         let initial = app.state.world.phase().fractions().to_vec();
         let eye = app.camera.position;
         app.action(KeyCode::KeyN);
         assert_eq!(app.state.accepted_steps, 1);
         app.action(KeyCode::KeyM);
         assert!(app.state.conservative);
-        assert!(!app.state.compressible);
+        assert_eq!(app.state.air_model, AirModel::Incompressible);
         assert!(app.paused);
         assert_eq!(app.state.accepted_steps, 0);
         assert_eq!(app.state.world.phase().fractions(), initial);
         assert_eq!(app.camera.position, eye);
         app.action(KeyCode::KeyG);
-        assert!(app.state.compressible);
+        assert_eq!(app.state.air_model, AirModel::Compressible);
         assert!(app.state.conservative);
         assert_eq!(app.state.world.phase().fractions(), initial);
         app.action(KeyCode::KeyM);
         assert!(!app.state.conservative);
-        assert!(app.state.compressible);
+        assert_eq!(app.state.air_model, AirModel::Compressible);
     }
     #[test]
     fn rejected_step_stays_visible_and_requires_explicit_reset_or_switch() {
-        let mut state = Comparison::new(PhaseReferenceScene::Channel, true, true).unwrap();
+        let mut state =
+            Comparison::new(PhaseReferenceScene::Channel, true, AirModel::Compressible).unwrap();
         for _ in 0..60 {
             let before = state.world.phase().fractions().to_vec();
             let steps = state.accepted_steps;
@@ -581,7 +638,7 @@ mod tests {
         assert!(app.state.failure.is_none());
         assert_eq!(app.state.accepted_steps, 0);
         assert!(app.state.conservative);
-        assert!(!app.state.compressible);
+        assert_eq!(app.state.air_model, AirModel::Incompressible);
         assert!(app.state.step());
     }
 }

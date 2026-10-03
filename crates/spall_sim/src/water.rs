@@ -8,6 +8,9 @@
 //! one fluid cell then covers `coarsen³` voxels and its solidity comes from
 //! [`SolidBoundary::coarsened`]. Scenes pick this to keep a whole valley's
 //! water inside the solver budget.
+//! Gameplay solves water only: every liquid/empty interface is at atmospheric
+//! pressure, including enclosed pockets. Air is freely displaced, not a second
+//! pressure phase. Construction, recovery and growth use the same policy.
 //!
 //! Worker execution solves an immutable clone with a fixed fluid dt. The owner
 //! validates its boundary revision and source rate before installing a result
@@ -444,7 +447,8 @@ impl AuthoritativeWater {
         let boundary = capture_boundary(terrain, setup.domain, coarsen)?;
         let mut grid = MacGridWorld::new(&boundary, setup.config).map_err(WaterError::Solver)?;
         grid.set_pressure_preconditioner(PressurePreconditioner::Multigrid);
-        grid.set_ambient_density(1.2).map_err(WaterError::Solver)?;
+        grid.set_freely_displaced_air()
+            .map_err(WaterError::Solver)?;
         let seed = seed_fractions(&mut grid, &boundary, &setup, coarsen)?;
         let gated_rate = Arc::new(AtomicU8::new(0));
         let exchange = Exchange::new(&setup, coarsen, Arc::clone(&gated_rate));
@@ -905,7 +909,8 @@ impl AuthoritativeWater {
         let boundary = capture_boundary(terrain, domain, c)?;
         let mut grid = MacGridWorld::new(&boundary, setup.config).map_err(WaterError::Solver)?;
         grid.set_pressure_preconditioner(PressurePreconditioner::Multigrid);
-        grid.set_ambient_density(1.2).map_err(WaterError::Solver)?;
+        grid.set_freely_displaced_air()
+            .map_err(WaterError::Solver)?;
 
         let (old_grid, old_exchange) = self.committed();
         let old_f = old_d.map(|d| (d / c) as usize);

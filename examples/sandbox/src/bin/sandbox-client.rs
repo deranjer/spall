@@ -13,12 +13,15 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
     about = "Spall sandbox render-window / replication client"
 )]
 struct Args {
-    /// Open the local ENG-122 water comparison, paused with incompressible air.
+    /// Open the local ENG-122 water comparison, paused with freely displaced air.
     #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "grid_fluid_demo", "ecology_demo", "ecology_capture"])]
     phase_fluid_demo: bool,
     /// Start the comparison with conservative momentum.
     #[arg(long, requires = "phase_fluid_demo")]
     phase_fluid_demo_momentum: bool,
+    /// Select the experimental incompressible-air comparison instead of water only.
+    #[arg(long, requires = "phase_fluid_demo")]
+    phase_fluid_demo_two_phase_air: bool,
     /// Use the experimental compressible air case (may reject a step).
     #[arg(long, requires = "phase_fluid_demo")]
     phase_fluid_demo_compressible_air: bool,
@@ -339,6 +342,7 @@ fn main() -> ExitCode {
             spall_client::PhaseFluidDemoOptions {
                 conservative_momentum: args.phase_fluid_demo_momentum,
                 compressible_air: args.phase_fluid_demo_compressible_air,
+                two_phase_air: args.phase_fluid_demo_two_phase_air,
                 autoplay: args.phase_fluid_demo_autoplay,
                 max_frames: args.frames,
                 capture: args.phase_fluid_demo_capture,

@@ -32,6 +32,19 @@ water crate. Its dense two-phase MAC/PLIC solver uses variable-density
 pressure projection, multigrid preconditioning and isothermal sealed air.
 Evidence is in [`docs/reports/ENG-103.md`](reports/ENG-103.md).
 
+ENG-122 changes authoritative gameplay to water-only MAC/PLIC flow with freely
+displaced air. Air has atmospheric pressure at reconstructed water surfaces,
+including enclosed pockets, and no mass, compression or back-pressure. The
+pressure system contains liquid pressure samples only; water in partial cells
+remains in conservative transport. Three layers of extrapolated water velocity
+support surface transport. Legacy two-phase models remain explicit experiments.
+Construction, domain growth and canonical recovery use the same water-only
+policy. Canonical water amount/trapped ledgers and their versioned wire format
+are unchanged; loading an older save uses the current numerical policy (air
+mass and runtime pressure/velocity were never canonical state). This deliberate
+model change supersedes sealed-air realism for gameplay, not terrain ownership,
+worker validation or mass/recovery invariants.
+
 ENG-105 lets `Simulation` own up to eight explicitly authored, disjoint bounded
 water domains, with at most 4,194,304 fluid cells across the group and 32 million
 voxel cells per domain. A connected pressure system belongs in one domain;

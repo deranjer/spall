@@ -46,6 +46,24 @@ pub struct PhasePressureWorld {
 
 impl PhasePressureWorld {
     pub fn new(phase: PhaseWater, config: PhasePressureConfig) -> Result<Self, PhasePressureError> {
+        Self::new_with_air(phase, config, true)
+    }
+
+    /// Water-only comparison: dry space has atmospheric pressure even when
+    /// enclosed. No gas mass, pressure rows or compression; air density is unused.
+    /// Retains geometric PLIC/FCT water transport without an ambient fluid.
+    pub fn new_water_only(
+        phase: PhaseWater,
+        config: PhasePressureConfig,
+    ) -> Result<Self, PhasePressureError> {
+        Self::new_with_air(phase, config, false)
+    }
+
+    fn new_with_air(
+        phase: PhaseWater,
+        config: PhasePressureConfig,
+        two_phase: bool,
+    ) -> Result<Self, PhasePressureError> {
         if config.mac.cell_size_m.to_bits() != phase.voxel_size_m().to_bits()
             || config.mac.gravity_m_s2.iter().any(|g| !g.is_finite())
         {
@@ -71,7 +89,11 @@ impl PhasePressureWorld {
                 .collect(),
         };
         let mut solver = MacGridWorld::new(&boundary, config.mac)?;
-        solver.set_ambient_density(config.air_density_kg_m3)?;
+        if two_phase {
+            solver.set_ambient_density(config.air_density_kg_m3)?;
+        } else {
+            solver.set_freely_displaced_air()?;
+        }
         solver.set_pressure_preconditioner(config.preconditioner);
         solver.set_strict_phase_bounds();
         solver.restore_fractions(phase.fractions())?;

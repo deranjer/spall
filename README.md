@@ -5,12 +5,14 @@ Planning baseline: 2026-09-06. T00 implements the Rust workspace, headless serve
 Run `cargo xtask check` for formatting, lint, and tests; `cargo xtask smoke` for a bounded server lifecycle; or `cargo xtask smoke --graphical` to include real window presentation and resize. Run the window directly with `cargo run -p sandbox --features client --bin sandbox-client -- --offline`.
 
 Generated-world water defaults to the performance choice: adaptive coarse MAC
-water, original velocity sampling, multigrid pressure and bounded conservative
-water transport, with the current smoothed water look. The initial cell budget
-is 50,000 (seed-1 showcase: 0.75 m at 512, 1 m at 1024), on a 20 Hz worker.
+water with freely displaced air, original velocity sampling, multigrid pressure
+and bounded conservative water transport, with the current smoothed water look.
+Air applies atmospheric pressure at the water surface, including enclosed
+pockets; it has no simulated mass, compression or back-pressure. The initial
+cell budget is 50,000 (seed-1 showcase: 0.75 m at 512, 1 m at 1024), on a 20 Hz worker.
 This accepts thin-wall leaks and diffuse narrow-trench flow; exact fine-phase
 and conservative-momentum experiments remain opt-in. See the
-[default decision](docs/reports/ENG-122.md#large-world-default-decision-2026-10-03)
+[default decision](docs/reports/ENG-122.md#water-only-default-2026-10-03)
 for measured costs and limits.
 
 The editor MVP is a separate leaf package: run `cargo run -p spall_editor`. It creates versioned RON project/scene documents and canonical `.spvox` voxel assets, and never adds egui to the game runtime dependency graph.

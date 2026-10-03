@@ -219,6 +219,7 @@ pub struct MacGridWorld {
     cumulative_open_outflow_m3: f64,
     pressure_preconditioner: PressurePreconditioner,
     ambient_density_kg_m3: Option<f64>,
+    freely_displaced_air: bool,
     compressible_enclosed_air: bool,
     stage_diagnostics: bool,
     diagnostic_outer_step: u64,
@@ -284,6 +285,7 @@ impl MacGridWorld {
             cumulative_open_outflow_m3: 0.0,
             pressure_preconditioner: PressurePreconditioner::Jacobi,
             ambient_density_kg_m3: None,
+            freely_displaced_air: false,
             compressible_enclosed_air: false,
             stage_diagnostics: false,
             diagnostic_outer_step: 0,
@@ -379,9 +381,30 @@ impl MacGridWorld {
             return Err(MacError::InvalidConfig);
         }
         self.ambient_density_kg_m3 = Some(density);
+        self.freely_displaced_air = false;
         // Sealed air defaults to isothermal compressible gas; see
         // `set_compressible_enclosed_air`.
         self.compressible_enclosed_air = true;
+        self.pressure_pa.fill(0.0);
+        self.previous_pressure_diagonal = None;
+        Ok(())
+    }
+
+    /// Liquid-only pressure with atmospheric empty space, including sealed
+    /// pockets. Retains geometric PLIC/FCT transport and advect-before-force
+    /// ordering, but has no air inertia, pressure rows or compression.
+    pub fn set_freely_displaced_air(&mut self) -> Result<(), MacError> {
+        if self.conservative_momentum || self.phase_predictor.is_some() {
+            return Err(MacError::InvalidConfig);
+        }
+        self.ambient_density_kg_m3 = None;
+        self.compressible_enclosed_air = false;
+        self.freely_displaced_air = true;
+        self.strict_phase_bounds = true;
+        // Wet-only projection has much less work, but saturated donor cells
+        // need pressure residuals below the unchanged 1e-10 low-order bound.
+        self.config.pressure_relative_tolerance =
+            self.config.pressure_relative_tolerance.min(1.0e-10);
         self.pressure_pa.fill(0.0);
         self.previous_pressure_diagonal = None;
         Ok(())
@@ -1231,7 +1254,9 @@ impl MacGridWorld {
         for substep in 0..required {
             // Preserve the historical single-phase backend for matched replay.
             // In the two-phase candidate, advect before applying forces.
-            if self.ambient_density_kg_m3.is_some() && !self.conservative_momentum {
+            if (self.ambient_density_kg_m3.is_some() || self.freely_displaced_air)
+                && !self.conservative_momentum
+            {
                 let stage = Instant::now();
                 self.advect_velocity(sub_dt);
                 metrics.velocity_advection_micros += stage.elapsed().as_micros() as u64;
@@ -1248,7 +1273,7 @@ impl MacGridWorld {
             {
                 *velocity += g * sub_dt;
             }
-            if self.ambient_density_kg_m3.is_some() {
+            if self.ambient_density_kg_m3.is_some() || self.freely_displaced_air {
                 for velocity in &mut self.u {
                     *velocity += self.config.gravity_m_s2[0] * sub_dt;
                 }
@@ -1262,7 +1287,7 @@ impl MacGridWorld {
                 self.print_stage_diagnostic(substep, "after_gravity", sub_dt, 0.0);
             }
 
-            if self.ambient_density_kg_m3.is_none() {
+            if self.ambient_density_kg_m3.is_none() && !self.freely_displaced_air {
                 let stage = Instant::now();
                 self.advect_velocity(sub_dt);
                 metrics.velocity_advection_micros += stage.elapsed().as_micros() as u64;
@@ -1728,6 +1753,10 @@ impl MacGridWorld {
         let [nx, ny, nz] = self.dims();
         let n = self.fraction.len();
         let h2 = self.config.cell_size_m.powi(2);
+        // Ghost-fluid pressure samples lie inside the reconstructed liquid.
+        // Air-centred samples have p=0; their water fractions still participate
+        // in transport unchanged. See Bridson, Fluid Simulation notes, sec 4.5.
+        let surfaces = self.freely_displaced_air.then(|| self.reconstruct_planes());
         let mut liquid = vec![false; n];
         for (i, cell_is_liquid) in liquid.iter_mut().enumerate() {
             // Legacy single-phase rows follow C > 0. The opt-in two-phase
@@ -1735,6 +1764,11 @@ impl MacGridWorld {
             // coefficients; no water fraction or pressure row is discarded.
             *cell_is_liquid =
                 (self.ambient_density_kg_m3.is_some() || self.fraction[i] > 0.0) && !self.solid[i];
+            if let Some(planes) = &surfaces
+                && let Some(plane) = planes[i]
+            {
+                *cell_is_liquid = plane.normal.iter().sum::<f64>() * 0.5 < plane.alpha;
+            }
         }
         let liquid_indices: Vec<usize> = liquid
             .iter()
@@ -1813,7 +1847,7 @@ impl MacGridWorld {
                         diag[i] += (if liquid[j] {
                             self.relative_inverse_face_density(i, j)
                         } else {
-                            2.0
+                            self.surface_face_factor(i, j, axis, &liquid, surfaces.as_deref())
                         }) / h2;
                         // Empty-cell pressure is atmospheric at the face;
                         // the half-cell distance doubles the coefficient.
@@ -2184,7 +2218,10 @@ impl MacGridWorld {
             &mut component_mean_counts,
         );
         self.pressure_pa = p;
-        self.correct_faces(&liquid, dt);
+        self.correct_faces(&liquid, dt, surfaces.as_deref());
+        if self.freely_displaced_air {
+            self.extrapolate_surface_velocities(&liquid);
+        }
         let mut div_after: f64 = 0.0;
         for z in 0..nz {
             for y in 0..ny {
@@ -2354,7 +2391,46 @@ impl MacGridWorld {
         (labels, anchored)
     }
 
-    fn correct_faces(&mut self, liquid: &[bool], dt: f64) {
+    /// Reciprocal liquid-centre to atmospheric-interface distance in cell
+    /// units. Use the PLIC plane's actual segment intersection where present;
+    /// full/dry neighbours use the existing half-cell free surface. The 0.01
+    /// minimum theta is the explicit ghost-fluid conditioning floor, not a
+    /// liquid-fraction cutoff or an added pressure anchor.
+    fn surface_face_factor(
+        &self,
+        a: usize,
+        b: usize,
+        axis: usize,
+        liquid: &[bool],
+        surfaces: Option<&[Option<InterfacePlane>]>,
+    ) -> f64 {
+        let Some(planes) = surfaces else {
+            return 2.0;
+        };
+        let (wet, dry) = if liquid[a] { (a, b) } else { (b, a) };
+        let direction = if dry > wet { 1.0 } else { -1.0 };
+        let intersection = |plane: InterfacePlane, offset: f64| {
+            let slope = plane.normal[axis] * direction;
+            if slope > 0.0 {
+                Some(offset + (plane.alpha - 0.5 * plane.normal.iter().sum::<f64>()) / slope)
+            } else {
+                None
+            }
+        };
+        let theta = planes[wet]
+            .and_then(|p| intersection(p, 0.0))
+            .or_else(|| planes[dry].and_then(|p| intersection(p, 1.0)))
+            .filter(|t| t.is_finite() && *t >= 0.0 && *t <= 1.0)
+            .unwrap_or(0.5);
+        1.0 / theta.max(0.01)
+    }
+
+    fn correct_faces(
+        &mut self,
+        liquid: &[bool],
+        dt: f64,
+        surfaces: Option<&[Option<InterfacePlane>]>,
+    ) {
         let [nx, ny, nz] = self.dims();
         let h = self.config.cell_size_m;
         let k = dt / (self.config.density_kg_m3 * h);
@@ -2378,7 +2454,7 @@ impl MacGridWorld {
                     {
                         let fi = x + (nx + 1) * (y + ny * z);
                         let interface_factor = if liquid[li] != liquid[ri] {
-                            2.0
+                            self.surface_face_factor(li, ri, 0, liquid, surfaces)
                         } else {
                             self.relative_inverse_face_density(li, ri)
                         };
@@ -2407,7 +2483,7 @@ impl MacGridWorld {
                         {
                             let fi = x + nx * (y + (ny + 1) * z);
                             let interface_factor = if liquid[bi] != liquid[ti] {
-                                2.0
+                                self.surface_face_factor(bi, ti, 1, liquid, surfaces)
                             } else {
                                 self.relative_inverse_face_density(bi, ti)
                             };
@@ -2449,12 +2525,87 @@ impl MacGridWorld {
                     {
                         let fi = x + nx * (y + ny * z);
                         let interface_factor = if liquid[ai] != liquid[bi] {
-                            2.0
+                            self.surface_face_factor(ai, bi, 2, liquid, surfaces)
                         } else {
                             self.relative_inverse_face_density(ai, bi)
                         };
                         self.w[fi] -=
                             interface_factor * k * (self.pressure_pa[bi] - self.pressure_pa[ai]);
+                    }
+                }
+            }
+        }
+        self.enforce_wall_velocities();
+    }
+
+    /// Ghost-fluid advection needs a narrow velocity extension outside liquid,
+    /// not independently accelerating dry-space velocities. Three face layers
+    /// cover the bounded CFL backtrace. Solids/closed exterior are never donors.
+    fn extrapolate_surface_velocities(&mut self, liquid: &[bool]) {
+        let dims = self.dims();
+        for axis in 0..3 {
+            let mut ext = dims;
+            ext[axis] += 1;
+            let count = ext.iter().product();
+            let mut known = vec![false; count];
+            let mut blocked = vec![false; count];
+            for i in 0..count {
+                let p = [i % ext[0], i / ext[0] % ext[1], i / (ext[0] * ext[1])];
+                let mut low = p;
+                let lower = if p[axis] > 0 {
+                    low[axis] -= 1;
+                    Some(self.cell_index(low[0], low[1], low[2]))
+                } else {
+                    None
+                };
+                let upper = (p[axis] < dims[axis]).then(|| self.cell_index(p[0], p[1], p[2]));
+                let open = axis == 1 && p[axis] == dims[axis] && self.config.open_top;
+                blocked[i] = lower.is_some_and(|c| self.solid[c])
+                    || upper.is_some_and(|c| self.solid[c])
+                    || ((lower.is_none() || upper.is_none()) && !open);
+                known[i] = !blocked[i]
+                    && (lower.is_some_and(|c| liquid[c]) || upper.is_some_and(|c| liquid[c]));
+            }
+            let faces = match axis {
+                0 => &mut self.u,
+                1 => &mut self.v,
+                _ => &mut self.w,
+            };
+            for (i, velocity) in faces.iter_mut().enumerate() {
+                if !known[i] {
+                    *velocity = 0.0;
+                }
+            }
+            let strides = [1, ext[0], ext[0] * ext[1]];
+            for _ in 0..3 {
+                let source = faces.clone();
+                let previous = known.clone();
+                for i in 0..count {
+                    if blocked[i] || previous[i] {
+                        continue;
+                    }
+                    let p = [i % ext[0], i / ext[0] % ext[1], i / (ext[0] * ext[1])];
+                    let (mut sum, mut donors) = (0.0, 0);
+                    for a in 0..3 {
+                        for positive in [false, true] {
+                            let j = if positive && p[a] + 1 < ext[a] {
+                                Some(i + strides[a])
+                            } else if !positive && p[a] > 0 {
+                                Some(i - strides[a])
+                            } else {
+                                None
+                            };
+                            if let Some(j) = j
+                                && previous[j]
+                            {
+                                sum += source[j];
+                                donors += 1;
+                            }
+                        }
+                    }
+                    if donors > 0 {
+                        faces[i] = sum / f64::from(donors);
+                        known[i] = true;
                     }
                 }
             }
@@ -2514,9 +2665,8 @@ impl MacGridWorld {
         let [nx, ny, nz] = self.dims();
         let h = self.config.cell_size_m;
         let old = self.fraction.clone();
-        let planes = self
-            .ambient_density_kg_m3
-            .map(|_| self.reconstruct_planes());
+        let planes = (self.ambient_density_kg_m3.is_some() || self.freely_displaced_air)
+            .then(|| self.reconstruct_planes());
         let n = old.len();
         let face_flux = |axis: usize, xf: usize, yf: usize, zf: usize| {
             let f = [xf, yf, zf];
@@ -2871,7 +3021,13 @@ impl MacGridWorld {
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
                 (lo.min(v), hi.max(v))
             });
-        if !touched.is_empty() && (minimum < -1.0e-10 || maximum > 1.0 + 1.0e-10) {
+        // Strict mode validates the final paired transfers below against exact
+        // [0,1] bounds. Its preliminary FCT candidate is not yet accepted;
+        // rejecting before that limiter prevents it doing its intended work.
+        if !self.strict_phase_bounds
+            && !touched.is_empty()
+            && (minimum < -1.0e-10 || maximum > 1.0 + 1.0e-10)
+        {
             return Err(MacError::TransportBoundsViolation { minimum, maximum });
         }
         let volume = self.cell_volume();
@@ -5237,7 +5393,7 @@ mod tests {
     /// tank filled to y=14 (3.5 m). The 2x4x2-cell interior (1 m air column,
     /// 1.5-2.5 m) starts dry at atmospheric pressure. Returns the water
     /// volume inside the bell interior after each tick.
-    fn diving_bell_run(compressible: bool, ticks: usize) -> (Vec<f64>, f64) {
+    fn diving_bell_run(air: Option<bool>, ticks: usize) -> (Vec<f64>, f64) {
         let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [12, 16, 2], 4096).unwrap();
         let mut volume = Volume::new(VolumeId::new(901).unwrap(), CellSizeCode::Quarter);
         volume
@@ -5259,9 +5415,13 @@ mod tests {
         volume.apply_edit(&plan).unwrap();
         let boundary = SolidBoundary::capture(&volume, spec).unwrap();
         let mut grid = MacGridWorld::new(&boundary, MacConfig::default()).unwrap();
-        grid.set_ambient_density(1.2).unwrap();
         grid.set_pressure_preconditioner(PressurePreconditioner::Multigrid);
-        grid.set_compressible_enclosed_air(compressible).unwrap();
+        if let Some(compressible) = air {
+            grid.set_ambient_density(1.2).unwrap();
+            grid.set_compressible_enclosed_air(compressible).unwrap();
+        } else {
+            grid.set_freely_displaced_air().unwrap();
+        }
         let bell = |x: usize, y: usize| (5..=6).contains(&x) && (6..=9).contains(&y);
         for z in 0..2 {
             for y in 0..14 {
@@ -5312,18 +5472,59 @@ mod tests {
             let tail = &series[series.len() / 2..];
             tail.iter().sum::<f64>() / tail.len() as f64
         };
-        let (compressible, mass_change) = diving_bell_run(true, 1200);
+        let (compressible, mass_change) = diving_bell_run(Some(true), 1200);
         assert!(mass_change.abs() < 1e-10);
         let measured = late_mean(&compressible);
         assert!(
             (measured / expected_volume - 1.0).abs() < 0.25,
             "measured {measured} m^3 vs isothermal {expected_volume} m^3"
         );
-        let (rigid, _) = diving_bell_run(false, 1200);
+        let (rigid, _) = diving_bell_run(Some(false), 1200);
         assert!(
             late_mean(&rigid) < 0.1 * expected_volume,
             "incompressible air should keep water out"
         );
+    }
+
+    #[test]
+    fn freely_displaced_air_fills_diving_bell_without_creating_water() {
+        let (series, mass_change) = diving_bell_run(None, 600);
+        let late = &series[series.len() / 2..];
+        let mean = late.iter().sum::<f64>() / late.len() as f64;
+        // Full 2x4x2 interior is 0.25 m3. Ignoring air pressure must let the
+        // bell flood rather than retain a rigid or compressed gas pocket.
+        assert!(mean > 0.225, "bell retained an air pocket: {mean}");
+        assert!(
+            mass_change.abs() < 1e-10,
+            "water mass changed: {mass_change}"
+        );
+    }
+
+    #[test]
+    fn freely_displaced_air_uses_plic_surface_pressure_and_preserves_partial_water() {
+        for top in [0.25, 0.75] {
+            let mut grid = all_air_grid([1, 5, 1], MacConfig::default());
+            grid.set_freely_displaced_air().unwrap();
+            for y in 0..3 {
+                grid.set_fraction(GlobalCell::new(0, y, 0), 1.0).unwrap();
+            }
+            grid.set_fraction(GlobalCell::new(0, 3, 0), top).unwrap();
+            let volume = grid.water_volume_m3();
+            let rows = if top > 0.5 { 4 } else { 3 };
+            for _ in 0..20 {
+                let step = grid.step(1.0 / 60.0).unwrap();
+                assert_eq!(step.pressure_active_rows_total, rows);
+                assert_eq!(step.pressure_converged_substeps, step.substeps);
+                assert!((grid.water_volume_m3() - volume).abs() < 1e-12);
+                assert!(grid.max_face_speed_l1().0 < 1e-7);
+            }
+            let surface_y = 3.0 + top;
+            let sample_y = f64::from(rows as u32) - 0.5;
+            let expected =
+                grid.config.density_kg_m3 * 9.81 * grid.config.cell_size_m * (surface_y - sample_y);
+            assert!((grid.pressure_pa[rows as usize - 1] - expected).abs() < 1e-5);
+            assert!(grid.fraction[3] > 0.0, "air-centred water was discarded");
+        }
     }
 
     #[test]
