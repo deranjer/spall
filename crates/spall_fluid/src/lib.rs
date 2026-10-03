@@ -10,6 +10,7 @@ pub mod component_fluid;
 pub mod cut_cell;
 pub mod fixtures;
 pub mod grid_mac;
+pub mod phase_graph;
 pub mod phase_pressure;
 pub mod phase_water;
 

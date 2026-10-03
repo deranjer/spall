@@ -95,6 +95,13 @@ impl CutCellGeometry {
         self.fine_spec
     }
 
+    pub(crate) fn component_at_index(&self, index: usize) -> Option<u32> {
+        self.fine_component
+            .get(index)
+            .copied()
+            .filter(|&id| id != SOLID)
+    }
+
     /// Component centroid in domain-local fine-voxel units. Keeping the
     /// origin separate avoids losing precision at large global coordinates.
     pub fn component_centroid(&self, index: usize) -> [f64; 3] {

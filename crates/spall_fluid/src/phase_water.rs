@@ -117,7 +117,9 @@ pub struct PhaseTransportMetrics {
 #[derive(Debug, Clone)]
 pub struct PhaseWater {
     geometry: Arc<CutCellGeometry>,
-    fractions: Vec<f64>,
+    // Share snapshots without copying the fine array, including when installing
+    // an accepted Vec. Arc<Vec<_>> avoids Vec -> Arc<[ _ ]> relocation scratch.
+    fractions: Arc<Vec<f64>>,
     faces: Arc<[u32]>,
     strides: [usize; 3],
     voxel_size_m: f64,
@@ -174,7 +176,7 @@ impl PhaseWater {
         faces.shrink_to_fit();
         let state = Self {
             geometry,
-            fractions: fractions.to_vec(),
+            fractions: fractions.to_vec().into(),
             faces: faces.into(),
             strides,
             voxel_size_m,
@@ -198,7 +200,7 @@ impl PhaseWater {
         self.basins_for(&fractions)?;
         Ok(Self {
             geometry: self.geometry.clone(),
-            fractions,
+            fractions: fractions.into(),
             faces: self.faces.clone(),
             strides: self.strides,
             voxel_size_m: self.voxel_size_m,
@@ -207,6 +209,12 @@ impl PhaseWater {
     }
     pub fn geometry(&self) -> &Arc<CutCellGeometry> {
         &self.geometry
+    }
+
+    pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.geometry, &other.geometry)
+            && Arc::ptr_eq(&self.fractions, &other.fractions)
+            && self.voxel_size_m.to_bits() == other.voxel_size_m.to_bits()
     }
     pub fn faces(&self) -> PhaseFaces<'_> {
         PhaseFaces {
@@ -290,7 +298,7 @@ impl PhaseWater {
         Self::overlap_in(&self.fractions, f)
     }
 
-    fn overlap_in(fractions: &[f64], f: PhaseFace) -> f64 {
+    pub(crate) fn overlap_in(fractions: &[f64], f: PhaseFace) -> f64 {
         if f.axis == 1 {
             f64::from(fractions[f.lower] == 1.0 && fractions[f.upper] > 0.0)
         } else {
@@ -363,6 +371,30 @@ impl PhaseWater {
         flux_m3_s: &[f64],
         cfl: f64,
     ) -> Result<PhaseTransportMetrics, PhaseError> {
+        self.transport_internal(dt, flux_m3_s, cfl, false)
+            .map(|(metrics, _)| metrics)
+    }
+
+    /// The coupled ledger receives exactly the accepted signed transfers in
+    /// fine-voxel fraction units. Default transport still drops this array
+    /// before basin validation to retain its established scratch lifetime.
+    pub(crate) fn transport_with_transfers(
+        &mut self,
+        dt: f64,
+        flux_m3_s: &[f64],
+        cfl: f64,
+    ) -> Result<(PhaseTransportMetrics, Vec<f64>), PhaseError> {
+        self.transport_internal(dt, flux_m3_s, cfl, true)
+            .map(|(m, t)| (m, t.expect("requested accepted transfers")))
+    }
+
+    fn transport_internal(
+        &mut self,
+        dt: f64,
+        flux_m3_s: &[f64],
+        cfl: f64,
+        retain_transfers: bool,
+    ) -> Result<(PhaseTransportMetrics, Option<Vec<f64>>), PhaseError> {
         if !dt.is_finite()
             || dt <= 0.0
             || !cfl.is_finite()
@@ -449,18 +481,27 @@ impl PhaseWater {
             passes += 1;
         };
         let moved: f64 = transfers.iter().map(|t| t.abs()).sum();
-        // Neither numeric buffer is needed while validating candidate basins.
+        // Ordinary transport releases both buffers before basin validation.
+        // Graph routing retains accepted transfers until its ledger is built.
         drop(outgoing);
-        drop(transfers);
+        let transfers = if retain_transfers {
+            Some(transfers)
+        } else {
+            drop(transfers);
+            None
+        };
         // Basin limit is part of atomic acceptance, including fragmentation.
         self.basins_for(&next)?;
-        self.fractions = next;
-        Ok(PhaseTransportMetrics {
-            moved_water_m3: moved * volume,
-            limited_water_m3: (original_moved - moved).max(0.0) * volume,
-            limiter_passes: passes,
-            numeric_scratch_bytes,
-        })
+        self.fractions = next.into();
+        Ok((
+            PhaseTransportMetrics {
+                moved_water_m3: moved * volume,
+                limited_water_m3: (original_moved - moved).max(0.0) * volume,
+                limiter_passes: passes,
+                numeric_scratch_bytes,
+            },
+            transfers,
+        ))
     }
 }
 
