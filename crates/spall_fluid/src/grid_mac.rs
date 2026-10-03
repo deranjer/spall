@@ -181,6 +181,7 @@ pub struct MacGridWorld {
     compressible_enclosed_air: bool,
     stage_diagnostics: bool,
     diagnostic_outer_step: u64,
+    strict_phase_bounds: bool,
 }
 
 impl MacGridWorld {
@@ -243,6 +244,7 @@ impl MacGridWorld {
             compressible_enclosed_air: false,
             stage_diagnostics: false,
             diagnostic_outer_step: 0,
+            strict_phase_bounds: false,
         })
     }
 
@@ -252,6 +254,12 @@ impl MacGridWorld {
 
     pub fn config(&self) -> MacConfig {
         self.config
+    }
+
+    /// Reference phase coupling requires strictly bounded canonical fractions.
+    /// Legacy replay retains its existing roundoff-tolerant transport path.
+    pub(crate) fn set_strict_phase_bounds(&mut self) {
+        self.strict_phase_bounds = true;
     }
 
     pub fn set_pressure_preconditioner(&mut self, value: PressurePreconditioner) {
@@ -392,6 +400,35 @@ impl MacGridWorld {
     /// then Y, then Z). Solid cells are always zero.
     pub fn fractions(&self) -> &[f64] {
         &self.fraction
+    }
+
+    pub fn pressure_at(&self, cell: GlobalCell) -> Option<f64> {
+        self.spec.index_of(cell).map(|i| self.pressure_pa[i])
+    }
+
+    /// Cell-centred liquid momentum diagnostic; not a conservative advection
+    /// ledger or a mixture-pressure wall-force accounting proof.
+    pub fn liquid_momentum_kg_m_s(&self) -> [f64; 3] {
+        let [nx, ny, nz] = self.dims();
+        let mut total = [0.0; 3];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let mass = self.config.density_kg_m3
+                        * self.fraction[self.cell_index(x, y, z)]
+                        * self.cell_volume();
+                    let velocity = [
+                        0.5 * (self.u[self.u_index(x, y, z)] + self.u[self.u_index(x + 1, y, z)]),
+                        0.5 * (self.v[self.v_index(x, y, z)] + self.v[self.v_index(x, y + 1, z)]),
+                        0.5 * (self.w[self.w_index(x, y, z)] + self.w[self.w_index(x, y, z + 1)]),
+                    ];
+                    for axis in 0..3 {
+                        total[axis] += mass * velocity[axis];
+                    }
+                }
+            }
+        }
+        total
     }
 
     pub fn trapped_fractions(&self) -> &[f64] {
@@ -2499,7 +2536,7 @@ impl MacGridWorld {
             }
         }
         let mut corrected_outflow = 0.0;
-        for (left, right, a, _) in anti {
+        for (edge, &(left, right, a, _)) in anti.iter().enumerate() {
             let limiter = match (left, right) {
                 (Some(l), Some(r)) if a >= 0.0 => r_minus[l].min(r_plus[r]),
                 (Some(l), Some(r)) => r_plus[l].min(r_minus[r]),
@@ -2510,6 +2547,9 @@ impl MacGridWorld {
                 _ => 1.0,
             };
             let flux = a * limiter;
+            if self.strict_phase_bounds {
+                low_fluxes[edge] += flux;
+            }
             accumulate_region_flux(
                 left,
                 right,
@@ -2543,7 +2583,39 @@ impl MacGridWorld {
             return Err(MacError::TransportBoundsViolation { minimum, maximum });
         }
         let volume = self.cell_volume();
-        let net_open_outflow_fraction = outflow_fraction + corrected_outflow;
+        let mut net_open_outflow_fraction = outflow_fraction + corrected_outflow;
+        if self.strict_phase_bounds {
+            // Re-limit the actually accepted donor+PLIC face transfers, never
+            // cell amounts. Reuse FCT scratch and recompute all boundary/region
+            // ledgers from exactly the final paired transfers.
+            strict_transfer_bounds(
+                &old,
+                &anti,
+                &mut low_fluxes,
+                &touched,
+                &mut p_plus,
+                &mut p_minus,
+                &mut low,
+            )?;
+            net_open_outflow_fraction = 0.0;
+            region_outflow_fraction = 0.0;
+            region_inflow_fraction = 0.0;
+            for ((left, right, _, _), &flux) in anti.iter().zip(&low_fluxes) {
+                accumulate_region_flux(
+                    *left,
+                    *right,
+                    flux,
+                    tracked_region,
+                    &mut region_outflow_fraction,
+                    &mut region_inflow_fraction,
+                );
+                if right.is_none() {
+                    net_open_outflow_fraction += flux;
+                } else if left.is_none() {
+                    net_open_outflow_fraction -= flux;
+                }
+            }
+        }
         if !net_open_outflow_fraction.is_finite() || net_open_outflow_fraction < 0.0 {
             return Err(MacError::NegativeOpenBoundaryFlux {
                 volume_fraction: net_open_outflow_fraction,
@@ -2564,6 +2636,79 @@ const ATMOSPHERIC_PRESSURE_PA: f64 = 101_325.0;
 /// Fraction excursion below which the shared-face donor limiter leaves fluxes
 /// unscaled. Must stay well inside the 1e-10 transport bound check.
 const DONOR_LIMIT_TOLERANCE: f64 = 1.0e-12;
+
+fn strict_transfer_bounds(
+    old: &[f64],
+    edges: &[(Option<usize>, Option<usize>, f64, bool)],
+    transfers: &mut [f64],
+    touched: &[usize],
+    incoming: &mut [f64],
+    outgoing: &mut [f64],
+    candidate: &mut [f64],
+) -> Result<(), MacError> {
+    for pass in 0..=64 {
+        for &i in touched {
+            incoming[i] = 0.0;
+            outgoing[i] = 0.0;
+        }
+        for (&(left, right, _, _), &flux) in edges.iter().zip(transfers.iter()) {
+            let (donor, receiver) = if flux >= 0.0 {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            if let Some(i) = donor {
+                outgoing[i] += flux.abs();
+            }
+            if let Some(i) = receiver {
+                incoming[i] += flux.abs();
+            }
+        }
+        let mut valid = true;
+        let mut minimum = 1.0_f64;
+        let mut maximum = 0.0_f64;
+        for &i in touched {
+            // Form the signed flux difference first: a balanced full-cell
+            // cycle stays exactly full instead of acquiring an ulp from
+            // adding a transfer to 1 before subtracting its matching outflow.
+            let v = old[i] + (incoming[i] - outgoing[i]);
+            candidate[i] = v;
+            minimum = minimum.min(v);
+            maximum = maximum.max(v);
+            valid &= v.is_finite() && (0.0..=1.0).contains(&v);
+        }
+        if valid {
+            return Ok(());
+        }
+        if pass == 64 {
+            return Err(MacError::TransportBoundsViolation { minimum, maximum });
+        }
+        for &i in touched {
+            let inc = incoming[i];
+            let out = outgoing[i];
+            let v = candidate[i];
+            incoming[i] = 1.0;
+            outgoing[i] = 1.0;
+            if v < 0.0 {
+                outgoing[i] = ((old[i] + inc) / out).clamp(0.0, 1.0) * (1.0 - 32.0 * f64::EPSILON);
+            } else if v > 1.0 {
+                incoming[i] =
+                    ((1.0 - old[i] + out) / inc).clamp(0.0, 1.0) * (1.0 - 32.0 * f64::EPSILON);
+            }
+        }
+        for (&(left, right, _, _), flux) in edges.iter().zip(transfers.iter_mut()) {
+            let (donor, receiver) = if *flux >= 0.0 {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            *flux *= donor
+                .map_or(1.0, |i| outgoing[i])
+                .min(receiver.map_or(1.0, |i| incoming[i]));
+        }
+    }
+    unreachable!("bounded strict transfer loop returns")
+}
 
 /// Plane n.x <= alpha inside the unit cell [0,1]^3. The normal is a
 /// Youngs-style smoothed VOF gradient; alpha is inverted from the stored volume.
@@ -4057,6 +4202,78 @@ mod tests {
     use super::*;
     use spall_core::{BrickCoord, CellSizeCode, MaterialId, Revision, VolumeId};
     use spall_voxel::{Brick, Volume};
+
+    #[test]
+    fn strict_phase_transfers_preserve_saturated_cycles_and_signed_boundary_accounting() {
+        let old = [1.0, 1.0, 1.0];
+        let edges = [
+            (Some(0), Some(1), 0.0, false),
+            (Some(1), Some(2), 0.0, false),
+            (Some(0), Some(2), 0.0, false),
+        ];
+        let mut transfers = [0.1, 0.1, -0.1];
+        let mut incoming = [0.0; 3];
+        let mut outgoing = [0.0; 3];
+        let mut candidate = old;
+        strict_transfer_bounds(
+            &old,
+            &edges,
+            &mut transfers,
+            &[0, 1, 2],
+            &mut incoming,
+            &mut outgoing,
+            &mut candidate,
+        )
+        .unwrap();
+        assert_eq!(transfers, [0.1, 0.1, -0.1]);
+        assert_eq!(candidate, old);
+
+        // Negative orientation: water exits the left boundary from cell 0,
+        // while a full neighbour receives a limited, paired internal transfer.
+        let old = [0.2, 1.0, 0.0];
+        let edges = [(None, Some(0), 0.0, true), (Some(0), Some(1), 0.0, false)];
+        let mut transfers = [-0.1, 0.1];
+        candidate = old;
+        strict_transfer_bounds(
+            &old,
+            &edges,
+            &mut transfers,
+            &[0, 1],
+            &mut incoming,
+            &mut outgoing,
+            &mut candidate,
+        )
+        .unwrap();
+        assert_eq!(transfers[1], 0.0);
+        assert!(candidate.iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!(
+            (candidate.iter().sum::<f64>() - old.iter().sum::<f64>() - transfers[0]).abs() < 1e-15
+        );
+    }
+
+    #[test]
+    fn strict_phase_transfers_reject_an_unresolved_saturated_chain() {
+        let old = [1.0; 108];
+        let edges: Vec<_> = (0..107)
+            .map(|i| (Some(i), Some(i + 1), 0.0, false))
+            .collect();
+        let mut transfers = vec![0.1; edges.len()];
+        let mut incoming = [0.0; 108];
+        let mut outgoing = [0.0; 108];
+        let mut candidate = old;
+        assert!(matches!(
+            strict_transfer_bounds(
+                &old,
+                &edges,
+                &mut transfers,
+                &(0..108).collect::<Vec<_>>(),
+                &mut incoming,
+                &mut outgoing,
+                &mut candidate
+            ),
+            Err(MacError::TransportBoundsViolation { .. })
+        ));
+    }
 
     #[test]
     fn geometric_plane_matches_analytic_volumes_and_translates_sharp_interfaces() {

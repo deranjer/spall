@@ -4,6 +4,12 @@ Experimental, not registered in `WireTag`, `WaterState`, store checkpoints or
 journals. This payload is only a proposed replacement for the amount/ledger
 arrays within a future explicitly versioned canonical restart state.
 
+Increment 7's fine MAC phase/pressure reference does not change this decision.
+Its strict channel transport gate fails and conservative momentum accuracy is
+unaccepted. The numerical candidate is cloned only for atomic in-memory steps;
+that clone is not a restart payload or a durable transaction. No reference
+pressure, velocity, air-model or runtime topology layout is serialized.
+
 ## Increment 5: component totals cannot recover phase placement
 
 The new experimental `PhaseWater` retains horizontal water fractions at fine

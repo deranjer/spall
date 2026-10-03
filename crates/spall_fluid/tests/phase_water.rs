@@ -657,3 +657,142 @@ fn two_buffer_limiter_exhaustion_preserves_all_amount_bits() {
         initial
     );
 }
+
+fn pressure_config() -> spall_fluid::phase_pressure::PhasePressureConfig {
+    use spall_fluid::grid_mac::{MacConfig, PressurePreconditioner};
+    spall_fluid::phase_pressure::PhasePressureConfig {
+        mac: MacConfig {
+            pressure_max_iterations: 1000,
+            ..MacConfig::default()
+        },
+        air_density_kg_m3: 1.2,
+        preconditioner: PressurePreconditioner::Multigrid,
+        max_retained_array_bytes: 100_000_000,
+    }
+}
+
+#[test]
+fn phase_pressure_retains_different_heads_behind_a_dry_crest() {
+    use spall_fluid::phase_pressure::PhasePressureWorld;
+    let phase = fixture(
+        [9, 6, 3],
+        |x, y, _| x == 4 && y < 5,
+        |x, y, _| {
+            if x < 4 {
+                (2.0 - y as f64).clamp(0.0, 1.0)
+            } else if x > 4 {
+                (1.3 - y as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        },
+        100,
+    );
+    let initial = phase.fractions().to_vec();
+    let volume = phase.water_volume_m3();
+    let mut world = PhasePressureWorld::new(phase, pressure_config()).unwrap();
+    for _ in 0..600 {
+        let metrics = world.step(0.01).unwrap();
+        assert_eq!(metrics.pressure_converged_substeps, metrics.substeps);
+        assert!(metrics.conservation_error_m3.abs() < 1e-12);
+    }
+    assert!(
+        (world.phase().water_volume_m3() + world.solver().cumulative_open_outflow_m3() - volume)
+            .abs()
+            < 1e-10
+    );
+    let difference = world
+        .phase()
+        .fractions()
+        .iter()
+        .zip(initial)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    assert!(difference < 1e-6, "head/fraction drift {difference}");
+    assert!(world.solver().max_liquid_speed_m_s() < 1e-6);
+    let left = world
+        .solver()
+        .pressure_at(GlobalCell::new(1, 0, 1))
+        .unwrap();
+    let right = world
+        .solver()
+        .pressure_at(GlobalCell::new(7, 0, 1))
+        .unwrap();
+    assert!(
+        left - right > 1000.0,
+        "head pressures unexpectedly merged: {left}, {right}"
+    );
+    assert_eq!(world.phase().fractions(), world.solver().fractions());
+}
+
+#[test]
+fn phase_pressure_late_failure_discards_fraction_velocity_pressure_and_cache() {
+    use spall_fluid::phase_pressure::{PhasePressureError, PhasePressureWorld};
+    let phase = fixture(
+        [6, 6, 3],
+        |_, _, _| false,
+        |x, y, _| if x < 3 && y < 3 { 1.0 } else { 0.0 },
+        100,
+    );
+    let initial = phase.fractions().to_vec();
+    let mut config = pressure_config();
+    config.mac.pressure_max_iterations = 1;
+    let mut world = PhasePressureWorld::new(phase, config).unwrap();
+    let initial_bytes = world.retained_array_bytes();
+    let error = world.step(0.01).unwrap_err();
+    assert!(matches!(
+        error,
+        PhasePressureError::PressureNotConverged { .. }
+    ));
+    assert_eq!(world.step(0.01).unwrap_err(), error);
+    assert_eq!(world.phase().fractions(), initial);
+    assert_eq!(world.solver().fractions(), initial);
+    assert_eq!(world.solver().max_face_component_velocity_m_s(), 0.0);
+    assert_eq!(world.solver().cumulative_open_outflow_m3(), 0.0);
+    assert_eq!(
+        world.solver().pressure_at(GlobalCell::new(0, 0, 0)),
+        Some(0.0)
+    );
+    assert_eq!(world.retained_array_bytes(), initial_bytes);
+}
+
+#[test]
+fn phase_pressure_rejects_scale_array_budget_and_invalid_dt() {
+    use spall_fluid::phase_pressure::{PhasePressureError, PhasePressureWorld};
+    let phase = fixture(
+        [6, 6, 3],
+        |_, _, _| false,
+        |_, y, _| if y < 2 { 1.0 } else { 0.0 },
+        100,
+    );
+    let mut config = pressure_config();
+    config.mac.cell_size_m = 0.5;
+    assert!(matches!(
+        PhasePressureWorld::new(phase.clone(), config),
+        Err(PhasePressureError::InvalidConfig)
+    ));
+    config = pressure_config();
+    config.max_retained_array_bytes = 1;
+    assert!(matches!(
+        PhasePressureWorld::new(phase.clone(), config),
+        Err(PhasePressureError::ArrayLimit { .. })
+    ));
+    config = pressure_config();
+    let initial_bytes = PhasePressureWorld::new(phase.clone(), config)
+        .unwrap()
+        .retained_array_bytes();
+    config.max_retained_array_bytes = initial_bytes;
+    let initial = phase.fractions().to_vec();
+    let mut world = PhasePressureWorld::new(phase, config).unwrap();
+    for dt in [0.0, -0.01, f64::NAN, f64::INFINITY] {
+        assert!(matches!(
+            world.step(dt),
+            Err(PhasePressureError::Mac(
+                spall_fluid::grid_mac::MacError::InvalidTimeStep
+            ))
+        ));
+    }
+    assert_eq!(world.phase().fractions(), initial);
+    assert_eq!(world.solver().max_face_component_velocity_m_s(), 0.0);
+    assert_eq!(world.retained_array_bytes(), initial_bytes);
+}

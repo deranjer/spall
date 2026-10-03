@@ -118,7 +118,7 @@ pub struct PhaseTransportMetrics {
 pub struct PhaseWater {
     geometry: Arc<CutCellGeometry>,
     fractions: Vec<f64>,
-    faces: Vec<u32>,
+    faces: Arc<[u32]>,
     strides: [usize; 3],
     voxel_size_m: f64,
     limits: PhaseLimits,
@@ -175,7 +175,7 @@ impl PhaseWater {
         let state = Self {
             geometry,
             fractions: fractions.to_vec(),
-            faces,
+            faces: faces.into(),
             strides,
             voxel_size_m,
             limits,
@@ -186,6 +186,24 @@ impl PhaseWater {
 
     pub fn fractions(&self) -> &[f64] {
         &self.fractions
+    }
+    pub fn voxel_size_m(&self) -> f64 {
+        self.voxel_size_m
+    }
+
+    /// Atomic candidate from a coupled solver on this exact immutable geometry.
+    /// The derived packed topology is shared; all phase validation is retained.
+    pub(crate) fn with_fractions(&self, fractions: Vec<f64>) -> Result<Self, PhaseError> {
+        self.geometry.aggregate_amounts(&fractions)?;
+        self.basins_for(&fractions)?;
+        Ok(Self {
+            geometry: self.geometry.clone(),
+            fractions,
+            faces: self.faces.clone(),
+            strides: self.strides,
+            voxel_size_m: self.voxel_size_m,
+            limits: self.limits,
+        })
     }
     pub fn geometry(&self) -> &Arc<CutCellGeometry> {
         &self.geometry
@@ -199,7 +217,7 @@ impl PhaseWater {
     /// Allocated fraction/face array storage; excludes shared geometry and
     /// temporary basin/transport scratch space. This fine reference is costly.
     pub fn array_storage_bytes(&self) -> usize {
-        self.fractions.capacity() * size_of::<f64>() + self.faces.capacity() * size_of::<u32>()
+        self.fractions.capacity() * size_of::<f64>() + self.faces.len() * size_of::<u32>()
     }
     pub fn water_volume_m3(&self) -> f64 {
         self.fractions.iter().sum::<f64>() * self.voxel_size_m.powi(3)
