@@ -1,5 +1,25 @@
 # Validation and operating contract
 
+## Generated-world water default
+
+The selected performance default is adaptive coarse MAC water with original
+velocity sampling, existing multigrid pressure, bounded conservative water
+transport and the current game water look. Generated scenes already select
+this path; this decision retains it explicitly. Normal `cargo xtask play`
+needs no water-method flag. Seed-1 showcase uses 0.75 m cells at 512 and 1 m
+at 1024, a 50,000-cell initial target, growth capped at twice that budget and
+a 20 Hz worker. The maximum coarsening fallback can exceed the initial target;
+domain limits still apply. Hand-authored scenes keep their declared resolution.
+
+Historical trench measurements: median 15.0/25.5 ms per water step and
+0.91/0.88 times realtime (512/1024). These are prior release measurements,
+not a fresh benchmark or a guaranteed frame rate. Thin walls may leak, narrow
+trenches diffuse, some shoreline seed water is dropped and reported, and
+parasitic rest currents remain. These accepted default tradeoffs do not mark
+ENG-122's exact-geometry/hydrostatic/sealed-air gates passed. The fine-phase
+comparison and conservative momentum remain experimental options in the local
+demo. Details and replacement criteria: `docs/reports/ENG-122.md`.
+
 ## ENG-122 windowed water comparison
 
 Run from the ENG-122 checkout:
