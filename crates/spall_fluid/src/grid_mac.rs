@@ -6,6 +6,8 @@ use std::time::Instant;
 
 use spall_core::GlobalCell;
 
+use crate::phase_graph::{GraphError, GraphLimits, PhaseGraph};
+use crate::phase_water::PhaseWater;
 use crate::{DomainSpec, SolidBoundary};
 
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +63,11 @@ pub struct MacStepMetrics {
     pub pressure_residual_initial_max: f64,
     pub pressure_residual_final_max: f64,
     pub pressure_converged_substeps: u32,
+    /// Opt-in phase-aware coarse predictor; final pressure rows remain fine.
+    pub phase_predictor_rows_total: u64,
+    pub phase_predictor_reuses: u32,
+    pub phase_predictor_rebuilds: u32,
+    pub phase_predictor_micros: u64,
     pub divergence_before_max_s: f64,
     pub divergence_after_max_s: f64,
     pub water_volume_before_m3: f64,
@@ -104,6 +111,7 @@ pub struct FractionBandDiagnostic {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MacError {
+    PhaseGraph(GraphError),
     InvalidConfig,
     InvalidTimeStep,
     SubstepBudgetExceeded { required: u32, maximum: u32 },
@@ -121,6 +129,7 @@ pub enum MacError {
 impl std::fmt::Display for MacError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PhaseGraph(error) => write!(f, "phase pressure predictor: {error}"),
             Self::InvalidConfig => write!(f, "invalid MAC grid configuration"),
             Self::InvalidTimeStep => write!(f, "outer timestep must be finite and positive"),
             Self::SubstepBudgetExceeded { required, maximum } => write!(
@@ -185,6 +194,7 @@ pub struct MacGridWorld {
     stage_diagnostics: bool,
     diagnostic_outer_step: u64,
     strict_phase_bounds: bool,
+    phase_predictor: Option<PhasePredictor>,
 }
 
 impl MacGridWorld {
@@ -248,6 +258,7 @@ impl MacGridWorld {
             stage_diagnostics: false,
             diagnostic_outer_step: 0,
             strict_phase_bounds: false,
+            phase_predictor: None,
         })
     }
 
@@ -267,6 +278,40 @@ impl MacGridWorld {
 
     pub fn set_pressure_preconditioner(&mut self, value: PressurePreconditioner) {
         self.pressure_preconditioner = value;
+    }
+
+    pub(crate) fn set_phase_pressure_predictor(
+        &mut self,
+        phase: &PhaseWater,
+        limits: GraphLimits,
+        sweeps: u32,
+    ) -> Result<(), MacError> {
+        if self.ambient_density_kg_m3.is_none()
+            || sweeps == 0
+            || sweeps > 64
+            || self.spec != phase.geometry().fine_spec()
+            || self.config.cell_size_m.to_bits() != phase.voxel_size_m().to_bits()
+            || self
+                .fraction
+                .iter()
+                .zip(phase.fractions())
+                .any(|(a, b)| a.to_bits() != b.to_bits())
+            || self
+                .solid
+                .iter()
+                .enumerate()
+                .any(|(i, &s)| s != phase.geometry().component_at_index(i).is_none())
+        {
+            return Err(MacError::InvalidConfig);
+        }
+        let graph = PhaseGraph::build(phase, limits).map_err(MacError::PhaseGraph)?;
+        self.phase_predictor = Some(PhasePredictor {
+            phase: phase.clone(),
+            graph,
+            limits,
+            sweeps,
+        });
+        Ok(())
     }
 
     /// Opt-in variable-density, two-phase pressure comparison. Both water and
@@ -538,6 +583,10 @@ impl MacGridWorld {
                 .previous_component_anchors
                 .as_ref()
                 .map_or(0, |v| v.capacity() * size_of::<bool>())
+            // Conservative retained upper bound: the initial canonical phase
+            // may share these fractions. Immutable geometry/faces are excluded.
+            + self.phase_predictor.as_ref().map_or(0, |s|
+                std::mem::size_of_val(s.phase.fractions()) + s.graph.array_storage_bytes())
     }
 
     pub fn fraction_bounds(&self) -> (f64, f64) {
@@ -1173,6 +1222,10 @@ impl MacGridWorld {
             let p = self.project(sub_dt)?;
             metrics.pressure_solve_micros += stage.elapsed().as_micros() as u64;
             metrics.pressure_iterations += p.iterations as u64;
+            metrics.phase_predictor_rows_total += p.phase_rows as u64;
+            metrics.phase_predictor_reuses += u32::from(p.phase_reused);
+            metrics.phase_predictor_rebuilds += u32::from(p.phase_rows > 0 && !p.phase_reused);
+            metrics.phase_predictor_micros += p.phase_micros;
             metrics.pressure_active_rows_total += p.active_cells as u64;
             metrics.pressure_residual_initial_max = metrics
                 .pressure_residual_initial_max
@@ -1605,6 +1658,7 @@ impl MacGridWorld {
         let mut component_mean_counts = vec![0usize; comp_count];
         let mut rhs = vec![0.0; n];
         let mut diag = vec![0.0; n];
+        let mut phase_diagonal = self.phase_predictor.as_ref().map(|_| vec![0.0; n]);
         let mut div_before: f64 = 0.0;
         for &i in &liquid_indices {
             let x = i % nx;
@@ -1640,7 +1694,11 @@ impl MacGridWorld {
                         // Empty-cell pressure is atmospheric at the face;
                         // the half-cell distance doubles the coefficient.
                     } else if axis == 1 && dir > 0 && self.config.open_top {
-                        diag[i] += 2.0 * self.relative_inverse_face_density(i, i) / h2;
+                        let extra = 2.0 * self.relative_inverse_face_density(i, i) / h2;
+                        diag[i] += extra;
+                        if let Some(d) = &mut phase_diagonal {
+                            d[i] += extra;
+                        }
                     }
                 }
             }
@@ -1657,6 +1715,9 @@ impl MacGridWorld {
                         .max(0.1 * ATMOSPHERIC_PRESSURE_PA);
                     let k = sealed[i] * self.config.density_kg_m3 / (absolute * dt * dt);
                     diag[i] += k;
+                    if let Some(d) = &mut phase_diagonal {
+                        d[i] += k;
+                    }
                     rhs[i] += k * self.pressure_pa[i];
                     if let Some(c) = components[i] {
                         anchored[c] = true;
@@ -1764,6 +1825,82 @@ impl MacGridWorld {
         for &i in &liquid_indices {
             r[i] = rhs[i] - ap[i];
         }
+        // Freeze acceptance against the original warm residual. Coarse guesses
+        // must never relax the fine solver's divergence/residual requirement.
+        let mut baseline_residual = None;
+        let mut phase_rows = 0;
+        let mut phase_reused = false;
+        let mut phase_micros = 0;
+        if let Some(state) = &self.phase_predictor {
+            let start = Instant::now();
+            project_component_means(
+                &mut r,
+                &components,
+                &anchored,
+                comp_count,
+                &liquid_indices,
+                &mut component_mean_sums,
+                &mut component_mean_counts,
+            );
+            baseline_residual = Some(l2_norm_indices(&r, &liquid_indices));
+            if self.ambient_density_kg_m3.is_none()
+                || self
+                    .solid
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &s)| s != state.phase.geometry().component_at_index(i).is_none())
+            {
+                return Err(MacError::BoundaryMismatch);
+            }
+            let phase = state
+                .phase
+                .with_fractions(self.fraction.clone())
+                .map_err(|e| MacError::PhaseGraph(GraphError::Phase(e)))?;
+            let (graph, reused) = state
+                .graph
+                .refresh(&phase, state.limits)
+                .map_err(MacError::PhaseGraph)?;
+            let weights: Vec<_> = phase
+                .faces()
+                .iter()
+                .map(|f| self.relative_inverse_face_density(f.lower, f.upper) / h2)
+                .collect();
+            let coarse = graph
+                .pressure_operator_with_diagonal(&phase, &weights, phase_diagonal.as_ref().unwrap())
+                .map_err(MacError::PhaseGraph)?;
+            let mut source = vec![0.0; graph.rows().len()];
+            for &i in &liquid_indices {
+                source[graph.row_at_index(i).unwrap() as usize] += r[i];
+            }
+            let correction = coarse
+                .smooth(&source, state.sweeps)
+                .map_err(MacError::PhaseGraph)?;
+            for &i in &liquid_indices {
+                p[i] += correction[graph.row_at_index(i).unwrap() as usize];
+            }
+            project_component_means(
+                &mut p,
+                &components,
+                &anchored,
+                comp_count,
+                &liquid_indices,
+                &mut component_mean_sums,
+                &mut component_mean_counts,
+            );
+            operator.apply(&p, &mut ap);
+            for &i in &liquid_indices {
+                r[i] = rhs[i] - ap[i];
+            }
+            phase_rows = graph.rows().len();
+            phase_reused = reused;
+            self.phase_predictor = Some(PhasePredictor {
+                phase,
+                graph,
+                limits: state.limits,
+                sweeps: state.sweeps,
+            });
+            phase_micros = start.elapsed().as_micros() as u64;
+        }
         if let Some(factor) = &ic0 {
             factor.apply(
                 &r,
@@ -1804,10 +1941,9 @@ impl MacGridWorld {
         if self.config.pressure_diagnostics {
             vector_operations_us += timer.elapsed().as_micros() as u64;
         }
-        let target = self
-            .config
-            .pressure_absolute_tolerance
-            .max(self.config.pressure_relative_tolerance * residual_initial);
+        let target = self.config.pressure_absolute_tolerance.max(
+            self.config.pressure_relative_tolerance * baseline_residual.unwrap_or(residual_initial),
+        );
         let mut d = zvec.clone();
         let mut rz = dot_indices(&r, &zvec, &liquid_indices);
         let mut residual_final = residual_initial;
@@ -2016,6 +2152,9 @@ impl MacGridWorld {
             );
         }
         Ok(ProjectionStats {
+            phase_rows,
+            phase_reused,
+            phase_micros,
             iterations,
             active_cells: liquid_indices.len(),
             residual_initial,
@@ -3741,6 +3880,9 @@ fn json_number(value: f64) -> String {
 
 #[derive(Default)]
 struct ProjectionStats {
+    phase_rows: usize,
+    phase_reused: bool,
+    phase_micros: u64,
     iterations: usize,
     active_cells: usize,
     residual_initial: f64,
@@ -3748,6 +3890,14 @@ struct ProjectionStats {
     divergence_before: f64,
     divergence_after: f64,
     converged: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PhasePredictor {
+    phase: PhaseWater,
+    graph: PhaseGraph,
+    limits: GraphLimits,
+    sweeps: u32,
 }
 
 /// Zero-fill incomplete Cholesky of the active seven-point pressure matrix.
@@ -4999,6 +5149,175 @@ mod tests {
             open_top,
             ..MacConfig::default()
         }
+    }
+
+    fn phase_for_grid(grid: &MacGridWorld) -> PhaseWater {
+        use crate::cut_cell::{CutCellGeometry, GeometryLimits};
+        use crate::phase_water::PhaseLimits;
+        let boundary = SolidBoundary {
+            spec: grid.spec,
+            solid: grid.solid.clone(),
+        };
+        let geometry = std::sync::Arc::new(
+            CutCellGeometry::build(
+                &boundary,
+                3,
+                GeometryLimits {
+                    max_fine_cells: 4096,
+                    max_components: 4096,
+                    max_portals: 12_288,
+                },
+            )
+            .unwrap(),
+        );
+        PhaseWater::new(
+            geometry,
+            &grid.fraction,
+            grid.config.cell_size_m,
+            PhaseLimits {
+                max_fine_cells: 4096,
+                max_faces: 12_288,
+                max_basins: 4096,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn phase_predictor_matches_physical_fine_projection_with_open_and_sealed_air() {
+        for open in [false, true] {
+            for compressible in [false, true] {
+                let mut grid = all_air_grid([6, 6, 3], quiet_config(open));
+                grid.set_ambient_density(1.2).unwrap();
+                grid.set_compressible_enclosed_air(compressible).unwrap();
+                grid.set_pressure_preconditioner(PressurePreconditioner::Ic0);
+                for i in 0..grid.fraction.len() {
+                    let y = i / 6 % 6;
+                    grid.fraction[i] = (2.3 - y as f64).clamp(0.0, 1.0);
+                }
+                let u = grid.u_index(3, 1, 1);
+                let v = grid.v_index(2, 3, 1);
+                grid.u[u] = 0.07;
+                grid.v[v] = -0.04;
+                let phase = phase_for_grid(&grid);
+                let mut predicted = grid.clone();
+                predicted
+                    .set_phase_pressure_predictor(
+                        &phase,
+                        GraphLimits {
+                            max_fine_cells: 4096,
+                            max_rows: 4096,
+                            max_connections: 12_288,
+                        },
+                        8,
+                    )
+                    .unwrap();
+                let plain = grid.project(0.01).unwrap();
+                let coarse = predicted.project(0.01).unwrap();
+                assert!(
+                    plain.converged && coarse.converged,
+                    "open={open} gas={compressible}"
+                );
+                assert!(coarse.phase_rows < coarse.active_cells && coarse.phase_reused);
+                for (a, b) in grid
+                    .u
+                    .iter()
+                    .chain(&grid.v)
+                    .chain(&grid.w)
+                    .zip(predicted.u.iter().chain(&predicted.v).chain(&predicted.w))
+                {
+                    assert!(
+                        (a - b).abs() < 1e-7,
+                        "physical face difference {}",
+                        (a - b).abs()
+                    );
+                }
+                for (a, b) in grid.pressure_pa.iter().zip(&predicted.pressure_pa) {
+                    assert!(
+                        (a - b).abs() < 1e-5,
+                        "physical pressure difference {}",
+                        (a - b).abs()
+                    );
+                }
+                // A boundary mutation cannot keep using the old geometry mapping.
+                predicted.solid[0] = true;
+                assert!(matches!(
+                    predicted.project(0.01),
+                    Err(MacError::BoundaryMismatch)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn phase_galerkin_includes_density_top_and_gas_diagonals_without_losing_symmetry() {
+        let mut grid = all_air_grid([6, 6, 3], quiet_config(true));
+        grid.set_ambient_density(1.2).unwrap();
+        for i in 0..grid.fraction.len() {
+            grid.fraction[i] = (2.3 - (i / 6 % 6) as f64).clamp(0.0, 1.0);
+        }
+        let phase = phase_for_grid(&grid);
+        let graph = PhaseGraph::build(
+            &phase,
+            GraphLimits {
+                max_fine_cells: 4096,
+                max_rows: 4096,
+                max_connections: 12_288,
+            },
+        )
+        .unwrap();
+        let h2 = grid.config.cell_size_m.powi(2);
+        let weights: Vec<_> = phase
+            .faces()
+            .iter()
+            .map(|f| grid.relative_inverse_face_density(f.lower, f.upper) / h2)
+            .collect();
+        let mut extra = vec![0.0; grid.fraction.len()];
+        // Synthetic sealed-gas compliance at every partial/air cell tests the
+        // same diagonal formula even though this all-air top is vented.
+        for (i, v) in extra.iter_mut().enumerate() {
+            *v = (1.0 - grid.fraction[i]) * grid.config.density_kg_m3
+                / (ATMOSPHERIC_PRESSURE_PA * 0.01_f64.powi(2));
+            if i / 6 % 6 == 5 {
+                *v += 2.0 * grid.relative_inverse_face_density(i, i) / h2;
+            }
+        }
+        let coarse = graph
+            .pressure_operator_with_diagonal(&phase, &weights, &extra)
+            .unwrap();
+        let mut diag = extra.clone();
+        for (f, &w) in phase.faces().iter().zip(&weights) {
+            diag[f.lower] += w;
+            diag[f.upper] += w;
+        }
+        let p: Vec<_> = (0..graph.rows().len())
+            .map(|i| (i % 7) as f64 - 3.0)
+            .collect();
+        let lifted: Vec<_> = (0..diag.len())
+            .map(|i| p[graph.row_at_index(i).unwrap() as usize])
+            .collect();
+        let active: Vec<_> = (0..diag.len()).collect();
+        let mut applied = vec![0.0; diag.len()];
+        apply_pressure_matrix(
+            &grid,
+            &lifted,
+            &vec![true; diag.len()],
+            &active,
+            &diag,
+            &mut applied,
+        );
+        let mut restricted = vec![0.0; p.len()];
+        for (i, v) in applied.iter().enumerate() {
+            restricted[graph.row_at_index(i).unwrap() as usize] += v;
+        }
+        for (a, b) in coarse.apply(&p).unwrap().iter().zip(restricted) {
+            assert!((a - b).abs() < 1e-8);
+        }
+        let q: Vec<_> = p.iter().map(|v| v * v + 0.2).collect();
+        let (mp, mq) = (coarse.smooth(&p, 8).unwrap(), coarse.smooth(&q, 8).unwrap());
+        let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+        assert!((dot(&p, &mq) - dot(&q, &mp)).abs() < 1e-12);
+        assert!(dot(&p, &mp) > 0.0 && dot(&q, &mq) > 0.0);
     }
 
     #[test]

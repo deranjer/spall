@@ -71,6 +71,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     times.sort_unstable();
     let graph = result.ok_or("missing graph")?;
+    // Install a fresh immutable amount array without changing fine predicates.
+    // Refresh timing excludes the zero-transport exercise itself.
+    let mut updated = phase.clone();
+    updated.transport(0.01, &vec![0.0; phase.faces().len()], 0.45)?;
+    let mut refresh_times = Vec::new();
+    let mut topology_reused = true;
+    for _ in 0..3 {
+        let start = Instant::now();
+        let (_, reused) = graph.refresh(
+            &updated,
+            spall_fluid::phase_graph::GraphLimits {
+                max_fine_cells: 4_000_000,
+                max_rows: 200_000,
+                max_connections: 600_000,
+            },
+        )?;
+        refresh_times.push(start.elapsed().as_micros());
+        topology_reused &= reused;
+    }
+    refresh_times.sort_unstable();
+    let refresh_median = refresh_times[1];
     let open = graph
         .rows()
         .iter()
@@ -89,9 +110,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let split = counts.iter().filter(|&&n| n > 1).count();
-    let gate = error.abs() < 1e-9 && open > 0 && graph.rows().len() < open;
+    let gate = error.abs() < 1e-9 && topology_reused && open > 0 && graph.rows().len() < open;
     println!(
-        "{{\"size\":{size},\"factor\":{},\"fine_cells\":{},\"open_fine_cells\":{open},\"pressure_rows\":{},\"wet_rows\":{wet},\"dry_rows\":{},\"components_with_multiple_wet_rows\":{split},\"connections\":{},\"graph_build_median_us\":{},\"phase_array_storage_bytes\":{},\"graph_array_storage_bytes\":{},\"row_water_error_m3\":{error},\"pressure_steps\":0,\"momentum_steps\":0,\"coupled_steps\":0,\"production_steps\":0,\"gate_pass\":{gate}}}",
+        "{{\"size\":{size},\"factor\":{},\"fine_cells\":{},\"open_fine_cells\":{open},\"pressure_rows\":{},\"wet_rows\":{wet},\"dry_rows\":{},\"components_with_multiple_wet_rows\":{split},\"connections\":{},\"graph_build_median_us\":{},\"graph_refresh_median_us\":{refresh_median},\"topology_reused\":{topology_reused},\"phase_array_storage_bytes\":{},\"graph_array_storage_bytes\":{},\"row_water_error_m3\":{error},\"pressure_steps\":0,\"momentum_steps\":0,\"coupled_steps\":0,\"production_steps\":0,\"gate_pass\":{gate}}}",
         setup.coarsen,
         fractions.len(),
         graph.rows().len(),

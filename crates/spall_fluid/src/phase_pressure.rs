@@ -6,6 +6,7 @@
 
 use crate::SolidBoundary;
 use crate::grid_mac::{MacConfig, MacError, MacGridWorld, MacStepMetrics, PressurePreconditioner};
+use crate::phase_graph::GraphLimits;
 use crate::phase_water::{PhaseError, PhaseWater};
 
 #[derive(Debug, Clone, Copy)]
@@ -13,7 +14,7 @@ pub struct PhasePressureConfig {
     pub mac: MacConfig,
     pub air_density_kg_m3: f64,
     pub preconditioner: PressurePreconditioner,
-    /// Retained phase + solver array cap, not transient pressure/clone/RSS cap.
+    /// Retained phase + solver array upper-bound cap, not transient/clone/RSS.
     pub max_retained_array_bytes: usize,
 }
 
@@ -88,8 +89,28 @@ impl PhasePressureWorld {
     pub fn solver(&self) -> &MacGridWorld {
         &self.solver
     }
+
+    /// Experimental physical Galerkin pressure predictor. Fine pressure
+    /// correction, convergence, geometry and strict transport remain required.
+    /// Enabling is atomic, including graph and retained-array budget failure.
+    pub fn enable_pressure_predictor(
+        &mut self,
+        limits: GraphLimits,
+        sweeps: u32,
+    ) -> Result<(), PhasePressureError> {
+        let mut solver = self.solver.clone();
+        solver.set_phase_pressure_predictor(&self.phase, limits, sweeps)?;
+        check_bytes(
+            self.phase.array_storage_bytes() + solver.allocated_bytes(),
+            self.max_retained_array_bytes,
+        )?;
+        self.solver = solver;
+        Ok(())
+    }
     /// Excludes shared exact geometry and transient solve/candidate allocations.
     /// Includes the canonical phase fractions and MAC's working fraction copy.
+    /// With a predictor, conservatively counts its fraction snapshot even when
+    /// it aliases canonical phase. Shared packed faces are counted only once.
     pub fn retained_array_bytes(&self) -> usize {
         self.phase.array_storage_bytes() + self.solver.allocated_bytes()
     }

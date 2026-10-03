@@ -67,7 +67,7 @@ impl PhaseConnection {
 #[derive(Debug, Clone)]
 pub struct PhaseGraph {
     snapshot: PhaseWater,
-    labels: Vec<u32>,
+    labels: Arc<Vec<u32>>,
     rows: Vec<PhaseRow>,
     connections: Arc<[PhaseConnection]>,
 }
@@ -186,7 +186,7 @@ impl PhaseGraph {
             .collect();
         Ok(Self {
             snapshot: phase.clone(),
-            labels,
+            labels: labels.into(),
             rows,
             connections: connections.into(),
         })
@@ -194,6 +194,66 @@ impl PhaseGraph {
 
     pub fn rows(&self) -> &[PhaseRow] {
         &self.rows
+    }
+
+    /// Reuses topology only when every membership/within-component liquid-edge
+    /// predicate is unchanged. A changed edge conservatively rebuilds even if
+    /// another path would keep the patch connected. Coefficients are never reused.
+    /// Returns (new immutable snapshot binding, topology_reused).
+    pub fn refresh(
+        &self,
+        phase: &PhaseWater,
+        limits: GraphLimits,
+    ) -> Result<(Self, bool), GraphError> {
+        if !self.snapshot.same_geometry(phase)
+            || self
+                .snapshot
+                .fractions()
+                .iter()
+                .zip(phase.fractions())
+                .any(|(a, b)| (*a > 0.0) != (*b > 0.0))
+            || phase.faces().iter().any(|face| {
+                if face.axis != 1
+                    || phase.fractions()[face.upper] == 0.0
+                    || phase.fractions()[face.lower] == 0.0
+                {
+                    return false;
+                }
+                let a = self.labels[face.lower] as usize;
+                let b = self.labels[face.upper] as usize;
+                self.rows[a].component == self.rows[b].component
+                    && (self.snapshot.fractions()[face.lower] == 1.0)
+                        != (phase.fractions()[face.lower] == 1.0)
+            })
+        {
+            return Self::build(phase, limits).map(|g| (g, false));
+        }
+        limit("fine cells", self.labels.len(), limits.max_fine_cells)?;
+        limit("rows", self.rows.len(), limits.max_rows)?;
+        limit(
+            "connections",
+            self.connections.len(),
+            limits.max_connections,
+        )?;
+        let mut rows = self.rows.clone();
+        for row in &mut rows {
+            row.water_m3 = 0.0;
+        }
+        let volume = phase.voxel_size_m().powi(3);
+        for (i, &fraction) in phase.fractions().iter().enumerate() {
+            if let Some(row) = self.row_at_index(i) {
+                rows[row as usize].water_m3 += fraction * volume;
+            }
+        }
+        Ok((
+            Self {
+                snapshot: phase.clone(),
+                labels: self.labels.clone(),
+                rows,
+                connections: self.connections.clone(),
+            },
+            true,
+        ))
     }
     pub fn connections(&self) -> &[PhaseConnection] {
         &self.connections
@@ -227,6 +287,27 @@ impl PhaseGraph {
         fine_weights: &[f64],
         fine_top_weights: &[f64],
     ) -> Result<AggregatedPressure, GraphError> {
+        let dims = phase
+            .geometry()
+            .fine_spec()
+            .dimensions()
+            .map(|n| n as usize);
+        if fine_top_weights.iter().enumerate().any(|(i, &w)| {
+            w != 0.0 && (self.row_at_index(i).is_none() || i / dims[0] % dims[1] != dims[1] - 1)
+        }) {
+            return Err(GraphError::InvalidState);
+        }
+        self.pressure_operator_with_diagonal(phase, fine_weights, fine_top_weights)
+    }
+
+    /// Physical fine diagonal terms include open-top pressure and compressible
+    /// sealed-gas compliance. They must be supplied by the same fine operator.
+    pub(crate) fn pressure_operator_with_diagonal(
+        &self,
+        phase: &PhaseWater,
+        fine_weights: &[f64],
+        fine_top_weights: &[f64],
+    ) -> Result<AggregatedPressure, GraphError> {
         self.binding(phase)?;
         if fine_weights.len() != phase.faces().len()
             || fine_top_weights.len() != self.labels.len()
@@ -244,17 +325,12 @@ impl PhaseGraph {
                 weights[self.connection(a, b, f.axis)] += weight;
             }
         }
-        let dims = phase
-            .geometry()
-            .fine_spec()
-            .dimensions()
-            .map(|n| n as usize);
         let mut top_weights = vec![0.0; self.rows.len()];
         for (i, &weight) in fine_top_weights.iter().enumerate() {
             if weight == 0.0 {
                 continue;
             }
-            if self.labels[i] == NONE || i / dims[0] % dims[1] != dims[1] - 1 {
+            if self.labels[i] == NONE {
                 return Err(GraphError::InvalidState);
             }
             top_weights[self.labels[i] as usize] += weight;
@@ -348,6 +424,62 @@ impl PhaseGraph {
 }
 
 impl AggregatedPressure {
+    /// Fixed-count symmetric Gauss-Seidel correction. This is a pressure
+    /// predictor, not acceptance of the physical fine divergence constraint.
+    /// Unanchored constant modes are left for the owning fine solver's gauge.
+    pub(crate) fn smooth(&self, source: &[f64], sweeps: u32) -> Result<Vec<f64>, GraphError> {
+        if source.len() != self.top_weights.len()
+            || source.iter().any(|v| !v.is_finite())
+            || sweeps == 0
+            || sweeps > 64
+        {
+            return Err(GraphError::InvalidState);
+        }
+        let mut diagonal = self.top_weights.clone();
+        let mut counts = vec![0usize; diagonal.len() + 1];
+        for edge in self.connections.iter() {
+            counts[edge.lower_row as usize + 1] += 1;
+            counts[edge.upper_row as usize + 1] += 1;
+        }
+        for i in 1..counts.len() {
+            counts[i] += counts[i - 1];
+        }
+        let mut cursor = counts.clone();
+        let mut entries = vec![(0u32, 0.0); *counts.last().unwrap()];
+        for (edge, &w) in self.connections.iter().zip(&self.weights) {
+            let a = edge.lower_row as usize;
+            let b = edge.upper_row as usize;
+            diagonal[a] += w;
+            diagonal[b] += w;
+            entries[cursor[a]] = (b as u32, w);
+            cursor[a] += 1;
+            entries[cursor[b]] = (a as u32, w);
+            cursor[b] += 1;
+        }
+        if diagonal.iter().any(|d| !d.is_finite()) {
+            return Err(GraphError::InvalidState);
+        }
+        let mut x = vec![0.0; source.len()];
+        for _ in 0..sweeps {
+            for reverse in [false, true] {
+                for k in 0..x.len() {
+                    let i = if reverse { x.len() - 1 - k } else { k };
+                    if diagonal[i] == 0.0 {
+                        continue;
+                    }
+                    let sum = entries[counts[i]..counts[i + 1]]
+                        .iter()
+                        .map(|&(j, w)| w * x[j as usize])
+                        .sum::<f64>();
+                    x[i] = (source[i] + sum) / diagonal[i];
+                }
+            }
+        }
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(GraphError::InvalidState);
+        }
+        Ok(x)
+    }
     pub fn apply(&self, pressure: &[f64]) -> Result<Vec<f64>, GraphError> {
         if pressure.len() != self.top_weights.len() || pressure.iter().any(|p| !p.is_finite()) {
             return Err(GraphError::InvalidState);

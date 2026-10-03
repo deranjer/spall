@@ -79,6 +79,113 @@ fn graph(phase: &PhaseWater) -> PhaseGraph {
 }
 
 #[test]
+fn refresh_reuses_only_identical_membership_and_liquid_edges() {
+    let limits = GraphLimits {
+        max_fine_cells: 30_000,
+        max_rows: 30_000,
+        max_connections: 90_000,
+    };
+    let phase = fixture(
+        [3; 3],
+        |_, _, _| false,
+        |x, y, _| {
+            if y == 0 {
+                if x == 0 { 0.4 } else { 0.8 }
+            } else {
+                0.0
+            }
+        },
+        100,
+    );
+    let g = graph(&phase);
+    let mut changed = phase.clone();
+    let mut flux = vec![0.0; phase.faces().len()];
+    let f = phase
+        .faces()
+        .iter()
+        .position(|f| f.lower == 0 && f.upper == 1)
+        .unwrap();
+    flux[f] = 0.01;
+    changed.transport(0.01, &flux, 0.45).unwrap();
+    let (updated, reused) = g.refresh(&changed, limits).unwrap();
+    assert!(reused);
+    let fresh = graph(&changed);
+    for i in 0..changed.fractions().len() {
+        assert_eq!(updated.row_at_index(i), fresh.row_at_index(i));
+    }
+    assert!(
+        (updated.rows().iter().map(|r| r.water_m3).sum::<f64>() - changed.water_volume_m3()).abs()
+            < 1e-15
+    );
+    let weights = vec![1.0; flux.len()];
+    let top = vec![0.0; 27];
+    assert!(updated.pressure_operator(&changed, &weights, &top).is_ok());
+    assert!(matches!(
+        g.pressure_operator(&changed, &weights, &top),
+        Err(GraphError::StaleSnapshot)
+    ));
+    assert!(matches!(
+        g.refresh(
+            &changed,
+            GraphLimits {
+                max_rows: 0,
+                ..limits
+            }
+        ),
+        Err(GraphError::Limit { .. })
+    ));
+
+    let vertical = fixture(
+        [3; 3],
+        |_, _, _| false,
+        |_, y, _| {
+            if y == 0 {
+                0.875
+            } else if y == 1 {
+                0.5
+            } else {
+                0.0
+            }
+        },
+        100,
+    );
+    let old = graph(&vertical);
+    let mut next = vertical.clone();
+    let mut flux = vec![0.0; next.faces().len()];
+    let f = next
+        .faces()
+        .iter()
+        .position(|f| f.lower == 0 && f.upper == 3)
+        .unwrap();
+    flux[f] = -0.125 * 0.25_f64.powi(3) / 0.01;
+    next.transport(0.01, &flux, 0.45).unwrap();
+    assert_eq!(next.fractions()[0], 1.0);
+    let (updated, reused) = old.refresh(&next, limits).unwrap();
+    assert!(!reused);
+    let fresh = graph(&next);
+    for i in 0..27 {
+        assert_eq!(updated.row_at_index(i), fresh.row_at_index(i));
+    }
+    let dry = fixture(
+        [3; 3],
+        |_, _, _| false,
+        |x, y, _| if x == 1 && y == 0 { 0.8 } else { 0.0 },
+        100,
+    );
+    let mut wet = dry.clone();
+    let old = graph(&dry);
+    let mut flux = vec![0.0; wet.faces().len()];
+    let f = wet
+        .faces()
+        .iter()
+        .position(|f| f.lower == 0 && f.upper == 1)
+        .unwrap();
+    flux[f] = -0.01;
+    wet.transport(0.01, &flux, 0.45).unwrap();
+    assert!(!old.refresh(&wet, limits).unwrap().1);
+}
+
+#[test]
 fn dry_crest_keeps_two_pools_inside_one_open_component() {
     let phase = fixture(
         [3; 3],

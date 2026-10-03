@@ -212,8 +212,10 @@ impl PhaseWater {
     }
 
     pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
+        self.same_geometry(other) && Arc::ptr_eq(&self.fractions, &other.fractions)
+    }
+    pub(crate) fn same_geometry(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.geometry, &other.geometry)
-            && Arc::ptr_eq(&self.fractions, &other.fractions)
             && self.voxel_size_m.to_bits() == other.voxel_size_m.to_bits()
     }
     pub fn faces(&self) -> PhaseFaces<'_> {
