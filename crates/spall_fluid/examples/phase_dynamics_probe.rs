@@ -1,14 +1,9 @@
 //! Same static geometry/time as component_dynamics_probe, fine MAC reference.
 //! Motion gates only: not conservative momentum accuracy or generated trench.
-use spall_core::{BrickCoord, CellSizeCode, GlobalCell, MaterialId, Revision, VolumeId};
-use spall_fluid::cut_cell::{CutCellGeometry, GeometryLimits};
 use spall_fluid::grid_mac::{MacConfig, PressurePreconditioner};
+use spall_fluid::phase_fixtures::PhaseReferenceScene;
 use spall_fluid::phase_pressure::{PhasePressureConfig, PhasePressureWorld};
-use spall_fluid::phase_water::{PhaseLimits, PhaseWater};
-use spall_fluid::{DomainSpec, SolidBoundary};
-use spall_voxel::{Brick, EditPlan, Volume};
-use std::{sync::Arc, time::Instant};
-
+use std::time::Instant;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "low-dam".into());
     if !["channel", "low-dam", "full-wall"].contains(&mode.as_str()) {
@@ -37,71 +32,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("incompressible-air") => false,
         _ => return Err("optional fifth argument must be incompressible-air".into()),
     };
-    let dims: [u32; 3] = if mode == "channel" {
-        [48, 18, 12]
-    } else {
-        [9, 6, 3]
+    let scene = match mode.as_str() {
+        "channel" => PhaseReferenceScene::Channel,
+        "low-dam" => PhaseReferenceScene::LowDam,
+        _ => PhaseReferenceScene::FullWall,
     };
-    let id = VolumeId::new(7).unwrap();
-    let mut terrain = Volume::new(id, CellSizeCode::Quarter);
-    for z in 0..dims[2].div_ceil(32) {
-        for y in 0..dims[1].div_ceil(32) {
-            for x in 0..dims[0].div_ceil(32) {
-                terrain.insert_brick(
-                    BrickCoord::new(i64::from(x), i64::from(y), i64::from(z)),
-                    Brick::uniform(MaterialId::AIR, Revision(1)),
-                )?;
-            }
-        }
-    }
-    let mut edits = EditPlan::new(id);
-    let mut seed = Vec::new();
-    for z in 0..dims[2] {
-        for y in 0..dims[1] {
-            for x in 0..dims[0] {
-                let solid = if mode == "channel" {
-                    y < 3 || (x >= 18 && !(3..9).contains(&z) && y < 12)
-                } else {
-                    x == 4 && (mode == "full-wall" || y < 5)
-                };
-                if solid {
-                    edits.set(
-                        GlobalCell::new(i64::from(x), i64::from(y), i64::from(z)),
-                        MaterialId(1),
-                    );
-                }
-                let water = !solid
-                    && if mode == "channel" {
-                        x < 18 && y < 9
-                    } else {
-                        x < 4 && y < 2
-                    };
-                seed.push(if water { 1.0 } else { 0.0 });
-            }
-        }
-    }
-    terrain.apply_edit(&edits)?;
-    let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), dims, 30_000)?;
-    let boundary = SolidBoundary::capture(&terrain, spec)?;
-    let geometry = Arc::new(CutCellGeometry::build(
-        &boundary,
-        3,
-        GeometryLimits {
-            max_fine_cells: 30_000,
-            max_components: 30_000,
-            max_portals: 90_000,
-        },
-    )?);
-    let phase = PhaseWater::new(
-        geometry,
-        &seed,
-        0.25,
-        PhaseLimits {
-            max_fine_cells: 30_000,
-            max_faces: 90_000,
-            max_basins: 30_000,
-        },
-    )?;
+    let dims = scene.dimensions();
+    let phase = scene.build()?;
     let mut world = PhasePressureWorld::new(
         phase,
         PhasePressureConfig {

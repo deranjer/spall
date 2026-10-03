@@ -13,6 +13,20 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
     about = "Spall sandbox render-window / replication client"
 )]
 struct Args {
+    /// Open the local ENG-122 water comparison, paused with incompressible air.
+    #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "grid_fluid_demo", "ecology_demo", "ecology_capture"])]
+    phase_fluid_demo: bool,
+    /// Start the comparison with conservative momentum.
+    #[arg(long, requires = "phase_fluid_demo")]
+    phase_fluid_demo_momentum: bool,
+    /// Use the experimental compressible air case (may reject a step).
+    #[arg(long, requires = "phase_fluid_demo")]
+    phase_fluid_demo_compressible_air: bool,
+    #[arg(long, requires = "phase_fluid_demo")]
+    phase_fluid_demo_autoplay: bool,
+    /// Save the comparison window through the real renderer.
+    #[arg(long, requires = "phase_fluid_demo")]
+    phase_fluid_demo_capture: Option<PathBuf>,
     /// Open the local interactive MAC water inspection viewer. This private
     /// debug simulation is separate from the authoritative game tick.
     #[arg(long, conflicts_with_all = ["offline", "connect", "interactive"])]
@@ -319,6 +333,28 @@ fn parse_cut(s: &str) -> Result<Cut, String> {
 fn main() -> ExitCode {
     sandbox::init_tracing();
     let args = Args::parse();
+
+    if args.phase_fluid_demo {
+        return match spall_client::run_phase_fluid_demo_window(
+            spall_client::PhaseFluidDemoOptions {
+                conservative_momentum: args.phase_fluid_demo_momentum,
+                compressible_air: args.phase_fluid_demo_compressible_air,
+                autoplay: args.phase_fluid_demo_autoplay,
+                max_frames: args.frames,
+                capture: args.phase_fluid_demo_capture,
+            },
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error @ spall_client::ClientError::Gpu(_)) => {
+                eprintln!("sandbox-client: {error}");
+                ExitCode::from(3)
+            }
+            Err(error) => {
+                eprintln!("sandbox-client: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
 
     if args.grid_fluid_demo {
         return match spall_client::run_grid_fluid_demo_window() {

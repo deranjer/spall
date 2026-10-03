@@ -1,5 +1,35 @@
 # Validation and operating contract
 
+## ENG-122 windowed water comparison
+
+Run from the ENG-122 checkout:
+
+```powershell
+$env:CARGO_TARGET_DIR='G:/Programming/voxel_engine/target'
+cargo run -p sandbox --features client --bin sandbox-client --release -- --phase-fluid-demo
+```
+
+This local experimental viewer uses the same quarter-metre channel, low-dam
+and full-wall fixtures as `phase_dynamics_probe`. It starts paused with the
+original velocity sampling and **incompressible air comparison**, explicitly
+shown on screen. Space runs/pauses, N advances 10 ms, M switches momentum method,
+G switches air model, R resets, and 1/2/3 select the scene. Switching resets and
+pauses the water while preserving the camera for the same scene. Click for
+mouse look, WASD/QE fly, Escape releases the cursor, and F12 saves
+`.local/screenshots/phase-water.png`.
+
+The existing compressible-air conservative channel rejects step 27; its last
+accepted state and failure remain visible. The incompressible comparison is
+separate evidence and does not satisfy that gate. Water is displayed as
+cell-volume boxes, not a reconstructed PLIC surface. This viewer is separate
+from the authoritative generated game, with no save/wire activation.
+
+For bounded graphical checks, use `--frames 60 --phase-fluid-demo-autoplay
+--phase-fluid-demo-capture PATH.png`; add `--phase-fluid-demo-momentum` and/or
+`--phase-fluid-demo-compressible-air` to select the initial configuration.
+The viewer limits work to two fixed steps per frame and drops backlog;
+displayed simulation time counts only accepted steps, not wall-clock time.
+
 These commands and fixtures are **planned interfaces**. T00 implements
 `cargo xtask check`, the bounded GPU-free portion of `cargo xtask smoke`, and
 the offline clear-window capability smoke (`cargo xtask smoke --graphical`).

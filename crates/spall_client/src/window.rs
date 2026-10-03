@@ -4653,6 +4653,11 @@ impl WorldRenderer {
         self.debug_water_source = merge_water_columns(instances, self.debug_water_material);
     }
 
+    /// Local inspection viewers have no replicated terrain residency window.
+    pub(super) fn set_debug_water_window(&mut self, center: [f64; 3]) {
+        self.water_window = Some(center);
+    }
+
     /// Installs (or, with `None`, clears) the smoothed water surface and the
     /// height field behind the underwater look.
     pub(super) fn set_water_look(&mut self, look: Option<crate::water_look::WaterLook>) {
@@ -4979,7 +4984,7 @@ impl WorldRenderer {
         }
     }
 
-    fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
+    pub(super) fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
         self.yakui_winit.handle_window_event(&mut self.yakui, event)
     }
 

@@ -5,6 +5,7 @@ pub mod ecology_demo;
 pub mod grid_fluid_demo;
 pub mod interactive;
 pub mod net;
+pub mod phase_fluid_demo;
 pub mod predict;
 pub mod replica;
 pub mod residency;
@@ -23,6 +24,7 @@ pub use net::{
     run_replication_client, run_replication_client_with_game_content,
     run_replication_client_with_manifest, run_replication_client_with_progression, tool_request,
 };
+pub use phase_fluid_demo::{PhaseFluidDemoOptions, run_phase_fluid_demo_window};
 pub use predict::{ClientPhysics, PlayerMovementSummary, PredictedPlayer};
 pub use replica::{ApplyOutcome, MotionTrack, ReplicaConfig, ReplicaWorld};
 pub use residency::{ClientResidency, ClientResidencyPass, MAX_RELOAD_REQUESTS_PER_STEP};
