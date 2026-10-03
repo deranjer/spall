@@ -74,6 +74,9 @@ pub struct MacStepMetrics {
     pub velocity_advection_micros: u64,
     pub pressure_solve_micros: u64,
     pub transport_micros: u64,
+    pub strict_path_repair_count: u64,
+    /// Additional transient CSR/BFS array capacities; excludes FCT scratch.
+    pub strict_path_scratch_bytes: usize,
     pub boundary_micros: u64,
     pub total_micros: u64,
 }
@@ -1187,8 +1190,11 @@ impl MacGridWorld {
             }
 
             let stage = Instant::now();
-            let (permitted_outflow, tracked_out, tracked_in) =
+            let (permitted_outflow, tracked_out, tracked_in, strict) =
                 self.advect_fraction_fct(sub_dt, tracked_region)?;
+            metrics.strict_path_repair_count += strict.path_repairs;
+            metrics.strict_path_scratch_bytes =
+                metrics.strict_path_scratch_bytes.max(strict.scratch_bytes);
             outflow += permitted_outflow;
             region_outflow += tracked_out;
             region_inflow += tracked_in;
@@ -2227,7 +2233,7 @@ impl MacGridWorld {
         &mut self,
         dt: f64,
         tracked_region: Option<&[bool]>,
-    ) -> Result<(f64, f64, f64), MacError> {
+    ) -> Result<(f64, f64, f64, StrictTransferMetrics), MacError> {
         let [nx, ny, nz] = self.dims();
         let h = self.config.cell_size_m;
         let old = self.fraction.clone();
@@ -2584,11 +2590,12 @@ impl MacGridWorld {
         }
         let volume = self.cell_volume();
         let mut net_open_outflow_fraction = outflow_fraction + corrected_outflow;
+        let mut strict = StrictTransferMetrics::default();
         if self.strict_phase_bounds {
             // Re-limit the actually accepted donor+PLIC face transfers, never
             // cell amounts. Reuse FCT scratch and recompute all boundary/region
             // ledgers from exactly the final paired transfers.
-            strict_transfer_bounds(
+            strict = strict_transfer_bounds(
                 &old,
                 &anti,
                 &mut low_fluxes,
@@ -2626,6 +2633,7 @@ impl MacGridWorld {
             net_open_outflow_fraction * volume,
             region_outflow_fraction * volume,
             region_inflow_fraction * volume,
+            strict,
         ))
     }
 }
@@ -2637,6 +2645,12 @@ const ATMOSPHERIC_PRESSURE_PA: f64 = 101_325.0;
 /// unscaled. Must stay well inside the 1e-10 transport bound check.
 const DONOR_LIMIT_TOLERANCE: f64 = 1.0e-12;
 
+#[derive(Debug, Default)]
+struct StrictTransferMetrics {
+    path_repairs: u64,
+    scratch_bytes: usize,
+}
+
 fn strict_transfer_bounds(
     old: &[f64],
     edges: &[(Option<usize>, Option<usize>, f64, bool)],
@@ -2645,7 +2659,7 @@ fn strict_transfer_bounds(
     incoming: &mut [f64],
     outgoing: &mut [f64],
     candidate: &mut [f64],
-) -> Result<(), MacError> {
+) -> Result<StrictTransferMetrics, MacError> {
     for pass in 0..=64 {
         for &i in touched {
             incoming[i] = 0.0;
@@ -2665,49 +2679,267 @@ fn strict_transfer_bounds(
             }
         }
         let mut valid = true;
-        let mut minimum = 1.0_f64;
-        let mut maximum = 0.0_f64;
         for &i in touched {
             // Form the signed flux difference first: a balanced full-cell
             // cycle stays exactly full instead of acquiring an ulp from
             // adding a transfer to 1 before subtracting its matching outflow.
             let v = old[i] + (incoming[i] - outgoing[i]);
             candidate[i] = v;
-            minimum = minimum.min(v);
-            maximum = maximum.max(v);
             valid &= v.is_finite() && (0.0..=1.0).contains(&v);
         }
         if valid {
-            return Ok(());
+            return Ok(StrictTransferMetrics::default());
         }
         if pass == 64 {
-            return Err(MacError::TransportBoundsViolation { minimum, maximum });
+            return repair_strict_transfer_paths(
+                old, edges, transfers, touched, incoming, outgoing, candidate,
+            );
         }
-        for &i in touched {
-            let inc = incoming[i];
-            let out = outgoing[i];
-            let v = candidate[i];
-            incoming[i] = 1.0;
-            outgoing[i] = 1.0;
-            if v < 0.0 {
-                outgoing[i] = ((old[i] + inc) / out).clamp(0.0, 1.0) * (1.0 - 32.0 * f64::EPSILON);
-            } else if v > 1.0 {
-                incoming[i] =
-                    ((1.0 - old[i] + out) / inc).clamp(0.0, 1.0) * (1.0 - 32.0 * f64::EPSILON);
-            }
-        }
-        for (&(left, right, _, _), flux) in edges.iter().zip(transfers.iter_mut()) {
-            let (donor, receiver) = if *flux >= 0.0 {
+        // Gauss-Seidel face corrections use updated neighbour sums immediately.
+        // Jacobi scaling propagated a roundoff defect only one edge per pass
+        // and could chase it around a saturated loop indefinitely. Alternate
+        // traversal so both orientations of saturated paths are resolved.
+        for offset in 0..edges.len() {
+            let edge = if pass % 2 == 0 {
+                edges.len() - 1 - offset
+            } else {
+                offset
+            };
+            let (left, right, _, _) = edges[edge];
+            let flux = transfers[edge];
+            let (donor, receiver) = if flux >= 0.0 {
                 (left, right)
             } else {
                 (right, left)
             };
-            *flux *= donor
-                .map_or(1.0, |i| outgoing[i])
-                .min(receiver.map_or(1.0, |i| incoming[i]));
+            let mut reduction = 0.0_f64;
+            for (cell, lower) in [(donor, true), (receiver, false)] {
+                if let Some(i) = cell {
+                    let v = old[i] + (incoming[i] - outgoing[i]);
+                    let violation = if lower { -v } else { v - 1.0 };
+                    if violation > 0.0 {
+                        reduction = reduction.max(violation);
+                    }
+                }
+            }
+            let magnitude = flux.abs();
+            // Round an actual correction inward in transfer units. A broad
+            // fraction-sized safety margin creates fresh capacity violations
+            // at full neighbours and amplifies around saturated cycles.
+            let accepted = if reduction > 0.0 {
+                (magnitude - reduction).next_down().max(0.0)
+            } else {
+                magnitude
+            };
+            let removed = magnitude - accepted;
+            transfers[edge] = accepted.copysign(flux);
+            if let Some(i) = donor {
+                outgoing[i] -= removed;
+            }
+            if let Some(i) = receiver {
+                incoming[i] -= removed;
+            }
         }
     }
     unreachable!("bounded strict transfer loop returns")
+}
+
+/// Route a reduction back along an incoming path (overflow), or forward along
+/// an outgoing path (underflow), to a cell with actual capacity. Intermediate
+/// full cells receive the same paired correction on both incident faces.
+/// Unlike local sweeps, this does not send a capacity defect around a loop.
+fn repair_strict_transfer_paths(
+    old: &[f64],
+    edges: &[(Option<usize>, Option<usize>, f64, bool)],
+    transfers: &mut [f64],
+    touched: &[usize],
+    incoming: &mut [f64],
+    outgoing: &mut [f64],
+    candidate: &mut [f64],
+) -> Result<StrictTransferMetrics, MacError> {
+    let n = touched.len();
+    let slot = |cell| {
+        touched
+            .binary_search(&cell)
+            .expect("edge endpoint is touched")
+    };
+    let mut offsets = vec![0usize; n + 1];
+    for &(l, r, _, _) in edges {
+        for i in [l, r].into_iter().flatten() {
+            offsets[slot(i) + 1] += 1;
+        }
+    }
+    for i in 1..=n {
+        offsets[i] += offsets[i - 1];
+    }
+    let mut adjacency = vec![0usize; offsets[n]];
+    let mut cursors = offsets[..n].to_vec();
+    for (edge, &(l, r, _, _)) in edges.iter().enumerate() {
+        for i in [l, r].into_iter().flatten() {
+            let i = slot(i);
+            adjacency[cursors[i]] = edge;
+            cursors[i] += 1;
+        }
+    }
+    // Reuse the cursor allocation for BFS parents.
+    let mut parents = cursors;
+    parents.fill(usize::MAX);
+    let mut queue = Vec::with_capacity(touched.len());
+    let mut metrics = StrictTransferMetrics {
+        path_repairs: 0,
+        scratch_bytes: (offsets.capacity()
+            + adjacency.capacity()
+            + parents.capacity()
+            + queue.capacity())
+            * size_of::<usize>(),
+    };
+    // Every correction either resolves a violated endpoint or exhausts a path
+    // edge. Keep an explicit finite budget even for floating-point degeneracy.
+    let budget = 64.min(touched.len().saturating_add(edges.len()));
+    for repair in 0..=budget {
+        for &i in touched {
+            incoming[i] = 0.0;
+            outgoing[i] = 0.0;
+        }
+        for (&(l, r, _, _), &f) in edges.iter().zip(transfers.iter()) {
+            let (d, r) = if f >= 0.0 { (l, r) } else { (r, l) };
+            if let Some(i) = d {
+                outgoing[i] += f.abs();
+            }
+            if let Some(i) = r {
+                incoming[i] += f.abs();
+            }
+        }
+        for &i in touched {
+            candidate[i] = old[i] + (incoming[i] - outgoing[i]);
+        }
+        let Some(&root) = touched
+            .iter()
+            .find(|&&i| !(0.0..=1.0).contains(&candidate[i]))
+        else {
+            return Ok(metrics);
+        };
+        if !candidate[root].is_finite() || repair == budget {
+            break;
+        }
+        let overflow = candidate[root] > 1.0;
+        let needed = if overflow {
+            candidate[root] - 1.0
+        } else {
+            -candidate[root]
+        };
+        for &i in &queue {
+            parents[i] = usize::MAX;
+        }
+        queue.clear();
+        let root = slot(root);
+        parents[root] = 0;
+        queue.push(root);
+        let mut target = None;
+        let mut boundary_edge = None;
+        let mut best_capacity = 0.0_f64;
+        let mut best = None;
+        let mut cursor = 0;
+        'search: while cursor < queue.len() {
+            let cell = queue[cursor];
+            cursor += 1;
+            if cell != root {
+                let capacity = if overflow {
+                    1.0 - candidate[touched[cell]]
+                } else {
+                    candidate[touched[cell]]
+                };
+                if capacity >= needed {
+                    target = Some(cell);
+                    break;
+                }
+                if capacity > best_capacity {
+                    best_capacity = capacity;
+                    best = Some(cell);
+                }
+            }
+            for &edge in &adjacency[offsets[cell]..offsets[cell + 1]] {
+                let (l, r, _, _) = edges[edge];
+                let f = transfers[edge];
+                if f == 0.0 {
+                    continue;
+                }
+                let (d, r) = if f >= 0.0 { (l, r) } else { (r, l) };
+                let next = if overflow && r == Some(touched[cell]) {
+                    d
+                } else if !overflow && d == Some(touched[cell]) {
+                    r
+                } else {
+                    continue;
+                };
+                if next.is_none() {
+                    target = Some(cell);
+                    boundary_edge = Some(edge);
+                    break 'search;
+                }
+                if let Some(next) = next {
+                    let next = slot(next);
+                    if parents[next] == usize::MAX {
+                        parents[next] = edge;
+                        queue.push(next);
+                    }
+                }
+            }
+        }
+        let Some(target) = target.or(best) else {
+            break;
+        };
+        let capacity = if boundary_edge.is_some() {
+            f64::INFINITY
+        } else if overflow {
+            1.0 - candidate[touched[target]]
+        } else {
+            candidate[touched[target]]
+        };
+        let mut amount = needed.min(capacity);
+        if let Some(edge) = boundary_edge {
+            amount = amount.min(transfers[edge].abs());
+        }
+        let mut cell = target;
+        while cell != root {
+            let edge = parents[cell];
+            amount = amount.min(transfers[edge].abs());
+            let (l, r, _, _) = edges[edge];
+            let (d, r) = if transfers[edge] >= 0.0 {
+                (l, r)
+            } else {
+                (r, l)
+            };
+            cell = slot(if overflow { r } else { d }.expect("BFS path has an interior parent"));
+        }
+        if amount <= 0.0 {
+            break;
+        }
+        cell = target;
+        let mut changed = false;
+        if let Some(edge) = boundary_edge {
+            let f = transfers[edge];
+            transfers[edge] = (f.abs() - amount).max(0.0).copysign(f);
+            changed |= transfers[edge] != f;
+        }
+        while cell != root {
+            let edge = parents[cell];
+            let f = transfers[edge];
+            let (l, r, _, _) = edges[edge];
+            let (d, r) = if f >= 0.0 { (l, r) } else { (r, l) };
+            transfers[edge] = (f.abs() - amount).max(0.0).copysign(f);
+            changed |= transfers[edge] != f;
+            cell = slot(if overflow { r } else { d }.expect("BFS path has an interior parent"));
+        }
+        if !changed {
+            break;
+        }
+        metrics.path_repairs += 1;
+    }
+    Err(MacError::TransportBoundsViolation {
+        minimum: touched.iter().map(|&i| candidate[i]).fold(1.0, f64::min),
+        maximum: touched.iter().map(|&i| candidate[i]).fold(0.0, f64::max),
+    })
 }
 
 /// Plane n.x <= alpha inside the unit cell [0,1]^3. The normal is a
@@ -4252,16 +4484,16 @@ mod tests {
     }
 
     #[test]
-    fn strict_phase_transfers_reject_an_unresolved_saturated_chain() {
+    fn strict_phase_transfers_resolve_both_saturated_chain_orientations() {
         let old = [1.0; 108];
         let edges: Vec<_> = (0..107)
             .map(|i| (Some(i), Some(i + 1), 0.0, false))
             .collect();
-        let mut transfers = vec![0.1; edges.len()];
         let mut incoming = [0.0; 108];
         let mut outgoing = [0.0; 108];
         let mut candidate = old;
-        assert!(matches!(
+        for flux in [0.1, -0.1] {
+            let mut transfers = vec![flux; edges.len()];
             strict_transfer_bounds(
                 &old,
                 &edges,
@@ -4269,10 +4501,165 @@ mod tests {
                 &(0..108).collect::<Vec<_>>(),
                 &mut incoming,
                 &mut outgoing,
+                &mut candidate,
+            )
+            .unwrap();
+            assert_eq!(candidate, old);
+            assert!(transfers.iter().all(|&f| f == 0.0));
+        }
+    }
+
+    #[test]
+    fn strict_phase_transfers_keep_throughflow_when_full_cell_fluxes_differ_by_ulps() {
+        let old = [0.5, 1.0, 1.0, 1.0, 0.5];
+        let edges: Vec<_> = (0..4).map(|i| (Some(i), Some(i + 1), 0.0, false)).collect();
+        let mut incoming = [0.0; 5];
+        let mut outgoing = [0.0; 5];
+        let mut candidate = old;
+        for sign in [1.0, -1.0] {
+            let mut transfers = vec![
+                0.01 + 3.0 * f64::EPSILON,
+                0.01 + 2.0 * f64::EPSILON,
+                0.01 + f64::EPSILON,
+                0.01,
+            ];
+            if sign < 0.0 {
+                transfers.reverse();
+            }
+            transfers.iter_mut().for_each(|f| *f *= sign);
+            strict_transfer_bounds(
+                &old,
+                &edges,
+                &mut transfers,
+                &[0, 1, 2, 3, 4],
+                &mut incoming,
+                &mut outgoing,
+                &mut candidate,
+            )
+            .unwrap();
+            assert!(candidate.iter().all(|v| (0.0..=1.0).contains(v)));
+            assert!((candidate.iter().sum::<f64>() - old.iter().sum::<f64>()).abs() < 1e-14);
+            assert!(
+                transfers.iter().all(|f| (f.abs() - 0.01).abs() < 1e-12),
+                "roundoff repair destroyed throughflow: {transfers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_phase_transfers_repair_a_path_longer_than_the_local_sweep_budget() {
+        let old = [1.0; 512];
+        // Two interleaved parity groups prevent either traversal from resolving
+        // the entire directed path in one sweep. The global path repair must
+        // return water through the connected chain without extra local passes.
+        let edges: Vec<_> = (0..511)
+            .step_by(2)
+            .chain((1..511).step_by(2))
+            .map(|i| (Some(i), Some(i + 1), 0.0, false))
+            .collect();
+        let mut transfers = vec![0.1; edges.len()];
+        let mut incoming = [0.0; 512];
+        let mut outgoing = [0.0; 512];
+        let mut candidate = old;
+        let metrics = strict_transfer_bounds(
+            &old,
+            &edges,
+            &mut transfers,
+            &(0..512).collect::<Vec<_>>(),
+            &mut incoming,
+            &mut outgoing,
+            &mut candidate,
+        )
+        .unwrap();
+        assert!(
+            metrics.path_repairs > 0 && metrics.path_repairs <= (old.len() + edges.len()) as u64
+        );
+        assert_eq!(candidate, old);
+        assert!(transfers.iter().all(|&f| f.abs() < 1e-14));
+        assert!(metrics.scratch_bytes > 0);
+    }
+
+    #[test]
+    fn strict_path_repair_rejects_a_correction_that_cannot_change_a_face() {
+        let flux = 0.4_f64;
+        let old = [flux.next_up() - flux - 1e-25, 0.0, 0.5];
+        let edges = [
+            (Some(2), Some(0), 0.0, false),
+            (Some(0), Some(1), 0.0, false),
+        ];
+        let initial = [flux, flux.next_up()];
+        let mut transfers = initial;
+        let mut incoming = [0.0; 3];
+        let mut outgoing = [0.0; 3];
+        let mut candidate = old;
+        // The amount deficit is smaller than either transfer's ulp. Do not
+        // repeatedly "repair" unchanged faces or clip the cell fraction.
+        assert!(matches!(
+            repair_strict_transfer_paths(
+                &old,
+                &edges,
+                &mut transfers,
+                &[0, 1, 2],
+                &mut incoming,
+                &mut outgoing,
                 &mut candidate
             ),
             Err(MacError::TransportBoundsViolation { .. })
         ));
+        assert_eq!(transfers, initial);
+        assert!(candidate[0] < 0.0);
+    }
+
+    #[test]
+    fn strict_path_repair_refunds_open_outflow_in_both_face_orientations() {
+        for (l, r, flux) in [(Some(0), None, 0.2), (None, Some(0), -0.2)] {
+            let old = [0.1];
+            let edges = [(l, r, 0.0, true)];
+            let mut transfers = [flux];
+            let mut incoming = [0.0];
+            let mut outgoing = [0.0];
+            let mut candidate = old;
+            let metrics = repair_strict_transfer_paths(
+                &old,
+                &edges,
+                &mut transfers,
+                &[0],
+                &mut incoming,
+                &mut outgoing,
+                &mut candidate,
+            )
+            .unwrap();
+            assert_eq!(metrics.path_repairs, 1);
+            assert_eq!(candidate, [0.0]);
+            assert!((candidate[0] + transfers[0].abs() - old[0]).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn strict_path_repair_rejects_when_its_finite_augmentation_budget_is_exhausted() {
+        let old: Vec<_> = (0..65).flat_map(|_| [0.5, 1.0]).collect();
+        let edges: Vec<_> = (0..65)
+            .map(|i| (Some(2 * i), Some(2 * i + 1), 0.0, false))
+            .collect();
+        let mut transfers = vec![0.1; 65];
+        let mut incoming = vec![0.0; old.len()];
+        let mut outgoing = vec![0.0; old.len()];
+        let mut candidate = old.clone();
+        let touched: Vec<_> = (0..old.len()).collect();
+        assert!(matches!(
+            repair_strict_transfer_paths(
+                &old,
+                &edges,
+                &mut transfers,
+                &touched,
+                &mut incoming,
+                &mut outgoing,
+                &mut candidate
+            ),
+            Err(MacError::TransportBoundsViolation { .. })
+        ));
+        assert!(candidate.iter().any(|&f| f > 1.0));
+        assert_eq!(transfers[64], 0.1);
     }
 
     #[test]
@@ -4668,7 +5055,7 @@ mod tests {
         let region = [true, false];
         let before = grid.water_volume_m3();
         let upper_before = grid.fraction[grid.cell_index(0, 0, 0)] * grid.cell_volume();
-        let (open_outflow, region_out, region_in) =
+        let (open_outflow, region_out, region_in, _) =
             grid.advect_fraction_fct(0.1, Some(&region)).unwrap();
         let upper_after = grid.fraction[grid.cell_index(0, 0, 0)] * grid.cell_volume();
         assert_eq!(open_outflow, 0.0);

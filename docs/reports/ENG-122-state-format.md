@@ -4,9 +4,10 @@ Experimental, not registered in `WireTag`, `WaterState`, store checkpoints or
 journals. This payload is only a proposed replacement for the amount/ledger
 arrays within a future explicitly versioned canonical restart state.
 
-Increment 7's fine MAC phase/pressure reference does not change this decision.
-Its strict channel transport gate fails and conservative momentum accuracy is
-unaccepted. The numerical candidate is cloned only for atomic in-memory steps;
+The fine MAC phase/pressure reference does not change this decision. Its
+increment-7 channel failure is resolved by increment 8's paired-transfer
+repair, but conservative momentum accuracy remains unaccepted. The numerical
+candidate is cloned only for atomic in-memory steps;
 that clone is not a restart payload or a durable transaction. No reference
 pressure, velocity, air-model or runtime topology layout is serialized.
 

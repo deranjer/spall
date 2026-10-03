@@ -109,6 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut substeps = 0;
     let mut pressure_rows = 0;
     let mut pressure_iterations = 0;
+    let mut path_repairs = 0;
+    let mut path_scratch_bytes = 0;
     let mut times = Vec::new();
     let mut failure = None;
     for _ in 0..steps {
@@ -125,6 +127,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         substeps += metrics.substeps;
         pressure_rows += metrics.pressure_active_rows_total;
         pressure_iterations += metrics.pressure_iterations;
+        path_repairs += metrics.strict_path_repair_count;
+        path_scratch_bytes = path_scratch_bytes.max(metrics.strict_path_scratch_bytes);
         max_divergence = max_divergence.max(metrics.divergence_after_max_s);
         peak_momentum = peak_momentum.max(world.solver().liquid_momentum_kg_m_s()[0]);
         peak_liquid_speed = peak_liquid_speed.max(world.solver().max_liquid_speed_m_s());
@@ -154,6 +158,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let median = times
         .get(times.len() / 2)
         .map_or_else(|| "null".into(), ToString::to_string);
+    let p99 = times
+        .get(times.len().saturating_sub(1) * 99 / 100)
+        .map_or_else(|| "null".into(), ToString::to_string);
+    let maximum = times
+        .last()
+        .map_or_else(|| "null".into(), ToString::to_string);
     let accounting =
         world.phase().water_volume_m3() + world.solver().cumulative_open_outflow_m3() - initial;
     let gate = accepted == steps
@@ -168,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map_or_else(|| "null".into(), |e| format!("{e:?}"));
     println!(
-        "{{\"fixture\":{mode:?},\"backend\":\"fine_mac_phase_reference\",\"fine_dimensions\":{dims:?},\"phase_geometry_factor\":3,\"solver_cell_size_m\":0.25,\"requested_steps\":{steps},\"accepted_steps\":{accepted},\"accepted_substeps\":{substeps},\"dt_s\":0.01,\"advanced_time_s\":{},\"initial_water_m3\":{initial},\"downstream_water_m3\":{downstream},\"peak_eastward_liquid_momentum_kg_m_s\":{peak_momentum},\"peak_liquid_speed_m_s\":{peak_liquid_speed},\"peak_all_face_speed_m_s\":{peak_all_speed},\"peak_divergence_per_s\":{max_divergence},\"pressure_rows_total\":{pressure_rows},\"pressure_iterations_total\":{pressure_iterations},\"initial_liquid_energy_j\":{initial_energy},\"peak_liquid_energy_j\":{peak_energy},\"accounting_error_m3\":{accounting},\"retained_phase_solver_array_bytes\":{},\"coupled_iteration_median_us\":{median},\"failure\":{failure_json},\"motion_gate_pass\":{gate},\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
+        "{{\"fixture\":{mode:?},\"backend\":\"fine_mac_phase_reference\",\"fine_dimensions\":{dims:?},\"phase_geometry_factor\":3,\"solver_cell_size_m\":0.25,\"requested_steps\":{steps},\"accepted_steps\":{accepted},\"accepted_substeps\":{substeps},\"dt_s\":0.01,\"advanced_time_s\":{},\"initial_water_m3\":{initial},\"downstream_water_m3\":{downstream},\"peak_eastward_liquid_momentum_kg_m_s\":{peak_momentum},\"peak_liquid_speed_m_s\":{peak_liquid_speed},\"peak_all_face_speed_m_s\":{peak_all_speed},\"peak_divergence_per_s\":{max_divergence},\"pressure_rows_total\":{pressure_rows},\"pressure_iterations_total\":{pressure_iterations},\"initial_liquid_energy_j\":{initial_energy},\"peak_liquid_energy_j\":{peak_energy},\"accounting_error_m3\":{accounting},\"retained_phase_solver_array_bytes\":{},\"coupled_iteration_median_us\":{median},\"coupled_iteration_p99_us\":{p99},\"coupled_iteration_max_us\":{maximum},\"strict_path_repairs\":{path_repairs},\"strict_path_scratch_peak_bytes\":{path_scratch_bytes},\"failure\":{failure_json},\"motion_gate_pass\":{gate},\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
         f64::from(accepted) * 0.01,
         world.retained_array_bytes()
     );
