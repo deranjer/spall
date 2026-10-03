@@ -57,8 +57,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let predictor = match std::env::args().nth(2).as_deref() {
         None | Some("baseline") => false,
         Some("predictor") => true,
-        _ => return Err("mode must be baseline or predictor".into()),
+        Some("balanced") => false,
+        _ => return Err("mode must be baseline, predictor or balanced".into()),
     };
+    let balanced = std::env::args().nth(2).as_deref() == Some("balanced");
     let mut world = spall_fluid::phase_pressure::PhasePressureWorld::new(
         phase,
         spall_fluid::phase_pressure::PhasePressureConfig {
@@ -81,6 +83,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             8,
         )?;
     }
+    if balanced {
+        world.enable_pressure_preconditioner(
+            spall_fluid::phase_graph::GraphLimits {
+                max_fine_cells: 4_000_000,
+                max_rows: 200_000,
+                max_connections: 600_000,
+            },
+            8,
+        )?;
+    }
     let initial = world.phase().water_volume_m3();
     let mut accepted = 0;
     let mut substeps = 0;
@@ -90,6 +102,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reuses = 0;
     let mut rebuilds = 0;
     let mut coarse_us = 0;
+    let mut balanced_applications = 0;
+    let mut balanced_us = 0;
+    let mut balanced_scratch = 0;
     let mut times = Vec::new();
     let mut pressure_times = Vec::new();
     let mut max_speed = 0.0_f64;
@@ -113,6 +128,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reuses += m.phase_predictor_reuses;
         rebuilds += m.phase_predictor_rebuilds;
         coarse_us += m.phase_predictor_micros;
+        balanced_applications += m.phase_preconditioner_applications;
+        balanced_us += m.phase_preconditioner_micros;
+        balanced_scratch = balanced_scratch.max(m.phase_preconditioner_scratch_bytes);
         max_speed = max_speed.max(world.solver().max_liquid_speed_m_s());
     }
     let error =
@@ -122,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or_else(|| "null".into(), |e| format!("{e:?}"));
     let gate = accepted == 2 && error.abs() < 1e-9;
     println!(
-        "{{\"size\":{size},\"seed\":1,\"season\":\"autumn\",\"backend\":\"fine_mac_phase_reference\",\"predictor\":{predictor},\"requested_steps\":2,\"accepted_steps\":{accepted},\"dt_s\":0.05,\"substeps\":{substeps},\"fine_pressure_rows_total\":{fine_rows},\"fine_pressure_iterations\":{fine_iterations},\"predictor_rows_total\":{coarse_rows},\"predictor_reuses\":{reuses},\"predictor_rebuilds\":{rebuilds},\"predictor_total_us\":{coarse_us},\"all_in_step_us\":{times:?},\"pressure_step_us\":{pressure_times:?},\"peak_liquid_speed_m_s\":{max_speed},\"accounting_error_m3\":{error},\"retained_array_upper_bound_bytes\":{},\"failure\":{failure_json},\"startup_gate_pass\":{gate},\"minute_rest_gate_accepted\":false,\"generated_trench_gate_accepted\":false,\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
+        "{{\"size\":{size},\"seed\":1,\"season\":\"autumn\",\"backend\":\"fine_mac_phase_reference\",\"predictor\":{predictor},\"requested_steps\":2,\"accepted_steps\":{accepted},\"dt_s\":0.05,\"substeps\":{substeps},\"fine_pressure_rows_total\":{fine_rows},\"fine_pressure_iterations\":{fine_iterations},\"phase_balanced_preconditioner\":{balanced},\"balanced_applications\":{balanced_applications},\"balanced_scratch_peak_bytes\":{balanced_scratch},\"predictor_rows_total\":{coarse_rows},\"predictor_reuses\":{reuses},\"predictor_rebuilds\":{rebuilds},\"predictor_total_us\":{coarse_us},\"balanced_application_total_us\":{balanced_us},\"all_in_step_us\":{times:?},\"pressure_step_us\":{pressure_times:?},\"peak_liquid_speed_m_s\":{max_speed},\"accounting_error_m3\":{error},\"retained_array_upper_bound_bytes\":{},\"failure\":{failure_json},\"startup_gate_pass\":{gate},\"minute_rest_gate_accepted\":false,\"generated_trench_gate_accepted\":false,\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
         world.retained_array_bytes()
     );
     if !gate {

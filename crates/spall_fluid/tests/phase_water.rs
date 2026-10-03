@@ -885,3 +885,91 @@ fn phase_pressure_rejects_scale_array_budget_and_invalid_dt() {
     assert_eq!(world.solver().max_face_component_velocity_m_s(), 0.0);
     assert_eq!(world.retained_array_bytes(), initial_bytes);
 }
+#[test]
+fn phase_pressure_balanced_keeps_two_heads_and_rejects_late_failure_atomically() {
+    use spall_fluid::phase_graph::GraphLimits;
+    use spall_fluid::phase_pressure::{PhasePressureError, PhasePressureWorld};
+    let limits = GraphLimits {
+        max_fine_cells: 30_000,
+        max_rows: 30_000,
+        max_connections: 90_000,
+    };
+    let phase = fixture(
+        [9, 6, 3],
+        |x, y, _| x == 4 && y < 5,
+        |x, y, _| {
+            if x < 4 {
+                (2.0 - y as f64).clamp(0.0, 1.0)
+            } else if x > 4 {
+                (1.3 - y as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        },
+        100,
+    );
+    let initial = phase.fractions().to_vec();
+    let mut world = PhasePressureWorld::new(phase, pressure_config()).unwrap();
+    let before = world.retained_array_bytes();
+    assert!(world.enable_pressure_preconditioner(limits, 0).is_err());
+    assert_eq!(world.retained_array_bytes(), before);
+    world.enable_pressure_preconditioner(limits, 8).unwrap();
+    let mut reused = 0;
+    for _ in 0..600 {
+        let m = world.step(0.01).unwrap();
+        assert_eq!(m.pressure_converged_substeps, m.substeps);
+        assert!(m.phase_preconditioner_applications > 0);
+        reused += m.phase_predictor_reuses;
+    }
+    assert!(reused > 0);
+    assert!(world.solver().max_liquid_speed_m_s() < 1e-6);
+    assert!(
+        world
+            .phase()
+            .fractions()
+            .iter()
+            .zip(&initial)
+            .all(|(a, b)| (a - b).abs() < 1e-6)
+    );
+    let left = world
+        .solver()
+        .pressure_at(GlobalCell::new(1, 0, 1))
+        .unwrap();
+    let right = world
+        .solver()
+        .pressure_at(GlobalCell::new(7, 0, 1))
+        .unwrap();
+    assert!(left - right > 1000.0);
+    let phase = fixture(
+        [6, 6, 3],
+        |_, _, _| false,
+        |x, y, _| if x < 3 && y < 3 { 1.0 } else { 0.0 },
+        100,
+    );
+    let initial = phase.fractions().to_vec();
+    let mut config = pressure_config();
+    config.mac.pressure_max_iterations = 1;
+    let mut world = PhasePressureWorld::new(phase, config).unwrap();
+    world.enable_pressure_preconditioner(limits, 8).unwrap();
+    let before = world.retained_array_bytes();
+    let error = world.step(0.01).unwrap_err();
+    assert!(matches!(
+        error,
+        PhasePressureError::PressureNotConverged { .. }
+    ));
+    assert_eq!(world.step(0.01).unwrap_err(), error);
+    assert_eq!(world.phase().fractions(), initial);
+    assert_eq!(world.retained_array_bytes(), before);
+    assert_eq!(world.solver().max_face_component_velocity_m_s(), 0.0);
+    config = pressure_config();
+    config.max_retained_array_bytes = PhasePressureWorld::new(world.phase().clone(), config)
+        .unwrap()
+        .retained_array_bytes();
+    let mut limited = PhasePressureWorld::new(world.phase().clone(), config).unwrap();
+    let before = limited.retained_array_bytes();
+    assert!(matches!(
+        limited.enable_pressure_preconditioner(limits, 8),
+        Err(PhasePressureError::ArrayLimit { .. })
+    ));
+    assert_eq!(limited.retained_array_bytes(), before);
+}

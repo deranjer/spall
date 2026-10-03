@@ -23,8 +23,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let predictor = match std::env::args().nth(3).as_deref() {
         None | Some("baseline") => false,
         Some("predictor") => true,
-        _ => return Err("optional pressure mode must be baseline or predictor".into()),
+        Some("balanced") => false,
+        _ => return Err("optional pressure mode must be baseline, predictor or balanced".into()),
     };
+    let balanced = std::env::args().nth(3).as_deref() == Some("balanced");
     let dims: [u32; 3] = if mode == "channel" {
         [48, 18, 12]
     } else {
@@ -112,6 +114,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             8,
         )?;
     }
+    if balanced {
+        world.enable_pressure_preconditioner(
+            spall_fluid::phase_graph::GraphLimits {
+                max_fine_cells: 30_000,
+                max_rows: 30_000,
+                max_connections: 90_000,
+            },
+            8,
+        )?;
+    }
     let initial = world.phase().water_volume_m3();
     let initial_energy =
         world.solver().gravitational_potential_energy_j() + world.solver().kinetic_energy_j();
@@ -128,6 +140,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut predictor_reuses = 0;
     let mut predictor_rebuilds = 0;
     let mut predictor_micros = 0;
+    let mut balanced_applications = 0;
+    let mut balanced_micros = 0;
+    let mut balanced_scratch = 0;
     let mut path_repairs = 0;
     let mut path_scratch_bytes = 0;
     let mut times = Vec::new();
@@ -150,6 +165,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         predictor_reuses += metrics.phase_predictor_reuses;
         predictor_rebuilds += metrics.phase_predictor_rebuilds;
         predictor_micros += metrics.phase_predictor_micros;
+        balanced_applications += metrics.phase_preconditioner_applications;
+        balanced_micros += metrics.phase_preconditioner_micros;
+        balanced_scratch = balanced_scratch.max(metrics.phase_preconditioner_scratch_bytes);
         path_repairs += metrics.strict_path_repair_count;
         path_scratch_bytes = path_scratch_bytes.max(metrics.strict_path_scratch_bytes);
         max_divergence = max_divergence.max(metrics.divergence_after_max_s);
@@ -201,7 +219,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map_or_else(|| "null".into(), |e| format!("{e:?}"));
     println!(
-        "{{\"fixture\":{mode:?},\"backend\":\"fine_mac_phase_reference\",\"fine_dimensions\":{dims:?},\"phase_geometry_factor\":3,\"solver_cell_size_m\":0.25,\"requested_steps\":{steps},\"accepted_steps\":{accepted},\"accepted_substeps\":{substeps},\"dt_s\":0.01,\"advanced_time_s\":{},\"initial_water_m3\":{initial},\"downstream_water_m3\":{downstream},\"peak_eastward_liquid_momentum_kg_m_s\":{peak_momentum},\"peak_liquid_speed_m_s\":{peak_liquid_speed},\"peak_all_face_speed_m_s\":{peak_all_speed},\"peak_divergence_per_s\":{max_divergence},\"pressure_rows_total\":{pressure_rows},\"pressure_iterations_total\":{pressure_iterations},\"phase_pressure_predictor\":{predictor},\"predictor_rows_total\":{predictor_rows},\"predictor_reuses\":{predictor_reuses},\"predictor_rebuilds\":{predictor_rebuilds},\"predictor_total_us\":{predictor_micros},\"initial_liquid_energy_j\":{initial_energy},\"peak_liquid_energy_j\":{peak_energy},\"accounting_error_m3\":{accounting},\"retained_phase_solver_array_bytes\":{},\"coupled_iteration_median_us\":{median},\"coupled_iteration_p99_us\":{p99},\"coupled_iteration_max_us\":{maximum},\"strict_path_repairs\":{path_repairs},\"strict_path_scratch_peak_bytes\":{path_scratch_bytes},\"failure\":{failure_json},\"motion_gate_pass\":{gate},\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
+        "{{\"fixture\":{mode:?},\"backend\":\"fine_mac_phase_reference\",\"fine_dimensions\":{dims:?},\"phase_geometry_factor\":3,\"solver_cell_size_m\":0.25,\"requested_steps\":{steps},\"accepted_steps\":{accepted},\"accepted_substeps\":{substeps},\"dt_s\":0.01,\"advanced_time_s\":{},\"initial_water_m3\":{initial},\"downstream_water_m3\":{downstream},\"peak_eastward_liquid_momentum_kg_m_s\":{peak_momentum},\"peak_liquid_speed_m_s\":{peak_liquid_speed},\"peak_all_face_speed_m_s\":{peak_all_speed},\"peak_divergence_per_s\":{max_divergence},\"pressure_rows_total\":{pressure_rows},\"pressure_iterations_total\":{pressure_iterations},\"phase_pressure_predictor\":{predictor},\"phase_balanced_preconditioner\":{balanced},\"balanced_applications\":{balanced_applications},\"balanced_scratch_peak_bytes\":{balanced_scratch},\"predictor_rows_total\":{predictor_rows},\"predictor_reuses\":{predictor_reuses},\"predictor_rebuilds\":{predictor_rebuilds},\"predictor_total_us\":{predictor_micros},\"balanced_application_total_us\":{balanced_micros},\"initial_liquid_energy_j\":{initial_energy},\"peak_liquid_energy_j\":{peak_energy},\"accounting_error_m3\":{accounting},\"retained_phase_solver_array_bytes\":{},\"coupled_iteration_median_us\":{median},\"coupled_iteration_p99_us\":{p99},\"coupled_iteration_max_us\":{maximum},\"strict_path_repairs\":{path_repairs},\"strict_path_scratch_peak_bytes\":{path_scratch_bytes},\"failure\":{failure_json},\"motion_gate_pass\":{gate},\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
         f64::from(accepted) * 0.01,
         world.retained_array_bytes()
     );

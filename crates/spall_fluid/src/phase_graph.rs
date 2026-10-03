@@ -261,6 +261,9 @@ impl PhaseGraph {
     pub fn row_at_index(&self, index: usize) -> Option<u32> {
         self.labels.get(index).copied().filter(|&r| r != NONE)
     }
+    pub(crate) fn shared_labels(&self) -> Arc<Vec<u32>> {
+        self.labels.clone()
+    }
     /// Excludes the shared immutable phase/geometry, build queue/map and operators.
     pub fn array_storage_bytes(&self) -> usize {
         self.labels.capacity() * size_of::<u32>()
@@ -428,13 +431,14 @@ impl AggregatedPressure {
     /// predictor, not acceptance of the physical fine divergence constraint.
     /// Unanchored constant modes are left for the owning fine solver's gauge.
     pub(crate) fn smooth(&self, source: &[f64], sweeps: u32) -> Result<Vec<f64>, GraphError> {
-        if source.len() != self.top_weights.len()
-            || source.iter().any(|v| !v.is_finite())
-            || sweeps == 0
-            || sweeps > 64
-        {
-            return Err(GraphError::InvalidState);
-        }
+        let smoother = self.smoother()?;
+        let mut x = vec![0.0; source.len()];
+        smoother.apply(source, &mut x, sweeps)?;
+        Ok(x)
+    }
+
+    /// Build immutable CSR once per physical projection, outside Krylov loops.
+    pub(crate) fn smoother(&self) -> Result<PressureSmoother, GraphError> {
         let mut diagonal = self.top_weights.clone();
         let mut counts = vec![0usize; diagonal.len() + 1];
         for edge in self.connections.iter() {
@@ -459,26 +463,11 @@ impl AggregatedPressure {
         if diagonal.iter().any(|d| !d.is_finite()) {
             return Err(GraphError::InvalidState);
         }
-        let mut x = vec![0.0; source.len()];
-        for _ in 0..sweeps {
-            for reverse in [false, true] {
-                for k in 0..x.len() {
-                    let i = if reverse { x.len() - 1 - k } else { k };
-                    if diagonal[i] == 0.0 {
-                        continue;
-                    }
-                    let sum = entries[counts[i]..counts[i + 1]]
-                        .iter()
-                        .map(|&(j, w)| w * x[j as usize])
-                        .sum::<f64>();
-                    x[i] = (source[i] + sum) / diagonal[i];
-                }
-            }
-        }
-        if x.iter().any(|v| !v.is_finite()) {
-            return Err(GraphError::InvalidState);
-        }
-        Ok(x)
+        Ok(PressureSmoother {
+            diagonal,
+            counts,
+            entries,
+        })
     }
     pub fn apply(&self, pressure: &[f64]) -> Result<Vec<f64>, GraphError> {
         if pressure.len() != self.top_weights.len() || pressure.iter().any(|p| !p.is_finite()) {
@@ -502,6 +491,55 @@ impl AggregatedPressure {
     }
     pub fn array_storage_bytes(&self) -> usize {
         (self.weights.capacity() + self.top_weights.capacity()) * size_of::<f64>()
+    }
+}
+
+pub(crate) struct PressureSmoother {
+    diagonal: Vec<f64>,
+    counts: Vec<usize>,
+    entries: Vec<(u32, f64)>,
+}
+
+impl PressureSmoother {
+    pub(crate) fn apply(
+        &self,
+        source: &[f64],
+        x: &mut [f64],
+        sweeps: u32,
+    ) -> Result<(), GraphError> {
+        if source.len() != self.diagonal.len()
+            || x.len() != source.len()
+            || source.iter().any(|v| !v.is_finite())
+            || sweeps == 0
+            || sweeps > 64
+        {
+            return Err(GraphError::InvalidState);
+        }
+        x.fill(0.0);
+        for _ in 0..sweeps {
+            for reverse in [false, true] {
+                for k in 0..x.len() {
+                    let i = if reverse { x.len() - 1 - k } else { k };
+                    if self.diagonal[i] == 0.0 {
+                        continue;
+                    }
+                    let sum = self.entries[self.counts[i]..self.counts[i + 1]]
+                        .iter()
+                        .map(|&(j, w)| w * x[j as usize])
+                        .sum::<f64>();
+                    x[i] = (source[i] + sum) / self.diagonal[i];
+                }
+            }
+        }
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(GraphError::InvalidState);
+        }
+        Ok(())
+    }
+    pub fn array_storage_bytes(&self) -> usize {
+        self.diagonal.capacity() * size_of::<f64>()
+            + self.counts.capacity() * size_of::<usize>()
+            + self.entries.capacity() * size_of::<(u32, f64)>()
     }
 }
 

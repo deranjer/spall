@@ -107,6 +107,22 @@ impl PhasePressureWorld {
         self.solver = solver;
         Ok(())
     }
+    /// Experimental balanced phase correction in every Krylov iteration.
+    /// Reuses fine convergence/transport gates; extra work is per projection.
+    pub fn enable_pressure_preconditioner(
+        &mut self,
+        limits: GraphLimits,
+        sweeps: u32,
+    ) -> Result<(), PhasePressureError> {
+        let mut solver = self.solver.clone();
+        solver.set_phase_pressure_preconditioner(&self.phase, limits, sweeps)?;
+        check_bytes(
+            self.phase.array_storage_bytes() + solver.allocated_bytes(),
+            self.max_retained_array_bytes,
+        )?;
+        self.solver = solver;
+        Ok(())
+    }
     /// Excludes shared exact geometry and transient solve/candidate allocations.
     /// Includes the canonical phase fractions and MAC's working fraction copy.
     /// With a predictor, conservatively counts its fraction snapshot even when

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use spall_core::GlobalCell;
 
-use crate::phase_graph::{GraphError, GraphLimits, PhaseGraph};
+use crate::phase_graph::{GraphError, GraphLimits, PhaseGraph, PressureSmoother};
 use crate::phase_water::PhaseWater;
 use crate::{DomainSpec, SolidBoundary};
 
@@ -68,6 +68,10 @@ pub struct MacStepMetrics {
     pub phase_predictor_reuses: u32,
     pub phase_predictor_rebuilds: u32,
     pub phase_predictor_micros: u64,
+    pub phase_preconditioner_applications: u32,
+    pub phase_preconditioner_micros: u64,
+    /// Additional per-projection numerical arrays; not total peak or RSS.
+    pub phase_preconditioner_scratch_bytes: usize,
     pub divergence_before_max_s: f64,
     pub divergence_after_max_s: f64,
     pub water_volume_before_m3: f64,
@@ -310,7 +314,19 @@ impl MacGridWorld {
             graph,
             limits,
             sweeps,
+            iterative: false,
         });
+        Ok(())
+    }
+
+    pub(crate) fn set_phase_pressure_preconditioner(
+        &mut self,
+        phase: &PhaseWater,
+        limits: GraphLimits,
+        sweeps: u32,
+    ) -> Result<(), MacError> {
+        self.set_phase_pressure_predictor(phase, limits, sweeps)?;
+        self.phase_predictor.as_mut().unwrap().iterative = true;
         Ok(())
     }
 
@@ -1226,6 +1242,11 @@ impl MacGridWorld {
             metrics.phase_predictor_reuses += u32::from(p.phase_reused);
             metrics.phase_predictor_rebuilds += u32::from(p.phase_rows > 0 && !p.phase_reused);
             metrics.phase_predictor_micros += p.phase_micros;
+            metrics.phase_preconditioner_applications += p.phase_applications;
+            metrics.phase_preconditioner_micros += p.phase_apply_micros;
+            metrics.phase_preconditioner_scratch_bytes = metrics
+                .phase_preconditioner_scratch_bytes
+                .max(p.phase_scratch_bytes);
             metrics.pressure_active_rows_total += p.active_cells as u64;
             metrics.pressure_residual_initial_max = metrics
                 .pressure_residual_initial_max
@@ -1831,6 +1852,7 @@ impl MacGridWorld {
         let mut phase_rows = 0;
         let mut phase_reused = false;
         let mut phase_micros = 0;
+        let mut balanced = None;
         if let Some(state) = &self.phase_predictor {
             let start = Instant::now();
             project_component_means(
@@ -1868,28 +1890,37 @@ impl MacGridWorld {
             let coarse = graph
                 .pressure_operator_with_diagonal(&phase, &weights, phase_diagonal.as_ref().unwrap())
                 .map_err(MacError::PhaseGraph)?;
-            let mut source = vec![0.0; graph.rows().len()];
-            for &i in &liquid_indices {
-                source[graph.row_at_index(i).unwrap() as usize] += r[i];
-            }
-            let correction = coarse
-                .smooth(&source, state.sweeps)
-                .map_err(MacError::PhaseGraph)?;
-            for &i in &liquid_indices {
-                p[i] += correction[graph.row_at_index(i).unwrap() as usize];
-            }
-            project_component_means(
-                &mut p,
-                &components,
-                &anchored,
-                comp_count,
-                &liquid_indices,
-                &mut component_mean_sums,
-                &mut component_mean_counts,
-            );
-            operator.apply(&p, &mut ap);
-            for &i in &liquid_indices {
-                r[i] = rhs[i] - ap[i];
+            if state.iterative {
+                balanced = Some(BalancedPhasePressure::new(
+                    &graph,
+                    coarse.smoother().map_err(MacError::PhaseGraph)?,
+                    n,
+                    state.sweeps,
+                ));
+            } else {
+                let mut source = vec![0.0; graph.rows().len()];
+                for &i in &liquid_indices {
+                    source[graph.row_at_index(i).unwrap() as usize] += r[i];
+                }
+                let correction = coarse
+                    .smooth(&source, state.sweeps)
+                    .map_err(MacError::PhaseGraph)?;
+                for &i in &liquid_indices {
+                    p[i] += correction[graph.row_at_index(i).unwrap() as usize];
+                }
+                project_component_means(
+                    &mut p,
+                    &components,
+                    &anchored,
+                    comp_count,
+                    &liquid_indices,
+                    &mut component_mean_sums,
+                    &mut component_mean_counts,
+                );
+                operator.apply(&p, &mut ap);
+                for &i in &liquid_indices {
+                    r[i] = rhs[i] - ap[i];
+                }
             }
             phase_rows = graph.rows().len();
             phase_reused = reused;
@@ -1898,22 +1929,29 @@ impl MacGridWorld {
                 graph,
                 limits: state.limits,
                 sweeps: state.sweeps,
+                iterative: state.iterative,
             });
             phase_micros = start.elapsed().as_micros() as u64;
         }
-        if let Some(factor) = &ic0 {
-            factor.apply(
-                &r,
-                &mut zvec,
-                &liquid_indices,
-                preconditioner_work.as_mut().unwrap(),
-            );
-        } else if let Some(mg) = &mut multigrid {
-            mg.apply(&r, &mut zvec);
+        let mut base = BasePressurePreconditioner {
+            ic0: ic0.as_ref(),
+            multigrid: multigrid.as_mut(),
+            work: preconditioner_work.as_mut(),
+            active: &liquid_indices,
+            diag: &diag,
+        };
+        let mut phase_applications = 0;
+        let mut phase_apply_micros = 0;
+        let phase_scratch_bytes = balanced
+            .as_ref()
+            .map_or(0, BalancedPhasePressure::array_storage_bytes);
+        if let Some(b) = &mut balanced {
+            let start = Instant::now();
+            b.apply(&r, &mut zvec, &operator, &mut base)?;
+            phase_applications += 1;
+            phase_apply_micros += start.elapsed().as_micros() as u64;
         } else {
-            for &i in &liquid_indices {
-                zvec[i] = if diag[i] > 0.0 { r[i] / diag[i] } else { 0.0 };
-            }
+            base.apply(&r, &mut zvec);
         }
         if self.config.pressure_diagnostics {
             preconditioner_application_us += timer.elapsed().as_micros() as u64;
@@ -1988,19 +2026,13 @@ impl MacGridWorld {
                 break;
             }
             let preconditioner_timer = Instant::now();
-            if let Some(factor) = &ic0 {
-                factor.apply(
-                    &r,
-                    &mut zvec,
-                    &liquid_indices,
-                    preconditioner_work.as_mut().unwrap(),
-                );
-            } else if let Some(mg) = &mut multigrid {
-                mg.apply(&r, &mut zvec);
+            if let Some(b) = &mut balanced {
+                let start = Instant::now();
+                b.apply(&r, &mut zvec, &operator, &mut base)?;
+                phase_applications += 1;
+                phase_apply_micros += start.elapsed().as_micros() as u64;
             } else {
-                for &i in &liquid_indices {
-                    zvec[i] = if diag[i] > 0.0 { r[i] / diag[i] } else { 0.0 };
-                }
+                base.apply(&r, &mut zvec);
             }
             let preconditioner_elapsed = if self.config.pressure_diagnostics {
                 let elapsed = preconditioner_timer.elapsed().as_micros() as u64;
@@ -2152,6 +2184,9 @@ impl MacGridWorld {
             );
         }
         Ok(ProjectionStats {
+            phase_applications,
+            phase_apply_micros,
+            phase_scratch_bytes,
             phase_rows,
             phase_reused,
             phase_micros,
@@ -3880,6 +3915,9 @@ fn json_number(value: f64) -> String {
 
 #[derive(Default)]
 struct ProjectionStats {
+    phase_applications: u32,
+    phase_apply_micros: u64,
+    phase_scratch_bytes: usize,
     phase_rows: usize,
     phase_reused: bool,
     phase_micros: u64,
@@ -3898,6 +3936,110 @@ struct PhasePredictor {
     graph: PhaseGraph,
     limits: GraphLimits,
     sweeps: u32,
+    iterative: bool,
+}
+
+struct BasePressurePreconditioner<'a> {
+    ic0: Option<&'a Ic0Factor>,
+    multigrid: Option<&'a mut Multigrid>,
+    work: Option<&'a mut Vec<f64>>,
+    active: &'a [usize],
+    diag: &'a [f64],
+}
+impl BasePressurePreconditioner<'_> {
+    fn apply(&mut self, source: &[f64], target: &mut [f64]) {
+        if let Some(factor) = self.ic0 {
+            factor.apply(source, target, self.active, self.work.as_mut().unwrap());
+        } else if let Some(mg) = &mut self.multigrid {
+            mg.apply(source, target);
+        } else {
+            for &i in self.active {
+                target[i] = if self.diag[i] > 0.0 {
+                    source[i] / self.diag[i]
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+}
+
+/// Balanced B = Q + (I-QA) S (I-AQ), Q=P B_c P^T.
+/// Q is symmetric positive semidefinite, S is the existing symmetric fine
+/// preconditioner. Thus x^T B x = x^T Q x + y^T S y with y=(I-AQ)x.
+/// Owning CG retains its component-mean projection; no new gauge pins.
+struct BalancedPhasePressure {
+    labels: std::sync::Arc<Vec<u32>>,
+    coarse: PressureSmoother,
+    row_source: Vec<f64>,
+    row_q: Vec<f64>,
+    row_z: Vec<f64>,
+    temporary: Vec<f64>,
+    applied: Vec<f64>,
+    sweeps: u32,
+}
+impl BalancedPhasePressure {
+    fn new(graph: &PhaseGraph, coarse: PressureSmoother, n: usize, sweeps: u32) -> Self {
+        let m = graph.rows().len();
+        Self {
+            labels: graph.shared_labels(),
+            coarse,
+            row_source: vec![0.0; m],
+            row_q: vec![0.0; m],
+            row_z: vec![0.0; m],
+            temporary: vec![0.0; n],
+            applied: vec![0.0; n],
+            sweeps,
+        }
+    }
+    fn apply(
+        &mut self,
+        source: &[f64],
+        target: &mut [f64],
+        operator: &PressureOperator,
+        base: &mut BasePressurePreconditioner<'_>,
+    ) -> Result<(), MacError> {
+        self.row_source.fill(0.0);
+        for &i in base.active {
+            self.row_source[self.labels[i] as usize] += source[i];
+        }
+        self.coarse
+            .apply(&self.row_source, &mut self.row_q, self.sweeps)
+            .map_err(MacError::PhaseGraph)?;
+        for &i in base.active {
+            self.temporary[i] = self.row_q[self.labels[i] as usize];
+        }
+        operator.apply(&self.temporary, &mut self.applied);
+        for &i in base.active {
+            self.temporary[i] = source[i] - self.applied[i];
+        }
+        base.apply(&self.temporary, target);
+        operator.apply(target, &mut self.applied);
+        self.row_source.fill(0.0);
+        for &i in base.active {
+            self.row_source[self.labels[i] as usize] += self.applied[i];
+        }
+        self.coarse
+            .apply(&self.row_source, &mut self.row_z, self.sweeps)
+            .map_err(MacError::PhaseGraph)?;
+        for &i in base.active {
+            let row = self.labels[i] as usize;
+            target[i] += self.row_q[row] - self.row_z[row];
+        }
+        if base.active.iter().any(|&i| !target[i].is_finite()) {
+            return Err(MacError::PhaseGraph(GraphError::InvalidState));
+        }
+        Ok(())
+    }
+    fn array_storage_bytes(&self) -> usize {
+        self.coarse.array_storage_bytes()
+            + (self.row_source.capacity()
+                + self.row_q.capacity()
+                + self.row_z.capacity()
+                + self.temporary.capacity()
+                + self.applied.capacity())
+                * size_of::<f64>()
+    }
 }
 
 /// Zero-fill incomplete Cholesky of the active seven-point pressure matrix.
@@ -5318,6 +5460,144 @@ mod tests {
         let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
         assert!((dot(&p, &mq) - dot(&q, &mp)).abs() < 1e-12);
         assert!(dot(&p, &mp) > 0.0 && dot(&q, &mq) > 0.0);
+    }
+
+    #[test]
+    fn balanced_phase_pressure_is_symmetric_positive_and_reuses_scratch() {
+        for anchored in [false, true] {
+            let mut grid = all_air_grid([6, 6, 3], quiet_config(anchored));
+            grid.set_ambient_density(1.2).unwrap();
+            for i in 0..grid.fraction.len() {
+                grid.solid[i] = i % 6 == 2;
+                grid.fraction[i] = if grid.solid[i] {
+                    0.0
+                } else {
+                    (2.3 - (i / 6 % 6) as f64).clamp(0.0, 1.0)
+                };
+            }
+            let phase = phase_for_grid(&grid);
+            let graph = PhaseGraph::build(
+                &phase,
+                GraphLimits {
+                    max_fine_cells: 4096,
+                    max_rows: 4096,
+                    max_connections: 12_288,
+                },
+            )
+            .unwrap();
+            let weights: Vec<_> = phase
+                .faces()
+                .iter()
+                .map(|f| grid.relative_inverse_face_density(f.lower, f.upper) / 0.25_f64.powi(2))
+                .collect();
+            let extra: Vec<_> = (0..grid.fraction.len())
+                .map(|i| if anchored && !grid.solid[i] { 3.0 } else { 0.0 })
+                .collect();
+            let coarse = graph
+                .pressure_operator_with_diagonal(&phase, &weights, &extra)
+                .unwrap();
+            let mut diag = extra;
+            for (f, &w) in phase.faces().iter().zip(weights.iter()) {
+                diag[f.lower] += w;
+                diag[f.upper] += w;
+            }
+            let liquid: Vec<_> = grid.solid.iter().map(|s| !s).collect();
+            let active: Vec<_> = (0..liquid.len()).filter(|&i| liquid[i]).collect();
+            let operator = PressureOperator::build(&grid, &liquid, &active, &diag);
+            let mut balanced =
+                BalancedPhasePressure::new(&graph, coarse.smoother().unwrap(), diag.len(), 8);
+            let mut base = BasePressurePreconditioner {
+                ic0: None,
+                multigrid: None,
+                work: None,
+                active: &active,
+                diag: &diag,
+            };
+            let (labels, mut anchors) = grid.label_components(&liquid);
+            anchors.fill(anchored);
+            let mut sums = vec![0.0; anchors.len()];
+            let mut counts = vec![0; anchors.len()];
+            let mut x: Vec<_> = (0..diag.len()).map(|i| (i % 7) as f64 - 3.0).collect();
+            let mut y: Vec<_> = (0..diag.len()).map(|i| (i % 11) as f64 - 5.0).collect();
+            for v in [&mut x, &mut y] {
+                project_component_means(
+                    v,
+                    &labels,
+                    &anchors,
+                    anchors.len(),
+                    &active,
+                    &mut sums,
+                    &mut counts,
+                );
+            }
+            let (mut bx, mut by) = (vec![0.0; diag.len()], vec![0.0; diag.len()]);
+            let pointers = (
+                balanced.temporary.as_ptr(),
+                balanced.applied.as_ptr(),
+                balanced.row_source.as_ptr(),
+                balanced.row_q.as_ptr(),
+                balanced.row_z.as_ptr(),
+            );
+            let bytes = balanced.array_storage_bytes();
+            balanced.apply(&x, &mut bx, &operator, &mut base).unwrap();
+            balanced.apply(&y, &mut by, &operator, &mut base).unwrap();
+            assert_eq!(
+                pointers,
+                (
+                    balanced.temporary.as_ptr(),
+                    balanced.applied.as_ptr(),
+                    balanced.row_source.as_ptr(),
+                    balanced.row_q.as_ptr(),
+                    balanced.row_z.as_ptr()
+                )
+            );
+            assert_eq!(bytes, balanced.array_storage_bytes());
+            for v in [&mut bx, &mut by] {
+                project_component_means(
+                    v,
+                    &labels,
+                    &anchors,
+                    anchors.len(),
+                    &active,
+                    &mut sums,
+                    &mut counts,
+                );
+            }
+            let dot = |a: &[f64], b: &[f64]| dot_indices(a, b, &active);
+            let (xby, ybx) = (dot(&x, &by), dot(&y, &bx));
+            assert!((xby - ybx).abs() < 1e-10 * xby.abs().max(ybx.abs()).max(1.0));
+            assert!(dot(&x, &bx) > 0.0 && dot(&y, &by) > 0.0);
+            let mut predicted = grid.clone();
+            grid.set_pressure_preconditioner(PressurePreconditioner::Ic0);
+            predicted.set_pressure_preconditioner(PressurePreconditioner::Ic0);
+            predicted
+                .set_phase_pressure_preconditioner(
+                    &phase,
+                    GraphLimits {
+                        max_fine_cells: 4096,
+                        max_rows: 4096,
+                        max_connections: 12_288,
+                    },
+                    8,
+                )
+                .unwrap();
+            let u = grid.u_index(4, 1, 1);
+            grid.u[u] = 0.07;
+            predicted.u[u] = 0.07;
+            let plain = grid.project(0.01).unwrap();
+            let result = predicted.project(0.01).unwrap();
+            assert!(plain.converged && result.converged);
+            assert!(result.phase_applications > 0 && result.phase_scratch_bytes > 0);
+            for (a, b) in grid
+                .u
+                .iter()
+                .chain(&grid.v)
+                .chain(&grid.w)
+                .zip(predicted.u.iter().chain(&predicted.v).chain(&predicted.w))
+            {
+                assert!((a - b).abs() < 1e-7);
+            }
+        }
     }
 
     #[test]
