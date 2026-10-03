@@ -20,8 +20,10 @@ mouse look, WASD/QE fly, Escape releases the cursor, and F12 saves
 
 The existing compressible-air conservative channel rejects step 27; its last
 accepted state and failure remain visible. The incompressible comparison is
-separate evidence and does not satisfy that gate. Water is displayed as
-cell-volume boxes, not a reconstructed PLIC surface. This viewer is separate
+separate evidence and does not satisfy that gate. Water uses the game's shared
+smoothed surface, tint and underwater caustics. A presentation-only byte-fraction
+snapshot feeds that renderer; it does not change solver fractions and is not an
+exact reconstructed PLIC surface. This viewer is separate
 from the authoritative generated game, with no save/wire activation.
 
 For bounded graphical checks, use `--frames 60 --phase-fluid-demo-autoplay

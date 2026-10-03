@@ -284,7 +284,7 @@ impl PhaseDemoApp {
             )
         } else {
             format!(
-                "{} | Time {:.2}s | Water {:.4} m3 | Accounting error {:.2e} m3\nLocal experiment; cell-volume water display, not a generated game world.",
+                "{} | Time {:.2}s | Water {:.4} m3 | Accounting error {:.2e} m3\nLocal experiment with the game water look; not a generated game world.",
                 if self.paused {
                     "PAUSED - Space to run"
                 } else {
@@ -314,8 +314,7 @@ impl PhaseDemoApp {
             Err(e) => return self.fail(event_loop, e),
         };
         self.terrain_dirty = false;
-        renderer.set_debug_water_window(self.camera.position.to_array().map(f64::from));
-        renderer.set_debug_water(&water);
+        renderer.set_water_look(Some(water));
         self.frames += 1;
         let capture_frame = self
             .options
@@ -364,7 +363,6 @@ impl ApplicationHandler for PhaseDemoApp {
         let materials = [
             Material::new([0.29, 0.24, 0.17], 0.95, 0.0),
             Material::new([0.12, 0.075, 0.03], 0.9, 0.0),
-            Material::new([0.015, 0.22, 0.78], 0.18, 0.05).emissive(0.06),
         ];
         match WorldRenderer::new(
             window.clone(),
@@ -483,40 +481,53 @@ fn build_terrain(world: &PhasePressureWorld) -> Vec<CubeInstance> {
     ));
     out
 }
-fn build_water(world: &PhasePressureWorld) -> Vec<CubeInstance> {
-    let [nx, ny, _] = world
-        .phase()
-        .geometry()
-        .fine_spec()
-        .dimensions()
-        .map(|n| n as usize);
-    let h = world.phase().voxel_size_m() as f32;
-    world
-        .phase()
-        .fractions()
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| **f > 0.0)
-        .map(|(i, &f)| {
-            let (x, y, z) = (i % nx, i / nx % ny, i / (nx * ny));
-            let height = h * f as f32;
-            CubeInstance::new(
-                [
-                    (x as f32 + 0.5) * h,
-                    y as f32 * h + 0.5 * height,
-                    (z as f32 + 0.5) * h,
-                ],
-                2,
-                [h, height, h],
-                CubeInstance::IDENTITY_ROTATION,
-            )
-        })
-        .collect()
+// The local solver remains full precision. This snapshot is presentation-only:
+// use the same byte fractions and surface/underwater path as replicated water.
+fn build_water(world: &PhasePressureWorld) -> crate::water_look::WaterLook {
+    let spec = world.phase().geometry().fine_spec();
+    let dimensions = spec.dimensions();
+    let frame = spall_protocol::WaterKeyframe {
+        server_tick: spall_core::Tick(0),
+        frame_seq: 0,
+        origin: spec.origin(),
+        dimensions,
+        coarsen: 1,
+        fractions: world
+            .phase()
+            .fractions()
+            .iter()
+            .map(|fraction| (fraction * 255.0).round() as u8)
+            .collect(),
+    };
+    // These shared reference fixtures are quarter-metre, origin-zero domains.
+    // Bound the field to the fixture rather than the much larger game window.
+    let h = world.phase().voxel_size_m();
+    let center = [
+        f64::from(dimensions[0]) * h * 0.5,
+        0.0,
+        f64::from(dimensions[2]) * h * 0.5,
+    ];
+    let radius = (f64::from(dimensions[0].max(dimensions[2])) * h * 0.5 + h) as f32;
+    crate::water_look::build_water_look(&[frame], center, radius, 0)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn game_water_look_tracks_fixture_resets_without_mutating_phase() {
+        let mut app = PhaseDemoApp::new(PhaseFluidDemoOptions::default()).unwrap();
+        let fractions = app.state.world.phase().fractions().to_vec();
+        let look = build_water(&app.state.world);
+        assert!(!look.indices.is_empty());
+        assert_eq!(look.field.surface_at(0.125, 0.125), Some(2.25));
+        assert_eq!(look.field.surface_at(6.125, 1.625), None);
+        assert_eq!(app.state.world.phase().fractions(), fractions);
+        app.action(KeyCode::Digit3);
+        let look = build_water(&app.state.world);
+        assert_eq!(look.field.surface_at(0.125, 0.125), Some(0.5));
+        assert_eq!(look.field.surface_at(1.125, 0.125), None);
+        assert_eq!(look.field.surface_at(1.625, 0.125), None);
+    }
     #[test]
     fn switching_method_restarts_identical_phase_without_changing_air_or_camera() {
         let mut app = PhaseDemoApp::new(PhaseFluidDemoOptions::default()).unwrap();

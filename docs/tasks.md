@@ -1196,3 +1196,5 @@ default channel/generated startup gates. Usage/checks in validation.md and
 reports/ENG-122.md; raw replay in ENG-122-viewer-fixture.jsonl.
 
 ENG-122 increment-13 combined-tree check: cargo xtask check passed formatting, strict workspace all-targets/all-features Clippy and workspace all-features tests: 1176 passed, 0 failed, 63 ignored. Renderer fixes additionally passed affected strict Clippy, viewer tests, final formatting/diff checks and release graphical captures.
+
+ENG-122 viewer follow-up (2026-10-03): replaced older debug water boxes with the game's shared smoothed surface/underwater tint/fog/caustics renderer for both methods. Presentation-only byte snapshot leaves solver fractions unchanged. Three viewer tests and four water-look tests pass; affected strict Clippy, release build, formatting/diff checks and two real GPU captures pass. Full workspace checks not repeated for this presentation fix. Details in reports/ENG-122.md. Keep in_progress; next unblocked ENG-122 remains conservative gas-mass/density coupling.
