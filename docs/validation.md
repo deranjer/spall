@@ -5,6 +5,11 @@
 The latest paced trench check passes flow at 512 but **fails at 1024**: the
 worker advances at about 0.90x realtime, yet no water crosses the old domain
 edge. This local water-only default has not passed large-world flow acceptance.
+The 144-cell reproduction is `cargo run --release -p spall_fluid --example
+shallow_shore_probe`; it currently exits 1 because a 0.20 m water layer above
+an open lower trench has no pressure/velocity support. Run its known failing
+drainage invariant with `cargo test -p spall_fluid --example shallow_shore_probe
+-- --ignored --nocapture`. This is failed evidence until a physical fix lands.
 Run `cargo run --release -p sandbox --example water_trench_probe -- 512`
 or `-- 1024`; the latter currently exits 1 for the failed flow check. Exact
 workload, limits and raw evidence are in `docs/reports/ENG-122.md`.
