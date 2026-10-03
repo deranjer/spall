@@ -45,6 +45,15 @@ mass and runtime pressure/velocity were never canonical state). This deliberate
 model change supersedes sealed-air realism for gameplay, not terrain ownership,
 worker validation or mass/recovery invariants.
 
+The ENG-122 shallow-film closure and zero-air dual momentum trial are an
+explicit diagnostic opt-in only (`set_experimental_surface_films`). They fail
+energy, stability and partial-layer rest gates and are not selected by any
+gameplay constructor, growth or recovery path. Its half-cell inertia support
+does not yet match reconstructed liquid geometry. The existing water-only
+policy also has unresolved shallow drainage and wider-pool rest failures;
+see `docs/reports/ENG-122.md` before treating numerical check success as
+hydraulic acceptance.
+
 ENG-105 lets `Simulation` own up to eight explicitly authored, disjoint bounded
 water domains, with at most 4,194,304 fluid cells across the group and 32 million
 voxel cells per domain. A connected pressure system belongs in one domain;

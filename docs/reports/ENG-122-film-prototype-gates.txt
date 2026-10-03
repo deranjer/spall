@@ -1,0 +1,40 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests examples\shallow_shore_probe.rs (G:/Programming/voxel_engine/target\debug\examples\shallow_shore_probe-0732c17d39996588.exe)
+
+running 4 tests
+test tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest ... FAILED
+test tests::flat_shallow_pool_and_full_wall_preserve_rest_and_volume ... ok
+test tests::shallow_water_must_drain_into_the_open_lower_trench ... FAILED
+test tests::deeper_water_control_drains_and_conserves_volume ... FAILED
+
+failures:
+
+---- tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest stdout ----
+
+thread 'tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest' (11336) panicked at crates\spall_fluid\examples\shallow_shore_probe.rs:256:13:
+step=1, speed=0.4905, energy=794970.8853750001, mass_error=0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::shallow_water_must_drain_into_the_open_lower_trench stdout ----
+
+thread 'tests::shallow_water_must_drain_into_the_open_lower_trench' (22600) panicked at crates\spall_fluid\examples\shallow_shore_probe.rs:209:9:
+assertion `left == right` failed
+  left: 333
+ right: 600
+
+---- tests::deeper_water_control_drains_and_conserves_volume stdout ----
+
+thread 'tests::deeper_water_control_drains_and_conserves_volume' (17420) panicked at crates\spall_fluid\examples\shallow_shore_probe.rs:193:9:
+assertion `left == right` failed
+  left: 265
+ right: 600
+
+
+failures:
+    tests::deeper_water_control_drains_and_conserves_volume
+    tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest
+    tests::shallow_water_must_drain_into_the_open_lower_trench
+
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.43s
+
+error: test failed, to rerun pass `-p spall_fluid --example shallow_shore_probe`

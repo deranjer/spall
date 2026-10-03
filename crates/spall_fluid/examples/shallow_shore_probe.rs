@@ -6,6 +6,15 @@ use spall_fluid::{DomainSpec, SolidBoundary};
 use spall_voxel::{Brick, EditPlan, Volume};
 
 fn fixture(depth: f64, water_only: bool) -> Result<MacGridWorld, Box<dyn std::error::Error>> {
+    fixture_with_geometry(depth, water_only, false, false)
+}
+
+fn fixture_with_geometry(
+    depth: f64,
+    water_only: bool,
+    flat_floor: bool,
+    wall: bool,
+) -> Result<MacGridWorld, Box<dyn std::error::Error>> {
     // Fine quarter-metre voxels exactly resolve both full-cell solid layers.
     // Coarsening gives 12x6x2 cells at 1 m: shelf top at 2 m, trench floor at
     // 1 m, lip at x=6 m. Water has a flat 2+depth m surface over the shelf.
@@ -19,9 +28,9 @@ fn fixture(depth: f64, water_only: bool) -> Result<MacGridWorld, Box<dyn std::er
     }
     let mut edits = EditPlan::new(volume.id());
     for z in 0..8 {
-        for y in 0..8 {
+        for y in 0..16 {
             for x in 0..48 {
-                if y < 4 || x < 24 {
+                if y < 4 || (y < 8 && (x < 24 || flat_floor)) || (wall && (24..28).contains(&x)) {
                     edits.set(GlobalCell::new(x, y, z), MaterialId(1));
                 }
             }
@@ -39,11 +48,14 @@ fn fixture(depth: f64, water_only: bool) -> Result<MacGridWorld, Box<dyn std::er
     grid.set_pressure_preconditioner(PressurePreconditioner::Multigrid);
     if water_only {
         grid.set_freely_displaced_air()?;
+        if std::env::var("SHALLOW_SHORE_FILMS").as_deref() == Ok("1") {
+            grid.set_experimental_surface_films()?;
+        }
     } else {
         grid.set_ambient_density(1.2)?;
     }
     for z in 0..2 {
-        for x in 0..6 {
+        for x in 0..if flat_floor { 12 } else { 6 } {
             grid.set_fraction(GlobalCell::new(x, 2, z), depth)?;
         }
     }
@@ -62,11 +74,15 @@ struct Outcome {
     min: f64,
     max: f64,
     failure: Option<String>,
+    peak_energy: f64,
+    initial_energy: f64,
 }
 
 fn run(depth: f64, water_only: bool) -> Result<Outcome, Box<dyn std::error::Error>> {
     let mut grid = fixture(depth, water_only)?;
     let initial = grid.water_volume_m3();
+    let initial_energy = grid.gravitational_potential_energy_j();
+    let mut peak_energy = initial_energy;
     let before = grid.fractions().to_vec();
     let (mut accepted, mut first_rows, mut rows, mut max_speed) = (0, None, 0, 0.0_f64);
     let mut failure = None;
@@ -79,6 +95,8 @@ fn run(depth: f64, water_only: bool) -> Result<Outcome, Box<dyn std::error::Erro
                 first_rows.get_or_insert(m.pressure_active_rows_total);
                 rows += m.pressure_active_rows_total;
                 max_speed = max_speed.max(grid.max_face_component_velocity_m_s());
+                peak_energy = peak_energy
+                    .max(grid.kinetic_energy_j() + grid.gravitational_potential_energy_j());
                 if m.pressure_converged_substeps != m.substeps {
                     failure = Some("pressure did not converge".into());
                     break;
@@ -115,18 +133,20 @@ fn run(depth: f64, water_only: bool) -> Result<Outcome, Box<dyn std::error::Erro
         min: grid.fractions().iter().copied().fold(1.0, f64::min),
         max: grid.fractions().iter().copied().fold(0.0, f64::max),
         failure,
+        peak_energy,
+        initial_energy,
     })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let films = std::env::var("SHALLOW_SHORE_FILMS").as_deref() == Ok("1");
     let mut shallow_passed = false;
     for (depth, water_only) in [(0.2, true), (0.75, true), (0.2, false)] {
+        let enabled = films && water_only;
         eprintln!("shallow-shore case: depth={depth}, water_only={water_only}");
         let o = run(depth, water_only)?;
-        let flow = o.accepted == 600
-            && o.failure.is_none()
-            && o.downstream > 1e-9
-            && o.error.abs() < 1e-10;
+        let flow =
+            o.accepted == 600 && o.failure.is_none() && o.downstream > 0.5 && o.error.abs() < 1e-10;
         if depth == 0.2 && water_only {
             shallow_passed = flow;
         }
@@ -134,6 +154,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .failure
             .as_ref()
             .map_or_else(|| "null".into(), |e| format!("{e:?}"));
+        let energy_gate = o.peak_energy <= o.initial_energy * 1.05;
+        println!(
+            "{{\"scenario\":\"shallow_shore_energy\",\"water_depth_m\":{depth},\"water_only\":{water_only},\"experimental_films\":{enabled},\"initial_mechanical_energy_j\":{},\"peak_mechanical_energy_j\":{},\"energy_gate_pass\":{energy_gate}}}",
+            o.initial_energy, o.peak_energy
+        );
+        if depth == 0.2 && water_only {
+            shallow_passed &= energy_gate;
+        }
         println!(
             "{{\"scenario\":\"resolved_shallow_shelf_to_lower_trench\",\"cell_size_m\":1,\"dimensions\":[12,6,2],\"water_depth_m\":{depth},\"water_only\":{water_only},\"requested_steps\":600,\"accepted_steps\":{},\"dt_s\":0.05,\"first_pressure_rows\":{},\"pressure_rows_total\":{},\"initial_water_m3\":{},\"downstream_water_m3\":{},\"water_error_m3\":{},\"max_face_speed_m_s\":{},\"fractions_bit_identical\":{},\"fraction_min\":{},\"fraction_max\":{},\"failure\":{failure},\"flow_gate_pass\":{flow}}}",
             o.accepted,
@@ -175,12 +203,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "ENG-122 known failing shallow-lip flow gate; run explicitly, remove ignore with physical fix"]
+    #[ignore = "ENG-122 unresolved shallow-film gate; run explicitly against baseline or opted-in prototype"]
     fn shallow_water_must_drain_into_the_open_lower_trench() {
         let o = run(0.2, true).unwrap();
         assert_eq!(o.accepted, 600);
         assert!(o.failure.is_none());
         assert!(o.error.abs() < 1e-10);
+        assert!(
+            o.peak_energy <= o.initial_energy * 1.05,
+            "excess mechanical energy: initial={}, peak={}",
+            o.initial_energy,
+            o.peak_energy
+        );
         assert!(
             o.downstream > 0.5,
             "shallow water froze: downstream={}, pressure rows={}, speed={}, bit-identical={}",
@@ -189,5 +223,44 @@ mod tests {
             o.max_speed,
             o.bit_identical
         );
+    }
+
+    #[test]
+    fn flat_shallow_pool_and_full_wall_preserve_rest_and_volume() {
+        for (flat_floor, wall) in [(true, false), (false, true)] {
+            let mut grid = fixture_with_geometry(0.2, true, flat_floor, wall).unwrap();
+            let before = grid.fractions().to_vec();
+            let mass = grid.water_volume_m3();
+            for _ in 0..600 {
+                grid.step(0.05).unwrap();
+                assert!(grid.max_face_component_velocity_m_s() < 1e-9);
+                assert!((grid.water_volume_m3() - mass).abs() < 1e-12);
+            }
+            assert_eq!(grid.fractions(), before);
+        }
+    }
+
+    #[test]
+    #[ignore = "ENG-122 newly exposed long-duration partial-layer rest failure; run explicitly"]
+    fn hydrostatic_partial_layer_over_deeper_water_stays_at_rest() {
+        let mut grid = fixture_with_geometry(0.2, true, true, false).unwrap();
+        for z in 0..2 {
+            for x in 0..12 {
+                grid.set_fraction(GlobalCell::new(x, 2, z), 1.0).unwrap();
+                grid.set_fraction(GlobalCell::new(x, 3, z), 0.25).unwrap();
+            }
+        }
+        let mass = grid.water_volume_m3();
+        for step in 0..600 {
+            grid.step(0.05).unwrap();
+            assert!(
+                grid.max_face_component_velocity_m_s() < 1e-7,
+                "step={step}, speed={}, energy={}, mass_error={}",
+                grid.max_face_component_velocity_m_s(),
+                grid.kinetic_energy_j() + grid.gravitational_potential_energy_j(),
+                grid.water_volume_m3() - mass
+            );
+            assert!((grid.water_volume_m3() - mass).abs() < 1e-10);
+        }
     }
 }

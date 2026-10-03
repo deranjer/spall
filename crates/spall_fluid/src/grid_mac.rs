@@ -220,6 +220,7 @@ pub struct MacGridWorld {
     pressure_preconditioner: PressurePreconditioner,
     ambient_density_kg_m3: Option<f64>,
     freely_displaced_air: bool,
+    experimental_surface_films: bool,
     compressible_enclosed_air: bool,
     stage_diagnostics: bool,
     diagnostic_outer_step: u64,
@@ -286,6 +287,7 @@ impl MacGridWorld {
             pressure_preconditioner: PressurePreconditioner::Jacobi,
             ambient_density_kg_m3: None,
             freely_displaced_air: false,
+            experimental_surface_films: false,
             compressible_enclosed_air: false,
             stage_diagnostics: false,
             diagnostic_outer_step: 0,
@@ -382,6 +384,7 @@ impl MacGridWorld {
         }
         self.ambient_density_kg_m3 = Some(density);
         self.freely_displaced_air = false;
+        self.experimental_surface_films = false;
         // Sealed air defaults to isothermal compressible gas; see
         // `set_compressible_enclosed_air`.
         self.compressible_enclosed_air = true;
@@ -400,6 +403,7 @@ impl MacGridWorld {
         self.ambient_density_kg_m3 = None;
         self.compressible_enclosed_air = false;
         self.freely_displaced_air = true;
+        self.experimental_surface_films = false;
         self.strict_phase_bounds = true;
         // Wet-only projection has much less work, but saturated donor cells
         // need pressure residuals below the unchanged 1e-10 low-order bound.
@@ -407,6 +411,17 @@ impl MacGridWorld {
             self.config.pressure_relative_tolerance.min(1.0e-10);
         self.pressure_pa.fill(0.0);
         self.previous_pressure_diagonal = None;
+        Ok(())
+    }
+
+    /// ENG-122 diagnostic prototype, NOT an accepted gameplay policy. Its
+    /// half-cell velocity/mass support fails shallow-film energy and rest
+    /// gates. Only the explicitly opted-in shallow-shore probe uses it.
+    pub fn set_experimental_surface_films(&mut self) -> Result<(), MacError> {
+        if !self.freely_displaced_air {
+            return Err(MacError::InvalidConfig);
+        }
+        self.experimental_surface_films = true;
         Ok(())
     }
 
@@ -1256,6 +1271,7 @@ impl MacGridWorld {
             // In the two-phase candidate, advect before applying forces.
             if (self.ambient_density_kg_m3.is_some() || self.freely_displaced_air)
                 && !self.conservative_momentum
+                && !self.experimental_surface_films
             {
                 let stage = Instant::now();
                 self.advect_velocity(sub_dt);
@@ -2220,6 +2236,9 @@ impl MacGridWorld {
         self.pressure_pa = p;
         self.correct_faces(&liquid, dt, surfaces.as_deref());
         if self.freely_displaced_air {
+            if self.experimental_surface_films {
+                self.accelerate_unresolved_surface_films(&liquid, dt);
+            }
             self.extrapolate_surface_velocities(&liquid);
         }
         let mut div_after: f64 = 0.0;
@@ -2538,6 +2557,45 @@ impl MacGridWorld {
         self.enforce_wall_velocities();
     }
 
+    /// A VOF film below the pressure sample still has a hydrostatic head. On
+    /// horizontal faces without a bulk pressure sample, integrate the shallow
+    /// layer pressure (rho*g*d^2/2): division by the mean face depth gives
+    /// -g*(d_right-d_left)/h. The existing bounded PLIC transfers move its mass.
+    /// This closure is for downward vertical gravity; bulk faces continue to
+    /// use the three-dimensional ghost-fluid pressure projection.
+    fn accelerate_unresolved_surface_films(&mut self, liquid: &[bool], dt: f64) {
+        let [gx, gy, gz] = self.config.gravity_m_s2;
+        if gx != 0.0 || gz != 0.0 || gy >= 0.0 {
+            return;
+        }
+        let [nx, ny, nz] = self.dims();
+        for axis in [0, 2] {
+            let mut ext = [nx, ny, nz];
+            ext[axis] += 1;
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let p = [x, y, z];
+                        if p[axis] == 0 {
+                            continue;
+                        }
+                        let mut low = p;
+                        low[axis] -= 1;
+                        let a = self.cell_index(low[0], low[1], low[2]);
+                        let b = self.cell_index(x, y, z);
+                        if self.solid[a] || self.solid[b] || liquid[a] || liquid[b] {
+                            continue;
+                        }
+                        let acceleration = gy * (self.fraction[b] - self.fraction[a]);
+                        let fi = x + ext[0] * (y + ext[1] * z);
+                        let faces = if axis == 0 { &mut self.u } else { &mut self.w };
+                        faces[fi] += dt * acceleration;
+                    }
+                }
+            }
+        }
+    }
+
     /// Ghost-fluid advection needs a narrow velocity extension outside liquid,
     /// not independently accelerating dry-space velocities. Three face layers
     /// cover the bounded CFL backtrace. Solids/closed exterior are never donors.
@@ -2564,7 +2622,14 @@ impl MacGridWorld {
                     || upper.is_some_and(|c| self.solid[c])
                     || ((lower.is_none() || upper.is_none()) && !open);
                 known[i] = !blocked[i]
-                    && (lower.is_some_and(|c| liquid[c]) || upper.is_some_and(|c| liquid[c]));
+                    && (lower.is_some_and(|c| liquid[c])
+                        || upper.is_some_and(|c| liquid[c])
+                        // Shallow films have no cell-centre pressure sample.
+                        // Keep horizontal momentum and downward outlet velocity;
+                        // an empty face above a film is not a gravity donor.
+                        || (self.experimental_surface_films
+                            && ((axis != 1 && lower.is_some_and(|c| self.fraction[c] > 0.0))
+                                || upper.is_some_and(|c| self.fraction[c] > 0.0))));
             }
             let faces = match axis {
                 0 => &mut self.u,
@@ -2635,6 +2700,29 @@ impl MacGridWorld {
                 if self.solid[j] { c } else { self.fraction[j] }
             };
             let mut normal = [0.0; 3];
+            // A bottom-supported film has a height function even when the
+            // generic fraction gradient places its plane away from the lip.
+            // Reconstruct its surface slope from neighbouring layer depths;
+            // otherwise bounded swept slabs can never reach that dry face.
+            if self.experimental_surface_films
+                && self.config.gravity_m_s2[0] == 0.0
+                && self.config.gravity_m_s2[2] == 0.0
+                && self.config.gravity_m_s2[1] < 0.0
+                && c < 0.5
+                && y > 0
+                && self.solid[self.cell_index(x, y - 1, z)]
+            {
+                normal[1] = 1.0;
+                for axis in [0, 2] {
+                    let mut lo = p;
+                    let mut hi = p;
+                    lo[axis] -= 1;
+                    hi[axis] += 1;
+                    normal[axis] = 0.5 * (sample(lo) - sample(hi));
+                }
+                *plane = Some(InterfacePlane::from_fraction(normal, c));
+                return;
+            }
             for axis in 0..3 {
                 let b = (axis + 1) % 3;
                 let d = (axis + 2) % 3;
@@ -2784,7 +2872,18 @@ impl MacGridWorld {
                 .unwrap_or(0.0);
             let high = if let Some(planes) = &planes {
                 upstream.map_or(0.0, |i| {
-                    planes[i].map_or(courant * old[i], |plane| plane.swept_volume(axis, courant))
+                    planes[i].map_or(courant * old[i], |plane| {
+                        if self.experimental_surface_films
+                            && axis == 1
+                            && plane.normal.iter().sum::<f64>() * 0.5 >= plane.alpha
+                        {
+                            // Vertically unresolved films use positive upwind
+                            // transport; momentum follows this accepted mass.
+                            donor
+                        } else {
+                            plane.swept_volume(axis, courant)
+                        }
+                    })
                 })
             } else {
                 courant * reconstructed
@@ -3070,7 +3169,7 @@ impl MacGridWorld {
                 volume_fraction: net_open_outflow_fraction,
             });
         }
-        if self.conservative_momentum {
+        if self.conservative_momentum || self.experimental_surface_films {
             let candidate =
                 momentum::transport(self, &old, &low, &anti, &low_fluxes, &full_fluxes)?;
             [self.u, self.v, self.w] = candidate.velocity;
@@ -5516,7 +5615,11 @@ mod tests {
                 assert_eq!(step.pressure_active_rows_total, rows);
                 assert_eq!(step.pressure_converged_substeps, step.substeps);
                 assert!((grid.water_volume_m3() - volume).abs() < 1e-12);
-                assert!(grid.max_face_speed_l1().0 < 1e-7);
+                assert!(
+                    grid.max_face_speed_l1().0 < 1e-7,
+                    "top={top}, v={:?}",
+                    grid.v
+                );
             }
             let surface_y = 3.0 + top;
             let sample_y = f64::from(rows as u32) - 0.5;

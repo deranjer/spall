@@ -14,6 +14,16 @@ Run `cargo run --release -p sandbox --example water_trench_probe -- 512`
 or `-- 1024`; the latter currently exits 1 for the failed flow check. Exact
 workload, limits and raw evidence are in `docs/reports/ENG-122.md`.
 
+The shallow-shore probe now records mechanical-energy growth and includes a
+wider partial-layer rest gate. Both baseline drainage and that rest gate were
+run explicitly and fail; ordinary example tests mark those two gates ignored.
+`SHALLOW_SHORE_FILMS=1` selects a diagnostic closure with zero-air accepted-
+transfer momentum. It still fails rest, energy and the unchanged stability
+budget, and is not a gameplay default. Run all its gates with
+`cargo test -p spall_fluid --example shallow_shore_probe -- --include-ignored`.
+Clear the environment variable before testing the default. Do not rerun the
+large-world performance gate as acceptance until these small physics gates pass.
+
 The selected performance default is adaptive coarse MAC water with original
 velocity sampling, multigrid pressure, bounded conservative water transport,
 freely displaced air and the current game water look. Air is atmospheric at
