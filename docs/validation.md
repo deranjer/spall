@@ -2,6 +2,13 @@
 
 ## Generated-world water default
 
+The latest paced trench check passes flow at 512 but **fails at 1024**: the
+worker advances at about 0.90x realtime, yet no water crosses the old domain
+edge. This local water-only default has not passed large-world flow acceptance.
+Run `cargo run --release -p sandbox --example water_trench_probe -- 512`
+or `-- 1024`; the latter currently exits 1 for the failed flow check. Exact
+workload, limits and raw evidence are in `docs/reports/ENG-122.md`.
+
 The selected performance default is adaptive coarse MAC water with original
 velocity sampling, multigrid pressure, bounded conservative water transport,
 freely displaced air and the current game water look. Air is atmospheric at
