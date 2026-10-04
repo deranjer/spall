@@ -15,6 +15,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if ![512, 1024].contains(&size) {
         return Err("size must be 512 or 1024".into());
     }
+    let replay_path = std::env::var_os("SPALL_WATER_REPLAY_PATH").map(std::path::PathBuf::from);
+    let mut precursor = None;
+    let mut precursor_fluid_time = 0.0;
     let scene = worldgen_scene::generate_with_season(
         "showcase",
         1,
@@ -150,6 +153,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 step_times.len()
             );
         }
+        if replay_path.is_some() {
+            let water = sim.water().unwrap();
+            if let Some(grid) = water.grid() {
+                // Retain the latest CFL-admissible committed input. This
+                // diagnostic cloning perturbs pacing; never credit this run
+                // as timing acceptance. No owner state is advanced here.
+                if water.frame().fluid_time_s > precursor_fluid_time
+                    && grid.substeps_required_diagnostic(0.05).is_ok()
+                {
+                    precursor = Some(grid.clone());
+                    precursor_fluid_time = water.frame().fluid_time_s;
+                }
+            }
+        }
         // Pace from each tick's start; never catch up in a burst after a hitch.
         let budget = Duration::from_secs_f64(1.0 / 60.0);
         if let Some(left) = budget.checked_sub(timer.elapsed()) {
@@ -195,6 +212,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut shadow = water.grid().ok_or("missing committed water grid")?.clone();
     let final_face_speed = shadow.max_face_component_velocity_m_s();
     let final_interface_speed = shadow.reconstructed_interface_speed_m_s();
+    if let Some(path) = &replay_path {
+        shadow.write_reconstructed_replay(std::io::BufWriter::new(std::fs::File::create(path)?))?;
+        let precursor_path = path.with_extension("precursor.water-replay");
+        if let Some(grid) = &precursor {
+            grid.write_reconstructed_replay(std::io::BufWriter::new(std::fs::File::create(
+                &precursor_path,
+            )?))?;
+        }
+        println!(
+            "{}",
+            serde_json::json!({"scenario":"water_replay_capture", "format_version":1,
+            "final_state_path":path, "precursor_path":precursor.as_ref().map(|_| &precursor_path),
+            "precursor_owner_fluid_time_s":precursor_fluid_time, "final_owner_fluid_time_s":f.fluid_time_s,
+            "owner_state_advanced":false, "timing_acceptance":false})
+        );
+    }
     shadow.set_pressure_diagnostics(true);
     let next_step = shadow.step(0.05);
     let final_step_error = next_step.as_ref().err().map(ToString::to_string);
@@ -245,7 +278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "pressure_rows_total":rows,"pressure_iterations_total":iterations,"water_past_old_edge_m3":downstream,
             "initial_accounted_water_m3":initial,"water_error_m3":accounting(&sim)-initial,"seed_report":format!("{seed:?}"),
             "fraction_min":f.exact_fractions.iter().copied().fold(1.0,f64::min),"fraction_max":f.exact_fractions.iter().copied().fold(0.0,f64::max),
-            "failure":failure,"water_crossed_old_edge":crossed,"trench_center_section":section,"graphical_acceptance":false,"network_acceptance":false,
+            "failure":failure,"water_crossed_old_edge":crossed,"trench_center_section":section,"graphical_acceptance":false,"network_acceptance":false,"timing_acceptance":replay_path.is_none(),
             "final_face_speed_m_s":final_face_speed,"final_interface_predictor_speed_m_s":final_interface_speed,"final_shadow_step_dt_s":0.05,"final_shadow_step_accepted":final_step_accepted,"final_shadow_step_error":final_step_error
         })
     );

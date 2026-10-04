@@ -1243,3 +1243,21 @@ not proof that the optimized failed state is stable. New small tests cover dry
 padding/zero-lane equivalence, tiny positive masses, pinned dense numerical
 compatibility and independence of water transfers from discarded donor samples.
 Current raw evidence and integration decision: reports/ENG-122.md.
+
+ENG-122 exact failing-step replay (2026-10-04): optional
+`SPALL_WATER_REPLAY_PATH=.local/coupling-512.water-replay` with
+`water_trench_probe.exe 512 water-support` captures the final numerical grid and
+last CFL-admissible precursor. It reports `timing_acceptance:false`; cloning
+perturbs pacing. `water_step_replay.exe FILE STEPS [trace]` is bounded to 1000
+50ms steps and accepts only version1 strict reconstructed-water snapshots;
+`SPALL_WATER_REPLAY_OUTPUT` saves an accepted result for byte comparison.
+Full precursor32.95s ->33.00s matches all7070989 captured bytes and then fails
+nine-versus-eight substeps. Run the retained reduced diagnostic with
+`water_step_replay.exe crates/spall_fluid/fixtures/eng122-trench-crop-v1.water-replay 100`:
+it currently accepts two steps then fails ten-versus-eight. New walls alter
+pressure connections; it is not original trench acceptance. Its explicit ignored
+acceptance test can be run with `cargo test -p spall_fluid --lib
+captured_trench_crop_advances_without_velocity_instability --release -- --ignored`;
+this currently fails, remains open, and is not counted as a CI pass. Three replay
+invariants validate bitwise next-state preservation, unchanged rejection state
+and malformed input rejection. See reports/ENG-122.md and coupling-replay evidence.

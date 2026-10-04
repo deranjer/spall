@@ -468,3 +468,17 @@ used. Next ENG-122: reproduce the edit/growth-dependent high Cartesian/interface
 velocity state and stabilize physical pressure/momentum coupling before claiming
 a performance gate or promoting this backend. Exact runs and remaining risks
 are in docs/reports/ENG-122.md.
+
+ENG-122 exact-state diagnostics (2026-10-04): the failing 512 transition now
+replays byte for byte from an explicitly versioned, little-endian numerical
+snapshot that retains warm pressure and interface predictors. This diagnostic
+is separate from canonical saves/wire/owner installation, bounded to one million
+cells, and accepts only the strict reconstructed water-only model. Rebuilt cut
+fluxes and unused legacy caches are omitted. Optional trench capture perturbs
+pacing and reports no timing acceptance. A tracked 100-cell crop fails its third
+50ms step, but its new domain walls change pressure connections and it is never
+original workload acceptance. The coupling instability and unchanged full
+512 gate remain open; no gameplay/default/numerical budget changes. A trial
+removing only the embedded-cap inertia floor failed full-state pressure
+convergence and was dropped. Next ENG-122: physically matched pressure/momentum
+response and pressure conditioning using the crop plus exact full replay.

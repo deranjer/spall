@@ -11,6 +11,7 @@ use crate::phase_water::PhaseWater;
 use crate::{DomainSpec, SolidBoundary};
 mod cut_surface;
 mod momentum;
+mod replay;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MacConfig {
@@ -454,8 +455,8 @@ impl MacGridWorld {
 
     /// ENG-122 reconstructed liquid support diagnostic. Small drainage and
     /// energy, nearly saturated rest and reference motion gates pass. Generated
-    /// trench flow and final-state advance pass, but 512 performance remains
-    /// unaccepted. This is
+    /// trench flow passes, but the current 512 final-state advance fails its
+    /// unchanged substep budget and performance remains unaccepted. This is
     /// not an accepted gameplay policy; it uses symmetric Gauss-Seidel CG,
     /// independently of the legacy MG solver.
     pub fn set_cut_surface_support(&mut self) -> Result<(), MacError> {
@@ -1267,22 +1268,7 @@ impl MacGridWorld {
             return Err(MacError::BoundaryMismatch);
         }
         let (max_speed, max_speed_cell) = self.max_face_speed_l1();
-        let advective_dt = if max_speed > 0.0 {
-            self.config.cfl_limit * self.config.cell_size_m / max_speed
-        } else {
-            f64::INFINITY
-        };
-        let gravity = self
-            .config
-            .gravity_m_s2
-            .iter()
-            .map(|g| g.abs())
-            .fold(0.0, f64::max);
-        let gravity_dt = if gravity > 0.0 {
-            (2.0 * self.config.cfl_limit * self.config.cell_size_m / gravity).sqrt()
-        } else {
-            f64::INFINITY
-        };
+        let (advective_dt, gravity_dt) = self.stability_time_limits(max_speed);
         let stable_dt = advective_dt.min(gravity_dt);
         let required = (outer_dt_s / stable_dt).ceil().max(1.0) as u32;
         if self.config.pressure_diagnostics {
@@ -1705,6 +1691,26 @@ impl MacGridWorld {
     fn w_index(&self, x: usize, y: usize, z: usize) -> usize {
         let [nx, ny, _] = self.dims();
         x + nx * (y + ny * z)
+    }
+
+    fn stability_time_limits(&self, max_speed: f64) -> (f64, f64) {
+        let advective_dt = if max_speed > 0.0 {
+            self.config.cfl_limit * self.config.cell_size_m / max_speed
+        } else {
+            f64::INFINITY
+        };
+        let gravity = self
+            .config
+            .gravity_m_s2
+            .iter()
+            .map(|g| g.abs())
+            .fold(0.0, f64::max);
+        let gravity_dt = if gravity > 0.0 {
+            (2.0 * self.config.cfl_limit * self.config.cell_size_m / gravity).sqrt()
+        } else {
+            f64::INFINITY
+        };
+        (advective_dt, gravity_dt)
     }
 
     fn max_face_speed_l1(&self) -> (f64, usize) {

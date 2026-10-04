@@ -1,0 +1,22 @@
+{
+  "format_version": 1,
+  "source_parent": "18e3a3e7db717397fe9f7c402d412929b6a1c66e",
+  "capture_source": "18e3a3e+exact-replay",
+  "replay_source": "18e3a3e+exact-replay-final",
+  "full_precursor_path": ".local/coupling-512.precursor.water-replay",
+  "full_failed_path": ".local/coupling-512.water-replay",
+  "full_replayed_path": ".local/coupling-512.replayed.water-replay",
+  "full_failed_sha256": "4f8d02e3832e33dd8b2e0c8302a80d0ab638f8bfb48c2aa4ba8afe11154afcc8",
+  "full_replayed_sha256": "4f8d02e3832e33dd8b2e0c8302a80d0ab638f8bfb48c2aa4ba8afe11154afcc8",
+  "full_state_byte_count": 7070989,
+  "byte_identical": true,
+  "precursor_fluid_time_s": 32.95,
+  "failed_fluid_time_s": 33.0,
+  "steps_to_match": 1,
+  "dt_s": 0.05,
+  "recorded_fast_faces": 101,
+  "full_numerical_snapshots_committed": false,
+  "small_crop_fixture_committed": true,
+  "physics_default_changed": false,
+  "timing_acceptance": false
+}
