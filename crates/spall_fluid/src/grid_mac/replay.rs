@@ -288,19 +288,36 @@ mod tests {
         assert_eq!(bytes(&original), encoded);
         assert_eq!(bytes(&replay), encoded);
     }
-    /// A real captured neighborhood, with explicit new closed domain walls.
-    /// This is a reduced diagnostic, never original trench acceptance.
+    /// Original captured crop, including its open top. Preserve total water
+    /// by accounting for permitted exterior transfers, as in the full trench.
     #[test]
-    #[ignore = "ENG-122 unresolved pressure/momentum coupling: third step exceeds the unchanged CFL budget"]
     fn captured_trench_crop_advances_without_velocity_instability() {
         let input = include_bytes!("../../fixtures/eng122-trench-crop-v1.water-replay");
         let mut grid = MacGridWorld::read_reconstructed_replay(input.as_slice()).unwrap();
         let initial = grid.water_volume_m3();
+        let mut exterior = 0.0;
         for _ in 0..100 {
             let metrics = grid.step(0.05).unwrap();
             assert_eq!(metrics.pressure_converged_substeps, metrics.substeps);
-            assert!((grid.water_volume_m3() - initial).abs() < 1e-10);
+            assert!(metrics.permitted_outflow_m3 >= 0.0);
+            exterior += metrics.permitted_outflow_m3;
+            assert!((grid.water_volume_m3() + exterior - initial).abs() < 1e-10);
             assert!(grid.fraction.iter().all(|c| (0.0..=1.0).contains(c)));
+        }
+    }
+    /// Separate sealed variant: no exterior transfer or raw volume loss is
+    /// allowed. Its new top wall is explicit, not original trench acceptance.
+    #[test]
+    fn sealed_trench_crop_retains_all_water_and_remains_stable() {
+        let input = include_bytes!("../../fixtures/eng122-trench-crop-v1.water-replay");
+        let mut grid = MacGridWorld::read_reconstructed_replay(input.as_slice()).unwrap();
+        grid.config.open_top = false;
+        let initial = grid.water_volume_m3();
+        for _ in 0..100 {
+            let metrics = grid.step(0.05).unwrap();
+            assert_eq!(metrics.pressure_converged_substeps, metrics.substeps);
+            assert_eq!(metrics.permitted_outflow_m3, 0.0);
+            assert!((grid.water_volume_m3() - initial).abs() < 1e-10);
         }
     }
 

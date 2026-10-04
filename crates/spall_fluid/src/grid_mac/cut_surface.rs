@@ -251,35 +251,61 @@ impl Gauge {
             closed_rows: groups.into_iter().filter(|g| !g.is_empty()).collect(),
         }
     }
-    fn apply(&self, v: &mut [f64]) {
-        for rows in &self.closed_rows {
-            // Preserve the original row order and arithmetic for each mean.
-            let mut sum = 0.0;
+}
+
+struct ScaledEdge {
+    a: usize,
+    b: usize,
+    wa: f64,
+    wb: f64,
+}
+fn apply(x: &[f64], boundary_diagonal: &[f64], edges: &[ScaledEdge], out: &mut [f64]) {
+    for i in 0..x.len() {
+        out[i] = boundary_diagonal[i] * x[i];
+    }
+    for e in edges {
+        let jump = e.wa * x[e.a] - e.wb * x[e.b];
+        out[e.a] += e.wa * jump;
+        out[e.b] -= e.wb * jump;
+    }
+}
+// Euclidean null-space projection in diagonally equilibrated coordinates.
+// The constant physical pressure mode is root_diagonal, not a constant vector.
+fn scaled_gauge(gauge: &Gauge, root_diagonal: &[f64], v: &mut [f64]) {
+    for rows in &gauge.closed_rows {
+        let sum: f64 = rows.iter().map(|&i| root_diagonal[i] * v[i]).sum();
+        let weight: f64 = rows.iter().map(|&i| root_diagonal[i].powi(2)).sum();
+        if weight > 0.0 {
             for &i in rows {
-                sum += v[i];
-            }
-            let mean = sum / rows.len() as f64;
-            for &i in rows {
-                v[i] -= mean;
+                v[i] -= root_diagonal[i] * (sum / weight);
             }
         }
     }
 }
-
-fn apply(x: &[f64], diagonal: &[f64], edges: &[Edge], h2: f64, out: &mut [f64]) {
-    for i in 0..x.len() {
-        out[i] = diagonal[i] * x[i];
+fn physical_norm(v: &[f64], root_diagonal: &[f64]) -> f64 {
+    let squares: f64 = v
+        .iter()
+        .zip(root_diagonal)
+        .map(|(v, d)| (v * d).powi(2))
+        .sum();
+    if squares.is_finite() && squares > 0.0 {
+        return squares.sqrt();
     }
-    for e in edges {
-        let k = e.area / e.distance / h2;
-        out[e.a] -= k * x[e.b];
-        out[e.b] -= k * x[e.a];
+    let scale = v
+        .iter()
+        .zip(root_diagonal)
+        .map(|(v, d)| (v * d).abs())
+        .fold(0.0, f64::max);
+    if scale == 0.0 || !scale.is_finite() {
+        return scale;
     }
+    scale
+        * v.iter()
+            .zip(root_diagonal)
+            .map(|(v, d)| (v * d / scale).powi(2))
+            .sum::<f64>()
+            .sqrt()
 }
-fn norm(v: &[f64]) -> f64 {
-    v.iter().map(|v| v * v).sum::<f64>().sqrt()
-}
-
 // Symmetric Gauss-Seidel: (D+L) D^-1 (D+L)^T. Unlike a directional
 // relaxation, this is a symmetric positive preconditioner for the actual
 // liquid graph, including its small geometric interfaces and closed gauges.
@@ -356,14 +382,27 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     let mut area: [Vec<f64>; 3] = std::array::from_fn(|a| vec![0.0; known[a].len()]);
     let mut face_mass: [Vec<f64>; 3] = std::array::from_fn(|a| vec![0.0; known[a].len()]);
     let potential = |p: Point| -rho * h * dot(grid.config.gravity_m_s2, p);
-    // The same distance regularization as the existing ghost-fluid theta floor;
-    // shared by matrix, pressure impulse and face inertia. Geometry/amounts
-    // and the existence of a free boundary are never fabricated by this floor.
+    // Preserve existing Cartesian distance regularization. Embedded caps use
+    // their actual half-cell liquid inertia: imposing this floor there can hold
+    // a tiny cap fixed while pressure repeatedly accelerates an exposed patch.
+    // No geometry, amount or free-boundary participation is thresholded.
     let distance = |d: f64| d.max(0.01);
     for (r, cell) in cells.iter().enumerate() {
         if cell.cap.area > 0.0 {
             let center = add(sub(centers[r], cell.center), cell.cap.center);
-            let u = std::array::from_fn(|axis| grid.cut_surface_velocity[axis][indices[r]]);
+            let i = indices[r];
+            let u = std::array::from_fn(|axis| grid.cut_surface_velocity[axis][i]);
+            // The surface normal is derived from the canonical face momentum
+            // after accepted water transfers. Independently transporting its
+            // old normal lets it disagree with the Cartesian liquid outflow
+            // and repeatedly feed a spurious pressure impulse back into faces.
+            // Preserve transported tangent state and the new normal correction.
+            let sampled = sample_velocity(&grid.u, &grid.v, &grid.w, dims, centers[r]);
+            let normal_velocity = dot(sampled, cell.normal);
+            let correction = normal_velocity - dot(u, cell.normal);
+            for axis in 0..3 {
+                grid.cut_surface_velocity[axis][i] += cell.normal[axis] * correction;
+            }
             free.push(Free {
                 row: r,
                 air: Some(indices[r]),
@@ -371,8 +410,8 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 face: 0,
                 sign: 1.0,
                 area: cell.cap.area,
-                distance: distance(grid.fraction[indices[r]] / (2.0 * cell.cap.area)),
-                velocity: dot(u, cell.normal),
+                distance: grid.fraction[indices[r]] / (2.0 * cell.cap.area),
+                velocity: normal_velocity,
                 potential: potential(center),
             });
         }
@@ -502,18 +541,30 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     }
     let labels: Vec<_> = (0..n).map(|i| root(&mut parent, i)).collect();
     let reference = free.first().map_or(0.0, |f| f.potential);
+    // Solve phi = physical_pressure + potential(center) - base[row].
+    // The cap's atmospheric potential is zero in its own row's coordinates;
+    // subtracting a large common potential after A*phi loses tiny corrections.
+    // Affine offsets enter both the RHS and final pressure impulse exactly.
+    let mut component_base = vec![None; n];
+    for f in &free {
+        if f.axis.is_none() {
+            component_base[labels[f.row]].get_or_insert(f.potential);
+        }
+    }
+    let mut base: Vec<_> = labels
+        .iter()
+        .map(|&c| component_base[c].unwrap_or(reference))
+        .collect();
+    drop(component_base);
+    for f in &free {
+        if f.axis.is_none() {
+            base[f.row] = f.potential;
+        }
+    }
     // Positive outward flow can consume only the receiving cell's actual air
     // volume. A closing interface then has prescribed displacement flux and
     // unknown contact pressure instead of atmospheric Dirichlet pressure.
     // Include Cartesian patches as well as embedded caps (both sides of a gap).
-    let mut lower = vec![Vec::new(); n];
-    let mut upper = vec![Vec::new(); n];
-    for e in &edges {
-        let (a, b) = if e.a < e.b { (e.a, e.b) } else { (e.b, e.a) };
-        let k = e.area / e.distance / (h * h);
-        lower[b].push((a, k));
-        upper[a].push((b, k));
-    }
     let mut held = vec![None; free.len()];
     let mut attempts = 0;
     let mut total_iterations = 0;
@@ -521,49 +572,120 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         indices
             .iter()
             .enumerate()
-            .map(|(r, i)| grid.pressure_pa[*i] + potential(centers[r]) - reference)
+            .map(|(r, i)| grid.pressure_pa[*i] + (potential(centers[r]) - base[r]))
             .collect::<Vec<_>>()
     });
-    let (phi, initial, final_residual, before) = loop {
+    // Use sqrt(stiffness), never stiffness itself: 2*A^2/C can overflow
+    // for real positive subnormal fractions. D^-1/2 A D^-1/2 is the same SPD
+    // equation, with physical residual/velocity checks retained below.
+    let edge_root: Vec<_> = edges
+        .iter()
+        .map(|e| e.area.sqrt() / e.distance.sqrt() / h)
+        .collect();
+    let free_root: Vec<_> = free
+        .iter()
+        .map(|f| {
+            if f.axis.is_none() {
+                std::f64::consts::SQRT_2 * f.area / grid.fraction[indices[f.row]].sqrt() / h
+            } else {
+                f.area.sqrt() / f.distance.sqrt() / h
+            }
+        })
+        .collect();
+    let corrected_free = |f: &Free, x: &[f64], inv: &[f64]| {
+        if f.axis.is_none() {
+            let root_c = grid.fraction[indices[f.row]].sqrt();
+            f.velocity + dt / rho / h * (x[f.row] / root_c) * (inv[f.row] / root_c) * (2.0 * f.area)
+        } else {
+            f.velocity
+                - dt / rho / h / f.distance * ((f.potential - base[f.row]) - x[f.row] * inv[f.row])
+        }
+    };
+    let (phi, inverse_root, initial, final_residual, before) = loop {
         let mut closed = vec![true; n];
         for (j, f) in free.iter().enumerate() {
             if held[j].is_none() {
                 closed[labels[f.row]] = false;
             }
         }
-        let mut diagonal = vec![0.0; n];
-        let mut rhs = vec![0.0; n];
+        let mut root_diagonal = vec![0.0_f64; n];
         let mut flux = vec![0.0; n];
-        for e in &edges {
-            let k = e.area / e.distance / h.powi(2);
-            diagonal[e.a] += k;
-            diagonal[e.b] += k;
+        for (e, &k) in edges.iter().zip(&edge_root) {
+            root_diagonal[e.a] = root_diagonal[e.a].hypot(k);
+            root_diagonal[e.b] = root_diagonal[e.b].hypot(k);
             flux[e.a] += e.area * e.velocity;
             flux[e.b] -= e.area * e.velocity;
         }
         for (j, f) in free.iter().enumerate() {
             if let Some(q) = held[j] {
                 flux[f.row] += q;
+            } else {
+                root_diagonal[f.row] = root_diagonal[f.row].hypot(free_root[j]);
+                flux[f.row] += f.area * f.velocity;
+            }
+        }
+        let inverse_root: Vec<_> = root_diagonal
+            .iter()
+            .map(|d| if *d > 0.0 { 1.0 / d } else { 0.0 })
+            .collect();
+        let mut diagonal = vec![0.0; n];
+        let mut boundary_diagonal = vec![0.0; n];
+        let mut response = vec![0.0_f64; n];
+        let mut rhs: Vec<_> = flux
+            .iter()
+            .zip(&inverse_root)
+            .map(|(q, inv)| -rho / dt / h * q * inv)
+            .collect();
+        let mut scaled_edges = Vec::with_capacity(edges.len());
+        let mut lower = vec![Vec::new(); n];
+        let mut upper = vec![Vec::new(); n];
+        for (e, &k) in edges.iter().zip(&edge_root) {
+            let wa = k * inverse_root[e.a];
+            let wb = k * inverse_root[e.b];
+            diagonal[e.a] += wa * wa;
+            diagonal[e.b] += wb * wb;
+            let jump = k * (base[e.b] - base[e.a]);
+            rhs[e.a] += wa * jump;
+            rhs[e.b] -= wb * jump;
+            response[e.a] = response[e.a].max(dt / rho / h / e.distance * inverse_root[e.a]);
+            response[e.b] = response[e.b].max(dt / rho / h / e.distance * inverse_root[e.b]);
+            let (a, b) = if e.a < e.b { (e.a, e.b) } else { (e.b, e.a) };
+            lower[b].push((a, wa * wb));
+            upper[a].push((b, wa * wb));
+            scaled_edges.push(ScaledEdge {
+                a: e.a,
+                b: e.b,
+                wa,
+                wb,
+            });
+        }
+        for (j, f) in free.iter().enumerate() {
+            if held[j].is_some() {
                 continue;
             }
-            let k = f.area / f.distance / h.powi(2);
-            diagonal[f.row] += k;
-            rhs[f.row] += k * (f.potential - reference);
-            flux[f.row] += f.area * f.velocity;
+            let k = free_root[j];
+            let w = k * inverse_root[f.row];
+            diagonal[f.row] += w * w;
+            boundary_diagonal[f.row] += w * w;
+            rhs[f.row] += w * (k * (f.potential - base[f.row]));
+            let sensitivity = if f.axis.is_none() {
+                let c = grid.fraction[indices[f.row]].sqrt();
+                dt / rho / h * (2.0 * f.area / c) * (inverse_root[f.row] / c)
+            } else {
+                dt / rho / h / f.distance * inverse_root[f.row]
+            };
+            response[f.row] = response[f.row].max(sensitivity);
         }
         let before = flux
             .iter()
             .enumerate()
             .map(|(r, v)| v.abs() / h / grid.fraction[indices[r]])
             .fold(0.0, f64::max);
-        for r in 0..n {
-            rhs[r] -= rho / dt / h * flux[r];
-        }
         let mut sums = vec![0.0; n];
         let mut counts = vec![0usize; n];
         for (r, &c) in labels.iter().enumerate() {
             if closed[c] {
-                sums[c] += rhs[r];
+                sums[c] -= rho / dt / h * flux[r];
                 counts[c] += 1;
             }
         }
@@ -573,49 +695,63 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             }
         }
         let gauge = Gauge::new(&labels, &closed);
-        gauge.apply(&mut rhs);
-        let mut phi: Vec<_> = warm.take().unwrap_or_else(|| {
-            rhs.iter()
-                .zip(&diagonal)
-                .map(|(r, d)| if *d > 0.0 { r / d } else { 0.0 })
-                .collect()
-        });
-        gauge.apply(&mut phi);
+        scaled_gauge(&gauge, &root_diagonal, &mut rhs);
+        // Krylov vectors use x = (physical_pressure + potential - base) * sqrt(D).
+        // Convert back with inverse_root for physical pressure and face impulses.
+        let mut phi: Vec<_> = warm
+            .take()
+            .map(|v| v.iter().zip(&root_diagonal).map(|(p, d)| p * d).collect())
+            .unwrap_or_else(|| {
+                rhs.iter()
+                    .zip(&diagonal)
+                    .map(|(r, d)| if *d > 0.0 { r / d } else { 0.0 })
+                    .collect()
+            });
+        scaled_gauge(&gauge, &root_diagonal, &mut phi);
         let mut product = vec![0.0; n];
-        apply(&phi, &diagonal, &edges, h * h, &mut product);
+        apply(&phi, &boundary_diagonal, &scaled_edges, &mut product);
         let mut residual: Vec<_> = rhs.iter().zip(&product).map(|(b, a)| b - a).collect();
-        gauge.apply(&mut residual);
-        let initial = norm(&residual);
+        scaled_gauge(&gauge, &root_diagonal, &mut residual);
+        let initial = physical_norm(&residual, &root_diagonal);
         let target = grid
             .config
             .pressure_absolute_tolerance
-            .max(grid.config.pressure_relative_tolerance * norm(&rhs))
+            .max(grid.config.pressure_relative_tolerance * physical_norm(&rhs, &root_diagonal))
             // For a full cell (no moving embedded face), pressure residual
             // changes its amount by dt^2/rho * residual. Reserve two orders
             // of margin inside the unchanged 1e-10 donor bound.
             .min(1e-12 * rho / dt.powi(2));
         let mut z = vec![0.0; n];
         precondition(&residual, &diagonal, &lower, &upper, &mut z);
-        gauge.apply(&mut z);
+        scaled_gauge(&gauge, &root_diagonal, &mut z);
         let mut direction = z.clone();
         let mut rz: f64 = residual.iter().zip(&z).map(|(r, z)| r * z).sum();
         // A tiny row can satisfy the global flux norm while retaining a large
         // pressure/velocity error. Also resolve each row's diagonal-scaled
         // potential defect; no volume threshold removes a row from this gate.
+        // Also bound the remaining pressure-induced velocity correction by
+        // 1e-8 m/s. A fixed Pa tolerance alone is unsafe as cap inertia vanishes.
         let locally_converged = |residual: &[f64]| {
             residual.iter().enumerate().all(|(i, r)| {
-                diagonal[i] == 0.0
-                    || (r / diagonal[i]).abs()
+                diagonal[i] == 0.0 || {
+                    let defect = r / diagonal[i];
+                    (defect * inverse_root[i]).abs()
                         <= grid.config.pressure_absolute_tolerance.max(
-                            grid.config.pressure_relative_tolerance * (rhs[i] / diagonal[i]).abs(),
+                            grid.config.pressure_relative_tolerance
+                                * (rhs[i] / diagonal[i] * inverse_root[i]).abs(),
                         )
+                        && (defect * response[i]).abs() <= 1e-8
+                }
             })
         };
         let mut iterations = 0;
-        while (norm(&residual) > target || !locally_converged(&residual))
+        while (physical_norm(&residual, &root_diagonal) > target || !locally_converged(&residual))
             && iterations + total_iterations < grid.config.pressure_max_iterations
         {
-            if norm(&residual) <= target {
+            if physical_norm(&residual, &root_diagonal) <= target || !rz.is_finite() {
+                // A finite pressure hint on a vanishing-inertia cap can also
+                // overflow the CG dot product. The same budgeted relaxation
+                // removes that hint without changing the equation or tolerance.
                 // Local symmetric relaxation corrects weak rows whose dot
                 // products disappear beneath the large rows' roundoff. Each
                 // correction consumes one iteration of the original budget.
@@ -623,20 +759,20 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 for i in 0..n {
                     phi[i] += z[i];
                 }
-                gauge.apply(&mut phi);
-                apply(&phi, &diagonal, &edges, h * h, &mut product);
+                scaled_gauge(&gauge, &root_diagonal, &mut phi);
+                apply(&phi, &boundary_diagonal, &scaled_edges, &mut product);
                 for i in 0..n {
                     residual[i] = rhs[i] - product[i];
                 }
-                gauge.apply(&mut residual);
+                scaled_gauge(&gauge, &root_diagonal, &mut residual);
                 precondition(&residual, &diagonal, &lower, &upper, &mut z);
-                gauge.apply(&mut z);
+                scaled_gauge(&gauge, &root_diagonal, &mut z);
                 direction.copy_from_slice(&z);
                 rz = residual.iter().zip(&z).map(|(r, z)| r * z).sum();
                 iterations += 1;
                 continue;
             }
-            apply(&direction, &diagonal, &edges, h * h, &mut product);
+            apply(&direction, &boundary_diagonal, &scaled_edges, &mut product);
             let dp: f64 = direction.iter().zip(&product).map(|(a, b)| a * b).sum();
             if !dp.is_finite() || dp <= 0.0 {
                 return Err(MacError::MomentumInvalidState);
@@ -646,20 +782,20 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 phi[i] += alpha * direction[i];
                 residual[i] -= alpha * product[i];
             }
-            gauge.apply(&mut residual);
+            scaled_gauge(&gauge, &root_diagonal, &mut residual);
             // Recursive CG residuals can lose the remaining correction through
             // cancellation. Verify apparent convergence against the actual
             // operator and restart from that residual within the same budget.
-            let reliable = norm(&residual) <= target;
+            let reliable = physical_norm(&residual, &root_diagonal) <= target;
             if reliable {
-                apply(&phi, &diagonal, &edges, h * h, &mut product);
+                apply(&phi, &boundary_diagonal, &scaled_edges, &mut product);
                 for i in 0..n {
                     residual[i] = rhs[i] - product[i];
                 }
-                gauge.apply(&mut residual);
+                scaled_gauge(&gauge, &root_diagonal, &mut residual);
             }
             precondition(&residual, &diagonal, &lower, &upper, &mut z);
-            gauge.apply(&mut z);
+            scaled_gauge(&gauge, &root_diagonal, &mut z);
             let next: f64 = residual.iter().zip(&z).map(|(a, b)| a * b).sum();
             let beta = if reliable { 0.0 } else { next / rz };
             for i in 0..n {
@@ -668,12 +804,12 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             rz = next;
             iterations += 1;
         }
-        apply(&phi, &diagonal, &edges, h * h, &mut product);
+        apply(&phi, &boundary_diagonal, &scaled_edges, &mut product);
         for i in 0..n {
             residual[i] = rhs[i] - product[i];
         }
-        gauge.apply(&mut residual);
-        let final_residual = norm(&residual);
+        scaled_gauge(&gauge, &root_diagonal, &mut residual);
+        let final_residual = physical_norm(&residual, &root_diagonal);
         if final_residual > target * 1.01 || !locally_converged(&residual) {
             return Err(MacError::MomentumPressureNotConverged {
                 residual: final_residual,
@@ -685,8 +821,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             let Some(air) = f.air else {
                 continue;
             };
-            let q = f.area
-                * (f.velocity - dt / rho / h / f.distance * (f.potential - reference - phi[f.row]));
+            let q = f.area * corrected_free(f, &phi, &inverse_root);
             let capacity = (1.0 - grid.fraction[air]) * h / dt;
             let constraint = if q > capacity { Some(capacity) } else { None };
             if held[j] != constraint {
@@ -695,9 +830,14 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             }
         }
         if !changed {
-            break (phi, initial, final_residual, before);
+            break (phi, inverse_root, initial, final_residual, before);
         }
-        warm = Some(phi);
+        warm = Some(
+            phi.iter()
+                .zip(&inverse_root)
+                .map(|(p, inv)| p * inv)
+                .collect(),
+        );
         attempts += 1;
         if attempts > 32 || total_iterations > grid.config.pressure_max_iterations {
             return Err(MacError::MomentumPressureNotConverged {
@@ -705,14 +845,21 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             });
         }
     };
+    let free_velocity: Vec<_> = free
+        .iter()
+        .map(|f| corrected_free(f, &phi, &inverse_root))
+        .collect();
     grid.pressure_pa.fill(0.0);
     for r in 0..n {
-        grid.pressure_pa[indices[r]] = phi[r] + reference - potential(centers[r]);
+        grid.pressure_pa[indices[r]] = phi[r] * inverse_root[r] + (base[r] - potential(centers[r]));
     }
     grid.cut_surface_flux = std::array::from_fn(|a| vec![0.0; known[a].len()]);
     let mut flux = vec![0.0; n];
     for e in &edges {
-        let u = e.velocity - dt / rho / h / e.distance * (phi[e.b] - phi[e.a]);
+        let u = e.velocity
+            - dt / rho / h / e.distance
+                * ((base[e.b] - base[e.a])
+                    + (phi[e.b] * inverse_root[e.b] - phi[e.a] * inverse_root[e.a]));
         if grid.config.pressure_diagnostics && u.abs() > 10.0 {
             eprintln!(
                 "{{\"type\":\"cut_fast_edge\",\"axis\":{},\"face\":{},\"a\":{},\"b\":{},\"fraction_a\":{:.17e},\"fraction_b\":{:.17e},\"area\":{:.17e},\"distance\":{:.17e},\"predicted_velocity\":{:.17e},\"corrected_velocity\":{:.17e},\"phi_a\":{:.17e},\"phi_b\":{:.17e}}}",
@@ -726,8 +873,8 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 e.distance,
                 e.velocity,
                 u,
-                phi[e.a],
-                phi[e.b]
+                phi[e.a] * inverse_root[e.a] + base[e.a] - reference,
+                phi[e.b] * inverse_root[e.b] + base[e.b] - reference
             );
         }
         let q = e.area * u;
@@ -736,10 +883,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         flux[e.b] -= q;
     }
     for (j, f) in free.iter().enumerate() {
-        let u = held[j].map_or_else(
-            || f.velocity - dt / rho / h / f.distance * (f.potential - reference - phi[f.row]),
-            |q| q / f.area,
-        );
+        let u = held[j].map_or_else(|| free_velocity[j], |q| q / f.area);
         if grid.config.pressure_diagnostics && u.abs() > 10.0 {
             eprintln!(
                 "{{\"type\":\"cut_fast_free\",\"axis_or_cap\":{},\"face\":{},\"cell\":{},\"fraction\":{:.17e},\"area\":{:.17e},\"distance\":{:.17e},\"predicted_velocity\":{:.17e},\"corrected_velocity\":{:.17e},\"phi\":{:.17e},\"boundary_phi\":{:.17e},\"held\":{}}}",
@@ -751,7 +895,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 f.distance,
                 f.velocity,
                 u,
-                phi[f.row],
+                phi[f.row] * inverse_root[f.row] + base[f.row] - reference,
                 f.potential - reference,
                 held[j].is_some()
             );
@@ -864,7 +1008,7 @@ mod tests {
         let gauge = Gauge::new(&labels, &[true, false, false, true, false, false, true]);
         let initial = [3.0, -7.0, 9.0, 1e-120, 1e300, 3e-120, 42.0];
         let mut projected = initial;
-        gauge.apply(&mut projected);
+        scaled_gauge(&gauge, &[1.0; 7], &mut projected);
         assert_eq!(projected[1].to_bits(), initial[1].to_bits());
         assert_eq!(projected[4].to_bits(), initial[4].to_bits());
         assert_eq!(projected[0] + projected[2], 0.0);
@@ -877,8 +1021,101 @@ mod tests {
         shifted[0] += 100.0;
         shifted[2] += 100.0;
         shifted[6] -= 9.0;
-        gauge.apply(&mut shifted);
+        scaled_gauge(&gauge, &[1.0; 7], &mut shifted);
         assert_eq!(projected, shifted);
+    }
+
+    #[test]
+    fn equilibrated_closed_gauge_preserves_physical_pressure_jumps() {
+        let gauge = Gauge::new(&[0, 0, 0], &[true, false, false]);
+        let roots = [2.0, 3.0, 4.0];
+        let mut original = [3.0, 10.0, 11.0];
+        let jump = original[1] / roots[1] - original[0] / roots[0];
+        let mut shifted: [f64; 3] = std::array::from_fn(|i| original[i] + 100.0 * roots[i]);
+        scaled_gauge(&gauge, &roots, &mut original);
+        scaled_gauge(&gauge, &roots, &mut shifted);
+        assert!((original[1] / roots[1] - original[0] / roots[0] - jump).abs() < 1e-14);
+        assert!(
+            original
+                .iter()
+                .zip(roots)
+                .map(|(v, d)| v * d)
+                .sum::<f64>()
+                .abs()
+                < 1e-14
+        );
+        for (a, b) in original.iter().zip(shifted) {
+            assert!((a - b).abs() < 1e-13);
+        }
+    }
+
+    #[test]
+    fn stale_reconstructed_normal_cannot_inject_canonical_momentum() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [5, 5, 5], 125).unwrap();
+        let mut grid = MacGridWorld::new(
+            &SolidBoundary {
+                spec,
+                solid: vec![false; 125],
+            },
+            super::super::MacConfig {
+                cell_size_m: 0.75,
+                gravity_m_s2: [0.0; 3],
+                reconstructed_surface_support: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        grid.set_freely_displaced_air().unwrap();
+        grid.set_fraction(GlobalCell::new(2, 2, 2), 0.25).unwrap();
+        let mut stale = grid.clone();
+        stale.cut_surface_velocity = std::array::from_fn(|_| vec![0.0; 125]);
+        let wet = stale.cell_index_global(GlobalCell::new(2, 2, 2)).unwrap();
+        stale.cut_surface_velocity[1][wet] = 10_000.0;
+        grid.project(0.05).unwrap();
+        stale.project(0.05).unwrap();
+        assert_eq!(stale.u, grid.u);
+        assert_eq!(stale.v, grid.v);
+        assert_eq!(stale.w, grid.w);
+        assert_eq!(stale.cut_surface_flux, grid.cut_surface_flux);
+        assert_eq!(stale.pressure_pa, grid.pressure_pa);
+        assert!(stale.reconstructed_interface_speed_m_s() < 1e-7);
+    }
+
+    #[test]
+    fn vanishing_thickness_cap_cannot_turn_a_pressure_hint_into_motion() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [5, 5, 5], 125).unwrap();
+        for fraction in [1e-40, 1e-120, 1e-300, 1e-311, f64::from_bits(1)] {
+            let mut grid = MacGridWorld::new(
+                &SolidBoundary {
+                    spec,
+                    solid: vec![false; 125],
+                },
+                super::super::MacConfig {
+                    cell_size_m: 0.75,
+                    gravity_m_s2: [0.0; 3],
+                    reconstructed_surface_support: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            grid.set_freely_displaced_air().unwrap();
+            let cell = GlobalCell::new(2, 2, 2);
+            grid.set_fraction(cell, fraction).unwrap();
+            let i = grid.cell_index_global(cell).unwrap();
+            grid.pressure_pa[i] = 10_000.0;
+            let before = grid.water_volume_m3();
+            let p = grid.project(0.05).unwrap();
+            assert!(p.converged);
+            assert!(p.iterations <= grid.config.pressure_max_iterations as usize);
+            assert!(grid.max_face_component_velocity_m_s() < 1e-7);
+            assert!(grid.reconstructed_interface_speed_m_s() < 1e-7);
+            assert_eq!(grid.water_volume_m3().to_bits(), before.to_bits());
+            assert_eq!(grid.fraction[i].to_bits(), fraction.to_bits());
+        }
     }
 
     #[test]
@@ -975,8 +1212,9 @@ mod tests {
             let mut py = [0.0; 4];
             precondition(&x, &diagonal, &lower, &upper, &mut px);
             precondition(&y, &diagonal, &lower, &upper, &mut py);
-            Gauge::new(&[0, 0, 0, 3], &[true, false, false, true]).apply(&mut px);
-            Gauge::new(&[0, 0, 0, 3], &[true, false, false, true]).apply(&mut py);
+            let gauge = Gauge::new(&[0, 0, 0, 3], &[true, false, false, true]);
+            scaled_gauge(&gauge, &[1.0; 4], &mut px);
+            scaled_gauge(&gauge, &[1.0; 4], &mut py);
             let inner =
                 |a: &[f64; 4], b: &[f64; 4]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f64>();
             let xy = inner(&x, &py);

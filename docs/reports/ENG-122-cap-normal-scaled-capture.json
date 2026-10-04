@@ -1,0 +1,30 @@
+{
+  "source_revision": "0b00760+scaled-cap-normal-capture",
+  "timing_acceptance": false,
+  "original_workload": "512 water-support",
+  "accepted_fluid_time_s": 12.1,
+  "next_required_substeps": 9,
+  "configured_max_substeps": 8,
+  "snapshots": [
+    {
+      "sha256": "0683c98c4f330e5c7b7beb8175b75ba83b0ad10aad9803ef6c8eba1459327ff6",
+      "bytes": 7070989,
+      "path": ".local/scaled-failure-512.precursor.water-replay",
+      "capture_source_revision": "0b00760+scaled-cap-normal-capture"
+    },
+    {
+      "sha256": "6d7d945972888c90309635b13fbe724cc5f80d3371d5c89bfe973d1675d5f40a",
+      "bytes": 7070989,
+      "path": ".local/scaled-failure-512.water-replay",
+      "capture_source_revision": "0b00760+scaled-cap-normal-capture"
+    },
+    {
+      "sha256": "797dd1116170fd3589d3563b62f9f894e44bcc7d40e83a717d5e22acfac37299",
+      "bytes": 5590991,
+      "path": ".local/cap-normal-new-512.water-replay",
+      "capture_source_revision": "0b00760+cap-normal-nonfinite-capture"
+    }
+  ],
+  "replayed_final_sha256": "6d7d945972888c90309635b13fbe724cc5f80d3371d5c89bfe973d1675d5f40a",
+  "replay_matches_captured_bytes": true
+}

@@ -482,3 +482,18 @@ original workload acceptance. The coupling instability and unchanged full
 removing only the embedded-cap inertia floor failed full-state pressure
 convergence and was dropped. Next ENG-122: physically matched pressure/momentum
 response and pressure conditioning using the crop plus exact full replay.
+
+ENG-122 scaled pressure/surface-normal checkpoint (2026-10-04): embedded normal
+predictors derive from accepted-transfer canonical momentum, with actual cap
+half-cell inertia and diagonally equilibrated equivalent SPD pressure equations.
+Physical residual, local potential/velocity error, closed gauge and original
+iteration/substep/CFL budgets remain enforced; every positive fraction stays in
+the model. Physical warm pressure and owner/save/wire contracts remain unchanged.
+The old full replay and numerical-overflow snapshot advance 100 steps, but the
+unchanged fresh 512 trench rejects at 12.10 s (9 versus 8 substeps); 1024 passes
+52.20 s. Reconstructed support remains diagnostic, ENG-122 stays in progress.
+The crop binary has an open top, correcting the preceding closed-crop wording;
+CI now checks accounted exterior water plus a separate sealed 100-step variant.
+Next: consistent Cartesian patch pressure/face momentum in vanishing fragments;
+original fresh gates, local momentum accuracy and full scratch peak remain open.
+See docs/reports/ENG-122.md for provenance and measured results.

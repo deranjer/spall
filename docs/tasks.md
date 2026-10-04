@@ -1299,3 +1299,18 @@ Added transport substage timing; baseline512momentum46%/interface25% dominate. S
 ### ENG-122 exact failing-step replay and 100-cell fixture (2026-10-04)
 Added version1 bounded little-endian reconstructed-only numerical replay, preserving warm physical pressure/interface state independently of canonical save/wire/owner installation. Optional trench capture reports no timing acceptance. Exact32.95s precursor step reproduces captured33s failure byte-for-byte (7070989bytes):40.29->58.92m/s face, next50ms9substepsvs8. Retained100cell5x4x5crop with explicit altered outer walls accepts2steps thenfails10vs8; ignored100step acceptance gate remains visibly unresolved, not CI pass/originaltrench acceptance. Three replay invariants pass; malformed input bounded/rejected. Embedded-cap exact-inertia trial on fullprecursor failedpressureconvergence and wasdropped; physics/default/budgets unchanged. Fullcheck results in reports/ENG-122.md. Keep diagnostic/in_progress. Next unblockedENG-122: physically matched pressure/momentum coupling and pressureconditioning on smallfixture + exactfullstate, then original512/1024gates; graphical/network/fullmemory/localmomentumaccuracy/recovery remain.
 Validation: cargo xtask check fmt/strictworkspaceClippy/allfeaturetests1204passed/0failed/64ignored; releasefluid89passed/0failed/1ignored; explicitcropgate fails as documented. Exact-state replay hashes match. Full check evidence in reports/ENG-122-coupling-replay-check.txt.
+
+ENG-122 scaled pressure/surface-normal checkpoint (2026-10-04): embedded normal
+predictors derive from accepted-transfer canonical momentum, with actual cap
+half-cell inertia and diagonally equilibrated equivalent SPD pressure equations.
+Physical residual, local potential/velocity error, closed gauge and original
+iteration/substep/CFL budgets remain enforced; every positive fraction stays in
+the model. Physical warm pressure and owner/save/wire contracts remain unchanged.
+The old full replay and numerical-overflow snapshot advance 100 steps, but the
+unchanged fresh 512 trench rejects at 12.10 s (9 versus 8 substeps); 1024 passes
+52.20 s. Reconstructed support remains diagnostic, ENG-122 stays in progress.
+The crop binary has an open top, correcting the preceding closed-crop wording;
+CI now checks accounted exterior water plus a separate sealed 100-step variant.
+Next: consistent Cartesian patch pressure/face momentum in vanishing fragments;
+original fresh gates, local momentum accuracy and full scratch peak remain open.
+See docs/reports/ENG-122.md for provenance and measured results.
