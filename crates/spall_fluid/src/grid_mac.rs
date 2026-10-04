@@ -435,7 +435,8 @@ impl MacGridWorld {
     }
 
     /// ENG-122 reconstructed liquid support diagnostic. Small drainage and
-    /// energy gates pass, but nearly saturated bulk-water rest fails. This is
+    /// energy and nearly saturated rest gates pass. Dynamic channel acceptance
+    /// remains incomplete. This is
     /// not an accepted gameplay policy and does not use the legacy MG solver.
     pub fn set_cut_surface_support(&mut self) -> Result<(), MacError> {
         if !self.freely_displaced_air || self.experimental_surface_films {
@@ -443,6 +444,10 @@ impl MacGridWorld {
         }
         self.cut_surface_support = true;
         Ok(())
+    }
+
+    pub(crate) fn cut_surface_support_enabled(&self) -> bool {
+        self.cut_surface_support
     }
 
     /// Two-phase only (on by default there): treat air that is sealed off from
@@ -2733,6 +2738,19 @@ impl MacGridWorld {
             }
             let p = [x as isize, y as isize, z as isize];
             let sample = |q: [isize; 3]| {
+                if self.cut_surface_support {
+                    if self.config.open_top && q[1] >= ny as isize {
+                        return 0.0;
+                    }
+                    // Mirror a closed wall in each coordinate independently.
+                    // Transverse ghost samples must retain their vertical
+                    // level; substituting c tilts a flat surface at corners.
+                    let r: [usize; 3] = std::array::from_fn(|a| {
+                        q[a].clamp(0, [nx, ny, nz][a] as isize - 1) as usize
+                    });
+                    let j = self.cell_index(r[0], r[1], r[2]);
+                    return if self.solid[j] { c } else { self.fraction[j] };
+                }
                 if q.iter()
                     .zip([nx, ny, nz])
                     .any(|(&v, n)| v < 0 || v >= n as isize)
@@ -3580,6 +3598,15 @@ impl InterfacePlane {
             for n in &mut normal {
                 *n /= norm;
             }
+        }
+        if resolved && fraction > 0.5 {
+            // Resolve the small complementary phase directly, instead of
+            // subtracting almost equal volumes during root finding.
+            let air = Self::from_fraction_tolerance(normal.map(|v| -v), 1.0 - fraction, true);
+            return Self {
+                normal: air.normal.map(|v| -v),
+                alpha: -air.alpha,
+            };
         }
         // Volume is monotone in alpha on [lo, hi] (0 at lo, 1 at hi). The
         // Illinois variant of regula falsi keeps that bracket and converges
@@ -5752,10 +5779,93 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "ENG-122 cut support creates a current in nearly saturated bulk water; promotion blocked"]
     fn reconstructed_support_preserves_nearly_saturated_surface_rest() {
+        for h in [0.5, 1.0] {
+            for dt in [0.025, 0.05] {
+                for mixed in [true, false] {
+                    let mut grid = all_air_grid(
+                        [12, 6, 2],
+                        MacConfig {
+                            cell_size_m: h,
+                            ..MacConfig::default()
+                        },
+                    );
+                    grid.set_freely_displaced_air().unwrap();
+                    grid.set_cut_surface_support().unwrap();
+                    for z in 0..2 {
+                        for x in 0..12 {
+                            grid.set_fraction(
+                                GlobalCell::new(x, 0, z),
+                                if mixed && (x + z) % 2 == 0 {
+                                    1.0
+                                } else {
+                                    1.0 - f64::EPSILON
+                                },
+                            )
+                            .unwrap();
+                            grid.set_fraction(GlobalCell::new(x, 1, z), 0.25).unwrap();
+                        }
+                    }
+                    let mass = grid.water_volume_m3();
+                    let mut peak = 0.0_f64;
+                    for step in 0..600 {
+                        let metrics = grid.step(dt).unwrap();
+                        assert_eq!(metrics.pressure_converged_substeps, metrics.substeps);
+                        let speed = grid.max_face_component_velocity_m_s();
+                        peak = peak.max(speed);
+                        assert!(speed < 1e-7, "step={step}, speed={speed}");
+                        assert!((grid.water_volume_m3() - mass).abs() < 1e-10);
+                        assert!(grid.pressure_pa.iter().all(|p| p.is_finite()));
+                    }
+                    println!(
+                        "{{\"scenario\":\"reconstructed_nearly_full_rest\",\"h_m\":{h},\"dt_s\":{dt},\"mixed\":{mixed},\"steps\":600,\"peak_speed_m_s\":{peak},\"mass_error_m3\":{}}}",
+                        grid.water_volume_m3() - mass
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cut_surface_reconstruction_preserves_flat_wall_normals_and_tiny_air_volume() {
+        let mut grid = all_air_grid([5, 4, 3], MacConfig::default());
+        grid.set_freely_displaced_air().unwrap();
+        grid.set_cut_surface_support().unwrap();
+        for z in 0..3 {
+            for x in 0..5 {
+                grid.set_fraction(GlobalCell::new(x, 0, z), 1.0 - f64::EPSILON)
+                    .unwrap();
+                grid.set_fraction(GlobalCell::new(x, 1, z), 0.25).unwrap();
+            }
+        }
+        let planes = grid.reconstruct_planes();
+        for z in 0..3 {
+            for x in 0..5 {
+                for y in [0, 1] {
+                    let i = grid.cell_index(x, y, z);
+                    let p = planes[i].unwrap();
+                    assert_eq!(p.normal, [0.0, 1.0, 0.0]);
+                    assert!((p.alpha - grid.fraction[i]).abs() <= f64::EPSILON);
+                }
+            }
+        }
+        for normal in [[1.0, 2.0, 3.0], [-1.0, 2.0, -3.0], [0.0, 1.0, 0.0]] {
+            for air in [f64::EPSILON, 1e-12, 0.01] {
+                let p = InterfacePlane::from_fraction_resolved(normal, 1.0 - air);
+                let actual = plane_cube_fraction(p.normal.map(|v| -v), -p.alpha);
+                let expected = 1.0 - (1.0 - air);
+                assert!(
+                    (actual - expected).abs() < expected * 1e-6,
+                    "normal={normal:?}, air={air}, actual={actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cut_surface_closes_a_buried_air_gap_without_losing_water_or_creating_energy() {
         let mut grid = all_air_grid(
-            [12, 6, 2],
+            [3, 4, 2],
             MacConfig {
                 cell_size_m: 1.0,
                 ..MacConfig::default()
@@ -5764,25 +5874,26 @@ mod tests {
         grid.set_freely_displaced_air().unwrap();
         grid.set_cut_surface_support().unwrap();
         for z in 0..2 {
-            for x in 0..12 {
-                grid.set_fraction(
-                    GlobalCell::new(x, 0, z),
-                    if (x + z) % 2 == 0 {
-                        1.0
-                    } else {
-                        1.0 - f64::EPSILON
-                    },
-                )
-                .unwrap();
+            for x in 0..3 {
+                grid.set_fraction(GlobalCell::new(x, 0, z), 0.99).unwrap();
                 grid.set_fraction(GlobalCell::new(x, 1, z), 0.25).unwrap();
             }
         }
-        let mass = grid.water_volume_m3();
-        for step in 0..600 {
+        let water = grid.water_volume_m3();
+        let energy = grid.gravitational_potential_energy_j();
+        for _ in 0..600 {
             grid.step(0.05).unwrap();
-            let speed = grid.max_face_component_velocity_m_s();
-            assert!(speed < 1e-7, "step={step}, speed={speed}");
-            assert!((grid.water_volume_m3() - mass).abs() < 1e-10);
+            assert!((grid.water_volume_m3() - water).abs() < 1e-10);
+            let (lo, hi) = grid.fraction_bounds();
+            assert!(lo >= 0.0 && hi <= 1.0);
+            assert!(
+                grid.gravitational_potential_energy_j() + grid.kinetic_energy_j() <= energy * 1.05
+            );
+        }
+        for z in 0..2 {
+            for x in 0..3 {
+                assert!(grid.fraction[grid.cell_index(x, 0, z)] > 0.995);
+            }
         }
     }
 

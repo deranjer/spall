@@ -1228,3 +1228,21 @@ Next unblocked ENG-122 item is consistent physical free-surface ownership
 across neighbouring reconstructions, then reference and original 512/1024
 paced trench gates. No speed, whole-memory or viewer acceptance is claimed.
 Exact evidence and regularization details: docs/reports/ENG-122.md.
+
+### ENG-122 surface reconstruction checkpoint (2026-10-04)
+
+Repaired closed-wall PLIC ghost sampling, nearly full complementary air geometry,
+and tiny exposed-polygon centroids. Added one-sided closing-interface pressure
+support on embedded and Cartesian boundaries, preserving amounts and limits.
+The previously ignored rest gate is enabled: eight 600-step cases at 0.5/1 m
+and 25/50 ms pass, peak speed 8.9182e-12 m/s (limit 1e-7), maximum volume error
+2.9133e-13 m3 (limit 1e-10). Shallow/deep drainage, energy and walls pass;
+76 fluid library tests pass. Low-dam/full-wall references pass 600 x 10 ms.
+Dynamic channel FAILS at 228/600: 12 required substeps versus 8; peak face speed
+125.0097 m/s, water error 7.11e-15 m3, no integral energy growth. Keep diagnostic
+and ENG-122 in_progress. Next unblocked ENG-122: dynamic interface velocity
+and accepted momentum support near vanishing fragments; pass unchanged channel
+and current rest/drainage/energy gates, then original paced 512/1024 trench
+before gameplay promotion. Exact checks, evidence and full-check result:
+docs/reports/ENG-122.md and ENG-122-surface-reconstruction-* files. No viewer,
+GPU, whole-memory or generated-performance acceptance.

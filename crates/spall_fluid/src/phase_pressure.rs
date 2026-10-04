@@ -113,6 +113,28 @@ impl PhasePressureWorld {
         &self.solver
     }
 
+    /// ENG-122 diagnostic support model; reserve its retained face-flux arrays
+    /// before enabling. This does not activate it in authoritative gameplay.
+    pub fn enable_cut_surface_support(&mut self) -> Result<(), PhasePressureError> {
+        if self.solver.cut_surface_support_enabled() {
+            return Ok(());
+        }
+        let [nx, ny, nz] = self
+            .phase
+            .geometry()
+            .fine_spec()
+            .dimensions()
+            .map(|v| v as usize);
+        let slots = (nx + 1) * ny * nz + nx * (ny + 1) * nz + nx * ny * (nz + 1);
+        let bytes = self
+            .retained_array_bytes()
+            .checked_add(slots * size_of::<f64>())
+            .ok_or(PhasePressureError::InvalidConfig)?;
+        check_bytes(bytes, self.max_retained_array_bytes)?;
+        self.solver.set_cut_surface_support()?;
+        Ok(())
+    }
+
     /// Opt into accepted-flux staggered mixture momentum transport followed by
     /// a fine projection on the new phase. First-order experimental advection;
     /// no production/save/wire activation or full interface accuracy claim.
@@ -203,5 +225,35 @@ fn check_bytes(requested: usize, limit: usize) -> Result<(), PhasePressureError>
         Err(PhasePressureError::ArrayLimit { requested, limit })
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod support_tests {
+    use super::*;
+    use crate::phase_fixtures::PhaseReferenceScene;
+    #[test]
+    fn support_activation_respects_array_budget_atomically_and_is_idempotent() {
+        let phase = PhaseReferenceScene::LowDam.build().unwrap();
+        let config = PhasePressureConfig {
+            mac: MacConfig::default(),
+            air_density_kg_m3: 1.2,
+            preconditioner: PressurePreconditioner::Multigrid,
+            max_retained_array_bytes: 100_000_000,
+        };
+        let mut world = PhasePressureWorld::new_water_only(phase, config).unwrap();
+        world.max_retained_array_bytes = world.retained_array_bytes();
+        let before = format!("{:?}", world.solver);
+        assert!(matches!(
+            world.enable_cut_surface_support(),
+            Err(PhasePressureError::ArrayLimit { .. })
+        ));
+        assert_eq!(format!("{:?}", world.solver), before);
+        world.max_retained_array_bytes = 100_000_000;
+        world.enable_cut_surface_support().unwrap();
+        world.step(0.01).unwrap();
+        world.max_retained_array_bytes = world.retained_array_bytes();
+        world.enable_cut_surface_support().unwrap();
+        assert!(world.solver.cut_surface_support_enabled());
     }
 }

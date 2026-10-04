@@ -1164,7 +1164,7 @@ Run cargo test -p sandbox --features client --test vegetation for deterministic 
 
 GPU evidence: cargo run -p sandbox --features client --example vegetation-gallery -- .local/vegetation-gallery produces ten generated tree and ten generated ground specimens in four seasons through production geometry/shadows. Live launch: cargo xtask play --worldgen showcase --seed 1 --worldgen-size 512 --season autumn. Every generated size and editor Run in game use the common factory. Hardware performance and manual traversal remain separate. Details: docs/reports/ENG-118-vegetation.md.
 
-### ENG-122 reconstructed liquid support gates (2026-10-03)
+### ENG-122 reconstructed liquid support gates (2026-10-04)
 
 Run `cargo test -p spall_fluid --lib cut_surface --release` for centroid and
 positive-fragment geometry, and `cargo test -p spall_fluid --example
@@ -1174,11 +1174,15 @@ shallow_shore_probe --release` for unconditional opted-in support drainage,
 -p spall_fluid --example shallow_shore_probe --release`; its exit status covers
 both shallow flow and energy. Unset the variable for the gameplay baseline.
 
-The separate integration gate must run explicitly:
-`cargo test -p spall_fluid --lib reconstructed_support_preserves_nearly_saturated_surface_rest --release -- --ignored --nocapture`.
-It currently FAILS at step 0 (0.0083013904 m/s versus 1e-7 m/s), so support
-must remain diagnostic. An otherwise passing `cargo xtask check` excludes
-that known failure and does not authorize promotion. Existing gameplay rest
-regressions remain enabled. The original paced 512/1024 trench, reference
-scene, viewer/GPU and performance gates are still required before activation.
+The previously ignored rest gate is repaired and enabled:
+`cargo test -p spall_fluid --lib reconstructed_support_preserves_nearly_saturated_surface_rest --release -- --nocapture`.
+Eight 600-step cases pass, with peak speed 8.92e-12 m/s versus 1e-7 and maximum
+volume error 2.92e-13 m3 versus 1e-10. Existing gameplay rest regressions remain
+enabled. Test unchanged reference scenes using `cargo run -p spall_fluid
+--example phase_dynamics_probe --release -- <channel|low-dam|full-wall> 600
+water-support`. Low-dam/full-wall pass; channel FAILS at 228/600, requiring
+12 substeps versus the unchanged budget of 8. A passing workspace check does
+not authorize promotion while this explicit diagnostic gate fails. The original
+paced 512/1024 trench, viewer/GPU and performance gates remain required before
+activation. No workload, threshold, water amount or velocity cutoff was changed.
 Evidence and remaining risks: docs/reports/ENG-122.md.

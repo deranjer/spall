@@ -154,6 +154,14 @@ fn geometry(original: Option<InterfacePlane>, fraction: f64) -> Result<Cell, Mac
     );
     let mut volume = 0.0;
     let mut tetrahedra = Vec::new();
+    let extent = all
+        .iter()
+        .flat_map(|p| sub(*p, reference))
+        .map(f64::abs)
+        .fold(0.0, f64::max);
+    if extent <= 0.0 {
+        return Err(MacError::InvalidConfig);
+    }
     for patch in patches {
         if patch.points.len() < 3 {
             continue;
@@ -162,8 +170,11 @@ fn geometry(original: Option<InterfacePlane>, fraction: f64) -> Result<Cell, Mac
         for j in 1..patch.points.len() - 1 {
             let (b, c) = (patch.points[j], patch.points[j + 1]);
             let tetra = dot(
-                sub(a, reference),
-                cross(sub(b, reference), sub(c, reference)),
+                scale(sub(a, reference), 1.0 / extent),
+                cross(
+                    scale(sub(b, reference), 1.0 / extent),
+                    scale(sub(c, reference), 1.0 / extent),
+                ),
             )
             .abs()
                 / 6.0;
@@ -211,6 +222,7 @@ struct Edge {
 }
 struct Free {
     row: usize,
+    air: Option<usize>,
     axis: Option<usize>,
     face: usize,
     sign: f64,
@@ -296,6 +308,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             let u = sample_velocity(&grid.u, &grid.v, &grid.w, dims, center);
             free.push(Free {
                 row: r,
+                air: Some(indices[r]),
                 axis: None,
                 face: 0,
                 sign: 1.0,
@@ -369,35 +382,44 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                     continue;
                 };
                 let face = &cells[r].faces[axis * 2 + side];
-                let exposed = (face.area - overlap.area).max(0.0);
-                area[axis][fi] += face.area;
-                if exposed <= 0.0 {
+                let neighbour = if side == 1 { b } else { a };
+                let neighbour_row = if side == 1 { br } else { ar };
+                // Clip the exposed polygon itself. Subtracting almost equal
+                // area moments can put a tiny remainder's centroid far
+                // outside the cell and create an enormous pressure impulse.
+                let exposed = if neighbour_row.is_none() {
+                    face.clone()
+                } else if let Some(mut plane) = planes[neighbour.unwrap()] {
+                    plane.alpha += if side == 1 {
+                        plane.normal[axis]
+                    } else {
+                        -plane.normal[axis]
+                    };
+                    plane.normal = plane.normal.map(|v| -v);
+                    plane.alpha = -plane.alpha;
+                    Patch::new(clip(&face.points, plane, &mut Vec::new()))
+                } else {
+                    Patch::default()
+                };
+                area[axis][fi] += exposed.area;
+                if exposed.area <= 0.0 {
                     continue;
                 }
-                let mut shared_center = overlap.center;
-                if side == 0 {
-                    shared_center[axis] -= 1.0;
-                }
-                let center = scale(
-                    sub(
-                        scale(face.center, face.area),
-                        scale(shared_center, overlap.area),
-                    ),
-                    1.0 / exposed,
-                );
+                let center = exposed.center;
                 let local = add(sub(centers[r], cells[r].center), center);
                 free.push(Free {
                     row: r,
+                    air: if side == 1 { b } else { a },
                     axis: Some(axis),
                     face: fi,
                     sign,
-                    area: exposed,
+                    area: exposed.area,
                     distance: distance((center[axis] - cells[r].center[axis]).abs()),
                     velocity: sign * u,
                     potential: potential(local),
                 });
             }
-            area[axis][fi] -= overlap.area;
+            area[axis][fi] += overlap.area;
             known[axis][fi] = area[axis][fi] > 0.0;
         }
     }
@@ -422,108 +444,166 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     }
     let labels: Vec<_> = (0..n).map(|i| root(&mut parent, i)).collect();
     let reference = free.first().map_or(0.0, |f| f.potential);
-    let mut closed = vec![true; n];
-    for f in &free {
-        closed[labels[f.row]] = false;
-    }
-    let mut diagonal = vec![0.0; n];
-    let mut rhs = vec![0.0; n];
-    let mut flux = vec![0.0; n];
-    for e in &edges {
-        let k = e.area / e.distance / h.powi(2);
-        diagonal[e.a] += k;
-        diagonal[e.b] += k;
-        flux[e.a] += e.area * e.velocity;
-        flux[e.b] -= e.area * e.velocity;
-    }
-    for f in &free {
-        let k = f.area / f.distance / h.powi(2);
-        diagonal[f.row] += k;
-        rhs[f.row] += k * (f.potential - reference);
-        flux[f.row] += f.area * f.velocity;
-    }
-    let before = flux
-        .iter()
-        .enumerate()
-        .map(|(r, v)| v.abs() / h / grid.fraction[indices[r]])
-        .fold(0.0, f64::max);
-    for r in 0..n {
-        rhs[r] -= rho / dt / h * flux[r];
-    }
-    gauge(&mut rhs, &labels, &closed);
-    let mut phi: Vec<_> = rhs
-        .iter()
-        .zip(&diagonal)
-        .map(|(r, d)| if *d > 0.0 { r / d } else { 0.0 })
-        .collect();
-    gauge(&mut phi, &labels, &closed);
-    let mut product = vec![0.0; n];
-    apply(&phi, &diagonal, &edges, h * h, &mut product);
-    let mut residual: Vec<_> = rhs.iter().zip(&product).map(|(b, a)| b - a).collect();
-    gauge(&mut residual, &labels, &closed);
-    let initial = norm(&residual);
-    let target = grid
-        .config
-        .pressure_absolute_tolerance
-        .max(grid.config.pressure_relative_tolerance * norm(&rhs));
-    let mut z: Vec<_> = (0..n)
-        .map(|i| {
-            if diagonal[i] > 0.0 {
-                residual[i] / diagonal[i]
-            } else {
-                0.0
+    // Positive outward flow can consume only the receiving cell's actual air
+    // volume. A closing interface then has prescribed displacement flux and
+    // unknown contact pressure instead of atmospheric Dirichlet pressure.
+    // Include Cartesian patches as well as embedded caps (both sides of a gap).
+    let mut held = vec![None; free.len()];
+    let mut attempts = 0;
+    let mut total_iterations = 0;
+    let (phi, initial, final_residual, before) = loop {
+        let mut closed = vec![true; n];
+        for (j, f) in free.iter().enumerate() {
+            if held[j].is_none() {
+                closed[labels[f.row]] = false;
             }
-        })
-        .collect();
-    gauge(&mut z, &labels, &closed);
-    let mut direction = z.clone();
-    let mut rz: f64 = residual.iter().zip(&z).map(|(r, z)| r * z).sum();
-    let mut iterations = 0;
-    while norm(&residual) > target && iterations < grid.config.pressure_max_iterations {
-        apply(&direction, &diagonal, &edges, h * h, &mut product);
-        let dp: f64 = direction.iter().zip(&product).map(|(a, b)| a * b).sum();
-        if !dp.is_finite() || dp <= 0.0 {
-            return Err(MacError::MomentumInvalidState);
         }
-        let alpha = rz / dp;
+        let mut diagonal = vec![0.0; n];
+        let mut rhs = vec![0.0; n];
+        let mut flux = vec![0.0; n];
+        for e in &edges {
+            let k = e.area / e.distance / h.powi(2);
+            diagonal[e.a] += k;
+            diagonal[e.b] += k;
+            flux[e.a] += e.area * e.velocity;
+            flux[e.b] -= e.area * e.velocity;
+        }
+        for (j, f) in free.iter().enumerate() {
+            if let Some(q) = held[j] {
+                flux[f.row] += q;
+                continue;
+            }
+            let k = f.area / f.distance / h.powi(2);
+            diagonal[f.row] += k;
+            rhs[f.row] += k * (f.potential - reference);
+            flux[f.row] += f.area * f.velocity;
+        }
+        let before = flux
+            .iter()
+            .enumerate()
+            .map(|(r, v)| v.abs() / h / grid.fraction[indices[r]])
+            .fold(0.0, f64::max);
+        for r in 0..n {
+            rhs[r] -= rho / dt / h * flux[r];
+        }
+        let mut sums = vec![0.0; n];
+        let mut counts = vec![0usize; n];
+        for (r, &c) in labels.iter().enumerate() {
+            if closed[c] {
+                sums[c] += rhs[r];
+                counts[c] += 1;
+            }
+        }
+        for c in 0..n {
+            if counts[c] > 0 && (sums[c] / counts[c] as f64).abs() > 1e-7 {
+                return Err(MacError::IncompatibleEnclosedPressureRegion);
+            }
+        }
+        gauge(&mut rhs, &labels, &closed);
+        let mut phi: Vec<_> = rhs
+            .iter()
+            .zip(&diagonal)
+            .map(|(r, d)| if *d > 0.0 { r / d } else { 0.0 })
+            .collect();
+        gauge(&mut phi, &labels, &closed);
+        let mut product = vec![0.0; n];
+        apply(&phi, &diagonal, &edges, h * h, &mut product);
+        let mut residual: Vec<_> = rhs.iter().zip(&product).map(|(b, a)| b - a).collect();
+        gauge(&mut residual, &labels, &closed);
+        let initial = norm(&residual);
+        let target = grid
+            .config
+            .pressure_absolute_tolerance
+            .max(grid.config.pressure_relative_tolerance * norm(&rhs))
+            // For a full cell (no moving embedded face), pressure residual
+            // changes its amount by dt^2/rho * residual. Reserve two orders
+            // of margin inside the unchanged 1e-10 donor bound.
+            .min(1e-12 * rho / dt.powi(2));
+        let mut z: Vec<_> = (0..n)
+            .map(|i| {
+                if diagonal[i] > 0.0 {
+                    residual[i] / diagonal[i]
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        gauge(&mut z, &labels, &closed);
+        let mut direction = z.clone();
+        let mut rz: f64 = residual.iter().zip(&z).map(|(r, z)| r * z).sum();
+        let mut iterations = 0;
+        while norm(&residual) > target
+            && iterations + total_iterations < grid.config.pressure_max_iterations
+        {
+            apply(&direction, &diagonal, &edges, h * h, &mut product);
+            let dp: f64 = direction.iter().zip(&product).map(|(a, b)| a * b).sum();
+            if !dp.is_finite() || dp <= 0.0 {
+                return Err(MacError::MomentumInvalidState);
+            }
+            let alpha = rz / dp;
+            for i in 0..n {
+                phi[i] += alpha * direction[i];
+                residual[i] -= alpha * product[i];
+            }
+            gauge(&mut residual, &labels, &closed);
+            for i in 0..n {
+                z[i] = if diagonal[i] > 0.0 {
+                    residual[i] / diagonal[i]
+                } else {
+                    0.0
+                };
+            }
+            gauge(&mut z, &labels, &closed);
+            let next: f64 = residual.iter().zip(&z).map(|(a, b)| a * b).sum();
+            let beta = next / rz;
+            for i in 0..n {
+                direction[i] = z[i] + beta * direction[i];
+            }
+            rz = next;
+            iterations += 1;
+        }
+        apply(&phi, &diagonal, &edges, h * h, &mut product);
         for i in 0..n {
-            phi[i] += alpha * direction[i];
-            residual[i] -= alpha * product[i];
+            residual[i] = rhs[i] - product[i];
         }
         gauge(&mut residual, &labels, &closed);
-        for i in 0..n {
-            z[i] = if diagonal[i] > 0.0 {
-                residual[i] / diagonal[i]
-            } else {
-                0.0
+        let final_residual = norm(&residual);
+        if final_residual > target * 1.01 {
+            return Err(MacError::MomentumPressureNotConverged {
+                residual: final_residual,
+            });
+        }
+        total_iterations += iterations;
+        let mut changed = false;
+        for (j, f) in free.iter().enumerate() {
+            let Some(air) = f.air else {
+                continue;
             };
+            let q = f.area
+                * (f.velocity - dt / rho / h / f.distance * (f.potential - reference - phi[f.row]));
+            let capacity = (1.0 - grid.fraction[air]) * h / dt;
+            let constraint = if q > capacity { Some(capacity) } else { None };
+            if held[j] != constraint {
+                held[j] = constraint;
+                changed = true;
+            }
         }
-        gauge(&mut z, &labels, &closed);
-        let next: f64 = residual.iter().zip(&z).map(|(a, b)| a * b).sum();
-        let beta = next / rz;
-        for i in 0..n {
-            direction[i] = z[i] + beta * direction[i];
+        if !changed {
+            break (phi, initial, final_residual, before);
         }
-        rz = next;
-        iterations += 1;
-    }
-    apply(&phi, &diagonal, &edges, h * h, &mut product);
-    for i in 0..n {
-        residual[i] = rhs[i] - product[i];
-    }
-    gauge(&mut residual, &labels, &closed);
-    let final_residual = norm(&residual);
-    if final_residual > target * 1.01 {
-        return Err(MacError::MomentumPressureNotConverged {
-            residual: final_residual,
-        });
-    }
+        attempts += 1;
+        if attempts > 32 || total_iterations > grid.config.pressure_max_iterations {
+            return Err(MacError::MomentumPressureNotConverged {
+                residual: final_residual,
+            });
+        }
+    };
     grid.pressure_pa.fill(0.0);
     for r in 0..n {
         grid.pressure_pa[indices[r]] = phi[r] + reference - potential(centers[r]);
     }
     grid.cut_surface_flux = std::array::from_fn(|a| vec![0.0; known[a].len()]);
-    flux.fill(0.0);
+    let mut flux = vec![0.0; n];
     for e in &edges {
         let u = e.velocity - dt / rho / h / e.distance * (phi[e.b] - phi[e.a]);
         let q = e.area * u;
@@ -531,8 +611,11 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         flux[e.a] += q;
         flux[e.b] -= q;
     }
-    for f in &free {
-        let u = f.velocity - dt / rho / h / f.distance * (f.potential - reference - phi[f.row]);
+    for (j, f) in free.iter().enumerate() {
+        let u = held[j].map_or_else(
+            || f.velocity - dt / rho / h / f.distance * (f.potential - reference - phi[f.row]),
+            |q| q / f.area,
+        );
         flux[f.row] += f.area * u;
         if let Some(axis) = f.axis {
             grid.cut_surface_flux[axis][f.face] += f.sign * f.area * u * h * h;
@@ -568,7 +651,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         .map(|(r, v)| v.abs() / h / grid.fraction[indices[r]])
         .fold(0.0, f64::max);
     Ok(ProjectionStats {
-        iterations: iterations as usize,
+        iterations: total_iterations as usize,
         active_cells: n,
         residual_initial: initial,
         residual_final: final_residual,
@@ -583,8 +666,22 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
 mod tests {
     use super::*;
     #[test]
+    fn a_tiny_exposed_face_has_a_centroid_inside_its_actual_polygon() {
+        for width in [f64::EPSILON, 1e-12, 1e-6] {
+            let plane = InterfacePlane {
+                normal: [0.0, -1.0, 0.0],
+                alpha: -(1.0 - width),
+            };
+            let patch = Patch::new(clip(&square(0, 1.0), plane, &mut Vec::new()));
+            assert!(patch.area > 0.0);
+            assert!((patch.area - width).abs() <= f64::EPSILON);
+            assert!(patch.center[1] >= 1.0 - width && patch.center[1] <= 1.0);
+            assert!((patch.center[2] - 0.5).abs() < 1e-14);
+        }
+    }
+    #[test]
     fn tiny_reflected_fragments_keep_nonzero_geometric_support() {
-        for fraction in [1e-50, 1e-188, 1e-300] {
+        for fraction in [1e-50, 1e-188, 1e-300, f64::from_bits(1)] {
             for normal in [[1.0, 1.0, 1.0], [-1.0, 1.0, -1.0], [1e-102, 0.5, 0.5]] {
                 let g = geometry(
                     Some(InterfacePlane::from_fraction_resolved(normal, fraction)),

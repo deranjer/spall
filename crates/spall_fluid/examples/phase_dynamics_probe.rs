@@ -16,15 +16,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("steps must be 1..=6000".into());
     }
     let predictor = match std::env::args().nth(3).as_deref() {
-        None | Some("baseline") | Some("water-only") => false,
+        None | Some("baseline") | Some("water-only") | Some("water-support") => false,
         Some("predictor") => true,
         Some("balanced") => false,
         _ => {
-            return Err("optional mode must be baseline, predictor, balanced or water-only".into());
+            return Err(
+                "optional mode must be baseline, predictor, balanced, water-only or water-support"
+                    .into(),
+            );
         }
     };
     let balanced = std::env::args().nth(3).as_deref() == Some("balanced");
-    let water_only = std::env::args().nth(3).as_deref() == Some("water-only");
+    let cut_support = std::env::args().nth(3).as_deref() == Some("water-support");
+    let water_only = cut_support || std::env::args().nth(3).as_deref() == Some("water-only");
     let momentum = match std::env::args().nth(4).as_deref() {
         None => false,
         Some("momentum") if !water_only => true,
@@ -56,6 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         PhasePressureWorld::new(phase, config)
     }?;
+    if cut_support {
+        world.enable_cut_surface_support()?;
+    }
     if predictor {
         world.enable_pressure_predictor(
             spall_fluid::phase_graph::GraphLimits {
@@ -77,6 +84,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     let initial = world.phase().water_volume_m3();
+    println!(
+        "{{\"scenario\":\"surface_support_reference_configuration\",\"cut_surface_support\":{cut_support},\"accepted_water_momentum_transport\":{cut_support},\"water_only\":{water_only},\"fixture\":{mode:?},\"steps\":{steps},\"dt_s\":0.01}}"
+    );
     let initial_energy =
         world.solver().gravitational_potential_energy_j() + world.solver().kinetic_energy_j();
     let mut peak_energy = initial_energy;
