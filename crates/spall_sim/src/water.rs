@@ -232,6 +232,16 @@ impl WaterFrame {
     }
 }
 
+/// Cumulative reasons water time was skipped. Residency counts owner ticks;
+/// the other counters count fixed fluid steps. Observability only.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WaterSkipReasons {
+    pub busy: u64,
+    pub stale: u64,
+    pub stability: u64,
+    pub residency: u64,
+}
+
 /// Water timing and accounting from one authoritative server tick.
 #[derive(Debug, Clone, Default)]
 pub struct WaterTickMetrics {
@@ -250,9 +260,11 @@ pub struct WaterTickMetrics {
     /// Metrics of a solver step completed since the previous tick, if any.
     pub step: Option<MacStepMetrics>,
     /// Number of fixed fluid steps skipped so far, either because the stability
-    /// preflight rejected a step or because a worker fell behind. The server
-    /// tick and dt are unchanged.
+    /// preflight rejected a step, a worker fell behind, or a completed result
+    /// was stale. Residency pauses count owner ticks. Totals survive domain
+    /// growth; the server tick and dt are unchanged.
     pub skipped_ticks: u64,
+    pub skip_reasons: WaterSkipReasons,
     /// Cumulative simulated fluid time dropped, including residency pauses.
     /// Observability only.
     pub skipped_duration: Duration,
@@ -945,7 +957,32 @@ impl AuthoritativeWater {
             &grid,
             &exchange,
         ));
-        let engine = Self::make_engine(setup.execution, grid, frame, exchange, c)?;
+        let mut engine = Self::make_engine(setup.execution, grid, frame, exchange, c)?;
+        // Growing replaces the worker, but cumulative observability belongs to
+        // the region. Carry its counters without carrying any in-flight result.
+        match (&self.engine, &mut engine) {
+            (Engine::Worker(old), Engine::Worker(new)) => {
+                new.skipped_steps = old.skipped_steps;
+                new.skipped_s = old.skipped_s;
+                new.skip_reasons = old.skip_reasons;
+            }
+            (
+                Engine::Inline {
+                    skipped_ticks: ticks,
+                    skipped_s: seconds,
+                    ..
+                },
+                Engine::Inline {
+                    skipped_ticks,
+                    skipped_s,
+                    ..
+                },
+            ) => {
+                *skipped_ticks = *ticks;
+                *skipped_s = *seconds;
+            }
+            _ => unreachable!("growth preserves execution mode"),
+        }
         Ok(Self {
             setup,
             domain,
@@ -988,8 +1025,16 @@ impl AuthoritativeWater {
             trapped_volume_m3: self.grid().map_or(0.0, MacGridWorld::trapped_volume_m3),
             domain_growths: self.growths,
             growth_refused: self.growth_refused,
+            skip_reasons: match &self.engine {
+                Engine::Inline { skipped_ticks, .. } => WaterSkipReasons {
+                    stability: *skipped_ticks,
+                    ..WaterSkipReasons::default()
+                },
+                Engine::Worker(w) => w.skip_reasons,
+            },
             ..WaterTickMetrics::default()
         };
+        report.skip_reasons.residency = self.residency_skips;
         self.boundary_pending |= boundary_dirty && !std::mem::take(&mut self.boundary_current);
         self.boundary_current = false;
         // Check every domain's declared residency even while sleeping. Missing
@@ -1018,6 +1063,7 @@ impl AuthoritativeWater {
             self.boundary_pending = true;
             self.residency_skips += 1;
             self.residency_skipped_s += dt_s;
+            report.skip_reasons.residency = self.residency_skips;
             report.waiting_for_residency = true;
             report.skipped_ticks = skips + self.residency_skips;
             report.skipped_duration = Duration::from_secs_f64(skipped_s + self.residency_skipped_s);
@@ -1088,6 +1134,7 @@ impl AuthoritativeWater {
                     Err(error) => return Err(WaterError::Solver(error)),
                 }
                 report.skipped_ticks = *skipped_ticks;
+                report.skip_reasons.stability = *skipped_ticks;
                 report.skipped_duration = Duration::from_secs_f64(*skipped_s);
                 report.step_duration = started.elapsed();
                 report.frame_seq = frame.seq;
@@ -1188,6 +1235,12 @@ struct Completed {
     duration: Duration,
 }
 
+enum WorkerSkip {
+    Busy,
+    Stale,
+    Stability,
+}
+
 struct WaterWorker {
     grid: Box<MacGridWorld>,
     exchange: Exchange,
@@ -1201,6 +1254,7 @@ struct WaterWorker {
     step_dt_s: f64,
     coarsen: u32,
     skipped_steps: u64,
+    skip_reasons: WaterSkipReasons,
     skipped_s: f64,
 }
 
@@ -1249,6 +1303,7 @@ impl WaterWorker {
             step_dt_s,
             coarsen,
             skipped_steps: 0,
+            skip_reasons: WaterSkipReasons::default(),
             skipped_s: 0.0,
         })
     }
@@ -1267,7 +1322,12 @@ impl WaterWorker {
         ));
     }
 
-    fn skip(&mut self) {
+    fn skip(&mut self, reason: WorkerSkip) {
+        match reason {
+            WorkerSkip::Busy => self.skip_reasons.busy += 1,
+            WorkerSkip::Stale => self.skip_reasons.stale += 1,
+            WorkerSkip::Stability => self.skip_reasons.stability += 1,
+        }
         self.skipped_steps += 1;
         self.skipped_s += self.step_dt_s;
     }
@@ -1297,7 +1357,7 @@ impl WaterWorker {
                 if done.input.revision != self.revision
                     || done.input.rate != self.exchange.gated_rate.load(Ordering::Relaxed)
                 {
-                    self.skip();
+                    self.skip(WorkerSkip::Stale);
                 } else {
                     match done.outcome {
                         Ok(metrics) => {
@@ -1309,7 +1369,9 @@ impl WaterWorker {
                             self.exchange.gated_rate = live_rate;
                             self.publish(self.step_dt_s);
                         }
-                        Err(MacError::SubstepBudgetExceeded { .. }) => self.skip(),
+                        Err(MacError::SubstepBudgetExceeded { .. }) => {
+                            self.skip(WorkerSkip::Stability)
+                        }
                         Err(e) => return Err(WaterError::Solver(e)),
                     }
                 }
@@ -1323,7 +1385,7 @@ impl WaterWorker {
         while self.owed_s + 1e-9 >= self.step_dt_s {
             self.owed_s = (self.owed_s - self.step_dt_s).max(0.0);
             if self.in_flight {
-                self.skip();
+                self.skip(WorkerSkip::Busy);
                 continue;
             }
             let rate = self.exchange.gated_rate.load(Ordering::Relaxed);
@@ -1345,6 +1407,9 @@ impl WaterWorker {
         }
         report.frame_seq = self.frame.seq;
         report.skipped_ticks = self.skipped_steps;
+        report.skip_reasons.busy = self.skip_reasons.busy;
+        report.skip_reasons.stale = self.skip_reasons.stale;
+        report.skip_reasons.stability = self.skip_reasons.stability;
         report.skipped_duration = Duration::from_secs_f64(self.skipped_s);
         Ok(())
     }
@@ -1555,6 +1620,8 @@ mod tests {
         let metrics = water.tick(&volume, false, 1.0 / 60.0).unwrap();
         assert!(metrics.waiting_for_residency);
         assert_eq!(metrics.skipped_ticks, 1);
+        assert_eq!(metrics.skip_reasons.residency, 1);
+        assert_eq!(metrics.skip_reasons.stability, 0);
         assert_eq!(water.canonical_state(), before);
         let metrics = water.tick(&resident, false, 1.0 / 60.0).unwrap();
         assert!(metrics.step.is_some());
@@ -1594,6 +1661,56 @@ mod tests {
     }
 
     #[test]
+    fn worker_busy_and_stability_skips_preserve_committed_state() {
+        let (volume, setup) = tank();
+        let mut water = AuthoritativeWater::new(&volume, setup.on_worker(0.05)).unwrap();
+        let before = water.canonical_state();
+        let Engine::Worker(worker) = &mut water.engine else {
+            panic!("worker");
+        };
+        let input = Advance {
+            grid: (*worker.grid).clone(),
+            exchange: worker.exchange.clone(),
+            revision: worker.revision,
+            rate: 0,
+            dt_s: 0.05,
+        };
+        let (send, recv) = mpsc::sync_channel(1);
+        worker.completed = recv;
+        worker.in_flight = true;
+        let mut report = WaterTickMetrics::default();
+        worker.advance(0.1, None, &mut report).unwrap();
+        assert_eq!(report.skip_reasons.busy, 2);
+        assert_eq!(report.skip_reasons.stale + report.skip_reasons.stability, 0);
+        send.send(Completed {
+            input,
+            outcome: Err(MacError::SubstepBudgetExceeded {
+                required: 9,
+                maximum: 8,
+            }),
+            duration: Duration::ZERO,
+        })
+        .unwrap();
+        worker.advance(0.001, None, &mut report).unwrap();
+        assert_eq!(report.skipped_ticks, 3);
+        assert_eq!(report.skip_reasons.busy, 2);
+        assert_eq!(report.skip_reasons.stability, 1);
+        assert_eq!(report.skip_reasons.stale, 0);
+        assert_eq!(report.skipped_duration, Duration::from_secs_f64(0.05 * 3.0));
+        assert_eq!(worker.frame.fluid_time_s, 0.0);
+        assert_eq!(water.canonical_state(), before);
+        let domain = DomainSpec::new(GlobalCell::new(0, 0, 0), [20, 8, 12], 10_000).unwrap();
+        let mut grown = water.grown(&volume, domain).unwrap();
+        let after_growth = grown.tick(&volume, false, 0.001).unwrap();
+        assert_eq!(after_growth.skipped_ticks, report.skipped_ticks);
+        assert_eq!(after_growth.skipped_duration, report.skipped_duration);
+        assert_eq!(after_growth.skip_reasons.busy, 2);
+        assert_eq!(after_growth.skip_reasons.stability, 1);
+        assert_eq!(grown.frame().fluid_time_s, 0.0);
+        assert_eq!(grown.frame().volume_m3, water.frame().volume_m3);
+    }
+
+    #[test]
     fn stale_worker_result_cannot_overwrite_a_placement_or_trapped_ledger() {
         let (mut volume, setup) = tank();
         let mut water = AuthoritativeWater::new(&volume, setup.on_worker(1.0 / 30.0)).unwrap();
@@ -1623,6 +1740,8 @@ mod tests {
         volume.apply_edit(&edit).unwrap();
         let report = water.tick(&volume, true, 1.0 / 60.0).unwrap();
         assert_eq!(report.skipped_ticks, 1);
+        assert_eq!(report.skip_reasons.stale, 1);
+        assert_eq!(report.skip_reasons.busy + report.skip_reasons.stability, 0);
         assert_eq!(water.grid().unwrap().fraction_at(cell), Some(0.0));
         assert!((water.frame().volume_m3 - initial).abs() < 1e-12);
         assert_eq!(water.frame().fluid_time_s, 0.0);
@@ -1630,6 +1749,8 @@ mod tests {
         let paused = water.tick(&volume, false, 1.0 / 60.0).unwrap();
         assert!(paused.waiting_for_residency);
         assert_eq!(paused.skipped_ticks, 2, "preserve earlier stale-job skips");
+        assert_eq!(paused.skip_reasons.stale, 1);
+        assert_eq!(paused.skip_reasons.residency, 1);
         assert!(paused.skipped_duration.as_secs_f64() >= 1.0 / 30.0);
     }
 }

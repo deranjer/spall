@@ -1,0 +1,17 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+   Compiling spall_sim v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 7.70s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\release\deps\spall_sim-5179144218a3a1cf.exe)
+
+running 9 tests
+test water::tests::coarse_seed_preserves_authored_volume_and_frames_quantize_it ... ok
+test water::tests::stale_worker_result_cannot_overwrite_a_placement_or_trapped_ledger ... ok
+test water::tests::worker_busy_and_stability_skips_preserve_committed_state ... ok
+test water::tests::unknown_residency_suspends_without_guessing_and_resumes_conservatively ... ok
+test water::tests::springs_add_and_drains_remove_accounted_volume ... ok
+test water::tests::gated_source_only_fills_once_a_rate_is_selected ... ok
+test water::tests::a_higher_gated_source_rate_fills_faster ... ok
+test water::tests::worker_advances_on_its_own_thread_and_conserves_volume ... ok
+test water::tests::quiet_water_sleeps_and_a_committed_boundary_wakes_it ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 0.02s

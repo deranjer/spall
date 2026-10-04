@@ -69,6 +69,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut committed, mut rejected, mut nonconverged) = (0, 0, 0);
     let mut hammer_committed = 0;
     let (mut rows, mut iterations, mut skipped, mut skipped_s) = (0, 0, 0, 0.0);
+    let mut skip_reasons = Default::default();
+    let mut stages = Vec::new();
     let mut growths = 0;
     let mut growth_refused = 0;
     let mut accepted_ticks = 0;
@@ -117,10 +119,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 growths = m.domain_growths;
             }
             skipped = m.skipped_ticks;
+            skip_reasons = m.skip_reasons;
             growth_refused = m.growth_refused;
             skipped_s = m.skipped_duration.as_secs_f64();
             if let Some(step) = m.step {
                 step_times.push(m.step_duration.as_micros() as u64);
+                stages.push([
+                    step.velocity_advection_micros,
+                    step.pressure_solve_micros,
+                    step.transport_micros,
+                    step.boundary_micros,
+                    u64::from(step.substeps),
+                ]);
                 rows += step.pressure_active_rows_total;
                 iterations += step.pressure_iterations;
                 nonconverged += u64::from(step.substeps - step.pressure_converged_substeps);
@@ -173,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let crossed = downstream > 1e-9;
     // Outside the measured paced run, check the next step on an immutable
-    // shadow. Busy/stale/stability skips share a counter; a stalled final
+    // shadow. Skip causes are also reported; a stalled final
     // state must not earn stability acceptance just because it once flowed.
     let mut shadow = water.grid().ok_or("missing committed water grid")?.clone();
     let final_face_speed = shadow.max_face_component_velocity_m_s();
@@ -185,6 +195,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .is_ok_and(|m| m.pressure_converged_substeps == m.substeps);
     let percentile = |v: &[u64], p: usize| v.get(v.len().saturating_sub(1) * p / 100).copied();
+    let stage_profile: Vec<_> = [
+        "velocity_advection",
+        "pressure",
+        "transport",
+        "boundary",
+        "substeps",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, name)| {
+        let mut values: Vec<u64> = stages.iter().map(|s| s[i]).collect();
+        values.sort_unstable();
+        serde_json::json!({"stage": name, "sum": values.iter().sum::<u64>(),
+                "median": percentile(&values, 50), "p95": percentile(&values, 95)})
+    })
+    .collect();
     println!(
         "{}",
         serde_json::json!({
@@ -200,6 +226,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "solver_steps":step_times.len(),"step_median_us":percentile(&step_times,50),"step_p95_us":percentile(&step_times,95),"step_max_us":step_times.last(),
             "tick_median_us":percentile(&tick_times,50),"tick_p95_us":percentile(&tick_times,95),"tick_max_us":tick_times.last(),
             "growths":growths,"growth_tick_us":growth_ticks,"growth_refused":growth_refused,
+            "skip_reasons":{"busy":skip_reasons.busy,"stale":skip_reasons.stale,"stability":skip_reasons.stability,"residency":skip_reasons.residency},
+            "stage_profile_us_except_substeps":stage_profile,
             "skipped_steps":skipped,"skipped_fluid_s":skipped_s,"nonconverged_substeps":nonconverged,
             "pressure_rows_total":rows,"pressure_iterations_total":iterations,"water_past_old_edge_m3":downstream,
             "initial_accounted_water_m3":initial,"water_error_m3":accounting(&sim)-initial,"seed_report":format!("{seed:?}"),

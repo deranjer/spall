@@ -1205,3 +1205,17 @@ workspace check and these motion passes do not authorize gameplay promotion whil
 local momentum accuracy and complete memory/performance acceptance remain open.
 No workload, threshold, water amount or velocity cutoff was changed.
 Evidence and remaining risks: docs/reports/ENG-122.md.
+
+### ENG-122 worker profile (2026-10-04)
+
+The unchanged paced trench example also emits `skip_reasons` and stage timing
+sums/medians/p95s over accepted worker steps. `busy`, `stale` and `stability`
+count skipped fixed fluid steps; `residency` counts paused owner ticks. Totals
+survive growth. Stage timings are microseconds except the explicitly labeled
+substep entry. Counters are observability, not relaxed motion gates. Controlled
+worker tests cover busy/stability rejection, unchanged committed state, growth
+carry-over, stale placement/ledger protection and residency accumulation.
+Closed gauge tests cover independent offsets, component means, tiny values,
+preserved pressure differences and untouched open rows. The original final
+50 ms shadow advance, flow/conservation/rest/energy gates remain required.
+See reports/ENG-122.md and ENG-122-worker-profile-* for final evidence.

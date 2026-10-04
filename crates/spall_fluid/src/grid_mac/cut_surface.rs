@@ -234,21 +234,38 @@ fn root(parent: &mut [usize], mut i: usize) -> usize {
     }
     i
 }
-fn gauge(v: &mut [f64], labels: &[usize], closed: &[bool]) {
-    let mut sum = vec![0.0; v.len()];
-    let mut count = vec![0usize; v.len()];
-    for (i, &c) in labels.iter().enumerate() {
-        if closed[c] {
-            sum[c] += v[i];
-            count[c] += 1;
+// Component membership changes only when the contact active set changes.
+// Open rows have a physical pressure boundary and require no gauge work.
+struct Gauge {
+    closed_rows: Vec<Vec<usize>>,
+}
+impl Gauge {
+    fn new(labels: &[usize], closed: &[bool]) -> Self {
+        let mut groups = vec![Vec::new(); labels.len()];
+        for (i, &c) in labels.iter().enumerate() {
+            if closed[c] {
+                groups[c].push(i);
+            }
+        }
+        Self {
+            closed_rows: groups.into_iter().filter(|g| !g.is_empty()).collect(),
         }
     }
-    for (i, &c) in labels.iter().enumerate() {
-        if closed[c] {
-            v[i] -= sum[c] / count[c] as f64;
+    fn apply(&self, v: &mut [f64]) {
+        for rows in &self.closed_rows {
+            // Preserve the original row order and arithmetic for each mean.
+            let mut sum = 0.0;
+            for &i in rows {
+                sum += v[i];
+            }
+            let mean = sum / rows.len() as f64;
+            for &i in rows {
+                v[i] -= mean;
+            }
         }
     }
 }
+
 fn apply(x: &[f64], diagonal: &[f64], edges: &[Edge], h2: f64, out: &mut [f64]) {
     for i in 0..x.len() {
         out[i] = diagonal[i] * x[i];
@@ -555,18 +572,19 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 return Err(MacError::IncompatibleEnclosedPressureRegion);
             }
         }
-        gauge(&mut rhs, &labels, &closed);
+        let gauge = Gauge::new(&labels, &closed);
+        gauge.apply(&mut rhs);
         let mut phi: Vec<_> = warm.take().unwrap_or_else(|| {
             rhs.iter()
                 .zip(&diagonal)
                 .map(|(r, d)| if *d > 0.0 { r / d } else { 0.0 })
                 .collect()
         });
-        gauge(&mut phi, &labels, &closed);
+        gauge.apply(&mut phi);
         let mut product = vec![0.0; n];
         apply(&phi, &diagonal, &edges, h * h, &mut product);
         let mut residual: Vec<_> = rhs.iter().zip(&product).map(|(b, a)| b - a).collect();
-        gauge(&mut residual, &labels, &closed);
+        gauge.apply(&mut residual);
         let initial = norm(&residual);
         let target = grid
             .config
@@ -578,7 +596,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             .min(1e-12 * rho / dt.powi(2));
         let mut z = vec![0.0; n];
         precondition(&residual, &diagonal, &lower, &upper, &mut z);
-        gauge(&mut z, &labels, &closed);
+        gauge.apply(&mut z);
         let mut direction = z.clone();
         let mut rz: f64 = residual.iter().zip(&z).map(|(r, z)| r * z).sum();
         // A tiny row can satisfy the global flux norm while retaining a large
@@ -605,14 +623,14 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 for i in 0..n {
                     phi[i] += z[i];
                 }
-                gauge(&mut phi, &labels, &closed);
+                gauge.apply(&mut phi);
                 apply(&phi, &diagonal, &edges, h * h, &mut product);
                 for i in 0..n {
                     residual[i] = rhs[i] - product[i];
                 }
-                gauge(&mut residual, &labels, &closed);
+                gauge.apply(&mut residual);
                 precondition(&residual, &diagonal, &lower, &upper, &mut z);
-                gauge(&mut z, &labels, &closed);
+                gauge.apply(&mut z);
                 direction.copy_from_slice(&z);
                 rz = residual.iter().zip(&z).map(|(r, z)| r * z).sum();
                 iterations += 1;
@@ -628,7 +646,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 phi[i] += alpha * direction[i];
                 residual[i] -= alpha * product[i];
             }
-            gauge(&mut residual, &labels, &closed);
+            gauge.apply(&mut residual);
             // Recursive CG residuals can lose the remaining correction through
             // cancellation. Verify apparent convergence against the actual
             // operator and restart from that residual within the same budget.
@@ -638,10 +656,10 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 for i in 0..n {
                     residual[i] = rhs[i] - product[i];
                 }
-                gauge(&mut residual, &labels, &closed);
+                gauge.apply(&mut residual);
             }
             precondition(&residual, &diagonal, &lower, &upper, &mut z);
-            gauge(&mut z, &labels, &closed);
+            gauge.apply(&mut z);
             let next: f64 = residual.iter().zip(&z).map(|(a, b)| a * b).sum();
             let beta = if reliable { 0.0 } else { next / rz };
             for i in 0..n {
@@ -654,7 +672,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         for i in 0..n {
             residual[i] = rhs[i] - product[i];
         }
-        gauge(&mut residual, &labels, &closed);
+        gauge.apply(&mut residual);
         let final_residual = norm(&residual);
         if final_residual > target * 1.01 || !locally_converged(&residual) {
             return Err(MacError::MomentumPressureNotConverged {
@@ -838,6 +856,29 @@ pub(super) fn transport_velocity(
 mod tests {
     use super::*;
     #[test]
+    fn disconnected_closed_gauges_preserve_open_pressure_and_row_differences() {
+        let labels = [0, 1, 0, 3, 1, 3, 6];
+        let gauge = Gauge::new(&labels, &[true, false, false, true, false, false, true]);
+        let initial = [3.0, -7.0, 9.0, 1e-120, 1e300, 3e-120, 42.0];
+        let mut projected = initial;
+        gauge.apply(&mut projected);
+        assert_eq!(projected[1].to_bits(), initial[1].to_bits());
+        assert_eq!(projected[4].to_bits(), initial[4].to_bits());
+        assert_eq!(projected[0] + projected[2], 0.0);
+        assert!((projected[3] + projected[5]).abs() < 1e-135);
+        assert_eq!(projected[6], 0.0);
+        assert_eq!(projected[2] - projected[0], initial[2] - initial[0]);
+        assert!(((projected[5] - projected[3]) / (initial[5] - initial[3]) - 1.0).abs() < 1e-15);
+        // Independent component offsets must leave the same pressure solution.
+        let mut shifted = initial;
+        shifted[0] += 100.0;
+        shifted[2] += 100.0;
+        shifted[6] -= 9.0;
+        gauge.apply(&mut shifted);
+        assert_eq!(projected, shifted);
+    }
+
+    #[test]
     fn tiny_fragment_pressure_guess_cannot_create_motion_without_forces() {
         use crate::{DomainSpec, SolidBoundary};
         use spall_core::GlobalCell;
@@ -931,8 +972,8 @@ mod tests {
             let mut py = [0.0; 4];
             precondition(&x, &diagonal, &lower, &upper, &mut px);
             precondition(&y, &diagonal, &lower, &upper, &mut py);
-            gauge(&mut px, &[0, 0, 0, 3], &[true, false, false, true]);
-            gauge(&mut py, &[0, 0, 0, 3], &[true, false, false, true]);
+            Gauge::new(&[0, 0, 0, 3], &[true, false, false, true]).apply(&mut px);
+            Gauge::new(&[0, 0, 0, 3], &[true, false, false, true]).apply(&mut py);
             let inner =
                 |a: &[f64; 4], b: &[f64; 4]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f64>();
             let xy = inner(&x, &py);

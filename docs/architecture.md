@@ -426,3 +426,18 @@ time and repeated 512 runs at about 0.54x. The 512 performance, full transient
 memory and local momentum-accuracy gates remain open. No default promotion
 follows from the passing motion gates. See docs/reports/ENG-122.md for the
 regularized inertia, unchanged gates and precise integration blocker.
+
+### ENG-122 worker observability and pressure gauge reuse (2026-10-04)
+
+Water tick metrics distinguish fixed-step skips for a busy worker, a stale
+revision/rate result, and a stability-budget rejection; residency pauses count
+owner ticks separately. Their totals survive replacement during domain growth.
+These counters change no scheduling, revision validation or step acceptance.
+The reconstructed diagnostic pressure solve builds closed-component row lists
+once per contact active set. Gauge applications reuse those lists, preserve
+per-component row summation order, and leave atmospheric/open rows untouched.
+The first matched 512 profile spends similar accepted-step time in pressure and
+transport and shows no stability rejections. This allocation reduction does not
+establish a meaningful speedup or full memory acceptance. Transport profiling
+is the next ENG-122 item; gameplay backend and numerical limits are unchanged.
+See docs/reports/ENG-122.md for final runs and checks.
