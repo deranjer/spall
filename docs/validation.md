@@ -15,8 +15,11 @@ or `-- 1024`; the latter currently exits 1 for the failed flow check. Exact
 workload, limits and raw evidence are in `docs/reports/ENG-122.md`.
 
 The shallow-shore probe now records mechanical-energy growth and includes a
-wider partial-layer rest gate. Both baseline drainage and that rest gate were
-run explicitly and fail; ordinary example tests mark those two gates ignored.
+wider partial-layer rest gate. The rest gate now passes normally after the
+atmospheric surface-distance correction; only shallow drainage remains a
+known failing ignored gate. Four 600-step analytical cases at two resolutions
+and time steps also verify pressure, rest and conservation with nearly full
+bulk cells. The new regression fails against the original distance lookup.
 `SHALLOW_SHORE_FILMS=1` selects a diagnostic closure with zero-air accepted-
 transfer momentum. It still fails rest, energy and the unchanged stability
 budget, and is not a gameplay default. Run all its gates with

@@ -38,6 +38,10 @@ including enclosed pockets, and no mass, compression or back-pressure. The
 pressure system contains liquid pressure samples only; water in partial cells
 remains in conservative transport. Three layers of extrapolated water velocity
 support surface transport. Legacy two-phase models remain explicit experiments.
+Atmospheric pressure distances use a valid intersection in the air-centred
+cell first, then a validated wet-cell fallback. Matrix assembly and velocity
+correction share that distance; tiny bulk fraction deficits do not select a
+different boundary or change canonical water amounts.
 Construction, domain growth and canonical recovery use the same water-only
 policy. Canonical water amount/trapped ledgers and their versioned wire format
 are unchanged; loading an older save uses the current numerical policy (air
@@ -50,7 +54,8 @@ explicit diagnostic opt-in only (`set_experimental_surface_films`). They fail
 energy, stability and partial-layer rest gates and are not selected by any
 gameplay constructor, growth or recovery path. Its half-cell inertia support
 does not yet match reconstructed liquid geometry. The existing water-only
-policy also has unresolved shallow drainage and wider-pool rest failures;
+policy still has unresolved shallow drainage. Its wider-pool rest failure was
+repaired by the atmospheric surface-distance correction;
 see `docs/reports/ENG-122.md` before treating numerical check success as
 hydraulic acceptance.
 

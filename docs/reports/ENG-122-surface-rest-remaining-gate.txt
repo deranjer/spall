@@ -1,0 +1,22 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.90s
+     Running unittests examples\shallow_shore_probe.rs (G:/Programming/voxel_engine/target\debug\examples\shallow_shore_probe-0732c17d39996588.exe)
+
+running 1 test
+test tests::shallow_water_must_drain_into_the_open_lower_trench ... FAILED
+
+failures:
+
+---- tests::shallow_water_must_drain_into_the_open_lower_trench stdout ----
+
+thread 'tests::shallow_water_must_drain_into_the_open_lower_trench' (37828) panicked at crates\spall_fluid\examples\shallow_shore_probe.rs:218:9:
+shallow water froze: downstream=0, pressure rows=0, speed=0, bit-identical=true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::shallow_water_must_drain_into_the_open_lower_trench
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.56s
+
+error: test failed, to rerun pass `-p spall_fluid --example shallow_shore_probe`

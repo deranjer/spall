@@ -241,7 +241,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "ENG-122 newly exposed long-duration partial-layer rest failure; run explicitly"]
     fn hydrostatic_partial_layer_over_deeper_water_stays_at_rest() {
         let mut grid = fixture_with_geometry(0.2, true, true, false).unwrap();
         for z in 0..2 {
@@ -251,8 +250,10 @@ mod tests {
             }
         }
         let mass = grid.water_volume_m3();
+        let mut peak_speed = 0.0_f64;
         for step in 0..600 {
             grid.step(0.05).unwrap();
+            peak_speed = peak_speed.max(grid.max_face_component_velocity_m_s());
             assert!(
                 grid.max_face_component_velocity_m_s() < 1e-7,
                 "step={step}, speed={}, energy={}, mass_error={}",
@@ -262,5 +263,9 @@ mod tests {
             );
             assert!((grid.water_volume_m3() - mass).abs() < 1e-10);
         }
+        println!(
+            "{{\"scenario\":\"wide_partial_layer_rest\",\"steps\":600,\"dt_s\":0.05,\"peak_speed_m_s\":{peak_speed},\"water_error_m3\":{}}}",
+            grid.water_volume_m3() - mass
+        );
     }
 }

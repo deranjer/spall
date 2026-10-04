@@ -2436,10 +2436,17 @@ impl MacGridWorld {
                 None
             }
         };
-        let theta = planes[wet]
-            .and_then(|p| intersection(p, 0.0))
-            .or_else(|| planes[dry].and_then(|p| intersection(p, 1.0)))
-            .filter(|t| t.is_finite() && *t >= 0.0 && *t <= 1.0)
+        let valid = |t: &f64| t.is_finite() && *t >= 0.0 && *t <= 1.0;
+        // The air-centred cell describes the atmospheric boundary seen from
+        // this pressure segment. A nearly saturated wet cell can also acquire
+        // a PLIC plane through roundoff; that internal reconstruction must not
+        // replace the surface on the air side. Reject each invalid candidate
+        // before falling back, so one out-of-segment plane cannot mask the
+        // other cell's valid boundary.
+        let theta = planes[dry]
+            .and_then(|p| intersection(p, 1.0))
+            .filter(valid)
+            .or_else(|| planes[wet].and_then(|p| intersection(p, 0.0)).filter(valid))
             .unwrap_or(0.5);
         1.0 / theta.max(0.01)
     }
@@ -5627,6 +5634,61 @@ mod tests {
                 grid.config.density_kg_m3 * 9.81 * grid.config.cell_size_m * (surface_y - sample_y);
             assert!((grid.pressure_pa[rows as usize - 1] - expected).abs() < 1e-5);
             assert!(grid.fraction[3] > 0.0, "air-centred water was discarded");
+        }
+    }
+
+    #[test]
+    fn atmospheric_surface_pressure_is_stable_with_nearly_saturated_neighbours() {
+        for h in [0.5, 1.0] {
+            for dt in [0.025, 0.05] {
+                let mut grid = all_air_grid(
+                    [12, 6, 2],
+                    MacConfig {
+                        cell_size_m: h,
+                        ..MacConfig::default()
+                    },
+                );
+                grid.set_pressure_preconditioner(PressurePreconditioner::Multigrid);
+                grid.set_freely_displaced_air().unwrap();
+                for z in 0..2 {
+                    for x in 0..12 {
+                        // Keep the actual tiny deficits. No snapping to one or
+                        // liquid-volume adjustment is part of the correction.
+                        let full = if (x + z) % 2 == 0 {
+                            1.0
+                        } else {
+                            1.0 - f64::EPSILON
+                        };
+                        grid.set_fraction(GlobalCell::new(x, 0, z), full).unwrap();
+                        grid.set_fraction(GlobalCell::new(x, 1, z), 0.25).unwrap();
+                    }
+                }
+                let mass = grid.water_volume_m3();
+                let expected_pressure = 1000.0 * 9.81 * h * 0.75;
+                let (mut peak_speed, mut peak_pressure_error) = (0.0_f64, 0.0_f64);
+                for _ in 0..600 {
+                    let step = grid.step(dt).unwrap();
+                    assert_eq!(step.pressure_converged_substeps, step.substeps);
+                    peak_speed = peak_speed.max(grid.max_face_component_velocity_m_s());
+                    assert!(peak_speed < 1e-7, "h={h}, dt={dt}, speed={peak_speed}");
+                    assert!((grid.water_volume_m3() - mass).abs() < 1e-10);
+                    for z in 0..2 {
+                        for x in 0..12 {
+                            let i = grid.cell_index(x, 0, z);
+                            peak_pressure_error = peak_pressure_error
+                                .max((grid.pressure_pa[i] - expected_pressure).abs());
+                        }
+                    }
+                    assert!(
+                        peak_pressure_error < 1e-5,
+                        "pressure error={peak_pressure_error}"
+                    );
+                }
+                println!(
+                    "{{\"scenario\":\"nearly_saturated_surface_rest\",\"h_m\":{h},\"dt_s\":{dt},\"steps\":600,\"peak_speed_m_s\":{peak_speed},\"peak_pressure_error_pa\":{peak_pressure_error},\"water_error_m3\":{}}}",
+                    grid.water_volume_m3() - mass
+                );
+            }
         }
     }
 

@@ -1,0 +1,13 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.18s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\debug\deps\spall_fluid-f74cc782aa423cc5.exe)
+
+running 1 test
+{"scenario":"nearly_saturated_surface_rest","h_m":0.5,"dt_s":0.025,"steps":600,"peak_speed_m_s":0.00000000000006902811655606911,"peak_pressure_error_pa":0.000000000544787326361984,"water_error_m3":-0.000000000000007549516567451064}
+{"scenario":"nearly_saturated_surface_rest","h_m":0.5,"dt_s":0.05,"steps":600,"peak_speed_m_s":0.00000000000013489209749195652,"peak_pressure_error_pa":0.0000000005238689482212067,"water_error_m3":-0.000000000000003552713678800501}
+{"scenario":"nearly_saturated_surface_rest","h_m":1,"dt_s":0.025,"steps":600,"peak_speed_m_s":0.00000000000015112910922709943,"peak_pressure_error_pa":0.0000000023992470232769847,"water_error_m3":-0.00000000000012434497875801753}
+{"scenario":"nearly_saturated_surface_rest","h_m":1,"dt_s":0.05,"steps":600,"peak_speed_m_s":0.00000000000027422508708241367,"peak_pressure_error_pa":0.0000000022100721253082156,"water_error_m3":-0.00000000000004263256414560601}
+test grid_mac::tests::atmospheric_surface_pressure_is_stable_with_nearly_saturated_neighbours ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 68 filtered out; finished in 2.32s
+

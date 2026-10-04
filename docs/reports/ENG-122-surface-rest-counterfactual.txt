@@ -1,0 +1,19 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.75s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\debug\deps\spall_fluid-f74cc782aa423cc5.exe)
+
+running 1 test
+
+thread 'grid_mac::tests::atmospheric_surface_pressure_is_stable_with_nearly_saturated_neighbours' (37176) panicked at crates\spall_fluid\src\grid_mac.rs:5673:21:
+h=0.5, dt=0.025, speed=0.016892457024009794
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test grid_mac::tests::atmospheric_surface_pressure_is_stable_with_nearly_saturated_neighbours ... FAILED
+
+failures:
+
+failures:
+    grid_mac::tests::atmospheric_surface_pressure_is_stable_with_nearly_saturated_neighbours
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p spall_fluid --lib`
