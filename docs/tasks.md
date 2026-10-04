@@ -1260,3 +1260,19 @@ paced1024 trench passes:5.130528m3 beyond old edge,0.8908x realtime. 512 flows
 Keep diagnostic/in_progress and gameplay default unchanged. Next unblocked
 ENG-122: reproduce/fix edited-worker dry-face velocity and boundary invalidation,
 then rerun unchanged gates. Exact files/checks/risks in reports/ENG-122.md.
+### ENG-122 unchanged-boundary and subnormal reconstruction checkpoint (2026-10-04)
+No-op boundary commits/refreshes preserve corrected predictor and pressure;
+actual geometry changes still invalidate them, trapped-water release and owner
+revision validation remain intact. Small shelf/trench compares600steps exactly
+against uninterrupted dynamics. Extracted512fragment C=f64::from_bits(7) exposed
+quadratic-offset and centroid determinant underflow; scaled analytic offset and
+per-axis tetrahedron normalization fix it without deletion/cutoffs. Diagnostic
+pressure now uses symmetric Gauss-Seidel CG on the same graph and verifies
+apparent convergence against the true residual within the original400budget.
+81fluid tests, shallow6gates and channel600steps pass (peak5.2316m/s). Final-source
+1024trench passes5.129372m3past old edge at0.8904x realtime;512stillFAILS final50ms
+step (10substeps vs8), stalls27.1s despite retained predictor being present.
+Keep diagnostic/in_progress and default unchanged. Next unblockedENG-122:
+extract/reproduce actual wet-face donor and pressure correction driving the
+512Cartesian/extension velocity spike. Full checks/risks/evidence in reports/ENG-122.md.
+Full cargo xtask check passed:1195passed/0failed/63ignored, strict Clippy and formatting included.

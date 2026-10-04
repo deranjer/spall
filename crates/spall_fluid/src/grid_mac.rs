@@ -448,7 +448,8 @@ impl MacGridWorld {
     /// ENG-122 reconstructed liquid support diagnostic. Small drainage and
     /// energy, nearly saturated rest and reference motion gates pass. Generated
     /// trench flow passes, but 512 still exceeds the substep budget. This is
-    /// not an accepted gameplay policy and does not use the legacy MG solver.
+    /// not an accepted gameplay policy; it uses symmetric Gauss-Seidel CG,
+    /// independently of the legacy MG solver.
     pub fn set_cut_surface_support(&mut self) -> Result<(), MacError> {
         if !self.freely_displaced_air || self.experimental_surface_films {
             return Err(MacError::InvalidConfig);
@@ -1066,6 +1067,9 @@ impl MacGridWorld {
         if prepared.len() != self.solid.len() {
             return Err(MacError::BoundaryMismatch);
         }
+        if prepared == self.solid {
+            return Ok(());
+        }
         self.solid = prepared;
         self.cut_surface_velocity = std::array::from_fn(|_| Vec::new());
         self.pressure_pa.fill(0.0);
@@ -1135,6 +1139,12 @@ impl MacGridWorld {
             }
         }
 
+        // A terrain revision can change fine voxels without changing this
+        // coarsened fluid boundary. Preserve valid dynamic reconstruction and
+        // pressure in that case. Trapped water still needs its release attempt.
+        if candidate_solid == self.solid && displaced.is_empty() {
+            return Ok(0.0);
+        }
         let mut visited = vec![false; self.solid.len()];
         let mut queue = VecDeque::new();
         let neighbor_cells = |cell: GlobalCell| {
@@ -3707,7 +3717,11 @@ impl InterfacePlane {
                 };
             }
             if b > 0.0 {
-                let quadratic = 0.5 * (c + (8.0 * a * b * fraction - c * c / 3.0).max(0.0).sqrt());
+                // Form the square root before products can underflow for a
+                // tiny anisotropic wedge. Subtract c^2 in the scaled domain.
+                let root = (0.5 * (8.0_f64.ln() + a.ln() + b.ln() + fraction.ln())).exp();
+                let ratio = c / root / 3.0_f64.sqrt();
+                let quadratic = 0.5 * (c + root * (1.0 - ratio * ratio).max(0.0).sqrt());
                 if quadratic >= c && quadratic <= b {
                     return Self {
                         normal,
@@ -6687,7 +6701,7 @@ mod tests {
         let mut grid = all_air_grid([2, 1, 1], quiet_config(false));
         grid.pressure_pa.copy_from_slice(&[3.0, -3.0]);
         grid.previous_liquid.fill(true);
-        grid.commit_boundary(vec![false; 2]).unwrap();
+        grid.commit_boundary(vec![false, true]).unwrap();
         assert_eq!(grid.pressure_pa, vec![0.0, 0.0]);
         assert_eq!(grid.previous_liquid, vec![false, false]);
     }

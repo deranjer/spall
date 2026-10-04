@@ -399,7 +399,9 @@ channel pass. Embedded normal corrections now survive between steps in a
 derived cell velocity, transported with the exact accepted water transfers
 using the same convex water-only upwind solve as momentum. Full-cell samples
 come from corrected Cartesian velocities; initialization uses liquid centroids.
-Boundary commits invalidate this derived state. It is not additional fluid
+Actual boundary changes invalidate this derived state. Identical boundaries
+preserve the predictor and pressure; trapped-water release still runs when
+needed. Worker revisions continue to reject stale jobs. It is not additional fluid
 mass, a second physical momentum ledger or canonical save state. The existing
 paired path repair runs before low-order predictor validation as well as after
 FCT. Previous physical pressure seeds reduced-potential CG, including active-set
@@ -409,7 +411,11 @@ resolves nearly full cells. Embedded and exposed Cartesian closing interfaces
 use bounded displacement flux with unknown contact pressure instead of
 unconditional atmospheric pressure. Actual exposed polygons determine their
 centroids. This bounded active-set prototype is not full dynamic acceptance.
-The diagnostic uses Jacobi CG, not the selected legacy multigrid solver.
+The diagnostic uses symmetric Gauss-Seidel preconditioned CG on the actual
+liquid graph, independently of legacy multigrid. Apparent convergence is checked
+against the true matrix residual; additional correction uses the remaining
+original budget. Anisotropic subnormal wedges use a scaled analytic offset and
+per-axis normalized centroid weights, without deleting positive fragments.
 Retained flux and three cell-velocity arrays are counted and budget checked.
 Whole transient geometry/RSS remains unmeasured. Original paced trenches now
 flow in both sizes: 1024 passes the final-state advance gate at 0.89x real time;

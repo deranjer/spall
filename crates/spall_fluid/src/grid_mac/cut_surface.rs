@@ -154,14 +154,18 @@ fn geometry(original: Option<InterfacePlane>, fraction: f64) -> Result<Cell, Mac
     );
     let mut volume = 0.0;
     let mut tetrahedra = Vec::new();
-    let extent = all
-        .iter()
-        .flat_map(|p| sub(*p, reference))
-        .map(f64::abs)
-        .fold(0.0, f64::max);
-    if extent <= 0.0 {
+    // Normalize each axis independently before computing tetrahedron weights.
+    // A single largest extent leaves a subnormal slab's determinant underflowing.
+    // All weights share the same affine determinant, so centroids are unchanged.
+    let extent: Point = std::array::from_fn(|a| {
+        all.iter()
+            .map(|p| (p[a] - reference[a]).abs())
+            .fold(0.0, f64::max)
+    });
+    if extent.iter().any(|v| *v <= 0.0) {
         return Err(MacError::InvalidConfig);
     }
+    let normalized = |p: Point| std::array::from_fn(|a| (p[a] - reference[a]) / extent[a]);
     for patch in patches {
         if patch.points.len() < 3 {
             continue;
@@ -169,15 +173,7 @@ fn geometry(original: Option<InterfacePlane>, fraction: f64) -> Result<Cell, Mac
         let a = patch.points[0];
         for j in 1..patch.points.len() - 1 {
             let (b, c) = (patch.points[j], patch.points[j + 1]);
-            let tetra = dot(
-                scale(sub(a, reference), 1.0 / extent),
-                cross(
-                    scale(sub(b, reference), 1.0 / extent),
-                    scale(sub(c, reference), 1.0 / extent),
-                ),
-            )
-            .abs()
-                / 6.0;
+            let tetra = dot(normalized(a), cross(normalized(b), normalized(c))).abs() / 6.0;
             volume += tetra;
             tetrahedra.push((tetra, scale(add(add(reference, a), add(b, c)), 0.25)));
         }
@@ -267,6 +263,30 @@ fn norm(v: &[f64]) -> f64 {
     v.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
 
+// Symmetric Gauss-Seidel: (D+L) D^-1 (D+L)^T. Unlike a directional
+// relaxation, this is a symmetric positive preconditioner for the actual
+// liquid graph, including its small geometric interfaces and closed gauges.
+fn precondition(
+    residual: &[f64],
+    diagonal: &[f64],
+    lower: &[Vec<(usize, f64)>],
+    upper: &[Vec<(usize, f64)>],
+    out: &mut [f64],
+) {
+    for i in 0..out.len() {
+        out[i] = if diagonal[i] > 0.0 {
+            (residual[i] + lower[i].iter().map(|(j, k)| k * out[*j]).sum::<f64>()) / diagonal[i]
+        } else {
+            0.0
+        };
+    }
+    for i in (0..out.len()).rev() {
+        if diagonal[i] > 0.0 {
+            out[i] += upper[i].iter().map(|(j, k)| k * out[*j]).sum::<f64>() / diagonal[i];
+        }
+    }
+}
+
 pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStats, MacError> {
     let dims = grid.dims();
     let h = grid.config.cell_size_m;
@@ -282,7 +302,16 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         }
         *row = Some(cells.len());
         indices.push(i);
-        let cell = geometry(planes[i], grid.fraction[i])?;
+        let cell = geometry(planes[i], grid.fraction[i]).inspect_err(|_| {
+            if grid.config.pressure_diagnostics {
+                eprintln!(
+                    "{{\"type\":\"cut_geometry_failure\",\"cell\":{i},\"fraction\":{:.17e},\"plane_normal\":{:?},\"plane_alpha\":{:.17e}}}",
+                    grid.fraction[i],
+                    planes[i].map_or([0.0; 3], |p| p.normal),
+                    planes[i].map_or(0.0, |p| p.alpha)
+                );
+            }
+        })?;
         let p = [i % dims[0], i / dims[0] % dims[1], i / (dims[0] * dims[1])];
         centers.push(std::array::from_fn(|a| p[a] as f64 + cell.center[a]));
         cells.push(cell);
@@ -460,6 +489,14 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     // volume. A closing interface then has prescribed displacement flux and
     // unknown contact pressure instead of atmospheric Dirichlet pressure.
     // Include Cartesian patches as well as embedded caps (both sides of a gap).
+    let mut lower = vec![Vec::new(); n];
+    let mut upper = vec![Vec::new(); n];
+    for e in &edges {
+        let (a, b) = if e.a < e.b { (e.a, e.b) } else { (e.b, e.a) };
+        let k = e.area / e.distance / (h * h);
+        lower[b].push((a, k));
+        upper[a].push((b, k));
+    }
     let mut held = vec![None; free.len()];
     let mut attempts = 0;
     let mut total_iterations = 0;
@@ -539,15 +576,8 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             // changes its amount by dt^2/rho * residual. Reserve two orders
             // of margin inside the unchanged 1e-10 donor bound.
             .min(1e-12 * rho / dt.powi(2));
-        let mut z: Vec<_> = (0..n)
-            .map(|i| {
-                if diagonal[i] > 0.0 {
-                    residual[i] / diagonal[i]
-                } else {
-                    0.0
-                }
-            })
-            .collect();
+        let mut z = vec![0.0; n];
+        precondition(&residual, &diagonal, &lower, &upper, &mut z);
         gauge(&mut z, &labels, &closed);
         let mut direction = z.clone();
         let mut rz: f64 = residual.iter().zip(&z).map(|(r, z)| r * z).sum();
@@ -566,16 +596,21 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 residual[i] -= alpha * product[i];
             }
             gauge(&mut residual, &labels, &closed);
-            for i in 0..n {
-                z[i] = if diagonal[i] > 0.0 {
-                    residual[i] / diagonal[i]
-                } else {
-                    0.0
-                };
+            // Recursive CG residuals can lose the remaining correction through
+            // cancellation. Verify apparent convergence against the actual
+            // operator and restart from that residual within the same budget.
+            let reliable = norm(&residual) <= target;
+            if reliable {
+                apply(&phi, &diagonal, &edges, h * h, &mut product);
+                for i in 0..n {
+                    residual[i] = rhs[i] - product[i];
+                }
+                gauge(&mut residual, &labels, &closed);
             }
+            precondition(&residual, &diagonal, &lower, &upper, &mut z);
             gauge(&mut z, &labels, &closed);
             let next: f64 = residual.iter().zip(&z).map(|(a, b)| a * b).sum();
-            let beta = next / rz;
+            let beta = if reliable { 0.0 } else { next / rz };
             for i in 0..n {
                 direction[i] = z[i] + beta * direction[i];
             }
@@ -737,6 +772,118 @@ pub(super) fn transport_velocity(
 mod tests {
     use super::*;
     #[test]
+    fn trench_subnormal_anisotropic_fragment_reconstructs_without_deletion() {
+        let fraction = f64::from_bits(7);
+        let normal = [-4.569712586733911e-147, 5.519002140292094e-246, 1.0];
+        let reflected = InterfacePlane::from_fraction_resolved(normal.map(f64::abs), fraction);
+        // The exact wedge is bounded by both dominant axes, not the fallback
+        // root search's roughly 1e-20 thickness.
+        assert!(reflected.alpha > 1e-246 && reflected.alpha < 1e-230);
+        let cell = geometry(
+            Some(InterfacePlane::from_fraction_resolved(normal, fraction)),
+            fraction,
+        )
+        .unwrap();
+        assert!(cell.cap.area > 0.0);
+        assert!(
+            cell.center
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        );
+        assert!(cell.center[2] > 0.0 && cell.center[2] < reflected.alpha);
+        // Axis-aligned minimum-positive slabs retain their centroid too.
+        let smallest = f64::from_bits(1);
+        let slab = geometry(
+            Some(InterfacePlane::from_fraction_resolved(
+                [0.0, 0.0, 1.0],
+                smallest,
+            )),
+            smallest,
+        )
+        .unwrap();
+        assert!(slab.cap.area > 0.0);
+    }
+    #[test]
+    fn pressure_preconditioner_is_symmetric_positive_on_closed_and_tiny_graphs() {
+        let x = [1.0, -2.0, 1.0, 0.0];
+        let y = [-3.0, 1.0, 2.0, 0.0];
+        for scale in [1.0, 1e-120] {
+            let diagonal = [2.0 * scale, 5.0 * scale, 3.0 * scale, 0.0];
+            let lower = vec![
+                vec![],
+                vec![(0, 2.0 * scale)],
+                vec![(1, 3.0 * scale)],
+                vec![],
+            ];
+            let upper = vec![
+                vec![(1, 2.0 * scale)],
+                vec![(2, 3.0 * scale)],
+                vec![],
+                vec![],
+            ];
+            let mut px = [0.0; 4];
+            let mut py = [0.0; 4];
+            precondition(&x, &diagonal, &lower, &upper, &mut px);
+            precondition(&y, &diagonal, &lower, &upper, &mut py);
+            gauge(&mut px, &[0, 0, 0, 3], &[true, false, false, true]);
+            gauge(&mut py, &[0, 0, 0, 3], &[true, false, false, true]);
+            let inner =
+                |a: &[f64; 4], b: &[f64; 4]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f64>();
+            let xy = inner(&x, &py);
+            let yx = inner(&y, &px);
+            assert!((xy - yx).abs() <= 1e-12 * xy.abs().max(yx.abs()));
+            assert!(inner(&x, &px) > 0.0 && inner(&y, &py) > 0.0);
+            assert!(px.iter().chain(&py).all(|v| v.is_finite()));
+            assert_eq!(px[3], 0.0);
+        }
+    }
+    #[test]
+    fn unchanged_boundary_refresh_preserves_dynamic_reconstruction() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        let dims = [12, 6, 2];
+        let boundary = SolidBoundary {
+            spec: DomainSpec::new(GlobalCell::new(0, 0, 0), dims, 144).unwrap(),
+            solid: (0..144)
+                .map(|i| i / 12 % 6 < if i % 12 < 6 { 2 } else { 1 })
+                .collect(),
+        };
+        let mut control = MacGridWorld::new(
+            &boundary,
+            super::super::MacConfig {
+                cell_size_m: 1.0,
+                reconstructed_surface_support: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        control.set_freely_displaced_air().unwrap();
+        for z in 0..2 {
+            for x in 0..6 {
+                control.set_fraction(GlobalCell::new(x, 2, z), 0.2).unwrap();
+            }
+        }
+        let mut refreshed = control.clone();
+        for step in 0..600 {
+            control.step(0.05).unwrap();
+            refreshed.step(0.05).unwrap();
+            assert_eq!(
+                refreshed.refresh_boundary_retaining(&boundary).unwrap(),
+                0.0
+            );
+            refreshed.commit_boundary(boundary.solid.clone()).unwrap();
+            assert_eq!(
+                refreshed.cut_surface_velocity, control.cut_surface_velocity,
+                "step={step}"
+            );
+            assert_eq!(refreshed.pressure_pa, control.pressure_pa, "step={step}");
+            assert_eq!(refreshed.fraction, control.fraction, "step={step}");
+            assert_eq!(refreshed.u, control.u, "step={step}");
+            assert_eq!(refreshed.v, control.v, "step={step}");
+            assert_eq!(refreshed.w, control.w, "step={step}");
+        }
+    }
+    #[test]
     fn interface_predictor_uses_accepted_water_and_preserves_momentum_and_energy() {
         use crate::{DomainSpec, SolidBoundary};
         use spall_core::GlobalCell;
@@ -811,7 +958,9 @@ mod tests {
         }
         let retained = grid.allocated_bytes();
         let cached_bytes = 3 * grid.fraction.len() * size_of::<f64>();
-        grid.commit_boundary(grid.solid.clone()).unwrap();
+        let mut changed = grid.solid.clone();
+        changed[0] = true;
+        grid.commit_boundary(changed).unwrap();
         assert_eq!(retained - grid.allocated_bytes(), cached_bytes);
         assert!(grid.cut_surface_velocity.iter().all(Vec::is_empty));
     }

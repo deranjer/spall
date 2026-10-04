@@ -1180,9 +1180,13 @@ Eight 600-step cases pass, with peak speed 9.15e-12 m/s versus 1e-7 and maximum
 volume error 3.31e-13 m3 versus 1e-10. Existing gameplay rest regressions remain
 enabled. Test unchanged reference scenes using `cargo run -p spall_fluid
 --example phase_dynamics_probe --release -- <channel|low-dam|full-wall> 600
-water-support`. All three pass 600 steps; channel peak face speed is 5.13 m/s.
+water-support`. All three pass 600 steps; channel peak face speed is 5.23 m/s.
 Accepted-transfer predictor conservation/energy and tiny moving-liquid
 regressions run in `cargo test -p spall_fluid --lib cut_surface --release`.
+This also covers 600-step exact equivalence under unchanged boundary refreshes,
+preconditioner symmetry/positivity on closed and tiny graphs, and the extracted
+anisotropic subnormal fragment from the 512 trench. Real-geometry invalidation
+and trapped-water release remain enabled regressions in the full fluid suite.
 Build `cargo build -p sandbox --example water_trench_probe --release`, then run
 the built example sequentially with `512 water-support` and `1024 water-support`.
 Omitting `water-support` retains the gameplay baseline. Keep other builds and
