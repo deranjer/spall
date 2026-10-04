@@ -1217,3 +1217,14 @@ Diagnostic hydrostatic-film support plus zero-air accepted-transfer dual momentu
 Repaired the wider partial-layer resting-pool gate without changing its workload or thresholds: choose validated air-side PLIC pressure boundary first, then validated wet-side fallback, shared by pressure matrix and velocity correction. Nearly saturated bulk-cell planes no longer override the free surface. Fractions/canonical ledgers remain unchanged. Four600-step analytical cases at0.5/1m and25/50ms pass pressure<2.40e-9Pa error, speed<2.75e-13m/s and volume error<1.25e-13m3; targets1e-5Pa/1e-7m/s/1e-10m3. Original lookup makes new regression fail immediately at0.016892m/s. Previously failed12x6x2 rest gate is enabled and passes600steps; ordinary example3passed/1ignored. Unchanged0.20m shallow drainage stillFAILS(zero rows/zero downstream);0.75m control4.376055m3of9 flows. Rejected film prototype remains disabled. See reports/ENG-122.md and surface-rest evidence. Next ENG-122: matched subcell pressure/velocity/face inertia for liquid below all centre samples, preserving rest/energy/conservation/walls before unchanged paced512/1024. Keep in_progress.
 
 ENG-122 surface-distance final checks: cargo xtask check passed formatting, strict workspace all-targets/all-features Clippy, and tests: 1183 passed, 0 failed, 63 ignored. Ordinary shallow-shore example tests: 3 passed, 1 unresolved drainage gate ignored; that ignored gate was explicitly run and failed. The three water-only reference motion probes (channel, low-dam, full-wall) each passed 600 steps at 10 ms; timings overlapped workspace checks and are not benchmark evidence. No paced large-world or GPU rerun. Details in reports/ENG-122.md.
+
+ENG-122 support checkpoint (2026-10-03): added an opt-in reconstructed-liquid
+pressure support diagnostic with actual wetted faces, embedded free surfaces
+and accepted-transfer water-only momentum. Unchanged 600-step shallow/deep
+shelf drainage, energy, conservation, full-wall and ordinary rest gates pass.
+Nearly saturated bulk-water rest FAILS immediately (0.0083013904 m/s).
+Gameplay remains on the existing water-only backend; ENG-122 stays in progress.
+Next unblocked ENG-122 item is consistent physical free-surface ownership
+across neighbouring reconstructions, then reference and original 512/1024
+paced trench gates. No speed, whole-memory or viewer acceptance is claimed.
+Exact evidence and regularization details: docs/reports/ENG-122.md.

@@ -1163,3 +1163,22 @@ Wood retains 0.25 m cells; greedy merging changes draw boxes, never cell resolut
 Run cargo test -p sandbox --features client --test vegetation for deterministic biome/grounding, allowed offspring, four-season leaves, root/soil destruction, normal committed wood growth, exact checkpoint/journal recovery and two real QUIC clients including a late joiner. Run cargo test -p spall_protocol vegetation::tests for bounded chunk framing/repair, and cargo xtask check for the repository-wide gate.
 
 GPU evidence: cargo run -p sandbox --features client --example vegetation-gallery -- .local/vegetation-gallery produces ten generated tree and ten generated ground specimens in four seasons through production geometry/shadows. Live launch: cargo xtask play --worldgen showcase --seed 1 --worldgen-size 512 --season autumn. Every generated size and editor Run in game use the common factory. Hardware performance and manual traversal remain separate. Details: docs/reports/ENG-118-vegetation.md.
+
+### ENG-122 reconstructed liquid support gates (2026-10-03)
+
+Run `cargo test -p spall_fluid --lib cut_surface --release` for centroid and
+positive-fragment geometry, and `cargo test -p spall_fluid --example
+shallow_shore_probe --release` for unconditional opted-in support drainage,
+5% energy, volume, bounds, rest and full-wall regressions. For the identical
+600-step diagnostic evidence, set `SHALLOW_SHORE_SUPPORT=1` and run `cargo run
+-p spall_fluid --example shallow_shore_probe --release`; its exit status covers
+both shallow flow and energy. Unset the variable for the gameplay baseline.
+
+The separate integration gate must run explicitly:
+`cargo test -p spall_fluid --lib reconstructed_support_preserves_nearly_saturated_surface_rest --release -- --ignored --nocapture`.
+It currently FAILS at step 0 (0.0083013904 m/s versus 1e-7 m/s), so support
+must remain diagnostic. An otherwise passing `cargo xtask check` excludes
+that known failure and does not authorize promotion. Existing gameplay rest
+regressions remain enabled. The original paced 512/1024 trench, reference
+scene, viewer/GPU and performance gates are still required before activation.
+Evidence and remaining risks: docs/reports/ENG-122.md.

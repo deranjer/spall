@@ -387,3 +387,15 @@ change to the frozen wire record set (the sentinel reuses `BaselineAck`).
 ### ENG-118 implemented vegetation ownership
 
 The sandbox worldgen factory adds game-authored procedural vegetation after base terrain generation, before authoritative collision/world creation. CPU-only spall_ecology::living owns stable-ID plants, biome/soil eligibility, retained connected wood paths and a plant season clock. Simulation owns it; growth is acknowledged only through the normal edit pipeline. Wood remains ordinary destructible terrain/body cells. Non-solid leaf/ground geometry is derived from server keyframes and shares opaque lighting/shadows. Atomic persistence includes full state after topology plus small clock rows. No hidden supports, per-voxel entities or alternate physics. Rules, budgets and remaining global-season/moisture work: docs/reports/ENG-118-vegetation.md.
+
+### ENG-122 reconstructed support diagnostic (2026-10-03)
+
+The opt-in `MacGridWorld::set_cut_surface_support` backend constructs PLIC
+liquid centroids, wetted Cartesian faces and embedded free surfaces, with
+reduced-potential pressure and accepted-transfer water-only momentum. It has
+no air mass or hidden pressure anchors. Gameplay keeps the existing backend:
+shallow drainage/energy pass, but nearly saturated bulk water fails rest.
+The diagnostic uses Jacobi CG, not the selected legacy multigrid solver.
+Retained flux arrays are counted; whole transient geometry/RSS and generated
+trench performance remain unmeasured. See docs/reports/ENG-122.md for the
+regularized inertia, unchanged gates and precise integration blocker.

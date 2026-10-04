@@ -9,6 +9,7 @@ use spall_core::GlobalCell;
 use crate::phase_graph::{GraphError, GraphLimits, PhaseGraph, PressureSmoother};
 use crate::phase_water::PhaseWater;
 use crate::{DomainSpec, SolidBoundary};
+mod cut_surface;
 mod momentum;
 
 #[derive(Debug, Clone, Copy)]
@@ -221,6 +222,8 @@ pub struct MacGridWorld {
     ambient_density_kg_m3: Option<f64>,
     freely_displaced_air: bool,
     experimental_surface_films: bool,
+    cut_surface_support: bool,
+    cut_surface_flux: [Vec<f64>; 3],
     compressible_enclosed_air: bool,
     stage_diagnostics: bool,
     diagnostic_outer_step: u64,
@@ -288,6 +291,8 @@ impl MacGridWorld {
             ambient_density_kg_m3: None,
             freely_displaced_air: false,
             experimental_surface_films: false,
+            cut_surface_support: false,
+            cut_surface_flux: [Vec::new(), Vec::new(), Vec::new()],
             compressible_enclosed_air: false,
             stage_diagnostics: false,
             diagnostic_outer_step: 0,
@@ -385,6 +390,8 @@ impl MacGridWorld {
         self.ambient_density_kg_m3 = Some(density);
         self.freely_displaced_air = false;
         self.experimental_surface_films = false;
+        self.cut_surface_support = false;
+        self.cut_surface_flux = std::array::from_fn(|_| Vec::new());
         // Sealed air defaults to isothermal compressible gas; see
         // `set_compressible_enclosed_air`.
         self.compressible_enclosed_air = true;
@@ -404,6 +411,8 @@ impl MacGridWorld {
         self.compressible_enclosed_air = false;
         self.freely_displaced_air = true;
         self.experimental_surface_films = false;
+        self.cut_surface_support = false;
+        self.cut_surface_flux = std::array::from_fn(|_| Vec::new());
         self.strict_phase_bounds = true;
         // Wet-only projection has much less work, but saturated donor cells
         // need pressure residuals below the unchanged 1e-10 low-order bound.
@@ -418,10 +427,21 @@ impl MacGridWorld {
     /// half-cell velocity/mass support fails shallow-film energy and rest
     /// gates. Only the explicitly opted-in shallow-shore probe uses it.
     pub fn set_experimental_surface_films(&mut self) -> Result<(), MacError> {
-        if !self.freely_displaced_air {
+        if !self.freely_displaced_air || self.cut_surface_support {
             return Err(MacError::InvalidConfig);
         }
         self.experimental_surface_films = true;
+        Ok(())
+    }
+
+    /// ENG-122 reconstructed liquid support diagnostic. Small drainage and
+    /// energy gates pass, but nearly saturated bulk-water rest fails. This is
+    /// not an accepted gameplay policy and does not use the legacy MG solver.
+    pub fn set_cut_surface_support(&mut self) -> Result<(), MacError> {
+        if !self.freely_displaced_air || self.experimental_surface_films {
+            return Err(MacError::InvalidConfig);
+        }
+        self.cut_surface_support = true;
         Ok(())
     }
 
@@ -665,6 +685,7 @@ impl MacGridWorld {
             + (self.fraction.capacity() + self.trapped.capacity() + self.pressure_pa.capacity())
                 * size_of::<f64>()
             + (self.u.capacity() + self.v.capacity() + self.w.capacity()) * size_of::<f64>()
+            + self.cut_surface_flux.iter().map(|v| v.capacity() * size_of::<f64>()).sum::<usize>()
             + self
                 .previous_pressure_diagonal
                 .as_ref()
@@ -1272,6 +1293,7 @@ impl MacGridWorld {
             if (self.ambient_density_kg_m3.is_some() || self.freely_displaced_air)
                 && !self.conservative_momentum
                 && !self.experimental_surface_films
+                && !self.cut_surface_support
             {
                 let stage = Instant::now();
                 self.advect_velocity(sub_dt);
@@ -1287,9 +1309,13 @@ impl MacGridWorld {
                 .iter_mut()
                 .zip(std::iter::repeat(self.config.gravity_m_s2[1]))
             {
-                *velocity += g * sub_dt;
+                if !self.cut_surface_support {
+                    *velocity += g * sub_dt;
+                }
             }
-            if self.ambient_density_kg_m3.is_some() || self.freely_displaced_air {
+            if !self.cut_surface_support
+                && (self.ambient_density_kg_m3.is_some() || self.freely_displaced_air)
+            {
                 for velocity in &mut self.u {
                     *velocity += self.config.gravity_m_s2[0] * sub_dt;
                 }
@@ -1766,6 +1792,9 @@ impl MacGridWorld {
     }
 
     fn project(&mut self, dt: f64) -> Result<ProjectionStats, MacError> {
+        if self.cut_surface_support {
+            return cut_surface::project(self, dt);
+        }
         let [nx, ny, nz] = self.dims();
         let n = self.fraction.len();
         let h2 = self.config.cell_size_m.powi(2);
@@ -2239,7 +2268,7 @@ impl MacGridWorld {
             if self.experimental_surface_films {
                 self.accelerate_unresolved_surface_films(&liquid, dt);
             }
-            self.extrapolate_surface_velocities(&liquid);
+            self.extrapolate_surface_velocities(&liquid, None);
         }
         let mut div_after: f64 = 0.0;
         for z in 0..nz {
@@ -2606,7 +2635,11 @@ impl MacGridWorld {
     /// Ghost-fluid advection needs a narrow velocity extension outside liquid,
     /// not independently accelerating dry-space velocities. Three face layers
     /// cover the bounded CFL backtrace. Solids/closed exterior are never donors.
-    fn extrapolate_surface_velocities(&mut self, liquid: &[bool]) {
+    fn extrapolate_surface_velocities(
+        &mut self,
+        liquid: &[bool],
+        cut_faces: Option<&[Vec<bool>; 3]>,
+    ) {
         let dims = self.dims();
         for axis in 0..3 {
             let mut ext = dims;
@@ -2637,6 +2670,9 @@ impl MacGridWorld {
                         || (self.experimental_surface_films
                             && ((axis != 1 && lower.is_some_and(|c| self.fraction[c] > 0.0))
                                 || upper.is_some_and(|c| self.fraction[c] > 0.0))));
+                if let Some(cut) = cut_faces {
+                    known[i] = !blocked[i] && cut[axis][i];
+                }
             }
             let faces = match axis {
                 0 => &mut self.u,
@@ -2711,13 +2747,15 @@ impl MacGridWorld {
             // generic fraction gradient places its plane away from the lip.
             // Reconstruct its surface slope from neighbouring layer depths;
             // otherwise bounded swept slabs can never reach that dry face.
-            if self.experimental_surface_films
+            if (self.experimental_surface_films || self.cut_surface_support)
                 && self.config.gravity_m_s2[0] == 0.0
                 && self.config.gravity_m_s2[2] == 0.0
                 && self.config.gravity_m_s2[1] < 0.0
                 && c < 0.5
                 && y > 0
-                && self.solid[self.cell_index(x, y - 1, z)]
+                && (self.solid[self.cell_index(x, y - 1, z)]
+                    || (self.cut_surface_support
+                        && self.fraction[self.cell_index(x, y - 1, z)] == 1.0))
             {
                 normal[1] = 1.0;
                 for axis in [0, 2] {
@@ -2727,7 +2765,11 @@ impl MacGridWorld {
                     hi[axis] += 1;
                     normal[axis] = 0.5 * (sample(lo) - sample(hi));
                 }
-                *plane = Some(InterfacePlane::from_fraction(normal, c));
+                *plane = Some(if self.cut_surface_support {
+                    InterfacePlane::from_fraction_resolved(normal, c)
+                } else {
+                    InterfacePlane::from_fraction(normal, c)
+                });
                 return;
             }
             for axis in 0..3 {
@@ -2747,7 +2789,11 @@ impl MacGridWorld {
                     }
                 }
             }
-            *plane = Some(InterfacePlane::from_fraction(normal, c));
+            *plane = Some(if self.cut_surface_support {
+                InterfacePlane::from_fraction_resolved(normal, c)
+            } else {
+                InterfacePlane::from_fraction(normal, c)
+            });
         });
         planes
     }
@@ -2895,6 +2941,15 @@ impl MacGridWorld {
             } else {
                 courant * reconstructed
             };
+            if self.cut_surface_support {
+                let fi = match axis {
+                    0 => self.u_index(xf, yf, zf),
+                    1 => self.v_index(xf, yf, zf),
+                    _ => self.w_index(xf, yf, zf),
+                };
+                let flux = self.cut_surface_flux[axis][fi] * dt / h.powi(3);
+                return Some((left, right, flux, flux, courant));
+            }
             Some((left, right, donor, high, courant))
         };
         let mut raw_fluxes: Vec<(Option<usize>, Option<usize>, f64, f64)> = Vec::new();
@@ -3176,7 +3231,8 @@ impl MacGridWorld {
                 volume_fraction: net_open_outflow_fraction,
             });
         }
-        if self.conservative_momentum || self.experimental_surface_films {
+        if self.conservative_momentum || self.experimental_surface_films || self.cut_surface_support
+        {
             let candidate =
                 momentum::transport(self, &old, &low, &anti, &low_fluxes, &full_fluxes)?;
             [self.u, self.v, self.w] = candidate.velocity;
@@ -3508,7 +3564,15 @@ struct InterfacePlane {
 }
 
 impl InterfacePlane {
-    fn from_fraction(mut normal: [f64; 3], fraction: f64) -> Self {
+    fn from_fraction(normal: [f64; 3], fraction: f64) -> Self {
+        Self::from_fraction_tolerance(normal, fraction, false)
+    }
+
+    fn from_fraction_resolved(normal: [f64; 3], fraction: f64) -> Self {
+        Self::from_fraction_tolerance(normal, fraction, true)
+    }
+
+    fn from_fraction_tolerance(mut normal: [f64; 3], fraction: f64, resolved: bool) -> Self {
         let norm: f64 = normal.iter().map(|n| n.abs()).sum();
         if norm == 0.0 {
             normal = [0.0, 1.0, 0.0];
@@ -3522,6 +3586,47 @@ impl InterfacePlane {
         // superlinearly; plain bisection needed 48 volume evaluations.
         let mut lo: f64 = normal.iter().map(|&n| n.min(0.0)).sum();
         let mut hi: f64 = normal.iter().map(|&n| n.max(0.0)).sum();
+        if resolved && fraction > 0.0 {
+            let weights: Vec<_> = normal
+                .iter()
+                .map(|v| v.abs())
+                .filter(|v| *v > 0.0)
+                .collect();
+            let factorial: f64 = match weights.len() {
+                1 => 1.0,
+                2 => 2.0,
+                _ => 6.0,
+            };
+            let corner =
+                ((fraction.ln() + factorial.ln() + weights.iter().map(|v| v.ln()).sum::<f64>())
+                    / weights.len() as f64)
+                    .exp();
+            if corner <= weights.iter().copied().fold(f64::INFINITY, f64::min) {
+                return Self {
+                    normal,
+                    alpha: lo + corner,
+                };
+            }
+            let mut sorted = normal.map(f64::abs);
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let [a, b, c] = sorted;
+            let linear = a * fraction + 0.5 * (b + c);
+            if linear >= b + c && linear <= a {
+                return Self {
+                    normal,
+                    alpha: lo + linear,
+                };
+            }
+            if b > 0.0 {
+                let quadratic = 0.5 * (c + (8.0 * a * b * fraction - c * c / 3.0).max(0.0).sqrt());
+                if quadratic >= c && quadratic <= b {
+                    return Self {
+                        normal,
+                        alpha: lo + quadratic,
+                    };
+                }
+            }
+        }
         let (mut g_lo, mut g_hi) = (-fraction, 1.0 - fraction);
         let mut side = 0i8;
         let mut alpha = 0.5 * (lo + hi);
@@ -3531,7 +3636,16 @@ impl InterfacePlane {
                 alpha = 0.5 * (lo + hi);
             }
             let g = plane_cube_fraction(normal, alpha) - fraction;
-            if g.abs() <= 1.0e-15 || hi - lo <= 1.0e-14 {
+            let tolerance = if resolved {
+                1e-15 * fraction.min(1.0 - fraction)
+            } else {
+                1e-15
+            };
+            if g.abs() <= tolerance
+                || (!resolved && hi - lo <= 1.0e-14)
+                || alpha == lo
+                || alpha == hi
+            {
                 break;
             }
             if g < 0.0 {
@@ -5634,6 +5748,41 @@ mod tests {
                 grid.config.density_kg_m3 * 9.81 * grid.config.cell_size_m * (surface_y - sample_y);
             assert!((grid.pressure_pa[rows as usize - 1] - expected).abs() < 1e-5);
             assert!(grid.fraction[3] > 0.0, "air-centred water was discarded");
+        }
+    }
+
+    #[test]
+    #[ignore = "ENG-122 cut support creates a current in nearly saturated bulk water; promotion blocked"]
+    fn reconstructed_support_preserves_nearly_saturated_surface_rest() {
+        let mut grid = all_air_grid(
+            [12, 6, 2],
+            MacConfig {
+                cell_size_m: 1.0,
+                ..MacConfig::default()
+            },
+        );
+        grid.set_freely_displaced_air().unwrap();
+        grid.set_cut_surface_support().unwrap();
+        for z in 0..2 {
+            for x in 0..12 {
+                grid.set_fraction(
+                    GlobalCell::new(x, 0, z),
+                    if (x + z) % 2 == 0 {
+                        1.0
+                    } else {
+                        1.0 - f64::EPSILON
+                    },
+                )
+                .unwrap();
+                grid.set_fraction(GlobalCell::new(x, 1, z), 0.25).unwrap();
+            }
+        }
+        let mass = grid.water_volume_m3();
+        for step in 0..600 {
+            grid.step(0.05).unwrap();
+            let speed = grid.max_face_component_velocity_m_s();
+            assert!(speed < 1e-7, "step={step}, speed={speed}");
+            assert!((grid.water_volume_m3() - mass).abs() < 1e-10);
         }
     }
 

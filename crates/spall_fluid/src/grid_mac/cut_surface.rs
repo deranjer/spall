@@ -1,0 +1,621 @@
+//! Liquid control volumes clipped by the same PLIC plane as water transport.
+//! Embedded atmospheric faces are geometric boundary DOFs, not pressure anchors.
+use super::{InterfacePlane, MacError, MacGridWorld, ProjectionStats, sample_velocity};
+
+type Point = [f64; 3];
+fn add(a: Point, b: Point) -> Point {
+    std::array::from_fn(|i| a[i] + b[i])
+}
+fn sub(a: Point, b: Point) -> Point {
+    std::array::from_fn(|i| a[i] - b[i])
+}
+fn scale(a: Point, k: f64) -> Point {
+    a.map(|v| v * k)
+}
+fn dot(a: Point, b: Point) -> f64 {
+    (0..3).map(|i| a[i] * b[i]).sum()
+}
+fn cross(a: Point, b: Point) -> Point {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+#[derive(Clone, Default)]
+struct Patch {
+    points: Vec<Point>,
+    area: f64,
+    center: Point,
+}
+impl Patch {
+    fn new(points: Vec<Point>) -> Self {
+        let mut result = Self {
+            points,
+            ..Self::default()
+        };
+        if result.points.len() < 3 {
+            return result;
+        }
+        let a = result.points[0];
+        let mut triangles = Vec::new();
+        for j in 1..result.points.len() - 1 {
+            let (b, c) = (result.points[j], result.points[j + 1]);
+            let v = cross(sub(b, a), sub(c, a));
+            let area = v[0].hypot(v[1]).hypot(v[2]) * 0.5;
+            result.area += area;
+            triangles.push((area, scale(add(add(a, b), c), 1.0 / 3.0)));
+        }
+        if result.area > 0.0 {
+            result.center = triangles.into_iter().fold([0.0; 3], |center, (area, p)| {
+                add(center, scale(p, area / result.area))
+            });
+        }
+        result
+    }
+}
+fn square(axis: usize, side: f64) -> Vec<Point> {
+    [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+        .map(|(a, b)| {
+            let mut p = [0.0; 3];
+            p[axis] = side;
+            p[(axis + 1) % 3] = a;
+            p[(axis + 2) % 3] = b;
+            p
+        })
+        .to_vec()
+}
+fn clip(points: &[Point], plane: InterfacePlane, crossings: &mut Vec<Point>) -> Vec<Point> {
+    let mut out = Vec::new();
+    if points.is_empty() {
+        return out;
+    }
+    let mut a = *points.last().unwrap();
+    let mut da = dot(plane.normal, a) - plane.alpha;
+    for &b in points {
+        let db = dot(plane.normal, b) - plane.alpha;
+        if (da <= 0.0) != (db <= 0.0) {
+            let p = if da <= 0.0 {
+                add(a, scale(sub(b, a), da / (da - db)))
+            } else {
+                add(b, scale(sub(a, b), db / (db - da)))
+            };
+            out.push(p);
+            crossings.push(p);
+        }
+        if db <= 0.0 {
+            out.push(b);
+        }
+        a = b;
+        da = db;
+    }
+    out
+}
+struct Cell {
+    center: Point,
+    faces: [Patch; 6],
+    cap: Patch,
+    normal: Point,
+}
+fn geometry(original: Option<InterfacePlane>, fraction: f64) -> Result<Cell, MacError> {
+    // Reflect into the positive corner before clipping: a signed plane offset
+    // cannot retain a tiny positive fragment beside a negative unit offset.
+    let plane =
+        original.map(|p| InterfacePlane::from_fraction_resolved(p.normal.map(f64::abs), fraction));
+    let mut cuts = Vec::new();
+    let mut faces = std::array::from_fn(|i| {
+        let p = square(i / 2, (i % 2) as f64);
+        Patch::new(plane.map_or_else(|| p.clone(), |q| clip(&p, q, &mut cuts)))
+    });
+    let mut normal = [0.0; 3];
+    if let Some(p) = plane {
+        normal = scale(p.normal, 1.0 / dot(p.normal, p.normal).sqrt());
+        // Exact duplicate removal; no positive-size fragment is thresholded.
+        cuts.sort_by(|a, b| {
+            a[0].total_cmp(&b[0])
+                .then(a[1].total_cmp(&b[1]))
+                .then(a[2].total_cmp(&b[2]))
+        });
+        cuts.dedup();
+        if !cuts.is_empty() {
+            let center = scale(
+                cuts.iter().copied().fold([0.0; 3], add),
+                1.0 / cuts.len() as f64,
+            );
+            let axis = (0..3)
+                .min_by(|&a, &b| normal[a].abs().total_cmp(&normal[b].abs()))
+                .unwrap();
+            let mut e = [0.0; 3];
+            e[axis] = 1.0;
+            let u = cross(normal, e);
+            let v = cross(normal, u);
+            cuts.sort_by(|a, b| {
+                let a = sub(*a, center);
+                let b = sub(*b, center);
+                dot(a, v)
+                    .atan2(dot(a, u))
+                    .total_cmp(&dot(b, v).atan2(dot(b, u)))
+            });
+        }
+    }
+    let mut cap = Patch::new(cuts);
+    let patches = faces.iter().chain(std::iter::once(&cap));
+    let all: Vec<_> = patches
+        .clone()
+        .flat_map(|p| p.points.iter().copied())
+        .collect();
+    if all.is_empty() {
+        return Err(MacError::InvalidConfig);
+    }
+    let reference = scale(
+        all.iter().copied().fold([0.0; 3], add),
+        1.0 / all.len() as f64,
+    );
+    let mut volume = 0.0;
+    let mut tetrahedra = Vec::new();
+    for patch in patches {
+        if patch.points.len() < 3 {
+            continue;
+        }
+        let a = patch.points[0];
+        for j in 1..patch.points.len() - 1 {
+            let (b, c) = (patch.points[j], patch.points[j + 1]);
+            let tetra = dot(
+                sub(a, reference),
+                cross(sub(b, reference), sub(c, reference)),
+            )
+            .abs()
+                / 6.0;
+            volume += tetra;
+            tetrahedra.push((tetra, scale(add(add(reference, a), add(b, c)), 0.25)));
+        }
+    }
+    if volume <= 0.0 || !volume.is_finite() {
+        return Err(MacError::InvalidConfig);
+    }
+    let mut center = tetrahedra
+        .into_iter()
+        .fold([0.0; 3], |center, (v, p)| add(center, scale(p, v / volume)));
+    if let Some(p) = original {
+        for axis in 0..3 {
+            if p.normal[axis] < 0.0 {
+                center[axis] = 1.0 - center[axis];
+                for patch in faces.iter_mut().chain(std::iter::once(&mut cap)) {
+                    patch.center[axis] = 1.0 - patch.center[axis];
+                    for point in &mut patch.points {
+                        point[axis] = 1.0 - point[axis];
+                    }
+                }
+                faces.swap(2 * axis, 2 * axis + 1);
+            }
+        }
+        normal = scale(p.normal, 1.0 / dot(p.normal, p.normal).sqrt());
+    }
+    Ok(Cell {
+        center,
+        faces,
+        cap,
+        normal,
+    })
+}
+
+struct Edge {
+    a: usize,
+    b: usize,
+    axis: usize,
+    face: usize,
+    area: f64,
+    distance: f64,
+    velocity: f64,
+}
+struct Free {
+    row: usize,
+    axis: Option<usize>,
+    face: usize,
+    sign: f64,
+    area: f64,
+    distance: f64,
+    velocity: f64,
+    potential: f64,
+}
+fn root(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
+}
+fn gauge(v: &mut [f64], labels: &[usize], closed: &[bool]) {
+    let mut sum = vec![0.0; v.len()];
+    let mut count = vec![0usize; v.len()];
+    for (i, &c) in labels.iter().enumerate() {
+        if closed[c] {
+            sum[c] += v[i];
+            count[c] += 1;
+        }
+    }
+    for (i, &c) in labels.iter().enumerate() {
+        if closed[c] {
+            v[i] -= sum[c] / count[c] as f64;
+        }
+    }
+}
+fn apply(x: &[f64], diagonal: &[f64], edges: &[Edge], h2: f64, out: &mut [f64]) {
+    for i in 0..x.len() {
+        out[i] = diagonal[i] * x[i];
+    }
+    for e in edges {
+        let k = e.area / e.distance / h2;
+        out[e.a] -= k * x[e.b];
+        out[e.b] -= k * x[e.a];
+    }
+}
+fn norm(v: &[f64]) -> f64 {
+    v.iter().map(|v| v * v).sum::<f64>().sqrt()
+}
+
+pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStats, MacError> {
+    let dims = grid.dims();
+    let h = grid.config.cell_size_m;
+    let rho = grid.config.density_kg_m3;
+    let planes = grid.reconstruct_planes();
+    let mut rows = vec![None; grid.fraction.len()];
+    let mut cells = Vec::new();
+    let mut indices = Vec::new();
+    let mut centers = Vec::new();
+    for (i, row) in rows.iter_mut().enumerate() {
+        if grid.solid[i] || grid.fraction[i] <= 0.0 {
+            continue;
+        }
+        *row = Some(cells.len());
+        indices.push(i);
+        let cell = geometry(planes[i], grid.fraction[i])?;
+        let p = [i % dims[0], i / dims[0] % dims[1], i / (dims[0] * dims[1])];
+        centers.push(std::array::from_fn(|a| p[a] as f64 + cell.center[a]));
+        cells.push(cell);
+    }
+    let n = cells.len();
+    let mut edges = Vec::new();
+    let mut free = Vec::new();
+    let mut known: [Vec<bool>; 3] = std::array::from_fn(|a| {
+        let mut d = dims;
+        d[a] += 1;
+        vec![false; d.iter().product()]
+    });
+    let mut area: [Vec<f64>; 3] = std::array::from_fn(|a| vec![0.0; known[a].len()]);
+    let mut face_mass: [Vec<f64>; 3] = std::array::from_fn(|a| vec![0.0; known[a].len()]);
+    let potential = |p: Point| -rho * h * dot(grid.config.gravity_m_s2, p);
+    // The same distance regularization as the existing ghost-fluid theta floor;
+    // shared by matrix, pressure impulse and face inertia. Geometry/amounts
+    // and the existence of a free boundary are never fabricated by this floor.
+    let distance = |d: f64| d.max(0.01);
+    for (r, cell) in cells.iter().enumerate() {
+        if cell.cap.area > 0.0 {
+            let center = add(sub(centers[r], cell.center), cell.cap.center);
+            let u = sample_velocity(&grid.u, &grid.v, &grid.w, dims, center);
+            free.push(Free {
+                row: r,
+                axis: None,
+                face: 0,
+                sign: 1.0,
+                area: cell.cap.area,
+                distance: distance(grid.fraction[indices[r]] / (2.0 * cell.cap.area)),
+                velocity: dot(u, cell.normal),
+                potential: potential(center),
+            });
+        }
+    }
+    for axis in 0..3 {
+        let mut ext = dims;
+        ext[axis] += 1;
+        for fi in 0..known[axis].len() {
+            let p = [fi % ext[0], fi / ext[0] % ext[1], fi / (ext[0] * ext[1])];
+            let mut lo = p;
+            let a = if p[axis] > 0 {
+                lo[axis] -= 1;
+                Some(grid.cell_index(lo[0], lo[1], lo[2]))
+            } else {
+                None
+            };
+            let b = (p[axis] < dims[axis]).then(|| grid.cell_index(p[0], p[1], p[2]));
+            if a.is_some_and(|i| grid.solid[i]) || b.is_some_and(|i| grid.solid[i]) {
+                continue;
+            }
+            if (a.is_none() || b.is_none())
+                && !(axis == 1 && p[axis] == dims[axis] && grid.config.open_top)
+            {
+                continue;
+            }
+            let ar = a.and_then(|i| rows[i]);
+            let br = b.and_then(|i| rows[i]);
+            face_mass[axis][fi] =
+                a.map_or(0.0, |i| grid.fraction[i]) + b.map_or(0.0, |i| grid.fraction[i]);
+            let u = match axis {
+                0 => grid.u[fi],
+                1 => grid.v[fi],
+                _ => grid.w[fi],
+            };
+            let mut overlap = Patch::default();
+            if let (Some(l), Some(r)) = (ar, br) {
+                let face = &cells[l].faces[axis * 2 + 1];
+                overlap = if let Some(mut plane) = planes[b.unwrap()] {
+                    // Neighbour local coordinates = left coordinates - e_axis.
+                    plane.alpha += plane.normal[axis];
+                    Patch::new(clip(&face.points, plane, &mut Vec::new()))
+                } else {
+                    face.clone()
+                };
+                // Keep roundoff in polygon quadrature from making a negative
+                // exposed area; no water fraction is adjusted here.
+                overlap.area = overlap
+                    .area
+                    .min(face.area)
+                    .min(cells[r].faces[axis * 2].area);
+                if overlap.area > 0.0 {
+                    edges.push(Edge {
+                        a: l,
+                        b: r,
+                        axis,
+                        face: fi,
+                        area: overlap.area,
+                        distance: distance(centers[r][axis] - centers[l][axis]),
+                        velocity: u,
+                    });
+                }
+            }
+            for (row, side, sign) in [(ar, 1, 1.0), (br, 0, -1.0)] {
+                let Some(r) = row else {
+                    continue;
+                };
+                let face = &cells[r].faces[axis * 2 + side];
+                let exposed = (face.area - overlap.area).max(0.0);
+                area[axis][fi] += face.area;
+                if exposed <= 0.0 {
+                    continue;
+                }
+                let mut shared_center = overlap.center;
+                if side == 0 {
+                    shared_center[axis] -= 1.0;
+                }
+                let center = scale(
+                    sub(
+                        scale(face.center, face.area),
+                        scale(shared_center, overlap.area),
+                    ),
+                    1.0 / exposed,
+                );
+                let local = add(sub(centers[r], cells[r].center), center);
+                free.push(Free {
+                    row: r,
+                    axis: Some(axis),
+                    face: fi,
+                    sign,
+                    area: exposed,
+                    distance: distance((center[axis] - cells[r].center[axis]).abs()),
+                    velocity: sign * u,
+                    potential: potential(local),
+                });
+            }
+            area[axis][fi] -= overlap.area;
+            known[axis][fi] = area[axis][fi] > 0.0;
+        }
+    }
+    // Use the same half-cell liquid mass as accepted-transfer momentum.
+    // A face fragment receives its share of that mass by wetted area.
+    for e in &mut edges {
+        e.distance = distance(
+            (grid.fraction[indices[e.a]] + grid.fraction[indices[e.b]])
+                / (2.0 * area[e.axis][e.face]),
+        );
+    }
+    for f in &mut free {
+        if let Some(axis) = f.axis {
+            f.distance = distance(face_mass[axis][f.face] / (2.0 * area[axis][f.face]));
+        }
+    }
+    let mut parent: Vec<_> = (0..n).collect();
+    for e in &edges {
+        let a = root(&mut parent, e.a);
+        let b = root(&mut parent, e.b);
+        parent[a] = b;
+    }
+    let labels: Vec<_> = (0..n).map(|i| root(&mut parent, i)).collect();
+    let reference = free.first().map_or(0.0, |f| f.potential);
+    let mut closed = vec![true; n];
+    for f in &free {
+        closed[labels[f.row]] = false;
+    }
+    let mut diagonal = vec![0.0; n];
+    let mut rhs = vec![0.0; n];
+    let mut flux = vec![0.0; n];
+    for e in &edges {
+        let k = e.area / e.distance / h.powi(2);
+        diagonal[e.a] += k;
+        diagonal[e.b] += k;
+        flux[e.a] += e.area * e.velocity;
+        flux[e.b] -= e.area * e.velocity;
+    }
+    for f in &free {
+        let k = f.area / f.distance / h.powi(2);
+        diagonal[f.row] += k;
+        rhs[f.row] += k * (f.potential - reference);
+        flux[f.row] += f.area * f.velocity;
+    }
+    let before = flux
+        .iter()
+        .enumerate()
+        .map(|(r, v)| v.abs() / h / grid.fraction[indices[r]])
+        .fold(0.0, f64::max);
+    for r in 0..n {
+        rhs[r] -= rho / dt / h * flux[r];
+    }
+    gauge(&mut rhs, &labels, &closed);
+    let mut phi: Vec<_> = rhs
+        .iter()
+        .zip(&diagonal)
+        .map(|(r, d)| if *d > 0.0 { r / d } else { 0.0 })
+        .collect();
+    gauge(&mut phi, &labels, &closed);
+    let mut product = vec![0.0; n];
+    apply(&phi, &diagonal, &edges, h * h, &mut product);
+    let mut residual: Vec<_> = rhs.iter().zip(&product).map(|(b, a)| b - a).collect();
+    gauge(&mut residual, &labels, &closed);
+    let initial = norm(&residual);
+    let target = grid
+        .config
+        .pressure_absolute_tolerance
+        .max(grid.config.pressure_relative_tolerance * norm(&rhs));
+    let mut z: Vec<_> = (0..n)
+        .map(|i| {
+            if diagonal[i] > 0.0 {
+                residual[i] / diagonal[i]
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    gauge(&mut z, &labels, &closed);
+    let mut direction = z.clone();
+    let mut rz: f64 = residual.iter().zip(&z).map(|(r, z)| r * z).sum();
+    let mut iterations = 0;
+    while norm(&residual) > target && iterations < grid.config.pressure_max_iterations {
+        apply(&direction, &diagonal, &edges, h * h, &mut product);
+        let dp: f64 = direction.iter().zip(&product).map(|(a, b)| a * b).sum();
+        if !dp.is_finite() || dp <= 0.0 {
+            return Err(MacError::MomentumInvalidState);
+        }
+        let alpha = rz / dp;
+        for i in 0..n {
+            phi[i] += alpha * direction[i];
+            residual[i] -= alpha * product[i];
+        }
+        gauge(&mut residual, &labels, &closed);
+        for i in 0..n {
+            z[i] = if diagonal[i] > 0.0 {
+                residual[i] / diagonal[i]
+            } else {
+                0.0
+            };
+        }
+        gauge(&mut z, &labels, &closed);
+        let next: f64 = residual.iter().zip(&z).map(|(a, b)| a * b).sum();
+        let beta = next / rz;
+        for i in 0..n {
+            direction[i] = z[i] + beta * direction[i];
+        }
+        rz = next;
+        iterations += 1;
+    }
+    apply(&phi, &diagonal, &edges, h * h, &mut product);
+    for i in 0..n {
+        residual[i] = rhs[i] - product[i];
+    }
+    gauge(&mut residual, &labels, &closed);
+    let final_residual = norm(&residual);
+    if final_residual > target * 1.01 {
+        return Err(MacError::MomentumPressureNotConverged {
+            residual: final_residual,
+        });
+    }
+    grid.pressure_pa.fill(0.0);
+    for r in 0..n {
+        grid.pressure_pa[indices[r]] = phi[r] + reference - potential(centers[r]);
+    }
+    grid.cut_surface_flux = std::array::from_fn(|a| vec![0.0; known[a].len()]);
+    flux.fill(0.0);
+    for e in &edges {
+        let u = e.velocity - dt / rho / h / e.distance * (phi[e.b] - phi[e.a]);
+        let q = e.area * u;
+        grid.cut_surface_flux[e.axis][e.face] += q * h * h;
+        flux[e.a] += q;
+        flux[e.b] -= q;
+    }
+    for f in &free {
+        let u = f.velocity - dt / rho / h / f.distance * (f.potential - reference - phi[f.row]);
+        flux[f.row] += f.area * u;
+        if let Some(axis) = f.axis {
+            grid.cut_surface_flux[axis][f.face] += f.sign * f.area * u * h * h;
+        }
+    }
+    for (axis, wetted) in area.iter().enumerate() {
+        let velocities = match axis {
+            0 => &mut grid.u,
+            1 => &mut grid.v,
+            _ => &mut grid.w,
+        };
+        for (i, u) in velocities.iter_mut().enumerate() {
+            *u = if wetted[i] > 0.0 {
+                grid.cut_surface_flux[axis][i] / (wetted[i] * h * h)
+            } else {
+                0.0
+            };
+        }
+    }
+    // One shared signed transfer per Cartesian face; no atmospheric inflow.
+    if grid.config.open_top {
+        for z in 0..dims[2] {
+            for x in 0..dims[0] {
+                let i = grid.v_index(x, dims[1], z);
+                grid.cut_surface_flux[1][i] = grid.cut_surface_flux[1][i].max(0.0);
+            }
+        }
+    }
+    grid.extrapolate_surface_velocities(&vec![false; grid.fraction.len()], Some(&known));
+    let after = flux
+        .iter()
+        .enumerate()
+        .map(|(r, v)| v.abs() / h / grid.fraction[indices[r]])
+        .fold(0.0, f64::max);
+    Ok(ProjectionStats {
+        iterations: iterations as usize,
+        active_cells: n,
+        residual_initial: initial,
+        residual_final: final_residual,
+        divergence_before: before,
+        divergence_after: after,
+        converged: true,
+        ..ProjectionStats::default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn tiny_reflected_fragments_keep_nonzero_geometric_support() {
+        for fraction in [1e-50, 1e-188, 1e-300] {
+            for normal in [[1.0, 1.0, 1.0], [-1.0, 1.0, -1.0], [1e-102, 0.5, 0.5]] {
+                let g = geometry(
+                    Some(InterfacePlane::from_fraction_resolved(normal, fraction)),
+                    fraction,
+                )
+                .unwrap();
+                assert!(g.cap.area > 0.0 && g.cap.area.is_finite());
+                assert!(
+                    g.center
+                        .iter()
+                        .all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+                );
+                assert!(g.faces.iter().any(|p| p.area > 0.0));
+                assert!(g.center[1] > 0.0);
+            }
+        }
+    }
+    #[test]
+    fn clipped_liquid_has_correct_centroid_and_embedded_surface() {
+        for depth in [0.2, 0.75] {
+            let g = geometry(
+                Some(InterfacePlane::from_fraction([0.0, 1.0, 0.0], depth)),
+                depth,
+            )
+            .unwrap();
+            assert!((g.center[1] - depth / 2.0).abs() < 1e-14);
+            assert!((g.cap.area - 1.0).abs() < 1e-14);
+            assert!((g.cap.center[1] - depth).abs() < 1e-14);
+            assert_eq!(g.faces[3].area, 0.0);
+            assert!((g.faces[1].area - depth).abs() < 1e-14);
+            assert_eq!(g.faces[2].area, 1.0);
+        }
+    }
+}

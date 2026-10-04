@@ -48,6 +48,9 @@ fn fixture_with_geometry(
     grid.set_pressure_preconditioner(PressurePreconditioner::Multigrid);
     if water_only {
         grid.set_freely_displaced_air()?;
+        if std::env::var("SHALLOW_SHORE_SUPPORT").as_deref() == Ok("1") {
+            grid.set_cut_surface_support()?;
+        }
         if std::env::var("SHALLOW_SHORE_FILMS").as_deref() == Ok("1") {
             grid.set_experimental_surface_films()?;
         }
@@ -79,7 +82,10 @@ struct Outcome {
 }
 
 fn run(depth: f64, water_only: bool) -> Result<Outcome, Box<dyn std::error::Error>> {
-    let mut grid = fixture(depth, water_only)?;
+    run_grid(fixture(depth, water_only)?)
+}
+
+fn run_grid(mut grid: MacGridWorld) -> Result<Outcome, Box<dyn std::error::Error>> {
     let initial = grid.water_volume_m3();
     let initial_energy = grid.gravitational_potential_energy_j();
     let mut peak_energy = initial_energy;
@@ -140,6 +146,10 @@ fn run(depth: f64, water_only: bool) -> Result<Outcome, Box<dyn std::error::Erro
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let films = std::env::var("SHALLOW_SHORE_FILMS").as_deref() == Ok("1");
+    let support = std::env::var("SHALLOW_SHORE_SUPPORT").as_deref() == Ok("1");
+    println!(
+        "{{\"scenario\":\"support_probe_configuration\",\"cut_surface_support\":{support},\"experimental_films\":{films},\"steps\":600,\"dt_s\":0.05}}"
+    );
     let mut shallow_passed = false;
     for (depth, water_only) in [(0.2, true), (0.75, true), (0.2, false)] {
         let enabled = films && water_only;
@@ -186,6 +196,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconstructed_support_keeps_flat_pools_and_full_walls_at_rest() {
+        for (wall, deep) in [(false, false), (true, false), (false, true)] {
+            let mut grid = fixture_with_geometry(0.2, true, !wall, wall).unwrap();
+            grid.set_cut_surface_support().unwrap();
+            if deep {
+                for z in 0..2 {
+                    for x in 0..12 {
+                        grid.set_fraction(GlobalCell::new(x, 2, z), 1.0).unwrap();
+                        grid.set_fraction(GlobalCell::new(x, 3, z), 0.25).unwrap();
+                    }
+                }
+            }
+            let before = grid.fractions().to_vec();
+            let mass = grid.water_volume_m3();
+            for _ in 0..600 {
+                let m = grid.step(0.05).unwrap();
+                assert_eq!(m.pressure_converged_substeps, m.substeps);
+                assert!(grid.max_face_component_velocity_m_s() < 1e-9);
+                assert!((grid.water_volume_m3() - mass).abs() < 1e-12);
+            }
+            assert_eq!(grid.fractions(), before);
+        }
+    }
+
+    #[test]
+    fn reconstructed_support_drains_shallow_and_deep_water_with_bounded_energy() {
+        for depth in [0.2, 0.75] {
+            let mut grid = fixture(depth, true).unwrap();
+            grid.set_cut_surface_support().unwrap();
+            let o = run_grid(grid).unwrap();
+            assert_eq!(o.accepted, 600, "{:?}", o.failure);
+            assert!(o.failure.is_none());
+            assert!(o.downstream > 0.5);
+            assert!(o.error.abs() < 1e-10);
+            assert!(o.min >= 0.0 && o.max <= 1.0);
+            assert!(
+                o.peak_energy <= o.initial_energy * 1.05,
+                "depth={depth}, initial={}, peak={}",
+                o.initial_energy,
+                o.peak_energy
+            );
+        }
+    }
 
     #[test]
     fn deeper_water_control_drains_and_conserves_volume() {
