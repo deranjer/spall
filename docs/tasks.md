@@ -1246,3 +1246,17 @@ and current rest/drainage/energy gates, then original paced 512/1024 trench
 before gameplay promotion. Exact checks, evidence and full-check result:
 docs/reports/ENG-122.md and ENG-122-surface-reconstruction-* files. No viewer,
 GPU, whole-memory or generated-performance acceptance.
+
+### ENG-122 dynamic interface velocity checkpoint (2026-10-04)
+Retain embedded pressure corrections as derived liquid-centroid velocity,
+transport them with exact final accepted water transfers, run existing paired
+path repair before low-order validation, and warm-start reduced-potential CG
+within unchanged budgets. No air mass, cutoffs, clamping or topology changes.
+Channel now passes600/600 (peak5.127m/s), low-dam/full-wall pass, eight nearly
+saturated rest cases and shallow energy/drainage gates pass. Full xtask check:
+1192passed/0failed/63ignored, including strict Clippy. Original final gated
+paced1024 trench passes:5.130528m3 beyond old edge,0.8908x realtime. 512 flows
+20.156031m3 but FAILS final50ms step (10substeps vs8); fluid time stalls at26s.
+Keep diagnostic/in_progress and gameplay default unchanged. Next unblocked
+ENG-122: reproduce/fix edited-worker dry-face velocity and boundary invalidation,
+then rerun unchanged gates. Exact files/checks/risks in reports/ENG-122.md.

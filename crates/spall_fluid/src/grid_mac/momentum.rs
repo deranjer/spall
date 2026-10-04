@@ -228,7 +228,7 @@ pub(super) fn transport(
 /// convex average, including faces that start empty or dry completely. No gas
 /// inertia, mass floor, velocity clipping or division by a vanishing old mass.
 /// Wall reaction and open momentum flux use the same converged velocities.
-fn water_only_upwind(
+pub(super) fn water_only_upwind(
     old: &[f64],
     new: &[f64],
     velocity: &[f64],

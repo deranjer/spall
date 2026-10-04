@@ -1,0 +1,13 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.93s
+     Running `G:/Programming/voxel_engine/target\release\examples\shallow_shore_probe.exe`
+{"scenario":"support_probe_configuration","cut_surface_support":true,"experimental_films":false,"steps":600,"dt_s":0.05}
+shallow-shore case: depth=0.2, water_only=true
+{"scenario":"shallow_shore_energy","water_depth_m":0.2,"water_only":true,"experimental_films":false,"initial_mechanical_energy_j":58860,"peak_mechanical_energy_j":59348.74747666208,"energy_gate_pass":true}
+{"scenario":"resolved_shallow_shelf_to_lower_trench","cell_size_m":1,"dimensions":[12,6,2],"water_depth_m":0.2,"water_only":true,"requested_steps":600,"accepted_steps":600,"dt_s":0.05,"first_pressure_rows":12,"pressure_rows_total":16714,"initial_water_m3":2.4,"downstream_water_m3":2.287347123111868,"water_error_m3":0.0000000000000017763568394002505,"max_face_speed_m_s":2.380184147474619,"fractions_bit_identical":false,"fraction_min":0,"fraction_max":0.20307130581605884,"failure":null,"flow_gate_pass":true}
+shallow-shore case: depth=0.75, water_only=true
+{"scenario":"shallow_shore_energy","water_depth_m":0.75,"water_only":true,"experimental_films":false,"initial_mechanical_energy_j":220725,"peak_mechanical_energy_j":222276.88022144948,"energy_gate_pass":true}
+{"scenario":"resolved_shallow_shelf_to_lower_trench","cell_size_m":1,"dimensions":[12,6,2],"water_depth_m":0.75,"water_only":true,"requested_steps":600,"accepted_steps":600,"dt_s":0.05,"first_pressure_rows":12,"pressure_rows_total":17260,"initial_water_m3":9,"downstream_water_m3":8.87095806216923,"water_error_m3":0,"max_face_speed_m_s":2.998765937331038,"fractions_bit_identical":false,"fraction_min":0,"fraction_max":0.7529134876529032,"failure":null,"flow_gate_pass":true}
+shallow-shore case: depth=0.2, water_only=false
+{"scenario":"shallow_shore_energy","water_depth_m":0.2,"water_only":false,"experimental_films":false,"initial_mechanical_energy_j":58860,"peak_mechanical_energy_j":59938.90035009324,"energy_gate_pass":true}
+{"scenario":"resolved_shallow_shelf_to_lower_trench","cell_size_m":1,"dimensions":[12,6,2],"water_depth_m":0.2,"water_only":false,"requested_steps":600,"accepted_steps":600,"dt_s":0.05,"first_pressure_rows":108,"pressure_rows_total":64800,"initial_water_m3":2.4,"downstream_water_m3":1.709760340326625,"water_error_m3":-0.0000000000000013322676295501878,"max_face_speed_m_s":5.085747260794749,"fractions_bit_identical":false,"fraction_min":-0.0000000000000000000000000701768556158591,"fraction_max":0.1443963461079681,"failure":null,"flow_gate_pass":true}

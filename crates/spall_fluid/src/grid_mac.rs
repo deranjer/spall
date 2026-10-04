@@ -24,6 +24,9 @@ pub struct MacConfig {
     pub pressure_absolute_tolerance: f64,
     pub pressure_diagnostics: bool,
     pub open_top: bool,
+    /// ENG-122 diagnostic only; selected when freely displaced air is enabled.
+    /// Not part of the canonical save/wire configuration.
+    pub reconstructed_surface_support: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +54,7 @@ impl Default for MacConfig {
             pressure_absolute_tolerance: 1.0e-8,
             pressure_diagnostics: false,
             open_top: true,
+            reconstructed_surface_support: false,
         }
     }
 }
@@ -224,6 +228,7 @@ pub struct MacGridWorld {
     experimental_surface_films: bool,
     cut_surface_support: bool,
     cut_surface_flux: [Vec<f64>; 3],
+    cut_surface_velocity: [Vec<f64>; 3],
     compressible_enclosed_air: bool,
     stage_diagnostics: bool,
     diagnostic_outer_step: u64,
@@ -293,6 +298,7 @@ impl MacGridWorld {
             experimental_surface_films: false,
             cut_surface_support: false,
             cut_surface_flux: [Vec::new(), Vec::new(), Vec::new()],
+            cut_surface_velocity: [Vec::new(), Vec::new(), Vec::new()],
             compressible_enclosed_air: false,
             stage_diagnostics: false,
             diagnostic_outer_step: 0,
@@ -392,6 +398,7 @@ impl MacGridWorld {
         self.experimental_surface_films = false;
         self.cut_surface_support = false;
         self.cut_surface_flux = std::array::from_fn(|_| Vec::new());
+        self.cut_surface_velocity = std::array::from_fn(|_| Vec::new());
         // Sealed air defaults to isothermal compressible gas; see
         // `set_compressible_enclosed_air`.
         self.compressible_enclosed_air = true;
@@ -413,6 +420,7 @@ impl MacGridWorld {
         self.experimental_surface_films = false;
         self.cut_surface_support = false;
         self.cut_surface_flux = std::array::from_fn(|_| Vec::new());
+        self.cut_surface_velocity = std::array::from_fn(|_| Vec::new());
         self.strict_phase_bounds = true;
         // Wet-only projection has much less work, but saturated donor cells
         // need pressure residuals below the unchanged 1e-10 low-order bound.
@@ -420,6 +428,9 @@ impl MacGridWorld {
             self.config.pressure_relative_tolerance.min(1.0e-10);
         self.pressure_pa.fill(0.0);
         self.previous_pressure_diagonal = None;
+        if self.config.reconstructed_surface_support {
+            self.set_cut_surface_support()?;
+        }
         Ok(())
     }
 
@@ -435,8 +446,8 @@ impl MacGridWorld {
     }
 
     /// ENG-122 reconstructed liquid support diagnostic. Small drainage and
-    /// energy and nearly saturated rest gates pass. Dynamic channel acceptance
-    /// remains incomplete. This is
+    /// energy, nearly saturated rest and reference motion gates pass. Generated
+    /// trench flow passes, but 512 still exceeds the substep budget. This is
     /// not an accepted gameplay policy and does not use the legacy MG solver.
     pub fn set_cut_surface_support(&mut self) -> Result<(), MacError> {
         if !self.freely_displaced_air || self.experimental_surface_films {
@@ -448,6 +459,16 @@ impl MacGridWorld {
 
     pub(crate) fn cut_surface_support_enabled(&self) -> bool {
         self.cut_surface_support
+    }
+
+    /// Maximum component of the retained interface predictor. This is derived
+    /// numerical state, not an additional fluid mass or a momentum ledger.
+    pub fn reconstructed_interface_speed_m_s(&self) -> f64 {
+        self.cut_surface_velocity
+            .iter()
+            .flatten()
+            .map(|u| u.abs())
+            .fold(0.0, f64::max)
     }
 
     /// Two-phase only (on by default there): treat air that is sealed off from
@@ -691,6 +712,7 @@ impl MacGridWorld {
                 * size_of::<f64>()
             + (self.u.capacity() + self.v.capacity() + self.w.capacity()) * size_of::<f64>()
             + self.cut_surface_flux.iter().map(|v| v.capacity() * size_of::<f64>()).sum::<usize>()
+            + self.cut_surface_velocity.iter().map(|v| v.capacity() * size_of::<f64>()).sum::<usize>()
             + self
                 .previous_pressure_diagonal
                 .as_ref()
@@ -1045,6 +1067,7 @@ impl MacGridWorld {
             return Err(MacError::BoundaryMismatch);
         }
         self.solid = prepared;
+        self.cut_surface_velocity = std::array::from_fn(|_| Vec::new());
         self.pressure_pa.fill(0.0);
         self.previous_liquid.fill(false);
         if let Some(diagonal) = &mut self.previous_pressure_diagonal {
@@ -1191,6 +1214,7 @@ impl MacGridWorld {
         self.solid = candidate_solid;
         self.fraction = candidate_fraction;
         self.trapped = candidate_trapped;
+        self.cut_surface_velocity = std::array::from_fn(|_| Vec::new());
         self.pressure_pa.fill(0.0);
         self.previous_liquid.fill(false);
         if let Some(diagonal) = &mut self.previous_pressure_diagonal {
@@ -3081,6 +3105,27 @@ impl MacGridWorld {
         for &i in &touched {
             low[i] = old[i];
         }
+        let mut predictor_strict = StrictTransferMetrics::default();
+        if self.cut_surface_support {
+            // Cut support supplies the same proposed transfer to low/high FCT.
+            // Resolve saturated chains with the existing exact paired repair
+            // before validating this predictor; never clip the cell amounts.
+            let edges: Vec<_> = raw_fluxes.iter().map(|e| (e.0, e.1, 0.0, false)).collect();
+            predictor_strict = strict_transfer_bounds(
+                &old,
+                &edges,
+                &mut low_fluxes,
+                &touched,
+                &mut incoming,
+                &mut outgoing,
+                &mut low,
+            )?;
+            predictor_strict.scratch_bytes +=
+                edges.capacity() * size_of::<(Option<usize>, Option<usize>, f64, bool)>();
+            for &i in &touched {
+                low[i] = old[i];
+            }
+        }
         let mut outflow_fraction = 0.0;
         let mut region_outflow_fraction = 0.0;
         let mut region_inflow_fraction = 0.0;
@@ -3249,12 +3294,29 @@ impl MacGridWorld {
                 volume_fraction: net_open_outflow_fraction,
             });
         }
+        strict.path_repairs += predictor_strict.path_repairs;
+        strict.scratch_bytes = strict.scratch_bytes.max(predictor_strict.scratch_bytes);
         if self.conservative_momentum || self.experimental_surface_films || self.cut_surface_support
         {
+            let interface = if self.cut_surface_support {
+                Some(cut_surface::transport_velocity(
+                    self,
+                    &old,
+                    &low,
+                    &anti,
+                    &low_fluxes,
+                )?)
+            } else {
+                None
+            };
             let candidate =
                 momentum::transport(self, &old, &low, &anti, &low_fluxes, &full_fluxes)?;
             [self.u, self.v, self.w] = candidate.velocity;
             strict.momentum = candidate.metrics;
+            if let Some((velocity, bytes)) = interface {
+                self.cut_surface_velocity = velocity;
+                strict.momentum.bytes += bytes;
+            }
             strict.momentum.bytes += full_fluxes.capacity() * size_of::<f64>();
         }
         self.fraction = low;

@@ -575,6 +575,7 @@ impl AuthoritativeWater {
             pressure_max_iterations: state.pressure_max_iterations,
             pressure_diagnostics: false,
             open_top: state.open_top,
+            reconstructed_surface_support: false,
         };
         let cells = |values: &[[i64; 3]]| {
             values

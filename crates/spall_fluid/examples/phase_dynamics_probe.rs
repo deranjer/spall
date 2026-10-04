@@ -93,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut peak_momentum = 0.0_f64;
     let mut peak_liquid_speed = 0.0_f64;
     let mut peak_all_speed = 0.0_f64;
+    let mut peak_interface_speed = 0.0_f64;
     let mut max_divergence = 0.0_f64;
     let mut accepted = 0;
     let mut substeps = 0;
@@ -154,6 +155,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         peak_momentum = peak_momentum.max(world.solver().liquid_momentum_kg_m_s()[0]);
         peak_liquid_speed = peak_liquid_speed.max(world.solver().max_liquid_speed_m_s());
         peak_all_speed = peak_all_speed.max(world.solver().max_face_component_velocity_m_s());
+        peak_interface_speed =
+            peak_interface_speed.max(world.solver().reconstructed_interface_speed_m_s());
         peak_energy = peak_energy.max(
             world.solver().gravitational_potential_energy_j() + world.solver().kinetic_energy_j(),
         );
@@ -202,6 +205,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{{\"water_only\":{water_only},\"fixture\":{mode:?},\"backend\":\"fine_mac_phase_reference\",\"fine_dimensions\":{dims:?},\"phase_geometry_factor\":3,\"solver_cell_size_m\":0.25,\"requested_steps\":{steps},\"accepted_steps\":{accepted},\"accepted_substeps\":{substeps},\"dt_s\":0.01,\"advanced_time_s\":{},\"initial_water_m3\":{initial},\"downstream_water_m3\":{downstream},\"peak_eastward_liquid_momentum_kg_m_s\":{peak_momentum},\"peak_liquid_speed_m_s\":{peak_liquid_speed},\"peak_all_face_speed_m_s\":{peak_all_speed},\"peak_divergence_per_s\":{max_divergence},\"pressure_rows_total\":{pressure_rows},\"pressure_iterations_total\":{pressure_iterations},\"phase_pressure_predictor\":{predictor},\"phase_balanced_preconditioner\":{balanced},\"balanced_applications\":{balanced_applications},\"balanced_scratch_peak_bytes\":{balanced_scratch},\"predictor_rows_total\":{predictor_rows},\"predictor_reuses\":{predictor_reuses},\"predictor_rebuilds\":{predictor_rebuilds},\"predictor_total_us\":{predictor_micros},\"balanced_application_total_us\":{balanced_micros},\"initial_liquid_energy_j\":{initial_energy},\"peak_liquid_energy_j\":{peak_energy},\"accounting_error_m3\":{accounting},\"retained_phase_solver_array_bytes\":{},\"coupled_iteration_median_us\":{median},\"coupled_iteration_p99_us\":{p99},\"coupled_iteration_max_us\":{maximum},\"strict_path_repairs\":{path_repairs},\"strict_path_scratch_peak_bytes\":{path_scratch_bytes},\"failure\":{failure_json},\"motion_gate_pass\":{gate},\"compressible_enclosed_air\":{compressible_air},\"conservative_momentum_enabled\":{momentum},\"momentum_transport_error_kg_m_s\":{momentum_error:?},\"momentum_wall_impulse_kg_m_s\":{momentum_wall:?},\"momentum_open_outflow_kg_m_s\":{momentum_exterior:?},\"momentum_scratch_peak_bytes\":{momentum_scratch},\"momentum_subcycles_max\":{momentum_subcycles},\"momentum_dual_mass_defect_peak_kg\":{mass_defect},\"conservative_momentum_gate_accepted\":false,\"production_steps\":0}}",
         f64::from(accepted) * 0.01,
         world.retained_array_bytes()
+    );
+    println!(
+        "{{\"scenario\":\"retained_interface_predictor\",\"peak_component_speed_m_s\":{peak_interface_speed}}}"
     );
     if !gate {
         return Err("fine reference motion gate failed; see metrics".into());

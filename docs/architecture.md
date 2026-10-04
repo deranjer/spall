@@ -394,14 +394,25 @@ The opt-in `MacGridWorld::set_cut_surface_support` backend constructs PLIC
 liquid centroids, wetted Cartesian faces and embedded free surfaces, with
 reduced-potential pressure and accepted-transfer water-only momentum. It has
 no air mass or hidden pressure anchors. Gameplay keeps the existing backend:
-shallow drainage/energy and nearly saturated bulk rest pass, but the dynamic
-channel exceeds the unchanged substep budget at 228/600 steps. Closed-wall
+shallow drainage/energy, nearly saturated bulk rest and the 600-step dynamic
+channel pass. Embedded normal corrections now survive between steps in a
+derived cell velocity, transported with the exact accepted water transfers
+using the same convex water-only upwind solve as momentum. Full-cell samples
+come from corrected Cartesian velocities; initialization uses liquid centroids.
+Boundary commits invalidate this derived state. It is not additional fluid
+mass, a second physical momentum ledger or canonical save state. The existing
+paired path repair runs before low-order predictor validation as well as after
+FCT. Previous physical pressure seeds reduced-potential CG, including active-set
+re-solves, within the original total iteration budget. Closed-wall
 ghost samples retain their vertical level; complementary-air reconstruction
 resolves nearly full cells. Embedded and exposed Cartesian closing interfaces
 use bounded displacement flux with unknown contact pressure instead of
 unconditional atmospheric pressure. Actual exposed polygons determine their
 centroids. This bounded active-set prototype is not full dynamic acceptance.
 The diagnostic uses Jacobi CG, not the selected legacy multigrid solver.
-Retained flux arrays are counted; whole transient geometry/RSS and generated
-trench performance remain unmeasured. See docs/reports/ENG-122.md for the
+Retained flux and three cell-velocity arrays are counted and budget checked.
+Whole transient geometry/RSS remains unmeasured. Original paced trenches now
+flow in both sizes: 1024 passes the final-state advance gate at 0.89x real time;
+512 FAILS it (10 required substeps versus 8), despite earlier flow. No default
+promotion follows from the passing channel. See docs/reports/ENG-122.md for the
 regularized inertia, unchanged gates and precise integration blocker.

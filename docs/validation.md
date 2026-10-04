@@ -1176,13 +1176,23 @@ both shallow flow and energy. Unset the variable for the gameplay baseline.
 
 The previously ignored rest gate is repaired and enabled:
 `cargo test -p spall_fluid --lib reconstructed_support_preserves_nearly_saturated_surface_rest --release -- --nocapture`.
-Eight 600-step cases pass, with peak speed 8.92e-12 m/s versus 1e-7 and maximum
-volume error 2.92e-13 m3 versus 1e-10. Existing gameplay rest regressions remain
+Eight 600-step cases pass, with peak speed 9.15e-12 m/s versus 1e-7 and maximum
+volume error 3.31e-13 m3 versus 1e-10. Existing gameplay rest regressions remain
 enabled. Test unchanged reference scenes using `cargo run -p spall_fluid
 --example phase_dynamics_probe --release -- <channel|low-dam|full-wall> 600
-water-support`. Low-dam/full-wall pass; channel FAILS at 228/600, requiring
-12 substeps versus the unchanged budget of 8. A passing workspace check does
-not authorize promotion while this explicit diagnostic gate fails. The original
-paced 512/1024 trench, viewer/GPU and performance gates remain required before
-activation. No workload, threshold, water amount or velocity cutoff was changed.
+water-support`. All three pass 600 steps; channel peak face speed is 5.13 m/s.
+Accepted-transfer predictor conservation/energy and tiny moving-liquid
+regressions run in `cargo test -p spall_fluid --lib cut_surface --release`.
+Build `cargo build -p sandbox --example water_trench_probe --release`, then run
+the built example sequentially with `512 water-support` and `1024 water-support`.
+Omitting `water-support` retains the gameplay baseline. Keep other builds and
+owned demos stopped during the timed runs. The diagnostic configuration survives
+domain growth. Original seed, cuts, vegetation, pacing and limits are unchanged.
+After pacing, an untimed cloned final grid must accept one 50 ms step; this
+prevents earlier flow from masking later stability skips. 1024 exits 0, but
+512 exits 1: 10 required substeps versus the unchanged budget of 8. Occupancy
+filters in the trace are diagnostic only, never CFL acceptance. A passing
+workspace check does not authorize promotion while this gate fails. Viewer/GPU,
+local momentum accuracy and complete memory/performance acceptance remain open.
+No workload, threshold, water amount or velocity cutoff was changed.
 Evidence and remaining risks: docs/reports/ENG-122.md.

@@ -88,7 +88,10 @@ impl PhasePressureWorld {
                 .map(|i| phase.geometry().component_at(spec.cell_at(i)).is_none())
                 .collect(),
         };
-        let mut solver = MacGridWorld::new(&boundary, config.mac)?;
+        let support_requested = !two_phase && config.mac.reconstructed_surface_support;
+        let mut mac = config.mac;
+        mac.reconstructed_surface_support = false;
+        let mut solver = MacGridWorld::new(&boundary, mac)?;
         if two_phase {
             solver.set_ambient_density(config.air_density_kg_m3)?;
         } else {
@@ -97,12 +100,15 @@ impl PhasePressureWorld {
         solver.set_pressure_preconditioner(config.preconditioner);
         solver.set_strict_phase_bounds();
         solver.restore_fractions(phase.fractions())?;
-        let world = Self {
+        let mut world = Self {
             phase,
             solver,
             max_retained_array_bytes: config.max_retained_array_bytes,
         };
         check_bytes(world.retained_array_bytes(), world.max_retained_array_bytes)?;
+        if support_requested {
+            world.enable_cut_surface_support()?;
+        }
         Ok(world)
     }
 
@@ -125,7 +131,7 @@ impl PhasePressureWorld {
             .fine_spec()
             .dimensions()
             .map(|v| v as usize);
-        let slots = (nx + 1) * ny * nz + nx * (ny + 1) * nz + nx * ny * (nz + 1);
+        let slots = (nx + 1) * ny * nz + nx * (ny + 1) * nz + nx * ny * (nz + 1) + 3 * nx * ny * nz;
         let bytes = self
             .retained_array_bytes()
             .checked_add(slots * size_of::<f64>())
@@ -242,6 +248,13 @@ mod support_tests {
             max_retained_array_bytes: 100_000_000,
         };
         let mut world = PhasePressureWorld::new_water_only(phase, config).unwrap();
+        let mut tight = config;
+        tight.mac.reconstructed_surface_support = true;
+        tight.max_retained_array_bytes = world.retained_array_bytes();
+        assert!(matches!(
+            PhasePressureWorld::new_water_only(PhaseReferenceScene::LowDam.build().unwrap(), tight),
+            Err(PhasePressureError::ArrayLimit { .. })
+        ));
         world.max_retained_array_bytes = world.retained_array_bytes();
         let before = format!("{:?}", world.solver);
         assert!(matches!(

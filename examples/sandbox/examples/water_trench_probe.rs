@@ -21,7 +21,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         size,
         spall_ecology::living::Season::Autumn,
     )?;
-    let setup = scene.water_setup().ok_or("dry world")?.clone();
+    let mut setup = scene.water_setup().ok_or("dry world")?.clone();
+    let support = match std::env::args().nth(2).as_deref() {
+        None | Some("baseline") => false,
+        Some("water-support") => true,
+        _ => return Err("optional model must be baseline or water-support".into()),
+    };
+    setup.config.reconstructed_surface_support = support;
+    println!(
+        "{{\"scenario\":\"paced_trench_configuration\",\"world_size\":{size},\"reconstructed_surface_support\":{support},\"pressure_max_iterations\":{},\"max_substeps\":{}}}",
+        setup.config.pressure_max_iterations, setup.config.max_substeps
+    );
     let shoreline = setup
         .initial_fractions
         .iter()
@@ -156,12 +166,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let crossed = downstream > 1e-9;
+    // Outside the measured paced run, check the next step on an immutable
+    // shadow. Busy/stale/stability skips share a counter; a stalled final
+    // state must not earn stability acceptance just because it once flowed.
+    let mut shadow = water.grid().ok_or("missing committed water grid")?.clone();
+    let final_face_speed = shadow.max_face_component_velocity_m_s();
+    let final_interface_speed = shadow.reconstructed_interface_speed_m_s();
+    shadow.set_pressure_diagnostics(true);
+    let next_step = shadow.step(0.05);
+    let final_step_error = next_step.as_ref().err().map(ToString::to_string);
+    let final_step_accepted = next_step
+        .as_ref()
+        .is_ok_and(|m| m.pressure_converged_substeps == m.substeps);
     let percentile = |v: &[u64], p: usize| v.get(v.len().saturating_sub(1) * p / 100).copied();
     println!(
         "{}",
         serde_json::json!({
             "scenario":"reconstructed_eng121_paced_hammer_trench", "size":size,"seed":1,"season":"autumn",
-            "commit":"186aea8","water_only":true,"coarsen":setup.coarsen,
+            "source_revision":option_env!("SPALL_SOURCE_REVISION"),"reconstructed_surface_support":support,"water_only":true,"coarsen":setup.coarsen,
             "initial_domain_dimensions":setup.domain.dimensions(),"final_domain_dimensions":water.domain().dimensions(),
             "initial_fluid_cells":setup.domain.cell_count() / (setup.coarsen as usize).pow(3),"final_fluid_cells":f.exact_fractions.len(),
             "shoreline":[shoreline.x,shoreline.y,shoreline.z],"old_end_x_exclusive":old_end,"cut_end_x_exclusive":cut_end,
@@ -176,7 +198,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "pressure_rows_total":rows,"pressure_iterations_total":iterations,"water_past_old_edge_m3":downstream,
             "initial_accounted_water_m3":initial,"water_error_m3":accounting(&sim)-initial,"seed_report":format!("{seed:?}"),
             "fraction_min":f.exact_fractions.iter().copied().fold(1.0,f64::min),"fraction_max":f.exact_fractions.iter().copied().fold(0.0,f64::max),
-            "failure":failure,"water_crossed_old_edge":crossed,"trench_center_section":section,"graphical_acceptance":false,"network_acceptance":false
+            "failure":failure,"water_crossed_old_edge":crossed,"trench_center_section":section,"graphical_acceptance":false,"network_acceptance":false,
+            "final_face_speed_m_s":final_face_speed,"final_interface_predictor_speed_m_s":final_interface_speed,"final_shadow_step_dt_s":0.05,"final_shadow_step_accepted":final_step_accepted,"final_shadow_step_error":final_step_error
         })
     );
     if failure.is_some()
@@ -185,6 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || nonconverged > 0
         || hammer_committed != cuts as usize
         || !crossed
+        || !final_step_accepted
     {
         return Err("paced trench run failed; see JSON evidence".into());
     }

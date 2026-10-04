@@ -288,6 +288,18 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         cells.push(cell);
     }
     let n = cells.len();
+    if grid.cut_surface_velocity[0].len() != grid.fraction.len() {
+        // The embedded correction is a reconstruction DOF. Keep its corrected
+        // normal velocity rather than recreating it from extended Cartesian
+        // faces, which can feed an underresolved cap error back into pressure.
+        grid.cut_surface_velocity = std::array::from_fn(|_| vec![0.0; grid.fraction.len()]);
+        for (r, &i) in indices.iter().enumerate() {
+            let u = sample_velocity(&grid.u, &grid.v, &grid.w, dims, centers[r]);
+            for (axis, v) in u.into_iter().enumerate() {
+                grid.cut_surface_velocity[axis][i] = v;
+            }
+        }
+    }
     let mut edges = Vec::new();
     let mut free = Vec::new();
     let mut known: [Vec<bool>; 3] = std::array::from_fn(|a| {
@@ -305,7 +317,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     for (r, cell) in cells.iter().enumerate() {
         if cell.cap.area > 0.0 {
             let center = add(sub(centers[r], cell.center), cell.cap.center);
-            let u = sample_velocity(&grid.u, &grid.v, &grid.w, dims, center);
+            let u = std::array::from_fn(|axis| grid.cut_surface_velocity[axis][indices[r]]);
             free.push(Free {
                 row: r,
                 air: Some(indices[r]),
@@ -451,6 +463,13 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     let mut held = vec![None; free.len()];
     let mut attempts = 0;
     let mut total_iterations = 0;
+    let mut warm = grid.pressure_pa.iter().any(|p| *p != 0.0).then(|| {
+        indices
+            .iter()
+            .enumerate()
+            .map(|(r, i)| grid.pressure_pa[*i] + potential(centers[r]) - reference)
+            .collect::<Vec<_>>()
+    });
     let (phi, initial, final_residual, before) = loop {
         let mut closed = vec![true; n];
         for (j, f) in free.iter().enumerate() {
@@ -500,11 +519,12 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             }
         }
         gauge(&mut rhs, &labels, &closed);
-        let mut phi: Vec<_> = rhs
-            .iter()
-            .zip(&diagonal)
-            .map(|(r, d)| if *d > 0.0 { r / d } else { 0.0 })
-            .collect();
+        let mut phi: Vec<_> = warm.take().unwrap_or_else(|| {
+            rhs.iter()
+                .zip(&diagonal)
+                .map(|(r, d)| if *d > 0.0 { r / d } else { 0.0 })
+                .collect()
+        });
         gauge(&mut phi, &labels, &closed);
         let mut product = vec![0.0; n];
         apply(&phi, &diagonal, &edges, h * h, &mut product);
@@ -591,6 +611,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         if !changed {
             break (phi, initial, final_residual, before);
         }
+        warm = Some(phi);
         attempts += 1;
         if attempts > 32 || total_iterations > grid.config.pressure_max_iterations {
             return Err(MacError::MomentumPressureNotConverged {
@@ -617,6 +638,13 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             |q| q / f.area,
         );
         flux[f.row] += f.area * u;
+        if f.axis.is_none() {
+            // Retain the normal correction while preserving tangential state.
+            let i = indices[f.row];
+            for axis in 0..3 {
+                grid.cut_surface_velocity[axis][i] += cells[f.row].normal[axis] * (u - f.velocity);
+            }
+        }
         if let Some(axis) = f.axis {
             grid.cut_surface_flux[axis][f.face] += f.sign * f.area * u * h * h;
         }
@@ -645,6 +673,14 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         }
     }
     grid.extrapolate_surface_velocities(&vec![false; grid.fraction.len()], Some(&known));
+    for (r, &i) in indices.iter().enumerate() {
+        if cells[r].cap.area == 0.0 {
+            let u = sample_velocity(&grid.u, &grid.v, &grid.w, dims, centers[r]);
+            for (axis, v) in u.into_iter().enumerate() {
+                grid.cut_surface_velocity[axis][i] = v;
+            }
+        }
+    }
     let after = flux
         .iter()
         .enumerate()
@@ -662,9 +698,123 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     })
 }
 
+pub(super) fn transport_velocity(
+    grid: &MacGridWorld,
+    old: &[f64],
+    new: &[f64],
+    edges: &[(Option<usize>, Option<usize>, f64, bool)],
+    water: &[f64],
+) -> Result<([Vec<f64>; 3], usize), MacError> {
+    if old.len() != new.len()
+        || edges.len() != water.len()
+        || grid
+            .cut_surface_velocity
+            .iter()
+            .any(|v| v.len() != old.len())
+    {
+        return Err(MacError::InvalidConfig);
+    }
+    // Transport the reconstruction using the SAME final paired water transfers
+    // as momentum. Empty/drying cells need no air mass or artificial inertia.
+    let lanes: Vec<_> = edges
+        .iter()
+        .zip(water)
+        .map(|(e, f)| (e.0, e.1, *f))
+        .collect();
+    let blocked = vec![false; old.len()];
+    let mut candidate = [Vec::new(), Vec::new(), Vec::new()];
+    for (axis, velocity) in grid.cut_surface_velocity.iter().enumerate() {
+        candidate[axis] =
+            super::momentum::water_only_upwind(old, new, velocity, &blocked, &lanes)?.0;
+    }
+    let bytes = 10 * old.len() * size_of::<f64>()
+        + blocked.capacity() * size_of::<bool>()
+        + lanes.capacity() * size_of::<(Option<usize>, Option<usize>, f64)>();
+    Ok((candidate, bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interface_predictor_uses_accepted_water_and_preserves_momentum_and_energy() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        let boundary = SolidBoundary {
+            spec: DomainSpec::new(GlobalCell::new(0, 0, 0), [4, 1, 1], 4).unwrap(),
+            solid: vec![false; 4],
+        };
+        let mut grid = MacGridWorld::new(&boundary, super::super::MacConfig::default()).unwrap();
+        let edges = [
+            (Some(0), Some(1), 999.0, false),
+            (Some(2), Some(1), -999.0, false),
+        ];
+        for scale in [1.0, 1e-120] {
+            let old = [scale, 0.0, 0.75 * scale, 0.0];
+            let new = [0.4 * scale, scale, 0.35 * scale, 0.0];
+            grid.cut_surface_velocity = [vec![2.0, 0.0, -2.0, 0.0], vec![0.0; 4], vec![0.0; 4]];
+            let (next, _) =
+                transport_velocity(&grid, &old, &new, &edges, &[0.6 * scale, 0.4 * scale]).unwrap();
+            let momentum =
+                |mass: &[f64], u: &[f64]| mass.iter().zip(u).map(|(m, u)| m * u).sum::<f64>();
+            let energy =
+                |mass: &[f64], u: &[f64]| mass.iter().zip(u).map(|(m, u)| m * u * u).sum::<f64>();
+            assert!(
+                (momentum(&old, &grid.cut_surface_velocity[0]) - momentum(&new, &next[0])).abs()
+                    < scale * 1e-10
+            );
+            assert!(energy(&new, &next[0]) <= energy(&old, &grid.cut_surface_velocity[0]));
+            assert!((next[0][1] - 0.4).abs() < 1e-12);
+            assert_eq!(next[0][3], 0.0);
+        }
+    }
+    #[test]
+    fn tiny_moving_liquid_retains_volume_and_bounded_velocity_without_air_inertia() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        let boundary = SolidBoundary {
+            spec: DomainSpec::new(GlobalCell::new(0, 0, 0), [6, 4, 3], 72).unwrap(),
+            solid: vec![false; 72],
+        };
+        let mut grid = MacGridWorld::new(
+            &boundary,
+            super::super::MacConfig {
+                cell_size_m: 1.0,
+                gravity_m_s2: [0.0; 3],
+                reconstructed_surface_support: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        grid.set_freely_displaced_air().unwrap();
+        grid.set_fraction(GlobalCell::new(2, 1, 1), 1e-40).unwrap();
+        grid.set_fraction(GlobalCell::new(3, 1, 1), 1e-80).unwrap();
+        grid.u.fill(1.0);
+        grid.enforce_wall_velocities();
+        let volume = grid.water_volume_m3();
+        let energy = grid.kinetic_energy_j();
+        for step in 0..120 {
+            grid.step(0.01).unwrap();
+            assert!(
+                (grid.water_volume_m3() - volume).abs() < volume * 1e-9,
+                "step={step}"
+            );
+            assert!(grid.max_face_component_velocity_m_s() < 2.0, "step={step}");
+            assert!(grid.kinetic_energy_j() <= energy * 1.05, "step={step}");
+            assert!(grid.reconstructed_interface_speed_m_s().is_finite());
+            assert!(
+                grid.cut_surface_velocity
+                    .iter()
+                    .flatten()
+                    .all(|u| u.is_finite())
+            );
+        }
+        let retained = grid.allocated_bytes();
+        let cached_bytes = 3 * grid.fraction.len() * size_of::<f64>();
+        grid.commit_boundary(grid.solid.clone()).unwrap();
+        assert_eq!(retained - grid.allocated_bytes(), cached_bytes);
+        assert!(grid.cut_surface_velocity.iter().all(Vec::is_empty));
+    }
     #[test]
     fn a_tiny_exposed_face_has_a_centroid_inside_its_actual_polygon() {
         for width in [f64::EPSILON, 1e-12, 1e-6] {
