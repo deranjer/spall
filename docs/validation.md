@@ -1219,3 +1219,27 @@ Closed gauge tests cover independent offsets, component means, tiny values,
 preserved pressure differences and untouched open rows. The original final
 50 ms shadow advance, flow/conservation/rest/energy gates remain required.
 See reports/ENG-122.md and ENG-122-worker-profile-* for final evidence.
+
+### ENG-122 transport speed/stability distinction (2026-10-04)
+
+`stage_profile_us_except_substeps` now includes reconstruction, face-flux,
+limiter, paired-repair, interface and momentum timings. Limiter timing excludes
+repairs; stage totals cover accepted steps only. Original paced gates and all
+positive-water support rules are unchanged. Faster transport is experimental:
+one optimized 512 run fails the final 50 ms stability gate after 33 s of fluid
+time, despite conserved water, flow and converged accepted pressure substeps.
+An existing dry-cell velocity also limits CFL; occupancy-filtered diagnostics
+are not acceptance. The 1024 run passes. Earlier both-size motion passes apply
+to their earlier source/worker trajectories, not this increment's acceptance.
+
+The optional third argument `tail` runs at most 100 additional 50 ms steps on
+an untimed clone of the committed final grid. Its separate continuation record
+credits no owner fluid time or performance, and its failure exits nonzero.
+Example: `water_trench_probe.exe 512 water-support tail`. It is a bounded
+reproduction, not a replacement workload or an increased substep limit.
+A prior-dense numerical build from a4c0a04 plus instrumentation/tail passes
+100 extra cloned steps to 35.85 s; this is a different paced worker trajectory,
+not proof that the optimized failed state is stable. New small tests cover dry
+padding/zero-lane equivalence, tiny positive masses, pinned dense numerical
+compatibility and independence of water transfers from discarded donor samples.
+Current raw evidence and integration decision: reports/ENG-122.md.

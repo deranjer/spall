@@ -96,14 +96,21 @@ pub(super) fn transport(
                     .fold(0.0, f64::max),
             );
             drop(transported);
-            let (next, wall, exterior, error, sweeps) =
-                water_only_upwind(&mass, &expected, velocity, &blocked, &lanes)?;
+            let WaterOnlyResult {
+                velocity: next,
+                wall,
+                exterior,
+                error,
+                sweeps,
+                work_bytes,
+            } = water_only_upwind(&mass, &expected, velocity, &blocked, &lanes)?;
             result.metrics.wall[axis] = wall;
             result.metrics.exterior[axis] = exterior;
             result.metrics.error[axis] = error;
             result.metrics.sweeps = result.metrics.sweeps.max(sweeps);
             result.metrics.bytes = result.metrics.bytes.max(
-                8 * n * size_of::<f64>()
+                work_bytes
+                    + 8 * n * size_of::<f64>()
                     + blocked.capacity() * size_of::<bool>()
                     + lanes.capacity() * size_of::<(Option<usize>, Option<usize>, f64)>(),
             );
@@ -222,6 +229,15 @@ pub(super) fn transport(
     Ok(result)
 }
 
+pub(super) struct WaterOnlyResult {
+    pub velocity: Vec<f64>,
+    pub wall: f64,
+    pub exterior: f64,
+    pub error: f64,
+    pub sweeps: u32,
+    pub work_bytes: usize,
+}
+
 /// Implicit upwind dual momentum using exactly the accepted water mass fluxes.
 /// (M_new + outgoing) u_new - incoming*u_donor = M_old*u_old.
 /// Since M_new + outgoing = M_old + incoming, each velocity update is a
@@ -229,6 +245,165 @@ pub(super) fn transport(
 /// inertia, mass floor, velocity clipping or division by a vanishing old mass.
 /// Wall reaction and open momentum flux use the same converged velocities.
 pub(super) fn water_only_upwind(
+    old: &[f64],
+    new: &[f64],
+    velocity: &[f64],
+    blocked: &[bool],
+    lanes: &[(Option<usize>, Option<usize>, f64)],
+) -> Result<WaterOnlyResult, MacError> {
+    let n = old.len();
+    let momentum: Vec<_> = old.iter().zip(velocity).map(|(m, u)| m * u).collect();
+    let mut diagonal = old.to_vec();
+    let mut transported = old.to_vec();
+    for &(a, b, m) in lanes {
+        if let Some(i) = a {
+            transported[i] -= m;
+        }
+        if let Some(i) = b {
+            transported[i] += m;
+        }
+        if let Some(i) = if m >= 0.0 { b } else { a } {
+            diagonal[i] += m.abs();
+        }
+    }
+    for i in 0..n {
+        let defect = (transported[i] - new[i]).abs();
+        if defect > 1e-10 * old[i].max(new[i]) + 1e-12 {
+            return Err(MacError::MomentumMassMismatch {
+                face: i,
+                defect_kg: defect,
+            });
+        }
+    }
+    let tolerance = 1e-12 + 1e-11 * momentum.iter().map(|p| p.abs()).sum::<f64>();
+    let mut u: Vec<_> = velocity
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            if blocked[i] || diagonal[i] == 0.0 {
+                0.0
+            } else {
+                *u
+            }
+        })
+        .collect();
+    // Exactly null rows stay at the initialized zero velocity. Every positive
+    // old mass or incoming transfer creates a non-null diagonal, including
+    // newly wet, drying-throughflow and subnormal rows; there is no mass floor.
+    let active: Vec<_> = diagonal
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| (*d != 0.0).then_some(i))
+        .collect();
+    let incoming: Vec<_> = lanes
+        .iter()
+        .enumerate()
+        .filter_map(|(j, &(a, b, m))| {
+            (m != 0.0 && if m >= 0.0 { b } else { a }.is_some()).then_some(j)
+        })
+        .collect();
+    let work_bytes = (active.capacity() + incoming.capacity()) * size_of::<usize>();
+    let mut rhs = vec![0.0; n];
+    let mut converged = false;
+    let mut sweeps = 0;
+    for _ in 0..256 {
+        for &i in &active {
+            rhs[i] = momentum[i];
+        }
+        for &j in &incoming {
+            let (a, b, m) = lanes[j];
+            let (donor, receiver) = if m >= 0.0 { (a, b) } else { (b, a) };
+            if let Some(i) = receiver {
+                rhs[i] += m.abs() * donor.map_or(0.0, |j| u[j]);
+            }
+        }
+        let mut change = 0.0;
+        for &i in &active {
+            let next = if blocked[i] || diagonal[i] == 0.0 {
+                0.0
+            } else {
+                rhs[i] / diagonal[i]
+            };
+            change += diagonal[i] * (next - u[i]).abs();
+            u[i] = next;
+        }
+        sweeps += 1;
+        if change <= tolerance {
+            converged = true;
+            break;
+        }
+    }
+    if !converged || u.iter().any(|u| !u.is_finite()) {
+        return Err(MacError::MomentumInvalidState);
+    }
+    let mut reaction = momentum
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| blocked[*i])
+        .map(|(_, p)| p)
+        .sum::<f64>();
+    let mut exterior = 0.0;
+    for &(a, b, m) in lanes {
+        let (donor, receiver) = if m >= 0.0 { (a, b) } else { (b, a) };
+        let flux = m.abs() * donor.map_or(0.0, |j| u[j]);
+        if receiver.is_some_and(|i| blocked[i]) {
+            reaction += flux;
+        }
+        if receiver.is_none() {
+            exterior += flux;
+        }
+    }
+    for i in 0..n {
+        if new[i] == 0.0 {
+            u[i] = 0.0;
+        }
+    }
+    let error = new.iter().zip(&u).map(|(m, u)| m * u).sum::<f64>() + reaction + exterior
+        - momentum.iter().sum::<f64>();
+    if error.abs() > 2.0 * tolerance {
+        return Err(MacError::MomentumInvalidState);
+    }
+    Ok(WaterOnlyResult {
+        velocity: u,
+        wall: reaction,
+        exterior,
+        error,
+        sweeps,
+        work_bytes,
+    })
+}
+fn cell_faces(grid: &MacGridWorld, i: usize, axis: usize) -> [usize; 2] {
+    let [nx, ny, _] = grid.dims();
+    let (x, y, z) = (i % nx, i / nx % ny, i / (nx * ny));
+    match axis {
+        0 => [grid.u_index(x, y, z), grid.u_index(x + 1, y, z)],
+        1 => [grid.v_index(x, y, z), grid.v_index(x, y + 1, z)],
+        _ => [grid.w_index(x, y, z), grid.w_index(x, y, z + 1)],
+    }
+}
+fn is_wall(grid: &MacGridWorld, face: usize, axis: usize) -> bool {
+    let mut ext = grid.dims();
+    ext[axis] += 1;
+    let mut q = [
+        face % ext[0],
+        face / ext[0] % ext[1],
+        face / (ext[0] * ext[1]),
+    ];
+    if q[axis] == 0 || (q[axis] == grid.dims()[axis] && !(axis == 1 && grid.config.open_top)) {
+        return true;
+    }
+    if q[axis] < grid.dims()[axis] && grid.solid[grid.cell_index(q[0], q[1], q[2])] {
+        return true;
+    }
+    q[axis] -= 1;
+    grid.solid[grid.cell_index(q[0], q[1], q[2])]
+}
+
+// Pinned a4c0a04 dense solver oracle: this optimization must preserve accepted
+// momentum, convergence and ledgers even in disconnected subnormal components.
+// Kept test-only so the compatibility gate can detect future arithmetic changes.
+#[cfg(test)]
+fn dense_water_only_reference(
     old: &[f64],
     new: &[f64],
     velocity: &[f64],
@@ -330,32 +505,6 @@ pub(super) fn water_only_upwind(
     }
     Ok((u, reaction, exterior, error, sweeps))
 }
-fn cell_faces(grid: &MacGridWorld, i: usize, axis: usize) -> [usize; 2] {
-    let [nx, ny, _] = grid.dims();
-    let (x, y, z) = (i % nx, i / nx % ny, i / (nx * ny));
-    match axis {
-        0 => [grid.u_index(x, y, z), grid.u_index(x + 1, y, z)],
-        1 => [grid.v_index(x, y, z), grid.v_index(x, y + 1, z)],
-        _ => [grid.w_index(x, y, z), grid.w_index(x, y, z + 1)],
-    }
-}
-fn is_wall(grid: &MacGridWorld, face: usize, axis: usize) -> bool {
-    let mut ext = grid.dims();
-    ext[axis] += 1;
-    let mut q = [
-        face % ext[0],
-        face / ext[0] % ext[1],
-        face / (ext[0] * ext[1]),
-    ];
-    if q[axis] == 0 || (q[axis] == grid.dims()[axis] && !(axis == 1 && grid.config.open_top)) {
-        return true;
-    }
-    if q[axis] < grid.dims()[axis] && grid.solid[grid.cell_index(q[0], q[1], q[2])] {
-        return true;
-    }
-    q[axis] -= 1;
-    grid.solid[grid.cell_index(q[0], q[1], q[2])]
-}
 
 #[cfg(test)]
 mod tests {
@@ -365,10 +514,141 @@ mod tests {
     use spall_core::GlobalCell;
 
     #[test]
+    fn sparse_water_sweeps_are_bit_identical_to_the_previous_dense_solver() {
+        for tiny in [1e-40, 1e-120, 1e-300] {
+            for seed in 0..32 {
+                let n = 128;
+                let mut old = vec![0.0; n];
+                let mut new = old.clone();
+                let mut velocity = vec![1e5; n];
+                let mut blocked = vec![false; n];
+                let a = 7;
+                let b = 31;
+                let c = 63;
+                let d = 127;
+                old[a] = 1.0;
+                old[c] = 1.0;
+                old[d] = tiny;
+                new[a] = 0.75;
+                new[b] = 0.25;
+                new[c] = 1.0;
+                new[d] = tiny;
+                velocity[a] = seed as f64 / 9.0 - 2.0;
+                velocity[b] = -8.0;
+                velocity[c] = 1.0 - seed as f64 / 17.0;
+                velocity[d] = 4.0;
+                // Include wall reaction and open outflow in the same graph.
+                blocked[b] = seed % 2 == 0;
+                let mut lanes = vec![
+                    (Some(b), Some(a), -0.25),
+                    (Some(a), Some(c), 0.1),
+                    (Some(c), Some(a), 0.1),
+                    (Some(d), Some(d), tiny * 0.1),
+                ];
+                if seed % 3 == 0 {
+                    lanes.push((Some(c), None, 0.2));
+                    new[c] = 0.8;
+                }
+                lanes.extend((0..n - 1).map(|i| (Some(i), Some(i + 1), 0.0)));
+                let dense =
+                    dense_water_only_reference(&old, &new, &velocity, &blocked, &lanes).unwrap();
+                let sparse = water_only_upwind(&old, &new, &velocity, &blocked, &lanes).unwrap();
+                assert_eq!(
+                    dense.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    sparse
+                        .velocity
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    (
+                        dense.1.to_bits(),
+                        dense.2.to_bits(),
+                        dense.3.to_bits(),
+                        dense.4
+                    ),
+                    (
+                        sparse.wall.to_bits(),
+                        sparse.exterior.to_bits(),
+                        sparse.error.to_bits(),
+                        sparse.sweeps
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dry_padding_and_zero_transfers_preserve_positive_momentum_components() {
+        let old = [1.0, 0.0, 1.0, 1e-120];
+        let new = [0.75, 0.25, 1.0, 1e-120];
+        let velocity = [2.0, -8.0, -1.0, 4.0];
+        let lanes = [
+            (Some(1), Some(0), -0.25),
+            (Some(0), Some(2), 0.1),
+            (Some(2), Some(0), 0.1),
+            (Some(3), Some(3), 1e-121),
+        ];
+        let compact = water_only_upwind(&old, &new, &velocity, &[false; 4], &lanes).unwrap();
+        let mapping = [17, 500, 600, 638];
+        let mut padded_old = vec![0.0; 640];
+        let mut padded_new = padded_old.clone();
+        let mut padded_velocity = vec![1e5; 640];
+        for (i, &j) in mapping.iter().enumerate() {
+            padded_old[j] = old[i];
+            padded_new[j] = new[i];
+            padded_velocity[j] = velocity[i];
+        }
+        let mut padded_lanes: Vec<_> = lanes
+            .iter()
+            .map(|&(a, b, m)| (a.map(|i| mapping[i]), b.map(|i| mapping[i]), m))
+            .collect();
+        // Empty transfers and empty rows cannot alter conservation, mixing or
+        // convergence, even when their unused velocities are very large.
+        padded_lanes.extend((0..639).map(|i| (Some(i), Some(i + 1), 0.0)));
+        let padded = water_only_upwind(
+            &padded_old,
+            &padded_new,
+            &padded_velocity,
+            &vec![false; 640],
+            &padded_lanes,
+        )
+        .unwrap();
+        for (i, &j) in mapping.iter().enumerate() {
+            assert_eq!(compact.velocity[i].to_bits(), padded.velocity[j].to_bits());
+        }
+        assert_eq!(
+            (
+                compact.wall,
+                compact.exterior,
+                compact.error,
+                compact.sweeps
+            ),
+            (padded.wall, padded.exterior, padded.error, padded.sweeps)
+        );
+        assert_eq!(padded.velocity[0], 0.0);
+        assert_eq!(
+            padded.velocity[mapping[3]], 4.0,
+            "positive tiny mass must participate"
+        );
+        assert!(compact.error.abs() < 1e-10);
+        let energy =
+            |m: &[f64], u: &[f64]| m.iter().zip(u).map(|(m, u)| 0.5 * m * u * u).sum::<f64>();
+        assert!(energy(&new, &compact.velocity) <= energy(&old, &velocity));
+    }
+
+    #[test]
     fn water_only_momentum_handles_drying_and_empty_throughflow_without_air_mass() {
         let old = [1.0, 0.0, 0.0];
         let new = [0.0, 0.5, 0.5];
-        let (u, wall, exterior, error, _) = water_only_upwind(
+        let WaterOnlyResult {
+            velocity: u,
+            wall,
+            exterior,
+            error,
+            ..
+        } = water_only_upwind(
             &old,
             &new,
             &[2.0, 0.0, 0.0],
@@ -384,7 +664,9 @@ mod tests {
 
     #[test]
     fn water_only_upwinding_dissipates_energy_and_accounts_for_wall_and_outflow() {
-        let (u, _, _, error, _) = water_only_upwind(
+        let WaterOnlyResult {
+            velocity: u, error, ..
+        } = water_only_upwind(
             &[1.0, 1.0],
             &[1.0, 1.0],
             &[1.0, -1.0],
@@ -397,7 +679,12 @@ mod tests {
         for wall in [false, true] {
             let destination = wall.then_some(1);
             let new = if wall { [0.0, 1.0] } else { [0.0, 0.0] };
-            let (_, reaction, exterior, error, _) = water_only_upwind(
+            let WaterOnlyResult {
+                wall: reaction,
+                exterior,
+                error,
+                ..
+            } = water_only_upwind(
                 &[1.0, 0.0],
                 &new,
                 &[2.0, 0.0],

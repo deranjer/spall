@@ -420,9 +420,10 @@ large stale pressure just because its global flux residual is small. Symmetric
 local corrections consume that same budget. Anisotropic subnormal wedges use a scaled analytic offset and
 per-axis normalized centroid weights, without deleting positive fragments.
 Retained flux and three cell-velocity arrays are counted and budget checked.
-Whole transient geometry/RSS remains unmeasured. Original paced trenches now
-flow and pass the final-state advance gate in both sizes: 1024 at 0.89x real
-time and repeated 512 runs at about 0.54x. The 512 performance, full transient
+Whole transient geometry/RSS remains unmeasured. The prior pressure checkpoint
+passed original paced trenches in both sizes: 1024 at 0.89x real time and 512
+at about 0.54x. The subsequent faster transport diagnostic fails a later 512
+final-state stability gate; it remains unaccepted (see the checkpoint below). The 512 performance, full transient
 memory and local momentum-accuracy gates remain open. No default promotion
 follows from the passing motion gates. See docs/reports/ENG-122.md for the
 regularized inertia, unchanged gates and precise integration blocker.
@@ -441,3 +442,29 @@ transport and shows no stability rejections. This allocation reduction does not
 establish a meaningful speedup or full memory acceptance. Transport profiling
 is the next ENG-122 item; gameplay backend and numerical limits are unchanged.
 See docs/reports/ENG-122.md for final runs and checks.
+
+### ENG-122 transport profiling and experimental sparse sweeps (2026-10-04)
+
+Accepted-step transport metrics separately time reconstruction, face transfers,
+limiting, paired repair, interface transport and staggered momentum. The baseline
+512 profile places 46% of transport time in momentum and 25% in the interface
+predictor, which share the water-only implicit upwind solve. Its iterative work
+lists include every non-null mass/incoming-transfer row and nonzero incoming
+lane. Only exactly null rows and exactly zero transfers skip redundant sweep
+work; original validation, tolerance, iteration budget and reaction/outflow
+ledgers remain. New list capacities are included in scratch accounting. The
+reconstructed path also bypasses ordinary PLIC/donor computations that were
+replaced by its paired physical transfers. This is no geometry/topology or
+water-volume approximation. A pinned dense test oracle checks bit-identical
+velocities, convergence and ledgers across 96 small scenarios. Runtime/canonical
+DTOs, worker authority and the gameplay default remain unchanged.
+
+Measured transport cost falls, but a faster 512 worker run stalls at 33 s of
+fluid time with nine required substeps against eight. A dense-reference clone
+continuation from a different slower-worker trajectory passes through 35.85 s,
+so the failure cannot be attributed solely to elapsed fluid time. The diagnostic
+is unaccepted; no CFL/occupancy filtering, speed clipping or budget increase is
+used. Next ENG-122: reproduce the edit/growth-dependent high Cartesian/interface
+velocity state and stabilize physical pressure/momentum coupling before claiming
+a performance gate or promoting this backend. Exact runs and remaining risks
+are in docs/reports/ENG-122.md.

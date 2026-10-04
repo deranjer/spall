@@ -99,6 +99,13 @@ pub struct MacStepMetrics {
     pub velocity_advection_micros: u64,
     pub pressure_solve_micros: u64,
     pub transport_micros: u64,
+    /// Accepted transport stage timings; limiter excludes separately timed repairs.
+    pub transport_reconstruction_micros: u64,
+    pub transport_flux_micros: u64,
+    pub transport_limiter_micros: u64,
+    pub transport_repair_micros: u64,
+    pub transport_interface_micros: u64,
+    pub transport_momentum_micros: u64,
     pub strict_path_repair_count: u64,
     /// Additional transient CSR/BFS array capacities; excludes FCT scratch.
     pub strict_path_scratch_bytes: usize,
@@ -1418,6 +1425,12 @@ impl MacGridWorld {
             let stage = Instant::now();
             let (permitted_outflow, tracked_out, tracked_in, strict) =
                 self.advect_fraction_fct(sub_dt, tracked_region)?;
+            metrics.transport_reconstruction_micros += strict.timings[0];
+            metrics.transport_flux_micros += strict.timings[1];
+            metrics.transport_limiter_micros += strict.timings[2];
+            metrics.transport_repair_micros += strict.timings[3];
+            metrics.transport_interface_micros += strict.timings[4];
+            metrics.transport_momentum_micros += strict.timings[5];
             metrics.strict_path_repair_count += strict.path_repairs;
             metrics.strict_path_scratch_bytes =
                 metrics.strict_path_scratch_bytes.max(strict.scratch_bytes);
@@ -2856,12 +2869,19 @@ impl MacGridWorld {
         dt: f64,
         tracked_region: Option<&[bool]>,
     ) -> Result<(f64, f64, f64, StrictTransferMetrics), MacError> {
+        let mut timings = [0; 6];
+        let stage = Instant::now();
         let [nx, ny, nz] = self.dims();
         let h = self.config.cell_size_m;
         let old = self.fraction.clone();
-        let planes = (self.ambient_density_kg_m3.is_some() || self.freely_displaced_air)
+        // Reconstructed support already supplies paired physical transfers.
+        // Its ordinary donor/PLIC candidates would be computed then discarded.
+        let planes = (!self.cut_surface_support
+            && (self.ambient_density_kg_m3.is_some() || self.freely_displaced_air))
             .then(|| self.reconstruct_planes());
         let n = old.len();
+        timings[0] = stage.elapsed().as_micros() as u64;
+        let stage = Instant::now();
         let face_flux = |axis: usize, xf: usize, yf: usize, zf: usize| {
             let f = [xf, yf, zf];
             let (left, right, vel) = match axis {
@@ -2938,6 +2958,16 @@ impl MacGridWorld {
             {
                 return None;
             }
+            if self.cut_surface_support {
+                let courant = vel * dt / h;
+                let fi = match axis {
+                    0 => self.u_index(xf, yf, zf),
+                    1 => self.v_index(xf, yf, zf),
+                    _ => self.w_index(xf, yf, zf),
+                };
+                let flux = self.cut_surface_flux[axis][fi] * dt / h.powi(3);
+                return Some((left, right, flux, flux, courant));
+            }
             let upstream = if vel >= 0.0 { left } else { right };
             let c_up = upstream.map(|i| old[i]).unwrap_or(0.0);
             let courant = vel * dt / h;
@@ -2994,15 +3024,6 @@ impl MacGridWorld {
             } else {
                 courant * reconstructed
             };
-            if self.cut_surface_support {
-                let fi = match axis {
-                    0 => self.u_index(xf, yf, zf),
-                    1 => self.v_index(xf, yf, zf),
-                    _ => self.w_index(xf, yf, zf),
-                };
-                let flux = self.cut_surface_flux[axis][fi] * dt / h.powi(3);
-                return Some((left, right, flux, flux, courant));
-            }
             Some((left, right, donor, high, courant))
         };
         let mut raw_fluxes: Vec<(Option<usize>, Option<usize>, f64, f64)> = Vec::new();
@@ -3029,6 +3050,8 @@ impl MacGridWorld {
                 }
             }
         }
+        timings[1] = stage.elapsed().as_micros() as u64;
+        let stage = Instant::now();
         // Only cells with a non-trivial face can change. Every limiter pass and
         // the FCT bounds below work on this list: an earlier version swept the
         // whole domain (and re-allocated four domain-sized vectors) up to 64
@@ -3122,6 +3145,7 @@ impl MacGridWorld {
             // Resolve saturated chains with the existing exact paired repair
             // before validating this predictor; never clip the cell amounts.
             let edges: Vec<_> = raw_fluxes.iter().map(|e| (e.0, e.1, 0.0, false)).collect();
+            let repair = Instant::now();
             predictor_strict = strict_transfer_bounds(
                 &old,
                 &edges,
@@ -3131,6 +3155,7 @@ impl MacGridWorld {
                 &mut outgoing,
                 &mut low,
             )?;
+            timings[3] += repair.elapsed().as_micros() as u64;
             predictor_strict.scratch_bytes +=
                 edges.capacity() * size_of::<(Option<usize>, Option<usize>, f64, bool)>();
             for &i in &touched {
@@ -3272,6 +3297,7 @@ impl MacGridWorld {
             // Re-limit the actually accepted donor+PLIC face transfers, never
             // cell amounts. Reuse FCT scratch and recompute all boundary/region
             // ledgers from exactly the final paired transfers.
+            let repair = Instant::now();
             strict = strict_transfer_bounds(
                 &old,
                 &anti,
@@ -3281,6 +3307,7 @@ impl MacGridWorld {
                 &mut p_minus,
                 &mut low,
             )?;
+            timings[3] += repair.elapsed().as_micros() as u64;
             net_open_outflow_fraction = 0.0;
             region_outflow_fraction = 0.0;
             region_inflow_fraction = 0.0;
@@ -3307,8 +3334,10 @@ impl MacGridWorld {
         }
         strict.path_repairs += predictor_strict.path_repairs;
         strict.scratch_bytes = strict.scratch_bytes.max(predictor_strict.scratch_bytes);
+        timings[2] = (stage.elapsed().as_micros() as u64).saturating_sub(timings[3]);
         if self.conservative_momentum || self.experimental_surface_films || self.cut_surface_support
         {
+            let stage = Instant::now();
             let interface = if self.cut_surface_support {
                 Some(cut_surface::transport_velocity(
                     self,
@@ -3320,8 +3349,11 @@ impl MacGridWorld {
             } else {
                 None
             };
+            timings[4] = stage.elapsed().as_micros() as u64;
+            let stage = Instant::now();
             let candidate =
                 momentum::transport(self, &old, &low, &anti, &low_fluxes, &full_fluxes)?;
+            timings[5] = stage.elapsed().as_micros() as u64;
             [self.u, self.v, self.w] = candidate.velocity;
             strict.momentum = candidate.metrics;
             if let Some((velocity, bytes)) = interface {
@@ -3330,6 +3362,7 @@ impl MacGridWorld {
             }
             strict.momentum.bytes += full_fluxes.capacity() * size_of::<f64>();
         }
+        strict.timings = timings;
         self.fraction = low;
         Ok((
             net_open_outflow_fraction * volume,
@@ -3349,6 +3382,7 @@ const DONOR_LIMIT_TOLERANCE: f64 = 1.0e-12;
 
 #[derive(Debug, Default)]
 struct StrictTransferMetrics {
+    timings: [u64; 6],
     momentum: momentum::MomentumMetrics,
     path_repairs: u64,
     scratch_bytes: usize,
@@ -3489,6 +3523,7 @@ fn repair_strict_transfer_paths(
     parents.fill(usize::MAX);
     let mut queue = Vec::with_capacity(touched.len());
     let mut metrics = StrictTransferMetrics {
+        timings: [0; 6],
         momentum: momentum::MomentumMetrics::default(),
         path_repairs: 0,
         scratch_bytes: (offsets.capacity()
@@ -5853,6 +5888,51 @@ mod tests {
             assert!((grid.pressure_pa[rows as usize - 1] - expected).abs() < 1e-5);
             assert!(grid.fraction[3] > 0.0, "air-centred water was discarded");
         }
+    }
+
+    #[test]
+    fn reconstructed_transfers_do_not_depend_on_discarded_donor_velocity_samples() {
+        let mut grid = all_air_grid(
+            [4, 3, 2],
+            MacConfig {
+                cell_size_m: 1.0,
+                gravity_m_s2: [0.0; 3],
+                ..MacConfig::default()
+            },
+        );
+        grid.set_freely_displaced_air().unwrap();
+        grid.set_cut_surface_support().unwrap();
+        let left = grid.cell_index(1, 1, 0);
+        let right = grid.cell_index(2, 1, 0);
+        let tiny = grid.cell_index(3, 1, 1);
+        grid.fraction[left] = 0.25;
+        grid.fraction[right] = 0.25;
+        grid.fraction[tiny] = 1e-120;
+        grid.cut_surface_velocity = std::array::from_fn(|_| vec![0.0; grid.fraction.len()]);
+        grid.cut_surface_flux = [
+            vec![0.0; grid.u.len()],
+            vec![0.0; grid.v.len()],
+            vec![0.0; grid.w.len()],
+        ];
+        let face = grid.u_index(2, 1, 0);
+        grid.cut_surface_flux[0][face] = 0.1;
+        let mut different_samples = grid.clone();
+        different_samples.u.fill(-2.0);
+        different_samples.v.fill(3.0);
+        different_samples.w.fill(-1.0);
+        let mut region = vec![false; grid.fraction.len()];
+        region[right] = true;
+        let first = grid.advect_fraction_fct(0.1, Some(&region)).unwrap();
+        let second = different_samples
+            .advect_fraction_fct(0.1, Some(&region))
+            .unwrap();
+        assert_eq!((first.0, first.1, first.2), (second.0, second.1, second.2));
+        assert_eq!(grid.fraction, different_samples.fraction);
+        assert_eq!(grid.fraction[tiny], 1e-120);
+        assert!((grid.fraction[left] - 0.24).abs() < 1e-15);
+        assert!((grid.fraction[right] - 0.26).abs() < 1e-15);
+        assert!((first.2 - 0.01).abs() < 1e-15);
+        assert_eq!(first.0, 0.0);
     }
 
     #[test]

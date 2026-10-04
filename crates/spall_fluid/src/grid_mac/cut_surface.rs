@@ -842,11 +842,14 @@ pub(super) fn transport_velocity(
         .collect();
     let blocked = vec![false; old.len()];
     let mut candidate = [Vec::new(), Vec::new(), Vec::new()];
+    let mut work_bytes = 0;
     for (axis, velocity) in grid.cut_surface_velocity.iter().enumerate() {
-        candidate[axis] =
-            super::momentum::water_only_upwind(old, new, velocity, &blocked, &lanes)?.0;
+        let result = super::momentum::water_only_upwind(old, new, velocity, &blocked, &lanes)?;
+        work_bytes = work_bytes.max(result.work_bytes);
+        candidate[axis] = result.velocity;
     }
-    let bytes = 10 * old.len() * size_of::<f64>()
+    let bytes = work_bytes
+        + 10 * old.len() * size_of::<f64>()
         + blocked.capacity() * size_of::<bool>()
         + lanes.capacity() * size_of::<(Option<usize>, Option<usize>, f64)>();
     Ok((candidate, bytes))

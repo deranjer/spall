@@ -29,10 +29,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     setup.config.reconstructed_surface_support = support;
     let trace = match std::env::args().nth(3).as_deref() {
-        None => false,
+        None | Some("tail") => false,
         Some("trace") => true,
-        _ => return Err("optional diagnostic must be trace".into()),
+        _ => return Err("optional diagnostic must be trace or tail".into()),
     };
+    let tail = std::env::args().nth(3).as_deref() == Some("tail");
     setup.config.pressure_diagnostics = trace;
     println!(
         "{{\"scenario\":\"paced_trench_configuration\",\"world_size\":{size},\"reconstructed_surface_support\":{support},\"pressure_max_iterations\":{},\"max_substeps\":{}}}",
@@ -130,6 +131,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     step.transport_micros,
                     step.boundary_micros,
                     u64::from(step.substeps),
+                    step.transport_reconstruction_micros,
+                    step.transport_flux_micros,
+                    step.transport_limiter_micros,
+                    step.transport_repair_micros,
+                    step.transport_interface_micros,
+                    step.transport_momentum_micros,
                 ]);
                 rows += step.pressure_active_rows_total;
                 iterations += step.pressure_iterations;
@@ -201,6 +208,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "transport",
         "boundary",
         "substeps",
+        "transport_reconstruction",
+        "transport_flux",
+        "transport_limiter",
+        "transport_repair",
+        "transport_interface",
+        "transport_momentum",
     ]
     .into_iter()
     .enumerate()
@@ -236,6 +249,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "final_face_speed_m_s":final_face_speed,"final_interface_predictor_speed_m_s":final_interface_speed,"final_shadow_step_dt_s":0.05,"final_shadow_step_accepted":final_step_accepted,"final_shadow_step_error":final_step_error
         })
     );
+    let mut tail_failed = false;
+    if tail {
+        // Untimed reproduction on a clone: no extra owner time, worker work or
+        // accepted trench progress is credited by this continuation.
+        let mut continuation = water.grid().ok_or("missing committed water grid")?.clone();
+        continuation.set_pressure_diagnostics(false);
+        let initial_volume = continuation.water_volume_m3();
+        let mut accepted = 0;
+        let mut error = None;
+        for _ in 0..100 {
+            match continuation.step(0.05) {
+                Ok(m) if m.pressure_converged_substeps == m.substeps => accepted += 1,
+                Ok(_) => {
+                    error = Some("pressure did not converge".to_string());
+                    break;
+                }
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        tail_failed = error.is_some();
+        println!(
+            "{}",
+            serde_json::json!({
+                "scenario":"untimed_committed_grid_continuation", "source_revision":option_env!("SPALL_SOURCE_REVISION"),
+                "size":size, "initial_owner_fluid_time_s":f.fluid_time_s,
+                "dt_s":0.05, "requested_extra_steps":100, "accepted_extra_steps":accepted,
+                "continued_fluid_time_s":f.fluid_time_s + f64::from(accepted)*0.05,
+                "error":error, "water_error_m3":continuation.water_volume_m3()-initial_volume,
+                "final_face_speed_m_s":continuation.max_face_component_velocity_m_s(),
+                "final_interface_speed_m_s":continuation.reconstructed_interface_speed_m_s(),
+                "owner_state_advanced":false, "timing_acceptance":false
+            })
+        );
+    }
     if failure.is_some()
         || rejected > 0
         || accepted_ticks != requested_ticks
@@ -245,6 +295,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || !final_step_accepted
     {
         return Err("paced trench run failed; see JSON evidence".into());
+    }
+    if tail_failed {
+        return Err("untimed continuation failed; see separate JSON evidence".into());
     }
     Ok(())
 }
