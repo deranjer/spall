@@ -1276,3 +1276,18 @@ Keep diagnostic/in_progress and default unchanged. Next unblockedENG-122:
 extract/reproduce actual wet-face donor and pressure correction driving the
 512Cartesian/extension velocity spike. Full checks/risks/evidence in reports/ENG-122.md.
 Full cargo xtask check passed:1195passed/0failed/63ignored, strict Clippy and formatting included.
+
+### ENG-122 local pressure accuracy checkpoint (2026-10-04)
+Wet-face trace and a force-free5x5x5 reproduction confirm stale warm pressure
+can pass global flux convergence in tiny rows and inject66.7m/s motion. Every
+non-null positive row now also needs diagonal-scaled potential accuracy;
+symmetric local corrections use the original total400iteration budget. New
+regression passes at1e-40/1e-120/1e-300 fractions without dropping/clipping water.
+82fluid tests and channel600, shallow6 gates pass. Original512trench nowPASSES
+final50msstep in two runs (4substeps within8),24.77/24.62m3past old edge at
+0.5407/0.5370x realtime. 1024PASSES5.051671m3past old edge at0.8884x. Keep
+in_progress/diagnostic:512performance, full memory and local momentumaccuracy
+remain open. Next unblockedENG-122: profile grown512worker/pressure/transport
+cost and classify skips; reducecost without weakening newly passing gates.
+Exact checks/evidence/contracts:reports/ENG-122.md and ENG-122-local-pressure-*.
+Full cargo xtask check passed:1196passed/0failed/63ignored, strict Clippy and formatting included.

@@ -28,6 +28,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("optional model must be baseline or water-support".into()),
     };
     setup.config.reconstructed_surface_support = support;
+    let trace = match std::env::args().nth(3).as_deref() {
+        None => false,
+        Some("trace") => true,
+        _ => return Err("optional diagnostic must be trace".into()),
+    };
+    setup.config.pressure_diagnostics = trace;
     println!(
         "{{\"scenario\":\"paced_trench_configuration\",\"world_size\":{size},\"reconstructed_surface_support\":{support},\"pressure_max_iterations\":{},\"max_substeps\":{}}}",
         setup.config.pressure_max_iterations, setup.config.max_substeps

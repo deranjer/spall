@@ -581,10 +581,43 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         gauge(&mut z, &labels, &closed);
         let mut direction = z.clone();
         let mut rz: f64 = residual.iter().zip(&z).map(|(r, z)| r * z).sum();
+        // A tiny row can satisfy the global flux norm while retaining a large
+        // pressure/velocity error. Also resolve each row's diagonal-scaled
+        // potential defect; no volume threshold removes a row from this gate.
+        let locally_converged = |residual: &[f64]| {
+            residual.iter().enumerate().all(|(i, r)| {
+                diagonal[i] == 0.0
+                    || (r / diagonal[i]).abs()
+                        <= grid.config.pressure_absolute_tolerance.max(
+                            grid.config.pressure_relative_tolerance * (rhs[i] / diagonal[i]).abs(),
+                        )
+            })
+        };
         let mut iterations = 0;
-        while norm(&residual) > target
+        while (norm(&residual) > target || !locally_converged(&residual))
             && iterations + total_iterations < grid.config.pressure_max_iterations
         {
+            if norm(&residual) <= target {
+                // Local symmetric relaxation corrects weak rows whose dot
+                // products disappear beneath the large rows' roundoff. Each
+                // correction consumes one iteration of the original budget.
+                precondition(&residual, &diagonal, &lower, &upper, &mut z);
+                for i in 0..n {
+                    phi[i] += z[i];
+                }
+                gauge(&mut phi, &labels, &closed);
+                apply(&phi, &diagonal, &edges, h * h, &mut product);
+                for i in 0..n {
+                    residual[i] = rhs[i] - product[i];
+                }
+                gauge(&mut residual, &labels, &closed);
+                precondition(&residual, &diagonal, &lower, &upper, &mut z);
+                gauge(&mut z, &labels, &closed);
+                direction.copy_from_slice(&z);
+                rz = residual.iter().zip(&z).map(|(r, z)| r * z).sum();
+                iterations += 1;
+                continue;
+            }
             apply(&direction, &diagonal, &edges, h * h, &mut product);
             let dp: f64 = direction.iter().zip(&product).map(|(a, b)| a * b).sum();
             if !dp.is_finite() || dp <= 0.0 {
@@ -623,7 +656,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         }
         gauge(&mut residual, &labels, &closed);
         let final_residual = norm(&residual);
-        if final_residual > target * 1.01 {
+        if final_residual > target * 1.01 || !locally_converged(&residual) {
             return Err(MacError::MomentumPressureNotConverged {
                 residual: final_residual,
             });
@@ -662,6 +695,23 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     let mut flux = vec![0.0; n];
     for e in &edges {
         let u = e.velocity - dt / rho / h / e.distance * (phi[e.b] - phi[e.a]);
+        if grid.config.pressure_diagnostics && u.abs() > 10.0 {
+            eprintln!(
+                "{{\"type\":\"cut_fast_edge\",\"axis\":{},\"face\":{},\"a\":{},\"b\":{},\"fraction_a\":{:.17e},\"fraction_b\":{:.17e},\"area\":{:.17e},\"distance\":{:.17e},\"predicted_velocity\":{:.17e},\"corrected_velocity\":{:.17e},\"phi_a\":{:.17e},\"phi_b\":{:.17e}}}",
+                e.axis,
+                e.face,
+                indices[e.a],
+                indices[e.b],
+                grid.fraction[indices[e.a]],
+                grid.fraction[indices[e.b]],
+                e.area,
+                e.distance,
+                e.velocity,
+                u,
+                phi[e.a],
+                phi[e.b]
+            );
+        }
         let q = e.area * u;
         grid.cut_surface_flux[e.axis][e.face] += q * h * h;
         flux[e.a] += q;
@@ -672,6 +722,22 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             || f.velocity - dt / rho / h / f.distance * (f.potential - reference - phi[f.row]),
             |q| q / f.area,
         );
+        if grid.config.pressure_diagnostics && u.abs() > 10.0 {
+            eprintln!(
+                "{{\"type\":\"cut_fast_free\",\"axis_or_cap\":{},\"face\":{},\"cell\":{},\"fraction\":{:.17e},\"area\":{:.17e},\"distance\":{:.17e},\"predicted_velocity\":{:.17e},\"corrected_velocity\":{:.17e},\"phi\":{:.17e},\"boundary_phi\":{:.17e},\"held\":{}}}",
+                f.axis.unwrap_or(3),
+                f.face,
+                indices[f.row],
+                grid.fraction[indices[f.row]],
+                f.area,
+                f.distance,
+                f.velocity,
+                u,
+                phi[f.row],
+                f.potential - reference,
+                held[j].is_some()
+            );
+        }
         flux[f.row] += f.area * u;
         if f.axis.is_none() {
             // Retain the normal correction while preserving tangential state.
@@ -771,6 +837,46 @@ pub(super) fn transport_velocity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tiny_fragment_pressure_guess_cannot_create_motion_without_forces() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        let boundary = SolidBoundary {
+            spec: DomainSpec::new(GlobalCell::new(0, 0, 0), [5, 5, 5], 125).unwrap(),
+            solid: vec![false; 125],
+        };
+        let mut grid = MacGridWorld::new(
+            &boundary,
+            super::super::MacConfig {
+                cell_size_m: 0.75,
+                gravity_m_s2: [0.0; 3],
+                reconstructed_surface_support: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        grid.set_freely_displaced_air().unwrap();
+        for fraction in [1e-40, 1e-120, 1e-300] {
+            let mut grid = grid.clone();
+            for cell in [
+                GlobalCell::new(2, 2, 2),
+                GlobalCell::new(3, 2, 2),
+                GlobalCell::new(2, 3, 2),
+                GlobalCell::new(2, 2, 3),
+            ] {
+                grid.set_fraction(cell, fraction).unwrap();
+                let i = grid.cell_index_global(cell).unwrap();
+                grid.pressure_pa[i] = 10_000.0;
+            }
+            grid.project(0.05).unwrap();
+            assert!(
+                grid.max_face_component_velocity_m_s() < 1e-7,
+                "speed={}",
+                grid.max_face_component_velocity_m_s()
+            );
+            assert!(grid.reconstructed_interface_speed_m_s() < 1e-7);
+        }
+    }
     #[test]
     fn trench_subnormal_anisotropic_fragment_reconstructs_without_deletion() {
         let fraction = f64::from_bits(7);

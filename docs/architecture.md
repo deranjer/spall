@@ -414,11 +414,15 @@ centroids. This bounded active-set prototype is not full dynamic acceptance.
 The diagnostic uses symmetric Gauss-Seidel preconditioned CG on the actual
 liquid graph, independently of legacy multigrid. Apparent convergence is checked
 against the true matrix residual; additional correction uses the remaining
-original budget. Anisotropic subnormal wedges use a scaled analytic offset and
+original budget. Each non-null positive liquid row must also satisfy a
+diagonal-scaled potential defect criterion: a tiny row cannot pass with a
+large stale pressure just because its global flux residual is small. Symmetric
+local corrections consume that same budget. Anisotropic subnormal wedges use a scaled analytic offset and
 per-axis normalized centroid weights, without deleting positive fragments.
 Retained flux and three cell-velocity arrays are counted and budget checked.
 Whole transient geometry/RSS remains unmeasured. Original paced trenches now
-flow in both sizes: 1024 passes the final-state advance gate at 0.89x real time;
-512 FAILS it (10 required substeps versus 8), despite earlier flow. No default
-promotion follows from the passing channel. See docs/reports/ENG-122.md for the
+flow and pass the final-state advance gate in both sizes: 1024 at 0.89x real
+time and repeated 512 runs at about 0.54x. The 512 performance, full transient
+memory and local momentum-accuracy gates remain open. No default promotion
+follows from the passing motion gates. See docs/reports/ENG-122.md for the
 regularized inertia, unchanged gates and precise integration blocker.

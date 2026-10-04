@@ -1180,7 +1180,7 @@ Eight 600-step cases pass, with peak speed 9.15e-12 m/s versus 1e-7 and maximum
 volume error 3.31e-13 m3 versus 1e-10. Existing gameplay rest regressions remain
 enabled. Test unchanged reference scenes using `cargo run -p spall_fluid
 --example phase_dynamics_probe --release -- <channel|low-dam|full-wall> 600
-water-support`. All three pass 600 steps; channel peak face speed is 5.23 m/s.
+water-support`. All three pass 600 steps; channel peak face speed is 5.08 m/s.
 Accepted-transfer predictor conservation/energy and tiny moving-liquid
 regressions run in `cargo test -p spall_fluid --lib cut_surface --release`.
 This also covers 600-step exact equivalence under unchanged boundary refreshes,
@@ -1194,9 +1194,14 @@ owned demos stopped during the timed runs. The diagnostic configuration survives
 domain growth. Original seed, cuts, vegetation, pacing and limits are unchanged.
 After pacing, an untimed cloned final grid must accept one 50 ms step; this
 prevents earlier flow from masking later stability skips. 1024 exits 0, but
-512 exits 1: 10 required substeps versus the unchanged budget of 8. Occupancy
+512 exits 0 in two repeated runs: four final substeps within the budget of eight.
+The small force-free pressure-guess regression covers 1e-40, 1e-120 and 1e-300
+fractions; global flux convergence alone used to generate 66.7 m/s motion.
+Pass `trace` after `water-support` for wet-face pressure diagnostics; trace
+timings are not performance acceptance. Occupancy
 filters in the trace are diagnostic only, never CFL acceptance. A passing
-workspace check does not authorize promotion while this gate fails. Viewer/GPU,
+workspace check and these motion passes do not authorize gameplay promotion while
+512 runs at about 0.54x real time. Viewer/GPU,
 local momentum accuracy and complete memory/performance acceptance remain open.
 No workload, threshold, water amount or velocity cutoff was changed.
 Evidence and remaining risks: docs/reports/ENG-122.md.

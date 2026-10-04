@@ -447,7 +447,8 @@ impl MacGridWorld {
 
     /// ENG-122 reconstructed liquid support diagnostic. Small drainage and
     /// energy, nearly saturated rest and reference motion gates pass. Generated
-    /// trench flow passes, but 512 still exceeds the substep budget. This is
+    /// trench flow and final-state advance pass, but 512 performance remains
+    /// unaccepted. This is
     /// not an accepted gameplay policy; it uses symmetric Gauss-Seidel CG,
     /// independently of the legacy MG solver.
     pub fn set_cut_surface_support(&mut self) -> Result<(), MacError> {
