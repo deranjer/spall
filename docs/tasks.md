@@ -1472,3 +1472,8 @@ respects wet-column bottom/top to avoid falsely tinting dry rooms underwater.
 Final client86/render61/fluid104 and strict workspace Clippy pass; initial canal
 full-check1221/0/63 across137 suites preceded room changes. GPU before/after
 captures verified. In progress; nextENG-122 user assessment/stored transfers.
+
+ENG-122 manual acceptance (2026-10-05): user satisfied with current gameplay water
+look/feel/appearance after dry-room false underwater tint fix; requests PR.
+Original coarse-wall/capacity/recovery and experimental precision gates remain
+unfinished; gameplay feedback does not accept them. Ticket split decision pending.
