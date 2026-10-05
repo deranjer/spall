@@ -354,14 +354,13 @@ const WATER_BAND_M: f32 = 0.25;
 const WATER_VOXEL_M: f32 = 0.25;
 const WATER_VOXEL_HINT: f32 = 0.22;
 
-// Surface height of the water column at `xz`, or WATER_NONE.
-fn water_height_at(xz: vec2<f32>) -> f32 {
-    if globals.water_cam.w < 0.5 { return WATER_NONE; }
+// Top and bottom of the selected wet run, or WATER_NONE for a dry column.
+fn water_bounds_at(xz: vec2<f32>) -> vec2<f32> {
+    if globals.water_cam.w < 0.5 { return vec2<f32>(WATER_NONE); }
     let c = vec2<i32>(floor((xz - globals.water_field.xy) / globals.water_field.z));
     let dim = i32(globals.water_field.w);
-    if any(c < vec2<i32>(0)) || any(c >= vec2<i32>(dim)) { return WATER_NONE; }
-    let h = textureLoad(water_field_tex, c, 0).r;
-    return select(WATER_NONE, h, h > WATER_NONE);
+    if any(c < vec2<i32>(0)) || any(c >= vec2<i32>(dim)) { return vec2<f32>(WATER_NONE); }
+    return textureLoad(water_field_tex, c, 0).rg;
 }
 
 // Light scattered back toward the viewer by water at `depth` below the surface.
@@ -387,7 +386,10 @@ fn apply_water_view(lit: vec3<f32>, p: vec3<f32>, probe_xz: vec2<f32>) -> vec3<f
     if globals.water_cam.w < 0.5 { return lit; }
     let cam = globals.camera_pos.xyz;
     let cam_in = globals.water_cam.x > 0.5;
-    var s = water_height_at(probe_xz);
+    let bounds = water_bounds_at(probe_xz);
+    // Dry spaces below a pool are not underwater, even at the same X/Z.
+    if p.y < bounds.y { return lit; }
+    var s = bounds.x;
     if cam_in { s = globals.water_cam.y; }
     if s <= WATER_NONE { return lit; }
     let d = p - cam;
@@ -489,9 +491,10 @@ fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
     // Under water the light that reached this surface lost its reds on the way
     // down, and the sun's share is broken into drifting caustic veins.
     let probe_xz = in.world_pos.xz + n.xz * 0.06;
-    let wet_h = water_height_at(probe_xz);
+    let wet_bounds = water_bounds_at(probe_xz);
+    let wet_h = wet_bounds.x;
     var sub_light = vec3<f32>(1.0);
-    if in.world_pos.y < wet_h {
+    if in.world_pos.y >= wet_bounds.y && in.world_pos.y < wet_h {
         let depth = wet_h - in.world_pos.y;
         let sun_path = depth / max(l.y, 0.3);
         direct = direct * exp(-WATER_ABSORB * sun_path) * water_caustics(in.world_pos, depth, n);

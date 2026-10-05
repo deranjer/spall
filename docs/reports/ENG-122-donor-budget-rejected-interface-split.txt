@@ -1,0 +1,118 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `release` profile [optimized + debuginfo] target(s) in 9.95s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\release\deps\spall_fluid-b49d3fbffb0ad4ba.exe)
+
+running 97 tests
+test grid_mac::cut_surface::tests::disconnected_closed_gauges_preserve_open_pressure_and_row_differences ... ok
+test grid_mac::cut_surface::tests::trench_subnormal_anisotropic_fragment_reconstructs_without_deletion ... ok
+test grid_mac::cut_surface::tests::clipped_liquid_has_correct_centroid_and_embedded_surface ... ok
+test grid_mac::cut_surface::tests::interface_predictor_uses_accepted_water_and_preserves_momentum_and_energy ... ok
+test grid_mac::cut_surface::tests::equilibrated_closed_gauge_preserves_physical_pressure_jumps ... ok
+test grid_mac::cut_surface::tests::pressure_preconditioner_is_symmetric_positive_on_closed_and_tiny_graphs ... ok
+test grid_mac::cut_surface::tests::a_tiny_exposed_face_has_a_centroid_inside_its_actual_polygon ... ok
+test grid_mac::cut_surface::tests::tiny_reflected_fragments_keep_nonzero_geometric_support ... ok
+test fixtures::tests::scene_walls_and_dam_are_solid_and_reservoirs_open ... ok
+test grid_mac::cut_surface::tests::stale_reconstructed_normal_cannot_inject_canonical_momentum ... ok
+test grid_mac::cut_surface::tests::full_cell_free_boundary_retreat_keeps_uniform_translation ... ok
+test grid_mac::cut_surface::tests::tiny_fragment_pressure_guess_cannot_create_motion_without_forces ... ok
+test grid_mac::momentum::tests::conservative_momentum_accounts_for_open_boundary_and_wall_impulse ... ok
+test grid_mac::cut_surface::tests::exposed_air_patch_cannot_supply_water_to_a_moving_fragment ... ok
+test grid_mac::momentum::tests::conservative_momentum_preserves_uniform_transverse_velocity_and_energy ... ok
+test grid_mac::momentum::tests::conservative_momentum_uses_final_limited_fluxes_and_rejects_mass_defects ... ok
+test grid_mac::momentum::tests::dry_padding_and_zero_transfers_preserve_positive_momentum_components ... ok
+test grid_mac::cut_surface::tests::vanishing_thickness_cap_cannot_turn_a_pressure_hint_into_motion ... ok
+test grid_mac::momentum::tests::water_only_momentum_handles_drying_and_empty_throughflow_without_air_mass ... ok
+test grid_mac::momentum::tests::water_only_upwinding_dissipates_energy_and_accounts_for_wall_and_outflow ... ok
+test grid_mac::replay::tests::replay_preserves_rejected_cfl_state_without_advancing ... ok
+test grid_mac::replay::tests::replay_rejects_unknown_version_oversized_truncated_and_nonfinite_data ... ok
+test grid_mac::cut_surface::tests::wet_donors_preserve_local_uniform_momentum_and_zero_pressure_work ... ok
+test grid_mac::momentum::tests::sparse_water_sweeps_are_bit_identical_to_the_previous_dense_solver ... ok
+test grid_mac::tests::closed_pressure_operator_is_symmetric_positive_on_zero_mean_subspace ... ok
+test grid_mac::tests::boundary_edit_displaces_fully_submerged_cell_without_losing_water ... ok
+test grid_mac::tests::boundary_displacement_cannot_teleport_through_solid_walls ... ok
+test grid_mac::tests::boundary_edit_displaces_water_within_a_sealed_pocket ... ok
+test grid_mac::tests::assembled_pressure_operator_matches_reference_stencil ... ok
+test grid_mac::tests::committed_geometry_edit_invalidates_pressure_warm_start ... ok
+test grid_mac::tests::cut_surface_reconstruction_preserves_flat_wall_normals_and_tiny_air_volume ... ok
+test grid_mac::tests::fixed_tick_overload_does_not_advance_or_discard_time ... ok
+test grid_mac::tests::fraction_diagnostics_keep_tiny_cells_in_solver_and_report_bridging ... ok
+test grid_mac::tests::balanced_phase_pressure_is_symmetric_positive_and_reuses_scratch ... ok
+test grid_mac::tests::fct_shared_flux_is_conservative_and_keeps_fraction_bounds ... ok
+test fixtures::tests::reference_volumes_match_recorded_particle_fixture_bits ... ok
+test grid_mac::tests::geometric_plane_matches_analytic_volumes_and_translates_sharp_interfaces ... ok
+test grid_mac::tests::boundary_retains_sealed_water_and_releases_only_connected_capacity ... ok
+test grid_mac::tests::basin_initialization_spreads_vof_depth_over_the_wetted_footprint ... ok
+test grid_mac::tests::hydrostatic_measurements_are_consistent_at_two_time_steps ... ok
+test grid_mac::tests::hydrostatic_projection_is_consistent_at_two_cell_resolutions ... ok
+test grid_mac::tests::ic0_converges_on_anchored_component_and_rebuilds_for_each_projection ... ok
+test grid_mac::tests::ic0_handles_disconnected_enclosed_single_cell_nullspaces ... ok
+test grid_mac::tests::ic0_reports_non_positive_factor_pivots_without_fallback ... ok
+test grid_mac::tests::intact_wall_on_brick_seam_blocks_face_transfer ... ok
+test grid_mac::replay::tests::replay_preserves_warm_surface_state_and_next_accepted_transfers_bitwise ... ok
+test grid_mac::tests::open_top_accounting_subtracts_applied_negative_antiflux ... ok
+test grid_mac::tests::hydrostatic_column_cancels_gravity_at_a_free_surface ... ok
+test grid_mac::tests::geometry_boundary_rejects_liquid_overlap_without_mutating_grid ... ok
+test grid_mac::tests::open_top_outflow_is_explicit_and_closes_the_volume_balance ... ok
+test grid_mac::tests::phase_galerkin_includes_density_top_and_gas_diagonals_without_losing_symmetry ... ok
+test grid_mac::tests::mic0_and_multigrid_converge_to_the_ic0_projection_on_a_closed_two_phase_tank ... ok
+test grid_mac::tests::pressure_projection_matches_closed_two_cell_reference_and_nullspace ... ok
+test grid_mac::tests::multigrid_preconditioner_is_symmetric_positive_on_two_phase_geometry ... ok
+test grid_mac::tests::phase_predictor_matches_physical_fine_projection_with_open_and_sealed_air ... ok
+test grid_mac::tests::refined_boundary_preserves_world_extent_and_exact_aligned_solids ... ok
+test grid_mac::tests::reconstructed_transfers_do_not_depend_on_discarded_donor_velocity_samples ... ok
+test grid_mac::tests::rejected_fixture_edit_preserves_voxels_and_all_grid_arrays ... ok
+test grid_mac::tests::speed_and_energy_diagnostics_use_vector_velocity_and_gravity_reference ... ok
+test grid_mac::tests::scaled_tunnel_side_walls_meet_the_roof_without_an_air_course ... ok
+test grid_mac::tests::strict_path_repair_refunds_open_outflow_in_both_face_orientations ... ok
+test grid_mac::tests::strict_path_repair_rejects_a_correction_that_cannot_change_a_face ... ok
+test grid_mac::tests::strict_path_repair_rejects_when_its_finite_augmentation_budget_is_exhausted ... ok
+test grid_mac::tests::strict_phase_transfers_keep_throughflow_when_full_cell_fluxes_differ_by_ulps ... ok
+test grid_mac::tests::strict_phase_transfers_preserve_saturated_cycles_and_signed_boundary_accounting ... ok
+test grid_mac::tests::strict_phase_transfers_repair_a_path_longer_than_the_local_sweep_budget ... ok
+test grid_mac::tests::strict_phase_transfers_resolve_both_saturated_chain_orientations ... ok
+test grid_mac::tests::tracked_region_volume_change_matches_final_applied_face_fluxes ... ok
+test grid_mac::tests::freely_displaced_air_uses_plic_surface_pressure_and_preserves_partial_water ... ok
+test grid_mac::replay::tests::sealed_trench_crop_retains_all_water_and_remains_stable ... FAILED
+test grid_mac::tests::two_phase_pressure_matches_density_weighted_hydrostatic_column ... ok
+test grid_mac::tests::two_phase_variable_density_operator_is_symmetric_and_ic0_converges ... ok
+test grid_mac::cut_surface::tests::tiny_moving_liquid_retains_volume_and_bounded_velocity_without_air_inertia ... ok
+test grid_mac::tests::unoccupied_canal_closure_stops_subsequent_exchange ... ok
+test phase_pressure::support_tests::support_activation_respects_array_budget_atomically_and_is_idempotent ... ok
+test phase_water::tests::packed_index_ceiling_does_not_wrap_or_alias_axes ... ok
+test tests::boundary_snapshot_reads_real_voxels_across_brick_seam ... ok
+test grid_mac::tests::dam_breach_creates_downstream_surge_momentum ... ok
+test tests::brick_wise_capture_matches_the_per_cell_reference ... ok
+test tests::coarsening_keeps_one_voxel_walls_and_drops_isolated_voxels ... ok
+test tests::domain_limits_are_checked_before_allocation ... ok
+test tests::missing_residency_fails_closed_instead_of_becoming_air ... ok
+test tests::water_accounting_is_independent_and_refuses_solids_or_overfill ... ok
+test grid_mac::replay::tests::captured_trench_crop_advances_without_velocity_instability ... ok
+test grid_mac::tests::parallel_step_is_bit_identical_for_any_thread_count ... ok
+test grid_mac::tests::cut_surface_closes_a_buried_air_gap_without_losing_water_or_creating_energy ... ok
+test grid_mac::tests::stacked_pool_floor_blocks_flux_while_lower_tunnel_moves_water ... ok
+test grid_mac::tests::voxel_reservoir_initialization_matches_reference_volume_and_canal_moves_water ... ok
+test grid_mac::tests::fully_filled_basin_settles_without_losing_water_or_excess_surface_drift ... ok
+test grid_mac::cut_surface::tests::unchanged_boundary_refresh_preserves_dynamic_reconstruction ... ok
+test grid_mac::tests::freely_displaced_air_fills_diving_bell_without_creating_water ... ok
+test grid_mac::tests::atmospheric_surface_pressure_is_stable_with_nearly_saturated_neighbours ... ok
+test grid_mac::tests::two_phase_partial_depth_equilibrium_survives_thirty_seconds ... ok
+test grid_mac::tests::standing_wave_keeps_linear_period_without_numerical_damping_or_growth ... ok
+test grid_mac::tests::compressible_sealed_air_matches_isothermal_diving_bell_equilibrium ... ok
+test grid_mac::tests::two_phase_canal_breach_closure_and_tunnel_preserve_gameplay_invariants ... ok
+test grid_mac::tests::reconstructed_support_preserves_nearly_saturated_surface_rest ... ok
+
+failures:
+
+---- grid_mac::replay::tests::sealed_trench_crop_retains_all_water_and_remains_stable stdout ----
+
+thread 'grid_mac::replay::tests::sealed_trench_crop_retains_all_water_and_remains_stable' (26904) panicked at crates\spall_fluid\src\grid_mac\replay.rs:317:43:
+called `Result::unwrap()` on an `Err` value: SubstepBudgetExceeded { required: 9, maximum: 8 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    grid_mac::replay::tests::sealed_trench_crop_retains_all_water_and_remains_stable
+
+test result: FAILED. 96 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.48s
+
+error: test failed, to rerun pass `-p spall_fluid --lib`

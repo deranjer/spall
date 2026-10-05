@@ -1,0 +1,13 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.14s
+     Running unittests examples\shallow_shore_probe.rs (G:/Programming/voxel_engine/target\debug\examples\shallow_shore_probe-0732c17d39996588.exe)
+
+running 4 tests
+test tests::shallow_water_must_drain_into_the_open_lower_trench ... ignored, ENG-122 unresolved shallow-film gate; run explicitly against baseline or opted-in prototype
+test tests::deeper_water_control_drains_and_conserves_volume ... ok
+{"scenario":"wide_partial_layer_rest","steps":600,"dt_s":0.05,"peak_speed_m_s":0.00000000000027461366514103247,"water_error_m3":-0.00000000000003197442310920451}
+test tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest ... ok
+test tests::flat_shallow_pool_and_full_wall_preserve_rest_and_volume ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.14s
+

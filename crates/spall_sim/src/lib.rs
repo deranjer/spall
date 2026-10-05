@@ -99,7 +99,8 @@ pub use stage::{StageError, StageInput, StagedEdit, stage_edit};
 pub use transfer::{ChildBody, PlanChildError, plan_child};
 pub use water::{
     AuthoritativeWater, CellBox, GrowthPlan, GrowthRefusal, MAX_GATED_SOURCE_RATE, WaterError,
-    WaterExecution, WaterFrame, WaterGrowth, WaterSeedReport, WaterSetup, WaterTickMetrics,
+    WaterExecution, WaterFrame, WaterGrowth, WaterSeedReport, WaterSetup, WaterSkipReasons,
+    WaterTickMetrics,
 };
 pub use world::{RestoredBody, SimWorld, WorldError};
 pub use world::{

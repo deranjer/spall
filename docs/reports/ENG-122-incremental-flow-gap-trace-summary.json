@@ -1,0 +1,10 @@
+{
+  "name": "gap-trace",
+  "caps": 600,
+  "stored_caps_exceed_1e_minus8": 0,
+  "max_stored_cap_error_m_s": 3.97881864432633e-09,
+  "max_verified_internal_cap_error_m_s": 3.9788187241579774e-09,
+  "partial_flow_workspace_upper_bound_bytes": 1400,
+  "summary": null,
+  "timing_acceptance": false
+}

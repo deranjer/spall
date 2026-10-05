@@ -1,0 +1,27 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `release` profile [optimized + debuginfo] target(s) in 4.59s
+     Running unittests examples\shallow_shore_probe.rs (G:/Programming/voxel_engine/target\release\examples\shallow_shore_probe-6fdea60467f2f146.exe)
+
+running 6 tests
+test tests::shallow_water_must_drain_into_the_open_lower_trench ... ok
+test tests::deeper_water_control_drains_and_conserves_volume ... ok
+{"scenario":"wide_partial_layer_rest","steps":600,"dt_s":0.05,"peak_speed_m_s":0.000000000005160316618457496,"water_error_m3":-0.0000000000003090860900556436}
+test tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest ... ok
+test tests::flat_shallow_pool_and_full_wall_preserve_rest_and_volume ... ok
+test tests::reconstructed_support_drains_shallow_and_deep_water_with_bounded_energy ... ok
+
+thread 'tests::reconstructed_support_keeps_flat_pools_and_full_walls_at_rest' (13188) panicked at crates\spall_fluid\examples\shallow_shore_probe.rs:221:13:
+assertion `left == right` failed
+  left: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.9999999999999949, 1.0, 1.0, 0.9999999999999806, 1.0, 1.0, 1.0, 0.9999999999999544, 0.9999999999999999, 1.0, 1.0, 0.25000000000020967, 0.2499999999999244, 0.2499999999999793, 0.24999999999997943, 0.25000000000021083, 0.25000000000001127, 0.2500000000000523, 0.2499999999998958, 0.24999999999992892, 0.24999999999979447, 0.24999999999991274, 0.24999999999999814, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9999999999999771, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.9999999999999838, 1.0, 0.9999999999999978, 1.0, 0.2500000000000746, 0.2500000000000049, 0.2500000000000425, 0.2500000000000697, 0.2499999999999314, 0.25000000000021155, 0.25000000000004385, 0.2499999999998643, 0.24999999999981018, 0.24999999999984338, 0.2500000000001127, 0.24999999999989753, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+test tests::reconstructed_support_keeps_flat_pools_and_full_walls_at_rest ... FAILED
+
+failures:
+
+failures:
+    tests::reconstructed_support_keeps_flat_pools_and_full_walls_at_rest
+
+ right: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+error: test failed, to rerun pass `-p spall_fluid --example shallow_shore_probe`

@@ -1,0 +1,24 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `release` profile [optimized + debuginfo] target(s) in 4.82s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\release\deps\spall_fluid-b49d3fbffb0ad4ba.exe)
+
+running 1 test
+test grid_mac::cut_surface::tests::sealed_partial_cell_has_exactly_stationary_atmospheric_cap ... FAILED
+
+failures:
+
+---- grid_mac::cut_surface::tests::sealed_partial_cell_has_exactly_stationary_atmospheric_cap stdout ----
+
+thread 'grid_mac::cut_surface::tests::sealed_partial_cell_has_exactly_stationary_atmospheric_cap' (36036) panicked at crates\spall_fluid\src\grid_mac\cut_surface.rs:1069:17:
+assertion `left == right` failed: C=0.25, predictor=0.1
+  left: 1.3877787807814457e-17
+ right: 0.0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    grid_mac::cut_surface::tests::sealed_partial_cell_has_exactly_stationary_atmospheric_cap
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p spall_fluid --lib`

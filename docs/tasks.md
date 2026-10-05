@@ -1137,3 +1137,352 @@ wire/save contract changes explicit before integration. Validate hydrostatic
 rest and real trench/dam-break response, then measure the same generated
 512/1024 release workload. No sleep heuristic that stalls flow, body coupling
 or GPU solver. Evidence: reports/ENG-121-rest-state.md.
+
+### ENG-122 increment 1 - exact coarse open-space geometry (2026-10-02)
+
+Experimental cut_cell geometry retains every six-connected open component within
+coarse cells, integer solid-excluding capacity, vertical layer counts and matched
+open fine-face portals. Seven geometry tests cover thin internal walls/openings,
+misaligned apertures, seed-volume preservation, exact horizontal capacity,
+256-pattern connectivity against fine flood fill, and bounded build/input errors.
+Actual seed-1 autumn worlds retain all authored water (512: 674 m3; 1024:
+2400.546875 m3). Geometry build medians: 8.39 / 39.42 ms; no fluid steps measured.
+Integration decision: keep experimental until component-aware pressure/transport,
+conservative edit remapping and an explicitly versioned component-amount/ledger
+canonical state pass acceptance. Current one-amount-per-coarse-cell state cannot
+recover independent spaces. No production solver or save/wire change in this
+increment. Full design, checks and remaining risks: reports/ENG-122.md.
+
+ENG-122 increment 2 (2026-10-02): experimental component pressure/donor transport and candidate LE component-amount codec added after integrating merged main 7278376. Complete fluid suite: 67 passed; protocol: 52 existing plus four candidate tests passed; strict affected-package Clippy passed. Both showcase seed-1 autumn generated-world operator gates failed on first transport: residual-scale capacity overshoots, plus artificial rest currents 0.1341 m/s (512) and 1.0236 m/s (1024). Pressure samples 10.60/61.55 ms; zero accepted operator iterations, no production fluid steps. Keep experimental: no production/save/wire activation. See docs/reports/ENG-122.md, ENG-122-operators.jsonl and ENG-122-state-format.md. Next unblocked work is ENG-122 balanced free-surface projection and conservative bounded transport; momentum, sealed air, edit remapping and complete durable recovery remain gates. ENG-122 stays in progress.
+
+ENG-122 increment 3 (2026-10-02): experimental hydrostatic reference split and paired capacity limiter. Fourteen operator tests include one-minute irregular-surface rest at 0.5/0.3 fine-cell fractions, thirty-second unequal-level flow/conservation, saturated throughflow/cycles and atomic bounded-limiter failure. Both actual showcase seed-1 autumn generated worlds advance 1,200/1,200 operator iterations (60 s) with zero measured current, divergence and accounting error. Projection/transport medians 0.218/0.058 ms (512) and 0.588/0.156 ms (1024); these are rest-only operator costs excluding clone/build, not production/trench performance. The long-run sum-then-subtract density roundoff failure and correction are retained with raw evidence. See docs/reports/ENG-122.md and ENG-122-balanced-rest.jsonl. Keep experimental/in_progress: next ENG-122 work is velocity advection and dynamic dam/trench/interface acceptance; sealed air, edits/growth remapping, owner validation and durable recovery remain required before activation.
+ENG-122 increment-3 combined-tree verification: cargo xtask check passed formatting, workspace all-targets/all-features strict Clippy and workspace all-features tests: 1123 passed, 0 failed, 63 ignored. Ignored gates are not accepted.
+
+ENG-122 increment 4 (2026-10-02): experimental shared water/momentum donor transport and matched dual-mass pressure projection added; complete fluid suite 82 passed and affected-package strict all-targets/all-features Clippy passed. Both generated 512/1024 momentum rest probes advance 60 s with zero current/accounting error. Six-second 1.5 m channel surge and full-height thin-wall probes pass. Low dam with a dry high opening FAILS: 0.000272616 m3 crosses above-water crest; all 600 steps accepted, conservation holds but physical gate does not. Evidence and exact checks in docs/reports/ENG-122.md and separate momentum JSONL files. Keep experimental/in_progress; no production/save/wire activation. Next ENG-122 prerequisite: phase-aware basin/interface state and wet-face apertures for pools joined through air, then dynamic acceptance, sealed air, edit/remap/trapped ledgers and canonical owner/recovery integration. Full workspace xtask check not rerun for this increment.
+
+ENG-122 increment 5 (2026-10-02): bounded experimental fine phase state retains sub-coarse basin provenance and exposes actual wet face overlap plus directional donor apertures. Standalone prescribed-fine-flux transport conserves water with paired limits and atomic CFL/allocation/fragmentation rejection. Twelve new phase tests; final full fluid suite 94 passed/0 failed, strict affected-package all-targets/all-features Clippy passed. Generated 512/1024 seed accounting preserved exactly; construction medians 6.332/36.550 ms; retained phase arrays 13,722,864/76,076,688 bytes excluding shared geometry/scratch. Zero coupled steps claimed. Original coupled low-dam 600-step gate rerun and still FAILS at 0.000272616 m3 crossing (exit 1); standalone dry-crest prescribed-air test is not coupled acceptance. SCWA v1 component totals cannot recover the new fine phase placement; format limitation updated explicitly, no save/wire conversion. Keep experimental/in_progress. Next unblocked ENG-122: phase/basin-aware pressure and momentum coupling (including internal basin DOFs), then unchanged dynamic/interface gates, sealed air, edit/remap/trapped ledgers and complete canonical owner/recovery integration. See reports/ENG-122.md and separate phase construction/failure JSONL evidence. Full workspace xtask check and interactive acceptance unrun this increment.
+
+ENG-122 increment 6 (2026-10-02): user-requested packed fine faces and smaller scratch buffers implemented. Derived face record is u32 lower-index/axis; decoded endpoints/order unchanged, explicit 2^30 fine-cell ceiling prevents aliasing. Transport reuses two cell arrays as sums/scales/candidate, retains one transfer array, drops numeric scratch before basin validation. Retained phase arrays 512: 13,722,864 -> 7,240,744 bytes; 1024: 76,076,688 -> 32,314,648 bytes. Active-limiter numeric scratch 512: 32,314,448 -> 14,481,488; 1024: 135,316,016 -> 64,629,296 bytes (old scratch baseline calculated from exact old arrays, new capacities measured; excludes caller/geometry/basin memory). Fifteen phase tests, including 512 bit-identical comparisons to original transport and matched atomic 108-cell limiter exhaustion; final full fluid suite 98 passed/0 failed, strict affected-package Clippy and formatting passed. Both generated-world memory probes preserve seed amount bits/counts/accounting; prescribed full-neighbour memory exercises are not coupled dynamic acceptance. Keep experimental/in_progress; no save/wire activation. Full workspace xtask/game-window/trench acceptance unrun. Next ENG-122 remains phase/basin-aware pressure/momentum coupling and the unresolved low-dam gate, then sealed air, edit/remap/trapped ledgers and canonical owner/recovery. See reports/ENG-122.md and ENG-122-packed-phase-memory.jsonl.
+
+ENG-122 increment 7 (2026-10-02): experimental phase_pressure adapter couples canonical fine fractions to the actual 0.25 m two-phase MAC/PLIC reference; pressure converges in every accepted substep and failed candidates are discarded atomically. Packed phase topology is shared, retained arrays capped explicitly (not peak/RSS). Opt-in strict paired-transfer limiter preserves amount bounds without clipping; default MAC behavior unchanged. Full fluid suite 103 passed/0 failed and affected-package strict Clippy passed. Static low-dam and full-wall fine-reference probes accept 600/600 steps with zero downstream water. Channel FAILS after 340/600 steps at maximum fraction 1.0000000000000002; earlier arithmetic failure after 406 steps retained separately. No conservative momentum acceptance: reference velocity advection remains semi-Lagrangian. Keep experimental/in_progress, no production/save/wire activation. Next ENG-122: strict feasible paired-flux update for saturated channel paths, compressed phase/basin pressure plus conservative momentum and unchanged dynamic/interface gates, then sealed air, edit/remap/trapped ledgers and owner/recovery. Generated coupled cost/rest/trench and interactive gates unrun. See reports/ENG-122.md and phase-pressure JSONL evidence.
+ENG-122 increment-7 combined-tree verification: cargo xtask check passed formatting, workspace all-targets/all-features strict Clippy and workspace all-features tests: 1152 passed, 0 failed, 63 ignored. Ignored gates remain unaccepted; the separate reference channel probe still fails.
+
+ENG-122 increment 8 (2026-10-02): strict fine-reference water transport now applies paired sequential face corrections and, after unchanged 64 local passes, at most 64 connected-path augmentations to actual available capacity. Strict fraction bounds, exact geometry and water accounting are retained; no amount clipping or game/save/wire activation. Balanced cycles, both saturated-chain directions, ulp-scale throughflow, an interleaved 512-cell path, signed exterior accounting and bounded/no-progress rejection are covered by seven tests. Six-second low-dam/full-wall/channel probes pass 600/600 steps. Extended small channel surge passes 6000/6000 (60 s), accounting error -1.41e-12 m3, all-in median/p99/max 5.230/6.659/9.640 ms; 16 global repairs, additional active-indexed CSR/BFS scratch peak 189488 bytes. Three earlier failed attempts are retained separately. This is the actual fine 0.25 m reference, not compressed or generated-world acceptance; conservative momentum remains unaccepted. Next ENG-122: compressed phase/basin pressure and conservative momentum coupling, unchanged dynamic/interface and actual generated cost gates, then sealed air, edits/remapping/trapped ledgers and owner/recovery. See reports/ENG-122.md and strict-transfer JSONL evidence; keep in_progress/experimental.
+ENG-122 increment-8 verification: cargo xtask check passed at the repair checkpoint (before final 64-path cap/budget test), 1156 passed/0 failed/63 ignored. Final-tree formatting, strict workspace all-targets/all-features Clippy and full fluid suite passed (108 passed/0 failed); final capped 6000-step release channel replay passes with the same numerical results, median/p99/max 5.284/6.944/11.026 ms. Workspace tests were not repeated after the cap-only change; affected fluid and strict workspace checks were repeated. Ignored gates remain unaccepted.
+
+ENG-122 increment 9 (2026-10-02): experimental phase_graph builds separate wet patches and dry rows within each exact coarse open component, preserving below-crest pools connected only through air. A bounded snapshot-local piecewise-constant pressure basis aggregates actual fine faces and physical coefficients as P^T A P; no compressed pressure timestep is claimed. The candidate routing helper uses the actual final limited standalone phase transfers for both water and three-axis liquid momentum ledgers, with immutable atomic failure and stale-snapshot rejection. Phase clones share immutable fine fraction arrays without relocation copying; ordinary transport remains bit-identical. Six new graph tests; fluid suite 114 passed/0 failed; affected strict Clippy passed. Generated 512/1024 graph construction: 5879/17379 rows versus 116813/768526 fine open cells, medians 7.688/42.045 ms, additional graph arrays 3659504/14313328 bytes, exact row-water accounting; zero pressure/momentum/coupled/production steps. Existing 6000-step fine-reference channel replay passes with unchanged accounting and 16 repairs. Keep experimental/in_progress: actual conservative staggered momentum, pressure interpolation/hydrostatic balance, unchanged dynamic and generated-world cost gates, sealed air, edit remapping/trapped ledgers and phase-capable canonical owner/recovery integration remain. Next unblocked ENG-122: physical compressed pressure and staggered mass/momentum timestep on this basis. See docs/reports/ENG-122.md and phase-graph JSONL evidence.
+ENG-122 increment-9 combined-tree verification: cargo xtask check passed formatting, strict workspace all-targets/all-features Clippy and workspace all-features tests: 1163 passed, 0 failed, 63 ignored. Final formatting and diff checks also passed; ignored gates remain unaccepted.
+
+ENG-122 increment 10 (2026-10-02): opt-in phase-aware pressure predictor now uses actual fine MAC density/top/closed-gas diagonal coefficients, restricts the fine residual, applies eight symmetric row sweeps and lifts pressure correction before the existing fine solve. Fine pressure unknowns/face forces, gauge treatment and pre-predictor stopping tolerance remain; no compressed final timestep or conservative momentum claim. Exact geometry/membership/vertical wet-edge predicates permit shared topology refresh; changed predicates conservatively rebuild, changed solids reject stale geometry, coefficients always rebuild. Generated unchanged-layout refresh medians 0.758/4.318 ms versus full builds 7.787/42.695 ms (512/1024). Low-dam/full-wall/channel 600-step gates pass; predictor channel 6000 steps passes, water error -1.40e-12 m3. Moving channel reuses only once and rebuilds 5999 times; six-second predictor median 6.242 ms versus baseline 5.557 ms despite fewer pressure iterations. Two actual generated startup steps pass for each size/mode, but 1024 all-in cost remains about 6 seconds per 50 ms step, with retained predictor upper bound 218213336 bytes. This is expensive fine-reference startup, not generated minute/trench acceptance or production real-time evidence. Four new tests; complete fluid suite 118 passed/0 failed; affected strict Clippy passed. See docs/reports/ENG-122.md and ENG-122-phase-predictor.jsonl. Keep in_progress/experimental, no production/save/wire activation. Next unblocked ENG-122: stronger phase-aware multilevel correction, incremental patch updates and conservative staggered momentum using final strict transfers, then unchanged dynamic/generated/interface/owner-recovery gates.
+ENG-122 increment-10 final combined-tree verification: cargo xtask check passed formatting, strict workspace all-targets/all-features Clippy and workspace all-features tests: 1167 passed, 0 failed, 63 ignored. Ignored gates remain unaccepted; predictor generated performance remains far above the step budget.
+
+ENG-122 increment 11 (2026-10-02/03): opt-in balanced two-level phase-aware pressure preconditioning, B=Q+(I-QA)S(I-AQ), now applies cached physical row SGS during every fine Krylov iteration. Fine unknowns/convergence, component gauges, strict transport and default MAC arithmetic remain. Two new symmetry/positive-energy, scratch-reuse, matched face-solution and atomic unequal-head tests pass; complete fluid suite 120 passed/0 failed. cargo xtask check passed formatting, strict workspace all-targets/all-features Clippy and workspace all-features tests: 1169 passed, 0 failed, 63 ignored. Sequential channel comparison: fine iterations 10634 -> 7305, all-in median 5.486 -> 6.738 ms (slower). Actual two-step generated startup: 1024 iterations 324 -> 176, all-in 5845.744/6752.365 -> 5121.031/5391.947 ms; 512 gets slower. Additional balanced numerical scratch 12,720,208/49,397,104 bytes (512/1024), not whole peak/RSS; retained cap excludes transient arrays. All dam/wall/channel six-second probes and startup probes pass; 6000-step small channel passes with water error -1.371e-12 m3, 18 path repairs, 5999 topology rebuilds. Long-run timings overlap workspace checks, not comparative. No generated minute/trench/game-window or conservative momentum acceptance; no production/save/wire activation. See reports/ENG-122.md and phase-preconditioner JSONL files. Keep in_progress. Next unblocked ENG-122: conservative staggered momentum from final strict transfers and unchanged dynamic/interface gates; pressure hierarchy/incremental patch performance, sealed air, edits/remapping/trapped ledgers and canonical phase owner/recovery remain.
+
+ENG-122 increment 12 (2026-10-03): opt-in first-order staggered mixture momentum advection uses final strict accepted PLIC transfers plus full-volume flux, two half-cell dual lanes, bounded donor subcycles, wall/exterior reaction ledgers and a second fine projection on the new phase. Semi-Lagrangian advection remains the default. Relative pressure accuracy tightens to 1e-12; original 1e-8 absolute contract and unchanged 1e-8 relative dual-mass guard retained. Five new tests cover conservation/uniform transverse velocity/KE, final fluxes, budget and atomic pressure/mass failure, separate heads and explicit sealed-pocket rejection. cargo xtask check: formatting, strict workspace all-targets/all-features Clippy and workspace all-features tests passed, 1174 passed/0 failed/63 ignored; full fluid suite 125 passed. Default low-dam/full-wall pass 600/600 with zero downstream water. Default compressible-air channel FAILS at step 27 (26/600 accepted), dual-mass defect 8.748e-8 kg. Actual generated 512/1024 startup both FAIL first step (0/2), mass defects 2.225e-6/2.446e-6 kg. Existing sealed-air compliance compresses volume but has no conservative gas-mass state; do not bypass this prerequisite. Explicitly labeled incompressible-air comparison passes 600 and 6000 steps; 60-s water error -6.75e-14 m3, advection-only mixture momentum errors below 7.6e-10 kg m/s, additional momentum scratch 2777248 bytes and at most13 subcycles. Six-second comparison median16.146ms; long-run timings overlap checks. This altered air model is separate evidence, not default sealed-air/generated-trench acceptance. Earlier failures retained. No production/save/wire activation; keep in_progress. Next unblocked ENG-122: conservative gas-mass/density state coupled to sealed-air pressure and staggered momentum, then unchanged default channel/generated startup gates. General interface/accuracy, cost/scratch, generated minute/trench/game-window, edits/remapping/trapped ledgers and canonical owner/recovery remain. Exact files/checks/raw evidence in reports/ENG-122.md and momentum JSONL files.
+
+ENG-122 increment 13 (2026-10-03): added sandbox-client --phase-fluid-demo
+for a real window on the same channel/low-dam/full-wall headless fixtures.
+M switches velocity sampling/conservative momentum; G switches air model;
+either resets and pauses while retaining the same-scene camera. Rejected steps
+remain visible without applying the candidate. Default is explicitly labeled
+incompressible-air comparison. Two reset/rejection invariant tests pass;
+affected strict Clippy and release builds pass. Three bounded GPU window runs
+and inspected PNGs show both methods and the unchanged compressible step-27
+failure. Shared-fixture 600-step replay matches ten prior numerical fields
+exactly. No production/game-world/save/wire activation and no physics-gate
+acceptance. Keep in_progress. Next unblocked ENG-122: conservative gas-mass/
+density coupled to sealed-air pressure and staggered momentum, then unchanged
+default channel/generated startup gates. Usage/checks in validation.md and
+reports/ENG-122.md; raw replay in ENG-122-viewer-fixture.jsonl.
+
+ENG-122 increment-13 combined-tree check: cargo xtask check passed formatting, strict workspace all-targets/all-features Clippy and workspace all-features tests: 1176 passed, 0 failed, 63 ignored. Renderer fixes additionally passed affected strict Clippy, viewer tests, final formatting/diff checks and release graphical captures.
+
+ENG-122 viewer follow-up (2026-10-03): replaced older debug water boxes with the game's shared smoothed surface/underwater tint/fog/caustics renderer for both methods. Presentation-only byte snapshot leaves solver fractions unchanged. Three viewer tests and four water-look tests pass; affected strict Clippy, release build, formatting/diff checks and two real GPU captures pass. Full workspace checks not repeated for this presentation fix. Details in reports/ENG-122.md. Keep in_progress; next unblocked ENG-122 remains conservative gas-mass/density coupling.
+
+ENG-122 default decision (2026-10-03): user selected best practical large-world performance over exact fluid detail. Retain existing adaptive coarse production MAC/original velocity sampling/multigrid/conservative water-volume transport on a 20 Hz worker with current game water look. Initial 50k-cell target, seed-1 showcase 0.75m at512 and1m at1024; growth twice target. Historical ENG-121 trench medians15.0/25.5ms and0.91/0.88x realtime. Fine-phase/balanced/conservative momentum remain experimental owing to seconds-per-step cost and failed mass gates. Existing production setup already selects this path; no numerical, save/wire or UI switch change. Accept thin-wall leaks/diffuse flow/reported seed loss/rest currents as current default tradeoffs, not full ENG-122 gate acceptance. Four existing worldgen water tests, formatting/diff checks pass. Full checks/GPU/performance not rerun for docs/comment-only change. README, validation, report and worldgen policy comment record decision. Keep in_progress; next unblocked ENG-122 research remains gas-mass/density coupling, required for eventual conservative-momentum activation.
+
+ENG-122 water-only increment (2026-10-03): user explicitly chose freely displaced air. This supersedes earlier gas-mass/density prerequisite references for gameplay. Authoritative construction/growth/recovery and the local demo now select water-only MAC/PLIC with reconstructed atmospheric free surfaces; no gas mass/compression/back-pressure, including enclosed pockets. Adaptive coarse resolution, conservative water amounts, owner/revision checks and canonical ledgers remain; no save/wire format change. Original velocity sampling remains, conservative momentum and two-phase models remain explicit experiments. New inverted-bell flooding/conservation and partial-column hydrostatic tests pass, as do viewer model/reset checks. Seed-1 autumn generated 512/1024 matched expanded-domain 60-second runs accept 1200/1200 steps in each model: water-only median5.028/6.993ms vs priorair11.981/23.717ms, water error<6e-12m3. Flow differs (1024 downstream5.467 vs15.424m3), so no equivalent quality or paced hammer/trench/worker-realtime gate claim. Retained arrays unchanged; transient scratch/RSS not measured. Six-second channel/low-dam/full-wall water-only motion probes pass unchanged gates; resolved wall and low dam cross zero water. Graphical default runs with current water look. See reports/ENG-122.md and water-only JSONL evidence for exact checks and limitations. Keep in_progress. Next unblocked ENG-122: actual paced512/1024 trench and generated rest/shoreline quality withinbudget, then exact-wall/capacity and edit/recovery geometry work. Historical air/conservative momentum failures remain separate, unaccepted experiments.
+ENG-122 water-only combined-tree checks: cargo xtask check passed formatting, strict workspace all-targets/all-features Clippy and workspace all-features tests: 1180 passed, 0 failed, 63 ignored. Final fixture-probe CLI additionally passed affected strict Clippy, formatting and three release motion probes. Ignored gates remain unaccepted.
+
+ENG-122 paced large-world trench validation (2026-10-03): reconstructed documented ENG-121 workload in water_trench_probe, actual Simulation/vegetation/20Hz water worker, radius3 cuts every6ticks then3000pacedticks. Final512 commits46cuts, flow45.844534m3past old edge,0.9015x realtime,solver median10.249ms. Final1024 commits45cuts,0.8967x realtime,7.901ms median but ZERO water past old edge: flow gate FAIL, executable exits1. All pressure substeps converge, exact[0,1]fractions and mass errors<1.1e-11m3. Live vegetation adds94/14otheredits;512grows to96100cells. Largest1024owner tick409.633ms is not a growth tick and unattributed. Coarse centre sections implicate shallow shore fractions0.13-0.21 over majority-solid cells, adjoining open/dry trench; partial-cell pressure/velocity support is a hypothesis requiring a small reproduction. Repeated final runs sequential without builds/owned demo; initial evidence retained separately. Strict probe Clippy/release build/fmt/diff pass. No runtime changes; parent fullcheck1180/0/63not repeated. No graphical/network or equivalent matched historical benchmark acceptance. See reports/ENG-122.md and paced-trench JSONL. Keep in_progress; next unblocked ENG-122: small shallow-lip invariant reproduction and physically valid fix, then unchanged paced512/1024 reruns. Do not promote the default as large-world flow accepted.
+
+ENG-122 small shallow-shore reproduction (2026-10-03): new spall_fluid example shallow_shore_probe captures exactly resolved aligned shelf/trench geometry, 12x6x2 one-metre cells, shelf top2m/lip6m/trench floor1m. After600x50ms,0.20m water-only layer (2.4m3) has zero pressure rows, zero velocities, zero downstream water and bit-identical fractions; mass error0. First-step trace shows gravity0.4905m/s wiped to0 by pressure/velocity extension. All reconstructed cell centres lie in air, so no liquid pressure or extrapolation donors remain. This reproduces the mechanism without workers, growth, vegetation or partial solids; large-world geometry can still contribute. Explicit controls:0.75m water-only moves3.978048m3of9;0.20m prior air model moves1.709760m3of2.4. All600steps accepted and pressure converged; speed/conservation is not flow acceptance. Release reproduction exits1; deeper-flow invariant passes; ignored desired shallow-drain invariant was explicitly run and FAILS(exit101). Strict example Clippy/fmt/diff pass; no numerical runtime change or full workspace/large-world rerun. Evidence and exact checks in reports/ENG-122.md, shallow-shore JSONL and first-step trace. Keep in_progress. Next unblocked ENG-122: physical pressure/velocity support for shallow reconstructed liquid with no interior cell-centre samples, preserve rest/atmospheric surfaces/conservative mass/walls, then enable invariant and rerun unchanged paced512/1024. No hidden anchors, clipping, air switch or widened workload.
+
+
+### ENG-122 shallow-film trial checkpoint (2026-10-03)
+Diagnostic hydrostatic-film support plus zero-air accepted-transfer dual momentum remains opt-in and FAILED acceptance. The unchanged 144-cell fixture stops at 333/600 shallow and 265/600 deep steps (nine substeps required, budget eight); peak mechanical energy grows to 39.3x / 5.18x initial despite conserved water. A new wider partial-layer rest gate also exposes a baseline failure at step 3, 0.035919 m/s versus 1e-7 target; prototype fails at step 1, 0.4905 m/s. Ordinary example tests explicitly ignore these two unresolved gates, both actually run to failure. Zero-air momentum invariant tests and flat shallow pool/full-wall rest tests pass. Gameplay policy, canonical records and worker authority are unchanged. Next ENG-122 assignment: match subcell liquid geometry across pressure, face inertia, gravity and accepted mass/momentum transfers; pass drainage/rest/energy before rerunning unchanged paced 512/1024 trench. See docs/reports/ENG-122.md and ENG-122-film-{baseline,prototype}.jsonl. Status remains in progress.
+
+
+### ENG-122 atmospheric surface-distance correction (2026-10-03)
+Repaired the wider partial-layer resting-pool gate without changing its workload or thresholds: choose validated air-side PLIC pressure boundary first, then validated wet-side fallback, shared by pressure matrix and velocity correction. Nearly saturated bulk-cell planes no longer override the free surface. Fractions/canonical ledgers remain unchanged. Four600-step analytical cases at0.5/1m and25/50ms pass pressure<2.40e-9Pa error, speed<2.75e-13m/s and volume error<1.25e-13m3; targets1e-5Pa/1e-7m/s/1e-10m3. Original lookup makes new regression fail immediately at0.016892m/s. Previously failed12x6x2 rest gate is enabled and passes600steps; ordinary example3passed/1ignored. Unchanged0.20m shallow drainage stillFAILS(zero rows/zero downstream);0.75m control4.376055m3of9 flows. Rejected film prototype remains disabled. See reports/ENG-122.md and surface-rest evidence. Next ENG-122: matched subcell pressure/velocity/face inertia for liquid below all centre samples, preserving rest/energy/conservation/walls before unchanged paced512/1024. Keep in_progress.
+
+ENG-122 surface-distance final checks: cargo xtask check passed formatting, strict workspace all-targets/all-features Clippy, and tests: 1183 passed, 0 failed, 63 ignored. Ordinary shallow-shore example tests: 3 passed, 1 unresolved drainage gate ignored; that ignored gate was explicitly run and failed. The three water-only reference motion probes (channel, low-dam, full-wall) each passed 600 steps at 10 ms; timings overlapped workspace checks and are not benchmark evidence. No paced large-world or GPU rerun. Details in reports/ENG-122.md.
+
+ENG-122 support checkpoint (2026-10-03): added an opt-in reconstructed-liquid
+pressure support diagnostic with actual wetted faces, embedded free surfaces
+and accepted-transfer water-only momentum. Unchanged 600-step shallow/deep
+shelf drainage, energy, conservation, full-wall and ordinary rest gates pass.
+Nearly saturated bulk-water rest FAILS immediately (0.0083013904 m/s).
+Gameplay remains on the existing water-only backend; ENG-122 stays in progress.
+Next unblocked ENG-122 item is consistent physical free-surface ownership
+across neighbouring reconstructions, then reference and original 512/1024
+paced trench gates. No speed, whole-memory or viewer acceptance is claimed.
+Exact evidence and regularization details: docs/reports/ENG-122.md.
+
+### ENG-122 surface reconstruction checkpoint (2026-10-04)
+
+Repaired closed-wall PLIC ghost sampling, nearly full complementary air geometry,
+and tiny exposed-polygon centroids. Added one-sided closing-interface pressure
+support on embedded and Cartesian boundaries, preserving amounts and limits.
+The previously ignored rest gate is enabled: eight 600-step cases at 0.5/1 m
+and 25/50 ms pass, peak speed 8.9182e-12 m/s (limit 1e-7), maximum volume error
+2.9133e-13 m3 (limit 1e-10). Shallow/deep drainage, energy and walls pass;
+76 fluid library tests pass. Low-dam/full-wall references pass 600 x 10 ms.
+Dynamic channel FAILS at 228/600: 12 required substeps versus 8; peak face speed
+125.0097 m/s, water error 7.11e-15 m3, no integral energy growth. Keep diagnostic
+and ENG-122 in_progress. Next unblocked ENG-122: dynamic interface velocity
+and accepted momentum support near vanishing fragments; pass unchanged channel
+and current rest/drainage/energy gates, then original paced 512/1024 trench
+before gameplay promotion. Exact checks, evidence and full-check result:
+docs/reports/ENG-122.md and ENG-122-surface-reconstruction-* files. No viewer,
+GPU, whole-memory or generated-performance acceptance.
+
+### ENG-122 dynamic interface velocity checkpoint (2026-10-04)
+Retain embedded pressure corrections as derived liquid-centroid velocity,
+transport them with exact final accepted water transfers, run existing paired
+path repair before low-order validation, and warm-start reduced-potential CG
+within unchanged budgets. No air mass, cutoffs, clamping or topology changes.
+Channel now passes600/600 (peak5.127m/s), low-dam/full-wall pass, eight nearly
+saturated rest cases and shallow energy/drainage gates pass. Full xtask check:
+1192passed/0failed/63ignored, including strict Clippy. Original final gated
+paced1024 trench passes:5.130528m3 beyond old edge,0.8908x realtime. 512 flows
+20.156031m3 but FAILS final50ms step (10substeps vs8); fluid time stalls at26s.
+Keep diagnostic/in_progress and gameplay default unchanged. Next unblocked
+ENG-122: reproduce/fix edited-worker dry-face velocity and boundary invalidation,
+then rerun unchanged gates. Exact files/checks/risks in reports/ENG-122.md.
+### ENG-122 unchanged-boundary and subnormal reconstruction checkpoint (2026-10-04)
+No-op boundary commits/refreshes preserve corrected predictor and pressure;
+actual geometry changes still invalidate them, trapped-water release and owner
+revision validation remain intact. Small shelf/trench compares600steps exactly
+against uninterrupted dynamics. Extracted512fragment C=f64::from_bits(7) exposed
+quadratic-offset and centroid determinant underflow; scaled analytic offset and
+per-axis tetrahedron normalization fix it without deletion/cutoffs. Diagnostic
+pressure now uses symmetric Gauss-Seidel CG on the same graph and verifies
+apparent convergence against the true residual within the original400budget.
+81fluid tests, shallow6gates and channel600steps pass (peak5.2316m/s). Final-source
+1024trench passes5.129372m3past old edge at0.8904x realtime;512stillFAILS final50ms
+step (10substeps vs8), stalls27.1s despite retained predictor being present.
+Keep diagnostic/in_progress and default unchanged. Next unblockedENG-122:
+extract/reproduce actual wet-face donor and pressure correction driving the
+512Cartesian/extension velocity spike. Full checks/risks/evidence in reports/ENG-122.md.
+Full cargo xtask check passed:1195passed/0failed/63ignored, strict Clippy and formatting included.
+
+### ENG-122 local pressure accuracy checkpoint (2026-10-04)
+Wet-face trace and a force-free5x5x5 reproduction confirm stale warm pressure
+can pass global flux convergence in tiny rows and inject66.7m/s motion. Every
+non-null positive row now also needs diagonal-scaled potential accuracy;
+symmetric local corrections use the original total400iteration budget. New
+regression passes at1e-40/1e-120/1e-300 fractions without dropping/clipping water.
+82fluid tests and channel600, shallow6 gates pass. Original512trench nowPASSES
+final50msstep in two runs (4substeps within8),24.77/24.62m3past old edge at
+0.5407/0.5370x realtime. 1024PASSES5.051671m3past old edge at0.8884x. Keep
+in_progress/diagnostic:512performance, full memory and local momentumaccuracy
+remain open. Next unblockedENG-122: profile grown512worker/pressure/transport
+cost and classify skips; reducecost without weakening newly passing gates.
+Exact checks/evidence/contracts:reports/ENG-122.md and ENG-122-local-pressure-*.
+Full cargo xtask check passed:1196passed/0failed/63ignored, strict Clippy and formatting included.
+
+### ENG-122 worker profile and closed gauge checkpoint (2026-10-04)
+Separated busy/stale/stability/residency skip reasons and accepted-step stage timing; preserved counters across domain growth, which previously reset them. Scheduling/revisions/rates/numerical budgets/default backend unchanged. Closed-component row lists now replace repeated per-gauge scratch allocations/scans without changing component means or positive-liquid participation. Matched 512 pressure time is essentially unchanged; no meaningful speedup or whole-memory reduction claimed. Final unchanged sequential512/1024 trenches pass flow/conservation/final50msadvance; observed stability skips zero. 512 remains about0.54x real time, dominated by similar pressure/transport cost. Exact final figures/evidence/checks in reports/ENG-122.md and worker-profile files. Release fluid83/0, owner9/0, opted-in shallow6/0; referencechannel/low-dam/full-wall600/600 each; cargo xtask check fmt/strictworkspaceClippy/allfeaturetests1198passed/0failed/63ignored. Keep diagnostic/in_progress; graphical/network/fullmemory/localmomentumaccuracy remain open. Next unblockedENG-122: split transport geometry/FCT/path-repair/momentum costs and optimize largest measured part without weakening existing gates.
+### ENG-122 faster transport, failed512stability checkpoint (2026-10-04)
+Added transport substage timing; baseline512momentum46%/interface25% dominate. Sparse upwind sweeps retain all non-null positive/incoming mass and nonzero lanes, skip exactly null rows/zero transfers; reconstructed path bypasses ordinary PLIC/donor work replaced by accepted transfers. Same tolerances/budgets/ledgers/ownership/default.96smallcases bit-identical to pinned a4c0a04dense solver, plus dry-padding and accepted-transfer invariants.86releasefluid/6shallow tests pass; cargo xtask check fmt/strictClippy/allfeaturetests1201passed/0failed/63ignored. Referencechannel/dams600/600pass.512solver55.481->44.646ms, transport26.901->16.830ms, but BOTH optimized512runsFAIL final50msadvance at33s (9substepsvs8,58.92m/s face);1024passes24.827ms/0.8928x. Dense control's different slower-worker state accepts30.85s then100untimedclonedsteps through35.85s; causal attribution remains unresolved. No CFL/occupancy filtering/clipping/budget increase. Keep unaccepteddiagnostic/in_progress; no defaultpromotion. Exact evidence/checks/risks in reports/ENG-122.md and transport-profile logs. Next unblockedENG-122: small reproduction of edit/growth-dependent high Cartesian/interface velocities and physical pressure/momentum stabilization before unchanged gate reruns; fullmemory/localmomentumaccuracy/graphical/network/capacity/recovery remain.
+### ENG-122 exact failing-step replay and 100-cell fixture (2026-10-04)
+Added version1 bounded little-endian reconstructed-only numerical replay, preserving warm physical pressure/interface state independently of canonical save/wire/owner installation. Optional trench capture reports no timing acceptance. Exact32.95s precursor step reproduces captured33s failure byte-for-byte (7070989bytes):40.29->58.92m/s face, next50ms9substepsvs8. Retained100cell5x4x5crop with explicit altered outer walls accepts2steps thenfails10vs8; ignored100step acceptance gate remains visibly unresolved, not CI pass/originaltrench acceptance. Three replay invariants pass; malformed input bounded/rejected. Embedded-cap exact-inertia trial on fullprecursor failedpressureconvergence and wasdropped; physics/default/budgets unchanged. Fullcheck results in reports/ENG-122.md. Keep diagnostic/in_progress. Next unblockedENG-122: physically matched pressure/momentum coupling and pressureconditioning on smallfixture + exactfullstate, then original512/1024gates; graphical/network/fullmemory/localmomentumaccuracy/recovery remain.
+Validation: cargo xtask check fmt/strictworkspaceClippy/allfeaturetests1204passed/0failed/64ignored; releasefluid89passed/0failed/1ignored; explicitcropgate fails as documented. Exact-state replay hashes match. Full check evidence in reports/ENG-122-coupling-replay-check.txt.
+
+ENG-122 scaled pressure/surface-normal checkpoint (2026-10-04): embedded normal
+predictors derive from accepted-transfer canonical momentum, with actual cap
+half-cell inertia and diagonally equilibrated equivalent SPD pressure equations.
+Physical residual, local potential/velocity error, closed gauge and original
+iteration/substep/CFL budgets remain enforced; every positive fraction stays in
+the model. Physical warm pressure and owner/save/wire contracts remain unchanged.
+The old full replay and numerical-overflow snapshot advance 100 steps, but the
+unchanged fresh 512 trench rejects at 12.10 s (9 versus 8 substeps); 1024 passes
+52.20 s. Reconstructed support remains diagnostic, ENG-122 stays in progress.
+The crop binary has an open top, correcting the preceding closed-crop wording;
+CI now checks accounted exterior water plus a separate sealed 100-step variant.
+Next: consistent Cartesian patch pressure/face momentum in vanishing fragments;
+original fresh gates, local momentum accuracy and full scratch peak remain open.
+See docs/reports/ENG-122.md for provenance and measured results.
+
+ENG-122 donor-consistent cut-row boundary checkpoint (2026-10-04): exposed
+Cartesian patches of partial rows cannot donate nonexistent upstream liquid;
+zero transfer is enforced inside the existing pressure contact solve. Wet
+edges and embedded cap displacement retain their signs; full-row atmospheric
+boundary retreat remains free and has an explicit uniform-translation invariant.
+All positive fractions, numerical budgets, canonical amounts and owner/default
+contracts remain. Both original fresh 512/1024 trenches pass final advance and
+flow with no stability skips, ratios 0.8768/0.8661 and medians 33.176/34.926 ms.
+Water delivered beyond the 1024 old edge falls to 1.83481 m3; motion thresholds
+pass, local pressure/momentum/interface accuracy remains unaccepted. A removed
+Cartesian inertia-floor trial was rejected and fully dropped. 96 release fluid
+and 6 shallow tests pass; full checks and evidence in docs/reports/ENG-122.md.
+Keep ENG-122 diagnostic/in_progress. Next: boundary momentum/pressure-work and
+interface-motion accuracy, 1024 delivery comparison, complete scratch peak and
+sustained/game-window gates before promotion; exact capacity/recovery remain.
+
+ENG-122 wet-donor pressure-work checkpoint (2026-10-04): supersedes the prior
+blanket zero contact with an actual neighboring-water per-patch inflow bound;
+aggregate paired transport bounds remain authoritative. Uniform interior
+partial-water translation now retains local momentum/energy and zero pressure
+work in both directions (parent loses 13.20% x momentum). Both unchanged fresh
+512/1024 trenches pass final 50 ms advance with zero stability skips; delivery
+42.11817/4.97810 m3, ratios 0.8791/0.8753, medians 31.370/33.750 ms. All positive
+fractions and original budgets/default/owner/save/wire contracts remain.
+Signed-interface/phase-flux separation trial fails sealed crop 9/8 substeps and
+is dropped. Local moving-tiny-volume accuracy is not accepted: channel's
+normalized divergence reaches 1.38816e237 /s despite bounded speed/accounting.
+97 release fluid/6 shallow checks and replay/reference gates pass. See
+reports/ENG-122.md for exact commands, full-check status, risks and provenance.
+Next unblocked task remains ENG-122 interface/phase-transfer accuracy, complete
+scratch peak and sustained/game-window gates; exact capacity/recovery remain.
+
+ENG-122 stationary-cap and flux-audit checkpoint (2026-10-05): free caps with
+exactly zero net Cartesian outflow use the exact stationary continuity normal,
+within the existing pressure-response accuracy. Nonzero outflow and contact
+caps retain their pressure solution/displacement; all positive amounts and
+original budgets/default/owner/save/wire contracts remain. A 27-cell regression
+fails on parent normal drift1.38778e-17 m/s and passes five positive amounts
+through subnormal C=bits7; tracing has exact three-step state/600-step metric
+noninterference coverage. Both original fresh 512/1024 trenches pass final50ms
+and flow with zero stability skips, ratios0.8991/0.8963, delivery42.11817/4.98630
+m3. No causal speedup or whole-memory saving claimed. Giant normalized channel
+divergence stays1.38816e237/s: trace identifies 1.00974e-28 m3/s cancellation
+residue at C4.65533e-264 (relative1.2455e-16), not complete local accuracy.
+Broader cap reconstruction fails the existing closing-gap accuracy and is
+dropped. Release fluid99/shallow6 and reference/replay gates pass. Exact
+commands/evidence/full-check status in reports/ENG-122.md. Keep experimental
+and in_progress; next unblocked ENG-122 is nonzero-flow/closing-interface
+pressure-normal/accepted-momentum consistency, then full scratch and sustained
+windowed gates; exact capacity/thin-wall/recovery/physical acceptance remain.
+
+ENG-122 closing-cap audit checkpoint (2026-10-05): diagnostics now examine all
+free atmospheric caps' pressure/Cartesian-continuity normals, distinct from the
+worst volume-normalized row. The unchanged 24-cell/600-step air-gap reproduction
+has peak mismatch 9.98263e-5 m/s; channel peaks 0.0312354 m/s on a nearly full
+cell with a tiny air cap. A stronger local residual gate passes the small test
+and 99 release fluid invariants but exhausts original channel/world budgets;
+trial dropped, numerical physics/default and all positive amounts preserved.
+New full600-step trace noninterference test and identical46 non-timing channel
+properties pass; release fluid100 pass. Full-check evidence in reports/ENG-122.md.
+Original fresh trenches are prior ed024a9 evidence, not rerun measurements in
+this diagnostics-only increment. Remains experimental/in_progress. Next
+unblocked ENG-122: cancellation-resistant closing-interface pressure/normal
+consistency, then accepted momentum, scratch and sustained windowed gates;
+exact capacity/thin-wall/displacement/recovery and physical acceptance remain.
+
+ENG-122 pressure-impulse checkpoint (2026-10-05): reconstructed-support pressure
+jumps retain affine/product roundoff and use fused velocity impulses. Verified
+residuals evaluate projected Cartesian faces with range-safe equilibrated caps,
+within original stopping/contact/iteration/substep/CFL budgets. A real 1 Pa edge
+force disappears in the original expression; final preserves it and exact affine
+rest in both directions. Private NaN pressure norm no longer reports a finite
+value; regression covers overflow/underflow and nonfinite rows. All positive
+amounts and default/owner/save/wire behavior preserved. Release fluid102/shallow6,
+reference600/600 each and exact1000/100/100 captured replays pass. Original fresh
+512/1024 trenches pass final50ms with zero stability skips; ratios0.8948/0.8663,
+medians24.076/27.961ms, delivery42.02757/4.88146m3. No causal speedup claimed.
+Closing-cap accuracy remains open (gap peak1.00112e-4m/s, channel0.0476035m/s,
+all audited channel projections exceed1e-8); normalized divergence4.63193e73/s
+still not physical acceptance. Trace remains before accepted transport; new
+projection_residual diagnostic explicitly labels its evaluation. Exact commands,
+full-check result and evidence in reports/ENG-122.md. Next unblocked ENG-122:
+shared accurate pressure-correction/flux and accepted-momentum consistency for
+closing caps, then scratch and sustained windowed gates; exact capacity/thin
+walls/displacement/recovery remain. Keep experimental and in_progress.
+
+ENG-122 face-summation checkpoint (2026-10-05): optional cap audit separates
+compensated Cartesian-flux summation loss from remaining pressure/normal error,
+using the same rounded installed patch products on the originally selected
+worst cap. No solver/default/amount/owner/save/wire changes or new retained
+arrays. Analytic cancellation test and existing 600-step exact trace-state
+noninterference test cover the diagnostic. Channel600/600 and exact512
+precursor1000/1000 pass. All599 selected channel caps still exceed1e-8 after
+compensation; worst ordinary0.04760348394m/s changes only2.0628964e-7m/s,
+leaving0.04760369023m/s. Thus summation alone is insufficient. Shared split
+pressure/compensated geometric-flux/stricter cap-response trial was rejected:
+channel600 and release102 pass, but unchanged512 precursor accepts78/1000,
+then exhausts400 iterations with global residual5.9167570e-15 and cap-response
+defect-2.1260983e15m/s at C=1.0245860e-140. This is a convergence defect, not
+an accepted installed speed. Trial/debug prints removed. No amount filtering,
+extra budgets, velocity clipping or accuracy exemptions. Fresh paced trenches
+are prior checkpoint evidence; no rerun/windowed/physical acceptance claimed.
+Full-check results and exact commands: reports/ENG-122.md. Next unblocked
+ENG-122: shared local pressure/flux agreement for nearly closed caps and tiny
+moving fragments within original budgets; then accepted momentum, scratch,
+sustained windowed gates. Capacity/thin-wall/displacement/recovery remain open.
+Keep reconstructed support experimental and ENG-122 in progress.
+Final ENG-122 face-summation validation: xtask check1218 passed/0 failed/63 ignored
+across137 suites (formatting and strict Clippy); release fluid103/shallow6 pass.
+
+ENG-122 incremental pressure/flow checkpoint (2026-10-05): opt-in reconstructed
+support now solves fresh pressure increments, applies them to compensated patch
+velocities/fluxes, verifies actual flow residuals, then resets the increment.
+Cold-starts each contact solve; rounded pressure remains a cache/diagnostic.
+Existing global/local pressure/1e-8 response checks remain; every positive free
+cap additionally verifies net flux/area within5e-9 m/s before f64 installation.
+Original400/1000 iterations,32 contacts,8 substeps/CFL, topology, amounts and
+owner/save/wire/paired transport/default contracts remain. No floors/anchors/
+clipping. Krylov keeps progress through global convergence; zero/nonfinite dots
+use budgeted relaxation. Batching avoids costly every-iteration face work.
+Exact stationary-cap rule uses verified projected Cartesian sum; rounded output
+can falsely sum to zero. Analytic sub-ulp transfer/cap-normal regression protects
+this distinction; truly zero flow retains exact stationary normal.
+Original final512/1024 trenches pass3276/3270 ticks and final50ms, zero stability/
+residency skips, ratios0.8984/0.8855, medians25.887/32.156ms, delivery42.36514/
+5.23509m3. Sequential paced runs without concurrent owned builds/simulations.
+No controlled speedup or whole-memory saving claimed. Cold flow workspace
+conservative partial bounds: final shadows268608/374720 bytes (other projector
+allocations excluded). Library104, shallow6, references600 each and exact
+replays1000/100/100 pass. Closing-gap600 stored error3.97882e-9m/s meets1e-8;
+channel internal error4.99853e-9 meets5e-9 but stored error6.70132e-6 stillfails
+1e-8 on587/599 selected rows. Unfiltered normalized divergence1.21397e104/s
+remains enormous; no complete physical acceptance or default promotion.
+Full-check result/exact commands/initial replication failure and retries in
+reports/ENG-122.md; failed scalar/unbatched/rounded-zero trials preserved.
+Next unblocked ENG-122: preserve projected small transfers through stored face
+aggregation and accepted momentum, then full scratch and sustained/windowed
+checks. Capacity/thin walls/displacement/recovery remain open. In progress.
+Final ENG-122 incremental-flow validation: cargo xtask check1219 passed/0 failed/63 ignored
+across137 suites, including formatting and strict workspace Clippy. Initial dam-replication
+admin-ack failure and isolated retry pass are preserved; no networking/fixture/budget changes.
+
+ENG-122 canal viewer checkpoint (2026-10-05): --grid-fluid-demo uses gameplay
+water-only freely displaced air and the shared smoothed water renderer, preserving
+canal/gate/breach/reset/pause controls and occupied-gate rejection. Local fixture
+viewer, not authoritative multiplayer or reconstructed-support activation.
+Six600-step scenarios, conservation and presentation noninterference checks added.
+Bounded capture/launch and check results in reports/ENG-122.md. ENG-122 remains
+in_progress; next unblocked: user canal assessment, then stored-transfer precision.
+
+ENG-122 room viewer: scene7 / --grid-fluid-demo-room adds a sealed dry room below
+the0.25m canal floor; visual cutaway retains collision. H opens a real floor tile.
+Intact600 steps0m3; deliberate-hole600 steps1.200796876m3. Shared renderer now
+respects wet-column bottom/top to avoid falsely tinting dry rooms underwater.
+Final client86/render61/fluid104 and strict workspace Clippy pass; initial canal
+full-check1221/0/63 across137 suites preceded room changes. GPU before/after
+captures verified. In progress; nextENG-122 user assessment/stored transfers.
+
+ENG-122 manual acceptance (2026-10-05): user satisfied with current gameplay water
+look/feel/appearance after dry-room false underwater tint fix; requests PR.
+Original coarse-wall/capacity/recovery and experimental precision gates remain
+unfinished; gameplay feedback does not accept them. Ticket split decision pending.
+
+ENG-122 closeout (2026-10-05): user explicitly approves closing accepted gameplay
+water policy/look/feel/canal-room inspection and moving original unfinished gates
+to backlog ENG-123 (exact capacity/thin walls/coupled geometry), ENG-124 (edit/growth
+remapping/displacement/trapped ledgers/component recovery; depends ENG-123), ENG-125
+(stored-transfer precision/momentum/full scratch/sustained gates; promotion also
+depends ENG-123/124). PR187 open; not merged. Experimental support remains opt-in.
+Original failures are not passes. User-selected freely displaced air supersedes
+gas compression. Next unblocked research ENG-123 when requested.

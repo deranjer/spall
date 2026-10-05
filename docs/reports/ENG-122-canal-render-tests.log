@@ -1,0 +1,67 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.13s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\release\deps\spall_render-99c782df73edaa2a.exe)
+
+running 61 tests
+test camera::tests::default_camera_looks_down_negative_z ... ok
+test camera::tests::a_pick_ray_round_trips_through_project ... ok
+test camera::tests::linear_eye_space_depth_is_flat_across_a_camera_facing_plane ... ok
+test camera::tests::aabb_transformed_by_rotation_refits ... ok
+test camera::tests::frustum_accepts_a_box_ahead_and_rejects_one_far_behind ... ok
+test capture::tests::a_zero_edge_retrace_box_has_no_volume ... ok
+test camera::tests::linear_eye_space_depth_projects_onto_the_view_axis_under_rotation ... ok
+test camera::tests::look_clamps_pitch_and_wraps_yaw ... ok
+test camera::tests::a_point_behind_the_camera_lands_outside_clip ... ok
+test capture::tests::a_retrace_box_is_centred_and_clamped_to_the_cache ... ok
+test camera::tests::a_point_ahead_projects_near_the_clip_centre_and_into_the_depth_range ... ok
+test environment::tests::environments_actually_differ_in_lighting ... ok
+test capture::tests::frame_stats_are_empty_for_no_samples ... ok
+test capture::tests::frame_stats_single_sample_collapses_to_that_value ... ok
+test camera::tests::looking_along_reproduces_the_direction ... ok
+test capture::tests::frame_stats_use_nearest_rank_percentiles ... ok
+test capture::tests::a_steady_trace_has_zero_flicker ... ok
+test capture::tests::flicker_index_is_mean_abs_step_over_mean_level ... ok
+test environment::tests::keys_round_trip_and_are_unique ... ok
+test capture::tests::settle_index_finds_the_first_lasting_return_to_target ... ok
+test environment::tests::the_clear_colour_survives_tone_mapping ... ok
+test environment::tests::studio_is_the_default_and_matches_the_original_fixed_lighting ... ok
+test indirect::tests::apply_update_fills_and_dirties_only_the_changed_cells ... ok
+test fixtures::tests::daylight_terrain_is_open_lit_and_shadow_casting ... ok
+test indirect::tests::apply_update_ignores_bounds_outside_the_cache ... ok
+test indirect::tests::construction_fills_never_dirty_anything ... ok
+test indirect::tests::moving_a_body_dirties_vacated_and_entered_cells_but_preserves_the_overlap ... ok
+test indirect::tests::a_closed_probe_is_darker_than_an_open_probe ... ok
+test indirect::tests::volume_is_exactly_128_cubed_and_bounds_are_checked ... ok
+test indirect::tests::refilling_a_span_with_the_same_material_dirties_nothing ... ok
+test indirect::tests::moving_box_tracks_the_body_without_erasing_static_geometry ... ok
+test instances::tests::instance_and_vertex_layouts_match_their_rust_structs ... ok
+test instances::tests::foliage_compaction_preserves_grid_occupancy_materials_and_rotated_details ... ok
+test instances::tests::the_unit_cube_is_closed_outward_facing_and_unit_sized ... ok
+test pipeline::tests::cascade_matrices_are_finite_and_stable_for_sub_texel_camera_motion ... ok
+test pipeline::tests::cascade_splits_are_ordered_and_cover_the_camera_range ... ok
+test pipeline::tests::material_gpu_layout_is_storage_buffer_safe ... ok
+test scene::manifest_tests::emission_round_trips_as_base_colour_times_multiplier ... ok
+test scene::manifest_tests::the_table_is_indexed_by_id_and_fills_gaps_loudly ... ok
+test scene::tests::frame_all_points_the_camera_at_the_scene ... ok
+test scene::tests::item_bounds_track_the_mesh_and_the_model ... ok
+test sky_visibility::tests::a_body_covers_the_cells_its_box_touches_and_leaving_restores_the_terrain ... ok
+test sky_visibility::tests::a_cell_shared_by_two_bodies_stays_occupied_when_one_leaves ... ok
+test sky_visibility::tests::a_rotated_body_covers_at_least_its_axis_aligned_cells ... ok
+test sky_visibility::tests::the_cache_origin_is_grid_aligned_and_contains_the_centre ... ok
+test vertex::tests::a_yaw_rotates_the_normal_into_world_space ... ok
+test vertex::tests::gpu_vertex_is_tightly_packed_at_40_bytes ... ok
+test vertex::tests::identity_model_leaves_positions_and_normals_unchanged ... ok
+test water::tests::a_column_raises_every_field_cell_under_it ... ok
+test water::tests::a_point_is_submerged_only_below_the_local_surface ... ok
+test water::tests::a_flat_lake_is_two_triangles_plus_its_rim ... ok
+test water::tests::dry_cells_and_cells_outside_the_field_have_no_surface ... ok
+test water::tests::neighbouring_columns_of_different_height_meet_without_a_step ... ok
+test water::tests::raise_keeps_the_higher_surface ... ok
+test water::tests::room_below_a_water_column_is_not_submerged ... ok
+test water::tests::walls_stand_only_where_a_column_has_no_wet_neighbour ... ok
+test fixtures::tests::moving_body_overlap_tracks_the_shadow_and_keeps_the_receiver_wall ... ok
+test fixtures::tests::rapid_destruction_removes_the_occluder_and_reexposes_the_shadow ... ok
+test fixtures::tests::fixture_measures_closed_room_and_thin_wall_behavior ... ok
+test sky_visibility::tests::a_wall_thinner_than_a_cell_still_occupies_it ... ok
+test sky_visibility::tests::boxes_outside_the_cache_are_ignored ... ok
+
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

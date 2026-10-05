@@ -1,0 +1,192 @@
+{
+  "owner_state_advanced": false,
+  "source_revision": "4b4bd05+actual-donor-budget-final",
+  "runs": [
+    {
+      "requested_steps": 1000,
+      "last_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "4b4bd05+actual-donor-budget-final",
+        "step": 999,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          62
+        ],
+        "limiting_cell": [
+          102,
+          100,
+          335
+        ],
+        "limiting_outflow_l1_m_s": 3.5768862110237274,
+        "face_speed_m_s": 3.0057467240310323,
+        "interface_speed_m_s": 1.9959772930064898,
+        "water_change_m3": -1.0118128557223827E-11,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "input_path": ".local/scaled-failure-512.precursor.water-replay",
+      "exit_code": 0,
+      "input_sha256": "0683C98C4F330E5C7B7BEB8175B75BA83B0AD10AAD9803EF6C8EBA1459327FF6",
+      "output_path": ".local/donor-budget-final-replay1000.jsonl",
+      "first_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "4b4bd05+actual-donor-budget-final",
+        "step": 0,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          62
+        ],
+        "limiting_cell": [
+          107,
+          94,
+          346
+        ],
+        "limiting_outflow_l1_m_s": 53.9814020458638,
+        "face_speed_m_s": 33.83867038131531,
+        "interface_speed_m_s": 9.027311090298356,
+        "water_change_m3": 0.0,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "last_accepted": {
+        "scenario": "reconstructed_water_replay_accepted",
+        "step": 999,
+        "substeps": 1,
+        "pressure_iterations": 98,
+        "conservation_error_m3": 1.3642420526593924E-12
+      },
+      "accepted_steps": 1000,
+      "max_water_change_m3": 1.0913936421275139E-11,
+      "output_sha256": "2DAC11CB2DAE44846A773DC718673C43F6B3F67C7D27485C326D80565E77690E"
+    },
+    {
+      "requested_steps": 100,
+      "last_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "4b4bd05+actual-donor-budget-final",
+        "step": 99,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          62
+        ],
+        "limiting_cell": [
+          102,
+          100,
+          335
+        ],
+        "limiting_outflow_l1_m_s": 4.0278145721190715,
+        "face_speed_m_s": 3.0736297559899857,
+        "interface_speed_m_s": 1.973005351220482,
+        "water_change_m3": -3.183231456205249E-12,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "input_path": ".local/coupling-512.precursor.water-replay",
+      "exit_code": 0,
+      "input_sha256": "1AB462144B4DE6EF1B08EA198FB05855C9C7B34AAF839348F44FF3E1C7041D64",
+      "output_path": ".local/donor-budget-final-old-replay100.jsonl",
+      "first_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "4b4bd05+actual-donor-budget-final",
+        "step": 0,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          62
+        ],
+        "limiting_cell": [
+          112,
+          87,
+          343
+        ],
+        "limiting_outflow_l1_m_s": 41.147888953245356,
+        "face_speed_m_s": 40.294920579719985,
+        "interface_speed_m_s": 4.438510805807091,
+        "water_change_m3": 0.0,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "last_accepted": {
+        "scenario": "reconstructed_water_replay_accepted",
+        "step": 99,
+        "substeps": 1,
+        "pressure_iterations": 99,
+        "conservation_error_m3": 1.0231815394945443E-12
+      },
+      "accepted_steps": 100,
+      "max_water_change_m3": 4.092726157978177E-12,
+      "output_sha256": "4DF6936CDDC094114B74C8C079EBA8EB049DD358E8A9EF04145F61FEB900E4A7"
+    },
+    {
+      "requested_steps": 100,
+      "last_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "4b4bd05+actual-donor-budget-final",
+        "step": 99,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          49
+        ],
+        "limiting_cell": [
+          102,
+          100,
+          361
+        ],
+        "limiting_outflow_l1_m_s": 3.919593260634537,
+        "face_speed_m_s": 2.551255001954523,
+        "interface_speed_m_s": 1.0606331160153613,
+        "water_change_m3": 6.821210263296962E-13,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "input_path": ".local/cap-normal-new-512.water-replay",
+      "exit_code": 0,
+      "input_sha256": "797DD1116170FD3589D3563B62F9F894E44BCC7D40E83A717D5E22ACFAC37299",
+      "output_path": ".local/donor-budget-final-overflow-replay100.jsonl",
+      "first_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "4b4bd05+actual-donor-budget-final",
+        "step": 0,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          49
+        ],
+        "limiting_cell": [
+          100,
+          100,
+          361
+        ],
+        "limiting_outflow_l1_m_s": 2.7718769051098393,
+        "face_speed_m_s": 2.2891834413137366,
+        "interface_speed_m_s": 1.093286722921257,
+        "water_change_m3": 0.0,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "last_accepted": {
+        "scenario": "reconstructed_water_replay_accepted",
+        "step": 99,
+        "substeps": 1,
+        "pressure_iterations": 99,
+        "conservation_error_m3": 2.3874235921539366E-12
+      },
+      "accepted_steps": 100,
+      "max_water_change_m3": 2.5011104298755527E-12,
+      "output_sha256": "98A4FFAE8C75EB9221C90485B09BA91BCB3B88CA12E01790C5DCA57186D759A3"
+    }
+  ],
+  "note": "Exact full snapshots and raw outputs remain in .local; canonical crop plus sealed variant are ordinary CI. No owner/world/network/performance credit from replay.",
+  "timing_acceptance": false,
+  "dt_s": 0.05
+}

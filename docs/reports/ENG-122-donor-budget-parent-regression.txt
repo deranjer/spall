@@ -1,0 +1,22 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `release` profile [optimized + debuginfo] target(s) in 9.81s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\release\deps\spall_fluid-b49d3fbffb0ad4ba.exe)
+
+running 1 test
+test grid_mac::cut_surface::tests::wet_donors_preserve_local_uniform_momentum_and_zero_pressure_work ... FAILED
+
+failures:
+
+---- grid_mac::cut_surface::tests::wet_donors_preserve_local_uniform_momentum_and_zero_pressure_work stdout ----
+
+thread 'grid_mac::cut_surface::tests::wet_donors_preserve_local_uniform_momentum_and_zero_pressure_work' (35396) panicked at crates\spall_fluid\src\grid_mac\cut_surface.rs:1072:17:
+direction=-1, axis=0, before=[-2750.0, 0.0, 0.0], after=[-2386.9182061423326, 0.0, 0.0]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    grid_mac::cut_surface::tests::wet_donors_preserve_local_uniform_momentum_and_zero_pressure_work
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 96 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p spall_fluid --lib`

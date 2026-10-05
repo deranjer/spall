@@ -30,6 +30,9 @@ use crate::editor_scene::{
 /// (0.5 m) = median 102 ms per step flowing, 27,500 cells (0.75 m) = 15 ms;
 /// 1024-cell arena, 347,000 cells = 700 ms (water at 0.06x real time), 107,000
 /// (0.75 m) = 64 ms, 46,000 (1 m) = 16 ms. See `docs/reports/ENG-121.md`.
+/// Deliberate performance default (2026-10-03): keep this adaptive coarse MAC
+/// path with original velocity sampling; fine-phase/conservative momentum is
+/// experimental and must not replace it based on small-fixture results.
 pub const WATER_FLUID_CELL_BUDGET: usize = 50_000;
 
 /// Domain growth may take a region to this multiple of the budget.

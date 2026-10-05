@@ -1,0 +1,124 @@
+{
+  "source_revision": "e029907+cut-row-no-dry-inflow-final",
+  "replays": [
+    {
+      "path": ".local\\dry-donor-replay-1000.jsonl",
+      "sha256": "8360baa84caeec204fa13f10abb907301362b2570dc3637864a8df15dd3cc501",
+      "accepted_steps": 1000,
+      "added_fluid_time_s": 50.0,
+      "last_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "e029907+cut-row-no-dry-inflow-final",
+        "step": 999,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          62
+        ],
+        "limiting_cell": [
+          101,
+          89,
+          350
+        ],
+        "limiting_outflow_l1_m_s": 3.5164586117208283,
+        "face_speed_m_s": 3.390344666113705,
+        "interface_speed_m_s": 0.9840590732923084,
+        "water_change_m3": -9.549694368615746e-12,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "last_accepted": {
+        "scenario": "reconstructed_water_replay_accepted",
+        "step": 999,
+        "substeps": 1,
+        "pressure_iterations": 103,
+        "conservation_error_m3": 3.410605131648481e-13
+      },
+      "owner_state_advanced": false,
+      "timing_acceptance": false
+    },
+    {
+      "path": ".local\\dry-donor-old-replay.jsonl",
+      "sha256": "382dd77bbb3cb110d4a02c0c24ced81bb736c00798bd1b0051055571aef34557",
+      "accepted_steps": 100,
+      "added_fluid_time_s": 5.0,
+      "last_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "e029907+cut-row-no-dry-inflow-final",
+        "step": 99,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          62
+        ],
+        "limiting_cell": [
+          101,
+          90,
+          350
+        ],
+        "limiting_outflow_l1_m_s": 2.991437592511463,
+        "face_speed_m_s": 2.853427935351669,
+        "interface_speed_m_s": 1.8953737811836053,
+        "water_change_m3": -1.9326762412674725e-12,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "last_accepted": {
+        "scenario": "reconstructed_water_replay_accepted",
+        "step": 99,
+        "substeps": 1,
+        "pressure_iterations": 67,
+        "conservation_error_m3": 7.958078640513122e-13
+      },
+      "owner_state_advanced": false,
+      "timing_acceptance": false
+    },
+    {
+      "path": ".local\\dry-donor-overflow-replay.jsonl",
+      "sha256": "74ecb7b45e094a10569fc826afe1405bf898baa9b494083f7a4606774acc2d7d",
+      "accepted_steps": 100,
+      "added_fluid_time_s": 5.0,
+      "last_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "e029907+cut-row-no-dry-inflow-final",
+        "step": 99,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          49
+        ],
+        "limiting_cell": [
+          101,
+          100,
+          361
+        ],
+        "limiting_outflow_l1_m_s": 2.2898659712033007,
+        "face_speed_m_s": 1.3625036943610485,
+        "interface_speed_m_s": 10.509382274527672,
+        "water_change_m3": -1.1368683772161603e-12,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "last_accepted": {
+        "scenario": "reconstructed_water_replay_accepted",
+        "step": 99,
+        "substeps": 1,
+        "pressure_iterations": 105,
+        "conservation_error_m3": 3.410605131648481e-13
+      },
+      "owner_state_advanced": false,
+      "timing_acceptance": false
+    }
+  ],
+  "saved_final": {
+    "path": ".local/dry-donor-replay-1000-final.water-replay",
+    "sha256": "67213dc01dc87ad5252bf208b7457dd412dc19e69250ffbb587b0edf63803e9c"
+  },
+  "new_precursor_original_fluid_time_s": 12.05,
+  "new_replay_final_fluid_time_s": 62.05,
+  "owner_state_advanced": false,
+  "timing_acceptance": false
+}

@@ -1,0 +1,123 @@
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.44
+   Compiling rustls-webpki v0.103.15
+   Compiling rcgen v0.13.2
+   Compiling quinn-proto v0.11.17 (https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f2)
+   Compiling quinn v0.11.11
+   Compiling spall_net v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_net)
+   Compiling xtask v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\tools\xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.37s
+     Running `G:/Programming/voxel_engine/target\debug\xtask.exe check`
+    Checking spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Checking spall_sim v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_sim)
+    Checking spall_client v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_client)
+    Checking spall_server v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_server)
+    Checking sandbox v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\examples\sandbox)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.67s
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.44
+   Compiling spall_sim v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_sim)
+   Compiling rustls-webpki v0.103.15
+   Compiling rcgen v0.13.2
+   Compiling quinn-proto v0.11.17 (https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f2)
+   Compiling quinn v0.11.11
+   Compiling spall_net v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_net)
+   Compiling spall_client v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_client)
+   Compiling spall_server v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_server)
+   Compiling xtask v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\tools\xtask)
+   Compiling sandbox v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\examples\sandbox)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 23s
+     Running unittests src\main.rs (G:/Programming/voxel_engine/target\debug\deps\poc_local-eb86789e54816f14.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\debug\deps\sandbox-072c815e630f2b9f.exe)
+
+running 11 tests
+test editor_scene::tests::placement_translates_and_quarter_turns_like_the_editor ... ok
+test game::tests::a_tool_use_becomes_a_matching_edit_intent ... ok
+test content::layer_tests::static_import_uses_voxl_and_accepts_layer_metadata ... ok
+test editor_scene::tests::spawn_avoids_columns_with_overhead_geometry ... ok
+test vegetation::tests::catalogue_has_stable_twenty_species_and_every_biome ... ok
+test game::tests::the_linear_manifest_supersedes_v1_by_appearance_and_keeps_authored_looks ... ok
+test game::tests::manifest_is_valid_and_ids_are_fixed ... ok
+test progression_store::tests::committed_harvest_is_player_scoped_durable_and_idempotent ... ok
+test progression_store::tests::crafting_commit_and_exact_retry_survive_database_reopen ... ok
+test ecology_scene::tests::clearing_is_fully_resident_and_initial_vegetation_touches_soil ... ok
+test progression_store::tests::an_evicted_old_request_cannot_be_applied_again ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running unittests src\bin\sandbox-capture.rs (G:/Programming/voxel_engine/target\debug\deps\sandbox_capture-a2b245272fb15e88.exe)
+
+running 9 tests
+test tests::capture_aspect_follows_the_requested_dimensions ... ok
+test tests::g2_frame_scenes_are_distinct_lit_and_framed ... ok
+test tests::a_fixed_16_9_projection_distorts_a_4_3_target ... ok
+test tests::square_target_keeps_world_proportions ... ok
+test tests::four_by_three_target_keeps_world_proportions ... ok
+test tests::the_framed_shape_stays_inside_the_view ... ok
+test tests::sim_light_volume_tracks_terrain_occupancy_and_cuts ... ok
+test tests::destruction_scene_meshes_the_live_world_and_frames_it ... ok
+test tests::bounded_collapse_update_tracks_the_full_resample ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+
+     Running unittests src\bin\sandbox-client.rs (G:/Programming/voxel_engine/target\debug\deps\sandbox_client-00477728ee751e76.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\sandbox-server.rs (G:/Programming/voxel_engine/target\debug\deps\sandbox_server-9742a236a306ce3a.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\appearance.rs (G:/Programming/voxel_engine/target\debug\deps\appearance-076d73727a764200.exe)
+
+running 4 tests
+test wood_variants_still_drop_wood ... ok
+test the_manifest_extends_the_linear_one_and_variants_keep_their_bases_rules ... ok
+test forest_tints_map_to_variants_within_the_measured_error ... ok
+test variants_survive_an_edit_a_body_split_and_a_save ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.51s
+
+     Running tests\appearance_evolution.rs (G:/Programming/voxel_engine/target\debug\deps\appearance_evolution-d15422b8062bc653.exe)
+
+running 5 tests
+test extending_the_palette_keeps_every_earlier_meaning_and_colour ... ok
+test a_reused_lower_or_recoloured_row_is_refused ... ok
+test shipped_manifests_are_frozen ... ok
+test variant_ids_are_unique_and_never_collide_with_reserved_materials ... ok
+test a_saved_world_restores_under_an_extended_palette_unchanged ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.16s
+
+     Running tests\dam_gate_replication.rs (G:/Programming/voxel_engine/target\debug\deps\dam_gate_replication-8aa518f54520e4e9.exe)
+
+running 1 test
+test a_real_client_sees_the_dam_gate_open_after_the_admin_command ... FAILED
+
+failures:
+
+---- a_real_client_sees_the_dam_gate_open_after_the_admin_command stdout ----
+
+thread 'a_real_client_sees_the_dam_gate_open_after_the_admin_command' (15368) panicked at examples\sandbox\tests\dam_gate_replication.rs:130:5:
+expected the immediate "queued" ack plus at least one delayed commit/reject follow-up: []
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_real_client_sees_the_dam_gate_open_after_the_admin_command
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.08s
+
+error: test failed, to rerun pass `-p sandbox --test dam_gate_replication`
+xtask: cargo subcommand ["test", "--workspace", "--all-features"] failed with 101
+error: process didn't exit successfully: `G:/Programming/voxel_engine/target\debug\xtask.exe check` (exit code: 1)

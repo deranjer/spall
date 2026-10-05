@@ -1,0 +1,16 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.18s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\release\deps\spall_fluid-b49d3fbffb0ad4ba.exe)
+
+running 1 test
+{"scenario":"reconstructed_nearly_full_rest","h_m":0.5,"dt_s":0.025,"mixed":true,"steps":600,"peak_speed_m_s":0.000000000004136690989752915,"mass_error_m3":-0.0000000000000368594044175552}
+{"scenario":"reconstructed_nearly_full_rest","h_m":0.5,"dt_s":0.025,"mixed":false,"steps":600,"peak_speed_m_s":0.000000000000004440892098500626,"mass_error_m3":0.0000000000000004440892098500626}
+{"scenario":"reconstructed_nearly_full_rest","h_m":0.5,"dt_s":0.05,"mixed":true,"steps":600,"peak_speed_m_s":0.0000000000023703261575746373,"mass_error_m3":-0.00000000000003552713678800501}
+{"scenario":"reconstructed_nearly_full_rest","h_m":0.5,"dt_s":0.05,"mixed":false,"steps":600,"peak_speed_m_s":0.000000000000002220446049250313,"mass_error_m3":0.0000000000000004440892098500626}
+{"scenario":"reconstructed_nearly_full_rest","h_m":1,"dt_s":0.025,"mixed":true,"steps":600,"peak_speed_m_s":0.000000000008918136611620644,"mass_error_m3":-0.0000000000002913225216616411}
+{"scenario":"reconstructed_nearly_full_rest","h_m":1,"dt_s":0.025,"mixed":false,"steps":600,"peak_speed_m_s":0.000000000000008881784197001252,"mass_error_m3":0.000000000000003552713678800501}
+{"scenario":"reconstructed_nearly_full_rest","h_m":1,"dt_s":0.05,"mixed":true,"steps":600,"peak_speed_m_s":0.000000000004487521465534599,"mass_error_m3":-0.0000000000002877698079828406}
+{"scenario":"reconstructed_nearly_full_rest","h_m":1,"dt_s":0.05,"mixed":false,"steps":600,"peak_speed_m_s":0.000000000000004440892098500626,"mass_error_m3":0.000000000000003552713678800501}
+test grid_mac::tests::reconstructed_support_preserves_nearly_saturated_surface_rest ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 75 filtered out; finished in 2.47s
+

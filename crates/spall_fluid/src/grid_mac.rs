@@ -6,7 +6,12 @@ use std::time::Instant;
 
 use spall_core::GlobalCell;
 
+use crate::phase_graph::{GraphError, GraphLimits, PhaseGraph, PressureSmoother};
+use crate::phase_water::PhaseWater;
 use crate::{DomainSpec, SolidBoundary};
+mod cut_surface;
+mod momentum;
+mod replay;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MacConfig {
@@ -20,6 +25,9 @@ pub struct MacConfig {
     pub pressure_absolute_tolerance: f64,
     pub pressure_diagnostics: bool,
     pub open_top: bool,
+    /// ENG-122 diagnostic only; selected when freely displaced air is enabled.
+    /// Not part of the canonical save/wire configuration.
+    pub reconstructed_surface_support: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,12 +55,21 @@ impl Default for MacConfig {
             pressure_absolute_tolerance: 1.0e-8,
             pressure_diagnostics: false,
             open_top: true,
+            reconstructed_surface_support: false,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MacStepMetrics {
+    /// Advection-only mixture momentum ledger, excluding gravity/pressure.
+    pub momentum_transport_error_kg_m_s: [f64; 3],
+    pub momentum_wall_impulse_kg_m_s: [f64; 3],
+    pub momentum_open_outflow_kg_m_s: [f64; 3],
+    pub momentum_dual_mass_defect_kg: f64,
+    pub momentum_transport_subcycles: u32,
+    /// Additional momentum numerical payload, not whole peak/RSS.
+    pub momentum_scratch_bytes: usize,
     pub substeps: u32,
     /// Sum of pressure matrix rows assembled across this outer tick's
     /// projections; partial cells participate under the documented C > 0 rule.
@@ -61,6 +78,15 @@ pub struct MacStepMetrics {
     pub pressure_residual_initial_max: f64,
     pub pressure_residual_final_max: f64,
     pub pressure_converged_substeps: u32,
+    /// Opt-in phase-aware coarse predictor; final pressure rows remain fine.
+    pub phase_predictor_rows_total: u64,
+    pub phase_predictor_reuses: u32,
+    pub phase_predictor_rebuilds: u32,
+    pub phase_predictor_micros: u64,
+    pub phase_preconditioner_applications: u32,
+    pub phase_preconditioner_micros: u64,
+    /// Additional per-projection numerical arrays; not total peak or RSS.
+    pub phase_preconditioner_scratch_bytes: usize,
     pub divergence_before_max_s: f64,
     pub divergence_after_max_s: f64,
     pub water_volume_before_m3: f64,
@@ -74,6 +100,16 @@ pub struct MacStepMetrics {
     pub velocity_advection_micros: u64,
     pub pressure_solve_micros: u64,
     pub transport_micros: u64,
+    /// Accepted transport stage timings; limiter excludes separately timed repairs.
+    pub transport_reconstruction_micros: u64,
+    pub transport_flux_micros: u64,
+    pub transport_limiter_micros: u64,
+    pub transport_repair_micros: u64,
+    pub transport_interface_micros: u64,
+    pub transport_momentum_micros: u64,
+    pub strict_path_repair_count: u64,
+    /// Additional transient CSR/BFS array capacities; excludes FCT scratch.
+    pub strict_path_scratch_bytes: usize,
     pub boundary_micros: u64,
     pub total_micros: u64,
 }
@@ -101,6 +137,11 @@ pub struct FractionBandDiagnostic {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MacError {
+    MomentumPressureNotConverged { residual: f64 },
+    MomentumInvalidState,
+    MomentumMassMismatch { face: usize, defect_kg: f64 },
+    MomentumSubcycleBudget { required: u64 },
+    PhaseGraph(GraphError),
     InvalidConfig,
     InvalidTimeStep,
     SubstepBudgetExceeded { required: u32, maximum: u32 },
@@ -118,6 +159,19 @@ pub enum MacError {
 impl std::fmt::Display for MacError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MomentumPressureNotConverged { residual } => write!(
+                f,
+                "momentum projection did not converge: residual {residual}"
+            ),
+            Self::MomentumInvalidState => write!(f, "nonfinite staggered momentum candidate"),
+            Self::MomentumMassMismatch { face, defect_kg } => {
+                write!(f, "dual mass mismatch at face {face}: {defect_kg} kg")
+            }
+            Self::MomentumSubcycleBudget { required } => write!(
+                f,
+                "momentum requires {required} subcycles, above 1024 budget"
+            ),
+            Self::PhaseGraph(error) => write!(f, "phase pressure predictor: {error}"),
             Self::InvalidConfig => write!(f, "invalid MAC grid configuration"),
             Self::InvalidTimeStep => write!(f, "outer timestep must be finite and positive"),
             Self::SubstepBudgetExceeded { required, maximum } => write!(
@@ -178,9 +232,17 @@ pub struct MacGridWorld {
     cumulative_open_outflow_m3: f64,
     pressure_preconditioner: PressurePreconditioner,
     ambient_density_kg_m3: Option<f64>,
+    freely_displaced_air: bool,
+    experimental_surface_films: bool,
+    cut_surface_support: bool,
+    cut_surface_flux: [Vec<f64>; 3],
+    cut_surface_velocity: [Vec<f64>; 3],
     compressible_enclosed_air: bool,
     stage_diagnostics: bool,
     diagnostic_outer_step: u64,
+    strict_phase_bounds: bool,
+    conservative_momentum: bool,
+    phase_predictor: Option<PhasePredictor>,
 }
 
 impl MacGridWorld {
@@ -240,9 +302,17 @@ impl MacGridWorld {
             cumulative_open_outflow_m3: 0.0,
             pressure_preconditioner: PressurePreconditioner::Jacobi,
             ambient_density_kg_m3: None,
+            freely_displaced_air: false,
+            experimental_surface_films: false,
+            cut_surface_support: false,
+            cut_surface_flux: [Vec::new(), Vec::new(), Vec::new()],
+            cut_surface_velocity: [Vec::new(), Vec::new(), Vec::new()],
             compressible_enclosed_air: false,
             stage_diagnostics: false,
             diagnostic_outer_step: 0,
+            strict_phase_bounds: false,
+            conservative_momentum: false,
+            phase_predictor: None,
         })
     }
 
@@ -254,8 +324,73 @@ impl MacGridWorld {
         self.config
     }
 
+    /// Reference phase coupling requires strictly bounded canonical fractions.
+    /// Legacy replay retains its existing roundoff-tolerant transport path.
+    pub(crate) fn set_strict_phase_bounds(&mut self) {
+        self.strict_phase_bounds = true;
+    }
+
+    pub(crate) fn set_conservative_momentum(&mut self) -> Result<(), MacError> {
+        if self.ambient_density_kg_m3.is_none() || !self.strict_phase_bounds {
+            return Err(MacError::InvalidConfig);
+        }
+        self.conservative_momentum = true;
+        // Mixture mass needs a more accurate incompressible volume flux than
+        // the historical velocity-only reference. Tighten, never loosen, CG.
+        self.config.pressure_relative_tolerance =
+            self.config.pressure_relative_tolerance.min(1e-12);
+        self.config.pressure_absolute_tolerance = self.config.pressure_absolute_tolerance.min(1e-8);
+        Ok(())
+    }
+
     pub fn set_pressure_preconditioner(&mut self, value: PressurePreconditioner) {
         self.pressure_preconditioner = value;
+    }
+
+    pub(crate) fn set_phase_pressure_predictor(
+        &mut self,
+        phase: &PhaseWater,
+        limits: GraphLimits,
+        sweeps: u32,
+    ) -> Result<(), MacError> {
+        if self.ambient_density_kg_m3.is_none()
+            || sweeps == 0
+            || sweeps > 64
+            || self.spec != phase.geometry().fine_spec()
+            || self.config.cell_size_m.to_bits() != phase.voxel_size_m().to_bits()
+            || self
+                .fraction
+                .iter()
+                .zip(phase.fractions())
+                .any(|(a, b)| a.to_bits() != b.to_bits())
+            || self
+                .solid
+                .iter()
+                .enumerate()
+                .any(|(i, &s)| s != phase.geometry().component_at_index(i).is_none())
+        {
+            return Err(MacError::InvalidConfig);
+        }
+        let graph = PhaseGraph::build(phase, limits).map_err(MacError::PhaseGraph)?;
+        self.phase_predictor = Some(PhasePredictor {
+            phase: phase.clone(),
+            graph,
+            limits,
+            sweeps,
+            iterative: false,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn set_phase_pressure_preconditioner(
+        &mut self,
+        phase: &PhaseWater,
+        limits: GraphLimits,
+        sweeps: u32,
+    ) -> Result<(), MacError> {
+        self.set_phase_pressure_predictor(phase, limits, sweeps)?;
+        self.phase_predictor.as_mut().unwrap().iterative = true;
+        Ok(())
     }
 
     /// Opt-in variable-density, two-phase pressure comparison. Both water and
@@ -267,12 +402,82 @@ impl MacGridWorld {
             return Err(MacError::InvalidConfig);
         }
         self.ambient_density_kg_m3 = Some(density);
+        self.freely_displaced_air = false;
+        self.experimental_surface_films = false;
+        self.cut_surface_support = false;
+        self.cut_surface_flux = std::array::from_fn(|_| Vec::new());
+        self.cut_surface_velocity = std::array::from_fn(|_| Vec::new());
         // Sealed air defaults to isothermal compressible gas; see
         // `set_compressible_enclosed_air`.
         self.compressible_enclosed_air = true;
         self.pressure_pa.fill(0.0);
         self.previous_pressure_diagonal = None;
         Ok(())
+    }
+
+    /// Liquid-only pressure with atmospheric empty space, including sealed
+    /// pockets. Retains geometric PLIC/FCT transport and advect-before-force
+    /// ordering, but has no air inertia, pressure rows or compression.
+    pub fn set_freely_displaced_air(&mut self) -> Result<(), MacError> {
+        if self.conservative_momentum || self.phase_predictor.is_some() {
+            return Err(MacError::InvalidConfig);
+        }
+        self.ambient_density_kg_m3 = None;
+        self.compressible_enclosed_air = false;
+        self.freely_displaced_air = true;
+        self.experimental_surface_films = false;
+        self.cut_surface_support = false;
+        self.cut_surface_flux = std::array::from_fn(|_| Vec::new());
+        self.cut_surface_velocity = std::array::from_fn(|_| Vec::new());
+        self.strict_phase_bounds = true;
+        // Wet-only projection has much less work, but saturated donor cells
+        // need pressure residuals below the unchanged 1e-10 low-order bound.
+        self.config.pressure_relative_tolerance =
+            self.config.pressure_relative_tolerance.min(1.0e-10);
+        self.pressure_pa.fill(0.0);
+        self.previous_pressure_diagonal = None;
+        if self.config.reconstructed_surface_support {
+            self.set_cut_surface_support()?;
+        }
+        Ok(())
+    }
+
+    /// ENG-122 diagnostic prototype, NOT an accepted gameplay policy. Its
+    /// half-cell velocity/mass support fails shallow-film energy and rest
+    /// gates. Only the explicitly opted-in shallow-shore probe uses it.
+    pub fn set_experimental_surface_films(&mut self) -> Result<(), MacError> {
+        if !self.freely_displaced_air || self.cut_surface_support {
+            return Err(MacError::InvalidConfig);
+        }
+        self.experimental_surface_films = true;
+        Ok(())
+    }
+
+    /// ENG-122 experimental reconstructed support. Batched incremental
+    /// pressure/flow corrections use symmetric Gauss-Seidel CG independently
+    /// of legacy MG. Original 512/1024 trench and final-step gates pass; stored
+    /// face/interface accuracy, complete scratch and sustained windowed gates
+    /// remain open. This is not an accepted gameplay policy.
+    pub fn set_cut_surface_support(&mut self) -> Result<(), MacError> {
+        if !self.freely_displaced_air || self.experimental_surface_films {
+            return Err(MacError::InvalidConfig);
+        }
+        self.cut_surface_support = true;
+        Ok(())
+    }
+
+    pub(crate) fn cut_surface_support_enabled(&self) -> bool {
+        self.cut_surface_support
+    }
+
+    /// Maximum component of the retained interface predictor. This is derived
+    /// numerical state, not an additional fluid mass or a momentum ledger.
+    pub fn reconstructed_interface_speed_m_s(&self) -> f64 {
+        self.cut_surface_velocity
+            .iter()
+            .flatten()
+            .map(|u| u.abs())
+            .fold(0.0, f64::max)
     }
 
     /// Two-phase only (on by default there): treat air that is sealed off from
@@ -394,6 +599,35 @@ impl MacGridWorld {
         &self.fraction
     }
 
+    pub fn pressure_at(&self, cell: GlobalCell) -> Option<f64> {
+        self.spec.index_of(cell).map(|i| self.pressure_pa[i])
+    }
+
+    /// Cell-centred liquid momentum diagnostic; not a conservative advection
+    /// ledger or a mixture-pressure wall-force accounting proof.
+    pub fn liquid_momentum_kg_m_s(&self) -> [f64; 3] {
+        let [nx, ny, nz] = self.dims();
+        let mut total = [0.0; 3];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let mass = self.config.density_kg_m3
+                        * self.fraction[self.cell_index(x, y, z)]
+                        * self.cell_volume();
+                    let velocity = [
+                        0.5 * (self.u[self.u_index(x, y, z)] + self.u[self.u_index(x + 1, y, z)]),
+                        0.5 * (self.v[self.v_index(x, y, z)] + self.v[self.v_index(x, y + 1, z)]),
+                        0.5 * (self.w[self.w_index(x, y, z)] + self.w[self.w_index(x, y, z + 1)]),
+                    ];
+                    for axis in 0..3 {
+                        total[axis] += mass * velocity[axis];
+                    }
+                }
+            }
+        }
+        total
+    }
+
     pub fn trapped_fractions(&self) -> &[f64] {
         &self.trapped
     }
@@ -486,6 +720,8 @@ impl MacGridWorld {
             + (self.fraction.capacity() + self.trapped.capacity() + self.pressure_pa.capacity())
                 * size_of::<f64>()
             + (self.u.capacity() + self.v.capacity() + self.w.capacity()) * size_of::<f64>()
+            + self.cut_surface_flux.iter().map(|v| v.capacity() * size_of::<f64>()).sum::<usize>()
+            + self.cut_surface_velocity.iter().map(|v| v.capacity() * size_of::<f64>()).sum::<usize>()
             + self
                 .previous_pressure_diagonal
                 .as_ref()
@@ -498,6 +734,10 @@ impl MacGridWorld {
                 .previous_component_anchors
                 .as_ref()
                 .map_or(0, |v| v.capacity() * size_of::<bool>())
+            // Conservative retained upper bound: the initial canonical phase
+            // may share these fractions. Immutable geometry/faces are excluded.
+            + self.phase_predictor.as_ref().map_or(0, |s|
+                std::mem::size_of_val(s.phase.fractions()) + s.graph.array_storage_bytes())
     }
 
     pub fn fraction_bounds(&self) -> (f64, f64) {
@@ -835,7 +1075,11 @@ impl MacGridWorld {
         if prepared.len() != self.solid.len() {
             return Err(MacError::BoundaryMismatch);
         }
+        if prepared == self.solid {
+            return Ok(());
+        }
         self.solid = prepared;
+        self.cut_surface_velocity = std::array::from_fn(|_| Vec::new());
         self.pressure_pa.fill(0.0);
         self.previous_liquid.fill(false);
         if let Some(diagonal) = &mut self.previous_pressure_diagonal {
@@ -903,6 +1147,12 @@ impl MacGridWorld {
             }
         }
 
+        // A terrain revision can change fine voxels without changing this
+        // coarsened fluid boundary. Preserve valid dynamic reconstruction and
+        // pressure in that case. Trapped water still needs its release attempt.
+        if candidate_solid == self.solid && displaced.is_empty() {
+            return Ok(0.0);
+        }
         let mut visited = vec![false; self.solid.len()];
         let mut queue = VecDeque::new();
         let neighbor_cells = |cell: GlobalCell| {
@@ -982,6 +1232,7 @@ impl MacGridWorld {
         self.solid = candidate_solid;
         self.fraction = candidate_fraction;
         self.trapped = candidate_trapped;
+        self.cut_surface_velocity = std::array::from_fn(|_| Vec::new());
         self.pressure_pa.fill(0.0);
         self.previous_liquid.fill(false);
         if let Some(diagonal) = &mut self.previous_pressure_diagonal {
@@ -1016,22 +1267,7 @@ impl MacGridWorld {
             return Err(MacError::BoundaryMismatch);
         }
         let (max_speed, max_speed_cell) = self.max_face_speed_l1();
-        let advective_dt = if max_speed > 0.0 {
-            self.config.cfl_limit * self.config.cell_size_m / max_speed
-        } else {
-            f64::INFINITY
-        };
-        let gravity = self
-            .config
-            .gravity_m_s2
-            .iter()
-            .map(|g| g.abs())
-            .fold(0.0, f64::max);
-        let gravity_dt = if gravity > 0.0 {
-            (2.0 * self.config.cfl_limit * self.config.cell_size_m / gravity).sqrt()
-        } else {
-            f64::INFINITY
-        };
+        let (advective_dt, gravity_dt) = self.stability_time_limits(max_speed);
         let stable_dt = advective_dt.min(gravity_dt);
         let required = (outer_dt_s / stable_dt).ceil().max(1.0) as u32;
         if self.config.pressure_diagnostics {
@@ -1086,7 +1322,11 @@ impl MacGridWorld {
         for substep in 0..required {
             // Preserve the historical single-phase backend for matched replay.
             // In the two-phase candidate, advect before applying forces.
-            if self.ambient_density_kg_m3.is_some() {
+            if (self.ambient_density_kg_m3.is_some() || self.freely_displaced_air)
+                && !self.conservative_momentum
+                && !self.experimental_surface_films
+                && !self.cut_surface_support
+            {
                 let stage = Instant::now();
                 self.advect_velocity(sub_dt);
                 metrics.velocity_advection_micros += stage.elapsed().as_micros() as u64;
@@ -1101,9 +1341,13 @@ impl MacGridWorld {
                 .iter_mut()
                 .zip(std::iter::repeat(self.config.gravity_m_s2[1]))
             {
-                *velocity += g * sub_dt;
+                if !self.cut_surface_support {
+                    *velocity += g * sub_dt;
+                }
             }
-            if self.ambient_density_kg_m3.is_some() {
+            if !self.cut_surface_support
+                && (self.ambient_density_kg_m3.is_some() || self.freely_displaced_air)
+            {
                 for velocity in &mut self.u {
                     *velocity += self.config.gravity_m_s2[0] * sub_dt;
                 }
@@ -1117,7 +1361,7 @@ impl MacGridWorld {
                 self.print_stage_diagnostic(substep, "after_gravity", sub_dt, 0.0);
             }
 
-            if self.ambient_density_kg_m3.is_none() {
+            if self.ambient_density_kg_m3.is_none() && !self.freely_displaced_air {
                 let stage = Instant::now();
                 self.advect_velocity(sub_dt);
                 metrics.velocity_advection_micros += stage.elapsed().as_micros() as u64;
@@ -1131,8 +1375,22 @@ impl MacGridWorld {
 
             let stage = Instant::now();
             let p = self.project(sub_dt)?;
+            if self.conservative_momentum && !p.converged {
+                return Err(MacError::MomentumPressureNotConverged {
+                    residual: p.residual_final,
+                });
+            }
             metrics.pressure_solve_micros += stage.elapsed().as_micros() as u64;
             metrics.pressure_iterations += p.iterations as u64;
+            metrics.phase_predictor_rows_total += p.phase_rows as u64;
+            metrics.phase_predictor_reuses += u32::from(p.phase_reused);
+            metrics.phase_predictor_rebuilds += u32::from(p.phase_rows > 0 && !p.phase_reused);
+            metrics.phase_predictor_micros += p.phase_micros;
+            metrics.phase_preconditioner_applications += p.phase_applications;
+            metrics.phase_preconditioner_micros += p.phase_apply_micros;
+            metrics.phase_preconditioner_scratch_bytes = metrics
+                .phase_preconditioner_scratch_bytes
+                .max(p.phase_scratch_bytes);
             metrics.pressure_active_rows_total += p.active_cells as u64;
             metrics.pressure_residual_initial_max = metrics
                 .pressure_residual_initial_max
@@ -1150,12 +1408,79 @@ impl MacGridWorld {
             }
 
             let stage = Instant::now();
-            let (permitted_outflow, tracked_out, tracked_in) =
+            let (permitted_outflow, tracked_out, tracked_in, strict) =
                 self.advect_fraction_fct(sub_dt, tracked_region)?;
+            metrics.transport_reconstruction_micros += strict.timings[0];
+            metrics.transport_flux_micros += strict.timings[1];
+            metrics.transport_limiter_micros += strict.timings[2];
+            metrics.transport_repair_micros += strict.timings[3];
+            metrics.transport_interface_micros += strict.timings[4];
+            metrics.transport_momentum_micros += strict.timings[5];
+            metrics.strict_path_repair_count += strict.path_repairs;
+            metrics.strict_path_scratch_bytes =
+                metrics.strict_path_scratch_bytes.max(strict.scratch_bytes);
+            for axis in 0..3 {
+                metrics.momentum_transport_error_kg_m_s[axis] += strict.momentum.error[axis];
+                metrics.momentum_wall_impulse_kg_m_s[axis] += strict.momentum.wall[axis];
+                metrics.momentum_open_outflow_kg_m_s[axis] += strict.momentum.exterior[axis];
+            }
+            metrics.momentum_dual_mass_defect_kg = metrics
+                .momentum_dual_mass_defect_kg
+                .max(strict.momentum.mass_defect);
+            metrics.momentum_transport_subcycles = metrics
+                .momentum_transport_subcycles
+                .max(strict.momentum.sweeps);
+            metrics.momentum_scratch_bytes =
+                metrics.momentum_scratch_bytes.max(strict.momentum.bytes);
             outflow += permitted_outflow;
             region_outflow += tracked_out;
             region_inflow += tracked_in;
             metrics.transport_micros += stage.elapsed().as_micros() as u64;
+            if self.conservative_momentum {
+                // Density and momentum just moved together. Restore the fine
+                // incompressibility constraint on the new phase before commit.
+                let stage = Instant::now();
+                let force_pressure = self.pressure_pa.clone();
+                metrics.momentum_scratch_bytes = metrics
+                    .momentum_scratch_bytes
+                    .max(force_pressure.capacity() * size_of::<f64>());
+                let post = self.project(sub_dt)?;
+                if !post.converged {
+                    return Err(MacError::MomentumPressureNotConverged {
+                        residual: post.residual_final,
+                    });
+                }
+                // The second projection is an incremental pressure impulse.
+                // Retain force + correction pressure for diagnostics/warm start.
+                for (pressure, force) in self.pressure_pa.iter_mut().zip(force_pressure) {
+                    *pressure += force;
+                }
+                metrics.pressure_solve_micros += stage.elapsed().as_micros() as u64;
+                metrics.pressure_iterations += post.iterations as u64;
+                metrics.pressure_active_rows_total += post.active_cells as u64;
+                metrics.pressure_residual_initial_max = metrics
+                    .pressure_residual_initial_max
+                    .max(post.residual_initial);
+                metrics.pressure_residual_final_max =
+                    metrics.pressure_residual_final_max.max(post.residual_final);
+                metrics.divergence_before_max_s =
+                    metrics.divergence_before_max_s.max(post.divergence_before);
+                metrics.divergence_after_max_s =
+                    metrics.divergence_after_max_s.max(post.divergence_after);
+                metrics.phase_predictor_rows_total += post.phase_rows as u64;
+                metrics.phase_predictor_reuses += u32::from(post.phase_reused);
+                metrics.phase_predictor_rebuilds +=
+                    u32::from(post.phase_rows > 0 && !post.phase_reused);
+                metrics.phase_predictor_micros += post.phase_micros;
+                metrics.phase_preconditioner_applications += post.phase_applications;
+                metrics.phase_preconditioner_micros += post.phase_apply_micros;
+                metrics.phase_preconditioner_scratch_bytes = metrics
+                    .phase_preconditioner_scratch_bytes
+                    .max(post.phase_scratch_bytes);
+                if p.converged && !post.converged {
+                    metrics.pressure_converged_substeps -= 1;
+                }
+            }
             metrics.active_cells = self.active_cells();
             if self.stage_diagnostics {
                 self.print_stage_diagnostic(
@@ -1367,6 +1692,26 @@ impl MacGridWorld {
         x + nx * (y + ny * z)
     }
 
+    fn stability_time_limits(&self, max_speed: f64) -> (f64, f64) {
+        let advective_dt = if max_speed > 0.0 {
+            self.config.cfl_limit * self.config.cell_size_m / max_speed
+        } else {
+            f64::INFINITY
+        };
+        let gravity = self
+            .config
+            .gravity_m_s2
+            .iter()
+            .map(|g| g.abs())
+            .fold(0.0, f64::max);
+        let gravity_dt = if gravity > 0.0 {
+            (2.0 * self.config.cfl_limit * self.config.cell_size_m / gravity).sqrt()
+        } else {
+            f64::INFINITY
+        };
+        (advective_dt, gravity_dt)
+    }
+
     fn max_face_speed_l1(&self) -> (f64, usize) {
         self.max_face_speed_l1_for_occupancy(0.0)
     }
@@ -1505,9 +1850,16 @@ impl MacGridWorld {
     }
 
     fn project(&mut self, dt: f64) -> Result<ProjectionStats, MacError> {
+        if self.cut_surface_support {
+            return cut_surface::project(self, dt);
+        }
         let [nx, ny, nz] = self.dims();
         let n = self.fraction.len();
         let h2 = self.config.cell_size_m.powi(2);
+        // Ghost-fluid pressure samples lie inside the reconstructed liquid.
+        // Air-centred samples have p=0; their water fractions still participate
+        // in transport unchanged. See Bridson, Fluid Simulation notes, sec 4.5.
+        let surfaces = self.freely_displaced_air.then(|| self.reconstruct_planes());
         let mut liquid = vec![false; n];
         for (i, cell_is_liquid) in liquid.iter_mut().enumerate() {
             // Legacy single-phase rows follow C > 0. The opt-in two-phase
@@ -1515,6 +1867,11 @@ impl MacGridWorld {
             // coefficients; no water fraction or pressure row is discarded.
             *cell_is_liquid =
                 (self.ambient_density_kg_m3.is_some() || self.fraction[i] > 0.0) && !self.solid[i];
+            if let Some(planes) = &surfaces
+                && let Some(plane) = planes[i]
+            {
+                *cell_is_liquid = plane.normal.iter().sum::<f64>() * 0.5 < plane.alpha;
+            }
         }
         let liquid_indices: Vec<usize> = liquid
             .iter()
@@ -1562,6 +1919,7 @@ impl MacGridWorld {
         let mut component_mean_counts = vec![0usize; comp_count];
         let mut rhs = vec![0.0; n];
         let mut diag = vec![0.0; n];
+        let mut phase_diagonal = self.phase_predictor.as_ref().map(|_| vec![0.0; n]);
         let mut div_before: f64 = 0.0;
         for &i in &liquid_indices {
             let x = i % nx;
@@ -1592,12 +1950,16 @@ impl MacGridWorld {
                         diag[i] += (if liquid[j] {
                             self.relative_inverse_face_density(i, j)
                         } else {
-                            2.0
+                            self.surface_face_factor(i, j, axis, &liquid, surfaces.as_deref())
                         }) / h2;
                         // Empty-cell pressure is atmospheric at the face;
                         // the half-cell distance doubles the coefficient.
                     } else if axis == 1 && dir > 0 && self.config.open_top {
-                        diag[i] += 2.0 * self.relative_inverse_face_density(i, i) / h2;
+                        let extra = 2.0 * self.relative_inverse_face_density(i, i) / h2;
+                        diag[i] += extra;
+                        if let Some(d) = &mut phase_diagonal {
+                            d[i] += extra;
+                        }
                     }
                 }
             }
@@ -1614,6 +1976,9 @@ impl MacGridWorld {
                         .max(0.1 * ATMOSPHERIC_PRESSURE_PA);
                     let k = sealed[i] * self.config.density_kg_m3 / (absolute * dt * dt);
                     diag[i] += k;
+                    if let Some(d) = &mut phase_diagonal {
+                        d[i] += k;
+                    }
                     rhs[i] += k * self.pressure_pa[i];
                     if let Some(c) = components[i] {
                         anchored[c] = true;
@@ -1721,19 +2086,112 @@ impl MacGridWorld {
         for &i in &liquid_indices {
             r[i] = rhs[i] - ap[i];
         }
-        if let Some(factor) = &ic0 {
-            factor.apply(
-                &r,
-                &mut zvec,
+        // Freeze acceptance against the original warm residual. Coarse guesses
+        // must never relax the fine solver's divergence/residual requirement.
+        let mut baseline_residual = None;
+        let mut phase_rows = 0;
+        let mut phase_reused = false;
+        let mut phase_micros = 0;
+        let mut balanced = None;
+        if let Some(state) = &self.phase_predictor {
+            let start = Instant::now();
+            project_component_means(
+                &mut r,
+                &components,
+                &anchored,
+                comp_count,
                 &liquid_indices,
-                preconditioner_work.as_mut().unwrap(),
+                &mut component_mean_sums,
+                &mut component_mean_counts,
             );
-        } else if let Some(mg) = &mut multigrid {
-            mg.apply(&r, &mut zvec);
-        } else {
-            for &i in &liquid_indices {
-                zvec[i] = if diag[i] > 0.0 { r[i] / diag[i] } else { 0.0 };
+            baseline_residual = Some(l2_norm_indices(&r, &liquid_indices));
+            if self.ambient_density_kg_m3.is_none()
+                || self
+                    .solid
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &s)| s != state.phase.geometry().component_at_index(i).is_none())
+            {
+                return Err(MacError::BoundaryMismatch);
             }
+            let phase = state
+                .phase
+                .with_fractions(self.fraction.clone())
+                .map_err(|e| MacError::PhaseGraph(GraphError::Phase(e)))?;
+            let (graph, reused) = state
+                .graph
+                .refresh(&phase, state.limits)
+                .map_err(MacError::PhaseGraph)?;
+            let weights: Vec<_> = phase
+                .faces()
+                .iter()
+                .map(|f| self.relative_inverse_face_density(f.lower, f.upper) / h2)
+                .collect();
+            let coarse = graph
+                .pressure_operator_with_diagonal(&phase, &weights, phase_diagonal.as_ref().unwrap())
+                .map_err(MacError::PhaseGraph)?;
+            if state.iterative {
+                balanced = Some(BalancedPhasePressure::new(
+                    &graph,
+                    coarse.smoother().map_err(MacError::PhaseGraph)?,
+                    n,
+                    state.sweeps,
+                ));
+            } else {
+                let mut source = vec![0.0; graph.rows().len()];
+                for &i in &liquid_indices {
+                    source[graph.row_at_index(i).unwrap() as usize] += r[i];
+                }
+                let correction = coarse
+                    .smooth(&source, state.sweeps)
+                    .map_err(MacError::PhaseGraph)?;
+                for &i in &liquid_indices {
+                    p[i] += correction[graph.row_at_index(i).unwrap() as usize];
+                }
+                project_component_means(
+                    &mut p,
+                    &components,
+                    &anchored,
+                    comp_count,
+                    &liquid_indices,
+                    &mut component_mean_sums,
+                    &mut component_mean_counts,
+                );
+                operator.apply(&p, &mut ap);
+                for &i in &liquid_indices {
+                    r[i] = rhs[i] - ap[i];
+                }
+            }
+            phase_rows = graph.rows().len();
+            phase_reused = reused;
+            self.phase_predictor = Some(PhasePredictor {
+                phase,
+                graph,
+                limits: state.limits,
+                sweeps: state.sweeps,
+                iterative: state.iterative,
+            });
+            phase_micros = start.elapsed().as_micros() as u64;
+        }
+        let mut base = BasePressurePreconditioner {
+            ic0: ic0.as_ref(),
+            multigrid: multigrid.as_mut(),
+            work: preconditioner_work.as_mut(),
+            active: &liquid_indices,
+            diag: &diag,
+        };
+        let mut phase_applications = 0;
+        let mut phase_apply_micros = 0;
+        let phase_scratch_bytes = balanced
+            .as_ref()
+            .map_or(0, BalancedPhasePressure::array_storage_bytes);
+        if let Some(b) = &mut balanced {
+            let start = Instant::now();
+            b.apply(&r, &mut zvec, &operator, &mut base)?;
+            phase_applications += 1;
+            phase_apply_micros += start.elapsed().as_micros() as u64;
+        } else {
+            base.apply(&r, &mut zvec);
         }
         if self.config.pressure_diagnostics {
             preconditioner_application_us += timer.elapsed().as_micros() as u64;
@@ -1761,10 +2219,9 @@ impl MacGridWorld {
         if self.config.pressure_diagnostics {
             vector_operations_us += timer.elapsed().as_micros() as u64;
         }
-        let target = self
-            .config
-            .pressure_absolute_tolerance
-            .max(self.config.pressure_relative_tolerance * residual_initial);
+        let target = self.config.pressure_absolute_tolerance.max(
+            self.config.pressure_relative_tolerance * baseline_residual.unwrap_or(residual_initial),
+        );
         let mut d = zvec.clone();
         let mut rz = dot_indices(&r, &zvec, &liquid_indices);
         let mut residual_final = residual_initial;
@@ -1809,19 +2266,13 @@ impl MacGridWorld {
                 break;
             }
             let preconditioner_timer = Instant::now();
-            if let Some(factor) = &ic0 {
-                factor.apply(
-                    &r,
-                    &mut zvec,
-                    &liquid_indices,
-                    preconditioner_work.as_mut().unwrap(),
-                );
-            } else if let Some(mg) = &mut multigrid {
-                mg.apply(&r, &mut zvec);
+            if let Some(b) = &mut balanced {
+                let start = Instant::now();
+                b.apply(&r, &mut zvec, &operator, &mut base)?;
+                phase_applications += 1;
+                phase_apply_micros += start.elapsed().as_micros() as u64;
             } else {
-                for &i in &liquid_indices {
-                    zvec[i] = if diag[i] > 0.0 { r[i] / diag[i] } else { 0.0 };
-                }
+                base.apply(&r, &mut zvec);
             }
             let preconditioner_elapsed = if self.config.pressure_diagnostics {
                 let elapsed = preconditioner_timer.elapsed().as_micros() as u64;
@@ -1870,7 +2321,13 @@ impl MacGridWorld {
             &mut component_mean_counts,
         );
         self.pressure_pa = p;
-        self.correct_faces(&liquid, dt);
+        self.correct_faces(&liquid, dt, surfaces.as_deref());
+        if self.freely_displaced_air {
+            if self.experimental_surface_films {
+                self.accelerate_unresolved_surface_films(&liquid, dt);
+            }
+            self.extrapolate_surface_velocities(&liquid, None);
+        }
         let mut div_after: f64 = 0.0;
         for z in 0..nz {
             for y in 0..ny {
@@ -1973,6 +2430,12 @@ impl MacGridWorld {
             );
         }
         Ok(ProjectionStats {
+            phase_applications,
+            phase_apply_micros,
+            phase_scratch_bytes,
+            phase_rows,
+            phase_reused,
+            phase_micros,
             iterations,
             active_cells: liquid_indices.len(),
             residual_initial,
@@ -2034,7 +2497,53 @@ impl MacGridWorld {
         (labels, anchored)
     }
 
-    fn correct_faces(&mut self, liquid: &[bool], dt: f64) {
+    /// Reciprocal liquid-centre to atmospheric-interface distance in cell
+    /// units. Use the PLIC plane's actual segment intersection where present;
+    /// full/dry neighbours use the existing half-cell free surface. The 0.01
+    /// minimum theta is the explicit ghost-fluid conditioning floor, not a
+    /// liquid-fraction cutoff or an added pressure anchor.
+    fn surface_face_factor(
+        &self,
+        a: usize,
+        b: usize,
+        axis: usize,
+        liquid: &[bool],
+        surfaces: Option<&[Option<InterfacePlane>]>,
+    ) -> f64 {
+        let Some(planes) = surfaces else {
+            return 2.0;
+        };
+        let (wet, dry) = if liquid[a] { (a, b) } else { (b, a) };
+        let direction = if dry > wet { 1.0 } else { -1.0 };
+        let intersection = |plane: InterfacePlane, offset: f64| {
+            let slope = plane.normal[axis] * direction;
+            if slope > 0.0 {
+                Some(offset + (plane.alpha - 0.5 * plane.normal.iter().sum::<f64>()) / slope)
+            } else {
+                None
+            }
+        };
+        let valid = |t: &f64| t.is_finite() && *t >= 0.0 && *t <= 1.0;
+        // The air-centred cell describes the atmospheric boundary seen from
+        // this pressure segment. A nearly saturated wet cell can also acquire
+        // a PLIC plane through roundoff; that internal reconstruction must not
+        // replace the surface on the air side. Reject each invalid candidate
+        // before falling back, so one out-of-segment plane cannot mask the
+        // other cell's valid boundary.
+        let theta = planes[dry]
+            .and_then(|p| intersection(p, 1.0))
+            .filter(valid)
+            .or_else(|| planes[wet].and_then(|p| intersection(p, 0.0)).filter(valid))
+            .unwrap_or(0.5);
+        1.0 / theta.max(0.01)
+    }
+
+    fn correct_faces(
+        &mut self,
+        liquid: &[bool],
+        dt: f64,
+        surfaces: Option<&[Option<InterfacePlane>]>,
+    ) {
         let [nx, ny, nz] = self.dims();
         let h = self.config.cell_size_m;
         let k = dt / (self.config.density_kg_m3 * h);
@@ -2058,7 +2567,7 @@ impl MacGridWorld {
                     {
                         let fi = x + (nx + 1) * (y + ny * z);
                         let interface_factor = if liquid[li] != liquid[ri] {
-                            2.0
+                            self.surface_face_factor(li, ri, 0, liquid, surfaces)
                         } else {
                             self.relative_inverse_face_density(li, ri)
                         };
@@ -2087,7 +2596,7 @@ impl MacGridWorld {
                         {
                             let fi = x + nx * (y + (ny + 1) * z);
                             let interface_factor = if liquid[bi] != liquid[ti] {
-                                2.0
+                                self.surface_face_factor(bi, ti, 1, liquid, surfaces)
                             } else {
                                 self.relative_inverse_face_density(bi, ti)
                             };
@@ -2129,12 +2638,140 @@ impl MacGridWorld {
                     {
                         let fi = x + nx * (y + ny * z);
                         let interface_factor = if liquid[ai] != liquid[bi] {
-                            2.0
+                            self.surface_face_factor(ai, bi, 2, liquid, surfaces)
                         } else {
                             self.relative_inverse_face_density(ai, bi)
                         };
                         self.w[fi] -=
                             interface_factor * k * (self.pressure_pa[bi] - self.pressure_pa[ai]);
+                    }
+                }
+            }
+        }
+        self.enforce_wall_velocities();
+    }
+
+    /// A VOF film below the pressure sample still has a hydrostatic head. On
+    /// horizontal faces without a bulk pressure sample, integrate the shallow
+    /// layer pressure (rho*g*d^2/2): division by the mean face depth gives
+    /// -g*(d_right-d_left)/h. The existing bounded PLIC transfers move its mass.
+    /// This closure is for downward vertical gravity; bulk faces continue to
+    /// use the three-dimensional ghost-fluid pressure projection.
+    fn accelerate_unresolved_surface_films(&mut self, liquid: &[bool], dt: f64) {
+        let [gx, gy, gz] = self.config.gravity_m_s2;
+        if gx != 0.0 || gz != 0.0 || gy >= 0.0 {
+            return;
+        }
+        let [nx, ny, nz] = self.dims();
+        for axis in [0, 2] {
+            let mut ext = [nx, ny, nz];
+            ext[axis] += 1;
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let p = [x, y, z];
+                        if p[axis] == 0 {
+                            continue;
+                        }
+                        let mut low = p;
+                        low[axis] -= 1;
+                        let a = self.cell_index(low[0], low[1], low[2]);
+                        let b = self.cell_index(x, y, z);
+                        if self.solid[a] || self.solid[b] || liquid[a] || liquid[b] {
+                            continue;
+                        }
+                        let acceleration = gy * (self.fraction[b] - self.fraction[a]);
+                        let fi = x + ext[0] * (y + ext[1] * z);
+                        let faces = if axis == 0 { &mut self.u } else { &mut self.w };
+                        faces[fi] += dt * acceleration;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ghost-fluid advection needs a narrow velocity extension outside liquid,
+    /// not independently accelerating dry-space velocities. Three face layers
+    /// cover the bounded CFL backtrace. Solids/closed exterior are never donors.
+    fn extrapolate_surface_velocities(
+        &mut self,
+        liquid: &[bool],
+        cut_faces: Option<&[Vec<bool>; 3]>,
+    ) {
+        let dims = self.dims();
+        for axis in 0..3 {
+            let mut ext = dims;
+            ext[axis] += 1;
+            let count = ext.iter().product();
+            let mut known = vec![false; count];
+            let mut blocked = vec![false; count];
+            for i in 0..count {
+                let p = [i % ext[0], i / ext[0] % ext[1], i / (ext[0] * ext[1])];
+                let mut low = p;
+                let lower = if p[axis] > 0 {
+                    low[axis] -= 1;
+                    Some(self.cell_index(low[0], low[1], low[2]))
+                } else {
+                    None
+                };
+                let upper = (p[axis] < dims[axis]).then(|| self.cell_index(p[0], p[1], p[2]));
+                let open = axis == 1 && p[axis] == dims[axis] && self.config.open_top;
+                blocked[i] = lower.is_some_and(|c| self.solid[c])
+                    || upper.is_some_and(|c| self.solid[c])
+                    || ((lower.is_none() || upper.is_none()) && !open);
+                known[i] = !blocked[i]
+                    && (lower.is_some_and(|c| liquid[c])
+                        || upper.is_some_and(|c| liquid[c])
+                        // Shallow films have no cell-centre pressure sample.
+                        // Keep horizontal momentum and downward outlet velocity;
+                        // an empty face above a film is not a gravity donor.
+                        || (self.experimental_surface_films
+                            && ((axis != 1 && lower.is_some_and(|c| self.fraction[c] > 0.0))
+                                || upper.is_some_and(|c| self.fraction[c] > 0.0))));
+                if let Some(cut) = cut_faces {
+                    known[i] = !blocked[i] && cut[axis][i];
+                }
+            }
+            let faces = match axis {
+                0 => &mut self.u,
+                1 => &mut self.v,
+                _ => &mut self.w,
+            };
+            for (i, velocity) in faces.iter_mut().enumerate() {
+                if !known[i] {
+                    *velocity = 0.0;
+                }
+            }
+            let strides = [1, ext[0], ext[0] * ext[1]];
+            for _ in 0..3 {
+                let source = faces.clone();
+                let previous = known.clone();
+                for i in 0..count {
+                    if blocked[i] || previous[i] {
+                        continue;
+                    }
+                    let p = [i % ext[0], i / ext[0] % ext[1], i / (ext[0] * ext[1])];
+                    let (mut sum, mut donors) = (0.0, 0);
+                    for a in 0..3 {
+                        for positive in [false, true] {
+                            let j = if positive && p[a] + 1 < ext[a] {
+                                Some(i + strides[a])
+                            } else if !positive && p[a] > 0 {
+                                Some(i - strides[a])
+                            } else {
+                                None
+                            };
+                            if let Some(j) = j
+                                && previous[j]
+                            {
+                                sum += source[j];
+                                donors += 1;
+                            }
+                        }
+                    }
+                    if donors > 0 {
+                        faces[i] = sum / f64::from(donors);
+                        known[i] = true;
                     }
                 }
             }
@@ -2154,6 +2791,19 @@ impl MacGridWorld {
             }
             let p = [x as isize, y as isize, z as isize];
             let sample = |q: [isize; 3]| {
+                if self.cut_surface_support {
+                    if self.config.open_top && q[1] >= ny as isize {
+                        return 0.0;
+                    }
+                    // Mirror a closed wall in each coordinate independently.
+                    // Transverse ghost samples must retain their vertical
+                    // level; substituting c tilts a flat surface at corners.
+                    let r: [usize; 3] = std::array::from_fn(|a| {
+                        q[a].clamp(0, [nx, ny, nz][a] as isize - 1) as usize
+                    });
+                    let j = self.cell_index(r[0], r[1], r[2]);
+                    return if self.solid[j] { c } else { self.fraction[j] };
+                }
                 if q.iter()
                     .zip([nx, ny, nz])
                     .any(|(&v, n)| v < 0 || v >= n as isize)
@@ -2164,6 +2814,35 @@ impl MacGridWorld {
                 if self.solid[j] { c } else { self.fraction[j] }
             };
             let mut normal = [0.0; 3];
+            // A bottom-supported film has a height function even when the
+            // generic fraction gradient places its plane away from the lip.
+            // Reconstruct its surface slope from neighbouring layer depths;
+            // otherwise bounded swept slabs can never reach that dry face.
+            if (self.experimental_surface_films || self.cut_surface_support)
+                && self.config.gravity_m_s2[0] == 0.0
+                && self.config.gravity_m_s2[2] == 0.0
+                && self.config.gravity_m_s2[1] < 0.0
+                && c < 0.5
+                && y > 0
+                && (self.solid[self.cell_index(x, y - 1, z)]
+                    || (self.cut_surface_support
+                        && self.fraction[self.cell_index(x, y - 1, z)] == 1.0))
+            {
+                normal[1] = 1.0;
+                for axis in [0, 2] {
+                    let mut lo = p;
+                    let mut hi = p;
+                    lo[axis] -= 1;
+                    hi[axis] += 1;
+                    normal[axis] = 0.5 * (sample(lo) - sample(hi));
+                }
+                *plane = Some(if self.cut_surface_support {
+                    InterfacePlane::from_fraction_resolved(normal, c)
+                } else {
+                    InterfacePlane::from_fraction(normal, c)
+                });
+                return;
+            }
             for axis in 0..3 {
                 let b = (axis + 1) % 3;
                 let d = (axis + 2) % 3;
@@ -2181,7 +2860,11 @@ impl MacGridWorld {
                     }
                 }
             }
-            *plane = Some(InterfacePlane::from_fraction(normal, c));
+            *plane = Some(if self.cut_surface_support {
+                InterfacePlane::from_fraction_resolved(normal, c)
+            } else {
+                InterfacePlane::from_fraction(normal, c)
+            });
         });
         planes
     }
@@ -2190,14 +2873,20 @@ impl MacGridWorld {
         &mut self,
         dt: f64,
         tracked_region: Option<&[bool]>,
-    ) -> Result<(f64, f64, f64), MacError> {
+    ) -> Result<(f64, f64, f64, StrictTransferMetrics), MacError> {
+        let mut timings = [0; 6];
+        let stage = Instant::now();
         let [nx, ny, nz] = self.dims();
         let h = self.config.cell_size_m;
         let old = self.fraction.clone();
-        let planes = self
-            .ambient_density_kg_m3
-            .map(|_| self.reconstruct_planes());
+        // Reconstructed support already supplies paired physical transfers.
+        // Its ordinary donor/PLIC candidates would be computed then discarded.
+        let planes = (!self.cut_surface_support
+            && (self.ambient_density_kg_m3.is_some() || self.freely_displaced_air))
+            .then(|| self.reconstruct_planes());
         let n = old.len();
+        timings[0] = stage.elapsed().as_micros() as u64;
+        let stage = Instant::now();
         let face_flux = |axis: usize, xf: usize, yf: usize, zf: usize| {
             let f = [xf, yf, zf];
             let (left, right, vel) = match axis {
@@ -2268,8 +2957,21 @@ impl MacGridWorld {
             // A face between two dry cells (or a dry cell and the
             // exterior) carries exactly zero donor and high-order
             // flux, so skipping it cannot change the result.
-            if left.is_none_or(|i| old[i] == 0.0) && right.is_none_or(|i| old[i] == 0.0) {
+            if !self.conservative_momentum
+                && left.is_none_or(|i| old[i] == 0.0)
+                && right.is_none_or(|i| old[i] == 0.0)
+            {
                 return None;
+            }
+            if self.cut_surface_support {
+                let courant = vel * dt / h;
+                let fi = match axis {
+                    0 => self.u_index(xf, yf, zf),
+                    1 => self.v_index(xf, yf, zf),
+                    _ => self.w_index(xf, yf, zf),
+                };
+                let flux = self.cut_surface_flux[axis][fi] * dt / h.powi(3);
+                return Some((left, right, flux, flux, courant));
             }
             let upstream = if vel >= 0.0 { left } else { right };
             let c_up = upstream.map(|i| old[i]).unwrap_or(0.0);
@@ -2311,14 +3013,26 @@ impl MacGridWorld {
                 .unwrap_or(0.0);
             let high = if let Some(planes) = &planes {
                 upstream.map_or(0.0, |i| {
-                    planes[i].map_or(courant * old[i], |plane| plane.swept_volume(axis, courant))
+                    planes[i].map_or(courant * old[i], |plane| {
+                        if self.experimental_surface_films
+                            && axis == 1
+                            && plane.normal.iter().sum::<f64>() * 0.5 >= plane.alpha
+                        {
+                            // Vertically unresolved films use positive upwind
+                            // transport; momentum follows this accepted mass.
+                            donor
+                        } else {
+                            plane.swept_volume(axis, courant)
+                        }
+                    })
                 })
             } else {
                 courant * reconstructed
             };
-            Some((left, right, donor, high))
+            Some((left, right, donor, high, courant))
         };
         let mut raw_fluxes: Vec<(Option<usize>, Option<usize>, f64, f64)> = Vec::new();
+        let mut full_fluxes = Vec::new();
         for axis in 0..3 {
             let ext = match axis {
                 0 => [nx + 1, ny, nz],
@@ -2334,8 +3048,15 @@ impl MacGridWorld {
                     (0..ext[0]).filter_map(move |xf| face_flux(axis, xf, yf, zf))
                 })
                 .collect();
-            raw_fluxes.extend(faces);
+            for (left, right, donor, high, full) in faces {
+                raw_fluxes.push((left, right, donor, high));
+                if self.conservative_momentum {
+                    full_fluxes.push(full);
+                }
+            }
         }
+        timings[1] = stage.elapsed().as_micros() as u64;
+        let stage = Instant::now();
         // Only cells with a non-trivial face can change. Every limiter pass and
         // the FCT bounds below work on this list: an earlier version swept the
         // whole domain (and re-allocated four domain-sized vectors) up to 64
@@ -2423,6 +3144,29 @@ impl MacGridWorld {
         for &i in &touched {
             low[i] = old[i];
         }
+        let mut predictor_strict = StrictTransferMetrics::default();
+        if self.cut_surface_support {
+            // Cut support supplies the same proposed transfer to low/high FCT.
+            // Resolve saturated chains with the existing exact paired repair
+            // before validating this predictor; never clip the cell amounts.
+            let edges: Vec<_> = raw_fluxes.iter().map(|e| (e.0, e.1, 0.0, false)).collect();
+            let repair = Instant::now();
+            predictor_strict = strict_transfer_bounds(
+                &old,
+                &edges,
+                &mut low_fluxes,
+                &touched,
+                &mut incoming,
+                &mut outgoing,
+                &mut low,
+            )?;
+            timings[3] += repair.elapsed().as_micros() as u64;
+            predictor_strict.scratch_bytes +=
+                edges.capacity() * size_of::<(Option<usize>, Option<usize>, f64, bool)>();
+            for &i in &touched {
+                low[i] = old[i];
+            }
+        }
         let mut outflow_fraction = 0.0;
         let mut region_outflow_fraction = 0.0;
         let mut region_inflow_fraction = 0.0;
@@ -2499,7 +3243,7 @@ impl MacGridWorld {
             }
         }
         let mut corrected_outflow = 0.0;
-        for (left, right, a, _) in anti {
+        for (edge, &(left, right, a, _)) in anti.iter().enumerate() {
             let limiter = match (left, right) {
                 (Some(l), Some(r)) if a >= 0.0 => r_minus[l].min(r_plus[r]),
                 (Some(l), Some(r)) => r_plus[l].min(r_minus[r]),
@@ -2510,6 +3254,9 @@ impl MacGridWorld {
                 _ => 1.0,
             };
             let flux = a * limiter;
+            if self.strict_phase_bounds {
+                low_fluxes[edge] += flux;
+            }
             accumulate_region_flux(
                 left,
                 right,
@@ -2539,21 +3286,94 @@ impl MacGridWorld {
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
                 (lo.min(v), hi.max(v))
             });
-        if !touched.is_empty() && (minimum < -1.0e-10 || maximum > 1.0 + 1.0e-10) {
+        // Strict mode validates the final paired transfers below against exact
+        // [0,1] bounds. Its preliminary FCT candidate is not yet accepted;
+        // rejecting before that limiter prevents it doing its intended work.
+        if !self.strict_phase_bounds
+            && !touched.is_empty()
+            && (minimum < -1.0e-10 || maximum > 1.0 + 1.0e-10)
+        {
             return Err(MacError::TransportBoundsViolation { minimum, maximum });
         }
         let volume = self.cell_volume();
-        let net_open_outflow_fraction = outflow_fraction + corrected_outflow;
+        let mut net_open_outflow_fraction = outflow_fraction + corrected_outflow;
+        let mut strict = StrictTransferMetrics::default();
+        if self.strict_phase_bounds {
+            // Re-limit the actually accepted donor+PLIC face transfers, never
+            // cell amounts. Reuse FCT scratch and recompute all boundary/region
+            // ledgers from exactly the final paired transfers.
+            let repair = Instant::now();
+            strict = strict_transfer_bounds(
+                &old,
+                &anti,
+                &mut low_fluxes,
+                &touched,
+                &mut p_plus,
+                &mut p_minus,
+                &mut low,
+            )?;
+            timings[3] += repair.elapsed().as_micros() as u64;
+            net_open_outflow_fraction = 0.0;
+            region_outflow_fraction = 0.0;
+            region_inflow_fraction = 0.0;
+            for ((left, right, _, _), &flux) in anti.iter().zip(&low_fluxes) {
+                accumulate_region_flux(
+                    *left,
+                    *right,
+                    flux,
+                    tracked_region,
+                    &mut region_outflow_fraction,
+                    &mut region_inflow_fraction,
+                );
+                if right.is_none() {
+                    net_open_outflow_fraction += flux;
+                } else if left.is_none() {
+                    net_open_outflow_fraction -= flux;
+                }
+            }
+        }
         if !net_open_outflow_fraction.is_finite() || net_open_outflow_fraction < 0.0 {
             return Err(MacError::NegativeOpenBoundaryFlux {
                 volume_fraction: net_open_outflow_fraction,
             });
         }
+        strict.path_repairs += predictor_strict.path_repairs;
+        strict.scratch_bytes = strict.scratch_bytes.max(predictor_strict.scratch_bytes);
+        timings[2] = (stage.elapsed().as_micros() as u64).saturating_sub(timings[3]);
+        if self.conservative_momentum || self.experimental_surface_films || self.cut_surface_support
+        {
+            let stage = Instant::now();
+            let interface = if self.cut_surface_support {
+                Some(cut_surface::transport_velocity(
+                    self,
+                    &old,
+                    &low,
+                    &anti,
+                    &low_fluxes,
+                )?)
+            } else {
+                None
+            };
+            timings[4] = stage.elapsed().as_micros() as u64;
+            let stage = Instant::now();
+            let candidate =
+                momentum::transport(self, &old, &low, &anti, &low_fluxes, &full_fluxes)?;
+            timings[5] = stage.elapsed().as_micros() as u64;
+            [self.u, self.v, self.w] = candidate.velocity;
+            strict.momentum = candidate.metrics;
+            if let Some((velocity, bytes)) = interface {
+                self.cut_surface_velocity = velocity;
+                strict.momentum.bytes += bytes;
+            }
+            strict.momentum.bytes += full_fluxes.capacity() * size_of::<f64>();
+        }
+        strict.timings = timings;
         self.fraction = low;
         Ok((
             net_open_outflow_fraction * volume,
             region_outflow_fraction * volume,
             region_inflow_fraction * volume,
+            strict,
         ))
     }
 }
@@ -2565,6 +3385,307 @@ const ATMOSPHERIC_PRESSURE_PA: f64 = 101_325.0;
 /// unscaled. Must stay well inside the 1e-10 transport bound check.
 const DONOR_LIMIT_TOLERANCE: f64 = 1.0e-12;
 
+#[derive(Debug, Default)]
+struct StrictTransferMetrics {
+    timings: [u64; 6],
+    momentum: momentum::MomentumMetrics,
+    path_repairs: u64,
+    scratch_bytes: usize,
+}
+
+fn strict_transfer_bounds(
+    old: &[f64],
+    edges: &[(Option<usize>, Option<usize>, f64, bool)],
+    transfers: &mut [f64],
+    touched: &[usize],
+    incoming: &mut [f64],
+    outgoing: &mut [f64],
+    candidate: &mut [f64],
+) -> Result<StrictTransferMetrics, MacError> {
+    for pass in 0..=64 {
+        for &i in touched {
+            incoming[i] = 0.0;
+            outgoing[i] = 0.0;
+        }
+        for (&(left, right, _, _), &flux) in edges.iter().zip(transfers.iter()) {
+            let (donor, receiver) = if flux >= 0.0 {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            if let Some(i) = donor {
+                outgoing[i] += flux.abs();
+            }
+            if let Some(i) = receiver {
+                incoming[i] += flux.abs();
+            }
+        }
+        let mut valid = true;
+        for &i in touched {
+            // Form the signed flux difference first: a balanced full-cell
+            // cycle stays exactly full instead of acquiring an ulp from
+            // adding a transfer to 1 before subtracting its matching outflow.
+            let v = old[i] + (incoming[i] - outgoing[i]);
+            candidate[i] = v;
+            valid &= v.is_finite() && (0.0..=1.0).contains(&v);
+        }
+        if valid {
+            return Ok(StrictTransferMetrics::default());
+        }
+        if pass == 64 {
+            return repair_strict_transfer_paths(
+                old, edges, transfers, touched, incoming, outgoing, candidate,
+            );
+        }
+        // Gauss-Seidel face corrections use updated neighbour sums immediately.
+        // Jacobi scaling propagated a roundoff defect only one edge per pass
+        // and could chase it around a saturated loop indefinitely. Alternate
+        // traversal so both orientations of saturated paths are resolved.
+        for offset in 0..edges.len() {
+            let edge = if pass % 2 == 0 {
+                edges.len() - 1 - offset
+            } else {
+                offset
+            };
+            let (left, right, _, _) = edges[edge];
+            let flux = transfers[edge];
+            let (donor, receiver) = if flux >= 0.0 {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            let mut reduction = 0.0_f64;
+            for (cell, lower) in [(donor, true), (receiver, false)] {
+                if let Some(i) = cell {
+                    let v = old[i] + (incoming[i] - outgoing[i]);
+                    let violation = if lower { -v } else { v - 1.0 };
+                    if violation > 0.0 {
+                        reduction = reduction.max(violation);
+                    }
+                }
+            }
+            let magnitude = flux.abs();
+            // Round an actual correction inward in transfer units. A broad
+            // fraction-sized safety margin creates fresh capacity violations
+            // at full neighbours and amplifies around saturated cycles.
+            let accepted = if reduction > 0.0 {
+                (magnitude - reduction).next_down().max(0.0)
+            } else {
+                magnitude
+            };
+            let removed = magnitude - accepted;
+            transfers[edge] = accepted.copysign(flux);
+            if let Some(i) = donor {
+                outgoing[i] -= removed;
+            }
+            if let Some(i) = receiver {
+                incoming[i] -= removed;
+            }
+        }
+    }
+    unreachable!("bounded strict transfer loop returns")
+}
+
+/// Route a reduction back along an incoming path (overflow), or forward along
+/// an outgoing path (underflow), to a cell with actual capacity. Intermediate
+/// full cells receive the same paired correction on both incident faces.
+/// Unlike local sweeps, this does not send a capacity defect around a loop.
+fn repair_strict_transfer_paths(
+    old: &[f64],
+    edges: &[(Option<usize>, Option<usize>, f64, bool)],
+    transfers: &mut [f64],
+    touched: &[usize],
+    incoming: &mut [f64],
+    outgoing: &mut [f64],
+    candidate: &mut [f64],
+) -> Result<StrictTransferMetrics, MacError> {
+    let n = touched.len();
+    let slot = |cell| {
+        touched
+            .binary_search(&cell)
+            .expect("edge endpoint is touched")
+    };
+    let mut offsets = vec![0usize; n + 1];
+    for &(l, r, _, _) in edges {
+        for i in [l, r].into_iter().flatten() {
+            offsets[slot(i) + 1] += 1;
+        }
+    }
+    for i in 1..=n {
+        offsets[i] += offsets[i - 1];
+    }
+    let mut adjacency = vec![0usize; offsets[n]];
+    let mut cursors = offsets[..n].to_vec();
+    for (edge, &(l, r, _, _)) in edges.iter().enumerate() {
+        for i in [l, r].into_iter().flatten() {
+            let i = slot(i);
+            adjacency[cursors[i]] = edge;
+            cursors[i] += 1;
+        }
+    }
+    // Reuse the cursor allocation for BFS parents.
+    let mut parents = cursors;
+    parents.fill(usize::MAX);
+    let mut queue = Vec::with_capacity(touched.len());
+    let mut metrics = StrictTransferMetrics {
+        timings: [0; 6],
+        momentum: momentum::MomentumMetrics::default(),
+        path_repairs: 0,
+        scratch_bytes: (offsets.capacity()
+            + adjacency.capacity()
+            + parents.capacity()
+            + queue.capacity())
+            * size_of::<usize>(),
+    };
+    // Every correction either resolves a violated endpoint or exhausts a path
+    // edge. Keep an explicit finite budget even for floating-point degeneracy.
+    let budget = 64.min(touched.len().saturating_add(edges.len()));
+    for repair in 0..=budget {
+        for &i in touched {
+            incoming[i] = 0.0;
+            outgoing[i] = 0.0;
+        }
+        for (&(l, r, _, _), &f) in edges.iter().zip(transfers.iter()) {
+            let (d, r) = if f >= 0.0 { (l, r) } else { (r, l) };
+            if let Some(i) = d {
+                outgoing[i] += f.abs();
+            }
+            if let Some(i) = r {
+                incoming[i] += f.abs();
+            }
+        }
+        for &i in touched {
+            candidate[i] = old[i] + (incoming[i] - outgoing[i]);
+        }
+        let Some(&root) = touched
+            .iter()
+            .find(|&&i| !(0.0..=1.0).contains(&candidate[i]))
+        else {
+            return Ok(metrics);
+        };
+        if !candidate[root].is_finite() || repair == budget {
+            break;
+        }
+        let overflow = candidate[root] > 1.0;
+        let needed = if overflow {
+            candidate[root] - 1.0
+        } else {
+            -candidate[root]
+        };
+        for &i in &queue {
+            parents[i] = usize::MAX;
+        }
+        queue.clear();
+        let root = slot(root);
+        parents[root] = 0;
+        queue.push(root);
+        let mut target = None;
+        let mut boundary_edge = None;
+        let mut best_capacity = 0.0_f64;
+        let mut best = None;
+        let mut cursor = 0;
+        'search: while cursor < queue.len() {
+            let cell = queue[cursor];
+            cursor += 1;
+            if cell != root {
+                let capacity = if overflow {
+                    1.0 - candidate[touched[cell]]
+                } else {
+                    candidate[touched[cell]]
+                };
+                if capacity >= needed {
+                    target = Some(cell);
+                    break;
+                }
+                if capacity > best_capacity {
+                    best_capacity = capacity;
+                    best = Some(cell);
+                }
+            }
+            for &edge in &adjacency[offsets[cell]..offsets[cell + 1]] {
+                let (l, r, _, _) = edges[edge];
+                let f = transfers[edge];
+                if f == 0.0 {
+                    continue;
+                }
+                let (d, r) = if f >= 0.0 { (l, r) } else { (r, l) };
+                let next = if overflow && r == Some(touched[cell]) {
+                    d
+                } else if !overflow && d == Some(touched[cell]) {
+                    r
+                } else {
+                    continue;
+                };
+                if next.is_none() {
+                    target = Some(cell);
+                    boundary_edge = Some(edge);
+                    break 'search;
+                }
+                if let Some(next) = next {
+                    let next = slot(next);
+                    if parents[next] == usize::MAX {
+                        parents[next] = edge;
+                        queue.push(next);
+                    }
+                }
+            }
+        }
+        let Some(target) = target.or(best) else {
+            break;
+        };
+        let capacity = if boundary_edge.is_some() {
+            f64::INFINITY
+        } else if overflow {
+            1.0 - candidate[touched[target]]
+        } else {
+            candidate[touched[target]]
+        };
+        let mut amount = needed.min(capacity);
+        if let Some(edge) = boundary_edge {
+            amount = amount.min(transfers[edge].abs());
+        }
+        let mut cell = target;
+        while cell != root {
+            let edge = parents[cell];
+            amount = amount.min(transfers[edge].abs());
+            let (l, r, _, _) = edges[edge];
+            let (d, r) = if transfers[edge] >= 0.0 {
+                (l, r)
+            } else {
+                (r, l)
+            };
+            cell = slot(if overflow { r } else { d }.expect("BFS path has an interior parent"));
+        }
+        if amount <= 0.0 {
+            break;
+        }
+        cell = target;
+        let mut changed = false;
+        if let Some(edge) = boundary_edge {
+            let f = transfers[edge];
+            transfers[edge] = (f.abs() - amount).max(0.0).copysign(f);
+            changed |= transfers[edge] != f;
+        }
+        while cell != root {
+            let edge = parents[cell];
+            let f = transfers[edge];
+            let (l, r, _, _) = edges[edge];
+            let (d, r) = if f >= 0.0 { (l, r) } else { (r, l) };
+            transfers[edge] = (f.abs() - amount).max(0.0).copysign(f);
+            changed |= transfers[edge] != f;
+            cell = slot(if overflow { r } else { d }.expect("BFS path has an interior parent"));
+        }
+        if !changed {
+            break;
+        }
+        metrics.path_repairs += 1;
+    }
+    Err(MacError::TransportBoundsViolation {
+        minimum: touched.iter().map(|&i| candidate[i]).fold(1.0, f64::min),
+        maximum: touched.iter().map(|&i| candidate[i]).fold(0.0, f64::max),
+    })
+}
+
 /// Plane n.x <= alpha inside the unit cell [0,1]^3. The normal is a
 /// Youngs-style smoothed VOF gradient; alpha is inverted from the stored volume.
 #[derive(Clone, Copy)]
@@ -2574,7 +3695,15 @@ struct InterfacePlane {
 }
 
 impl InterfacePlane {
-    fn from_fraction(mut normal: [f64; 3], fraction: f64) -> Self {
+    fn from_fraction(normal: [f64; 3], fraction: f64) -> Self {
+        Self::from_fraction_tolerance(normal, fraction, false)
+    }
+
+    fn from_fraction_resolved(normal: [f64; 3], fraction: f64) -> Self {
+        Self::from_fraction_tolerance(normal, fraction, true)
+    }
+
+    fn from_fraction_tolerance(mut normal: [f64; 3], fraction: f64, resolved: bool) -> Self {
         let norm: f64 = normal.iter().map(|n| n.abs()).sum();
         if norm == 0.0 {
             normal = [0.0, 1.0, 0.0];
@@ -2583,11 +3712,65 @@ impl InterfacePlane {
                 *n /= norm;
             }
         }
+        if resolved && fraction > 0.5 {
+            // Resolve the small complementary phase directly, instead of
+            // subtracting almost equal volumes during root finding.
+            let air = Self::from_fraction_tolerance(normal.map(|v| -v), 1.0 - fraction, true);
+            return Self {
+                normal: air.normal.map(|v| -v),
+                alpha: -air.alpha,
+            };
+        }
         // Volume is monotone in alpha on [lo, hi] (0 at lo, 1 at hi). The
         // Illinois variant of regula falsi keeps that bracket and converges
         // superlinearly; plain bisection needed 48 volume evaluations.
         let mut lo: f64 = normal.iter().map(|&n| n.min(0.0)).sum();
         let mut hi: f64 = normal.iter().map(|&n| n.max(0.0)).sum();
+        if resolved && fraction > 0.0 {
+            let weights: Vec<_> = normal
+                .iter()
+                .map(|v| v.abs())
+                .filter(|v| *v > 0.0)
+                .collect();
+            let factorial: f64 = match weights.len() {
+                1 => 1.0,
+                2 => 2.0,
+                _ => 6.0,
+            };
+            let corner =
+                ((fraction.ln() + factorial.ln() + weights.iter().map(|v| v.ln()).sum::<f64>())
+                    / weights.len() as f64)
+                    .exp();
+            if corner <= weights.iter().copied().fold(f64::INFINITY, f64::min) {
+                return Self {
+                    normal,
+                    alpha: lo + corner,
+                };
+            }
+            let mut sorted = normal.map(f64::abs);
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let [a, b, c] = sorted;
+            let linear = a * fraction + 0.5 * (b + c);
+            if linear >= b + c && linear <= a {
+                return Self {
+                    normal,
+                    alpha: lo + linear,
+                };
+            }
+            if b > 0.0 {
+                // Form the square root before products can underflow for a
+                // tiny anisotropic wedge. Subtract c^2 in the scaled domain.
+                let root = (0.5 * (8.0_f64.ln() + a.ln() + b.ln() + fraction.ln())).exp();
+                let ratio = c / root / 3.0_f64.sqrt();
+                let quadratic = 0.5 * (c + root * (1.0 - ratio * ratio).max(0.0).sqrt());
+                if quadratic >= c && quadratic <= b {
+                    return Self {
+                        normal,
+                        alpha: lo + quadratic,
+                    };
+                }
+            }
+        }
         let (mut g_lo, mut g_hi) = (-fraction, 1.0 - fraction);
         let mut side = 0i8;
         let mut alpha = 0.5 * (lo + hi);
@@ -2597,7 +3780,16 @@ impl InterfacePlane {
                 alpha = 0.5 * (lo + hi);
             }
             let g = plane_cube_fraction(normal, alpha) - fraction;
-            if g.abs() <= 1.0e-15 || hi - lo <= 1.0e-14 {
+            let tolerance = if resolved {
+                1e-15 * fraction.min(1.0 - fraction)
+            } else {
+                1e-15
+            };
+            if g.abs() <= tolerance
+                || (!resolved && hi - lo <= 1.0e-14)
+                || alpha == lo
+                || alpha == hi
+            {
                 break;
             }
             if g < 0.0 {
@@ -2858,6 +4050,49 @@ pub struct GridReservoirFixture {
 impl GridReservoirFixture {
     pub fn new(scale: u32, open_top: bool) -> Result<Self, Box<dyn std::error::Error>> {
         Self::configured(scale, open_top, false, 1)
+    }
+
+    /// Original quarter-metre reservoirs above a dry, sealed room. Extending
+    /// the domain below zero preserves every original canal/dam edit coordinate.
+    pub fn new_room_below_canal() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut fixture = Self::new(1, true)?;
+        fixture.volume.insert_brick(
+            spall_core::BrickCoord::new(0, -1, 0),
+            spall_voxel::Brick::uniform(spall_core::MaterialId::AIR, spall_core::Revision(1)),
+        )?;
+        let mut edit = spall_voxel::EditPlan::new(fixture.volume.id());
+        for y in -8..0 {
+            for z in 0..8 {
+                for x in 0..24 {
+                    if y == -8 || x == 0 || x == 23 || z == 0 || z == 7 {
+                        edit.set(GlobalCell::new(x, y, z), spall_core::MaterialId(1));
+                    }
+                }
+            }
+        }
+        fixture.volume.apply_edit(&edit)?;
+        let spec = DomainSpec::new(GlobalCell::new(0, -8, 0), [24, 20, 8], 24 * 20 * 8)?;
+        let boundary = SolidBoundary::capture(&fixture.volume, spec)?;
+        let mut grid = MacGridWorld::new(&boundary, fixture.grid.config())?;
+        for z in 0..8 {
+            for y in 0..12 {
+                for x in 0..24 {
+                    let cell = GlobalCell::new(x, y, z);
+                    grid.set_fraction(cell, fixture.grid.fraction_at(cell).unwrap())?;
+                }
+            }
+        }
+        fixture.upper_pool_region = vec![false; spec.cell_count()];
+        fixture.grid = grid;
+        Ok(fixture)
+    }
+
+    /// Deliberate control opening for the room leakage viewer; unlike the
+    /// cutaway this removes a real floor voxel and must admit water below.
+    pub fn open_floor_probe(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut edit = spall_voxel::EditPlan::new(self.volume.id());
+        edit.set(GlobalCell::new(6, 0, 3), spall_core::MaterialId::AIR);
+        self.apply_staged_edit(&edit)
     }
 
     pub fn new_tunnel(scale: u32) -> Result<Self, Box<dyn std::error::Error>> {
@@ -3364,6 +4599,12 @@ fn json_number(value: f64) -> String {
 
 #[derive(Default)]
 struct ProjectionStats {
+    phase_applications: u32,
+    phase_apply_micros: u64,
+    phase_scratch_bytes: usize,
+    phase_rows: usize,
+    phase_reused: bool,
+    phase_micros: u64,
     iterations: usize,
     active_cells: usize,
     residual_initial: f64,
@@ -3371,6 +4612,118 @@ struct ProjectionStats {
     divergence_before: f64,
     divergence_after: f64,
     converged: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PhasePredictor {
+    phase: PhaseWater,
+    graph: PhaseGraph,
+    limits: GraphLimits,
+    sweeps: u32,
+    iterative: bool,
+}
+
+struct BasePressurePreconditioner<'a> {
+    ic0: Option<&'a Ic0Factor>,
+    multigrid: Option<&'a mut Multigrid>,
+    work: Option<&'a mut Vec<f64>>,
+    active: &'a [usize],
+    diag: &'a [f64],
+}
+impl BasePressurePreconditioner<'_> {
+    fn apply(&mut self, source: &[f64], target: &mut [f64]) {
+        if let Some(factor) = self.ic0 {
+            factor.apply(source, target, self.active, self.work.as_mut().unwrap());
+        } else if let Some(mg) = &mut self.multigrid {
+            mg.apply(source, target);
+        } else {
+            for &i in self.active {
+                target[i] = if self.diag[i] > 0.0 {
+                    source[i] / self.diag[i]
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+}
+
+/// Balanced B = Q + (I-QA) S (I-AQ), Q=P B_c P^T.
+/// Q is symmetric positive semidefinite, S is the existing symmetric fine
+/// preconditioner. Thus x^T B x = x^T Q x + y^T S y with y=(I-AQ)x.
+/// Owning CG retains its component-mean projection; no new gauge pins.
+struct BalancedPhasePressure {
+    labels: std::sync::Arc<Vec<u32>>,
+    coarse: PressureSmoother,
+    row_source: Vec<f64>,
+    row_q: Vec<f64>,
+    row_z: Vec<f64>,
+    temporary: Vec<f64>,
+    applied: Vec<f64>,
+    sweeps: u32,
+}
+impl BalancedPhasePressure {
+    fn new(graph: &PhaseGraph, coarse: PressureSmoother, n: usize, sweeps: u32) -> Self {
+        let m = graph.rows().len();
+        Self {
+            labels: graph.shared_labels(),
+            coarse,
+            row_source: vec![0.0; m],
+            row_q: vec![0.0; m],
+            row_z: vec![0.0; m],
+            temporary: vec![0.0; n],
+            applied: vec![0.0; n],
+            sweeps,
+        }
+    }
+    fn apply(
+        &mut self,
+        source: &[f64],
+        target: &mut [f64],
+        operator: &PressureOperator,
+        base: &mut BasePressurePreconditioner<'_>,
+    ) -> Result<(), MacError> {
+        self.row_source.fill(0.0);
+        for &i in base.active {
+            self.row_source[self.labels[i] as usize] += source[i];
+        }
+        self.coarse
+            .apply(&self.row_source, &mut self.row_q, self.sweeps)
+            .map_err(MacError::PhaseGraph)?;
+        for &i in base.active {
+            self.temporary[i] = self.row_q[self.labels[i] as usize];
+        }
+        operator.apply(&self.temporary, &mut self.applied);
+        for &i in base.active {
+            self.temporary[i] = source[i] - self.applied[i];
+        }
+        base.apply(&self.temporary, target);
+        operator.apply(target, &mut self.applied);
+        self.row_source.fill(0.0);
+        for &i in base.active {
+            self.row_source[self.labels[i] as usize] += self.applied[i];
+        }
+        self.coarse
+            .apply(&self.row_source, &mut self.row_z, self.sweeps)
+            .map_err(MacError::PhaseGraph)?;
+        for &i in base.active {
+            let row = self.labels[i] as usize;
+            target[i] += self.row_q[row] - self.row_z[row];
+        }
+        if base.active.iter().any(|&i| !target[i].is_finite()) {
+            return Err(MacError::PhaseGraph(GraphError::InvalidState));
+        }
+        Ok(())
+    }
+    fn array_storage_bytes(&self) -> usize {
+        self.coarse.array_storage_bytes()
+            + (self.row_source.capacity()
+                + self.row_q.capacity()
+                + self.row_z.capacity()
+                + self.temporary.capacity()
+                + self.applied.capacity())
+                * size_of::<f64>()
+    }
 }
 
 /// Zero-fill incomplete Cholesky of the active seven-point pressure matrix.
@@ -4059,6 +5412,233 @@ mod tests {
     use spall_voxel::{Brick, Volume};
 
     #[test]
+    fn strict_phase_transfers_preserve_saturated_cycles_and_signed_boundary_accounting() {
+        let old = [1.0, 1.0, 1.0];
+        let edges = [
+            (Some(0), Some(1), 0.0, false),
+            (Some(1), Some(2), 0.0, false),
+            (Some(0), Some(2), 0.0, false),
+        ];
+        let mut transfers = [0.1, 0.1, -0.1];
+        let mut incoming = [0.0; 3];
+        let mut outgoing = [0.0; 3];
+        let mut candidate = old;
+        strict_transfer_bounds(
+            &old,
+            &edges,
+            &mut transfers,
+            &[0, 1, 2],
+            &mut incoming,
+            &mut outgoing,
+            &mut candidate,
+        )
+        .unwrap();
+        assert_eq!(transfers, [0.1, 0.1, -0.1]);
+        assert_eq!(candidate, old);
+
+        // Negative orientation: water exits the left boundary from cell 0,
+        // while a full neighbour receives a limited, paired internal transfer.
+        let old = [0.2, 1.0, 0.0];
+        let edges = [(None, Some(0), 0.0, true), (Some(0), Some(1), 0.0, false)];
+        let mut transfers = [-0.1, 0.1];
+        candidate = old;
+        strict_transfer_bounds(
+            &old,
+            &edges,
+            &mut transfers,
+            &[0, 1],
+            &mut incoming,
+            &mut outgoing,
+            &mut candidate,
+        )
+        .unwrap();
+        assert_eq!(transfers[1], 0.0);
+        assert!(candidate.iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!(
+            (candidate.iter().sum::<f64>() - old.iter().sum::<f64>() - transfers[0]).abs() < 1e-15
+        );
+    }
+
+    #[test]
+    fn strict_phase_transfers_resolve_both_saturated_chain_orientations() {
+        let old = [1.0; 108];
+        let edges: Vec<_> = (0..107)
+            .map(|i| (Some(i), Some(i + 1), 0.0, false))
+            .collect();
+        let mut incoming = [0.0; 108];
+        let mut outgoing = [0.0; 108];
+        let mut candidate = old;
+        for flux in [0.1, -0.1] {
+            let mut transfers = vec![flux; edges.len()];
+            strict_transfer_bounds(
+                &old,
+                &edges,
+                &mut transfers,
+                &(0..108).collect::<Vec<_>>(),
+                &mut incoming,
+                &mut outgoing,
+                &mut candidate,
+            )
+            .unwrap();
+            assert_eq!(candidate, old);
+            assert!(transfers.iter().all(|&f| f == 0.0));
+        }
+    }
+
+    #[test]
+    fn strict_phase_transfers_keep_throughflow_when_full_cell_fluxes_differ_by_ulps() {
+        let old = [0.5, 1.0, 1.0, 1.0, 0.5];
+        let edges: Vec<_> = (0..4).map(|i| (Some(i), Some(i + 1), 0.0, false)).collect();
+        let mut incoming = [0.0; 5];
+        let mut outgoing = [0.0; 5];
+        let mut candidate = old;
+        for sign in [1.0, -1.0] {
+            let mut transfers = vec![
+                0.01 + 3.0 * f64::EPSILON,
+                0.01 + 2.0 * f64::EPSILON,
+                0.01 + f64::EPSILON,
+                0.01,
+            ];
+            if sign < 0.0 {
+                transfers.reverse();
+            }
+            transfers.iter_mut().for_each(|f| *f *= sign);
+            strict_transfer_bounds(
+                &old,
+                &edges,
+                &mut transfers,
+                &[0, 1, 2, 3, 4],
+                &mut incoming,
+                &mut outgoing,
+                &mut candidate,
+            )
+            .unwrap();
+            assert!(candidate.iter().all(|v| (0.0..=1.0).contains(v)));
+            assert!((candidate.iter().sum::<f64>() - old.iter().sum::<f64>()).abs() < 1e-14);
+            assert!(
+                transfers.iter().all(|f| (f.abs() - 0.01).abs() < 1e-12),
+                "roundoff repair destroyed throughflow: {transfers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_phase_transfers_repair_a_path_longer_than_the_local_sweep_budget() {
+        let old = [1.0; 512];
+        // Two interleaved parity groups prevent either traversal from resolving
+        // the entire directed path in one sweep. The global path repair must
+        // return water through the connected chain without extra local passes.
+        let edges: Vec<_> = (0..511)
+            .step_by(2)
+            .chain((1..511).step_by(2))
+            .map(|i| (Some(i), Some(i + 1), 0.0, false))
+            .collect();
+        let mut transfers = vec![0.1; edges.len()];
+        let mut incoming = [0.0; 512];
+        let mut outgoing = [0.0; 512];
+        let mut candidate = old;
+        let metrics = strict_transfer_bounds(
+            &old,
+            &edges,
+            &mut transfers,
+            &(0..512).collect::<Vec<_>>(),
+            &mut incoming,
+            &mut outgoing,
+            &mut candidate,
+        )
+        .unwrap();
+        assert!(
+            metrics.path_repairs > 0 && metrics.path_repairs <= (old.len() + edges.len()) as u64
+        );
+        assert_eq!(candidate, old);
+        assert!(transfers.iter().all(|&f| f.abs() < 1e-14));
+        assert!(metrics.scratch_bytes > 0);
+    }
+
+    #[test]
+    fn strict_path_repair_rejects_a_correction_that_cannot_change_a_face() {
+        let flux = 0.4_f64;
+        let old = [flux.next_up() - flux - 1e-25, 0.0, 0.5];
+        let edges = [
+            (Some(2), Some(0), 0.0, false),
+            (Some(0), Some(1), 0.0, false),
+        ];
+        let initial = [flux, flux.next_up()];
+        let mut transfers = initial;
+        let mut incoming = [0.0; 3];
+        let mut outgoing = [0.0; 3];
+        let mut candidate = old;
+        // The amount deficit is smaller than either transfer's ulp. Do not
+        // repeatedly "repair" unchanged faces or clip the cell fraction.
+        assert!(matches!(
+            repair_strict_transfer_paths(
+                &old,
+                &edges,
+                &mut transfers,
+                &[0, 1, 2],
+                &mut incoming,
+                &mut outgoing,
+                &mut candidate
+            ),
+            Err(MacError::TransportBoundsViolation { .. })
+        ));
+        assert_eq!(transfers, initial);
+        assert!(candidate[0] < 0.0);
+    }
+
+    #[test]
+    fn strict_path_repair_refunds_open_outflow_in_both_face_orientations() {
+        for (l, r, flux) in [(Some(0), None, 0.2), (None, Some(0), -0.2)] {
+            let old = [0.1];
+            let edges = [(l, r, 0.0, true)];
+            let mut transfers = [flux];
+            let mut incoming = [0.0];
+            let mut outgoing = [0.0];
+            let mut candidate = old;
+            let metrics = repair_strict_transfer_paths(
+                &old,
+                &edges,
+                &mut transfers,
+                &[0],
+                &mut incoming,
+                &mut outgoing,
+                &mut candidate,
+            )
+            .unwrap();
+            assert_eq!(metrics.path_repairs, 1);
+            assert_eq!(candidate, [0.0]);
+            assert!((candidate[0] + transfers[0].abs() - old[0]).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn strict_path_repair_rejects_when_its_finite_augmentation_budget_is_exhausted() {
+        let old: Vec<_> = (0..65).flat_map(|_| [0.5, 1.0]).collect();
+        let edges: Vec<_> = (0..65)
+            .map(|i| (Some(2 * i), Some(2 * i + 1), 0.0, false))
+            .collect();
+        let mut transfers = vec![0.1; 65];
+        let mut incoming = vec![0.0; old.len()];
+        let mut outgoing = vec![0.0; old.len()];
+        let mut candidate = old.clone();
+        let touched: Vec<_> = (0..old.len()).collect();
+        assert!(matches!(
+            repair_strict_transfer_paths(
+                &old,
+                &edges,
+                &mut transfers,
+                &touched,
+                &mut incoming,
+                &mut outgoing,
+                &mut candidate
+            ),
+            Err(MacError::TransportBoundsViolation { .. })
+        ));
+        assert!(candidate.iter().any(|&f| f > 1.0));
+        assert_eq!(transfers[64], 0.1);
+    }
+
+    #[test]
     fn geometric_plane_matches_analytic_volumes_and_translates_sharp_interfaces() {
         assert!((plane_cube_fraction([1.0, 1.0, 1.0], 1.0) - 1.0 / 6.0).abs() < 1e-14);
         assert!((plane_cube_fraction([1.0, 1.0, 0.0], 1.0) - 0.5).abs() < 1e-14);
@@ -4220,7 +5800,7 @@ mod tests {
     /// tank filled to y=14 (3.5 m). The 2x4x2-cell interior (1 m air column,
     /// 1.5-2.5 m) starts dry at atmospheric pressure. Returns the water
     /// volume inside the bell interior after each tick.
-    fn diving_bell_run(compressible: bool, ticks: usize) -> (Vec<f64>, f64) {
+    fn diving_bell_run(air: Option<bool>, ticks: usize) -> (Vec<f64>, f64) {
         let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [12, 16, 2], 4096).unwrap();
         let mut volume = Volume::new(VolumeId::new(901).unwrap(), CellSizeCode::Quarter);
         volume
@@ -4242,9 +5822,13 @@ mod tests {
         volume.apply_edit(&plan).unwrap();
         let boundary = SolidBoundary::capture(&volume, spec).unwrap();
         let mut grid = MacGridWorld::new(&boundary, MacConfig::default()).unwrap();
-        grid.set_ambient_density(1.2).unwrap();
         grid.set_pressure_preconditioner(PressurePreconditioner::Multigrid);
-        grid.set_compressible_enclosed_air(compressible).unwrap();
+        if let Some(compressible) = air {
+            grid.set_ambient_density(1.2).unwrap();
+            grid.set_compressible_enclosed_air(compressible).unwrap();
+        } else {
+            grid.set_freely_displaced_air().unwrap();
+        }
         let bell = |x: usize, y: usize| (5..=6).contains(&x) && (6..=9).contains(&y);
         for z in 0..2 {
             for y in 0..14 {
@@ -4295,18 +5879,282 @@ mod tests {
             let tail = &series[series.len() / 2..];
             tail.iter().sum::<f64>() / tail.len() as f64
         };
-        let (compressible, mass_change) = diving_bell_run(true, 1200);
+        let (compressible, mass_change) = diving_bell_run(Some(true), 1200);
         assert!(mass_change.abs() < 1e-10);
         let measured = late_mean(&compressible);
         assert!(
             (measured / expected_volume - 1.0).abs() < 0.25,
             "measured {measured} m^3 vs isothermal {expected_volume} m^3"
         );
-        let (rigid, _) = diving_bell_run(false, 1200);
+        let (rigid, _) = diving_bell_run(Some(false), 1200);
         assert!(
             late_mean(&rigid) < 0.1 * expected_volume,
             "incompressible air should keep water out"
         );
+    }
+
+    #[test]
+    fn freely_displaced_air_fills_diving_bell_without_creating_water() {
+        let (series, mass_change) = diving_bell_run(None, 600);
+        let late = &series[series.len() / 2..];
+        let mean = late.iter().sum::<f64>() / late.len() as f64;
+        // Full 2x4x2 interior is 0.25 m3. Ignoring air pressure must let the
+        // bell flood rather than retain a rigid or compressed gas pocket.
+        assert!(mean > 0.225, "bell retained an air pocket: {mean}");
+        assert!(
+            mass_change.abs() < 1e-10,
+            "water mass changed: {mass_change}"
+        );
+    }
+
+    #[test]
+    fn freely_displaced_air_uses_plic_surface_pressure_and_preserves_partial_water() {
+        for top in [0.25, 0.75] {
+            let mut grid = all_air_grid([1, 5, 1], MacConfig::default());
+            grid.set_freely_displaced_air().unwrap();
+            for y in 0..3 {
+                grid.set_fraction(GlobalCell::new(0, y, 0), 1.0).unwrap();
+            }
+            grid.set_fraction(GlobalCell::new(0, 3, 0), top).unwrap();
+            let volume = grid.water_volume_m3();
+            let rows = if top > 0.5 { 4 } else { 3 };
+            for _ in 0..20 {
+                let step = grid.step(1.0 / 60.0).unwrap();
+                assert_eq!(step.pressure_active_rows_total, rows);
+                assert_eq!(step.pressure_converged_substeps, step.substeps);
+                assert!((grid.water_volume_m3() - volume).abs() < 1e-12);
+                assert!(
+                    grid.max_face_speed_l1().0 < 1e-7,
+                    "top={top}, v={:?}",
+                    grid.v
+                );
+            }
+            let surface_y = 3.0 + top;
+            let sample_y = f64::from(rows as u32) - 0.5;
+            let expected =
+                grid.config.density_kg_m3 * 9.81 * grid.config.cell_size_m * (surface_y - sample_y);
+            assert!((grid.pressure_pa[rows as usize - 1] - expected).abs() < 1e-5);
+            assert!(grid.fraction[3] > 0.0, "air-centred water was discarded");
+        }
+    }
+
+    #[test]
+    fn reconstructed_transfers_do_not_depend_on_discarded_donor_velocity_samples() {
+        let mut grid = all_air_grid(
+            [4, 3, 2],
+            MacConfig {
+                cell_size_m: 1.0,
+                gravity_m_s2: [0.0; 3],
+                ..MacConfig::default()
+            },
+        );
+        grid.set_freely_displaced_air().unwrap();
+        grid.set_cut_surface_support().unwrap();
+        let left = grid.cell_index(1, 1, 0);
+        let right = grid.cell_index(2, 1, 0);
+        let tiny = grid.cell_index(3, 1, 1);
+        grid.fraction[left] = 0.25;
+        grid.fraction[right] = 0.25;
+        grid.fraction[tiny] = 1e-120;
+        grid.cut_surface_velocity = std::array::from_fn(|_| vec![0.0; grid.fraction.len()]);
+        grid.cut_surface_flux = [
+            vec![0.0; grid.u.len()],
+            vec![0.0; grid.v.len()],
+            vec![0.0; grid.w.len()],
+        ];
+        let face = grid.u_index(2, 1, 0);
+        grid.cut_surface_flux[0][face] = 0.1;
+        let mut different_samples = grid.clone();
+        different_samples.u.fill(-2.0);
+        different_samples.v.fill(3.0);
+        different_samples.w.fill(-1.0);
+        let mut region = vec![false; grid.fraction.len()];
+        region[right] = true;
+        let first = grid.advect_fraction_fct(0.1, Some(&region)).unwrap();
+        let second = different_samples
+            .advect_fraction_fct(0.1, Some(&region))
+            .unwrap();
+        assert_eq!((first.0, first.1, first.2), (second.0, second.1, second.2));
+        assert_eq!(grid.fraction, different_samples.fraction);
+        assert_eq!(grid.fraction[tiny], 1e-120);
+        assert!((grid.fraction[left] - 0.24).abs() < 1e-15);
+        assert!((grid.fraction[right] - 0.26).abs() < 1e-15);
+        assert!((first.2 - 0.01).abs() < 1e-15);
+        assert_eq!(first.0, 0.0);
+    }
+
+    #[test]
+    fn reconstructed_support_preserves_nearly_saturated_surface_rest() {
+        for h in [0.5, 1.0] {
+            for dt in [0.025, 0.05] {
+                for mixed in [true, false] {
+                    let mut grid = all_air_grid(
+                        [12, 6, 2],
+                        MacConfig {
+                            cell_size_m: h,
+                            ..MacConfig::default()
+                        },
+                    );
+                    grid.set_freely_displaced_air().unwrap();
+                    grid.set_cut_surface_support().unwrap();
+                    for z in 0..2 {
+                        for x in 0..12 {
+                            grid.set_fraction(
+                                GlobalCell::new(x, 0, z),
+                                if mixed && (x + z) % 2 == 0 {
+                                    1.0
+                                } else {
+                                    1.0 - f64::EPSILON
+                                },
+                            )
+                            .unwrap();
+                            grid.set_fraction(GlobalCell::new(x, 1, z), 0.25).unwrap();
+                        }
+                    }
+                    let mass = grid.water_volume_m3();
+                    let mut peak = 0.0_f64;
+                    for step in 0..600 {
+                        let metrics = grid.step(dt).unwrap();
+                        assert_eq!(metrics.pressure_converged_substeps, metrics.substeps);
+                        let speed = grid.max_face_component_velocity_m_s();
+                        peak = peak.max(speed);
+                        assert!(speed < 1e-7, "step={step}, speed={speed}");
+                        assert!((grid.water_volume_m3() - mass).abs() < 1e-10);
+                        assert!(grid.pressure_pa.iter().all(|p| p.is_finite()));
+                    }
+                    println!(
+                        "{{\"scenario\":\"reconstructed_nearly_full_rest\",\"h_m\":{h},\"dt_s\":{dt},\"mixed\":{mixed},\"steps\":600,\"peak_speed_m_s\":{peak},\"mass_error_m3\":{}}}",
+                        grid.water_volume_m3() - mass
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cut_surface_reconstruction_preserves_flat_wall_normals_and_tiny_air_volume() {
+        let mut grid = all_air_grid([5, 4, 3], MacConfig::default());
+        grid.set_freely_displaced_air().unwrap();
+        grid.set_cut_surface_support().unwrap();
+        for z in 0..3 {
+            for x in 0..5 {
+                grid.set_fraction(GlobalCell::new(x, 0, z), 1.0 - f64::EPSILON)
+                    .unwrap();
+                grid.set_fraction(GlobalCell::new(x, 1, z), 0.25).unwrap();
+            }
+        }
+        let planes = grid.reconstruct_planes();
+        for z in 0..3 {
+            for x in 0..5 {
+                for y in [0, 1] {
+                    let i = grid.cell_index(x, y, z);
+                    let p = planes[i].unwrap();
+                    assert_eq!(p.normal, [0.0, 1.0, 0.0]);
+                    assert!((p.alpha - grid.fraction[i]).abs() <= f64::EPSILON);
+                }
+            }
+        }
+        for normal in [[1.0, 2.0, 3.0], [-1.0, 2.0, -3.0], [0.0, 1.0, 0.0]] {
+            for air in [f64::EPSILON, 1e-12, 0.01] {
+                let p = InterfacePlane::from_fraction_resolved(normal, 1.0 - air);
+                let actual = plane_cube_fraction(p.normal.map(|v| -v), -p.alpha);
+                let expected = 1.0 - (1.0 - air);
+                assert!(
+                    (actual - expected).abs() < expected * 1e-6,
+                    "normal={normal:?}, air={air}, actual={actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cut_surface_closes_a_buried_air_gap_without_losing_water_or_creating_energy() {
+        let mut grid = all_air_grid(
+            [3, 4, 2],
+            MacConfig {
+                cell_size_m: 1.0,
+                ..MacConfig::default()
+            },
+        );
+        grid.set_freely_displaced_air().unwrap();
+        grid.set_cut_surface_support().unwrap();
+        for z in 0..2 {
+            for x in 0..3 {
+                grid.set_fraction(GlobalCell::new(x, 0, z), 0.99).unwrap();
+                grid.set_fraction(GlobalCell::new(x, 1, z), 0.25).unwrap();
+            }
+        }
+        let water = grid.water_volume_m3();
+        let energy = grid.gravitational_potential_energy_j();
+        for _ in 0..600 {
+            grid.step(0.05).unwrap();
+            assert!((grid.water_volume_m3() - water).abs() < 1e-10);
+            let (lo, hi) = grid.fraction_bounds();
+            assert!(lo >= 0.0 && hi <= 1.0);
+            assert!(
+                grid.gravitational_potential_energy_j() + grid.kinetic_energy_j() <= energy * 1.05
+            );
+        }
+        for z in 0..2 {
+            for x in 0..3 {
+                assert!(grid.fraction[grid.cell_index(x, 0, z)] > 0.995);
+            }
+        }
+    }
+
+    #[test]
+    fn atmospheric_surface_pressure_is_stable_with_nearly_saturated_neighbours() {
+        for h in [0.5, 1.0] {
+            for dt in [0.025, 0.05] {
+                let mut grid = all_air_grid(
+                    [12, 6, 2],
+                    MacConfig {
+                        cell_size_m: h,
+                        ..MacConfig::default()
+                    },
+                );
+                grid.set_pressure_preconditioner(PressurePreconditioner::Multigrid);
+                grid.set_freely_displaced_air().unwrap();
+                for z in 0..2 {
+                    for x in 0..12 {
+                        // Keep the actual tiny deficits. No snapping to one or
+                        // liquid-volume adjustment is part of the correction.
+                        let full = if (x + z) % 2 == 0 {
+                            1.0
+                        } else {
+                            1.0 - f64::EPSILON
+                        };
+                        grid.set_fraction(GlobalCell::new(x, 0, z), full).unwrap();
+                        grid.set_fraction(GlobalCell::new(x, 1, z), 0.25).unwrap();
+                    }
+                }
+                let mass = grid.water_volume_m3();
+                let expected_pressure = 1000.0 * 9.81 * h * 0.75;
+                let (mut peak_speed, mut peak_pressure_error) = (0.0_f64, 0.0_f64);
+                for _ in 0..600 {
+                    let step = grid.step(dt).unwrap();
+                    assert_eq!(step.pressure_converged_substeps, step.substeps);
+                    peak_speed = peak_speed.max(grid.max_face_component_velocity_m_s());
+                    assert!(peak_speed < 1e-7, "h={h}, dt={dt}, speed={peak_speed}");
+                    assert!((grid.water_volume_m3() - mass).abs() < 1e-10);
+                    for z in 0..2 {
+                        for x in 0..12 {
+                            let i = grid.cell_index(x, 0, z);
+                            peak_pressure_error = peak_pressure_error
+                                .max((grid.pressure_pa[i] - expected_pressure).abs());
+                        }
+                    }
+                    assert!(
+                        peak_pressure_error < 1e-5,
+                        "pressure error={peak_pressure_error}"
+                    );
+                }
+                println!(
+                    "{{\"scenario\":\"nearly_saturated_surface_rest\",\"h_m\":{h},\"dt_s\":{dt},\"steps\":600,\"peak_speed_m_s\":{peak_speed},\"peak_pressure_error_pa\":{peak_pressure_error},\"water_error_m3\":{}}}",
+                    grid.water_volume_m3() - mass
+                );
+            }
+        }
     }
 
     #[test]
@@ -4397,6 +6245,313 @@ mod tests {
         }
     }
 
+    fn phase_for_grid(grid: &MacGridWorld) -> PhaseWater {
+        use crate::cut_cell::{CutCellGeometry, GeometryLimits};
+        use crate::phase_water::PhaseLimits;
+        let boundary = SolidBoundary {
+            spec: grid.spec,
+            solid: grid.solid.clone(),
+        };
+        let geometry = std::sync::Arc::new(
+            CutCellGeometry::build(
+                &boundary,
+                3,
+                GeometryLimits {
+                    max_fine_cells: 4096,
+                    max_components: 4096,
+                    max_portals: 12_288,
+                },
+            )
+            .unwrap(),
+        );
+        PhaseWater::new(
+            geometry,
+            &grid.fraction,
+            grid.config.cell_size_m,
+            PhaseLimits {
+                max_fine_cells: 4096,
+                max_faces: 12_288,
+                max_basins: 4096,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn phase_predictor_matches_physical_fine_projection_with_open_and_sealed_air() {
+        for open in [false, true] {
+            for compressible in [false, true] {
+                let mut grid = all_air_grid([6, 6, 3], quiet_config(open));
+                grid.set_ambient_density(1.2).unwrap();
+                grid.set_compressible_enclosed_air(compressible).unwrap();
+                grid.set_pressure_preconditioner(PressurePreconditioner::Ic0);
+                for i in 0..grid.fraction.len() {
+                    let y = i / 6 % 6;
+                    grid.fraction[i] = (2.3 - y as f64).clamp(0.0, 1.0);
+                }
+                let u = grid.u_index(3, 1, 1);
+                let v = grid.v_index(2, 3, 1);
+                grid.u[u] = 0.07;
+                grid.v[v] = -0.04;
+                let phase = phase_for_grid(&grid);
+                let mut predicted = grid.clone();
+                predicted
+                    .set_phase_pressure_predictor(
+                        &phase,
+                        GraphLimits {
+                            max_fine_cells: 4096,
+                            max_rows: 4096,
+                            max_connections: 12_288,
+                        },
+                        8,
+                    )
+                    .unwrap();
+                let plain = grid.project(0.01).unwrap();
+                let coarse = predicted.project(0.01).unwrap();
+                assert!(
+                    plain.converged && coarse.converged,
+                    "open={open} gas={compressible}"
+                );
+                assert!(coarse.phase_rows < coarse.active_cells && coarse.phase_reused);
+                for (a, b) in grid
+                    .u
+                    .iter()
+                    .chain(&grid.v)
+                    .chain(&grid.w)
+                    .zip(predicted.u.iter().chain(&predicted.v).chain(&predicted.w))
+                {
+                    assert!(
+                        (a - b).abs() < 1e-7,
+                        "physical face difference {}",
+                        (a - b).abs()
+                    );
+                }
+                for (a, b) in grid.pressure_pa.iter().zip(&predicted.pressure_pa) {
+                    assert!(
+                        (a - b).abs() < 1e-5,
+                        "physical pressure difference {}",
+                        (a - b).abs()
+                    );
+                }
+                // A boundary mutation cannot keep using the old geometry mapping.
+                predicted.solid[0] = true;
+                assert!(matches!(
+                    predicted.project(0.01),
+                    Err(MacError::BoundaryMismatch)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn phase_galerkin_includes_density_top_and_gas_diagonals_without_losing_symmetry() {
+        let mut grid = all_air_grid([6, 6, 3], quiet_config(true));
+        grid.set_ambient_density(1.2).unwrap();
+        for i in 0..grid.fraction.len() {
+            grid.fraction[i] = (2.3 - (i / 6 % 6) as f64).clamp(0.0, 1.0);
+        }
+        let phase = phase_for_grid(&grid);
+        let graph = PhaseGraph::build(
+            &phase,
+            GraphLimits {
+                max_fine_cells: 4096,
+                max_rows: 4096,
+                max_connections: 12_288,
+            },
+        )
+        .unwrap();
+        let h2 = grid.config.cell_size_m.powi(2);
+        let weights: Vec<_> = phase
+            .faces()
+            .iter()
+            .map(|f| grid.relative_inverse_face_density(f.lower, f.upper) / h2)
+            .collect();
+        let mut extra = vec![0.0; grid.fraction.len()];
+        // Synthetic sealed-gas compliance at every partial/air cell tests the
+        // same diagonal formula even though this all-air top is vented.
+        for (i, v) in extra.iter_mut().enumerate() {
+            *v = (1.0 - grid.fraction[i]) * grid.config.density_kg_m3
+                / (ATMOSPHERIC_PRESSURE_PA * 0.01_f64.powi(2));
+            if i / 6 % 6 == 5 {
+                *v += 2.0 * grid.relative_inverse_face_density(i, i) / h2;
+            }
+        }
+        let coarse = graph
+            .pressure_operator_with_diagonal(&phase, &weights, &extra)
+            .unwrap();
+        let mut diag = extra.clone();
+        for (f, &w) in phase.faces().iter().zip(&weights) {
+            diag[f.lower] += w;
+            diag[f.upper] += w;
+        }
+        let p: Vec<_> = (0..graph.rows().len())
+            .map(|i| (i % 7) as f64 - 3.0)
+            .collect();
+        let lifted: Vec<_> = (0..diag.len())
+            .map(|i| p[graph.row_at_index(i).unwrap() as usize])
+            .collect();
+        let active: Vec<_> = (0..diag.len()).collect();
+        let mut applied = vec![0.0; diag.len()];
+        apply_pressure_matrix(
+            &grid,
+            &lifted,
+            &vec![true; diag.len()],
+            &active,
+            &diag,
+            &mut applied,
+        );
+        let mut restricted = vec![0.0; p.len()];
+        for (i, v) in applied.iter().enumerate() {
+            restricted[graph.row_at_index(i).unwrap() as usize] += v;
+        }
+        for (a, b) in coarse.apply(&p).unwrap().iter().zip(restricted) {
+            assert!((a - b).abs() < 1e-8);
+        }
+        let q: Vec<_> = p.iter().map(|v| v * v + 0.2).collect();
+        let (mp, mq) = (coarse.smooth(&p, 8).unwrap(), coarse.smooth(&q, 8).unwrap());
+        let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+        assert!((dot(&p, &mq) - dot(&q, &mp)).abs() < 1e-12);
+        assert!(dot(&p, &mp) > 0.0 && dot(&q, &mq) > 0.0);
+    }
+
+    #[test]
+    fn balanced_phase_pressure_is_symmetric_positive_and_reuses_scratch() {
+        for anchored in [false, true] {
+            let mut grid = all_air_grid([6, 6, 3], quiet_config(anchored));
+            grid.set_ambient_density(1.2).unwrap();
+            for i in 0..grid.fraction.len() {
+                grid.solid[i] = i % 6 == 2;
+                grid.fraction[i] = if grid.solid[i] {
+                    0.0
+                } else {
+                    (2.3 - (i / 6 % 6) as f64).clamp(0.0, 1.0)
+                };
+            }
+            let phase = phase_for_grid(&grid);
+            let graph = PhaseGraph::build(
+                &phase,
+                GraphLimits {
+                    max_fine_cells: 4096,
+                    max_rows: 4096,
+                    max_connections: 12_288,
+                },
+            )
+            .unwrap();
+            let weights: Vec<_> = phase
+                .faces()
+                .iter()
+                .map(|f| grid.relative_inverse_face_density(f.lower, f.upper) / 0.25_f64.powi(2))
+                .collect();
+            let extra: Vec<_> = (0..grid.fraction.len())
+                .map(|i| if anchored && !grid.solid[i] { 3.0 } else { 0.0 })
+                .collect();
+            let coarse = graph
+                .pressure_operator_with_diagonal(&phase, &weights, &extra)
+                .unwrap();
+            let mut diag = extra;
+            for (f, &w) in phase.faces().iter().zip(weights.iter()) {
+                diag[f.lower] += w;
+                diag[f.upper] += w;
+            }
+            let liquid: Vec<_> = grid.solid.iter().map(|s| !s).collect();
+            let active: Vec<_> = (0..liquid.len()).filter(|&i| liquid[i]).collect();
+            let operator = PressureOperator::build(&grid, &liquid, &active, &diag);
+            let mut balanced =
+                BalancedPhasePressure::new(&graph, coarse.smoother().unwrap(), diag.len(), 8);
+            let mut base = BasePressurePreconditioner {
+                ic0: None,
+                multigrid: None,
+                work: None,
+                active: &active,
+                diag: &diag,
+            };
+            let (labels, mut anchors) = grid.label_components(&liquid);
+            anchors.fill(anchored);
+            let mut sums = vec![0.0; anchors.len()];
+            let mut counts = vec![0; anchors.len()];
+            let mut x: Vec<_> = (0..diag.len()).map(|i| (i % 7) as f64 - 3.0).collect();
+            let mut y: Vec<_> = (0..diag.len()).map(|i| (i % 11) as f64 - 5.0).collect();
+            for v in [&mut x, &mut y] {
+                project_component_means(
+                    v,
+                    &labels,
+                    &anchors,
+                    anchors.len(),
+                    &active,
+                    &mut sums,
+                    &mut counts,
+                );
+            }
+            let (mut bx, mut by) = (vec![0.0; diag.len()], vec![0.0; diag.len()]);
+            let pointers = (
+                balanced.temporary.as_ptr(),
+                balanced.applied.as_ptr(),
+                balanced.row_source.as_ptr(),
+                balanced.row_q.as_ptr(),
+                balanced.row_z.as_ptr(),
+            );
+            let bytes = balanced.array_storage_bytes();
+            balanced.apply(&x, &mut bx, &operator, &mut base).unwrap();
+            balanced.apply(&y, &mut by, &operator, &mut base).unwrap();
+            assert_eq!(
+                pointers,
+                (
+                    balanced.temporary.as_ptr(),
+                    balanced.applied.as_ptr(),
+                    balanced.row_source.as_ptr(),
+                    balanced.row_q.as_ptr(),
+                    balanced.row_z.as_ptr()
+                )
+            );
+            assert_eq!(bytes, balanced.array_storage_bytes());
+            for v in [&mut bx, &mut by] {
+                project_component_means(
+                    v,
+                    &labels,
+                    &anchors,
+                    anchors.len(),
+                    &active,
+                    &mut sums,
+                    &mut counts,
+                );
+            }
+            let dot = |a: &[f64], b: &[f64]| dot_indices(a, b, &active);
+            let (xby, ybx) = (dot(&x, &by), dot(&y, &bx));
+            assert!((xby - ybx).abs() < 1e-10 * xby.abs().max(ybx.abs()).max(1.0));
+            assert!(dot(&x, &bx) > 0.0 && dot(&y, &by) > 0.0);
+            let mut predicted = grid.clone();
+            grid.set_pressure_preconditioner(PressurePreconditioner::Ic0);
+            predicted.set_pressure_preconditioner(PressurePreconditioner::Ic0);
+            predicted
+                .set_phase_pressure_preconditioner(
+                    &phase,
+                    GraphLimits {
+                        max_fine_cells: 4096,
+                        max_rows: 4096,
+                        max_connections: 12_288,
+                    },
+                    8,
+                )
+                .unwrap();
+            let u = grid.u_index(4, 1, 1);
+            grid.u[u] = 0.07;
+            predicted.u[u] = 0.07;
+            let plain = grid.project(0.01).unwrap();
+            let result = predicted.project(0.01).unwrap();
+            assert!(plain.converged && result.converged);
+            assert!(result.phase_applications > 0 && result.phase_scratch_bytes > 0);
+            for (a, b) in grid
+                .u
+                .iter()
+                .chain(&grid.v)
+                .chain(&grid.w)
+                .zip(predicted.u.iter().chain(&predicted.v).chain(&predicted.w))
+            {
+                assert!((a - b).abs() < 1e-7);
+            }
+        }
+    }
+
     #[test]
     fn fraction_diagnostics_keep_tiny_cells_in_solver_and_report_bridging() {
         let mut grid = all_air_grid([3, 1, 1], quiet_config(false));
@@ -4451,7 +6606,7 @@ mod tests {
         let region = [true, false];
         let before = grid.water_volume_m3();
         let upper_before = grid.fraction[grid.cell_index(0, 0, 0)] * grid.cell_volume();
-        let (open_outflow, region_out, region_in) =
+        let (open_outflow, region_out, region_in, _) =
             grid.advect_fraction_fct(0.1, Some(&region)).unwrap();
         let upper_after = grid.fraction[grid.cell_index(0, 0, 0)] * grid.cell_volume();
         assert_eq!(open_outflow, 0.0);
@@ -4675,7 +6830,7 @@ mod tests {
         let mut grid = all_air_grid([2, 1, 1], quiet_config(false));
         grid.pressure_pa.copy_from_slice(&[3.0, -3.0]);
         grid.previous_liquid.fill(true);
-        grid.commit_boundary(vec![false; 2]).unwrap();
+        grid.commit_boundary(vec![false, true]).unwrap();
         assert_eq!(grid.pressure_pa, vec![0.0, 0.0]);
         assert_eq!(grid.previous_liquid, vec![false, false]);
     }

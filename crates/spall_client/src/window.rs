@@ -3788,6 +3788,7 @@ fn hammer_due(pending: bool, held: bool, last: Option<Instant>, now: Instant) ->
 /// Merges the water columns of a keyframe (all one cell wide, same-height runs
 /// side by side) into as few boxes as possible and assigns the water material:
 /// a flat lake is a handful of boxes, not one per fluid column.
+#[cfg(test)]
 fn merge_water_columns(columns: &[Instance], material: u32) -> Vec<Instance> {
     let mut cells = Vec::with_capacity(columns.len());
     for c in columns {
@@ -4431,9 +4432,6 @@ pub(super) struct WorldRenderer {
     /// Terrain, bodies and debug overlays live in its resident instance
     /// buffers.
     scene: GameRenderer,
-    /// Reserved material and instances used only by the ENG-103 inspection
-    /// viewer; the normal game material table remains opaque.
-    debug_water_material: u32,
     vegetation_frame: Option<Arc<spall_ecology::living::VisualFrame>>,
     vegetation_key: Option<VegetationKey>,
     vegetation_worker: VegetationWorker,
@@ -4648,11 +4646,6 @@ pub(super) enum AcquireOutcome {
 }
 
 impl WorldRenderer {
-    /// Queue translucent cells for the local fluid inspection view.
-    pub(super) fn set_debug_water(&mut self, instances: &[Instance]) {
-        self.debug_water_source = merge_water_columns(instances, self.debug_water_material);
-    }
-
     /// Installs (or, with `None`, clears) the smoothed water surface and the
     /// height field behind the underwater look.
     pub(super) fn set_water_look(&mut self, look: Option<crate::water_look::WaterLook>) {
@@ -4784,7 +4777,6 @@ impl WorldRenderer {
             .then(|| HudGpuTimer::new(&device, queue.get_timestamp_period()));
 
         let mut render_materials = materials.to_vec();
-        let debug_water_material = render_materials.len() as u32;
         // Water is presentation-only and drawn alpha-blended over the scene.
         render_materials.push(WATER_MATERIAL);
         let vegetation_material = render_materials.len() as u32;
@@ -4813,7 +4805,6 @@ impl WorldRenderer {
             surface,
             surface_config,
             scene,
-            debug_water_material,
             vegetation_frame: None,
             vegetation_key: None,
             vegetation_worker: VegetationWorker::spawn(vegetation_material)?,
@@ -4979,7 +4970,7 @@ impl WorldRenderer {
         }
     }
 
-    fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
+    pub(super) fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
         self.yakui_winit.handle_window_event(&mut self.yakui, event)
     }
 

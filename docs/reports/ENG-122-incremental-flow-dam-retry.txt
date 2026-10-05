@@ -1,0 +1,32 @@
+   Compiling ring v0.17.14
+   Compiling spall_physics v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_physics)
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+   Compiling spall_render v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_render)
+   Compiling rustls v0.23.44
+   Compiling spall_sim v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_sim)
+   Compiling rustls-webpki v0.103.15
+   Compiling rcgen v0.13.2
+   Compiling quinn-proto v0.11.17 (https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f2)
+   Compiling quinn v0.11.11
+   Compiling spall_net v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_net)
+   Compiling spall_client v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_client)
+   Compiling spall_server v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_server)
+   Compiling sandbox v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\examples\sandbox)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.36s
+     Running tests\dam_gate_replication.rs (G:/Programming/voxel_engine/target\debug\deps\dam_gate_replication-a6e5c66255505ddf.exe)
+
+running 1 test
+
+thread 'a_real_client_sees_the_dam_gate_open_after_the_admin_command' (27148) panicked at examples\sandbox\tests\dam_gate_replication.rs:130:5:
+expected the immediate "queued" ack plus at least one delayed commit/reject follow-up: []
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_real_client_sees_the_dam_gate_open_after_the_admin_command ... FAILED
+
+failures:
+
+failures:
+    a_real_client_sees_the_dam_gate_open_after_the_admin_command
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.44s
+
+error: test failed, to rerun pass `-p sandbox --test dam_gate_replication`

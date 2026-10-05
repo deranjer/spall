@@ -1,0 +1,46 @@
+{
+  "format": "SPWREP01",
+  "source_parent": "18e3a3e7db717397fe9f7c402d412929b6a1c66e",
+  "capture_source": "18e3a3e+exact-replay",
+  "scenario": "diagnostic_open_top_crop_of_paced_512_trench_precursor",
+  "original_owner_fluid_time_s": 32.950000000000266,
+  "original_domain_dimensions": [
+    62,
+    25,
+    62
+  ],
+  "original_domain_origin": [
+    57,
+    87,
+    306
+  ],
+  "crop_local_min_inclusive": [
+    54,
+    0,
+    37
+  ],
+  "crop_local_max_exclusive": [
+    59,
+    4,
+    42
+  ],
+  "dimensions": [
+    5,
+    4,
+    5
+  ],
+  "origin": [
+    111,
+    87,
+    343
+  ],
+  "cells": 100,
+  "full_precursor_sha256": "1ab462144b4de6ef1b08ea198fb05855c9c7b34aaf839348f44ff3e1c7041d64",
+  "crop_sha256": "3612e26257717d4aef9b92a07d04214b51d9d354a4e2736442f496df43db06b8",
+  "fraction_filtering": false,
+  "outside_connections": "side and bottom connections removed by diagnostic cropping; original open_top=true retained",
+  "original_trench_acceptance": false,
+  "timing_acceptance": false,
+  "default_physics_changed": false,
+  "open_top": true
+}

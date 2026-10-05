@@ -1,0 +1,52 @@
+Final retained support diagnostic; cargo commands ran with CARGO_TARGET_DIR=G:/Programming/voxel_engine/target. Equivalent compiled test binaries are repeated below to retain complete results.
+cargo test -p spall_fluid --lib cut_surface --release -- --nocapture
+
+running 2 tests
+test grid_mac::cut_surface::tests::clipped_liquid_has_correct_centroid_and_embedded_surface ... ok
+test grid_mac::cut_surface::tests::tiny_reflected_fragments_keep_nonzero_geometric_support ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 70 filtered out; finished in 0.00s
+
+cargo test -p spall_fluid --lib reconstructed_support_preserves_nearly_saturated_surface_rest --release -- --ignored --nocapture
+
+running 1 test
+
+thread 'grid_mac::tests::reconstructed_support_preserves_nearly_saturated_surface_rest' (32008) panicked at crates\spall_fluid\src\grid_mac.rs:5784:13:
+step=0, speed=0.008301390432100413
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test grid_mac::tests::reconstructed_support_preserves_nearly_saturated_surface_rest ... FAILED
+
+failures:
+
+failures:
+    grid_mac::tests::reconstructed_support_preserves_nearly_saturated_surface_rest
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.00s
+
+Expected known failing rest gate exit_code=101
+cargo test -p spall_fluid --example shallow_shore_probe --release -- --nocapture
+
+running 6 tests
+test tests::shallow_water_must_drain_into_the_open_lower_trench ... ignored, ENG-122 unresolved shallow-film gate; run explicitly against baseline or opted-in prototype
+test tests::deeper_water_control_drains_and_conserves_volume ... ok
+{"scenario":"wide_partial_layer_rest","steps":600,"dt_s":0.05,"peak_speed_m_s":0.00000000000027461366514103247,"water_error_m3":-0.00000000000003197442310920451}
+test tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest ... ok
+test tests::flat_shallow_pool_and_full_wall_preserve_rest_and_volume ... ok
+test tests::reconstructed_support_drains_shallow_and_deep_water_with_bounded_energy ... ok
+test tests::reconstructed_support_keeps_flat_pools_and_full_walls_at_rest ... ok
+
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+SHALLOW_SHORE_SUPPORT=1 cargo test -p spall_fluid --example shallow_shore_probe --release -- --include-ignored --nocapture
+
+running 6 tests
+test tests::shallow_water_must_drain_into_the_open_lower_trench ... ok
+test tests::deeper_water_control_drains_and_conserves_volume ... ok
+{"scenario":"wide_partial_layer_rest","steps":600,"dt_s":0.05,"peak_speed_m_s":0,"water_error_m3":0}
+test tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest ... ok
+test tests::flat_shallow_pool_and_full_wall_preserve_rest_and_volume ... ok
+test tests::reconstructed_support_drains_shallow_and_deep_water_with_bounded_energy ... ok
+test tests::reconstructed_support_keeps_flat_pools_and_full_walls_at_rest ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+

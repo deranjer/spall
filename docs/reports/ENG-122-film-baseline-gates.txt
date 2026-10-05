@@ -1,0 +1,29 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s
+     Running unittests examples\shallow_shore_probe.rs (G:/Programming/voxel_engine/target\debug\examples\shallow_shore_probe-0732c17d39996588.exe)
+
+running 2 tests
+test tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest ... FAILED
+test tests::shallow_water_must_drain_into_the_open_lower_trench ... FAILED
+
+failures:
+
+---- tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest stdout ----
+
+thread 'tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest' (32372) panicked at crates\spall_fluid\examples\shallow_shore_probe.rs:256:13:
+step=3, speed=0.035918944398657726, energy=794610.8495211039, mass_error=0.000000000000003552713678800501
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::shallow_water_must_drain_into_the_open_lower_trench stdout ----
+
+thread 'tests::shallow_water_must_drain_into_the_open_lower_trench' (15464) panicked at crates\spall_fluid\examples\shallow_shore_probe.rs:218:9:
+shallow water froze: downstream=0, pressure rows=0, speed=0, bit-identical=true
+
+
+failures:
+    tests::hydrostatic_partial_layer_over_deeper_water_stays_at_rest
+    tests::shallow_water_must_drain_into_the_open_lower_trench
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.52s
+
+error: test failed, to rerun pass `-p spall_fluid --example shallow_shore_probe`

@@ -1,0 +1,11 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `release` profile [optimized + debuginfo] target(s) in 5.13s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\release\deps\spall_fluid-b49d3fbffb0ad4ba.exe)
+
+running 4 tests
+test grid_mac::replay::tests::captured_trench_crop_advances_without_velocity_instability ... ignored, ENG-122 unresolved pressure/momentum coupling: third step exceeds the unchanged CFL budget
+test grid_mac::replay::tests::replay_preserves_rejected_cfl_state_without_advancing ... ok
+test grid_mac::replay::tests::replay_rejects_unknown_version_oversized_truncated_and_nonfinite_data ... ok
+test grid_mac::replay::tests::replay_preserves_warm_surface_state_and_next_accepted_transfers_bitwise ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 86 filtered out; finished in 0.00s
