@@ -1,0 +1,188 @@
+[
+  {
+    "name": "precursor1000",
+    "source_revision": "66d932c+pressure-impulse-final",
+    "input_file": ".local/scaled-failure-512.precursor.water-replay",
+    "input_sha256": "0683C98C4F330E5C7B7BEB8175B75BA83B0AD10AAD9803EF6C8EBA1459327FF6",
+    "requested_steps": 1000,
+    "accepted_steps": 1000,
+    "dt_s": 0.05,
+    "timing_acceptance": false,
+    "owner_state_advanced": false,
+    "initial_state": {
+      "scenario": "reconstructed_water_replay",
+      "source_revision": "66d932c+pressure-impulse-final",
+      "step": 0,
+      "dt_s": 0.05,
+      "dimensions": [
+        62,
+        25,
+        62
+      ],
+      "limiting_cell": [
+        107,
+        94,
+        346
+      ],
+      "limiting_outflow_l1_m_s": 53.9814020458638,
+      "face_speed_m_s": 33.83867038131531,
+      "interface_speed_m_s": 9.027311090298356,
+      "water_change_m3": 0.0,
+      "timing_acceptance": false,
+      "owner_state_advanced": false
+    },
+    "final_state": {
+      "scenario": "reconstructed_water_replay",
+      "source_revision": "66d932c+pressure-impulse-final",
+      "step": 999,
+      "dt_s": 0.05,
+      "dimensions": [
+        62,
+        25,
+        62
+      ],
+      "limiting_cell": [
+        102,
+        100,
+        335
+      ],
+      "limiting_outflow_l1_m_s": 3.6774872926456,
+      "face_speed_m_s": 3.0533572528468165,
+      "interface_speed_m_s": 2.217711763999424,
+      "water_change_m3": -9.777068044058979E-12,
+      "timing_acceptance": false,
+      "owner_state_advanced": false
+    },
+    "final_step": {
+      "scenario": "reconstructed_water_replay_accepted",
+      "step": 999,
+      "substeps": 1,
+      "pressure_iterations": 104,
+      "conservation_error_m3": 2.1600499167107046E-12
+    }
+  },
+  {
+    "name": "coupling100",
+    "source_revision": "66d932c+pressure-impulse-final",
+    "input_file": ".local/coupling-512.precursor.water-replay",
+    "input_sha256": "1AB462144B4DE6EF1B08EA198FB05855C9C7B34AAF839348F44FF3E1C7041D64",
+    "requested_steps": 100,
+    "accepted_steps": 100,
+    "dt_s": 0.05,
+    "timing_acceptance": false,
+    "owner_state_advanced": false,
+    "initial_state": {
+      "scenario": "reconstructed_water_replay",
+      "source_revision": "66d932c+pressure-impulse-final",
+      "step": 0,
+      "dt_s": 0.05,
+      "dimensions": [
+        62,
+        25,
+        62
+      ],
+      "limiting_cell": [
+        112,
+        87,
+        343
+      ],
+      "limiting_outflow_l1_m_s": 41.147888953245356,
+      "face_speed_m_s": 40.294920579719985,
+      "interface_speed_m_s": 4.438510805807091,
+      "water_change_m3": 0.0,
+      "timing_acceptance": false,
+      "owner_state_advanced": false
+    },
+    "final_state": {
+      "scenario": "reconstructed_water_replay",
+      "source_revision": "66d932c+pressure-impulse-final",
+      "step": 99,
+      "dt_s": 0.05,
+      "dimensions": [
+        62,
+        25,
+        62
+      ],
+      "limiting_cell": [
+        102,
+        100,
+        335
+      ],
+      "limiting_outflow_l1_m_s": 4.0278283722027055,
+      "face_speed_m_s": 3.070403447475416,
+      "interface_speed_m_s": 2.402398587561914,
+      "water_change_m3": -2.3874235921539366E-12,
+      "timing_acceptance": false,
+      "owner_state_advanced": false
+    },
+    "final_step": {
+      "scenario": "reconstructed_water_replay_accepted",
+      "step": 99,
+      "substeps": 1,
+      "pressure_iterations": 98,
+      "conservation_error_m3": 2.2737367544323206E-13
+    }
+  },
+  {
+    "name": "cap100",
+    "source_revision": "66d932c+pressure-impulse-final",
+    "input_file": ".local/cap-normal-new-512.water-replay",
+    "input_sha256": "797DD1116170FD3589D3563B62F9F894E44BCC7D40E83A717D5E22ACFAC37299",
+    "requested_steps": 100,
+    "accepted_steps": 100,
+    "dt_s": 0.05,
+    "timing_acceptance": false,
+    "owner_state_advanced": false,
+    "initial_state": {
+      "scenario": "reconstructed_water_replay",
+      "source_revision": "66d932c+pressure-impulse-final",
+      "step": 0,
+      "dt_s": 0.05,
+      "dimensions": [
+        62,
+        25,
+        49
+      ],
+      "limiting_cell": [
+        100,
+        100,
+        361
+      ],
+      "limiting_outflow_l1_m_s": 2.7718769051098393,
+      "face_speed_m_s": 2.2891834413137366,
+      "interface_speed_m_s": 1.093286722921257,
+      "water_change_m3": 0.0,
+      "timing_acceptance": false,
+      "owner_state_advanced": false
+    },
+    "final_state": {
+      "scenario": "reconstructed_water_replay",
+      "source_revision": "66d932c+pressure-impulse-final",
+      "step": 99,
+      "dt_s": 0.05,
+      "dimensions": [
+        62,
+        25,
+        49
+      ],
+      "limiting_cell": [
+        102,
+        100,
+        361
+      ],
+      "limiting_outflow_l1_m_s": 3.919477262726174,
+      "face_speed_m_s": 2.5512827292190994,
+      "interface_speed_m_s": 1.0036493577929104,
+      "water_change_m3": -1.4779288903810084E-12,
+      "timing_acceptance": false,
+      "owner_state_advanced": false
+    },
+    "final_step": {
+      "scenario": "reconstructed_water_replay_accepted",
+      "step": 99,
+      "substeps": 1,
+      "pressure_iterations": 67,
+      "conservation_error_m3": 3.410605131648481E-13
+    }
+  }
+]

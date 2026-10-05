@@ -1,0 +1,64 @@
+[
+  {
+    "scenario": "gap",
+    "source_revision": "66d932c+pressure-impulse-final",
+    "timing_acceptance": false,
+    "before_accepted_transport": true,
+    "audited_projections": 600,
+    "projections_exceeding_1e_minus8_m_s": 351,
+    "worst": {
+      "type": "cut_cap_continuity_audit",
+      "cell": [
+        2,
+        0,
+        1
+      ],
+      "fraction": 0.9999999999999999,
+      "dt_s": 0.05,
+      "cap_area_cells2": 3.1544589461778845E-08,
+      "cartesian_outflow_m3_s": 4.687092348357874E-12,
+      "continuity_normal_m_s": -0.0001485862529305386,
+      "pressure_normal_m_s": -4.8474226878897895E-05,
+      "normal_error_m_s": 0.00010011202605164071,
+      "pressure_response_accuracy_m_s": 1E-08,
+      "within_pressure_response_accuracy": false,
+      "projection_residual": 1.5253431580894303E-07,
+      "residual_evaluation": "projected_faces_with_equilibrated_caps",
+      "pressure_iterations": 9,
+      "free_caps": 7,
+      "contact_caps": 1,
+      "before_accepted_transport": true
+    }
+  },
+  {
+    "scenario": "channel",
+    "source_revision": "66d932c+pressure-impulse-final",
+    "timing_acceptance": false,
+    "before_accepted_transport": true,
+    "audited_projections": 599,
+    "projections_exceeding_1e_minus8_m_s": 599,
+    "worst": {
+      "type": "cut_cap_continuity_audit",
+      "cell": [
+        43,
+        5,
+        4
+      ],
+      "fraction": 0.9999999999999999,
+      "dt_s": 0.01,
+      "cap_area_cells2": 6.727331524814961E-11,
+      "cartesian_outflow_m3_s": 4.80389656113994E-13,
+      "continuity_normal_m_s": -0.1142538385312491,
+      "pressure_normal_m_s": -0.06665035459211523,
+      "normal_error_m_s": 0.04760348393913387,
+      "pressure_response_accuracy_m_s": 1E-08,
+      "within_pressure_response_accuracy": false,
+      "projection_residual": 6.4512804873372085E-06,
+      "residual_evaluation": "projected_faces_with_equilibrated_caps",
+      "pressure_iterations": 75,
+      "free_caps": 1084,
+      "contact_caps": 179,
+      "before_accepted_transport": true
+    }
+  }
+]

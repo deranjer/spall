@@ -1342,3 +1342,23 @@ this diagnostics-only increment. Remains experimental/in_progress. Next
 unblocked ENG-122: cancellation-resistant closing-interface pressure/normal
 consistency, then accepted momentum, scratch and sustained windowed gates;
 exact capacity/thin-wall/displacement/recovery and physical acceptance remain.
+
+ENG-122 pressure-impulse checkpoint (2026-10-05): reconstructed-support pressure
+jumps retain affine/product roundoff and use fused velocity impulses. Verified
+residuals evaluate projected Cartesian faces with range-safe equilibrated caps,
+within original stopping/contact/iteration/substep/CFL budgets. A real 1 Pa edge
+force disappears in the original expression; final preserves it and exact affine
+rest in both directions. Private NaN pressure norm no longer reports a finite
+value; regression covers overflow/underflow and nonfinite rows. All positive
+amounts and default/owner/save/wire behavior preserved. Release fluid102/shallow6,
+reference600/600 each and exact1000/100/100 captured replays pass. Original fresh
+512/1024 trenches pass final50ms with zero stability skips; ratios0.8948/0.8663,
+medians24.076/27.961ms, delivery42.02757/4.88146m3. No causal speedup claimed.
+Closing-cap accuracy remains open (gap peak1.00112e-4m/s, channel0.0476035m/s,
+all audited channel projections exceed1e-8); normalized divergence4.63193e73/s
+still not physical acceptance. Trace remains before accepted transport; new
+projection_residual diagnostic explicitly labels its evaluation. Exact commands,
+full-check result and evidence in reports/ENG-122.md. Next unblocked ENG-122:
+shared accurate pressure-correction/flux and accepted-momentum consistency for
+closing caps, then scratch and sustained windowed gates; exact capacity/thin
+walls/displacement/recovery remain. Keep experimental and in_progress.

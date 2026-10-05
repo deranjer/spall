@@ -253,6 +253,30 @@ impl Gauge {
     }
 }
 
+// Retain product and subtraction roundoff until the final pressure jump.
+// Adding large affine potentials before subtracting neighboring pressures can
+// otherwise erase the small impulse that closes a reconstructed interface.
+fn pressure_jump(base_a: f64, base_b: f64, x_a: f64, x_b: f64, inv_a: f64, inv_b: f64) -> f64 {
+    fn sum(a: f64, b: f64) -> (f64, f64) {
+        let high = a + b;
+        let back = high - a;
+        (high, (a - (high - back)) + (b - back))
+    }
+    let a = x_a * inv_a;
+    let b = x_b * inv_b;
+    let low_a = x_a.mul_add(inv_a, -a);
+    let low_b = x_b.mul_add(inv_b, -b);
+    let (base, low_base) = sum(base_b, -base_a);
+    let (pressure, low_pressure) = sum(b, -a);
+    let (jump, low_jump) = sum(base, pressure);
+    jump + (low_jump + low_base + low_pressure + low_b - low_a)
+}
+fn edge_velocity(e: &Edge, x: &[f64], inv: &[f64], base: &[f64], dt_rho_h: f64) -> f64 {
+    (-dt_rho_h / e.distance).mul_add(
+        pressure_jump(base[e.a], base[e.b], x[e.a], x[e.b], inv[e.a], inv[e.b]),
+        e.velocity,
+    )
+}
 struct ScaledEdge {
     a: usize,
     b: usize,
@@ -288,6 +312,9 @@ fn physical_norm(v: &[f64], root_diagonal: &[f64]) -> f64 {
         .zip(root_diagonal)
         .map(|(v, d)| (v * d).powi(2))
         .sum();
+    if squares.is_nan() {
+        return f64::INFINITY;
+    }
     if squares.is_finite() && squares > 0.0 {
         return squares.sqrt();
     }
@@ -595,10 +622,13 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     let corrected_free = |f: &Free, x: &[f64], inv: &[f64]| {
         if f.axis.is_none() {
             let root_c = grid.fraction[indices[f.row]].sqrt();
-            f.velocity + dt / rho / h * (x[f.row] / root_c) * (inv[f.row] / root_c) * (2.0 * f.area)
+            let response = dt / rho / h * (inv[f.row] / root_c) * (2.0 * f.area / root_c);
+            response.mul_add(x[f.row], f.velocity)
         } else {
-            f.velocity
-                - dt / rho / h / f.distance * ((f.potential - base[f.row]) - x[f.row] * inv[f.row])
+            (-dt / rho / h / f.distance).mul_add(
+                pressure_jump(base[f.row], f.potential, x[f.row], 0.0, inv[f.row], 1.0),
+                f.velocity,
+            )
         }
     };
     let (phi, inverse_root, initial, final_residual, before) = loop {
@@ -708,10 +738,38 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                     .collect()
             });
         scaled_gauge(&gauge, &root_diagonal, &mut phi);
+        // Verify pressure against the same geometric face impulses used by
+        // transport, rather than subtracting large assembled RHS/operator
+        // values whose roundoff need not match the projected boundary flux.
+        let physical_residual = |x: &[f64], out: &mut [f64]| {
+            out.fill(0.0);
+            for e in &edges {
+                let u = edge_velocity(e, x, &inverse_root, &base, dt / rho / h);
+                out[e.a] -= rho / dt / h * (e.area * inverse_root[e.a]) * u;
+                out[e.b] += rho / dt / h * (e.area * inverse_root[e.b]) * u;
+            }
+            for (j, f) in free.iter().enumerate() {
+                if let Some(q) = held[j] {
+                    out[f.row] -= rho / dt / h * inverse_root[f.row] * q;
+                } else if f.axis.is_none() {
+                    // Cap velocity itself can overflow for a finite stale
+                    // pressure hint on a subnormal amount. Its equilibrated
+                    // impulse stays representable; the cap's local base is
+                    // exactly its atmospheric potential.
+                    let w = free_root[j] * inverse_root[f.row];
+                    out[f.row] -= rho / dt / h * (f.area * inverse_root[f.row]) * f.velocity
+                        + w * w * x[f.row];
+                } else {
+                    out[f.row] -= rho / dt / h
+                        * (f.area * inverse_root[f.row])
+                        * corrected_free(f, x, &inverse_root);
+                }
+            }
+            scaled_gauge(&gauge, &root_diagonal, out);
+        };
         let mut product = vec![0.0; n];
-        apply(&phi, &boundary_diagonal, &scaled_edges, &mut product);
-        let mut residual: Vec<_> = rhs.iter().zip(&product).map(|(b, a)| b - a).collect();
-        scaled_gauge(&gauge, &root_diagonal, &mut residual);
+        let mut residual = vec![0.0; n];
+        physical_residual(&phi, &mut residual);
         let initial = physical_norm(&residual, &root_diagonal);
         let target = grid
             .config
@@ -760,11 +818,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                     phi[i] += z[i];
                 }
                 scaled_gauge(&gauge, &root_diagonal, &mut phi);
-                apply(&phi, &boundary_diagonal, &scaled_edges, &mut product);
-                for i in 0..n {
-                    residual[i] = rhs[i] - product[i];
-                }
-                scaled_gauge(&gauge, &root_diagonal, &mut residual);
+                physical_residual(&phi, &mut residual);
                 precondition(&residual, &diagonal, &lower, &upper, &mut z);
                 scaled_gauge(&gauge, &root_diagonal, &mut z);
                 direction.copy_from_slice(&z);
@@ -788,11 +842,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             // operator and restart from that residual within the same budget.
             let reliable = physical_norm(&residual, &root_diagonal) <= target;
             if reliable {
-                apply(&phi, &boundary_diagonal, &scaled_edges, &mut product);
-                for i in 0..n {
-                    residual[i] = rhs[i] - product[i];
-                }
-                scaled_gauge(&gauge, &root_diagonal, &mut residual);
+                physical_residual(&phi, &mut residual);
             }
             precondition(&residual, &diagonal, &lower, &upper, &mut z);
             scaled_gauge(&gauge, &root_diagonal, &mut z);
@@ -804,11 +854,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             rz = next;
             iterations += 1;
         }
-        apply(&phi, &boundary_diagonal, &scaled_edges, &mut product);
-        for i in 0..n {
-            residual[i] = rhs[i] - product[i];
-        }
-        scaled_gauge(&gauge, &root_diagonal, &mut residual);
+        physical_residual(&phi, &mut residual);
         let final_residual = physical_norm(&residual, &root_diagonal);
         if final_residual > target * 1.01 || !locally_converged(&residual) {
             return Err(MacError::MomentumPressureNotConverged {
@@ -868,10 +914,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     grid.cut_surface_flux = std::array::from_fn(|a| vec![0.0; known[a].len()]);
     let mut flux = vec![0.0; n];
     for e in &edges {
-        let u = e.velocity
-            - dt / rho / h / e.distance
-                * ((base[e.b] - base[e.a])
-                    + (phi[e.b] * inverse_root[e.b] - phi[e.a] * inverse_root[e.a]));
+        let u = edge_velocity(e, &phi, &inverse_root, &base, dt / rho / h);
         if grid.config.pressure_diagnostics && u.abs() > 10.0 {
             eprintln!(
                 "{{\"type\":\"cut_fast_edge\",\"axis\":{},\"face\":{},\"a\":{},\"b\":{},\"fraction_a\":{:.17e},\"fraction_b\":{:.17e},\"area\":{:.17e},\"distance\":{:.17e},\"predicted_velocity\":{:.17e},\"corrected_velocity\":{:.17e},\"phi_a\":{:.17e},\"phi_b\":{:.17e}}}",
@@ -946,7 +989,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         if let Some((f, continuity, pressure, error)) = worst {
             let cell = grid.spec.cell_at(indices[f.row]);
             eprintln!(
-                "{{\"type\":\"cut_cap_continuity_audit\",\"cell\":[{},{},{}],\"fraction\":{:.17e},\"dt_s\":{:.17e},\"cap_area_cells2\":{:.17e},\"cartesian_outflow_m3_s\":{:.17e},\"continuity_normal_m_s\":{:.17e},\"pressure_normal_m_s\":{:.17e},\"normal_error_m_s\":{:.17e},\"pressure_response_accuracy_m_s\":1e-8,\"within_pressure_response_accuracy\":{},\"matrix_residual\":{:.17e},\"pressure_iterations\":{},\"free_caps\":{},\"contact_caps\":{},\"before_accepted_transport\":true}}",
+                "{{\"type\":\"cut_cap_continuity_audit\",\"cell\":[{},{},{}],\"fraction\":{:.17e},\"dt_s\":{:.17e},\"cap_area_cells2\":{:.17e},\"cartesian_outflow_m3_s\":{:.17e},\"continuity_normal_m_s\":{:.17e},\"pressure_normal_m_s\":{:.17e},\"normal_error_m_s\":{:.17e},\"pressure_response_accuracy_m_s\":1e-8,\"within_pressure_response_accuracy\":{},\"projection_residual\":{:.17e},\"residual_evaluation\":\"projected_faces_with_equilibrated_caps\",\"pressure_iterations\":{},\"free_caps\":{},\"contact_caps\":{},\"before_accepted_transport\":true}}",
                 cell.x,
                 cell.y,
                 cell.z,
@@ -1043,10 +1086,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             let mut magnitude = 0.0;
             for e in &edges {
                 if e.a == r || e.b == r {
-                    let u = e.velocity
-                        - dt / rho / h / e.distance
-                            * ((base[e.b] - base[e.a])
-                                + (phi[e.b] * inverse_root[e.b] - phi[e.a] * inverse_root[e.a]));
+                    let u = edge_velocity(e, &phi, &inverse_root, &base, dt / rho / h);
                     let q = e.area * u;
                     let side = usize::from(e.a == r);
                     cartesian[2 * e.axis + side] += if side == 1 { q } else { -q };
@@ -1141,6 +1181,45 @@ pub(super) fn transport_velocity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn affine_pressure_impulse_preserves_small_force_and_exact_rest() {
+        // (2^27 + 1)(2^27 - 1) = 2^54 - 1, whereas the other
+        // product is 2^54. Rounding both products first erases a real
+        // 1 Pa difference. An affine base shift of -1 Pa must instead
+        // cancel it exactly, avoiding pressure work in the resting case.
+        let t = 2.0_f64.powi(27);
+        let x = [t + 1.0, t];
+        let inv = [t - 1.0, t];
+        for (base_b, expected) in [(0.0, -0.5), (-1.0, 0.0), (-2.0, 0.5)] {
+            let base = [0.0, base_b];
+            for (a, b, direction) in [(0, 1, 1.0), (1, 0, -1.0)] {
+                let edge = Edge {
+                    a,
+                    b,
+                    axis: 0,
+                    face: 0,
+                    area: 0.5,
+                    distance: 0.25,
+                    velocity: 0.0,
+                };
+                assert_eq!(
+                    edge_velocity(&edge, &x, &inv, &base, 0.125),
+                    direction * expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn physical_pressure_norm_never_hides_nonfinite_rows() {
+        assert_eq!(physical_norm(&[1e200], &[1.0]), 1e200);
+        assert_eq!(physical_norm(&[1e-200], &[1.0]), 1e-200);
+        assert_eq!(physical_norm(&[0.0], &[1.0]), 0.0);
+        for rows in [[f64::NAN, 0.0], [1.0, f64::NAN], [f64::INFINITY, 0.0]] {
+            assert!(physical_norm(&rows, &[1.0; 2]).is_infinite());
+        }
+        // An invalid row remains invalid even with zero stiffness.
+        assert!(physical_norm(&[f64::INFINITY], &[0.0]).is_infinite());
+    }
     #[test]
     fn pressure_row_trace_preserves_the_projected_water_and_momentum_state() {
         let fixture = include_bytes!("../../fixtures/eng122-trench-crop-v1.water-replay");
