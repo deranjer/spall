@@ -1,0 +1,8 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `release` profile [optimized + debuginfo] target(s) in 4.85s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\release\deps\spall_fluid-b49d3fbffb0ad4ba.exe)
+
+running 1 test
+test grid_mac::cut_surface::tests::closing_gap_trace_preserves_water_pressure_and_momentum ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.17s

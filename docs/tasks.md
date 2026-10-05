@@ -1365,3 +1365,18 @@ commands/evidence/full-check status in reports/ENG-122.md. Keep experimental
 and in_progress; next unblocked ENG-122 is nonzero-flow/closing-interface
 pressure-normal/accepted-momentum consistency, then full scratch and sustained
 windowed gates; exact capacity/thin-wall/recovery/physical acceptance remain.
+
+ENG-122 closing-cap audit checkpoint (2026-10-05): diagnostics now examine all
+free atmospheric caps' pressure/Cartesian-continuity normals, distinct from the
+worst volume-normalized row. The unchanged 24-cell/600-step air-gap reproduction
+has peak mismatch 9.98263e-5 m/s; channel peaks 0.0312354 m/s on a nearly full
+cell with a tiny air cap. A stronger local residual gate passes the small test
+and 99 release fluid invariants but exhausts original channel/world budgets;
+trial dropped, numerical physics/default and all positive amounts preserved.
+New full600-step trace noninterference test and identical46 non-timing channel
+properties pass; release fluid100 pass. Full-check evidence in reports/ENG-122.md.
+Original fresh trenches are prior ed024a9 evidence, not rerun measurements in
+this diagnostics-only increment. Remains experimental/in_progress. Next
+unblocked ENG-122: cancellation-resistant closing-interface pressure/normal
+consistency, then accepted momentum, scratch and sustained windowed gates;
+exact capacity/thin-wall/displacement/recovery and physical acceptance remain.

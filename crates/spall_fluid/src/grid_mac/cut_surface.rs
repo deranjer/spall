@@ -920,6 +920,51 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             grid.cut_surface_flux[axis][f.face] += f.sign * f.area * u * h * h;
         }
     }
+    if grid.config.pressure_diagnostics {
+        // The volume-normalized worst row can hide a nearly closed air gap.
+        // Audit every unconstrained cap against its own Cartesian continuity
+        // normal before installing caps. Contacts have prescribed displacement
+        // and reaction pressure, so count them separately instead of comparing
+        // them to the unconstrained atmospheric pressure response.
+        let mut free_caps = 0;
+        let mut contact_caps = 0;
+        let worst = free
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.axis.is_none())
+            .filter_map(|(j, f)| {
+                if held[j].is_some() {
+                    contact_caps += 1;
+                    return None;
+                }
+                free_caps += 1;
+                let continuity = -flux[f.row] / f.area;
+                let pressure = free_velocity[j];
+                Some((f, continuity, pressure, (continuity - pressure).abs()))
+            })
+            .max_by(|a, b| a.3.total_cmp(&b.3));
+        if let Some((f, continuity, pressure, error)) = worst {
+            let cell = grid.spec.cell_at(indices[f.row]);
+            eprintln!(
+                "{{\"type\":\"cut_cap_continuity_audit\",\"cell\":[{},{},{}],\"fraction\":{:.17e},\"dt_s\":{:.17e},\"cap_area_cells2\":{:.17e},\"cartesian_outflow_m3_s\":{:.17e},\"continuity_normal_m_s\":{:.17e},\"pressure_normal_m_s\":{:.17e},\"normal_error_m_s\":{:.17e},\"pressure_response_accuracy_m_s\":1e-8,\"within_pressure_response_accuracy\":{},\"matrix_residual\":{:.17e},\"pressure_iterations\":{},\"free_caps\":{},\"contact_caps\":{},\"before_accepted_transport\":true}}",
+                cell.x,
+                cell.y,
+                cell.z,
+                grid.fraction[indices[f.row]],
+                dt,
+                f.area,
+                flux[f.row] * h * h,
+                continuity,
+                pressure,
+                error,
+                error <= 1e-8,
+                final_residual,
+                total_iterations,
+                free_caps,
+                contact_caps
+            );
+        }
+    }
     for (j, f) in free.iter().enumerate().filter(|(_, f)| f.axis.is_none()) {
         // Zero net Cartesian outflow fixes a free atmospheric cap's normal
         // to zero by continuity. Avoid cancellation in its predictor/pressure
@@ -1116,6 +1161,59 @@ mod tests {
             assert_eq!(original.w, traced.w);
             assert_eq!(original.cut_surface_flux, traced.cut_surface_flux);
             assert_eq!(original.cut_surface_velocity, traced.cut_surface_velocity);
+        }
+    }
+    #[test]
+    fn closing_gap_trace_preserves_water_pressure_and_momentum() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        let mut original = MacGridWorld::new(
+            &SolidBoundary {
+                spec: DomainSpec::new(GlobalCell::new(0, 0, 0), [3, 4, 2], 24).unwrap(),
+                solid: vec![false; 24],
+            },
+            super::super::MacConfig {
+                cell_size_m: 1.0,
+                reconstructed_surface_support: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        original.set_freely_displaced_air().unwrap();
+        for z in 0..2 {
+            for x in 0..3 {
+                original
+                    .set_fraction(GlobalCell::new(x, 0, z), 0.99)
+                    .unwrap();
+                original
+                    .set_fraction(GlobalCell::new(x, 1, z), 0.25)
+                    .unwrap();
+            }
+        }
+        let mut traced = original.clone();
+        traced.config.pressure_diagnostics = true;
+        for step in 0..600 {
+            let a = original.step(0.05).unwrap();
+            let b = traced.step(0.05).unwrap();
+            assert_eq!(
+                a.divergence_after_max_s.to_bits(),
+                b.divergence_after_max_s.to_bits(),
+                "step={step}"
+            );
+            assert_eq!(a.pressure_iterations, b.pressure_iterations, "step={step}");
+            assert_eq!(original.fraction, traced.fraction, "step={step}");
+            assert_eq!(original.pressure_pa, traced.pressure_pa, "step={step}");
+            assert_eq!(original.u, traced.u, "step={step}");
+            assert_eq!(original.v, traced.v, "step={step}");
+            assert_eq!(original.w, traced.w, "step={step}");
+            assert_eq!(
+                original.cut_surface_flux, traced.cut_surface_flux,
+                "step={step}"
+            );
+            assert_eq!(
+                original.cut_surface_velocity, traced.cut_surface_velocity,
+                "step={step}"
+            );
         }
     }
     #[test]

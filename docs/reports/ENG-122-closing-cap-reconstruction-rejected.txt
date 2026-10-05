@@ -1,0 +1,20 @@
+   Compiling spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `release` profile [optimized + debuginfo] target(s) in 4.99s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\release\deps\spall_fluid-b49d3fbffb0ad4ba.exe)
+
+running 1 test
+closing cap row=14 c=9.99999999999998113e-1 area=3.58094602548396040e-7 cartesian=8.73688225716193201e-11 continuity=-2.43982517328815456e-4 pressure=-2.43871708458530634e-4 phi=4.47498409878013899e3 inv=5.26095638254283182e-1 residual=1.26343453644447764e-8
+
+thread 'grid_mac::tests::cut_surface_closes_a_buried_air_gap_without_losing_water_or_creating_energy' (39248) panicked at crates\spall_fluid\src\grid_mac.rs:6048:29:
+called `Result::unwrap()` on an `Err` value: MomentumPressureNotConverged { residual: 1.2634345364444776e-8 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test grid_mac::tests::cut_surface_closes_a_buried_air_gap_without_losing_water_or_creating_energy ... FAILED
+
+failures:
+
+failures:
+    grid_mac::tests::cut_surface_closes_a_buried_air_gap_without_losing_water_or_creating_energy
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p spall_fluid --lib`
