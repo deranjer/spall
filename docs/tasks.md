@@ -1477,3 +1477,12 @@ ENG-122 manual acceptance (2026-10-05): user satisfied with current gameplay wat
 look/feel/appearance after dry-room false underwater tint fix; requests PR.
 Original coarse-wall/capacity/recovery and experimental precision gates remain
 unfinished; gameplay feedback does not accept them. Ticket split decision pending.
+
+ENG-122 closeout (2026-10-05): user explicitly approves closing accepted gameplay
+water policy/look/feel/canal-room inspection and moving original unfinished gates
+to backlog ENG-123 (exact capacity/thin walls/coupled geometry), ENG-124 (edit/growth
+remapping/displacement/trapped ledgers/component recovery; depends ENG-123), ENG-125
+(stored-transfer precision/momentum/full scratch/sustained gates; promotion also
+depends ENG-123/124). PR187 open; not merged. Experimental support remains opt-in.
+Original failures are not passes. User-selected freely displaced air supersedes
+gas compression. Next unblocked research ENG-123 when requested.

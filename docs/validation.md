@@ -1,5 +1,10 @@
 # Validation and operating contract
 
+ENG-122 closeout (2026-10-05): user accepts current gameplay appearance/feel and
+explicitly approved moving unfinished exact-geometry/recovery/precision gates to
+ENG-123/124/125. PR187 is open. Historical measurements/failures below retain
+their original meaning; experimental reconstructed support remains opt-in.
+
 ## Generated-world water default
 
 The latest paced trench check passes flow at 512 but **fails at 1024**: the
