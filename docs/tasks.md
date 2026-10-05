@@ -1330,3 +1330,19 @@ and 6 shallow tests pass; full checks and evidence in docs/reports/ENG-122.md.
 Keep ENG-122 diagnostic/in_progress. Next: boundary momentum/pressure-work and
 interface-motion accuracy, 1024 delivery comparison, complete scratch peak and
 sustained/game-window gates before promotion; exact capacity/recovery remain.
+
+ENG-122 wet-donor pressure-work checkpoint (2026-10-04): supersedes the prior
+blanket zero contact with an actual neighboring-water per-patch inflow bound;
+aggregate paired transport bounds remain authoritative. Uniform interior
+partial-water translation now retains local momentum/energy and zero pressure
+work in both directions (parent loses 13.20% x momentum). Both unchanged fresh
+512/1024 trenches pass final 50 ms advance with zero stability skips; delivery
+42.11817/4.97810 m3, ratios 0.8791/0.8753, medians 31.370/33.750 ms. All positive
+fractions and original budgets/default/owner/save/wire contracts remain.
+Signed-interface/phase-flux separation trial fails sealed crop 9/8 substeps and
+is dropped. Local moving-tiny-volume accuracy is not accepted: channel's
+normalized divergence reaches 1.38816e237 /s despite bounded speed/accounting.
+97 release fluid/6 shallow checks and replay/reference gates pass. See
+reports/ENG-122.md for exact commands, full-check status, risks and provenance.
+Next unblocked task remains ENG-122 interface/phase-transfer accuracy, complete
+scratch peak and sustained/game-window gates; exact capacity/recovery remain.

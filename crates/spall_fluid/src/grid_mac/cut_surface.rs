@@ -823,19 +823,19 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             };
             let q = f.area * corrected_free(f, &phi, &inverse_root);
             let capacity = (1.0 - grid.fraction[air]) * h / dt;
-            let constraint = if f.axis.is_some() && cells[f.row].cap.area > 0.0 && q < 0.0 {
-                // In cut rows, exposed Cartesian patches have air upstream:
-                // pressure cannot source a liquid transfer from that dry patch.
-                // Wet overlap edges still permit signed liquid inflow, while
-                // the embedded cap retains signed interface displacement.
-                // Full rows have no cap: their atmospheric boundary must
-                // retain signed retreat, not become a hidden solid wall.
-                Some(0.0)
-            } else if q > capacity {
-                Some(capacity)
-            } else {
-                None
-            };
+            let donor_capacity = grid.fraction[air] * (h / dt);
+            let constraint =
+                if f.axis.is_some() && cells[f.row].cap.area > 0.0 && q < -donor_capacity {
+                    // Bound this cut-patch inflow by the upstream cell's water.
+                    // Paired transport still enforces the aggregate donor bound.
+                    // Empty donors supply zero; every positive amount participates.
+                    // Signed cap displacement and full-row retreat remain free.
+                    Some(-donor_capacity)
+                } else if q > capacity {
+                    Some(capacity)
+                } else {
+                    None
+                };
             if held[j] != constraint {
                 held[j] = constraint;
                 changed = true;
@@ -1014,6 +1014,77 @@ pub(super) fn transport_velocity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wet_donors_preserve_local_uniform_momentum_and_zero_pressure_work() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        for direction in [-1.0, 1.0] {
+            let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [48, 4, 3], 576).unwrap();
+            let mut grid = MacGridWorld::new(
+                &SolidBoundary {
+                    spec,
+                    solid: vec![false; 576],
+                },
+                super::super::MacConfig {
+                    cell_size_m: 1.0,
+                    gravity_m_s2: [0.0; 3],
+                    reconstructed_surface_support: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            grid.set_freely_displaced_air().unwrap();
+            for x in 0..48 {
+                grid.set_fraction(GlobalCell::new(x, 1, 1), if x == 24 { 0.75 } else { 0.25 })
+                    .unwrap();
+            }
+            grid.u.fill(direction);
+            grid.enforce_wall_velocities();
+            let fractions = grid.fraction.clone();
+            let measure = |g: &MacGridWorld| {
+                let mut momentum = [0.0; 3];
+                let mut energy = 0.0;
+                let mut mass = 0.0;
+                for x in 20..29 {
+                    let m = g.fraction[g.cell_index(x, 1, 1)]
+                        * g.config.density_kg_m3
+                        * g.cell_volume();
+                    mass += m;
+                    for (axis, faces) in [
+                        [g.u[g.u_index(x, 1, 1)], g.u[g.u_index(x + 1, 1, 1)]],
+                        [g.v[g.v_index(x, 1, 1)], g.v[g.v_index(x, 2, 1)]],
+                        [g.w[g.w_index(x, 1, 1)], g.w[g.w_index(x, 1, 2)]],
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        momentum[axis] += 0.5 * m * (faces[0] + faces[1]);
+                        energy += 0.25 * m * (faces[0].powi(2) + faces[1].powi(2));
+                    }
+                }
+                (momentum, energy, mass)
+            };
+            let (before_momentum, before_energy, mass) = measure(&grid);
+            assert!(grid.project(0.01).unwrap().converged);
+            assert_eq!(grid.fraction, fractions);
+            let (after_momentum, after_energy, _) = measure(&grid);
+            for (axis, (before, after)) in before_momentum.iter().zip(after_momentum).enumerate() {
+                assert!(
+                    (after - before).abs() < mass * 1e-8,
+                    "direction={direction}, axis={axis}, before={before_momentum:?}, after={after_momentum:?}"
+                );
+            }
+            assert!(
+                (after_energy - before_energy).abs() < before_energy * 1e-8,
+                "direction={direction}, before={before_energy}, after={after_energy}"
+            );
+            for x in 20..29 {
+                assert!((grid.u[grid.u_index(x, 1, 1)] - direction).abs() < 1e-8);
+                assert!(grid.pressure_pa[grid.cell_index(x, 1, 1)].abs() < 1e-5);
+            }
+        }
+    }
+
     #[test]
     fn full_cell_free_boundary_retreat_keeps_uniform_translation() {
         use crate::{DomainSpec, SolidBoundary};
