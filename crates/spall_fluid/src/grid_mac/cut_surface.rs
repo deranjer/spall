@@ -823,7 +823,19 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             };
             let q = f.area * corrected_free(f, &phi, &inverse_root);
             let capacity = (1.0 - grid.fraction[air]) * h / dt;
-            let constraint = if q > capacity { Some(capacity) } else { None };
+            let constraint = if f.axis.is_some() && cells[f.row].cap.area > 0.0 && q < 0.0 {
+                // In cut rows, exposed Cartesian patches have air upstream:
+                // pressure cannot source a liquid transfer from that dry patch.
+                // Wet overlap edges still permit signed liquid inflow, while
+                // the embedded cap retains signed interface displacement.
+                // Full rows have no cap: their atmospheric boundary must
+                // retain signed retreat, not become a hidden solid wall.
+                Some(0.0)
+            } else if q > capacity {
+                Some(capacity)
+            } else {
+                None
+            };
             if held[j] != constraint {
                 held[j] = constraint;
                 changed = true;
@@ -1002,6 +1014,91 @@ pub(super) fn transport_velocity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_cell_free_boundary_retreat_keeps_uniform_translation() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [6, 4, 3], 72).unwrap();
+        let mut grid = MacGridWorld::new(
+            &SolidBoundary {
+                spec,
+                solid: vec![false; 72],
+            },
+            super::super::MacConfig {
+                cell_size_m: 1.0,
+                gravity_m_s2: [0.0; 3],
+                reconstructed_surface_support: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        grid.set_freely_displaced_air().unwrap();
+        let wet = GlobalCell::new(2, 1, 1);
+        let receiver = GlobalCell::new(3, 1, 1);
+        grid.set_fraction(wet, 1.0).unwrap();
+        grid.u.fill(1.0);
+        grid.enforce_wall_velocities();
+        grid.project(0.01).unwrap();
+        // A full row has no embedded cap. Its Cartesian atmospheric boundary
+        // must remain free to retreat, rather than becoming a hidden wall.
+        assert_eq!(grid.u[grid.u_index(2, 1, 1)], 1.0);
+        assert_eq!(grid.u[grid.u_index(3, 1, 1)], 1.0);
+        grid.advect_fraction_fct(0.01, None).unwrap();
+        assert!((grid.fraction[grid.cell_index_global(wet).unwrap()] - 0.99).abs() < 1e-14);
+        assert!((grid.fraction[grid.cell_index_global(receiver).unwrap()] - 0.01).abs() < 1e-14);
+        assert_eq!(grid.water_volume_m3(), 1.0);
+    }
+
+    #[test]
+    fn exposed_air_patch_cannot_supply_water_to_a_moving_fragment() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        for fraction in [0.25, 1e-7, 1e-40, 1e-300] {
+            for direction in [-1.0, 1.0] {
+                let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [6, 4, 3], 72).unwrap();
+                let mut grid = MacGridWorld::new(
+                    &SolidBoundary {
+                        spec,
+                        solid: vec![false; 72],
+                    },
+                    super::super::MacConfig {
+                        cell_size_m: 1.0,
+                        gravity_m_s2: [0.0; 3],
+                        reconstructed_surface_support: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                grid.set_freely_displaced_air().unwrap();
+                let wet = GlobalCell::new(2, 1, 1);
+                let receiver = GlobalCell::new(if direction > 0.0 { 3 } else { 1 }, 1, 1);
+                grid.set_fraction(wet, fraction).unwrap();
+                grid.u.fill(direction);
+                grid.enforce_wall_velocities();
+                let before = grid.water_volume_m3();
+                let projection = grid.project(0.01).unwrap();
+                assert!(projection.converged);
+                let inward = grid.u_index(if direction > 0.0 { 2 } else { 3 }, 1, 1);
+                let outward = grid.u_index(if direction > 0.0 { 3 } else { 2 }, 1, 1);
+                // Inward transfer has no water donor; outward motion and signed
+                // embedded-interface displacement must remain available.
+                assert_eq!(grid.u[inward], 0.0, "C={fraction}, direction={direction}");
+                assert!(
+                    grid.u[outward] * direction > 0.0,
+                    "C={fraction}, direction={direction}"
+                );
+                assert_eq!(
+                    grid.fraction[grid.cell_index_global(wet).unwrap()].to_bits(),
+                    fraction.to_bits()
+                );
+                let (exterior, _, _, _) = grid.advect_fraction_fct(0.01, None).unwrap();
+                assert_eq!(exterior, 0.0);
+                assert!((grid.water_volume_m3() - before).abs() <= before * 1e-12);
+                assert!(grid.fraction[grid.cell_index_global(receiver).unwrap()] > 0.0);
+            }
+        }
+    }
+
     #[test]
     fn disconnected_closed_gauges_preserve_open_pressure_and_row_differences() {
         let labels = [0, 1, 0, 3, 1, 3, 6];

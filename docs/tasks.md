@@ -1314,3 +1314,19 @@ CI now checks accounted exterior water plus a separate sealed 100-step variant.
 Next: consistent Cartesian patch pressure/face momentum in vanishing fragments;
 original fresh gates, local momentum accuracy and full scratch peak remain open.
 See docs/reports/ENG-122.md for provenance and measured results.
+
+ENG-122 donor-consistent cut-row boundary checkpoint (2026-10-04): exposed
+Cartesian patches of partial rows cannot donate nonexistent upstream liquid;
+zero transfer is enforced inside the existing pressure contact solve. Wet
+edges and embedded cap displacement retain their signs; full-row atmospheric
+boundary retreat remains free and has an explicit uniform-translation invariant.
+All positive fractions, numerical budgets, canonical amounts and owner/default
+contracts remain. Both original fresh 512/1024 trenches pass final advance and
+flow with no stability skips, ratios 0.8768/0.8661 and medians 33.176/34.926 ms.
+Water delivered beyond the 1024 old edge falls to 1.83481 m3; motion thresholds
+pass, local pressure/momentum/interface accuracy remains unaccepted. A removed
+Cartesian inertia-floor trial was rejected and fully dropped. 96 release fluid
+and 6 shallow tests pass; full checks and evidence in docs/reports/ENG-122.md.
+Keep ENG-122 diagnostic/in_progress. Next: boundary momentum/pressure-work and
+interface-motion accuracy, 1024 delivery comparison, complete scratch peak and
+sustained/game-window gates before promotion; exact capacity/recovery remain.
