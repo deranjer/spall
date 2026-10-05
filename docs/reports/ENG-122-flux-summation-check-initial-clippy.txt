@@ -1,0 +1,37 @@
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.44
+   Compiling rustls-webpki v0.103.15
+   Compiling rcgen v0.13.2
+   Compiling quinn-proto v0.11.17 (https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f2)
+   Compiling quinn v0.11.11
+   Compiling spall_net v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_net)
+   Compiling xtask v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\tools\xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.72s
+     Running `G:/Programming/voxel_engine/target\debug\xtask.exe check`
+    Checking spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+error: usage of `bool::then` in `filter_map`
+    --> crates\spall_fluid\src\grid_mac\cut_surface.rs:1019:52
+     |
+1019 |                       .chain(free.iter().enumerate().filter_map(|(j, patch)| {
+     |  ____________________________________________________^
+1020 | |                         (patch.row == f.row && patch.axis.is_some()).then(|| {
+1021 | |                             patch.area
+1022 | |                                 * held[j].map_or_else(|| free_velocity[j], |q| q / patch.area)
+1023 | |                         })
+1024 | |                     })),
+     | |______________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#filter_map_bool_then
+     = note: `-D clippy::filter-map-bool-then` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::filter_map_bool_then)]`
+help: use `filter` then `map` instead
+     |
+1019 ~                     .chain(free.iter().enumerate().filter(|&(j, patch)| (patch.row == f.row && patch.axis.is_some())).map(|(j, patch)| patch.area
+1020 ~                                 * held[j].map_or_else(|| free_velocity[j], |q| q / patch.area))),
+     |
+
+error: could not compile `spall_fluid` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `spall_fluid` (lib test) due to 1 previous error
+xtask: cargo subcommand ["clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"] failed with 101
+error: process didn't exit successfully: `G:/Programming/voxel_engine/target\debug\xtask.exe check` (exit code: 1)

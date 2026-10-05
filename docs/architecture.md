@@ -583,3 +583,26 @@ full-check result and evidence in reports/ENG-122.md. Next unblocked ENG-122:
 shared accurate pressure-correction/flux and accepted-momentum consistency for
 closing caps, then scratch and sustained windowed gates; exact capacity/thin
 walls/displacement/recovery remain. Keep experimental and in_progress.
+
+ENG-122 face-summation checkpoint (2026-10-05): optional cap audit separates
+compensated Cartesian-flux summation loss from remaining pressure/normal error,
+using the same rounded installed patch products on the originally selected
+worst cap. No solver/default/amount/owner/save/wire changes or new retained
+arrays. Analytic cancellation test and existing 600-step exact trace-state
+noninterference test cover the diagnostic. Channel600/600 and exact512
+precursor1000/1000 pass. All599 selected channel caps still exceed1e-8 after
+compensation; worst ordinary0.04760348394m/s changes only2.0628964e-7m/s,
+leaving0.04760369023m/s. Thus summation alone is insufficient. Shared split
+pressure/compensated geometric-flux/stricter cap-response trial was rejected:
+channel600 and release102 pass, but unchanged512 precursor accepts78/1000,
+then exhausts400 iterations with global residual5.9167570e-15 and cap-response
+defect-2.1260983e15m/s at C=1.0245860e-140. This is a convergence defect, not
+an accepted installed speed. Trial/debug prints removed. No amount filtering,
+extra budgets, velocity clipping or accuracy exemptions. Fresh paced trenches
+are prior checkpoint evidence; no rerun/windowed/physical acceptance claimed.
+Full xtask check passes:1218/0/63 across137 suites, including strict Clippy;
+release fluid103 and shallow6 pass. Exact commands: reports/ENG-122.md. Next unblocked
+ENG-122: shared local pressure/flux agreement for nearly closed caps and tiny
+moving fragments within original budgets; then accepted momentum, scratch,
+sustained windowed gates. Capacity/thin-wall/displacement/recovery remain open.
+Keep reconstructed support experimental and ENG-122 in progress.

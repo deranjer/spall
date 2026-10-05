@@ -253,6 +253,23 @@ impl Gauge {
     }
 }
 
+// Diagnostic only: retain the low part of cancellation between installed
+// Cartesian patch fluxes. This does not alter pressure or accepted transport.
+fn audited_flux_sum(values: impl Iterator<Item = f64>) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut correction = 0.0;
+    for value in values {
+        let next = sum + value;
+        correction += if sum.abs() >= value.abs() {
+            (sum - next) + value
+        } else {
+            (value - next) + sum
+        };
+        sum = next;
+    }
+    sum + correction
+}
+
 // Retain product and subtraction roundoff until the final pressure jump.
 // Adding large affine potentials before subtracting neighboring pressures can
 // otherwise erase the small impulse that closes a reconstructed interface.
@@ -988,8 +1005,30 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             .max_by(|a, b| a.3.total_cmp(&b.3));
         if let Some((f, continuity, pressure, error)) = worst {
             let cell = grid.spec.cell_at(indices[f.row]);
+            // Re-evaluate only the audited row, from the same rounded patch
+            // products used for installation. This isolates summation loss;
+            // it cannot recover pressure/velocity/product roundoff.
+            let compensated = audited_flux_sum(
+                edges
+                    .iter()
+                    .filter(|e| e.a == f.row || e.b == f.row)
+                    .map(|e| {
+                        let q = e.area * edge_velocity(e, &phi, &inverse_root, &base, dt / rho / h);
+                        if e.a == f.row { q } else { -q }
+                    })
+                    .chain(
+                        free.iter()
+                            .enumerate()
+                            .filter(|(_, patch)| patch.row == f.row && patch.axis.is_some())
+                            .map(|(j, patch)| {
+                                patch.area
+                                    * held[j].map_or_else(|| free_velocity[j], |q| q / patch.area)
+                            }),
+                    ),
+            );
+            let compensated_normal = -compensated / f.area;
             eprintln!(
-                "{{\"type\":\"cut_cap_continuity_audit\",\"cell\":[{},{},{}],\"fraction\":{:.17e},\"dt_s\":{:.17e},\"cap_area_cells2\":{:.17e},\"cartesian_outflow_m3_s\":{:.17e},\"continuity_normal_m_s\":{:.17e},\"pressure_normal_m_s\":{:.17e},\"normal_error_m_s\":{:.17e},\"pressure_response_accuracy_m_s\":1e-8,\"within_pressure_response_accuracy\":{},\"projection_residual\":{:.17e},\"residual_evaluation\":\"projected_faces_with_equilibrated_caps\",\"pressure_iterations\":{},\"free_caps\":{},\"contact_caps\":{},\"before_accepted_transport\":true}}",
+                "{{\"type\":\"cut_cap_continuity_audit\",\"cell\":[{},{},{}],\"fraction\":{:.17e},\"dt_s\":{:.17e},\"cap_area_cells2\":{:.17e},\"cartesian_outflow_m3_s\":{:.17e},\"continuity_normal_m_s\":{:.17e},\"pressure_normal_m_s\":{:.17e},\"normal_error_m_s\":{:.17e},\"compensated_cartesian_outflow_m3_s\":{:.17e},\"compensated_continuity_normal_m_s\":{:.17e},\"summation_normal_difference_m_s\":{:.17e},\"compensated_pressure_normal_error_m_s\":{:.17e},\"pressure_response_accuracy_m_s\":1e-8,\"within_pressure_response_accuracy\":{},\"projection_residual\":{:.17e},\"residual_evaluation\":\"projected_faces_with_equilibrated_caps\",\"pressure_iterations\":{},\"free_caps\":{},\"contact_caps\":{},\"before_accepted_transport\":true}}",
                 cell.x,
                 cell.y,
                 cell.z,
@@ -1000,6 +1039,10 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 continuity,
                 pressure,
                 error,
+                compensated * h * h,
+                compensated_normal,
+                (continuity - compensated_normal).abs(),
+                (compensated_normal - pressure).abs(),
                 error <= 1e-8,
                 final_residual,
                 total_iterations,
@@ -1181,6 +1224,23 @@ pub(super) fn transport_velocity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cap_flux_audit_preserves_a_small_unbalanced_transfer() {
+        // Exactly represented opposing patch flows hide a real 1-unit transfer
+        // in ordinary left-to-right summation. A tiny cap amplifies that loss.
+        let large = 2.0_f64.powi(54);
+        for values in [
+            [large, 1.0, -large],
+            [-large, 1.0, large],
+            [1.0, large, -large],
+        ] {
+            let flux = audited_flux_sum(values.into_iter());
+            assert_eq!(flux, 1.0);
+            assert_eq!(-flux / 2.0_f64.powi(-40), -2.0_f64.powi(40));
+        }
+        assert_eq!(audited_flux_sum([large, -large].into_iter()), 0.0);
+    }
+
     #[test]
     fn affine_pressure_impulse_preserves_small_force_and_exact_rest() {
         // (2^27 + 1)(2^27 - 1) = 2^54 - 1, whereas the other
