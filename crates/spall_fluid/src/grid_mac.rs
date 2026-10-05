@@ -4052,6 +4052,49 @@ impl GridReservoirFixture {
         Self::configured(scale, open_top, false, 1)
     }
 
+    /// Original quarter-metre reservoirs above a dry, sealed room. Extending
+    /// the domain below zero preserves every original canal/dam edit coordinate.
+    pub fn new_room_below_canal() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut fixture = Self::new(1, true)?;
+        fixture.volume.insert_brick(
+            spall_core::BrickCoord::new(0, -1, 0),
+            spall_voxel::Brick::uniform(spall_core::MaterialId::AIR, spall_core::Revision(1)),
+        )?;
+        let mut edit = spall_voxel::EditPlan::new(fixture.volume.id());
+        for y in -8..0 {
+            for z in 0..8 {
+                for x in 0..24 {
+                    if y == -8 || x == 0 || x == 23 || z == 0 || z == 7 {
+                        edit.set(GlobalCell::new(x, y, z), spall_core::MaterialId(1));
+                    }
+                }
+            }
+        }
+        fixture.volume.apply_edit(&edit)?;
+        let spec = DomainSpec::new(GlobalCell::new(0, -8, 0), [24, 20, 8], 24 * 20 * 8)?;
+        let boundary = SolidBoundary::capture(&fixture.volume, spec)?;
+        let mut grid = MacGridWorld::new(&boundary, fixture.grid.config())?;
+        for z in 0..8 {
+            for y in 0..12 {
+                for x in 0..24 {
+                    let cell = GlobalCell::new(x, y, z);
+                    grid.set_fraction(cell, fixture.grid.fraction_at(cell).unwrap())?;
+                }
+            }
+        }
+        fixture.upper_pool_region = vec![false; spec.cell_count()];
+        fixture.grid = grid;
+        Ok(fixture)
+    }
+
+    /// Deliberate control opening for the room leakage viewer; unlike the
+    /// cutaway this removes a real floor voxel and must admit water below.
+    pub fn open_floor_probe(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut edit = spall_voxel::EditPlan::new(self.volume.id());
+        edit.set(GlobalCell::new(6, 0, 3), spall_core::MaterialId::AIR);
+        self.apply_staged_edit(&edit)
+    }
+
     pub fn new_tunnel(scale: u32) -> Result<Self, Box<dyn std::error::Error>> {
         Self::configured(scale, false, true, 1)
     }

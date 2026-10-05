@@ -1,0 +1,16 @@
+    Checking spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+   Compiling ring v0.17.14
+    Checking spall_render v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_render)
+   Compiling rustls v0.23.44
+    Checking spall_sim v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_sim)
+    Checking spall_editor v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\tools\spall_editor)
+    Checking rustls-webpki v0.103.15
+    Checking rcgen v0.13.2
+    Checking quinn-proto v0.11.17 (https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f2)
+    Checking quinn v0.11.11
+    Checking spall_net v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_net)
+    Checking spall_client v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_client)
+    Checking spall_server v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_server)
+    Checking xtask v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\tools\xtask)
+    Checking sandbox v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\examples\sandbox)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.08s

@@ -48,6 +48,36 @@ remain recorded. The fine-phase
 comparison and conservative momentum remain experimental options in the local
 demo. Details and replacement criteria: `docs/reports/ENG-122.md`.
 
+## Gameplay-water canal viewer (2026-10-05)
+
+The existing `--grid-fluid-demo` now uses the gameplay water policy: original
+velocity sampling, multigrid pressure, conservative water transport and freely
+displaced air. It draws the shared smoothed water surface and underwater look
+from presentation-only byte fractions. The quarter-metre fixtures and their
+edit/displacement rules remain unchanged; this local viewer is separate from
+the authoritative game and does not enable experimental reconstructed support.
+
+Launch: `cargo run -p sandbox --features client --bin sandbox-client --release -- --grid-fluid-demo`.
+1 selects closed reservoirs; C opens the canal; X closes it before breach;
+B breaches the dam; R resets; Space pauses; 2/3 select canal/breach scenes;
+4/5/6 select spreading basin/tunnel/resting basin. WASD/QE fly, click captures
+mouse look, Escape releases it, and F12 saves `.local/screenshots/canal-water.png`.
+Closing an occupied gate may reject placement, preserving water and geometry.
+Reset preserves camera and restores initial water and gate state.
+
+Bounded GPU check: `sandbox-client.exe --grid-fluid-demo --frames 60 --grid-fluid-demo-capture .local/screenshots/eng122-canal-gameplay-water.png`.
+CPU checks cover all six scenes for 600 steps, volume plus outflow accounting,
+open/close/breach/reset/pause, and rendering noninterference. No generated-world
+performance or full ENG-122 geometry acceptance is claimed from these fixtures.
+
+Room variant: add `--grid-fluid-demo-room` or press7. The lower room has a
+solid0.25m ceiling and a presentation-only front-wall cutaway; the HUD reports
+water below the floor. H opens a real floor tile as a positive control; R restores
+it. CPU evidence:600 steps intact0m3;600 steps after opening1.200796876m3.
+The shared renderer now honors wet-column bottoms so dry rooms below pools do
+not receive false underwater tint. This resolved fixture does not validate
+coarse large-world thin floors. Final checks/captures: reports/ENG-122.md.
+
 ## ENG-122 windowed water comparison
 
 Run from the ENG-122 checkout:

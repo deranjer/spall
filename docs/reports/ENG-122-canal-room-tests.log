@@ -1,0 +1,11 @@
+   Compiling spall_client v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_client)
+    Finished `release` profile [optimized + debuginfo] target(s) in 7.27s
+     Running unittests src\lib.rs (G:/Programming/voxel_engine/target\release\deps\spall_client-8c5eb16ace1f5ca3.exe)
+
+running 3 tests
+test grid_fluid_demo::tests::canal_water_rendering_does_not_change_solver_and_reset_restores_water ... ok
+{"cell_size_m":0.25,"hole_room_water_m3":1.2007968764536086,"hole_steps":600,"intact_room_water_m3":0.0,"intact_steps":600,"scenario":"canal_room_floor"}
+test grid_fluid_demo::tests::room_stays_dry_below_intact_floor_and_floods_through_real_hole ... ok
+test grid_fluid_demo::tests::all_canal_scenes_step_with_gameplay_water_policy ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 83 filtered out; finished in 2.47s

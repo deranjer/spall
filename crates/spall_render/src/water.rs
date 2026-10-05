@@ -21,6 +21,8 @@ pub struct WaterField {
     pub dim: u32,
     /// `dim * dim` heights, X fastest.
     pub heights: Vec<f32>,
+    /// Bottom of the selected wet run, X fastest; dry cells use NO_WATER.
+    pub bottoms: Vec<f32>,
 }
 
 impl WaterField {
@@ -32,6 +34,7 @@ impl WaterField {
             cell_m,
             dim,
             heights: vec![NO_WATER; dim as usize * dim as usize],
+            bottoms: vec![NO_WATER; dim as usize * dim as usize],
         }
     }
 
@@ -64,8 +67,10 @@ impl WaterField {
 
     /// The surface height at `(x, z)` if `point` is below it (in the water).
     pub fn submerged_surface(&self, point: [f32; 3]) -> Option<f32> {
+        let (ix, iz) = self.cell_of(point[0], point[2])?;
+        let bottom = self.bottoms[self.index(ix, iz)?];
         self.surface_at(point[0], point[2])
-            .filter(|&surface| point[1] < surface)
+            .filter(|&surface| point[1] >= bottom && point[1] < surface)
     }
 }
 
@@ -90,7 +95,11 @@ impl WaterField {
         let dim = i64::from(self.dim);
         for iz in iz0.max(0)..=iz1.min(dim - 1) {
             for ix in ix0.max(0)..=ix1.min(dim - 1) {
-                self.raise(ix, iz, column.top);
+                let i = self.index(ix, iz).expect("clipped field cell");
+                if column.top >= self.heights[i] {
+                    self.heights[i] = column.top;
+                    self.bottoms[i] = column.bottom;
+                }
             }
         }
     }
@@ -406,6 +415,40 @@ mod tests {
         assert_eq!(field.surface_at(1.1, 1.9), Some(3.0));
         assert_eq!(field.surface_at(0.9, 1.5), None);
         assert_eq!(field.surface_at(2.1, 1.5), None);
+    }
+
+    #[test]
+    fn room_below_a_water_column_is_not_submerged() {
+        let mut field = WaterField::new([0.0, 0.0], 0.25, 4);
+        field.raise_column(
+            &WaterColumn {
+                ix: 0,
+                iz: 0,
+                bottom: 0.25,
+                top: 1.0,
+            },
+            [0.0, 0.0],
+            0.25,
+        );
+        assert_eq!(field.submerged_surface([0.125, -1.0, 0.125]), None);
+        assert_eq!(field.submerged_surface([0.125, 0.24, 0.125]), None);
+        assert_eq!(field.submerged_surface([0.125, 0.25, 0.125]), Some(1.0));
+        assert_eq!(field.submerged_surface([0.125, 0.9, 0.125]), Some(1.0));
+        field.raise_column(
+            &WaterColumn {
+                ix: 0,
+                iz: 0,
+                bottom: -1.75,
+                top: -1.0,
+            },
+            [0.0, 0.0],
+            0.25,
+        );
+        assert_eq!(
+            field.submerged_surface([0.125, -1.5, 0.125]),
+            None,
+            "lower run must not replace the selected upper run"
+        );
     }
 
     #[test]

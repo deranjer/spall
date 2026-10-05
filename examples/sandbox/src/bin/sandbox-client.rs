@@ -30,10 +30,16 @@ struct Args {
     /// Save the comparison window through the real renderer.
     #[arg(long, requires = "phase_fluid_demo")]
     phase_fluid_demo_capture: Option<PathBuf>,
-    /// Open the local interactive MAC water inspection viewer. This private
-    /// debug simulation is separate from the authoritative game tick.
+    /// Open the canal/dam viewer with gameplay water policy and appearance.
+    /// This local simulation is separate from the authoritative game tick.
     #[arg(long, conflicts_with_all = ["offline", "connect", "interactive"])]
     grid_fluid_demo: bool,
+    /// Capture the canal demo through the gameplay renderer.
+    #[arg(long, requires = "grid_fluid_demo")]
+    grid_fluid_demo_capture: Option<PathBuf>,
+    /// Start with the canal above a dry room and a visual wall cutaway.
+    #[arg(long, requires = "grid_fluid_demo")]
+    grid_fluid_demo_room: bool,
     /// Open the client-local interactive ecology growth showcase.
     #[arg(long, conflicts_with_all = ["offline", "connect", "interactive", "grid_fluid_demo"])]
     ecology_demo: bool,
@@ -361,7 +367,11 @@ fn main() -> ExitCode {
     }
 
     if args.grid_fluid_demo {
-        return match spall_client::run_grid_fluid_demo_window() {
+        return match spall_client::run_grid_fluid_demo_window(
+            args.frames,
+            args.grid_fluid_demo_capture,
+            args.grid_fluid_demo_room,
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error @ spall_client::ClientError::Gpu(_)) => {
                 eprintln!("sandbox-client: {error}");

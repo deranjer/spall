@@ -1,8 +1,8 @@
-//! Local viewer for the ENG-103 MAC fixtures.
+//! Local canal viewer using the gameplay water policy and renderer.
 //!
 //! This owns a private copy of the CPU grid and never advances the game/server
-//! simulation. Water cubes show stored VOF cell fractions, not reconstructed
-//! free-surface geometry.
+//! simulation. Presentation snapshots feed the shared smoothed water surface;
+//! their byte fractions never feed back into the full-precision solver.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -29,12 +29,21 @@ const CAMERA_SPEED_M_S: f32 = 3.5;
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 const MATERIAL_STONE: u32 = 0;
 const MATERIAL_DAM: u32 = 1;
-const MATERIAL_WATER: u32 = 2;
 
 /// Opens an isolated interactive window for the bounded MAC fixtures.
-pub fn run_grid_fluid_demo_window() -> Result<(), ClientError> {
+pub fn run_grid_fluid_demo_window(
+    max_frames: Option<u64>,
+    capture: Option<std::path::PathBuf>,
+    room_below: bool,
+) -> Result<(), ClientError> {
     let event_loop = EventLoop::new()?;
-    let mut app = GridFluidDemoApp::new(Scene::Reservoirs)?;
+    let mut app = GridFluidDemoApp::new(if room_below {
+        Scene::RoomBelow
+    } else {
+        Scene::Reservoirs
+    })?;
+    app.max_frames = max_frames;
+    app.capture = capture;
     event_loop.run_app(&mut app)?;
     app.result
 }
@@ -42,6 +51,7 @@ pub fn run_grid_fluid_demo_window() -> Result<(), ClientError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scene {
     Reservoirs,
+    RoomBelow,
     Canal,
     Breach,
     Basin,
@@ -53,6 +63,7 @@ impl Scene {
     fn label(self) -> &'static str {
         match self {
             Self::Reservoirs => "Two reservoirs",
+            Self::RoomBelow => "Canal above dry room (front wall cutaway)",
             Self::Canal => "Open canal",
             Self::Breach => "Dam breach",
             Self::Basin => "Spreading basin",
@@ -69,6 +80,7 @@ impl Scene {
             KeyCode::Digit4 => Some(Self::Basin),
             KeyCode::Digit5 => Some(Self::Tunnel),
             KeyCode::Digit6 => Some(Self::Equilibrium),
+            KeyCode::Digit7 => Some(Self::RoomBelow),
             _ => None,
         }
     }
@@ -93,15 +105,23 @@ struct GridFluidDemoApp {
     title_update: Instant,
     result: Result<(), ClientError>,
     message: String,
+    max_frames: Option<u64>,
+    capture: Option<std::path::PathBuf>,
+    frames: u64,
 }
 
 impl GridFluidDemoApp {
     fn new(scene: Scene) -> Result<Self, ClientError> {
         let fixture = make_fixture(scene)?;
         let terrain = build_terrain(&fixture)?;
+        let eye = if scene == Scene::RoomBelow {
+            Vec3::new(8.0, 4.0, 6.0)
+        } else {
+            Vec3::new(6.0, 10.0, 4.0)
+        };
         let camera = Camera::looking_along(
-            Vec3::new(8.0, 5.5, 7.5),
-            Vec3::new(3.0, 0.8, 1.0) - Vec3::new(8.0, 5.5, 7.5),
+            eye,
+            Vec3::new(3.0, 0.0, 1.0) - eye,
             60.0_f32.to_radians(),
             16.0 / 9.0,
         );
@@ -124,6 +144,9 @@ impl GridFluidDemoApp {
             title_update: Instant::now(),
             result: Ok(()),
             message: scene.label().into(),
+            max_frames: None,
+            capture: None,
+            frames: 0,
         })
     }
 
@@ -154,6 +177,11 @@ impl GridFluidDemoApp {
                 fresh.window = self.window.clone();
                 fresh.renderer = self.renderer.take();
                 fresh.last_frame = Instant::now();
+                fresh.max_frames = self.max_frames;
+                fresh.capture = self.capture.clone();
+                fresh.frames = self.frames;
+                fresh.camera = self.camera;
+                fresh.cursor_locked = self.cursor_locked;
                 *self = fresh;
             }
             Err(error) => self.message = format!("Could not load {}: {error}", scene.label()),
@@ -196,7 +224,23 @@ impl GridFluidDemoApp {
                     Err(error) => self.message = format!("Canal closure rejected: {error}"),
                 }
             }
+            KeyCode::KeyH if self.scene == Scene::RoomBelow => {
+                match self.fixture.open_floor_probe() {
+                    Ok(()) => {
+                        self.message = "Floor hole opened deliberately".into();
+                        self.refresh_terrain();
+                    }
+                    Err(error) => self.message = format!("Floor opening rejected: {error}"),
+                }
+            }
             KeyCode::KeyR => self.set_scene(self.scene),
+            KeyCode::F12 => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.screenshot_request = Some(std::path::PathBuf::from(
+                        ".local/screenshots/canal-water.png",
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -277,15 +321,30 @@ impl GridFluidDemoApp {
             Err(error) => return self.fail(event_loop, error),
         };
         self.terrain_dirty = false;
-        renderer.set_debug_water(&water);
+        renderer.set_water_look(Some(water));
+        self.frames += 1;
+        if self.capture.is_some()
+            && self.frames == self.max_frames.map_or(20, |n| n.saturating_sub(10).max(1))
+        {
+            renderer.screenshot_request = self.capture.clone();
+        }
 
+        let room_status = if self.scene == Scene::RoomBelow {
+            format!(
+                " | room water {:.6} m3 | solid floor 0.25 m | front wall hidden for inspection",
+                room_water_volume(&self.fixture)
+            )
+        } else {
+            String::new()
+        };
         let status = format!(
-            "{} · t={:.2}s · {:.3} m³ retained · {:.3} m³ top outflow · {}",
+            "{} · t={:.2}s · {:.3} m³ retained · {:.3} m³ top outflow · {}{}",
             if self.paused { "PAUSED" } else { "LIVE" },
             self.simulated_time_s,
             self.fixture.grid().water_volume_m3(),
             self.fixture.grid().cumulative_open_outflow_m3(),
             self.message,
+            room_status,
         );
         if self.title_update.elapsed() >= Duration::from_millis(200) {
             if let Some(window) = &self.window {
@@ -299,13 +358,16 @@ impl GridFluidDemoApp {
             &[],
             &[],
             Some((
-                "ENG-103 TWO-PHASE WATER INSPECTION",
-                "1 reservoirs · 2 canal · 3 breach · 4 basin · 5 tunnel · 6 level basin · C open · B breach · X close · Space pause · R reset · WASD/QE move · mouse look",
+                "WATER CANAL - FREELY DISPLACED AIR",
+                "1 reservoirs · 2 canal · 3 breach · 4 basin · 5 tunnel · 6 level basin · 7 room below · H floor hole (room) · C open · B breach · X close · Space pause · R reset · F12 screenshot · WASD/QE move · mouse look",
                 &status,
             )),
             None,
         ) {
             self.fail(event_loop, error);
+        }
+        if self.max_frames.is_some_and(|n| self.frames >= n) {
+            event_loop.exit();
         }
     }
 }
@@ -328,7 +390,6 @@ impl ApplicationHandler for GridFluidDemoApp {
         let materials = [
             Material::new([0.29, 0.24, 0.17], 0.95, 0.0),
             Material::new([0.12, 0.075, 0.03], 0.9, 0.0),
-            Material::new([0.015, 0.22, 0.78], 0.18, 0.05).emissive(0.06),
         ];
         match WorldRenderer::new(
             window.clone(),
@@ -376,12 +437,15 @@ impl ApplicationHandler for GridFluidDemoApp {
                             | KeyCode::KeyB
                             | KeyCode::KeyX
                             | KeyCode::KeyR
+                            | KeyCode::F12
+                            | KeyCode::KeyH
                             | KeyCode::Digit1
                             | KeyCode::Digit2
                             | KeyCode::Digit3
                             | KeyCode::Digit4
                             | KeyCode::Digit5
-                            | KeyCode::Digit6 => self.action(key),
+                            | KeyCode::Digit6
+                            | KeyCode::Digit7 => self.action(key),
                             _ => {}
                         }
                     }
@@ -420,6 +484,8 @@ fn make_fixture(scene: Scene) -> Result<GridReservoirFixture, ClientError> {
     };
     let mut fixture = match scene {
         Scene::Reservoirs => make_base(),
+        Scene::RoomBelow => GridReservoirFixture::new_room_below_canal()
+            .map_err(|error| ClientError::Render(error.to_string())),
         Scene::Canal => {
             let mut fixture = make_base()?;
             fixture
@@ -443,7 +509,7 @@ fn make_fixture(scene: Scene) -> Result<GridReservoirFixture, ClientError> {
     }?;
     fixture
         .grid_mut()
-        .set_ambient_density(1.2)
+        .set_freely_displaced_air()
         .map_err(|error| ClientError::Render(error.to_string()))?;
     fixture
         .grid_mut()
@@ -466,10 +532,15 @@ fn build_terrain(fixture: &GridReservoirFixture) -> Result<Vec<CubeInstance>, Cl
                 if boundary.is_solid(cell) != Some(true) {
                     continue;
                 }
+                // The inspection cutaway hides the front wall only in drawing.
+                // The captured solver boundary still includes every wall voxel.
+                if cell.y < 0 && z == dz as i64 - 1 {
+                    continue;
+                }
                 instances.push(CubeInstance::new(
                     [
                         (x as f32 + 0.5) * h,
-                        (y as f32 + 0.5) * h,
+                        (cell.y as f32 + 0.5) * h,
                         (z as f32 + 0.5) * h,
                     ],
                     if x == 12 * i64::from(fixture.scale()) {
@@ -486,40 +557,147 @@ fn build_terrain(fixture: &GridReservoirFixture) -> Result<Vec<CubeInstance>, Cl
     Ok(instances)
 }
 
-fn build_water(fixture: &GridReservoirFixture) -> Vec<CubeInstance> {
+// Fixtures use quarter-metre, origin-zero grids. The shared renderer consumes
+// the same byte-fraction presentation as gameplay; canonical amounts stay f64.
+fn build_water(fixture: &GridReservoirFixture) -> crate::water_look::WaterLook {
     let grid = fixture.grid();
     let spec = grid.spec();
-    let origin = spec.origin();
-    let [dx, dy, dz] = spec.dimensions();
+    let dimensions = spec.dimensions();
+    let frame = spall_protocol::WaterKeyframe {
+        server_tick: spall_core::Tick(0),
+        frame_seq: 0,
+        origin: spec.origin(),
+        dimensions,
+        coarsen: 1,
+        fractions: grid
+            .fractions()
+            .iter()
+            .map(|f| (f * 255.0).round() as u8)
+            .collect(),
+    };
     let h = grid.config().cell_size_m;
-    let mut instances = Vec::new();
-    for z in 0..dz {
-        for y in 0..dy {
-            for x in 0..dx {
-                let cell = GlobalCell::new(
-                    origin.x + i64::from(x),
-                    origin.y + i64::from(y),
-                    origin.z + i64::from(z),
-                );
-                let Some(fraction) = grid.fraction_at(cell) else {
-                    continue;
-                };
-                if fraction <= 0.0 {
-                    continue;
-                }
-                let height = (h * fraction) as f32;
-                instances.push(CubeInstance::new(
-                    [
-                        (x as f64 + 0.5) as f32 * h as f32,
-                        (y as f64) as f32 * h as f32 + 0.5 * height,
-                        (z as f64 + 0.5) as f32 * h as f32,
-                    ],
-                    MATERIAL_WATER,
-                    [h as f32, height, h as f32],
-                    CubeInstance::IDENTITY_ROTATION,
-                ));
+    let center = [
+        f64::from(dimensions[0]) * h * 0.5,
+        0.0,
+        f64::from(dimensions[2]) * h * 0.5,
+    ];
+    let radius = (f64::from(dimensions[0].max(dimensions[2])) * h * 0.5 + h) as f32;
+    crate::water_look::build_water_look(&[frame], center, radius, 0)
+}
+
+fn room_water_volume(fixture: &GridReservoirFixture) -> f64 {
+    let grid = fixture.grid();
+    let spec = grid.spec();
+    let [nx, ny, _] = spec.dimensions().map(|n| n as usize);
+    grid.fractions()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| spec.origin().y + ((i / nx % ny) as i64) < 0)
+        .map(|(_, f)| f * grid.config().cell_size_m.powi(3))
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canal_water_rendering_does_not_change_solver_and_reset_restores_water() {
+        let mut app = GridFluidDemoApp::new(Scene::Reservoirs).unwrap();
+        let initial = app.fixture.grid().fractions().to_vec();
+        let initial_volume = app.fixture.grid().water_volume_m3();
+        let look = build_water(&app.fixture);
+        assert!(!look.indices.is_empty());
+        assert_eq!(app.fixture.grid().fractions(), initial);
+        app.action(KeyCode::KeyC);
+        assert!(app.canal_open);
+        app.action(KeyCode::KeyX);
+        assert!(!app.canal_open);
+        assert_eq!(app.fixture.grid().water_volume_m3(), initial_volume);
+        app.action(KeyCode::Space);
+        assert!(app.paused);
+        app.action(KeyCode::Space);
+        assert!(!app.paused);
+        app.action(KeyCode::KeyB);
+        assert!(app.dam_broken);
+        for _ in 0..120 {
+            app.fixture.step(FIXED_DT.as_secs_f64()).unwrap();
+        }
+        assert_ne!(app.fixture.grid().fractions(), initial);
+        let before = app.fixture.grid().fractions().to_vec();
+        let _ = build_water(&app.fixture);
+        assert_eq!(app.fixture.grid().fractions(), before);
+        assert!(
+            (app.fixture.grid().water_volume_m3()
+                + app.fixture.grid().cumulative_open_outflow_m3()
+                - initial_volume)
+                .abs()
+                < 1e-9
+        );
+        app.action(KeyCode::KeyR);
+        assert!(!app.canal_open && !app.dam_broken);
+        assert_eq!(app.fixture.grid().fractions(), initial);
+        assert_eq!(app.simulated_time_s, 0.0);
+    }
+
+    #[test]
+    fn room_stays_dry_below_intact_floor_and_floods_through_real_hole() {
+        let mut app = GridFluidDemoApp::new(Scene::RoomBelow).unwrap();
+        assert_eq!(room_water_volume(&app.fixture), 0.0);
+        app.action(KeyCode::KeyC);
+        app.action(KeyCode::KeyB);
+        for _ in 0..600 {
+            app.fixture.step(FIXED_DT.as_secs_f64()).unwrap();
+        }
+        assert_eq!(room_water_volume(&app.fixture), 0.0);
+        let initial = app.fixture.grid().water_volume_m3();
+        app.action(KeyCode::KeyH);
+        for _ in 0..600 {
+            app.fixture.step(FIXED_DT.as_secs_f64()).unwrap();
+        }
+        assert!(room_water_volume(&app.fixture) > 0.001);
+        println!(
+            "{}",
+            serde_json::json!({"scenario":"canal_room_floor", "intact_steps":600, "intact_room_water_m3":0.0, "hole_steps":600, "hole_room_water_m3":room_water_volume(&app.fixture), "cell_size_m":0.25})
+        );
+        assert!(
+            (app.fixture.grid().water_volume_m3()
+                + app.fixture.grid().cumulative_open_outflow_m3()
+                - initial)
+                .abs()
+                < 1e-9
+        );
+        app.action(KeyCode::KeyR);
+        assert_eq!(room_water_volume(&app.fixture), 0.0);
+        let boundary =
+            SolidBoundary::capture(app.fixture.volume(), app.fixture.grid().spec()).unwrap();
+        assert_eq!(boundary.is_solid(GlobalCell::new(6, 0, 3)), Some(true));
+    }
+
+    #[test]
+    fn all_canal_scenes_step_with_gameplay_water_policy() {
+        for scene in [
+            Scene::Reservoirs,
+            Scene::Canal,
+            Scene::Breach,
+            Scene::Basin,
+            Scene::Tunnel,
+            Scene::Equilibrium,
+        ] {
+            let mut fixture = make_fixture(scene).unwrap();
+            let initial = fixture.grid().water_volume_m3();
+            for _ in 0..600 {
+                fixture.step(FIXED_DT.as_secs_f64()).unwrap();
             }
+            assert!(
+                (fixture.grid().water_volume_m3() + fixture.grid().cumulative_open_outflow_m3()
+                    - initial)
+                    .abs()
+                    < 1e-9,
+                "{}",
+                scene.label()
+            );
+            assert!(!build_water(&fixture).indices.is_empty());
         }
     }
-    instances
 }

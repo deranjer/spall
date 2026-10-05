@@ -1456,3 +1456,19 @@ checks. Capacity/thin walls/displacement/recovery remain open. In progress.
 Final ENG-122 incremental-flow validation: cargo xtask check1219 passed/0 failed/63 ignored
 across137 suites, including formatting and strict workspace Clippy. Initial dam-replication
 admin-ack failure and isolated retry pass are preserved; no networking/fixture/budget changes.
+
+ENG-122 canal viewer checkpoint (2026-10-05): --grid-fluid-demo uses gameplay
+water-only freely displaced air and the shared smoothed water renderer, preserving
+canal/gate/breach/reset/pause controls and occupied-gate rejection. Local fixture
+viewer, not authoritative multiplayer or reconstructed-support activation.
+Six600-step scenarios, conservation and presentation noninterference checks added.
+Bounded capture/launch and check results in reports/ENG-122.md. ENG-122 remains
+in_progress; next unblocked: user canal assessment, then stored-transfer precision.
+
+ENG-122 room viewer: scene7 / --grid-fluid-demo-room adds a sealed dry room below
+the0.25m canal floor; visual cutaway retains collision. H opens a real floor tile.
+Intact600 steps0m3; deliberate-hole600 steps1.200796876m3. Shared renderer now
+respects wet-column bottom/top to avoid falsely tinting dry rooms underwater.
+Final client86/render61/fluid104 and strict workspace Clippy pass; initial canal
+full-check1221/0/63 across137 suites preceded room changes. GPU before/after
+captures verified. In progress; nextENG-122 user assessment/stored transfers.

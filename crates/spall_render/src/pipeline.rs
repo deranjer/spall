@@ -730,13 +730,19 @@ impl ScenePipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R32Float,
+                format: wgpu::TextureFormat::Rg32Float,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
             let view = texture.create_view(&Default::default());
             state.gpu = Some((texture, view));
         }
+        let bounds: Vec<[f32; 2]> = field
+            .heights
+            .iter()
+            .zip(&field.bottoms)
+            .map(|(&top, &bottom)| [top, bottom])
+            .collect();
         if let Some((texture, _)) = &state.gpu {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -745,10 +751,10 @@ impl ScenePipeline {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                bytemuck::cast_slice(&field.heights),
+                bytemuck::cast_slice(&bounds),
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(field.dim * 4),
+                    bytes_per_row: Some(field.dim * 8),
                     rows_per_image: Some(field.dim),
                 },
                 size,
