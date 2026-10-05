@@ -857,7 +857,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             });
         }
     };
-    let free_velocity: Vec<_> = free
+    let mut free_velocity: Vec<_> = free
         .iter()
         .map(|f| corrected_free(f, &phi, &inverse_root))
         .collect();
@@ -912,16 +912,40 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 held[j].is_some()
             );
         }
-        flux[f.row] += f.area * u;
         if f.axis.is_none() {
-            // Retain the normal correction while preserving tangential state.
-            let i = indices[f.row];
-            for axis in 0..3 {
-                grid.cut_surface_velocity[axis][i] += cells[f.row].normal[axis] * (u - f.velocity);
-            }
+            continue;
         }
+        flux[f.row] += f.area * u;
         if let Some(axis) = f.axis {
             grid.cut_surface_flux[axis][f.face] += f.sign * f.area * u * h * h;
+        }
+    }
+    for (j, f) in free.iter().enumerate().filter(|(_, f)| f.axis.is_none()) {
+        // Zero net Cartesian outflow fixes a free atmospheric cap's normal
+        // to zero by continuity. Avoid cancellation in its predictor/pressure
+        // subtraction, and require agreement with the solved normal within
+        // the existing pressure-response accuracy. Nonzero outflow retains
+        // the pressure result; contact caps retain prescribed displacement.
+        let u = held[j].map_or_else(
+            || {
+                if flux[f.row] == 0.0 {
+                    0.0
+                } else {
+                    free_velocity[j]
+                }
+            },
+            |q| q / f.area,
+        );
+        if !u.is_finite() || (held[j].is_none() && (u - free_velocity[j]).abs() > 1e-8) {
+            return Err(MacError::MomentumPressureNotConverged {
+                residual: final_residual,
+            });
+        }
+        free_velocity[j] = u;
+        flux[f.row] += f.area * u;
+        let i = indices[f.row];
+        for axis in 0..3 {
+            grid.cut_surface_velocity[axis][i] += cells[f.row].normal[axis] * (u - f.velocity);
         }
     }
     for (axis, wetted) in area.iter().enumerate() {
@@ -961,6 +985,64 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         .enumerate()
         .map(|(r, v)| v.abs() / h / grid.fraction[indices[r]])
         .fold(0.0, f64::max);
+    if grid.config.pressure_diagnostics {
+        // Audit projected boundary flux before transport, without omitting tiny rows
+        // or replacing the existing volume-normalized divergence metric.
+        if let Some((r, net)) = flux.iter().enumerate().max_by(|(a, qa), (b, qb)| {
+            (qa.abs() / grid.fraction[indices[*a]])
+                .total_cmp(&(qb.abs() / grid.fraction[indices[*b]]))
+        }) {
+            let mut cartesian = [0.0; 6];
+            let mut cap_flux = 0.0;
+            let mut cap_velocity = 0.0;
+            let mut magnitude = 0.0;
+            for e in &edges {
+                if e.a == r || e.b == r {
+                    let u = e.velocity
+                        - dt / rho / h / e.distance
+                            * ((base[e.b] - base[e.a])
+                                + (phi[e.b] * inverse_root[e.b] - phi[e.a] * inverse_root[e.a]));
+                    let q = e.area * u;
+                    let side = usize::from(e.a == r);
+                    cartesian[2 * e.axis + side] += if side == 1 { q } else { -q };
+                    magnitude += q.abs();
+                }
+            }
+            for (j, f) in free.iter().enumerate().filter(|(_, f)| f.row == r) {
+                let u = held[j].map_or_else(|| free_velocity[j], |q| q / f.area);
+                let q = f.area * u;
+                magnitude += q.abs();
+                if let Some(axis) = f.axis {
+                    cartesian[2 * axis + usize::from(f.sign > 0.0)] += q;
+                } else {
+                    cap_flux = q;
+                    cap_velocity = u;
+                }
+            }
+            let cell = grid.spec.cell_at(indices[r]);
+            eprintln!(
+                "{{\"type\":\"cut_row_flux_audit\",\"cell\":[{},{},{}],\"fraction\":{:.17e},\"dt_s\":{:.17e},\"cartesian_outflow_m3_s\":{:?},\"embedded_outflow_m3_s\":{:.17e},\"sum_absolute_outflow_m3_s\":{:.17e},\"net_outflow_m3_s\":{:.17e},\"relative_closure_error\":{:.17e},\"cap_area_cells2\":{:.17e},\"cap_normal\":{:?},\"cap_normal_velocity_m_s\":{:.17e},\"pressure_pa\":{:.17e}}}",
+                cell.x,
+                cell.y,
+                cell.z,
+                grid.fraction[indices[r]],
+                dt,
+                cartesian.map(|q| q * h * h),
+                cap_flux * h * h,
+                magnitude * h * h,
+                net * h * h,
+                if magnitude > 0.0 {
+                    net.abs() / magnitude
+                } else {
+                    0.0
+                },
+                cells[r].cap.area,
+                cells[r].normal,
+                cap_velocity,
+                grid.pressure_pa[indices[r]]
+            );
+        }
+    }
     Ok(ProjectionStats {
         iterations: total_iterations as usize,
         active_cells: n,
@@ -1014,6 +1096,67 @@ pub(super) fn transport_velocity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pressure_row_trace_preserves_the_projected_water_and_momentum_state() {
+        let fixture = include_bytes!("../../fixtures/eng122-trench-crop-v1.water-replay");
+        let mut original = MacGridWorld::read_reconstructed_replay(fixture.as_slice()).unwrap();
+        let mut traced = original.clone();
+        traced.config.pressure_diagnostics = true;
+        for _ in 0..3 {
+            let a = original.step(0.05).unwrap();
+            let b = traced.step(0.05).unwrap();
+            assert_eq!(
+                a.divergence_after_max_s.to_bits(),
+                b.divergence_after_max_s.to_bits()
+            );
+            assert_eq!(original.fraction, traced.fraction);
+            assert_eq!(original.pressure_pa, traced.pressure_pa);
+            assert_eq!(original.u, traced.u);
+            assert_eq!(original.v, traced.v);
+            assert_eq!(original.w, traced.w);
+            assert_eq!(original.cut_surface_flux, traced.cut_surface_flux);
+            assert_eq!(original.cut_surface_velocity, traced.cut_surface_velocity);
+        }
+    }
+    #[test]
+    fn sealed_partial_cell_has_exactly_stationary_atmospheric_cap() {
+        use crate::{DomainSpec, SolidBoundary};
+        use spall_core::GlobalCell;
+        for fraction in [0.25, 1e-40, 1e-120, 1e-300, f64::from_bits(7)] {
+            let spec = DomainSpec::new(GlobalCell::new(0, 0, 0), [3, 3, 3], 27).unwrap();
+            let mut solid = vec![true; 27];
+            solid[13] = false;
+            let mut grid = MacGridWorld::new(
+                &SolidBoundary { spec, solid },
+                super::super::MacConfig {
+                    cell_size_m: 1.0,
+                    gravity_m_s2: [0.0; 3],
+                    reconstructed_surface_support: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            grid.set_freely_displaced_air().unwrap();
+            grid.set_fraction(GlobalCell::new(1, 1, 1), fraction)
+                .unwrap();
+            // A stale normal predictor in a walled pore must be removed by
+            // projection: no Cartesian boundary can move or transfer liquid.
+            for velocity in [0.1, 1.0 / 3.0, -0.1] {
+                let mut grid = grid.clone();
+                grid.v.fill(velocity);
+                let before = grid.fraction.clone();
+                let result = grid.project(0.01).unwrap();
+                assert!(result.converged);
+                assert_eq!(grid.fraction, before);
+                assert_eq!(
+                    grid.cut_surface_velocity[1][13], 0.0,
+                    "C={fraction}, predictor={velocity}"
+                );
+                assert_eq!(result.divergence_after, 0.0);
+                assert!(grid.cut_surface_flux.iter().flatten().all(|q| *q == 0.0));
+            }
+        }
+    }
     #[test]
     fn wet_donors_preserve_local_uniform_momentum_and_zero_pressure_work() {
         use crate::{DomainSpec, SolidBoundary};

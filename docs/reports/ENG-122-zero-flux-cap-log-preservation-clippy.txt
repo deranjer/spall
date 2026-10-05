@@ -1,0 +1,2 @@
+    Checking spall_fluid v0.1.0 (C:\Users\deran\.codex\worktrees\eng-122-shoreline-capacity\voxel_engine\crates\spall_fluid)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.15s

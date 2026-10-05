@@ -1308,3 +1308,22 @@ normalized divergence reaches 1.38816e237 /s despite bounded speed/accounting.
 reports/ENG-122.md for exact commands, full-check status, risks and provenance.
 Next unblocked task remains ENG-122 interface/phase-transfer accuracy, complete
 scratch peak and sustained/game-window gates; exact capacity/recovery remain.
+
+ENG-122 stationary-cap and flux-audit checkpoint (2026-10-05): free caps with
+exactly zero net Cartesian outflow use the exact stationary continuity normal,
+within the existing pressure-response accuracy. Nonzero outflow and contact
+caps retain their pressure solution/displacement; all positive amounts and
+original budgets/default/owner/save/wire contracts remain. A 27-cell regression
+fails on parent normal drift1.38778e-17 m/s and passes five positive amounts
+through subnormal C=bits7; tracing has exact three-step state/600-step metric
+noninterference coverage. Both original fresh 512/1024 trenches pass final50ms
+and flow with zero stability skips, ratios0.8991/0.8963, delivery42.11817/4.98630
+m3. No causal speedup or whole-memory saving claimed. Giant normalized channel
+divergence stays1.38816e237/s: trace identifies 1.00974e-28 m3/s cancellation
+residue at C4.65533e-264 (relative1.2455e-16), not complete local accuracy.
+Broader cap reconstruction fails the existing closing-gap accuracy and is
+dropped. Release fluid99/shallow6 and reference/replay gates pass. Exact
+commands/evidence/full-check status in reports/ENG-122.md. Keep experimental
+and in_progress; next unblocked ENG-122 is nonzero-flow/closing-interface
+pressure-normal/accepted-momentum consistency, then full scratch and sustained
+windowed gates; exact capacity/thin-wall/recovery/physical acceptance remain.

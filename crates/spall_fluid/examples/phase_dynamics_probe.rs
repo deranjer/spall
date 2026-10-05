@@ -1,5 +1,6 @@
 //! Same static geometry/time as component_dynamics_probe, fine MAC reference.
 //! Motion gates only: not conservative momentum accuracy or generated trench.
+//! SPALL_CUT_ROW_TRACE enables a bounded per-projection row audit, without timing credit.
 use spall_fluid::grid_mac::{MacConfig, PressurePreconditioner};
 use spall_fluid::phase_fixtures::PhaseReferenceScene;
 use spall_fluid::phase_pressure::{PhasePressureConfig, PhasePressureWorld};
@@ -46,9 +47,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let dims = scene.dimensions();
     let phase = scene.build()?;
+    let trace = std::env::var_os("SPALL_CUT_ROW_TRACE").is_some();
+    let source_revision = option_env!("SPALL_SOURCE_REVISION").unwrap_or("unspecified");
     let config = PhasePressureConfig {
         mac: MacConfig {
             pressure_max_iterations: 1000,
+            pressure_diagnostics: trace,
             ..MacConfig::default()
         },
         air_density_kg_m3: 1.2,
@@ -85,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let initial = world.phase().water_volume_m3();
     println!(
-        "{{\"scenario\":\"surface_support_reference_configuration\",\"cut_surface_support\":{cut_support},\"accepted_water_momentum_transport\":{cut_support},\"water_only\":{water_only},\"fixture\":{mode:?},\"steps\":{steps},\"dt_s\":0.01}}"
+        "{{\"scenario\":\"surface_support_reference_configuration\",\"cut_surface_support\":{cut_support},\"accepted_water_momentum_transport\":{cut_support},\"water_only\":{water_only},\"fixture\":{mode:?},\"steps\":{steps},\"dt_s\":0.01,\"pressure_row_trace\":{trace},\"source_revision\":{source_revision:?},\"timing_acceptance\":false}}"
     );
     let initial_energy =
         world.solver().gravitational_potential_energy_j() + world.solver().kinetic_energy_j();

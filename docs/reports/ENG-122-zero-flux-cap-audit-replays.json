@@ -1,0 +1,394 @@
+{
+  "replays": [
+    {
+      "output_sha256": "6FEB13AB60B990574842A78803C2CEDDB9DA2BA8D261F446FA7F7E8F186A208F",
+      "accepted_steps": 1000,
+      "output_path": ".local/zero-flux-cap-final-replay1000.jsonl",
+      "last_accepted": {
+        "scenario": "reconstructed_water_replay_accepted",
+        "step": 999,
+        "substeps": 1,
+        "pressure_iterations": 98,
+        "conservation_error_m3": 1.3642420526593924E-12
+      },
+      "input_sha256": "0683C98C4F330E5C7B7BEB8175B75BA83B0AD10AAD9803EF6C8EBA1459327FF6",
+      "first_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "0dd7a48+zero-flux-cap-final",
+        "step": 0,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          62
+        ],
+        "limiting_cell": [
+          107,
+          94,
+          346
+        ],
+        "limiting_outflow_l1_m_s": 53.9814020458638,
+        "face_speed_m_s": 33.83867038131531,
+        "interface_speed_m_s": 9.027311090298356,
+        "water_change_m3": 0.0,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "last_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "0dd7a48+zero-flux-cap-final",
+        "step": 999,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          62
+        ],
+        "limiting_cell": [
+          102,
+          100,
+          335
+        ],
+        "limiting_outflow_l1_m_s": 3.5768862110237274,
+        "face_speed_m_s": 3.0057467240310323,
+        "interface_speed_m_s": 1.9959772930064898,
+        "water_change_m3": -1.0118128557223827E-11,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "requested_steps": 1000,
+      "exit_code": 0,
+      "input_path": ".local/scaled-failure-512.precursor.water-replay"
+    },
+    {
+      "output_sha256": "6471486B5C336F8D2899A765B03959A21B6D61BE1736915B59D13827450E6B24",
+      "accepted_steps": 100,
+      "output_path": ".local/zero-flux-cap-final-old-replay100.jsonl",
+      "last_accepted": {
+        "scenario": "reconstructed_water_replay_accepted",
+        "step": 99,
+        "substeps": 1,
+        "pressure_iterations": 99,
+        "conservation_error_m3": 1.0231815394945443E-12
+      },
+      "input_sha256": "1AB462144B4DE6EF1B08EA198FB05855C9C7B34AAF839348F44FF3E1C7041D64",
+      "first_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "0dd7a48+zero-flux-cap-final",
+        "step": 0,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          62
+        ],
+        "limiting_cell": [
+          112,
+          87,
+          343
+        ],
+        "limiting_outflow_l1_m_s": 41.147888953245356,
+        "face_speed_m_s": 40.294920579719985,
+        "interface_speed_m_s": 4.438510805807091,
+        "water_change_m3": 0.0,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "last_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "0dd7a48+zero-flux-cap-final",
+        "step": 99,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          62
+        ],
+        "limiting_cell": [
+          102,
+          100,
+          335
+        ],
+        "limiting_outflow_l1_m_s": 4.0278145721190715,
+        "face_speed_m_s": 3.0736297559899857,
+        "interface_speed_m_s": 1.973005351220482,
+        "water_change_m3": -3.183231456205249E-12,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "requested_steps": 100,
+      "exit_code": 0,
+      "input_path": ".local/coupling-512.precursor.water-replay"
+    },
+    {
+      "output_sha256": "B030AB31F6B44E2E8B4EC82F70DB67BAEA7214162EBA2BD9E92225785F6924DD",
+      "accepted_steps": 100,
+      "output_path": ".local/zero-flux-cap-final-overflow-replay100.jsonl",
+      "last_accepted": {
+        "scenario": "reconstructed_water_replay_accepted",
+        "step": 99,
+        "substeps": 1,
+        "pressure_iterations": 99,
+        "conservation_error_m3": 2.3874235921539366E-12
+      },
+      "input_sha256": "797DD1116170FD3589D3563B62F9F894E44BCC7D40E83A717D5E22ACFAC37299",
+      "first_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "0dd7a48+zero-flux-cap-final",
+        "step": 0,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          49
+        ],
+        "limiting_cell": [
+          100,
+          100,
+          361
+        ],
+        "limiting_outflow_l1_m_s": 2.7718769051098393,
+        "face_speed_m_s": 2.2891834413137366,
+        "interface_speed_m_s": 1.093286722921257,
+        "water_change_m3": 0.0,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "last_input": {
+        "scenario": "reconstructed_water_replay",
+        "source_revision": "0dd7a48+zero-flux-cap-final",
+        "step": 99,
+        "dt_s": 0.05,
+        "dimensions": [
+          62,
+          25,
+          49
+        ],
+        "limiting_cell": [
+          102,
+          100,
+          361
+        ],
+        "limiting_outflow_l1_m_s": 3.919593260634537,
+        "face_speed_m_s": 2.551255001954523,
+        "interface_speed_m_s": 1.0606331160153613,
+        "water_change_m3": 6.821210263296962E-13,
+        "timing_acceptance": false,
+        "owner_state_advanced": false
+      },
+      "requested_steps": 100,
+      "exit_code": 0,
+      "input_path": ".local/cap-normal-new-512.water-replay"
+    }
+  ],
+  "parent": "0dd7a48",
+  "trace_audits": [
+    {
+      "provenance": "parent-audit-only",
+      "local_trace_path": ".local/flux-audit-channel-trace.jsonl",
+      "audit_record_count": 600,
+      "note": "One worst normalized row per pressure projection; sampled rows are not a global absolute-error audit. Do not multiply the tiny fraction by cell volume before dividing, since that can underflow.",
+      "worst_sampled_divergence_per_s": 1.3881610921387677E+237,
+      "zero_cartesian_nonzero_cap_samples": [
+        {
+          "type": "cut_row_flux_audit",
+          "cell": [
+            12,
+            8,
+            2
+          ],
+          "fraction": 7.148514167113369E-59,
+          "dt_s": 0.01,
+          "cartesian_outflow_m3_s": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "embedded_outflow_m3_s": 6.4094170385472905E-56,
+          "sum_absolute_outflow_m3_s": 6.4094170385472905E-56,
+          "net_outflow_m3_s": 6.4094170385472905E-56,
+          "relative_closure_error": 1.0,
+          "cap_area_cells2": 7.389554735734703E-38,
+          "cap_normal": [
+            0.014726212581678009,
+            0.9998840728656624,
+            -0.0038703349433760214
+          ],
+          "cap_normal_velocity_m_s": 1.3877787807814457E-17,
+          "pressure_pa": 1.0208071373171278E-18
+        },
+        {
+          "type": "cut_row_flux_audit",
+          "cell": [
+            10,
+            8,
+            4
+          ],
+          "fraction": 5.0172653994026764E-57,
+          "dt_s": 0.01,
+          "cartesian_outflow_m3_s": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "embedded_outflow_m3_s": -1.1189030190430728E-54,
+          "sum_absolute_outflow_m3_s": 1.1189030190430728E-54,
+          "net_outflow_m3_s": -1.1189030190430728E-54,
+          "relative_closure_error": 1.0,
+          "cap_area_cells2": 1.290007352224283E-36,
+          "cap_normal": [
+            0.016350048198795108,
+            0.999861118857075,
+            -0.0032278354628904704
+          ],
+          "cap_normal_velocity_m_s": -1.3877787807814457E-17,
+          "pressure_pa": 4.118781120417451E-18
+        },
+        {
+          "type": "cut_row_flux_audit",
+          "cell": [
+            6,
+            8,
+            8
+          ],
+          "fraction": 1.3711689603765035E-71,
+          "dt_s": 0.01,
+          "cartesian_outflow_m3_s": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "embedded_outflow_m3_s": 2.685904779781409E-63,
+          "sum_absolute_outflow_m3_s": 2.685904779781409E-63,
+          "net_outflow_m3_s": 2.685904779781409E-63,
+          "relative_closure_error": 1.0,
+          "cap_area_cells2": 5.16106229989384E-46,
+          "cap_normal": [
+            -0.0010681908979060988,
+            0.9999828318823925,
+            -0.005761502293364859
+          ],
+          "cap_normal_velocity_m_s": 8.326672684688674E-17,
+          "pressure_pa": 5.573347414209608E-23
+        }
+      ],
+      "cell_size_m": 0.25,
+      "sha256": "6B6EA4FC7052B856B6D661420D86489B1B28476D44BBF3A612C60A779BA123D8",
+      "worst_sampled_normalized_row": {
+        "type": "cut_row_flux_audit",
+        "cell": [
+          11,
+          7,
+          7
+        ],
+        "fraction": 4.655330402333823E-264,
+        "dt_s": 0.01,
+        "cartesian_outflow_m3_s": [
+          0.0,
+          4.931297980421604E-263,
+          4.053535181202479E-13,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "embedded_outflow_m3_s": -4.05353518120248E-13,
+        "sum_absolute_outflow_m3_s": 8.107070362404959E-13,
+        "net_outflow_m3_s": -1.0097419586828951E-28,
+        "relative_closure_error": 1.2455078265576513E-16,
+        "cap_area_cells2": 1.7926463250676077E-10,
+        "cap_normal": [
+          -1.568407239814721E-250,
+          1.0,
+          1.0793712574964844E-247
+        ],
+        "cap_normal_velocity_m_s": -0.03617922955148093,
+        "pressure_pa": -5.306112442757308E-252
+      }
+    },
+    {
+      "provenance": "0dd7a48+zero-flux-cap-final",
+      "local_trace_path": ".local/zero-flux-cap-final-channel-trace.jsonl",
+      "audit_record_count": 600,
+      "note": "One worst normalized row per pressure projection; sampled rows are not a global absolute-error audit. Do not multiply the tiny fraction by cell volume before dividing, since that can underflow.",
+      "worst_sampled_divergence_per_s": 1.3881610921387677E+237,
+      "zero_cartesian_nonzero_cap_samples": [
+        {
+          "type": "cut_row_flux_audit",
+          "cell": [
+            15,
+            8,
+            5
+          ],
+          "fraction": 6.056181658943343E-302,
+          "dt_s": 0.01,
+          "cartesian_outflow_m3_s": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "embedded_outflow_m3_s": 9.746934369184845E-212,
+          "sum_absolute_outflow_m3_s": 9.746934369184845E-212,
+          "net_outflow_m3_s": 9.746934369184845E-212,
+          "relative_closure_error": 1.0,
+          "cap_area_cells2": 1.123745023822478E-193,
+          "cap_normal": [
+            0.5695471053912976,
+            0.8219586940597404,
+            -2.4844331404622086E-23
+          ],
+          "cap_normal_velocity_m_s": 1.3877787807814457E-17,
+          "pressure_pa": 5.567180346864361E-106
+        }
+      ],
+      "cell_size_m": 0.25,
+      "sha256": "84068C41CB0D557F137743C23104DCCED2C153080EF21FA8B5E9D53780062571",
+      "worst_sampled_normalized_row": {
+        "type": "cut_row_flux_audit",
+        "cell": [
+          11,
+          7,
+          7
+        ],
+        "fraction": 4.655330402333823E-264,
+        "dt_s": 0.01,
+        "cartesian_outflow_m3_s": [
+          0.0,
+          4.931297980421604E-263,
+          4.053535181202479E-13,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "embedded_outflow_m3_s": -4.05353518120248E-13,
+        "sum_absolute_outflow_m3_s": 8.107070362404959E-13,
+        "net_outflow_m3_s": -1.0097419586828951E-28,
+        "relative_closure_error": 1.2455078265576513E-16,
+        "cap_area_cells2": 1.7926463250676077E-10,
+        "cap_normal": [
+          -1.568407239814721E-250,
+          1.0,
+          1.0793712574964844E-247
+        ],
+        "cap_normal_velocity_m_s": -0.03617922955148093,
+        "pressure_pa": -5.306112442757308E-252
+      }
+    }
+  ],
+  "channel_trace_non_timing_metric_differences": [],
+  "source_revision": "0dd7a48+zero-flux-cap-final",
+  "owner_state_advanced": false,
+  "timing_acceptance": false,
+  "note": "Full raw traces/snapshots/untimed replay outputs remain in .local. Audits are projected pre-transport geometric flux; accepted conservative phase transfers and primary momentum are separate. No local full-accuracy or original owner/network/graphics credit from cropped/untimed scenarios."
+}
