@@ -453,12 +453,11 @@ impl MacGridWorld {
         Ok(())
     }
 
-    /// ENG-122 reconstructed liquid support diagnostic. Small drainage and
-    /// energy, nearly saturated rest and reference motion gates pass. Generated
-    /// trench flow passes, but the current 512 final-state advance fails its
-    /// unchanged substep budget and performance remains unaccepted. This is
-    /// not an accepted gameplay policy; it uses symmetric Gauss-Seidel CG,
-    /// independently of the legacy MG solver.
+    /// ENG-122 experimental reconstructed support. Batched incremental
+    /// pressure/flow corrections use symmetric Gauss-Seidel CG independently
+    /// of legacy MG. Original 512/1024 trench and final-step gates pass; stored
+    /// face/interface accuracy, complete scratch and sustained windowed gates
+    /// remain open. This is not an accepted gameplay policy.
     pub fn set_cut_surface_support(&mut self) -> Result<(), MacError> {
         if !self.freely_displaced_air || self.experimental_surface_films {
             return Err(MacError::InvalidConfig);

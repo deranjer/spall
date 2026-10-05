@@ -253,21 +253,57 @@ impl Gauge {
     }
 }
 
-// Diagnostic only: retain the low part of cancellation between installed
-// Cartesian patch fluxes. This does not alter pressure or accepted transport.
-fn audited_flux_sum(values: impl Iterator<Item = f64>) -> f64 {
-    let mut sum = 0.0_f64;
-    let mut correction = 0.0;
-    for value in values {
-        let next = sum + value;
-        correction += if sum.abs() >= value.abs() {
-            (sum - next) + value
+// Transient pressure-flow accumulator: retain increments below a face
+// velocity ulp and cancellation between opposing geometric patch fluxes.
+#[derive(Clone, Copy, Default)]
+struct FlowSum {
+    high: f64,
+    low: f64,
+}
+impl FlowSum {
+    fn add(&mut self, value: f64) {
+        let next = self.high + value;
+        self.low += if self.high.abs() >= value.abs() {
+            (self.high - next) + value
         } else {
-            (value - next) + sum
+            (value - next) + self.high
         };
-        sum = next;
+        self.high = next;
     }
-    sum + correction
+    fn value(self) -> f64 {
+        self.high + self.low
+    }
+    fn product(value: f64, factor: f64) -> Self {
+        let high = value * factor;
+        Self {
+            high,
+            low: value.mul_add(factor, -high),
+        }
+    }
+    fn scale(self, factor: f64) -> Self {
+        let mut out = Self::product(self.high, factor);
+        out.add(self.low * factor);
+        out
+    }
+    fn add_sum(&mut self, value: Self) {
+        self.add(value.high);
+        self.add(value.low);
+    }
+}
+fn audited_flux_sum(values: impl Iterator<Item = f64>) -> f64 {
+    let mut sum = FlowSum::default();
+    for value in values {
+        sum.add(value);
+    }
+    sum.value()
+}
+
+fn free_cap_normal(cartesian: FlowSum, pressure_normal: f64) -> f64 {
+    if cartesian.value() == 0.0 {
+        0.0
+    } else {
+        pressure_normal
+    }
 }
 
 // Retain product and subtraction roundoff until the final pressure jump.
@@ -612,13 +648,6 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
     let mut held = vec![None; free.len()];
     let mut attempts = 0;
     let mut total_iterations = 0;
-    let mut warm = grid.pressure_pa.iter().any(|p| *p != 0.0).then(|| {
-        indices
-            .iter()
-            .enumerate()
-            .map(|(r, i)| grid.pressure_pa[*i] + (potential(centers[r]) - base[r]))
-            .collect::<Vec<_>>()
-    });
     // Use sqrt(stiffness), never stiffness itself: 2*A^2/C can overflow
     // for real positive subnormal fractions. D^-1/2 A D^-1/2 is the same SPD
     // equation, with physical residual/velocity checks retained below.
@@ -648,7 +677,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             )
         }
     };
-    let (phi, inverse_root, initial, final_residual, before) = loop {
+    let (phi, inverse_root, edge_flow, free_flow, initial, final_residual, before) = loop {
         let mut closed = vec![true; n];
         for (j, f) in free.iter().enumerate() {
             if held[j].is_none() {
@@ -745,48 +774,72 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         scaled_gauge(&gauge, &root_diagonal, &mut rhs);
         // Krylov vectors use x = (physical_pressure + potential - base) * sqrt(D).
         // Convert back with inverse_root for physical pressure and face impulses.
-        let mut phi: Vec<_> = warm
-            .take()
-            .map(|v| v.iter().zip(&root_diagonal).map(|(p, d)| p * d).collect())
-            .unwrap_or_else(|| {
-                rhs.iter()
-                    .zip(&diagonal)
-                    .map(|(r, d)| if *d > 0.0 { r / d } else { 0.0 })
-                    .collect()
-            });
-        scaled_gauge(&gauge, &root_diagonal, &mut phi);
-        // Verify pressure against the same geometric face impulses used by
-        // transport, rather than subtracting large assembled RHS/operator
-        // values whose roundoff need not match the projected boundary flux.
-        let physical_residual = |x: &[f64], out: &mut [f64]| {
-            out.fill(0.0);
-            for e in &edges {
-                let u = edge_velocity(e, x, &inverse_root, &base, dt / rho / h);
-                out[e.a] -= rho / dt / h * (e.area * inverse_root[e.a]) * u;
-                out[e.b] += rho / dt / h * (e.area * inverse_root[e.b]) * u;
-            }
-            for (j, f) in free.iter().enumerate() {
-                if let Some(q) = held[j] {
-                    out[f.row] -= rho / dt / h * inverse_root[f.row] * q;
-                } else if f.axis.is_none() {
-                    // Cap velocity itself can overflow for a finite stale
-                    // pressure hint on a subnormal amount. Its equilibrated
-                    // impulse stays representable; the cap's local base is
-                    // exactly its atmospheric potential.
-                    let w = free_root[j] * inverse_root[f.row];
-                    out[f.row] -= rho / dt / h * (f.area * inverse_root[f.row]) * f.velocity
-                        + w * w * x[f.row];
-                } else {
-                    out[f.row] -= rho / dt / h
-                        * (f.area * inverse_root[f.row])
-                        * corrected_free(f, x, &inverse_root);
+        // Flow is the authoritative projection iterate. Pressure corrections
+        // update it directly, avoiding reconstruction from a large accumulated
+        // potential. The stored pressure remains a cache/diagnostic, not an
+        // independently reconstructed source of the accepted flux.
+        let mut phi = vec![0.0; n];
+        let mut edge_flow: Vec<_> = edges
+            .iter()
+            .map(|e| FlowSum {
+                high: edge_velocity(e, &phi, &inverse_root, &base, dt / rho / h),
+                low: 0.0,
+            })
+            .collect();
+        let mut free_flow: Vec<_> = free
+            .iter()
+            .map(|f| FlowSum {
+                high: corrected_free(f, &phi, &inverse_root),
+                low: 0.0,
+            })
+            .collect();
+        let physical_residual =
+            |edge_u: &[FlowSum], free_u: &[FlowSum], out: &mut [f64], sums: &mut [FlowSum]| {
+                sums.fill(FlowSum::default());
+                for (e, &u) in edges.iter().zip(edge_u) {
+                    let q = u.scale(e.area);
+                    sums[e.a].add_sum(q);
+                    sums[e.b].add_sum(q.scale(-1.0));
                 }
-            }
-            scaled_gauge(&gauge, &root_diagonal, out);
-        };
+                for (j, f) in free.iter().enumerate() {
+                    if let Some(q) = held[j] {
+                        sums[f.row].add(q);
+                    } else {
+                        sums[f.row].add_sum(free_u[j].scale(f.area));
+                    }
+                }
+                for i in 0..n {
+                    out[i] = -rho / dt / h * sums[i].value() * inverse_root[i];
+                }
+                scaled_gauge(&gauge, &root_diagonal, out);
+            };
+        let increment_flow =
+            |step: &[f64], scale: f64, edge_u: &mut [FlowSum], free_u: &mut [FlowSum]| {
+                for (e, u) in edges.iter().zip(edge_u) {
+                    let jump = pressure_jump(
+                        0.0,
+                        0.0,
+                        step[e.a],
+                        step[e.b],
+                        inverse_root[e.a],
+                        inverse_root[e.b],
+                    );
+                    u.add_sum(FlowSum::product(jump, -scale * dt / rho / h / e.distance));
+                }
+                for (f, u) in free.iter().zip(free_u) {
+                    let response = if f.axis.is_none() {
+                        let root_c = grid.fraction[indices[f.row]].sqrt();
+                        dt / rho / h * (inverse_root[f.row] / root_c) * (2.0 * f.area / root_c)
+                    } else {
+                        dt / rho / h / f.distance * inverse_root[f.row]
+                    };
+                    u.add_sum(FlowSum::product(step[f.row], scale * response));
+                }
+            };
+        let mut flow_sums = vec![FlowSum::default(); n];
         let mut product = vec![0.0; n];
         let mut residual = vec![0.0; n];
-        physical_residual(&phi, &mut residual);
+        physical_residual(&edge_flow, &free_flow, &mut residual, &mut flow_sums);
         let initial = physical_norm(&residual, &root_diagonal);
         let target = grid
             .config
@@ -806,6 +859,12 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         // potential defect; no volume threshold removes a row from this gate.
         // Also bound the remaining pressure-induced velocity correction by
         // 1e-8 m/s. A fixed Pa tolerance alone is unsafe as cap inertia vanishes.
+        let mut cap_area = vec![0.0; n];
+        for (j, f) in free.iter().enumerate() {
+            if f.axis.is_none() && held[j].is_none() {
+                cap_area[f.row] = f.area;
+            }
+        }
         let locally_converged = |residual: &[f64]| {
             residual.iter().enumerate().all(|(i, r)| {
                 diagonal[i] == 0.0 || {
@@ -816,26 +875,36 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                                 * (rhs[i] / diagonal[i] * inverse_root[i]).abs(),
                         )
                         && (defect * response[i]).abs() <= 1e-8
+                        && (cap_area[i] == 0.0
+                            || (r * root_diagonal[i] * (dt * h / rho) / cap_area[i]).abs() <= 5e-9)
                 }
             })
         };
+        let mut correction = vec![0.0; n];
         let mut iterations = 0;
         while (physical_norm(&residual, &root_diagonal) > target || !locally_converged(&residual))
             && iterations + total_iterations < grid.config.pressure_max_iterations
         {
-            if physical_norm(&residual, &root_diagonal) <= target || !rz.is_finite() {
-                // A finite pressure hint on a vanishing-inertia cap can also
-                // overflow the CG dot product. The same budgeted relaxation
-                // removes that hint without changing the equation or tolerance.
+            if !rz.is_finite() || rz <= 0.0 {
+                increment_flow(&correction, 1.0, &mut edge_flow, &mut free_flow);
+                for i in 0..n {
+                    phi[i] += correction[i];
+                }
+                correction.fill(0.0);
+                physical_residual(&edge_flow, &free_flow, &mut residual, &mut flow_sums);
+                // Tiny interfaces can underflow the CG dot product. Flush the
+                // pending correction, then use the same budgeted relaxation
+                // on the actual flow defect without changing the equation.
                 // Local symmetric relaxation corrects weak rows whose dot
                 // products disappear beneath the large rows' roundoff. Each
                 // correction consumes one iteration of the original budget.
                 precondition(&residual, &diagonal, &lower, &upper, &mut z);
+                increment_flow(&z, 1.0, &mut edge_flow, &mut free_flow);
                 for i in 0..n {
                     phi[i] += z[i];
                 }
                 scaled_gauge(&gauge, &root_diagonal, &mut phi);
-                physical_residual(&phi, &mut residual);
+                physical_residual(&edge_flow, &free_flow, &mut residual, &mut flow_sums);
                 precondition(&residual, &diagonal, &lower, &upper, &mut z);
                 scaled_gauge(&gauge, &root_diagonal, &mut z);
                 direction.copy_from_slice(&z);
@@ -850,16 +919,25 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             }
             let alpha = rz / dp;
             for i in 0..n {
-                phi[i] += alpha * direction[i];
+                correction[i] += alpha * direction[i];
                 residual[i] -= alpha * product[i];
             }
             scaled_gauge(&gauge, &root_diagonal, &mut residual);
-            // Recursive CG residuals can lose the remaining correction through
-            // cancellation. Verify apparent convergence against the actual
-            // operator and restart from that residual within the same budget.
-            let reliable = physical_norm(&residual, &root_diagonal) <= target;
+            // The accumulated correction is a fresh incremental pressure
+            // solve. Flush only after recursive global AND local convergence,
+            // then verify/restart from the actual two-component patch flows.
+            // Resetting this correction avoids losing subsequent small forces
+            // beneath a large total pressure, without updating every face at
+            // every Krylov iteration.
+            let reliable =
+                physical_norm(&residual, &root_diagonal) <= target && locally_converged(&residual);
             if reliable {
-                physical_residual(&phi, &mut residual);
+                increment_flow(&correction, 1.0, &mut edge_flow, &mut free_flow);
+                for i in 0..n {
+                    phi[i] += correction[i];
+                }
+                correction.fill(0.0);
+                physical_residual(&edge_flow, &free_flow, &mut residual, &mut flow_sums);
             }
             precondition(&residual, &diagonal, &lower, &upper, &mut z);
             scaled_gauge(&gauge, &root_diagonal, &mut z);
@@ -871,9 +949,19 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             rz = next;
             iterations += 1;
         }
-        physical_residual(&phi, &mut residual);
+        increment_flow(&correction, 1.0, &mut edge_flow, &mut free_flow);
+        for i in 0..n {
+            phi[i] += correction[i];
+        }
+        physical_residual(&edge_flow, &free_flow, &mut residual, &mut flow_sums);
         let final_residual = physical_norm(&residual, &root_diagonal);
-        if final_residual > target * 1.01 || !locally_converged(&residual) {
+        if final_residual > target * 1.01
+            || !locally_converged(&residual)
+            || flow_sums
+                .iter()
+                .enumerate()
+                .any(|(i, q)| cap_area[i] > 0.0 && (q.value() / cap_area[i]).abs() > 5e-9)
+        {
             return Err(MacError::MomentumPressureNotConverged {
                 residual: final_residual,
             });
@@ -884,7 +972,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             let Some(air) = f.air else {
                 continue;
             };
-            let q = f.area * corrected_free(f, &phi, &inverse_root);
+            let q = free_flow[j].scale(f.area).value();
             let capacity = (1.0 - grid.fraction[air]) * h / dt;
             let donor_capacity = grid.fraction[air] * (h / dt);
             let constraint =
@@ -905,14 +993,36 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             }
         }
         if !changed {
-            break (phi, inverse_root, initial, final_residual, before);
+            if grid.config.pressure_diagnostics {
+                let bytes = (edge_flow.capacity() + free_flow.capacity() + flow_sums.capacity())
+                    * size_of::<FlowSum>()
+                    + (cap_area.capacity() + correction.capacity()) * size_of::<f64>()
+                    + free.len() * size_of::<f64>();
+                let verified_cap_error = flow_sums
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| cap_area[*i] > 0.0)
+                    .map(|(i, q)| (q.value() / cap_area[i]).abs())
+                    .fold(0.0, f64::max);
+                eprintln!(
+                    "{{\"type\":\"cut_incremental_flow_workspace\",\"rows\":{},\"edges\":{},\"boundary_patches\":{},\"flow_workspace_bytes\":{},\"includes_boundary_output_vector\":true,\"conservative_upper_bound\":true,\"excludes_other_projector_scratch\":true,\"verified_free_cap_normal_error_m_s\":{:.17e},\"verified_cap_error_target_m_s\":5e-9,\"verification_before_f64_installation\":true}}",
+                    n,
+                    edges.len(),
+                    free.len(),
+                    bytes,
+                    verified_cap_error
+                );
+            }
+            break (
+                phi,
+                inverse_root,
+                edge_flow,
+                free_flow,
+                initial,
+                final_residual,
+                before,
+            );
         }
-        warm = Some(
-            phi.iter()
-                .zip(&inverse_root)
-                .map(|(p, inv)| p * inv)
-                .collect(),
-        );
         attempts += 1;
         if attempts > 32 || total_iterations > grid.config.pressure_max_iterations {
             return Err(MacError::MomentumPressureNotConverged {
@@ -920,18 +1030,16 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             });
         }
     };
-    let mut free_velocity: Vec<_> = free
-        .iter()
-        .map(|f| corrected_free(f, &phi, &inverse_root))
-        .collect();
+    let mut free_velocity: Vec<_> = free_flow.iter().map(|u| u.value()).collect();
+    let mut cartesian_flow = vec![FlowSum::default(); n];
     grid.pressure_pa.fill(0.0);
     for r in 0..n {
         grid.pressure_pa[indices[r]] = phi[r] * inverse_root[r] + (base[r] - potential(centers[r]));
     }
     grid.cut_surface_flux = std::array::from_fn(|a| vec![0.0; known[a].len()]);
     let mut flux = vec![0.0; n];
-    for e in &edges {
-        let u = edge_velocity(e, &phi, &inverse_root, &base, dt / rho / h);
+    for (e, &flow) in edges.iter().zip(&edge_flow) {
+        let u = flow.value();
         if grid.config.pressure_diagnostics && u.abs() > 10.0 {
             eprintln!(
                 "{{\"type\":\"cut_fast_edge\",\"axis\":{},\"face\":{},\"a\":{},\"b\":{},\"fraction_a\":{:.17e},\"fraction_b\":{:.17e},\"area\":{:.17e},\"distance\":{:.17e},\"predicted_velocity\":{:.17e},\"corrected_velocity\":{:.17e},\"phi_a\":{:.17e},\"phi_b\":{:.17e}}}",
@@ -949,6 +1057,9 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
                 phi[e.b] * inverse_root[e.b] + base[e.b] - reference
             );
         }
+        let precise_q = flow.scale(e.area);
+        cartesian_flow[e.a].add_sum(precise_q);
+        cartesian_flow[e.b].add_sum(precise_q.scale(-1.0));
         let q = e.area * u;
         grid.cut_surface_flux[e.axis][e.face] += q * h * h;
         flux[e.a] += q;
@@ -974,6 +1085,11 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         }
         if f.axis.is_none() {
             continue;
+        }
+        if let Some(q) = held[j] {
+            cartesian_flow[f.row].add(q);
+        } else {
+            cartesian_flow[f.row].add_sum(free_flow[j].scale(f.area));
         }
         flux[f.row] += f.area * u;
         if let Some(axis) = f.axis {
@@ -1011,9 +1127,10 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             let compensated = audited_flux_sum(
                 edges
                     .iter()
-                    .filter(|e| e.a == f.row || e.b == f.row)
-                    .map(|e| {
-                        let q = e.area * edge_velocity(e, &phi, &inverse_root, &base, dt / rho / h);
+                    .zip(&edge_flow)
+                    .filter(|(e, _)| e.a == f.row || e.b == f.row)
+                    .map(|(e, &u)| {
+                        let q = e.area * u.value();
                         if e.a == f.row { q } else { -q }
                     })
                     .chain(
@@ -1028,7 +1145,7 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             );
             let compensated_normal = -compensated / f.area;
             eprintln!(
-                "{{\"type\":\"cut_cap_continuity_audit\",\"cell\":[{},{},{}],\"fraction\":{:.17e},\"dt_s\":{:.17e},\"cap_area_cells2\":{:.17e},\"cartesian_outflow_m3_s\":{:.17e},\"continuity_normal_m_s\":{:.17e},\"pressure_normal_m_s\":{:.17e},\"normal_error_m_s\":{:.17e},\"compensated_cartesian_outflow_m3_s\":{:.17e},\"compensated_continuity_normal_m_s\":{:.17e},\"summation_normal_difference_m_s\":{:.17e},\"compensated_pressure_normal_error_m_s\":{:.17e},\"pressure_response_accuracy_m_s\":1e-8,\"within_pressure_response_accuracy\":{},\"projection_residual\":{:.17e},\"residual_evaluation\":\"projected_faces_with_equilibrated_caps\",\"pressure_iterations\":{},\"free_caps\":{},\"contact_caps\":{},\"before_accepted_transport\":true}}",
+                "{{\"type\":\"cut_cap_continuity_audit\",\"cell\":[{},{},{}],\"fraction\":{:.17e},\"dt_s\":{:.17e},\"cap_area_cells2\":{:.17e},\"cartesian_outflow_m3_s\":{:.17e},\"continuity_normal_m_s\":{:.17e},\"pressure_normal_m_s\":{:.17e},\"normal_error_m_s\":{:.17e},\"compensated_cartesian_outflow_m3_s\":{:.17e},\"compensated_continuity_normal_m_s\":{:.17e},\"summation_normal_difference_m_s\":{:.17e},\"compensated_pressure_normal_error_m_s\":{:.17e},\"pressure_response_accuracy_m_s\":1e-8,\"within_pressure_response_accuracy\":{},\"projection_residual\":{:.17e},\"residual_evaluation\":\"incremental_two_component_patch_flows\",\"pressure_iterations\":{},\"free_caps\":{},\"contact_caps\":{},\"before_accepted_transport\":true}}",
                 cell.x,
                 cell.y,
                 cell.z,
@@ -1052,19 +1169,26 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
         }
     }
     for (j, f) in free.iter().enumerate().filter(|(_, f)| f.axis.is_none()) {
-        // Zero net Cartesian outflow fixes a free atmospheric cap's normal
-        // to zero by continuity. Avoid cancellation in its predictor/pressure
-        // subtraction, and require agreement with the solved normal within
-        // the existing pressure-response accuracy. Nonzero outflow retains
-        // the pressure result; contact caps retain prescribed displacement.
+        // Exactly zero projected Cartesian outflow fixes the cap normal to
+        // zero. Test the same two-component flows verified by projection: a
+        // sum of rounded output faces can be zero while a real small transfer
+        // remains. Preserve that transfer's solved normal; contacts retain
+        // prescribed displacement. The pressure-response guard is unchanged.
+        if grid.config.pressure_diagnostics
+            && held[j].is_none()
+            && flux[f.row] == 0.0
+            && cartesian_flow[f.row].value() != 0.0
+        {
+            eprintln!(
+                "{{\"type\":\"cut_cartesian_sum_rounding\",\"cell_index\":{},\"fraction\":{:.17e},\"rounded_cartesian_outflow_m3_s\":0,\"projected_cartesian_outflow_m3_s\":{:.17e},\"cap_normal_m_s\":{:.17e},\"before_accepted_transport\":true}}",
+                indices[f.row],
+                grid.fraction[indices[f.row]],
+                cartesian_flow[f.row].value() * h * h,
+                free_velocity[j]
+            );
+        }
         let u = held[j].map_or_else(
-            || {
-                if flux[f.row] == 0.0 {
-                    0.0
-                } else {
-                    free_velocity[j]
-                }
-            },
+            || free_cap_normal(cartesian_flow[f.row], free_velocity[j]),
             |q| q / f.area,
         );
         if !u.is_finite() || (held[j].is_none() && (u - free_velocity[j]).abs() > 1e-8) {
@@ -1127,10 +1251,9 @@ pub(super) fn project(grid: &mut MacGridWorld, dt: f64) -> Result<ProjectionStat
             let mut cap_flux = 0.0;
             let mut cap_velocity = 0.0;
             let mut magnitude = 0.0;
-            for e in &edges {
+            for (e, &u) in edges.iter().zip(&edge_flow) {
                 if e.a == r || e.b == r {
-                    let u = edge_velocity(e, &phi, &inverse_root, &base, dt / rho / h);
-                    let q = e.area * u;
+                    let q = e.area * u.value();
                     let side = usize::from(e.a == r);
                     cartesian[2 * e.axis + side] += if side == 1 { q } else { -q };
                     magnitude += q.abs();
@@ -1224,6 +1347,35 @@ pub(super) fn transport_velocity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incremental_pressure_keeps_a_transfer_below_face_velocity_ulp() {
+        // Unit area and dt/(rho*h*distance)=1: this exactly represented
+        // pressure jump produces an outward velocity impulse -2^-54. The
+        // projected face rounds to 1, but its opposing unit flow must leave
+        // the actual pressure-induced transfer rather than exact rest.
+        let impulse = -2.0_f64.powi(-54);
+        let mut face = FlowSum {
+            high: 1.0,
+            low: 0.0,
+        };
+        face.add_sum(FlowSum::product(-impulse, -1.0));
+        assert_eq!(face.value(), 1.0);
+        let mut cell_outflow = face.scale(1.0);
+        cell_outflow.add(-1.0);
+        assert_eq!(cell_outflow.value(), impulse);
+        // A 2^-40-area atmospheric cap must carry the opposite transfer.
+        // Rounding the unit Cartesian faces first yields zero and wrongly
+        // forces this physically nonzero normal to zero.
+        let normal = -impulse / 2.0_f64.powi(-40);
+        assert_eq!(normal, 2.0_f64.powi(-14));
+        assert_eq!(free_cap_normal(cell_outflow, normal), normal);
+        assert_eq!(free_cap_normal(FlowSum::default(), impulse), 0.0);
+        // Equal and opposite pressure work returns exactly to the predictor.
+        face.add_sum(FlowSum::product(-impulse, 1.0));
+        assert_eq!(face.value(), 1.0);
+        assert_eq!(face.low, 0.0);
+    }
+
     #[test]
     fn cap_flux_audit_preserves_a_small_unbalanced_transfer() {
         // Exactly represented opposing patch flows hide a real 1-unit transfer

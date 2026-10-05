@@ -1,0 +1,1496 @@
+{
+  "512": {
+    "accepted_ticks": 3276,
+    "coarsen": 3,
+    "committed_edits": 140,
+    "cut_end_x_exclusive": 217,
+    "cut_interval_ticks": 6,
+    "elapsed_s": 56.7139595,
+    "failure": null,
+    "final_domain_dimensions": [
+      186,
+      75,
+      186
+    ],
+    "final_face_speed_m_s": 3.193488963325829,
+    "final_fluid_cells": 96100,
+    "final_interface_predictor_speed_m_s": 3.0147383150910385,
+    "final_shadow_step_accepted": true,
+    "final_shadow_step_dt_s": 0.05,
+    "final_shadow_step_error": null,
+    "fluid_realtime_ratio": 0.8983678877155322,
+    "fluid_time_s": 50.94999999999924,
+    "fraction_max": 1.0,
+    "fraction_min": 0.0,
+    "graphical_acceptance": false,
+    "growth_refused": 10,
+    "growth_tick_us": [
+      14410,
+      16780,
+      86042,
+      19438
+    ],
+    "growths": 4,
+    "hammer_committed": 46,
+    "initial_accounted_water_m3": 636.000000000001,
+    "initial_domain_dimensions": [
+      120,
+      48,
+      129
+    ],
+    "initial_fluid_cells": 27520,
+    "network_acceptance": false,
+    "nonconverged_substeps": 0,
+    "old_end_x_exclusive": 177,
+    "other_committed_edits": 94,
+    "post_dig_ticks": 3000,
+    "pressure_iterations_total": 196482,
+    "pressure_rows_total": 2329723,
+    "radius_voxels": 3,
+    "reconstructed_surface_support": true,
+    "rejected_edits": 0,
+    "requested_ticks": 3276,
+    "scenario": "reconstructed_eng121_paced_hammer_trench",
+    "season": "autumn",
+    "seed": 1,
+    "seed_report": "WaterSeedReport { seeded_m3: 635.9999999999999, dropped_in_solid_m3: 38.0 }",
+    "shoreline": [
+      171,
+      128,
+      387
+    ],
+    "size": 512,
+    "skip_reasons": {
+      "busy": 0,
+      "residency": 0,
+      "stability": 0,
+      "stale": 68
+    },
+    "skipped_fluid_s": 3.4,
+    "skipped_steps": 68,
+    "solver_steps": 1019,
+    "source_revision": "0087be8+incremental-flow-final",
+    "stage_profile_us_except_substeps": [
+      {
+        "median": 0,
+        "p95": 0,
+        "stage": "velocity_advection",
+        "sum": 0
+      },
+      {
+        "median": 17291,
+        "p95": 20178,
+        "stage": "pressure",
+        "sum": 17358241
+      },
+      {
+        "median": 7733,
+        "p95": 9598,
+        "stage": "transport",
+        "sum": 7830518
+      },
+      {
+        "median": 395,
+        "p95": 579,
+        "stage": "boundary",
+        "sum": 408074
+      },
+      {
+        "median": 1,
+        "p95": 1,
+        "stage": "substeps",
+        "sum": 1019
+      },
+      {
+        "median": 29,
+        "p95": 101,
+        "stage": "transport_reconstruction",
+        "sum": 35022
+      },
+      {
+        "median": 612,
+        "p95": 748,
+        "stage": "transport_flux",
+        "sum": 621380
+      },
+      {
+        "median": 414,
+        "p95": 1308,
+        "stage": "transport_limiter",
+        "sum": 591396
+      },
+      {
+        "median": 199,
+        "p95": 556,
+        "stage": "transport_repair",
+        "sum": 304888
+      },
+      {
+        "median": 1700,
+        "p95": 2101,
+        "stage": "transport_interface",
+        "sum": 1644934
+      },
+      {
+        "median": 4698,
+        "p95": 5786,
+        "stage": "transport_momentum",
+        "sum": 4596374
+      }
+    ],
+    "step_max_us": 39621,
+    "step_median_us": 25887,
+    "step_p95_us": 29638,
+    "submitted_cuts": 46,
+    "tick_max_us": 90079,
+    "tick_median_us": 500,
+    "tick_p95_us": 2104,
+    "timing_acceptance": true,
+    "trench_center_section": [
+      {
+        "solid": true,
+        "voxel_origin": [
+          165,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          165,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          165,
+          126,
+          387
+        ],
+        "water_fraction": 0.5695263768635672
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          165,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          168,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          168,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          168,
+          126,
+          387
+        ],
+        "water_fraction": 0.5324917181389304
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          168,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          171,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          171,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          171,
+          126,
+          387
+        ],
+        "water_fraction": 0.500591651801539
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          171,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          174,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          174,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          174,
+          126,
+          387
+        ],
+        "water_fraction": 0.44269488611268926
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          174,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          177,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          177,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          177,
+          126,
+          387
+        ],
+        "water_fraction": 0.3944084061588491
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          177,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          180,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          180,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          180,
+          126,
+          387
+        ],
+        "water_fraction": 0.33509204642790125
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          180,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          183,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          183,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          183,
+          126,
+          387
+        ],
+        "water_fraction": 0.2847175137409257
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          183,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          186,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          186,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          186,
+          126,
+          387
+        ],
+        "water_fraction": 0.2185695461663576
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          186,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          189,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          189,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          189,
+          126,
+          387
+        ],
+        "water_fraction": 0.1755885433340445
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          189,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          192,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          192,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          192,
+          126,
+          387
+        ],
+        "water_fraction": 0.15002178095065163
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          192,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          195,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          195,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          195,
+          126,
+          387
+        ],
+        "water_fraction": 0.15383450879648597
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          195,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          198,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          198,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          198,
+          126,
+          387
+        ],
+        "water_fraction": 0.1632959534381457
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          198,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          201,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          201,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          201,
+          126,
+          387
+        ],
+        "water_fraction": 0.28929368765897984
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          201,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          204,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          204,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          204,
+          126,
+          387
+        ],
+        "water_fraction": 0.3453012409650166
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          204,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          207,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          207,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          207,
+          126,
+          387
+        ],
+        "water_fraction": 0.3576769745403409
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          207,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          210,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          210,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          210,
+          126,
+          387
+        ],
+        "water_fraction": 0.35533518505086475
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          210,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          213,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          213,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          213,
+          126,
+          387
+        ],
+        "water_fraction": 0.35871490056717903
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          213,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          216,
+          120,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          216,
+          123,
+          387
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          216,
+          126,
+          387
+        ],
+        "water_fraction": 0.3749081288133242
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          216,
+          129,
+          387
+        ],
+        "water_fraction": 0.0
+      }
+    ],
+    "water_crossed_old_edge": true,
+    "water_error_m3": -3.410605131648481e-12,
+    "water_only": true,
+    "water_past_old_edge_m3": 42.36514450895235
+  },
+  "1024": {
+    "accepted_ticks": 3270,
+    "coarsen": 4,
+    "committed_edits": 59,
+    "cut_end_x_exclusive": 396,
+    "cut_interval_ticks": 6,
+    "elapsed_s": 58.6118203,
+    "failure": null,
+    "final_domain_dimensions": [
+      332,
+      48,
+      236
+    ],
+    "final_face_speed_m_s": 0.923995239984914,
+    "final_fluid_cells": 58764,
+    "final_interface_predictor_speed_m_s": 0.32824613904526895,
+    "final_shadow_step_accepted": true,
+    "final_shadow_step_dt_s": 0.05,
+    "final_shadow_step_error": null,
+    "fluid_realtime_ratio": 0.8854869160239882,
+    "fluid_time_s": 51.89999999999919,
+    "fraction_max": 1.0,
+    "fraction_min": 0.0,
+    "graphical_acceptance": false,
+    "growth_refused": 0,
+    "growth_tick_us": [
+      62004,
+      62018
+    ],
+    "growths": 2,
+    "hammer_committed": 45,
+    "initial_accounted_water_m3": 2201.4375,
+    "initial_domain_dimensions": [
+      260,
+      48,
+      236
+    ],
+    "initial_fluid_cells": 46020,
+    "network_acceptance": false,
+    "nonconverged_substeps": 0,
+    "old_end_x_exclusive": 356,
+    "other_committed_edits": 14,
+    "post_dig_ticks": 3000,
+    "pressure_iterations_total": 222387,
+    "pressure_rows_total": 3337659,
+    "radius_voxels": 3,
+    "reconstructed_surface_support": true,
+    "rejected_edits": 0,
+    "requested_ticks": 3270,
+    "scenario": "reconstructed_eng121_paced_hammer_trench",
+    "season": "autumn",
+    "seed": 1,
+    "seed_report": "WaterSeedReport { seeded_m3: 2201.4375, dropped_in_solid_m3: 199.109375 }",
+    "shoreline": [
+      351,
+      128,
+      821
+    ],
+    "size": 1024,
+    "skip_reasons": {
+      "busy": 6,
+      "residency": 0,
+      "stability": 0,
+      "stale": 43
+    },
+    "skipped_fluid_s": 2.45,
+    "skipped_steps": 49,
+    "solver_steps": 1038,
+    "source_revision": "0087be8+incremental-flow-final",
+    "stage_profile_us_except_substeps": [
+      {
+        "median": 0,
+        "p95": 0,
+        "stage": "velocity_advection",
+        "sum": 0
+      },
+      {
+        "median": 22152,
+        "p95": 28248,
+        "stage": "pressure",
+        "sum": 23710793
+      },
+      {
+        "median": 9270,
+        "p95": 15260,
+        "stage": "transport",
+        "sum": 10567538
+      },
+      {
+        "median": 283,
+        "p95": 441,
+        "stage": "boundary",
+        "sum": 335722
+      },
+      {
+        "median": 1,
+        "p95": 1,
+        "stage": "substeps",
+        "sum": 1038
+      },
+      {
+        "median": 14,
+        "p95": 28,
+        "stage": "transport_reconstruction",
+        "sum": 16220
+      },
+      {
+        "median": 599,
+        "p95": 728,
+        "stage": "transport_flux",
+        "sum": 623139
+      },
+      {
+        "median": 2617,
+        "p95": 3352,
+        "stage": "transport_limiter",
+        "sum": 2625716
+      },
+      {
+        "median": 1061,
+        "p95": 6808,
+        "stage": "transport_repair",
+        "sum": 2145896
+      },
+      {
+        "median": 1190,
+        "p95": 1658,
+        "stage": "transport_interface",
+        "sum": 1300830
+      },
+      {
+        "median": 3540,
+        "p95": 4678,
+        "stage": "transport_momentum",
+        "sum": 3846195
+      }
+    ],
+    "step_max_us": 67980,
+    "step_median_us": 32156,
+    "step_p95_us": 41961,
+    "submitted_cuts": 45,
+    "tick_max_us": 464766,
+    "tick_median_us": 330,
+    "tick_p95_us": 744,
+    "timing_acceptance": true,
+    "trench_center_section": [
+      {
+        "solid": true,
+        "voxel_origin": [
+          340,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          340,
+          124,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          340,
+          128,
+          820
+        ],
+        "water_fraction": 0.07942463931205289
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          340,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          344,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          344,
+          124,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          344,
+          128,
+          820
+        ],
+        "water_fraction": 0.07657694045523976
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          344,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          348,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          348,
+          124,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          348,
+          128,
+          820
+        ],
+        "water_fraction": 0.07486796379881924
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          348,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          352,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          352,
+          124,
+          820
+        ],
+        "water_fraction": 0.49327721307899364
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          352,
+          128,
+          820
+        ],
+        "water_fraction": 0.002084659250279993
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          352,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          356,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          356,
+          124,
+          820
+        ],
+        "water_fraction": 0.4745807891004406
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          356,
+          128,
+          820
+        ],
+        "water_fraction": 5.421010862427522e-20
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          356,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          360,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          360,
+          124,
+          820
+        ],
+        "water_fraction": 0.47241045447048974
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          360,
+          128,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          360,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          364,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          364,
+          124,
+          820
+        ],
+        "water_fraction": 0.47453630459201007
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          364,
+          128,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          364,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          368,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          368,
+          124,
+          820
+        ],
+        "water_fraction": 0.4913685353229751
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          368,
+          128,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          368,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          372,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          372,
+          124,
+          820
+        ],
+        "water_fraction": 0.538136469686416
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          372,
+          128,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          372,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          376,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          376,
+          124,
+          820
+        ],
+        "water_fraction": 0.5451983515415915
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          376,
+          128,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          376,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          380,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          380,
+          124,
+          820
+        ],
+        "water_fraction": 0.5483908115601916
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          380,
+          128,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          380,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          384,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          384,
+          124,
+          820
+        ],
+        "water_fraction": 0.5509111858415792
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          384,
+          128,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          384,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          388,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          388,
+          124,
+          820
+        ],
+        "water_fraction": 0.5527634203246026
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          388,
+          128,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          388,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          392,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          392,
+          124,
+          820
+        ],
+        "water_fraction": 0.5867907042469712
+      },
+      {
+        "solid": false,
+        "voxel_origin": [
+          392,
+          128,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          392,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          396,
+          120,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          396,
+          124,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          396,
+          128,
+          820
+        ],
+        "water_fraction": 0.0
+      },
+      {
+        "solid": true,
+        "voxel_origin": [
+          396,
+          132,
+          820
+        ],
+        "water_fraction": 0.0
+      }
+    ],
+    "water_crossed_old_edge": true,
+    "water_error_m3": -2.5011104298755527e-11,
+    "water_only": true,
+    "water_past_old_edge_m3": 5.235087026687268
+  }
+}

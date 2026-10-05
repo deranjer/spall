@@ -1385,3 +1385,34 @@ ENG-122: shared local pressure/flux agreement for nearly closed caps and tiny
 moving fragments within original budgets; then accepted momentum, scratch,
 sustained windowed gates. Capacity/thin-wall/displacement/recovery remain open.
 Keep reconstructed support experimental and ENG-122 in progress.
+ENG-122 incremental pressure/flow checkpoint (2026-10-05): opt-in reconstructed
+support now solves fresh pressure increments, applies them to compensated patch
+velocities/fluxes, verifies actual flow residuals, then resets the increment.
+Cold-starts each contact solve; rounded pressure remains a cache/diagnostic.
+Existing global/local pressure/1e-8 response checks remain; every positive free
+cap additionally verifies net flux/area within5e-9 m/s before f64 installation.
+Original400/1000 iterations,32 contacts,8 substeps/CFL, topology, amounts and
+owner/save/wire/paired transport/default contracts remain. No floors/anchors/
+clipping. Krylov keeps progress through global convergence; zero/nonfinite dots
+use budgeted relaxation. Batching avoids costly every-iteration face work.
+Exact stationary-cap rule uses verified projected Cartesian sum; rounded output
+can falsely sum to zero. Analytic sub-ulp transfer/cap-normal regression protects
+this distinction; truly zero flow retains exact stationary normal.
+Original final512/1024 trenches pass3276/3270 ticks and final50ms, zero stability/
+residency skips, ratios0.8984/0.8855, medians25.887/32.156ms, delivery42.36514/
+5.23509m3. Sequential paced runs without concurrent owned builds/simulations.
+No controlled speedup or whole-memory saving claimed. Cold flow workspace
+conservative partial bounds: final shadows268608/374720 bytes (other projector
+allocations excluded). Library104, shallow6, references600 each and exact
+replays1000/100/100 pass. Closing-gap600 stored error3.97882e-9m/s meets1e-8;
+channel internal error4.99853e-9 meets5e-9 but stored error6.70132e-6 stillfails
+1e-8 on587/599 selected rows. Unfiltered normalized divergence1.21397e104/s
+remains enormous; no complete physical acceptance or default promotion.
+Full-check result/exact commands/initial replication failure and retries in
+reports/ENG-122.md; failed scalar/unbatched/rounded-zero trials preserved.
+Next unblocked ENG-122: preserve projected small transfers through stored face
+aggregation and accepted momentum, then full scratch and sustained/windowed
+checks. Capacity/thin walls/displacement/recovery remain open. In progress.
+Final ENG-122 incremental-flow validation: cargo xtask check1219 passed/0 failed/63 ignored
+across137 suites, including formatting and strict workspace Clippy. Initial dam-replication
+admin-ack failure and isolated retry pass are preserved; no networking/fixture/budget changes.

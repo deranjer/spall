@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running tests\dam_gate_replication.rs (G:/Programming/voxel_engine/target\debug\deps\dam_gate_replication-a6e5c66255505ddf.exe)
+
+running 1 test
+spall-client: admin request 1 accepted: dam gate opening (11 pieces; queued, watch for follow-up status)
+spall-client: admin request 1 accepted: dam gate edit committed
+spall-client: admin request 1 accepted: dam gate edit committed
+spall-client: admin request 1 accepted: dam gate edit committed
+spall-client: admin request 1 accepted: dam gate edit committed
+spall-client: admin request 1 accepted: dam gate edit committed
+spall-client: admin request 1 accepted: dam gate edit committed
+spall-client: admin request 1 accepted: dam gate edit committed
+spall-client: admin request 1 accepted: dam gate edit committed
+spall-client: admin request 1 accepted: dam gate edit committed
+spall-client: admin request 1 accepted: dam gate edit committed
+spall-client: admin request 1 accepted: dam gate edit committed
+gate cells: 728, open on the client replica: 728, server final hash 3604533811830062f309825efa4170d8e723e8872b0bc310a9f8a40ba4cc1060, client final hash 3604533811830062f309825efa4170d8e723e8872b0bc310a9f8a40ba4cc1060
+test a_real_client_sees_the_dam_gate_open_after_the_admin_command ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.98s
