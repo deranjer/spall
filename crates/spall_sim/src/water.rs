@@ -373,8 +373,8 @@ impl Exchange {
     }
 }
 
-/// Seed accounting: authored water that could not be placed because its fluid
-/// cell is solid after coarsening.
+/// Seed accounting. Authored water overlapping a coarsened solid cell uses
+/// the existing conservative displacement/trapped-volume policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WaterSeedReport {
     pub seeded_m3: f64,
@@ -429,7 +429,7 @@ impl AuthoritativeWater {
         if !(1..=8).contains(&coarsen)
             || dims.iter().any(|d| *d % coarsen != 0)
             || cells.is_none_or(|n| n > spall_protocol::water::MAX_WATER_CELLS)
-            || voxels.is_none_or(|n| n > 32 * 1024 * 1024)
+            || voxels.is_none_or(|n| n > spall_protocol::water::MAX_WATER_VOXEL_CELLS)
             || setup.config.cell_size_m != VOXEL_CELL_M * f64::from(coarsen)
             || std::iter::once(&setup.sources)
                 .chain(setup.gated_sources.iter())
@@ -523,7 +523,11 @@ impl AuthoritativeWater {
         let c = self.setup.config;
         let coords = |cells: &[GlobalCell]| cells.iter().map(|p| [p.x, p.y, p.z]).collect();
         spall_protocol::WaterState {
-            version: 1,
+            version: if self.domain.cell_count() > spall_protocol::water::MAX_WATER_VOXEL_CELLS_V1 {
+                2
+            } else {
+                1
+            },
             origin: [
                 self.domain.origin().x,
                 self.domain.origin().y,
@@ -571,7 +575,7 @@ impl AuthoritativeWater {
         let domain = DomainSpec::new(
             GlobalCell::new(state.origin[0], state.origin[1], state.origin[2]),
             state.voxel_dimensions,
-            spall_protocol::water::MAX_WATER_CELLS * 512,
+            spall_protocol::water::MAX_WATER_VOXEL_CELLS,
         )
         .map_err(|e| WaterError::Boundary(e.to_string()))?;
         let c = state.config_bits.map(f64::from_bits);
@@ -785,8 +789,10 @@ impl AuthoritativeWater {
                 .iter()
                 .try_fold(1u128, |n, d| n.checked_mul(*d as u128));
             let fluid = voxels.map(|v| v / (c as u128).pow(3));
-            if voxels.is_none_or(|v| v > growth.max_voxel_cells as u128 || v > 32 * 1024 * 1024)
-                || fluid.is_none_or(|f| f > spall_protocol::water::MAX_WATER_CELLS as u128)
+            if voxels.is_none_or(|v| {
+                v > growth.max_voxel_cells as u128
+                    || v > spall_protocol::water::MAX_WATER_VOXEL_CELLS as u128
+            }) || fluid.is_none_or(|f| f > spall_protocol::water::MAX_WATER_CELLS as u128)
             {
                 refusal = GrowthRefusal::TooLarge;
                 if margin <= full_margin / 4 {
@@ -910,7 +916,7 @@ impl AuthoritativeWater {
             .try_fold(1usize, |n, d| n.checked_mul(*d as usize));
         if !aligned
             || cells.is_none_or(|n| n > spall_protocol::water::MAX_WATER_CELLS)
-            || voxels.is_none_or(|n| n > 32 * 1024 * 1024)
+            || voxels.is_none_or(|n| n > spall_protocol::water::MAX_WATER_VOXEL_CELLS)
         {
             return Err(WaterError::Boundary(
                 "grown water domain must contain the old one on its fluid grid within limits"
@@ -1178,8 +1184,8 @@ fn capture_boundary(
         .map_err(|error| WaterError::Boundary(error.to_string()))
 }
 
-/// Aggregates voxel fractions into fluid cells (`sum / coarsen³`). Water in a
-/// fluid cell that coarsened to solid is dropped and reported.
+/// Aggregates voxel fractions into fluid cells (`sum / coarsen³`). Overlap
+/// uses the same conservative displacement/retention as durable recovery.
 fn seed_fractions(
     grid: &mut MacGridWorld,
     boundary: &SolidBoundary,
@@ -1190,26 +1196,38 @@ fn seed_fractions(
     let per_cell = f64::from(coarsen).powi(3);
     let mut sums = std::collections::BTreeMap::<(i64, i64, i64), f64>::new();
     for (cell, fraction) in &setup.initial_fractions {
+        if !fraction.is_finite() || !(0.0..=1.0).contains(fraction) {
+            return Err(WaterError::Boundary(
+                "invalid initial water fraction".into(),
+            ));
+        }
         let c = i64::from(coarsen);
         let key = (
             origin.x + (cell.x - origin.x).div_euclid(c),
             origin.y + (cell.y - origin.y).div_euclid(c),
             origin.z + (cell.z - origin.z).div_euclid(c),
         );
-        *sums.entry(key).or_default() += fraction.clamp(0.0, 1.0) / per_cell;
+        *sums.entry(key).or_default() += fraction / per_cell;
     }
     let voxel_m3 = VOXEL_CELL_M.powi(3) * per_cell;
     let mut report = WaterSeedReport::default();
+    let dims = grid.spec().dimensions();
+    let mut values = vec![0.0; grid.spec().cell_count()];
     for ((x, y, z), fraction) in sums {
         let cell = GlobalCell::new(x, y, z);
-        let fraction = fraction.min(1.0);
+        if fraction > 1.0 + 1e-9 {
+            return Err(WaterError::Boundary(
+                "initial water exceeds cell capacity".into(),
+            ));
+        }
         match boundary.is_solid(cell) {
-            Some(false) => {
-                grid.set_fraction(cell, fraction)
-                    .map_err(WaterError::Solver)?;
+            Some(_) => {
+                let index = (x - origin.x) as usize
+                    + dims[0] as usize
+                        * ((y - origin.y) as usize + dims[1] as usize * (z - origin.z) as usize);
+                values[index] = fraction;
                 report.seeded_m3 += fraction * voxel_m3;
             }
-            Some(true) => report.dropped_in_solid_m3 += fraction * voxel_m3,
             None => {
                 return Err(WaterError::Boundary(format!(
                     "initial water at {cell:?} is outside the fluid domain"
@@ -1217,6 +1235,8 @@ fn seed_fractions(
             }
         }
     }
+    grid.restore_displacing(&values, boundary)
+        .map_err(WaterError::Solver)?;
     Ok(report)
 }
 
@@ -1486,6 +1506,33 @@ mod tests {
             .map(|f| f64::from(*f) / 255.0 * 0.125)
             .sum();
         assert!((quantized - authored).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn coarse_seed_overlap_is_retained_and_survives_canonical_recovery() {
+        let mut volume = Volume::new(VolumeId::new(3).unwrap(), CellSizeCode::Quarter);
+        volume
+            .insert_brick(
+                BrickCoord::new(0, 0, 0),
+                Brick::uniform(MaterialId(1), Revision(1)),
+            )
+            .unwrap();
+        let mut edit = EditPlan::new(volume.id());
+        edit.set(GlobalCell::new(0, 0, 0), MaterialId::AIR);
+        volume.apply_edit(&edit).unwrap();
+        // A real open voxel in a 2^3 block that the current boundary coarsens
+        // to solid. No connected free coarse cell exists for displacement.
+        let domain = DomainSpec::new(GlobalCell::new(0, 0, 0), [2, 2, 2], 8).unwrap();
+        let setup =
+            WaterSetup::new(domain, vec![(GlobalCell::new(0, 0, 0), 1.0)]).with_coarsening(2);
+        let water = AuthoritativeWater::new(&volume, setup).unwrap();
+        assert_eq!(water.seed_report().dropped_in_solid_m3, 0.0);
+        assert_eq!(water.frame().volume_m3, 0.25_f64.powi(3));
+        assert_eq!(water.frame().trapped, vec![0.125]);
+        let state = water.canonical_state();
+        assert_eq!(state.version, 1, "small legacy domains stay schema 1");
+        let restored = AuthoritativeWater::restore(&volume, &state).unwrap();
+        assert_eq!(restored.canonical_state(), state);
     }
 
     #[test]

@@ -485,9 +485,6 @@ impl ResidencyPass {
                 tick.evicted += 1;
                 self.evicted_by_pass.insert(coord);
                 self.out_of_interest.remove(&coord);
-                resident_count = resident_count.saturating_sub(1);
-                dense_estimate =
-                    dense_estimate.saturating_sub(MemoryReport::DENSE_BRICK_BYTES as u64);
             }
         }
 

@@ -353,6 +353,7 @@ fn measure(stationary: bool) -> Stages {
         summary_json: None,
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_budget_bytes: spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
         on_replica_ready: Some(Arc::new(move |replica| {
             *slot.lock().unwrap() = Some(replica);
         })),
@@ -394,6 +395,7 @@ fn measure(stationary: bool) -> Stages {
         summary_json: None,
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_budget_bytes: spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,

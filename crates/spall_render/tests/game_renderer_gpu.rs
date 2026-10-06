@@ -623,3 +623,100 @@ fn game_renderer_frame_cost_at_forest_scale() {
     );
     std::fs::write(dir.join("summary.json"), json).expect("write summary");
 }
+
+#[test]
+#[ignore = "requires a working GPU adapter; captures the procedural skybox"]
+fn daylight_skybox_has_a_sun_and_varied_voxel_clouds() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let environment = EnvironmentPreset::Daylight.environment();
+    let camera = Camera::looking_along(
+        Vec3::ZERO,
+        -environment.sun_dir,
+        82_f32.to_radians(),
+        SIZE.0 as f32 / SIZE.1 as f32,
+    );
+    let pixels = render_game_from(
+        &ctx,
+        &camera,
+        &environment,
+        DebugView::Shaded,
+        &[],
+        &[],
+        &materials(),
+    );
+    save_png("skybox-daylight.png", &pixels);
+
+    let center = ((SIZE.1 / 2 * SIZE.0 + SIZE.0 / 2) * 4) as usize;
+    let sun = &pixels[center..center + 3];
+    assert!(
+        sun.iter().all(|channel| *channel > 180) && sun[0] > sun[2],
+        "warm sun disc: {sun:?}"
+    );
+    let colors: std::collections::HashSet<[u8; 3]> = pixels
+        .chunks_exact(4)
+        .map(|pixel| [pixel[0] / 8, pixel[1] / 8, pixel[2] / 8])
+        .collect();
+    assert!(
+        colors.len() > 25,
+        "cloud and sky variation: {} colors",
+        colors.len()
+    );
+}
+
+#[test]
+#[ignore = "requires a working GPU adapter; checks sky orientation during camera movement"]
+fn skybox_sun_tracks_world_direction_under_camera_rotation() {
+    let ctx = RenderContext::headless().expect("GPU adapter");
+    let mut environment = EnvironmentPreset::Daylight.environment();
+    // Enlarge the disc so several pixels resolve it at the small CI capture size.
+    environment.sun_angular_diameter_deg = 4.0;
+    let camera = Camera::looking_along(
+        Vec3::ZERO,
+        -environment.sun_dir,
+        82_f32.to_radians(),
+        SIZE.0 as f32 / SIZE.1 as f32,
+    );
+    for (name, yaw, pitch) in [("up", 0.16, 0.2), ("down", -0.16, -0.2)] {
+        let mut turned = camera;
+        turned.look(yaw, pitch);
+        let pixels = render_game_from(
+            &ctx,
+            &turned,
+            &environment,
+            DebugView::Shaded,
+            &[],
+            &[],
+            &materials(),
+        );
+        save_png(&format!("skybox-rotation-{name}.png"), &pixels);
+        // Use the geometry camera projection as an independent reference for
+        // where a fixed celestial direction must land on the framebuffer.
+        let ndc = turned
+            .project(turned.position - environment.sun_dir * 100.0)
+            .expect("sun remains in front of camera");
+        let x = ((ndc[0] + 1.0) * 0.5 * SIZE.0 as f32).floor() as u32;
+        let y = ((1.0 - ndc[1]) * 0.5 * SIZE.1 as f32).floor() as u32;
+        assert!(x < SIZE.0 && y < SIZE.1);
+        let offset = ((y * SIZE.0 + x) * 4) as usize;
+        let sun = &pixels[offset..offset + 3];
+        assert!(
+            sun.iter().all(|channel| *channel > 180) && sun[0] > sun[2],
+            "{name}: sun missing at geometry-projected pixel ({x}, {y}): {sun:?}"
+        );
+        // Moving the eye must not move clouds or celestial bodies at infinity.
+        turned.position += Vec3::new(25.0, -8.0, 40.0);
+        let translated = render_game_from(
+            &ctx,
+            &turned,
+            &environment,
+            DebugView::Shaded,
+            &[],
+            &[],
+            &materials(),
+        );
+        assert_eq!(
+            pixels, translated,
+            "sky must be invariant under translation"
+        );
+    }
+}

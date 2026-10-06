@@ -363,6 +363,7 @@ impl GridFluidDemoApp {
                 &status,
             )),
             None,
+            None,
         ) {
             self.fail(event_loop, error);
         }
@@ -395,6 +396,7 @@ impl ApplicationHandler for GridFluidDemoApp {
             window.clone(),
             EnvironmentPreset::Daylight.environment(),
             &materials,
+            false,
             false,
         ) {
             Ok(renderer) => {

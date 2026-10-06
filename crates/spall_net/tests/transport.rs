@@ -19,6 +19,178 @@ fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual bounded bulk transfer / encrypted packet-loss profile"]
+async fn impaired_bulk_transfer_profile() {
+    use spall_net::spall_protocol::{BaselinePart, Hash32, TransferId};
+    let mib = std::env::var("SPALL_TRANSFER_PROBE_MIB")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("diagnostic MiB must be an integer")
+        })
+        .unwrap_or(4);
+    assert!(
+        (1..=128).contains(&mib),
+        "diagnostic MiB must be in 1..=128"
+    );
+    let bytes_expected = mib * 1024 * 1024;
+    // Keep the original small probe identical; large probes use the shipped
+    // baseline part size and existing streamed-baseline admission, not a raised
+    // legacy allocation ceiling.
+    let part_bytes = if mib <= 16 { 65536 } else { 1024 * 1024 };
+    let part_count = (bytes_expected / part_bytes) as u32;
+    let begin = spall_net::spall_protocol::BaselineBegin {
+        transfer_id: TransferId(1),
+        interest_epoch: spall_net::spall_protocol::InterestEpoch(0),
+        checkpoint_tick: spall_core::Tick(0),
+        journal_cursor: spall_core::JournalSeq(0),
+        world_version: spall_net::spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION,
+        content_version: 1,
+        total_bytes: bytes_expected as u64,
+        part_count,
+        regions: Vec::new(),
+    };
+    let identity = DevIdentity::generate().unwrap();
+    let token = JoinToken::generate().unwrap();
+    let mut cfg = TransportConfig::default();
+    cfg.udp_receive_buffer_bytes = std::env::var("SPALL_TRANSFER_PROBE_RCVBUF")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .expect("diagnostic UDP buffer must be an integer")
+        });
+    let controller =
+        std::env::var("SPALL_TRANSFER_PROBE_CONTROLLER").unwrap_or_else(|_| "cubic".into());
+    if controller == "bbr" {
+        cfg.congestion = spall_net::config::CongestionControl::Bbr;
+    } else {
+        assert_eq!(
+            controller, "cubic",
+            "unknown diagnostic congestion controller"
+        );
+    }
+    let server = Arc::new(
+        NetServer::bind(
+            loopback(),
+            &identity,
+            token,
+            demo_handshake(HARNESS_MANIFEST_TAG),
+            cfg,
+        )
+        .await
+        .unwrap(),
+    );
+    let loss = std::env::var("SPALL_TRANSFER_PROBE_LOSS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.05);
+    let proxy = spall_net::proxy::UdpProxy::spawn(
+        server.local_addr().unwrap(),
+        PacketFaultPlan {
+            delay: Duration::from_millis(100),
+            jitter: Duration::from_millis(20),
+            loss_ratio: loss,
+            ..PacketFaultPlan::shaped(1, 8 * 1024 * 1024)
+        },
+    )
+    .await
+    .unwrap();
+    let accepting_server = server.clone();
+    let accept = tokio::spawn(async move { accepting_server.accept().await.unwrap() });
+    let client = connect(
+        proxy.local_addr(),
+        identity.fingerprint(),
+        token,
+        demo_handshake(HARNESS_MANIFEST_TAG),
+        cfg,
+    )
+    .await
+    .unwrap();
+    let accepted = accept.await.unwrap();
+    let started = std::time::Instant::now();
+    let transfer = async {
+        let sending = async {
+            let mut bulk = accepted.open_bulk().await.unwrap();
+            for part_index in 0..part_count {
+                let payload = vec![part_index as u8; part_bytes];
+                bulk.send_part(&BaselinePart {
+                    transfer_id: TransferId(1),
+                    part_index,
+                    part_hash: Hash32::of(&payload),
+                    payload,
+                })
+                .await
+                .unwrap();
+            }
+            bulk.finish().unwrap();
+        };
+        let receiving = async {
+            let mut bulk = client.accept_streamed_baseline(&begin).await.unwrap();
+            let mut bytes = 0;
+            let mut next_index = 0;
+            while let Some(part) = bulk.next_part().await.unwrap() {
+                assert_eq!(part.transfer_id, begin.transfer_id);
+                assert_eq!(part.part_index, next_index);
+                assert_eq!(part.part_hash, Hash32::of(&part.payload));
+                assert!(part.payload.iter().all(|b| *b == part.part_index as u8));
+                bytes += part.payload.len();
+                next_index += 1;
+            }
+            assert_eq!(bytes, bytes_expected);
+            assert_eq!(next_index, part_count);
+        };
+        tokio::join!(sending, receiving);
+    };
+    let result = tokio::time::timeout(Duration::from_secs(90), transfer).await;
+    eprintln!(
+        "transfer_profile controller={controller} mib={mib} part_bytes={part_bytes} rcvbuf={:?} loss={loss} elapsed_ms={} complete={} server={:?} client={:?} proxy={:?}",
+        cfg.udp_receive_buffer_bytes,
+        started.elapsed().as_millis(),
+        result.is_ok(),
+        accepted.transport_stats(),
+        client.transport_stats(),
+        proxy.stats()
+    );
+    server.close();
+    proxy.shutdown().await;
+    assert!(
+        result.is_ok(),
+        "{mib} MiB diagnostic transfer exceeded 90-second bound"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn experimental_bbr_recovers_reliable_records_under_real_packet_loss() {
+    let params = TransportCheckParams {
+        clients: 2,
+        records_per_client: 10,
+        datagrams_per_client: 20,
+        proxy: Some(PacketFaultPlan {
+            loss_ratio: 0.10,
+            delay: Duration::from_millis(15),
+            jitter: Duration::from_millis(10),
+            ..PacketFaultPlan::transparent(0xBBA)
+        }),
+        run_bulk_transfer: true,
+        config: TransportConfig {
+            congestion: spall_net::config::CongestionControl::Bbr,
+            udp_receive_buffer_bytes: Some(1024 * 1024),
+            ..TransportConfig::for_tests()
+        },
+        overall_timeout: Duration::from_secs(30),
+    };
+    let report = run_transport_check(params.clone()).await.unwrap();
+    assert!(report.all_reliable_delivered(&params), "{report:?}");
+    assert!(
+        report
+            .proxy_stats
+            .iter()
+            .any(|s| s.c2s_dropped + s.s2c_dropped > 0)
+    );
+}
+
 /// Bullet 1: server + two headless clients authenticate and exchange records
 /// on every channel (reliable control, datagrams, and a bulk transfer).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -242,6 +414,42 @@ async fn malformed_length_and_oversized_transfer_stay_bounded() {
             matches!(err, TransportError::Frame(FrameError::Oversize { limit, .. }) if limit == 8192),
             "got {err:?}"
         );
+    }
+
+    // Version 3 uses incremental staging and its declared streaming cap,
+    // while the legacy assembled cap above remains 8192 bytes.
+    {
+        let mut bulk = client.open_bulk().await.unwrap();
+        for i in 0..4u32 {
+            let payload = vec![7u8; 3000];
+            bulk.send_part(&spall_protocol::BaselinePart {
+                transfer_id: spall_protocol::TransferId(2),
+                part_index: i,
+                part_hash: spall_protocol::Hash32::of(&payload),
+                payload,
+            })
+            .await
+            .unwrap();
+        }
+        bulk.finish().unwrap();
+        let begin = spall_protocol::BaselineBegin {
+            transfer_id: spall_protocol::TransferId(2),
+            interest_epoch: spall_protocol::InterestEpoch(1),
+            checkpoint_tick: spall_core::Tick(0),
+            journal_cursor: spall_core::JournalSeq(0),
+            world_version: spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION,
+            content_version: 1,
+            total_bytes: 12000,
+            part_count: 4,
+            regions: Vec::new(),
+        };
+        let mut recv = server_conn.accept_streamed_baseline(&begin).await.unwrap();
+        let mut count = 0;
+        while let Some(part) = recv.next_part().await.unwrap() {
+            assert_eq!(part.payload.len(), 3000);
+            count += 1;
+        }
+        assert_eq!(count, 4);
     }
 
     // The control stream still works after both hostile attempts.

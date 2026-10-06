@@ -15,7 +15,7 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Args;
@@ -76,8 +76,11 @@ pub struct PlayArgs {
     /// Build and run optimized (release) binaries instead of debug ones.
     #[arg(long)]
     release: bool,
+    /// Use sibling sandbox binaries without building from a source checkout.
+    #[arg(long, hide = true)]
+    portable: bool,
     /// How long to wait for the server to bind before giving up.
-    #[arg(long, default_value_t = 20_000)]
+    #[arg(long, default_value_t = 300_000)]
     startup_timeout_ms: u64,
     /// Output directory for the generated join token, fingerprint, and
     /// process logs. A unique directory under `.local/runs` is created if
@@ -103,6 +106,20 @@ pub struct PlayArgs {
 }
 
 pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskError> {
+    let runtime_root = if args.portable {
+        std::env::current_exe()
+            .map_err(|source| XtaskError::Output {
+                path: "xtask executable".into(),
+                source,
+            })?
+            .parent()
+            .ok_or_else(|| {
+                XtaskError::Capability("portable launcher has no parent directory".into())
+            })?
+            .to_path_buf()
+    } else {
+        workspace_root()
+    };
     let needs_server_baseline = args.late_join
         || args.editor_scene.is_some()
         || args.worldgen.is_some()
@@ -110,13 +127,29 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             args.scene.as_str(),
             "playground" | "play" | "sandbox-playground"
         );
-    let output = args.output.unwrap_or_else(unique_output);
+    let output = args.output.unwrap_or_else(|| {
+        if args.portable {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0);
+            runtime_root
+                .join("runs")
+                .join(format!("play-{stamp}-{}", std::process::id()))
+        } else {
+            unique_output()
+        }
+    });
     fs::create_dir_all(&output).map_err(|source| XtaskError::Output {
         path: output.display().to_string(),
         source,
     })?;
 
-    let profile = if args.release { "release" } else { "debug" };
+    let profile = if args.release || args.portable {
+        "release"
+    } else {
+        "debug"
+    };
     let mut server_build = vec!["build", "-p", "sandbox", "--bin", "sandbox-server"];
     let mut client_build = vec![
         "build",
@@ -131,8 +164,10 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         server_build.push("--release");
         client_build.push("--release");
     }
-    run_cargo(&server_build)?;
-    run_cargo(&client_build)?;
+    if !args.portable {
+        run_cargo(&server_build)?;
+        run_cargo(&client_build)?;
+    }
 
     // A fresh token per session (unlike `session`/`scenario`'s seeded one —
     // there is nothing here that needs to reproduce deterministically).
@@ -148,8 +183,8 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
     let _ = fs::remove_file(&fp_file);
     let _ = fs::remove_file(&addr_file);
 
-    let mut server_cmd = Command::new(sandbox_binary_profile("sandbox-server", profile));
-    server_cmd.current_dir(workspace_root()).args([
+    let mut server_cmd = Command::new(play_binary(&runtime_root, "sandbox-server", profile));
+    server_cmd.current_dir(&runtime_root).args([
         "--serve",
         "--listen",
         "127.0.0.1:0",
@@ -187,6 +222,20 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         }
         (None, None) => server_cmd.args(["--scene", &args.scene]),
     };
+    let server_stderr = output.join("server.stderr.log");
+    server_cmd.stderr(Stdio::from(fs::File::create(&server_stderr).map_err(
+        |source| XtaskError::Output {
+            path: server_stderr.display().to_string(),
+            source,
+        },
+    )?));
+    let server_stdout = output.join("server.stdout.log");
+    server_cmd.stdout(Stdio::from(fs::File::create(&server_stdout).map_err(
+        |source| XtaskError::Output {
+            path: server_stdout.display().to_string(),
+            source,
+        },
+    )?));
     hide_console(&mut server_cmd);
     let mut guard = ChildGuard::default();
     let server_child = server_cmd.spawn().map_err(|source| XtaskError::Output {
@@ -200,7 +249,23 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         &addr_file,
         &mut guard,
         Duration::from_millis(args.startup_timeout_ms),
-    )?
+    )
+    .map_err(|error| {
+        let diagnostic = fs::read_to_string(&server_stderr).unwrap_or_default();
+        let tail = diagnostic
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        XtaskError::Capability(format!(
+            "{error}\n{tail}\nDiagnostics: {}",
+            output.display()
+        ))
+    })?
     .parse()
     .map_err(|_| XtaskError::Capability("server wrote an unparseable bound address".into()))?;
     eprintln!(
@@ -214,8 +279,8 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
         args.ticks
     );
 
-    let mut client_cmd = Command::new(sandbox_binary_profile("sandbox-client", profile));
-    client_cmd.current_dir(workspace_root()).args([
+    let mut client_cmd = Command::new(play_binary(&runtime_root, "sandbox-client", profile));
+    client_cmd.current_dir(&runtime_root).args([
         "--connect",
         &bound.to_string(),
         "--server-fingerprint",
@@ -243,19 +308,23 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             .shots_dir
             .clone()
             .unwrap_or_else(|| output.join("shots"));
-        client_cmd
-            .arg("--shots-dir")
-            .arg(workspace_root().join(dir));
+        client_cmd.arg("--shots-dir").arg(runtime_root.join(dir));
     }
     if needs_server_baseline {
         client_cmd.arg("--late-join");
+        if args.worldgen_size.is_some_and(|size| size >= 4096) {
+            client_cmd.args(["--baseline-budget-mib", "8192"]);
+        }
     }
     if args.client_authoritative {
         client_cmd.arg("--client-authoritative");
     }
-    // Deliberately not hidden and not captured: the window is the point, and
-    // a connect failure's error message should land directly in this
-    // terminal instead of a log nobody's watching.
+    // Packaged launches have no terminal; the interactive client reports
+    // failures through its own window/log. Development launches keep the
+    // terminal visible for diagnostics.
+    if args.portable {
+        hide_console(&mut client_cmd);
+    }
     let client_status = client_cmd.status().map_err(|source| XtaskError::Output {
         path: "sandbox-client (spawn)".into(),
         source,
@@ -275,6 +344,20 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             vec!["sandbox-client".into(), "--interactive".into()],
             client_status.code().unwrap_or(1),
         ))
+    }
+}
+
+fn play_binary(root: &std::path::Path, name: &str, profile: &str) -> PathBuf {
+    let executable = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    let bundled = root.join(executable);
+    if bundled.is_file() {
+        bundled
+    } else {
+        sandbox_binary_profile(name, profile)
     }
 }
 
@@ -313,6 +396,8 @@ fn hide_console(_: &mut Command) {}
 #[cfg(test)]
 mod environment_tests {
     use super::parse_environment_key;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn reads_the_saved_environment_key() {
@@ -324,5 +409,28 @@ mod environment_tests {
 )";
         assert_eq!(parse_environment_key(ron).as_deref(), Some("sunset"));
         assert_eq!(parse_environment_key("(name: \"Main\")"), None);
+    }
+
+    #[test]
+    fn packaged_launch_resolves_sibling_game_binaries() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("spall-portable-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&root).expect("create temp package");
+        let name = if cfg!(windows) {
+            "sandbox-server.exe"
+        } else {
+            "sandbox-server"
+        };
+        let expected = root.join(name);
+        fs::write(&expected, b"test binary marker").expect("write package marker");
+        assert_eq!(
+            super::play_binary(&root, "sandbox-server", "release"),
+            expected
+        );
+        fs::remove_dir_all(root).expect("remove temp package");
     }
 }

@@ -26,6 +26,15 @@ use crate::canonical::Hash32;
 
 /// `BaselineBegin.world_version` of a segmented transfer (`1` is the single blob).
 pub const BASELINE_SEGMENTED_WORLD_VERSION: u32 = 2;
+/// Streaming variant with a separately negotiated cumulative compressed limit.
+pub const BASELINE_STREAMED_WORLD_VERSION: u32 = 3;
+/// Cumulative compressed bytes, processed one segment at a time; no whole-payload decode.
+pub const MAX_STREAMED_BASELINE_COMPRESSED: usize = 256 * 1024 * 1024;
+/// Only clients advertising this capability may receive world version 3.
+pub fn baseline_cap_streamed() -> Hash32 {
+    Hash32::of(b"spall.baseline.capability.streamed.v3")
+}
+
 /// Schema of [`SegmentManifest`] / [`BaselineSegment`].
 pub const SEGMENT_SCHEMA: u16 = 2;
 /// Decoded cost of a dense brick: `Vec<u16>` cells plus bookkeeping.

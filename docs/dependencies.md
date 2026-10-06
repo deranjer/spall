@@ -403,3 +403,10 @@ and dependency loading, and `spall_client` already depends on `spall_voxel`.
 T00's GPU capability smoke records the adapter/backend from wgpu in its
 client JSONL log. It does not claim a renderer-quality or GPU-performance
 gate; those begin in T05 and T12 respectively.
+
+## ENG-114 bounded UDP buffer diagnostic (2026-10-06)
+
+`spall_net` now directly uses `socket2 = "=0.6.5"` (MIT OR Apache-2.0),
+already present transitively in Cargo.lock. No version upgrade: only its direct
+dependency edge is added. It configures an explicitly requested kernel receive
+buffer within 64 KiB..=4 MiB; ordinary configuration retains the platform default.

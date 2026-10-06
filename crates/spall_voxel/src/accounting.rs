@@ -13,7 +13,7 @@ use crate::brick::DENSE_LAYER_BYTES;
 pub struct MemoryReport {
     /// Resident bricks stored as `Uniform` (metadata only, no cell array).
     pub uniform_bricks: usize,
-    /// Resident bricks stored as `Dense`.
+    /// Resident non-uniform bricks (full-width or internal paletted arrays).
     pub dense_bricks: usize,
     /// Dense payload bytes uniquely owned by the volume.
     pub owned_dense_bytes: usize,
@@ -38,11 +38,12 @@ impl MemoryReport {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::brick::Brick;
     use crate::edit::EditPlan;
     use crate::volume::Volume;
-    use spall_core::{BrickCoord, CellSizeCode, GlobalCell, MaterialId, Revision, VolumeId};
+    use spall_core::{
+        BrickCoord, CELLS_PER_BRICK, CellSizeCode, GlobalCell, MaterialId, Revision, VolumeId,
+    };
 
     fn vol() -> Volume {
         Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter)
@@ -77,23 +78,18 @@ mod tests {
 
         let before = v.memory_report();
         assert_eq!(before.dense_bricks, 1);
-        assert_eq!(before.owned_dense_bytes, MemoryReport::DENSE_BRICK_BYTES);
+        let payload_bytes = CELLS_PER_BRICK + 256 * size_of::<MaterialId>();
+        assert_eq!(before.owned_dense_bytes, payload_bytes);
         assert_eq!(before.snapshot_shared_bytes, 0);
 
         let snap = v.snapshot_brick(BrickCoord::new(0, 0, 0)).unwrap().unwrap();
         let during = v.memory_report();
         assert_eq!(during.owned_dense_bytes, 0);
         assert_eq!(during.snapshot_shared_bricks, 1);
-        assert_eq!(
-            during.snapshot_shared_bytes,
-            MemoryReport::DENSE_BRICK_BYTES
-        );
+        assert_eq!(during.snapshot_shared_bytes, payload_bytes);
 
         drop(snap);
-        assert_eq!(
-            v.memory_report().owned_dense_bytes,
-            MemoryReport::DENSE_BRICK_BYTES
-        );
+        assert_eq!(v.memory_report().owned_dense_bytes, payload_bytes);
     }
 
     #[test]

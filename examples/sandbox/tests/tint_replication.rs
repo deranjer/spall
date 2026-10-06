@@ -132,6 +132,7 @@ fn client_config(
         summary_json: None,
         transport: patient_transport(),
         client_residency: None,
+        baseline_budget_bytes: spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
         on_replica_ready: Some(Arc::new(move |replica| {
             *slot.lock().unwrap() = Some(replica);
         })),

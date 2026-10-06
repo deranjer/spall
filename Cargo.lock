@@ -3069,6 +3069,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "socket2",
  "spall_core",
  "spall_net",
  "spall_protocol",

@@ -100,6 +100,9 @@ struct Globals {
     sun: [f32; 4],
     sky_color: [f32; 4],
     ground_color: [f32; 4],
+    moon_dir: [f32; 4],
+    moon: [f32; 4],
+    moon_phase: [f32; 4],
     /// Point lights: position in `xyz`, range in `w`.
     point_lights: [[f32; 4]; MAX_POINT_LIGHTS],
     /// Point light colour times intensity in `rgb`.
@@ -149,6 +152,22 @@ struct ToneGlobals {
     _pad: [f32; 2],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SkyboxGlobals {
+    right: [f32; 4],
+    up: [f32; 4],
+    forward: [f32; 4],
+    sun_direction: [f32; 4],
+    moon_direction: [f32; 4],
+    horizon: [f32; 4],
+    zenith: [f32; 4],
+    cloud: [f32; 4],
+    params: [f32; 4],
+    moon_color: [f32; 4],
+    moon_params: [f32; 4],
+}
+
 /// The water height field as last supplied, plus its GPU copy.
 #[derive(Default)]
 struct WaterState {
@@ -158,6 +177,9 @@ struct WaterState {
 }
 
 pub struct ScenePipeline {
+    skybox: wgpu::RenderPipeline,
+    skybox_buffer: wgpu::Buffer,
+    skybox_bind: wgpu::BindGroup,
     opaque: wgpu::RenderPipeline,
     shadow: wgpu::RenderPipeline,
     opaque_cube: wgpu::RenderPipeline,
@@ -227,6 +249,11 @@ impl ScenePipeline {
             device,
             "spall-t12-tone-map",
             include_str!("shaders/tonemap.wgsl"),
+        );
+        let skybox_shader = shader(
+            device,
+            "spall-voxel-skybox",
+            include_str!("shaders/skybox.wgsl"),
         );
 
         let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -298,6 +325,10 @@ impl ScenePipeline {
                 uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
             ],
         });
+        let skybox_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("spall-voxel-skybox-layout"),
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT)],
+        });
 
         crate::probe::mark(
             "ScenePipeline::new: IndirectPipeline::new (3x vkCreateComputePipelines)",
@@ -365,12 +396,22 @@ impl ScenePipeline {
         );
         crate::probe::mark("ScenePipeline::new: vkCreateGraphicsPipelines(tone_map)");
         let tone_map = create_tone_pipeline(device, &tone_shader, &tone_layout, output_format);
-        crate::probe::mark("ScenePipeline::new: all 6 pipelines OK (3 compute + 3 graphics)");
+        let skybox = create_skybox_pipeline(device, &skybox_shader, &skybox_layout);
+        crate::probe::mark("ScenePipeline::new: all pipelines OK (3 compute + 9 graphics)");
         let globals_buffer = uniform_buffer::<Globals>(device, "spall-t12-globals");
         let shadow_globals_buffers = (0..CASCADE_COUNT)
             .map(|_| uniform_buffer::<ShadowGlobals>(device, "spall-shadow-globals"))
             .collect();
         let tone_globals_buffer = uniform_buffer::<ToneGlobals>(device, "spall-tone-globals");
+        let skybox_buffer = uniform_buffer::<SkyboxGlobals>(device, "spall-voxel-skybox-globals");
+        let skybox_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("spall-voxel-skybox-bind"),
+            layout: &skybox_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: skybox_buffer.as_entire_binding(),
+            }],
+        });
 
         let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("spall-sun-shadow-cascades"),
@@ -435,6 +476,9 @@ impl ScenePipeline {
         let water_none_view = water_none_texture.create_view(&Default::default());
 
         Self {
+            skybox,
+            skybox_buffer,
+            skybox_bind,
             opaque,
             shadow,
             opaque_cube,
@@ -505,6 +549,60 @@ impl ScenePipeline {
     }
     pub fn tone_map(&self) -> &wgpu::RenderPipeline {
         &self.tone_map
+    }
+
+    pub(crate) fn skybox_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.skybox
+    }
+
+    pub(crate) fn skybox_bind_group(
+        &self,
+        queue: &wgpu::Queue,
+        camera: &Camera,
+        environment: &Environment,
+    ) -> &wgpu::BindGroup {
+        let [hr, hg, hb, _] = environment.background_linear().map(|v| v as f32);
+        let globals = SkyboxGlobals {
+            right: camera.right().extend(0.0).to_array(),
+            up: camera.up().extend(0.0).to_array(),
+            forward: camera.forward().extend(0.0).to_array(),
+            // Environment sun_dir points toward the scene; the visible disc is
+            // in the opposite direction.
+            sun_direction: (-environment.sun_dir).extend(0.0).to_array(),
+            moon_direction: (-environment.moon_dir).extend(0.0).to_array(),
+            horizon: [hr, hg, hb, 1.0],
+            zenith: [hr * 0.72, hg * 0.9, hb * 1.05, 1.0],
+            cloud: {
+                let brightness = if environment.sun_intensity < 1.0 {
+                    0.16
+                } else if environment.sun_intensity < 3.0 {
+                    0.68
+                } else {
+                    0.9
+                };
+                [brightness, brightness * 1.02, brightness * 1.06, 1.0]
+            },
+            params: [
+                (camera.fov_y * 0.5).tan(),
+                camera.aspect,
+                environment.sun_angular_diameter_deg.to_radians() * 0.5,
+                environment.sun_visibility,
+            ],
+            moon_color: [
+                environment.moon_color[0],
+                environment.moon_color[1],
+                environment.moon_color[2],
+                1.0,
+            ],
+            moon_params: [
+                0.52_f32.to_radians() * 0.5,
+                environment.moon_phase,
+                environment.moon_visibility,
+                environment.moon_intensity,
+            ],
+        };
+        queue.write_buffer(&self.skybox_buffer, 0, bytemuck::bytes_of(&globals));
+        &self.skybox_bind
     }
     pub fn shadow_layer(&self, index: usize) -> &wgpu::TextureView {
         &self.shadow_layer_views[index]
@@ -660,6 +758,14 @@ impl ScenePipeline {
             sun: [sr, sg, sb, environment.sun_intensity],
             sky_color: [kr, kg, kb, 0.0],
             ground_color: [gr, gg, gb, 0.0],
+            moon_dir: environment.moon_dir.extend(0.0).to_array(),
+            moon: [
+                environment.moon_color[0],
+                environment.moon_color[1],
+                environment.moon_color[2],
+                environment.moon_intensity,
+            ],
+            moon_phase: [environment.moon_phase, 0.0, 0.0, 0.0],
             point_lights,
             point_colors,
             point_count,
@@ -1077,6 +1183,43 @@ fn create_tone_pipeline(
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: output_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_skybox_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("spall-voxel-skybox-pipeline-layout"),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("spall-voxel-skybox-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],

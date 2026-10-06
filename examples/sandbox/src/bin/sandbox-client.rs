@@ -30,6 +30,9 @@ struct Args {
     /// Save the comparison window through the real renderer.
     #[arg(long, requires = "phase_fluid_demo")]
     phase_fluid_demo_capture: Option<PathBuf>,
+    /// Opt into Quinn's experimental BBR congestion controller for validation.
+    #[arg(long)]
+    experimental_bbr: bool,
     /// Open the canal/dam viewer with gameplay water policy and appearance.
     /// This local simulation is separate from the authoritative game tick.
     #[arg(long, conflicts_with_all = ["offline", "connect", "interactive"])]
@@ -135,6 +138,9 @@ struct Args {
     /// topology with no edit replay.
     #[arg(long)]
     late_join: bool,
+    /// Memory admission budget for baseline staging (MiB).
+    #[arg(long, default_value_t = 4096)]
+    baseline_budget_mib: u32,
     /// Fixed baseline scene a live replica installs; must match the server's
     /// `--scene`. `bridge-cut` (default) or `cross-bridge-cut`.
     #[arg(long, default_value = "bridge-cut")]
@@ -148,6 +154,10 @@ struct Args {
     /// Whole-session deadline.
     #[arg(long, default_value_t = 30_000)]
     timeout_ms: u64,
+    /// Development test: request a server-authorized world reset at this observed
+    /// server tick. Repeat to stress replacement; the server must allow admin commands.
+    #[arg(long = "admin-reset-at")]
+    admin_reset_at: Vec<u64>,
     /// T23 / G3 row 7 slice E2: client-side terrain residency. `0` (default)
     /// keeps the replica fully resident. `> 0` runs the residency pass in the
     /// mover loop (needs `--move`): it evicts terrain outside a brick box
@@ -553,7 +563,14 @@ fn run_replication(args: Args) -> ExitCode {
         overall_timeout: Duration::from_millis(args.timeout_ms),
         log_json: args.log_json,
         summary_json: args.summary_json.clone(),
-        transport: TransportConfig::default(),
+        transport: TransportConfig {
+            congestion: if args.experimental_bbr {
+                spall_net::config::CongestionControl::Bbr
+            } else {
+                spall_net::config::CongestionControl::Cubic
+            },
+            ..TransportConfig::default()
+        },
         client_residency: (args.residency_budget_bricks > 0).then_some(
             spall_client::ClientResidencyLimits {
                 budget_bricks: args.residency_budget_bricks,
@@ -561,10 +578,15 @@ fn run_replication(args: Args) -> ExitCode {
                 max_dense_bytes: args.residency_budget_dense_bytes.unwrap_or(u64::MAX),
             },
         ),
+        baseline_budget_bytes: u64::from(args.baseline_budget_mib) * 1024 * 1024,
         on_replica_ready: None,
         interactive: None,
         client_authoritative: args.client_authoritative,
-        admin_script: Vec::new(),
+        admin_script: args
+            .admin_reset_at
+            .iter()
+            .map(|&tick| (tick, spall_protocol::AdminCommand::ResetWorld))
+            .collect(),
     };
     match spall_client::run_replication_client_with_progression(
         config,
@@ -748,8 +770,16 @@ fn run_interactive(args: Args) -> ExitCode {
         overall_timeout: Duration::from_secs(4 * 60 * 60),
         log_json: args.log_json,
         summary_json: None,
-        transport: TransportConfig::default(),
+        transport: TransportConfig {
+            congestion: if args.experimental_bbr {
+                spall_net::config::CongestionControl::Bbr
+            } else {
+                spall_net::config::CongestionControl::Cubic
+            },
+            ..TransportConfig::default()
+        },
         client_residency: None,
+        baseline_budget_bytes: u64::from(args.baseline_budget_mib) * 1024 * 1024,
         on_replica_ready: None,
         interactive: None, // set by `run_interactive_window` itself
         client_authoritative: args.client_authoritative,
@@ -773,6 +803,7 @@ fn run_interactive(args: Args) -> ExitCode {
             uncapped: args.uncapped,
             shots,
             shots_dir: args.shots_dir.clone(),
+            day_night_cycle: Some(args.environment.is_none()),
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,

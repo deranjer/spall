@@ -338,6 +338,7 @@ fn two_network_clients_receive_generated_vegetation_and_the_same_season() {
         summary_json: None,
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_budget_bytes: spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,

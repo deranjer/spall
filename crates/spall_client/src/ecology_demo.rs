@@ -552,6 +552,7 @@ impl EcologyDemoApp {
             &[],
             Some(("ECOLOGY SHOWCASE", "Space pause · . step +1s · +/- speed 1×/4×/16× · H harvest grass · B cut branch · X destroy root · WASD/QE fly · click capture mouse · Esc release", &status)),
             None,
+            None,
         ) { self.fail(event_loop, error); }
     }
 }
@@ -576,6 +577,7 @@ impl ApplicationHandler for EcologyDemoApp {
             window.clone(),
             EnvironmentPreset::Daylight.environment(),
             &materials,
+            false,
             false,
         ) {
             Ok(renderer) => {

@@ -122,6 +122,24 @@ impl JobToken {
         self
     }
 
+    /// Adds a dependency batch in one canonical sort. As with the individual
+    /// builders, the last observation of a brick replaces earlier ones.
+    /// Avoids shifting the whole read set for every missing-neighbour sentinel.
+    #[must_use]
+    pub fn reading_many(mut self, reads: impl IntoIterator<Item = ReadDep>) -> Self {
+        self.reads.extend(reads);
+        self.reads.sort_by_key(|dep| dep.brick.order_key());
+        self.reads.dedup_by(|later, earlier| {
+            if later.brick == earlier.brick {
+                *earlier = *later;
+                true
+            } else {
+                false
+            }
+        });
+        self
+    }
+
     fn put(&mut self, dep: ReadDep) {
         match self
             .reads
@@ -235,6 +253,48 @@ pub trait WorldView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_dependencies_match_incremental_order_and_last_observation() {
+        let mut reads = Vec::new();
+        for i in (0..128).rev() {
+            for volume in [vol(2), vol(1)] {
+                let brick = BrickRef::new(volume, BrickCoord::new(i % 7, i % 3, i));
+                reads.push(ReadDep {
+                    brick,
+                    state: DepState::Revision(Revision(i as u64)),
+                });
+                if i % 5 == 0 {
+                    reads.push(ReadDep {
+                        brick,
+                        state: DepState::Absent,
+                    });
+                }
+                if i % 11 == 0 {
+                    reads.push(ReadDep {
+                        brick,
+                        state: DepState::Failed,
+                    });
+                }
+            }
+        }
+        let prefix = JobToken::new(Generation(3), TopologyEpoch(4)).reading(
+            vol(1),
+            BrickCoord::new(0, 0, 0),
+            Revision(999),
+        );
+        let mut reference = prefix.clone();
+        for dep in &reads {
+            reference = match dep.state {
+                DepState::Revision(revision) => {
+                    reference.reading(dep.brick.volume, dep.brick.brick, revision)
+                }
+                DepState::Absent => reference.reading_absent(dep.brick.volume, dep.brick.brick),
+                DepState::Failed => reference.reading_failed(dep.brick.volume, dep.brick.brick),
+            };
+        }
+        assert_eq!(prefix.reading_many(reads), reference);
+    }
 
     struct FixedWorld {
         generation: Generation,

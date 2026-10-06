@@ -1,6 +1,7 @@
 //! Native render-window host and the client-side replica. GPU voxel extraction
 //! and transport wiring are added by later tasks.
 
+pub mod day_night;
 pub mod ecology_demo;
 pub mod grid_fluid_demo;
 pub mod interactive;

@@ -261,6 +261,8 @@ Implement in this order:
 
 R3 (ENG-96) adds two direct-light contracts to the shared renderer (`docs/reports/ENG-96.md`): sun shadows are cascaded maps with normal-offset bias and physically-scaled PCSS penumbrae (the sun's angular size is an `Environment` parameter), and skylight is *visibility-aware* -- a derived, client-local occupancy grid in the frozen 128 cubed / 0.5 m layout feeds a six-direction sky-visibility pass, so enclosed rooms receive no outdoor ambient; unknown (non-resident) space blocks rays rather than counting as sky.
 
+ENG-127 adds a procedural camera-oriented sky background in both the interactive game and editor viewport: environment-colored horizon/zenith, a sun disc aligned opposite `Environment.sun_dir`, and quantized procedural clouds. It is a render-only effect; it does not create world objects, affect sky-visibility lighting, or persist state. GPU capture evidence is recorded under `.local/runs/eng-94-parity/skybox-daylight.png`.
+
 The clipmap is a derived GPU lighting cache, not the world format. Do not require experimental hardware ray tracing or a sparse voxel octree for the initial renderer. Optional future hardware acceleration must preserve a supported baseline and be justified by captured evidence.
 
 Check indoor light leakage, emissive bounce, moving debris shadows, rapid edits, and motion ghosting. AO plus bloom alone does not pass G2. The exact indirect-light sampling/denoising implementation is a graphics integration decision in T13, not an invitation for separate agents to invent incompatible render pipelines.
@@ -637,3 +639,20 @@ checks. Capacity/thin walls/displacement/recovery remain open. In progress.
 Final ENG-122 incremental-flow validation: cargo xtask check1219 passed/0 failed/63 ignored
 across137 suites, including formatting and strict workspace Clippy. Initial dam-replication
 admin-ack failure and isolated retry pass are preserved; no networking/fixture/budget changes.
+
+### ENG-128 day/night presentation clock
+
+The sandbox's default sky, sun, moon, and environment lighting derive from the
+authoritative simulation tick. One Spall day is 72,000 ticks at 60 Hz (20 real
+minutes); tick zero is 06:00. Clients render the same clock from replicated
+server ticks instead of maintaining wall clocks. The lunar phase advances by
+one eighth per day over an eight-day cycle, from full moon through new moon and
+back. Moon visibility follows its orbit and phase, including a subdued daytime
+disc. Night ambient fill has a nonzero floor independent of moon visibility;
+moonlight adds a small phase-dependent contribution.
+
+The clock is presentation state, not persisted world state: a newly started
+simulation begins at day one sunrise. Explicit environment selection and the
+in-game cycle pause are visual overrides; resuming restores tick-derived
+lighting. No protocol clock field is needed because the existing server tick
+already supplies synchronization.

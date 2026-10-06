@@ -19,9 +19,7 @@ use spall_worldgen::{
 };
 use thiserror::Error;
 
-use crate::editor_scene::{
-    MAX_SCENE_WATER_CELLS, WATER_MARGIN_ABOVE, WATER_MARGIN_BELOW, WATER_MARGIN_XZ, WATER_STEP_S,
-};
+use crate::editor_scene::{WATER_MARGIN_ABOVE, WATER_MARGIN_BELOW, WATER_MARGIN_XZ, WATER_STEP_S};
 
 /// Fluid cells a generated world's water domain may start with. The solver
 /// costs roughly 0.5-2 microseconds per fluid cell per step and the water worker
@@ -154,7 +152,7 @@ pub fn water_setup(plan: &WaterPlan) -> Result<Option<WaterSetup>, WorldgenScene
     let domain = DomainSpec::new(
         GlobalCell::new(min[0], min[1], min[2]),
         dimensions,
-        MAX_SCENE_WATER_CELLS,
+        spall_protocol::water::MAX_WATER_VOXEL_CELLS,
     )
     .map_err(|e| WorldgenSceneError::WaterDomain(e.to_string()))?;
     Ok(Some(

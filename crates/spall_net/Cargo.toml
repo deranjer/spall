@@ -19,6 +19,7 @@ rcgen.workspace = true
 ring.workspace = true
 rustls.workspace = true
 serde.workspace = true
+socket2 = "=0.6.5"
 spall_core.workspace = true
 spall_protocol.workspace = true
 thiserror.workspace = true

@@ -736,19 +736,39 @@ impl EditorApp {
     }
 
     fn worldgen_dialog(&mut self) {
-        use crate::worldgen_panel::{SIZES, legend};
+        use crate::worldgen_panel::{SEASONS, SIZES, legend};
         theme::hint("Preview the generated showcase arena, then walk it in the game.");
         theme::hint("Mountains, hills, swamp with lake and river, desert, caves.");
+        theme::hint("The preview checks world capacity before launch. Startup errors appear here.");
         theme::field_with_placeholder("Seed", &mut self.worldgen.seed_text, "1");
-        theme::hstack(6.0, || {
-            for size in SIZES {
-                let kind = if self.worldgen.size_cells == size {
-                    ButtonKind::Primary
-                } else {
-                    ButtonKind::Secondary
-                };
-                if theme::button(kind, ButtonSize::Small, &format!("{} m", size / 4)) {
-                    self.worldgen.size_cells = size;
+        theme::hstack(8.0, || {
+            theme::label(12.0, theme::TEXT, "World size");
+            let selected_size = format!("{} m", self.worldgen.size_cells / 4);
+            if theme::dropdown_button(&selected_size) {
+                self.worldgen.size_menu_open = !self.worldgen.size_menu_open;
+                self.worldgen.season_menu_open = false;
+            }
+            if self.worldgen.size_menu_open {
+                let labels: Vec<_> = SIZES.iter().map(|size| format!("{} m", size / 4)).collect();
+                let entries: Vec<_> = labels.iter().map(|label| MenuEntry::new(label)).collect();
+                let refs: Vec<_> = entries.iter().collect();
+                if let Some(index) = theme::dropdown_from(DropdownSide::Left, 180.0, &refs) {
+                    self.worldgen.size_cells = SIZES[index];
+                    self.worldgen.preview = None;
+                    self.worldgen.size_menu_open = false;
+                }
+            }
+            theme::label(12.0, theme::TEXT, "Season");
+            if theme::dropdown_button(&self.worldgen.season) {
+                self.worldgen.season_menu_open = !self.worldgen.season_menu_open;
+                self.worldgen.size_menu_open = false;
+            }
+            if self.worldgen.season_menu_open {
+                let entries: Vec<_> = SEASONS.iter().map(|name| MenuEntry::new(name)).collect();
+                let refs: Vec<_> = entries.iter().collect();
+                if let Some(index) = theme::dropdown_from(DropdownSide::Right, 180.0, &refs) {
+                    self.worldgen.season = SEASONS[index].into();
+                    self.worldgen.season_menu_open = false;
                 }
             }
             if theme::button(ButtonKind::Secondary, ButtonSize::Small, "Randomize seed") {
@@ -786,10 +806,27 @@ impl EditorApp {
             f64::from(high) * 0.25,
             preview.seed
         ));
-        if theme::button(
+        let launch_matches_preview = crate::worldgen_panel::parse_seed(&self.worldgen.seed_text)
+            .is_ok_and(|seed| seed == preview.seed)
+            && self.worldgen.size_cells == preview.size_cells;
+        let can_launch =
+            launch_matches_preview && preview.launch_error.is_none() && self.play_launch.is_none();
+        if let Some(error) = &preview.launch_error {
+            theme::hint(&format!(
+                "Cannot run this world: {error}. Try a smaller size."
+            ));
+        }
+        if self.worldgen.size_cells >= 4096 {
+            theme::hint("1024 m worlds use substantial memory; 32 GB RAM recommended.");
+        }
+        if self.play_launch.is_some() {
+            theme::hint(&self.status);
+        }
+        if theme::button_enabled(
             ButtonKind::Primary,
             ButtonSize::Regular,
-            "Run in game (cargo xtask play)",
+            "Run in game",
+            can_launch,
         ) {
             self.run_worldgen();
         }

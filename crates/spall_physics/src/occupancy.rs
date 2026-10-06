@@ -92,6 +92,19 @@ impl OccupancyGrid {
             }
         }
 
+        if snaps.len() == 1 && dims == [32, 32, 32] {
+            let (coord, snap) = &snaps[0];
+            if min == GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32) {
+                let material = snap.material_cells();
+                let solid = material.iter().map(|m| !m.is_air()).collect();
+                return Ok(Self {
+                    origin: min,
+                    dims,
+                    solid,
+                    material,
+                });
+            }
+        }
         let mut solid = vec![false; cells as usize];
         let mut material = vec![MaterialId::AIR; cells as usize];
         for (coord, snap) in &snaps {
@@ -377,6 +390,53 @@ impl OccupancyGrid {
 mod tests {
     use super::*;
     use spall_voxel::fixtures;
+
+    #[test]
+    #[ignore = "manual occupancy/greedy timing diagnostic"]
+    fn full_brick_timing_probe() {
+        let mut volume = Volume::new(vid(1), spall_core::CellSizeCode::Quarter);
+        volume
+            .insert_brick(
+                BrickCoord::new(0, 0, 0),
+                spall_voxel::Brick::uniform(MaterialId(1), spall_core::Revision(1)),
+            )
+            .unwrap();
+        let snap = volume
+            .snapshot_brick(BrickCoord::new(0, 0, 0))
+            .unwrap()
+            .unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            std::hint::black_box(snap.material_cells());
+        }
+        eprintln!("grid_probe bulk1000_us={}", started.elapsed().as_micros());
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            std::hint::black_box(
+                OccupancyGrid::from_region(
+                    &volume,
+                    GlobalCell::new(0, 0, 0),
+                    GlobalCell::new(31, 31, 31),
+                )
+                .unwrap(),
+            );
+        }
+        eprintln!(
+            "grid_probe extract1000_us={}",
+            started.elapsed().as_micros()
+        );
+        let grid = OccupancyGrid::from_region(
+            &volume,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(31, 31, 31),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            std::hint::black_box(crate::greedy_boxes(&grid));
+        }
+        eprintln!("grid_probe greedy1000_us={}", started.elapsed().as_micros());
+    }
 
     fn vid(n: u64) -> spall_core::VolumeId {
         spall_core::VolumeId::new(n).unwrap()

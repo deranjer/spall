@@ -411,6 +411,7 @@ pub struct ReplicaWorld {
 /// (class D in `docs/reports/large-world-baseline-design.md`): the caller budgets it before the
 /// first brick is staged.
 pub struct StagedBaseline {
+    reuse: BTreeMap<u64, Volume>,
     checkpoint_tick: u64,
     volumes: BTreeMap<u64, Volume>,
     owner: BTreeMap<u64, CanonicalOwner>,
@@ -425,6 +426,7 @@ pub struct StagedBaseline {
 impl StagedBaseline {
     pub fn new(checkpoint_tick: u64) -> Self {
         Self {
+            reuse: BTreeMap::new(),
             checkpoint_tick,
             volumes: BTreeMap::new(),
             owner: BTreeMap::new(),
@@ -434,6 +436,10 @@ impl StagedBaseline {
             open: None,
             bricks: 0,
         }
+    }
+
+    pub(crate) fn set_reuse(&mut self, volumes: BTreeMap<u64, Volume>) {
+        self.reuse = volumes;
     }
 
     /// Bricks staged so far.
@@ -516,26 +522,25 @@ impl StagedBaseline {
         vid: VolumeId,
         bb: &spall_protocol::BaselineBrick,
     ) -> Result<(), String> {
-        use spall_protocol::BaselineCells;
         if self.open != Some(vid.get()) {
             return Err(format!(
                 "brick for volume {vid}, which is not the open volume"
             ));
         }
-        let cells: Vec<MaterialId> = match &bb.cells {
-            BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
-            BaselineCells::Dense(raw) => {
-                if raw.len() != spall_core::CELLS_PER_BRICK {
-                    return Err(format!(
-                        "baseline brick in {vid} has {} cells, expected {}",
-                        raw.len(),
-                        spall_core::CELLS_PER_BRICK
-                    ));
-                }
-                raw.iter().copied().map(MaterialId).collect()
+        let candidate = self.reuse.get(&vid.get()).and_then(|v| {
+            v.snapshot_brick(BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]))
+                .ok()
+                .flatten()
+        });
+        let brick = match (&bb.cells, candidate) {
+            (spall_protocol::BaselineCells::Dense(raw), Some(candidate))
+                if raw.len() == spall_core::CELLS_PER_BRICK =>
+            {
+                let cells: Vec<_> = raw.iter().copied().map(MaterialId).collect();
+                Brick::restored_reusing(&cells, Revision(bb.revision), bb.edited, &candidate)
             }
+            _ => baseline_brick(bb)?,
         };
-        let brick = Brick::restored(&cells, Revision(bb.revision), bb.edited);
         self.volumes
             .get_mut(&vid.get())
             .expect("open volume is staged")
@@ -578,6 +583,11 @@ impl StagedBaseline {
 }
 
 impl ReplicaWorld {
+    /// Immutable COW snapshot for exact payload reuse during atomic replacement.
+    /// It carries no permission to publish or to skip baseline validation.
+    pub(crate) fn baseline_reuse_volumes(&self) -> BTreeMap<u64, Volume> {
+        self.volumes.clone()
+    }
     /// Installs a fixed-scene baseline: `terrain` is the world grid. Bodies
     /// present before play are added with [`Self::install_body`].
     /// `docs/tasks.md` T10: "Initial fixed-scene baseline can be installed
@@ -676,15 +686,19 @@ impl ReplicaWorld {
         self.install_staged(staged)
     }
 
-    /// Decoded bytes the replica's terrain and bodies hold, counting every resident brick as a
-    /// dense one (conservative). Used to admit a replacement baseline, which coexists with the
-    /// current world until the atomic swap.
+    /// Geometry allocation estimate for replacement admission. Uniform bricks
+    /// keep their compact cost; resident dense bricks include their cell payload.
+    /// The old world coexists with staging until the atomic swap.
     pub fn decoded_bytes_estimate(&self) -> u64 {
         self.volumes
             .values()
-            .map(|v| v.resident_brick_count() as u64)
-            .sum::<u64>()
-            * spall_protocol::segment::DENSE_BRICK_DECODED_COST as u64
+            .map(|v| {
+                let storage = v.memory_report();
+                storage.total_dense_bytes() as u64
+                    + (storage.dense_bricks + storage.uniform_bricks) as u64
+                        * spall_protocol::segment::UNIFORM_BRICK_DECODED_COST as u64
+            })
+            .sum()
     }
 
     /// Installs a fully staged baseline atomically: the same swap `install_baseline_world`
@@ -1706,6 +1720,13 @@ fn apply_writes(
 /// Shared by the late-join install, the hash-repair patch, and the T17
 /// `SplitOffBaseline` / `SourcePatchBaseline` op replay.
 fn baseline_brick(bb: &BaselineBrick) -> Result<Brick, String> {
+    if let BaselineCells::Uniform(id) = &bb.cells {
+        return Ok(Brick::restored_uniform(
+            MaterialId(*id),
+            Revision(bb.revision),
+            bb.edited,
+        ));
+    }
     let cells: Vec<MaterialId> = match &bb.cells {
         BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
         BaselineCells::Dense(raw) => {
@@ -2013,6 +2034,45 @@ mod tests {
         ))
         .unwrap();
         v
+    }
+
+    #[test]
+    fn replacement_admission_keeps_uniform_bricks_compact() {
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        for x in 0..2 {
+            volume
+                .insert_brick(
+                    BrickCoord::new(x, 0, 0),
+                    Brick::uniform(MaterialId(1), Revision(1)),
+                )
+                .unwrap();
+        }
+        let mut edit = EditPlan::new(volume.id());
+        edit.set(GlobalCell::new(32, 0, 0), MaterialId::AIR);
+        volume.apply_edit(&edit).unwrap();
+        let replica = ReplicaWorld::from_baseline(volume, ReplicaConfig::default());
+        let manifest = spall_protocol::segment::SegmentManifest {
+            schema: 2,
+            segment_count: 1,
+            volume_count: 1,
+            total_bricks: 1,
+            total_decoded_bytes: 64,
+            segment_decoded_cap: spall_protocol::segment::DEFAULT_SEGMENT_DECODED_BYTES as u32,
+        };
+        let admission = crate::segmented::StagingAdmission {
+            // Enough for the existing dense + uniform pair and incoming uniform
+            // geometry, but not for pretending both existing bricks are dense.
+            budget_bytes: (4 * spall_protocol::segment::DEFAULT_SEGMENT_DECODED_BYTES
+                + spall_protocol::segment::DENSE_BRICK_DECODED_COST
+                + 1024) as u64,
+            existing_replica_bytes: replica.decoded_bytes_estimate(),
+        };
+        admission.check(&manifest).unwrap();
+        let overestimate = crate::segmented::StagingAdmission {
+            existing_replica_bytes: 2 * spall_protocol::segment::DENSE_BRICK_DECODED_COST as u64,
+            ..admission
+        };
+        assert!(overestimate.check(&manifest).is_err());
     }
 
     #[test]

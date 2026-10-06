@@ -151,6 +151,7 @@ pub enum StageError {
 
 /// Prepares `input` into a [`StagedEdit`].
 pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
+    let _total = crate::prof::Span::start("stage.total");
     let plan = EditPlan::sphere(input.volume_id, input.brush, input.kind.write_material());
     if plan.writes.is_empty() {
         return Err(StageError::EmptyBrush);
@@ -193,6 +194,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         )?,
     };
     drop(sp_idx);
+    let token_span = crate::prof::Span::start("stage.read_token");
     let mut token = index.token();
 
     // Merge in the plan's touched bricks at their pre-edit state.
@@ -211,6 +213,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         }
     }
 
+    drop(token_span);
     // Conservation is over the *logical* solid-cell count (resident + retained
     // evicted digests), so eviction never shifts the ledger regardless of where
     // the evicted bricks are. Identical to a resident-only walk when nothing is
@@ -352,6 +355,118 @@ fn face_neighbours(c: BrickCoord) -> [BrickCoord; 6] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "manual full 4096-cell world staging profile; several GiB"]
+    fn full_world_stage_profile() {
+        full_world_edit_profile(false);
+    }
+
+    #[test]
+    #[ignore = "manual full 4096-cell commit profile with exact terrain colliders; several GiB"]
+    fn full_world_commit_profile() {
+        full_world_edit_profile(true);
+    }
+
+    fn full_world_edit_profile(with_commit: bool) {
+        use spall_worldgen::{Preset, WorldGenSpec, WorldgenPalette};
+        let started = std::time::Instant::now();
+        let generated = spall_worldgen::generate(&WorldGenSpec::new(
+            Preset::Showcase,
+            1,
+            4096,
+            WorldgenPalette::sequential(1),
+        ))
+        .unwrap();
+        eprintln!(
+            "stage_profile generation_ms={}",
+            started.elapsed().as_millis()
+        );
+        let cache = spall_structure::LabelCache::new();
+        let started = std::time::Instant::now();
+        let graph = spall_structure::SupportGraph::build_cached(
+            &generated.terrain,
+            AnchorPlane::at(0),
+            ResidencyMode::AllResident,
+            &CancelToken::new(),
+            &cache,
+        )
+        .unwrap();
+        drop(graph);
+        eprintln!(
+            "stage_profile warm_labels_ms={}",
+            started.elapsed().as_millis()
+        );
+        let mut world = with_commit.then(|| {
+            let mut setup = crate::fixtures::flat_terrain_setup();
+            setup.terrain = generated.terrain.clone();
+            let started = std::time::Instant::now();
+            let world = crate::world::SimWorld::new(setup).unwrap();
+            eprintln!(
+                "commit_profile world_init_ms={}",
+                started.elapsed().as_millis()
+            );
+            // The serving host hashes the initial baseline before accepting edits.
+            let _ = world.world_hash();
+            world
+        });
+        let intent = EditIntent::cut(
+            spall_protocol::RequestId(1),
+            spall_core::EntityId::new(1).unwrap(),
+            EditTarget::Terrain,
+            brush(1024, 16, 1024, 8),
+        );
+        let input = StageInput::new(
+            &intent,
+            generated.terrain.id(),
+            generated.terrain,
+            EvictedBricks::new(),
+            AnchorPlane::at(0),
+            Generation::START,
+            TopologyEpoch::START,
+        )
+        .with_label_cache(cache);
+        let _ = crate::prof::drain();
+        let staged = stage_edit(&input).unwrap();
+        for (name, duration) in crate::prof::drain() {
+            eprintln!(
+                "stage_profile {name} ms={:.3}",
+                duration.as_secs_f64() * 1000.0
+            );
+        }
+        assert!(staged.ledger.check().is_ok());
+        eprintln!(
+            "stage_profile read_dependencies={} splits={} destroyed={}",
+            staged.token.reads().len(),
+            staged.memberships.len(),
+            staged.ledger.destroyed
+        );
+        if let Some(world) = world.as_mut() {
+            let solids = world.total_solid_cells();
+            let mut journal = crate::journal::JournalSink::new();
+            let committed = crate::commit::commit(
+                world,
+                &mut journal,
+                &staged,
+                spall_core::Tick(1),
+                spall_protocol::ControlSeq(1),
+            )
+            .unwrap();
+            let crate::commit::CommitOutcome::Committed(committed) = committed else {
+                panic!("profile token unexpectedly stale");
+            };
+            for (name, duration) in crate::prof::drain() {
+                eprintln!(
+                    "commit_profile {name} ms={:.3}",
+                    duration.as_secs_f64() * 1000.0
+                );
+            }
+            assert_eq!(world.total_solid_cells(), solids - staged.ledger.destroyed);
+            for result in &committed.topology.result_hashes {
+                assert_eq!(world.volume_hash(result.volume).unwrap(), result.hash);
+            }
+            assert_eq!(journal.len(), 1);
+        }
+    }
     use spall_core::units::{BRUSH_UNIT, BrushPoint};
     use spall_core::{CellSizeCode, EntityId, GlobalCell, SphereBrush};
     use spall_structure::AnchorPlane;

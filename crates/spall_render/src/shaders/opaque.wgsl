@@ -12,6 +12,9 @@ struct Globals {
     sun: vec4<f32>,
     sky_color: vec4<f32>,
     ground_color: vec4<f32>,
+    moon_dir: vec4<f32>,
+    moon: vec4<f32>,
+    moon_phase: vec4<f32>,
     // Point lights (xyz position, w range) and colour x intensity; count in x.
     point_lights: array<vec4<f32>, 8>,
     point_colors: array<vec4<f32>, 8>,
@@ -487,6 +490,9 @@ fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
     let specular = (d * g * f) / max(4.0 * n_dot_v * n_dot_l, 0.001);
     let diffuse = (vec3<f32>(1.0) - f) * (1.0 - metallic) * base / PI;
     var direct = (diffuse + specular) * globals.sun.rgb * globals.sun.w * n_dot_l * visibility;
+    let moon_l = normalize(-globals.moon_dir.xyz);
+    let moon_ndl = max(dot(n, moon_l), 0.0);
+    let moon_direct = base * globals.moon.rgb * globals.moon.w * moon_ndl / PI;
     var ambient = base * skylight.radiance * mix(0.35, 1.0, clamp(in.ao, 0.0, 1.0));
     // Under water the light that reached this surface lost its reds on the way
     // down, and the sun's share is broken into drifting caustic veins.
@@ -518,7 +524,7 @@ fn water_caustics(p: vec3<f32>, depth: f32, n: vec3<f32>) -> f32 {
         point += globals.point_colors[i].rgb * ndl * falloff * falloff / (1.0 + d2);
     }
     let torch_light = base * point / PI;
-    let lit = ambient + direct + (indirect + bounced) * sub_light + emission + torch_light;
+    let lit = ambient + direct + moon_direct + (indirect + bounced) * sub_light + emission + torch_light;
     return vec4<f32>(apply_water_view(lit, in.world_pos, probe_xz), mat.base_color.a);
 }
 

@@ -1486,3 +1486,127 @@ remapping/displacement/trapped ledgers/component recovery; depends ENG-123), ENG
 depends ENG-123/124). PR187 open; not merged. Experimental support remains opt-in.
 Original failures are not passes. User-selected freely displaced air supersedes
 gas compression. Next unblocked research ENG-123 when requested.
+
+### ENG-126 — Portable editor build and world launch options
+
+User-requested Windows distribution follow-up to ENG-74/89/93 and worldgen ENG-113/114. The editor world-generation dialog offers a free-form seed with a randomize action, a dropdown of supported sizes from 128 m through 1024 m, and an initial-season dropdown. Keep 256 m as the default. The selected preview must be invalidated when its seed or size no longer matches the form, and Run passes the preview seed/size plus selected season to the actual sandbox server.
+
+Ship a portable folder containing `spall-editor.exe`, `xtask.exe`, `sandbox-server.exe`, `sandbox-client.exe`, and concise launch instructions. When sibling binaries exist, editor Run Scene and Run World invoke the sibling xtask directly; `xtask play --portable` launches the sibling sandbox binaries without compiling or requiring the workspace checkout. Preserve the existing FPS HUD, world-reset admin action, and in-game sun direction control. Seasons are selected at launch and continue on the existing ecology clock; live season mutation is explicitly outside this assignment.
+
+Validation: editor worldgen argument/selection tests, editor CPU tests, `cargo check -p xtask`, `cargo check -p spall_editor`, and the portable package build script. Manual GPU presentation on the target machine is separate.
+
+
+### ENG-127 — Voxel-styled skybox, sun disc, and clouds
+
+User-requested interactive renderer presentation increment. Replace the flat background with a camera-oriented procedural sky that follows the active environment and sun direction, with a visible sun disc and voxel-like stepped clouds. Keep it renderer-only; do not add voxel simulation or persistence state. Focused render validation and manual GPU review are separate evidence.
+
+### ENG-128 — 20-minute day/night clock and lunar cycle
+
+Use the authoritative 60 Hz server tick for a deterministic 20-minute solar day, smooth sky/sun/environment lighting, and an eight-day waxing/waning moon cycle. Show a faint phase-appropriate moon in daylight when above the horizon, and retain readable night ambient light when the moon is new or below the horizon. The HUD/admin lighting menu shows the world time and phase; presets and explicit launch environment selection pause the visual cycle, with a resume control. The simulation tick is not persisted, so a restarted world begins at 06:00; do not add a competing client wall clock or protocol field.
+
+Validation: `cargo test -p spall_client day_night::tests`, `cargo check -p spall_render -p spall_client -p sandbox --features client`, and the focused GPU renderer test/capture for skybox and lighting shader validation. Manual hardware presentation remains separate.
+
+### ENG-127 camera correction
+
+Mouse-look correction: reconstruct sky rays with clip-space +Y up, matching
+geometry camera projection. Fixed celestial directions and clouds rotate with
+the view and remain invariant under camera translation. Regression evidence
+and exact checks: [camera correction](reports/ENG-127-camera-correction.md).
+### ENG-126 large-world startup correction
+
+The 128..1024 m dropdown lists valid preview dimensions, not proven playable
+sizes. Seed 1 at 1024 m requires 47,421,308 water-domain voxel cells against
+the existing 4,000,000 limit and exits before readiness. The preview now checks
+that capacity, preserves the map, and shows why Run is unavailable. The editor
+monitors launcher exit, reports startup errors, and prevents duplicate launches.
+The default 256 m seed-1 server launch was measured successful. Larger playable
+sizes remain an explicit capacity/integration prerequisite; do not remove water,
+shrink the selected world, or report a longer timeout as a fix. ENG-126 remains
+in progress. Evidence: [startup correction](reports/ENG-126-startup-correction.md).
+
+### ENG-126 large-world integration (2026-10-06)
+
+Portable implementation complete: the 1024 m seed-1 world now launches in the
+actual packaged GPU client. Extended water uses bounded schema 2 beyond the
+legacy 32 Mi fine-cell limit; new negotiated world version 3 streams bounded
+segments under a 256 MiB compressed ceiling and explicit client admission.
+Legacy wire limits, exact geometry, authority and durable recovery remain
+intact. Control pumping and a bounded outgoing baseline slot prevent false
+idle/backlog disconnects. Editor status distinguishes window opening from a
+ready world. The package and relevant CPU/QUIC/GPU smoke checks pass.
+
+Memory and performance targets are not accepted: measured server/client peaks
+exceed the existing targets. Next assignment ENG-114 covers large-world
+resource and reset/destruction feasibility. Exact evidence, changed files,
+checks and remaining risks: reports/ENG-126-large-world-integration.md.
+
+### ENG-114 memory optimization and full-world stress (2026-10-06)
+
+The full seed-1 4096-cell (1024 m) world keeps all 196,608 bricks, exact
+collision, water and ecology. Stream collider preparation, restore immutable
+payloads directly, pack low-diversity material arrays and reuse exact unchanged
+payloads during atomic client resets. Worldgen packs on its owning thread and
+retains source arrays until packing ends to avoid Windows heap fragmentation.
+The clean two-client probe confirms all eight digs, both resets on each client,
+and final authoritative hash equality. Headless peaks are 8.076 GiB server and
+2.195 GiB per client; server <=8 GiB remains a target miss. Commit latency and
+impaired joining require further work. No whole-foundation, eight-client, soak
+or new GPU gate is claimed. Exact commands, failed probes and next ENG-114
+profiling work: reports/ENG-114-memory-stress.md. Ticket remains in progress.
+
+### ENG-114 commit/transfer and reset follow-up (2026-10-06)
+
+Batch complete read-dependency tokens with one stable canonical sort, preserving
+last-observation duplicate semantics and all absent/failed sentinels. Full-world
+token build measured 2081.95 -> 11.07 ms, total staging 3205.66 -> 1130.85 ms.
+Share exact full/empty label shapes within each label cache. The clean full
+4096-cell eight-dig/two-reset run passes final hash agreement with 7.847 GiB
+server and 2.199 GiB maximum client peaks. Commit p95 remains 8954.14 ms versus
+100 ms target (7 single-brick samples); a large-collapse sample takes 8063.52 ms.
+CUBIC's isolated 4 MiB impaired transfer exceeded 90 s; experimental BBR took
+4827 ms. Keep CUBIC as the shipped default; BBR is explicit diagnostic opt-in,
+with a distinct full-workload fixture and unchanged limits. Next ENG-114 covers
+remaining commit latency and transport/congestion gates. Exact checks, files,
+full impaired evidence and limitations: reports/ENG-114-commit-transfer.md.
+
+The accepted-baseline shutdown race now drains reliable writers after durable
+simulation completion, waits for bulk FIN acknowledgement, and fails explicitly
+at the existing transport idle bound. Red/green delayed-link regression passes.
+The corrected full BBR impaired workload still fails: second reset on the
+shaped client exceeds the existing 30 s shutdown drain; no final hash agreement.
+Server peak is 7.851 GiB; all eight actions commit, but only one reset installs
+on that client. Keep ENG-114 in progress. Do not increase budgets to claim a
+pass. Final default-CUBIC small reset regression and scoped checks pass;
+portable package rebuilt. Next: ENG-114 commit latency and bounded full-size
+impaired reset convergence, then controller fairness and remaining stress gates.
+
+### ENG-114 count-proven occupancy and commit profiling (2026-10-06)
+
+Exact cached solid counts prove full/empty brick labels even with mixed
+materials; partial occupancy retains the same six-face flood fill. Palette,
+wide/max-ID storage, plane-cut disconnection and old COW snapshots match the
+reference. Cold full-world labels measured 19269 -> 16676 ms; warmed staging
+610 ms and commit191 ms remain above 100 ms. Phase timings expose hash/encoding
+costs and do not explain all integrated latency. Full BBR impaired rerun still
+fails the second shaped reset at the existing 30 s shutdown drain. All 8 digs
+commit, transparent client installs 2 resets, shaped only 1; final hashes differ.
+Server/client peaks 7.952/2.198 GiB are from a failed workload. Integrated commit
+p95 4247.91 ms and large collapse 2426.30 ms miss their 100 ms/2 s targets.
+A 96 MiB raw BBR transfer takes 72977 ms without world decoding,
+under unchanged 8 MiB/s/200 ms RTT/20 ms jitter/5% loss. Diagnostic workload
+selection stays within existing streamed admission and 90 s deadline; default
+controller remains CUBIC. Final small default reset and ordinary checks pass;
+portable rebuilt. Exact evidence: reports/ENG-114-commit-transfer.md.
+Next unblocked ENG-114: global structural-analysis and integrated commit costs,
+transport throughput/loss/socket-relay pacing and bounded full reset convergence.
+Do not claim G3/G4, whole-foundation, eight-client, soak or GPU gates passed.
+
+### ENG-114 buffering/relay priorities (2026-10-06)
+
+Sorted adjacency candidate reverted: exact full staging did not improve (631 vs
+610 ms). New checkerboard boundary/resume invariant retained. Optional 64 KiB..=4
+MiB UDP receive-buffer diagnostic preserves default platform buffering/CUBIC.
+96 MiB BBR probe: 72.531 s with requested 1 MiB endpoints, 68.108 s with bounded
+due-packet relay batching, versus prior 72.977 s. Single observations; no new
+full-world or G3/G4 acceptance. Next ENG-114: remaining pacing diagnosis, full-size
+reset convergence and integrated graph cost. See reports/ENG-114-commit-transfer.md.

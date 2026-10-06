@@ -1,5 +1,5 @@
 //! The World Gen dialog's data: parsing, the column-map preview, and the
-//! `cargo xtask play` arguments that run the previewed world.
+//! launcher arguments that run the previewed world.
 //!
 //! Everything here is plain CPU data so it can be tested without a window; the
 //! dialog (`ui.rs`) draws it and `main.rs` owns the GPU texture.
@@ -7,9 +7,10 @@
 use spall_worldgen::debug::{ColumnStats, biome_color, column_stats, top_down_rgba};
 use spall_worldgen::{Biome, ColumnMap, Preset, WorldGenSpec, WorldgenPalette};
 
-/// Arena edges the dialog offers, in cells (0.25 m each): 128 m and 256 m.
-pub(crate) const SIZES: [u32; 2] = [512, 1024];
+/// Arena edge choices in cells (0.25 m each).
+pub(crate) const SIZES: [u32; 4] = [512, 1024, 2048, 4096];
 pub(crate) const DEFAULT_SIZE: u32 = 1024;
+pub(crate) const SEASONS: [&str; 4] = ["spring", "summer", "autumn", "winter"];
 
 /// A generated column map, ready to show.
 pub(crate) struct Preview {
@@ -18,11 +19,16 @@ pub(crate) struct Preview {
     /// `size_cells x size_cells` RGBA8, row-major with `z` as the row.
     pub rgba: Vec<u8>,
     pub stats: ColumnStats,
+    /// Full-world generation may reject a valid preview at its capacity gate.
+    pub launch_error: Option<String>,
 }
 
 pub(crate) struct WorldgenPanel {
     pub seed_text: String,
     pub size_cells: u32,
+    pub season: String,
+    pub size_menu_open: bool,
+    pub season_menu_open: bool,
     pub preview: Option<Preview>,
     pub error: Option<String>,
 }
@@ -30,8 +36,11 @@ pub(crate) struct WorldgenPanel {
 impl Default for WorldgenPanel {
     fn default() -> Self {
         Self {
-            seed_text: "1".into(),
+            seed_text: random_seed().to_string(),
             size_cells: DEFAULT_SIZE,
+            season: "summer".into(),
+            size_menu_open: false,
+            season_menu_open: false,
             preview: None,
             error: None,
         }
@@ -61,17 +70,21 @@ pub(crate) fn generate_preview(seed: u64, size_cells: u32) -> Result<Preview, St
         WorldgenPalette::sequential(1),
     );
     let columns = ColumnMap::compute(&spec).map_err(|e| e.to_string())?;
+    let launch_error = spall_worldgen::generate::validate_water_budget(&columns)
+        .err()
+        .map(|error| error.to_string());
     Ok(Preview {
         seed,
         size_cells,
         rgba: top_down_rgba(&columns),
         stats: column_stats(&columns),
+        launch_error,
     })
 }
 
-/// Arguments after `cargo` that play the world: it is built by the sandbox
-/// server from the same seed and size as the preview.
-pub(crate) fn play_args(seed: u64, size_cells: u32) -> Vec<String> {
+/// Arguments after the launcher command that play the same seeded world shown
+/// in the preview.
+pub(crate) fn play_args(seed: u64, size_cells: u32, season: &str) -> Vec<String> {
     vec![
         "xtask".into(),
         "play".into(),
@@ -81,6 +94,8 @@ pub(crate) fn play_args(seed: u64, size_cells: u32) -> Vec<String> {
         seed.to_string(),
         "--worldgen-size".into(),
         size_cells.to_string(),
+        "--season".into(),
+        season.to_owned(),
     ]
 }
 
@@ -88,7 +103,7 @@ pub(crate) fn play_args(seed: u64, size_cells: u32) -> Vec<String> {
 pub(crate) fn random_seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |d| d.as_nanos() as u64 % 1_000_000)
+        .map_or(1, |d| d.as_nanos() as u64 ^ u64::from(std::process::id()))
 }
 
 /// Legend rows: label, colour, and share of the map, in [`Biome::ALL`] order.
@@ -151,7 +166,7 @@ mod tests {
     #[test]
     fn play_arguments_name_the_previewed_world() {
         assert_eq!(
-            play_args(9, 512),
+            play_args(9, 512, "winter"),
             [
                 "xtask",
                 "play",
@@ -160,8 +175,36 @@ mod tests {
                 "--seed",
                 "9",
                 "--worldgen-size",
-                "512"
+                "512",
+                "--season",
+                "winter"
             ]
         );
+    }
+
+    #[test]
+    fn size_choices_match_server_bounds_and_default_to_a_large_world() {
+        assert_eq!(DEFAULT_SIZE, 1024);
+        assert_eq!(SIZES, [512, 1024, 2048, 4096]);
+        assert!(
+            SIZES
+                .iter()
+                .all(|size| (128..=4096).contains(size) && size % 32 == 0)
+        );
+    }
+
+    #[test]
+    fn launch_options_start_with_a_seed_and_valid_season() {
+        let options = WorldgenPanel::default();
+        assert!(options.seed_text.parse::<u64>().is_ok());
+        assert!(SEASONS.contains(&options.season.as_str()));
+    }
+
+    #[test]
+    #[ignore = "large-world preview capacity regression; no terrain allocation"]
+    fn large_preview_passes_the_extended_capacity_check() {
+        let preview = generate_preview(1, 4096).unwrap();
+        assert_eq!(preview.rgba.len(), 4096 * 4096 * 4);
+        assert!(preview.launch_error.is_none(), "{:?}", preview.launch_error);
     }
 }

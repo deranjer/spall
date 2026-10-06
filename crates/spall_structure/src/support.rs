@@ -16,7 +16,9 @@
 //!   Never treated as air and never as a permanent anchor.
 
 use spall_core::{BrickCoord, GlobalCell, VolumeId};
-use spall_jobs::{Generation, JobToken, Staleness, TopologyEpoch, WorldView};
+use spall_jobs::{
+    BrickRef, DepState, Generation, JobToken, ReadDep, Staleness, TopologyEpoch, WorldView,
+};
 use spall_voxel::{EditOutcome, Volume};
 
 use crate::graph::{
@@ -175,17 +177,23 @@ impl StructureIndex {
     /// while assembling a boundary component. These sentinels cover both
     /// streamed unknowns and all-resident empty-space assumptions.
     pub fn token(&self) -> JobToken {
-        let mut token = JobToken::new(self.generation, self.topology_epoch);
-        for (brick, revision) in self.graph.read_revisions() {
-            token = token.reading(self.volume, brick, revision);
-        }
-        for brick in self.graph.absent_dependencies() {
-            token = token.reading_absent(self.volume, brick);
-        }
-        for brick in self.graph.failed_dependencies() {
-            token = token.reading_failed(self.volume, brick);
-        }
-        token
+        let resident = self
+            .graph
+            .read_revisions()
+            .map(|(brick, revision)| ReadDep {
+                brick: BrickRef::new(self.volume, brick),
+                state: DepState::Revision(revision),
+            });
+        let absent = self.graph.absent_dependencies().map(|brick| ReadDep {
+            brick: BrickRef::new(self.volume, brick),
+            state: DepState::Absent,
+        });
+        let failed = self.graph.failed_dependencies().map(|brick| ReadDep {
+            brick: BrickRef::new(self.volume, brick),
+            state: DepState::Failed,
+        });
+        JobToken::new(self.generation, self.topology_epoch)
+            .reading_many(resident.chain(absent).chain(failed))
     }
 
     /// Validates the current graph against the live world. Anything other than

@@ -1557,6 +1557,9 @@ type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
 ///   reliable reader that blows either bound is disconnected (and re-baselines
 ///   on reconnect); the backlog already accepted is still flushed, so committed
 ///   topology is never silently discarded to stay under budget.
+/// * One version-3 baseline has a separate 256 MiB compressed slot, in the
+///   same FIFO. The writer may own one transfer while one more waits; ordinary
+///   reliable traffic retains its 8 MiB limit.
 /// * Motion is lossy: only the newest unsent batch is retained, so a slow
 ///   reader accumulates no stale motion (`docs/protocol.md`: "Drop superseded
 ///   unsent motion snapshots").
@@ -1564,6 +1567,7 @@ type ClientMap = Arc<Mutex<HashMap<u64, OutboundHandle>>>;
 struct OutboundQueue {
     reliable: VecDeque<Outbound>,
     reliable_bytes: usize,
+    streamed_baseline_pending: bool,
     motion: Option<Arc<Vec<MotionSnapshot>>>,
     /// Set once a reliable push blew the bound. The writer flushes what is
     /// already queued, says goodbye, and exits.
@@ -1587,6 +1591,25 @@ impl OutboundQueue {
             // The shutdown marker always goes through — it ends the stream.
             Outbound::Shutdown(reason) => {
                 self.reliable.push_back(Outbound::Shutdown(reason));
+                Ok(())
+            }
+            Outbound::Baseline(transfer)
+                if transfer.begin.world_version
+                    == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION =>
+            {
+                // One bounded streaming transfer has its own slot; counting its
+                // compressed bytes as control backlog would reject it before send.
+                if self.overflowed
+                    || self.streamed_baseline_pending
+                    || self.reliable.len() >= MAX_RELIABLE_BACKLOG
+                    || transfer.payload_bytes()
+                        > spall_protocol::segment::MAX_STREAMED_BASELINE_COMPRESSED
+                {
+                    self.overflowed = true;
+                    return Err(OutboundOverflow);
+                }
+                self.streamed_baseline_pending = true;
+                self.reliable.push_back(Outbound::Baseline(transfer));
                 Ok(())
             }
             reliable => {
@@ -1700,6 +1723,7 @@ impl OutboundHandle {
         // queue, or the cap would count every reliable byte ever sent on this
         // connection rather than what is waiting.
         q.reliable_bytes = 0;
+        q.streamed_baseline_pending = false;
         OutboundBatch {
             reliable: q.reliable.drain(..).collect(),
             motion: q.motion.take(),
@@ -1831,6 +1855,7 @@ async fn serve_async(
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_CHANNEL_CAP);
     let (count_tx, mut count_rx) = watch::channel(0usize);
     let (stop_tx, stop_rx) = watch::channel(false);
+    let (accept_stop_tx, accept_stop_rx) = watch::channel(false);
 
     // Reload credentials atomically from the operator-managed registry. A
     // malformed or unreadable update fails closed by revoking the whole live
@@ -1915,16 +1940,18 @@ async fn serve_async(
         let egress_closed = egress_closed.clone();
         let inbound_tx = inbound_tx.clone();
         let stop_rx = stop_rx.clone();
+        let accept_stop_rx = accept_stop_rx.clone();
         let admission = AdmissionGate::new(config.max_clients);
         tokio::spawn(async move {
             let mut connected = 0usize;
             loop {
-                if *stop_rx.borrow() {
+                if *stop_rx.borrow() || *accept_stop_rx.borrow() {
                     break;
                 }
                 let accepted = tokio::select! {
                     r = server.accept() => r,
                     _ = wait_true(stop_rx.clone()) => break,
+                    _ = wait_true(accept_stop_rx.clone()) => break,
                 };
                 let conn = match accepted {
                     Ok(c) => Arc::new(c),
@@ -3207,11 +3234,6 @@ async fn serve_async(
             }
         }
 
-        broadcast(
-            &clients_for_sim,
-            Outbound::Shutdown(Connection::BYE_REASON_COMPLETE),
-        );
-
         // Clean-shutdown durability: queue the final journal tail + checkpoint
         // + retain, then block until the off-thread writer has drained and
         // exited (`docs/protocol.md`: "Clean shutdown waits for a final
@@ -3392,15 +3414,38 @@ async fn serve_async(
         }
     });
 
-    let sim_result = sim_join
+    let mut sim_result = sim_join
         .await
         .map_err(|e| ServeError::Runtime(format!("sim thread panicked: {e}")))?;
 
-    // Tear down.
+    // Stop admission first. Keep readers and heartbeats alive while writers
+    // drain every accepted reliable record, including their owned bulk stream.
+    let _ = accept_stop_tx.send(true);
+    let _ = accept.await;
+    broadcast(
+        &clients,
+        Outbound::Shutdown(Connection::BYE_REASON_COMPLETE),
+    );
+    let drain = async {
+        loop {
+            if conns.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    if tokio::time::timeout(config.transport.idle_timeout, drain)
+        .await
+        .is_err()
+    {
+        sim_result.ok = false;
+        sim_result.error =
+            Some("accepted reliable traffic did not drain within the shutdown bound".into());
+    }
+    // The existing transport idle bound also bounds a stalled shutdown drain.
     let _ = stop_tx.send(true);
     server.close();
     let _ = tokio::time::timeout(Duration::from_secs(3), server.wait_idle()).await;
-    let _ = accept.await;
 
     // T20: total egress. Hold the `conns` lock across the whole read so a
     // late-closing `serve_conn` can neither remove-and-accumulate an entry
@@ -3810,6 +3855,7 @@ enum Phase {
 
 struct ClientLink {
     session: SessionId,
+    segmented: bool,
     phase: Phase,
 }
 
@@ -3947,6 +3993,7 @@ impl LateJoin {
             session.raw(),
             ClientLink {
                 session,
+                segmented: false,
                 phase: Phase::Live,
             },
         );
@@ -3979,10 +4026,12 @@ impl LateJoin {
         self.cached_baseline = None;
         self.pending_captures.clear();
         let base_id = self.next_id();
-        let transfer = baseline::transfer_from_snapshot(
+        let segmented = self.links.values().all(|link| link.segmented);
+        let transfer = baseline::transfer_from_snapshot_supported(
             baseline::snapshot_world(sim, self.backing_ref()),
             TransferId(base_id.0 | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT),
             InterestEpoch(1),
+            segmented,
         )?;
         let keyframe = Arc::new(motion.full_snapshots(sim.world(), sim.current_tick()));
         let sessions: Vec<SessionId> = self.sessions().collect();
@@ -4063,12 +4112,16 @@ impl LateJoin {
         };
 
         if want_baseline {
+            let segmented =
+                ack.verified_manifest_hash == spall_protocol::segment::baseline_cap_streamed();
+            self.links.get_mut(&session.raw()).unwrap().segmented = segmented;
             let id = self.next_id();
-            match self
-                .cached_baseline
-                .as_ref()
-                .filter(|b| b.begin.journal_cursor == JournalSeq(sim.journal_cursor()))
-            {
+            match self.cached_baseline.as_ref().filter(|b| {
+                b.begin.journal_cursor == JournalSeq(sim.journal_cursor())
+                    && (b.begin.world_version
+                        == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION)
+                        == segmented
+            }) {
                 Some(transfer) => {
                     let transfer = transfer.reissue(id);
                     self.baseline_bytes += transfer.payload_bytes() as u64;
@@ -4085,10 +4138,11 @@ impl LateJoin {
                     let snapshot = baseline::snapshot_world(sim, self.backing_ref());
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
                     self.capture_pool.spawn(move || {
-                        let _ = tx.send(baseline::transfer_from_snapshot(
+                        let _ = tx.send(baseline::transfer_from_snapshot_supported(
                             snapshot,
                             id,
                             InterestEpoch(1),
+                            segmented,
                         ));
                     });
                     if let Some(link) = self.links.get_mut(&session.raw()) {
@@ -4178,6 +4232,7 @@ impl LateJoin {
                 Some(ClientLink {
                     session,
                     phase: Phase::Joining { retries, .. },
+                    ..
                 }) => {
                     *retries += 1;
                     (*session, *retries)
@@ -4196,7 +4251,8 @@ impl LateJoin {
             }
             self.retries += 1;
             let id = self.next_id();
-            match self.capture_for(sim, id) {
+            let segmented = self.links.get(&raw).is_some_and(|link| link.segmented);
+            match self.capture_for_format(sim, id, segmented) {
                 Some(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&raw) {
@@ -4244,19 +4300,31 @@ impl LateJoin {
     /// Captures a baseline transfer at the current tick / journal cursor, over
     /// the logical brick set (evicted bricks filled from the residency
     /// backing when one is installed).
+    #[cfg(test)]
     fn capture_for(&mut self, sim: &Simulation, id: TransferId) -> Option<BaselineTransfer> {
+        self.capture_for_format(sim, id, false)
+    }
+
+    fn capture_for_format(
+        &mut self,
+        sim: &Simulation,
+        id: TransferId,
+        segmented: bool,
+    ) -> Option<BaselineTransfer> {
         let cursor = JournalSeq(sim.journal_cursor());
         if let Some(cached) = &self.cached_baseline
             && cached.begin.journal_cursor == cursor
+            && (cached.begin.world_version
+                == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION)
+                == segmented
         {
             return Some(cached.reissue(id));
         }
-        let transfer = baseline::logical_capture_transfer(
-            sim,
-            self.backing_ref(),
+        let transfer = baseline::transfer_from_snapshot_supported(
+            baseline::snapshot_world(sim, self.backing_ref()),
             id,
             InterestEpoch(1),
-            cursor,
+            segmented,
         )
         .ok()?;
         self.cached_baseline = Some(std::sync::Arc::new(transfer.reissue(id)));
@@ -4285,13 +4353,14 @@ impl LateJoin {
                         );
                     }
                 }
-                _ => {
+                Err(error) => {
+                    tracing::error!(%error, session = raw, "baseline capture failed");
                     self.failed += 1;
                     if let Some(link) = self.links.remove(&raw) {
                         send_to(
                             clients,
                             link.session,
-                            Outbound::Shutdown(Connection::BYE_REASON_CATCH_UP_EXHAUSTED),
+                            Outbound::Shutdown(Connection::BYE_REASON_BASELINE_CAPACITY),
                         );
                     }
                 }
@@ -5021,7 +5090,7 @@ async fn send_baseline(conn: &Connection, transfer: &BaselineTransfer) -> bool {
             return false;
         }
     }
-    if bulk.finish().is_err() {
+    if bulk.finish_and_wait().await.is_err() {
         return false;
     }
     conn.send_record(WireRecord::BaselineEnd(transfer.end))
@@ -5249,6 +5318,57 @@ async fn serve_conn(
 mod tests {
     use super::*;
     use spall_store::{JournalPayload, JournalRecord};
+
+    #[test]
+    fn streamed_baseline_has_one_bounded_fifo_slot_and_drain_releases_it() {
+        let sim = Simulation::new(spall_sim::SimulationConfig::new(
+            spall_sim::fixtures::bridged_terrain_setup(),
+        ))
+        .unwrap();
+        let mut transfer = baseline::transfer_from_snapshot_supported(
+            baseline::snapshot_world(&sim, None),
+            TransferId(1),
+            InterestEpoch(1),
+            true,
+        )
+        .unwrap();
+        let payload = vec![0u8; spall_protocol::limits::MAX_BULK_PART];
+        let hash = spall_protocol::Hash32::of(&payload);
+        transfer.parts = (0..9)
+            .map(|i| spall_protocol::BaselinePart {
+                transfer_id: TransferId(1),
+                part_index: i,
+                part_hash: hash,
+                payload: payload.clone(),
+            })
+            .collect();
+        transfer.begin.total_bytes = transfer.payload_bytes() as u64;
+        transfer.begin.part_count = 9;
+        let transfer = Arc::new(transfer);
+        assert!(transfer.payload_bytes() > MAX_RELIABLE_BACKLOG_BYTES);
+        let handle = OutboundHandle::new();
+        handle
+            .push(Outbound::Baseline(Arc::clone(&transfer)))
+            .unwrap();
+        assert_eq!(handle.reliable_bytes(), 0, "separate bounded transfer slot");
+        let batch = handle.take();
+        assert_eq!(batch.reliable.len(), 1);
+        assert!(!batch.overflowed);
+        handle
+            .push(Outbound::Baseline(Arc::clone(&transfer)))
+            .unwrap();
+        assert!(
+            handle.push(Outbound::Baseline(transfer)).is_err(),
+            "second queued transfer must be bounded"
+        );
+        let batch = handle.take();
+        assert_eq!(
+            batch.reliable.len(),
+            1,
+            "accepted transfer is never discarded"
+        );
+        assert!(batch.overflowed);
+    }
 
     #[test]
     fn queue_full_intent_rejections_are_marked_retryable() {
@@ -5752,7 +5872,10 @@ mod tests {
         assert_eq!(first.begin.journal_cursor, second.begin.journal_cursor);
         assert_eq!(first.begin.transfer_id, TransferId(1));
         assert_eq!(second.begin.transfer_id, TransferId(2));
-        assert!(std::sync::Arc::ptr_eq(&first.world, &second.world));
+        assert!(std::sync::Arc::ptr_eq(
+            first.world.as_ref().unwrap(),
+            second.world.as_ref().unwrap()
+        ));
         assert!(
             second
                 .parts

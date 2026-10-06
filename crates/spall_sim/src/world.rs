@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 
 use glam::DQuat;
 use spall_core::{
-    BrickCoord, CellSizeCode, EntityId, GlobalCell, IdError, LocalCell, MaterialId, PlayerInput,
-    Revision, VolumeId,
+    BrickCoord, CellSizeCode, EntityId, GlobalCell, IdError, MaterialId, PlayerInput, Revision,
+    VolumeId,
 };
 use spall_jobs::{BrickRef, BrickStatus, Generation, TopologyEpoch, WorldView};
 use spall_physics::{
@@ -196,6 +196,14 @@ fn empty_evicted() -> &'static EvictedBricks {
 /// `None` if the volume has none.
 fn first_solid_brick_grid(volume: &Volume) -> Result<Option<OccupancyGrid>, WorldError> {
     for coord in volume.resident_brick_coords() {
+        if volume
+            .snapshot_brick(coord)
+            .ok()
+            .flatten()
+            .is_some_and(|brick| brick.solid_cells() == 0)
+        {
+            continue;
+        }
         let min = GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32);
         let max = GlobalCell::new(min.x + 31, min.y + 31, min.z + 31);
         let grid = OccupancyGrid::from_region(volume, min, max)?;
@@ -371,9 +379,25 @@ impl SimWorld {
             return Err(WorldError::BrickCoordinateOverflow(coord));
         };
         let max = GlobalCell::new(max_x, max_y, max_z);
-        let grid = OccupancyGrid::from_region(volume, min, max)?;
-        if grid.solid_count() == 0 {
+        let solid_cells = volume
+            .snapshot_brick(coord)
+            .ok()
+            .flatten()
+            .map(|brick| brick.solid_cells());
+        if solid_cells == Some(0) {
             return Ok(None);
+        }
+        let grid = OccupancyGrid::from_region(volume, min, max)?;
+        if solid_cells == Some(spall_core::CELLS_PER_BRICK as u32) {
+            // Proven full occupancy has exactly one greedy box regardless of
+            // material diversity. This is the same exact policy as planning
+            // the grid, without rescanning every solid cell for the decision.
+            return Ok(Some(ColliderPlan {
+                representation: spall_physics::Representation::MergedCuboids,
+                coarsen_k: 1,
+                grid,
+                primitives: 1,
+            }));
         }
         Ok(Some(plan_collider(&grid)?))
     }
@@ -387,7 +411,18 @@ impl SimWorld {
         let terrain = self.terrain.volume.clone();
         let mut planned = Vec::new();
         for coord in terrain.resident_brick_coords() {
-            planned.push((coord, Self::plan_terrain_brick(&terrain, coord)?));
+            let Some(plan) = Self::plan_terrain_brick(&terrain, coord)? else {
+                continue;
+            };
+            // Validate every collider before retiring the legacy representation,
+            // but retain only its policy, not a 32-cubed occupancy grid per
+            // solid brick. The immutable terrain snapshot can reproduce each
+            // grid during publication. Full-world grid staging otherwise costs
+            // several GiB even though physics consumes one grid at a time.
+            self.physics_origin
+                .localize_terrain_grid(plan.grid, f64::from(terrain.cell_size().metres() as f32))
+                .ok_or(WorldError::PhysicsFrameOutOfRange)?;
+            planned.push((coord, plan.representation));
         }
 
         // The legacy fixed body is no longer used after this one-way switch.
@@ -396,15 +431,19 @@ impl SimWorld {
         self.physics.retire_body(self.terrain.phys);
         let mut colliders = BTreeMap::new();
         let cell_m = terrain.cell_size().metres() as f32;
-        for (coord, plan) in planned {
-            let Some(plan) = plan else { continue };
+        for (coord, representation) in planned {
+            let min = GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32);
+            let max = GlobalCell::new(min.x + 31, min.y + 31, min.z + 31);
+            // Identical snapshot/coordinates already passed extraction and
+            // localization above; no live mutation occurs between the passes.
+            let fine = OccupancyGrid::from_region(&terrain, min, max)?;
             let (grid, translation_m) = self
                 .physics_origin
-                .localize_terrain_grid(plan.grid, f64::from(cell_m))
+                .localize_terrain_grid(fine, f64::from(cell_m))
                 .ok_or(WorldError::PhysicsFrameOutOfRange)?;
             let phys = self.physics.add_body(BodySpec {
                 kind: PhysBodyKind::Fixed,
-                representation: plan.representation,
+                representation,
                 grid,
                 cell_m,
                 density_kg_m3: 1.0,
@@ -2196,12 +2235,7 @@ pub fn solid_cells(volume: &Volume) -> u64 {
         let Some(snap) = volume.snapshot_brick(coord).ok().flatten() else {
             continue;
         };
-        for index in 0..spall_core::CELLS_PER_BRICK as u16 {
-            let local = LocalCell::from_linear_index(index).expect("index < 32768");
-            if !snap.get(local).is_air() {
-                total += 1;
-            }
-        }
+        total += u64::from(snap.solid_cells());
     }
     total
 }
@@ -2214,4 +2248,152 @@ pub fn brick_of(cell: GlobalCell) -> BrickCoord {
 /// The cell size code of a volume, restated for callers that only hold an id.
 pub fn cell_size_of(volume: &Volume) -> CellSizeCode {
     volume.cell_size()
+}
+
+#[cfg(test)]
+mod terrain_plan_tests {
+    use super::*;
+
+    #[test]
+    fn solid_count_matches_cell_reference_after_edits_and_snapshot_forks() {
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        for (x, material) in [(0, MaterialId(1)), (1, MaterialId::AIR)] {
+            volume
+                .insert_brick(
+                    BrickCoord::new(x, 0, 0),
+                    spall_voxel::Brick::uniform(material, Revision(1)),
+                )
+                .unwrap();
+        }
+        let before = volume.clone();
+        let mut edit = spall_voxel::EditPlan::new(volume.id());
+        edit.set(GlobalCell::new(1, 2, 3), MaterialId::AIR);
+        edit.set(GlobalCell::new(33, 2, 3), MaterialId(u16::MAX));
+        volume.apply_edit(&edit).unwrap();
+        for candidate in [&before, &volume] {
+            let reference: u64 = candidate
+                .resident_brick_coords()
+                .into_iter()
+                .map(|coord| {
+                    let snapshot = candidate.snapshot_brick(coord).unwrap().unwrap();
+                    snapshot
+                        .material_cells()
+                        .into_iter()
+                        .filter(|m| !m.is_air())
+                        .count() as u64
+                })
+                .sum();
+            assert_eq!(solid_cells(candidate), reference);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual full-world collider validation diagnostic; about 3 GiB"]
+    fn full_world_plan_probe() {
+        use spall_worldgen::{Preset, WorldGenSpec, WorldgenPalette};
+        let started = std::time::Instant::now();
+        let world = spall_worldgen::generate(&WorldGenSpec::new(
+            Preset::Showcase,
+            1,
+            4096,
+            WorldgenPalette::sequential(1),
+        ))
+        .unwrap();
+        eprintln!("plan_probe generation_ms={}", started.elapsed().as_millis());
+        let started = std::time::Instant::now();
+        for (i, coord) in world
+            .terrain
+            .resident_brick_coords()
+            .into_iter()
+            .enumerate()
+            .take(2048)
+        {
+            if i % 1024 == 0 {
+                eprintln!(
+                    "plan_probe index={i} coord={coord:?} elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
+            let phase = std::time::Instant::now();
+            let count = world
+                .terrain
+                .snapshot_brick(coord)
+                .unwrap()
+                .unwrap()
+                .solid_cells();
+            let count_us = phase.elapsed().as_micros();
+            let phase = std::time::Instant::now();
+            let min = GlobalCell::new(coord.x * 32, coord.y * 32, coord.z * 32);
+            let max = GlobalCell::new(min.x + 31, min.y + 31, min.z + 31);
+            let grid = OccupancyGrid::from_region(&world.terrain, min, max).unwrap();
+            let grid_us = phase.elapsed().as_micros();
+            let phase = std::time::Instant::now();
+            if count != 0 && count != spall_core::CELLS_PER_BRICK as u32 {
+                let _ = plan_collider(&grid).unwrap();
+            }
+            let plan_us = phase.elapsed().as_micros();
+            if i < 20 || grid_us > 1000 || plan_us > 1000 {
+                eprintln!(
+                    "plan_probe i={i} coord={coord:?} solid={count} count_us={count_us} grid_us={grid_us} plan_us={plan_us}"
+                );
+            }
+        }
+        eprintln!("plan_probe validation_ms={}", started.elapsed().as_millis());
+    }
+
+    #[test]
+    fn cached_occupancy_shortcuts_match_exact_planning_and_refuse_unknown_cells() {
+        let coord = BrickCoord::new(0, 0, 0);
+        let mut volume = Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter);
+        assert!(SimWorld::plan_terrain_brick(&volume, coord).is_err());
+        for empty in [false, true] {
+            let cells: Vec<_> = (0..spall_core::CELLS_PER_BRICK)
+                .map(|i| {
+                    if empty {
+                        MaterialId::AIR
+                    } else {
+                        MaterialId(1 + (i % 3) as u16)
+                    }
+                })
+                .collect();
+            volume
+                .insert_brick(
+                    coord,
+                    spall_voxel::Brick::restored(&cells, Revision(2), empty),
+                )
+                .unwrap();
+            let plan = SimWorld::plan_terrain_brick(&volume, coord).unwrap();
+            if empty {
+                assert!(plan.is_none());
+            } else {
+                let plan = plan.unwrap();
+                let reference = plan_collider(
+                    &OccupancyGrid::from_region(
+                        &volume,
+                        GlobalCell::new(0, 0, 0),
+                        GlobalCell::new(31, 31, 31),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(plan.representation, reference.representation);
+                assert_eq!(plan.primitives, reference.primitives);
+                assert_eq!(plan.grid.solid_count(), reference.grid.solid_count());
+                for z in 0..32 {
+                    for y in 0..32 {
+                        for x in 0..32 {
+                            assert_eq!(
+                                plan.grid.material(x, y, z),
+                                reference.grid.material(x, y, z)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(matches!(
+            SimWorld::plan_terrain_brick(&volume, BrickCoord::new(i64::MAX, 0, 0)),
+            Err(WorldError::BrickCoordinateOverflow(_))
+        ));
+    }
 }

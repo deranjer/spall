@@ -72,6 +72,12 @@ impl EnvironmentPreset {
                 sun_angular_diameter_deg: 2.0,
                 exposure: 1.0,
                 background: [0x12, 0x15, 0x1a],
+                sun_visibility: 1.0,
+                moon_dir: Vec3::new(0.0, -1.0, 0.0),
+                moon_color: [0.52, 0.62, 0.92],
+                moon_intensity: 0.025,
+                moon_phase: 0.5,
+                moon_visibility: 0.04,
             },
             Self::Daylight => Environment {
                 sun_dir: Vec3::new(-0.45, -0.75, -0.35).normalize(),
@@ -82,6 +88,12 @@ impl EnvironmentPreset {
                 sun_angular_diameter_deg: 1.0,
                 exposure: 1.0,
                 background: [120, 170, 220],
+                sun_visibility: 1.0,
+                moon_dir: Vec3::new(0.0, -1.0, 0.0),
+                moon_color: [0.52, 0.62, 0.92],
+                moon_intensity: 0.025,
+                moon_phase: 0.5,
+                moon_visibility: 0.16,
             },
             Self::Overcast => Environment {
                 sun_dir: Vec3::new(-0.2, -0.95, -0.15).normalize(),
@@ -92,6 +104,12 @@ impl EnvironmentPreset {
                 sun_angular_diameter_deg: 6.0,
                 exposure: 0.9,
                 background: [120, 132, 145],
+                sun_visibility: 1.0,
+                moon_dir: Vec3::new(0.0, -1.0, 0.0),
+                moon_color: [0.52, 0.62, 0.92],
+                moon_intensity: 0.025,
+                moon_phase: 0.5,
+                moon_visibility: 0.12,
             },
             Self::Sunset => Environment {
                 sun_dir: Vec3::new(-0.9, -0.18, -0.35).normalize(),
@@ -102,6 +120,12 @@ impl EnvironmentPreset {
                 sun_angular_diameter_deg: 1.2,
                 exposure: 1.0,
                 background: [180, 92, 60],
+                sun_visibility: 1.0,
+                moon_dir: Vec3::new(0.0, -1.0, 0.0),
+                moon_color: [0.52, 0.62, 0.92],
+                moon_intensity: 0.025,
+                moon_phase: 0.5,
+                moon_visibility: 0.16,
             },
             Self::Night => Environment {
                 sun_dir: Vec3::new(0.3, -0.7, 0.4).normalize(),
@@ -112,6 +136,12 @@ impl EnvironmentPreset {
                 sun_angular_diameter_deg: 0.6,
                 exposure: 1.2,
                 background: [8, 12, 31],
+                sun_visibility: 0.0,
+                moon_dir: Vec3::new(0.0, -1.0, 0.0),
+                moon_color: [0.52, 0.62, 0.92],
+                moon_intensity: 0.08,
+                moon_phase: 0.5,
+                moon_visibility: 1.0,
             },
         }
     }
@@ -138,6 +168,19 @@ pub struct Environment {
     pub exposure: f32,
     /// Displayed (sRGB-encoded) background colour after tone mapping.
     pub background: [u8; 3],
+    /// Sun-disc visibility independently of direct-light intensity.
+    pub sun_visibility: f32,
+    /// Unit vector from the moon toward the scene.
+    pub moon_dir: Vec3,
+    /// Linear moon tint.
+    pub moon_color: [f32; 3],
+    /// Direct moonlight strength; low by design, with readable ambient kept
+    /// separately in `sky` and `ground`.
+    pub moon_intensity: f32,
+    /// Lunar age in the range [0, 1): new at 0, full at 0.5.
+    pub moon_phase: f32,
+    /// Visible disc brightness after daylight washout and horizon fade.
+    pub moon_visibility: f32,
 }
 
 impl Default for Environment {

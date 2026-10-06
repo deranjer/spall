@@ -40,6 +40,7 @@ use yakui_wgpu::{SurfaceInfo as YakuiSurfaceInfo, YakuiWgpu};
 use yakui_winit::YakuiWinit;
 
 use crate::ClientError;
+use crate::day_night::environment_for_clock;
 use crate::interactive::{InteractiveSession, InteractiveView, LiveInput};
 use crate::net::{
     ClientNetConfig, run_replication_client_with_game_content,
@@ -128,6 +129,9 @@ pub struct InteractiveOptions {
     /// `shots_dir`; the window closes after the last step. Empty = normal play.
     pub shots: Vec<ShotStep>,
     pub shots_dir: PathBuf,
+    /// Whether to advance the world clock from authoritative server ticks.
+    /// `None` uses the normal cycle-on default.
+    pub day_night_cycle: Option<bool>,
 }
 
 /// One step of a scripted screenshot tour (see [`parse_shots`]).
@@ -385,6 +389,7 @@ struct InteractiveApp {
     window: Option<Arc<Window>>,
     renderer: Option<WorldRenderer>,
     environment: Environment,
+    day_night_cycle: bool,
     render_materials: Vec<spall_render::Material>,
     /// Material index of the debug overlay colour (one past the manifest).
     debug_material: u32,
@@ -1403,6 +1408,7 @@ impl InteractiveApp {
             window: None,
             renderer: None,
             environment,
+            day_night_cycle: options.day_night_cycle.unwrap_or(true),
             render_materials,
             debug_material,
             uncapped: options.uncapped,
@@ -1561,6 +1567,7 @@ impl InteractiveApp {
                 self.environment = preset.environment();
                 if let Some(renderer) = &mut self.renderer {
                     renderer.environment = preset.environment();
+                    renderer.day_cycle_enabled = false;
                 }
                 self.script_at = Some(now + Duration::from_secs(3));
                 return;
@@ -1702,6 +1709,7 @@ impl ApplicationHandler for InteractiveApp {
             self.environment,
             &self.render_materials,
             self.uncapped,
+            self.day_night_cycle,
         ) {
             Ok(renderer) => {
                 self.window = Some(window);
@@ -2233,6 +2241,8 @@ impl ApplicationHandler for InteractiveApp {
                                 self.admin_request_pending,
                                 self.sky_visibility_on,
                                 self.bounce_on,
+                                renderer.day_cycle_enabled,
+                                renderer.day_clock_label.clone(),
                             )
                         });
                         match renderer.finish_frame(
@@ -2242,6 +2252,7 @@ impl ApplicationHandler for InteractiveApp {
                             &live_body_meshes,
                             None,
                             menu_view.as_ref().map(|view| (view, &mut menu_actions)),
+                            view.map(|view| view.server_tick),
                         ) {
                             Ok(timing) => timing,
                             Err(error) => {
@@ -3873,6 +3884,8 @@ fn admin_menu_view(
     pending: bool,
     sky_visibility_on: bool,
     bounce_on: bool,
+    day_cycle_enabled: bool,
+    world_time: String,
 ) -> AdminMenuView {
     let admin_status = match (
         pending,
@@ -3916,7 +3929,22 @@ fn admin_menu_view(
         water,
         sky_visibility_on,
         bounce_on,
+        day_cycle_enabled,
+        world_time,
     }
+}
+
+fn lunar_phase_name(phase: f32) -> &'static str {
+    [
+        "new",
+        "waxing crescent",
+        "first quarter",
+        "waxing gibbous",
+        "full",
+        "waning gibbous",
+        "last quarter",
+        "waning crescent",
+    ][((phase.rem_euclid(1.0) * 8.0).round() as usize) % 8]
 }
 
 /// A plus at the centre of the screen, white with a target in reach and red
@@ -3990,6 +4018,8 @@ pub(super) struct AdminMenuView {
     pub sky_visibility_on: bool,
     /// Diffuse bounce (`F6`) is on.
     pub bounce_on: bool,
+    pub world_time: String,
+    pub day_cycle_enabled: bool,
 }
 
 /// Buttons clicked in the admin menu this frame.
@@ -4028,7 +4058,9 @@ fn admin_menu_panel(
     selected_environment: &mut Option<EnvironmentPreset>,
     environment: &mut Environment,
     debug_view: &mut DebugView,
+    day_cycle_enabled: &mut bool,
 ) {
+    let environment_before_controls = *environment;
     yakui::colored_box_container(PANEL_BG.with_alpha(0.88), || {
         yakui::pad(yakui::widgets::Pad::all(14.0), || {
             yakui::row(|| {
@@ -4124,6 +4156,18 @@ fn admin_menu_panel(
                 yakui::pad(yakui::widgets::Pad::horizontal(18.0), || {
                     yakui::column(|| {
                         section("Lighting");
+                        muted(13.0, view.world_time.clone());
+                        yakui::row(|| {
+                            if yakui::button(if view.day_cycle_enabled {
+                                "Pause day/night cycle"
+                            } else {
+                                "Resume day/night cycle"
+                            })
+                            .clicked
+                            {
+                                *day_cycle_enabled = !*day_cycle_enabled;
+                            }
+                        });
                         muted(12.0, "Environment preset (resets sun and exposure)");
                         yakui::row(|| {
                             for preset in EnvironmentPreset::ALL {
@@ -4279,6 +4323,9 @@ fn admin_menu_panel(
             });
         });
     });
+    if *environment != environment_before_controls {
+        *day_cycle_enabled = false;
+    }
 }
 
 /// Every render view the Lighting panel offers, in `F4` order.
@@ -4424,6 +4471,8 @@ impl VegetationWorker {
 
 pub(super) struct WorldRenderer {
     environment: Environment,
+    day_cycle_enabled: bool,
+    day_clock_label: String,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
@@ -4689,6 +4738,7 @@ impl WorldRenderer {
         environment: Environment,
         materials: &[spall_render::Material],
         uncapped: bool,
+        day_cycle_enabled: bool,
     ) -> Result<Self, ClientError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(window.clone()),
@@ -4800,6 +4850,8 @@ impl WorldRenderer {
 
         Ok(Self {
             environment,
+            day_cycle_enabled,
+            day_clock_label: "Waiting for server time".to_owned(),
             device,
             queue,
             surface,
@@ -5072,6 +5124,7 @@ impl WorldRenderer {
         live_body_meshes: &[u64],
         demo_hud: Option<(&str, &str, &str)>,
         admin_menu: Option<(&AdminMenuView, &mut AdminMenuActions)>,
+        server_tick: Option<u64>,
     ) -> Result<FrameTiming, ClientError> {
         let AcquiredFrame {
             frame_start,
@@ -5081,6 +5134,21 @@ impl WorldRenderer {
             instance_count,
             acquire_ms,
         } = acquired;
+
+        if let Some(server_tick) = server_tick {
+            let (environment, state) =
+                environment_for_clock(server_tick, self.day_cycle_enabled, self.environment);
+            self.environment = environment;
+            if let Some(state) = state {
+                self.day_clock_label = format!(
+                    "Day {} · {:02}:{:02} · {} moon",
+                    state.day_index + 1,
+                    state.hour,
+                    state.minute,
+                    lunar_phase_name(state.lunar_phase),
+                );
+            }
+        }
 
         self.scene.set_bodies(&self.device, &self.queue, &[]);
         self.scene
@@ -5215,6 +5283,7 @@ impl WorldRenderer {
                             &mut selected_environment,
                             &mut self.environment,
                             &mut self.debug_view,
+                            &mut self.day_cycle_enabled,
                         );
                     } else {
                         yakui::colored_box_container(PANEL_BG.with_alpha(0.55), || {
@@ -5232,6 +5301,7 @@ impl WorldRenderer {
         self.yakui.finish();
         if let Some(preset) = selected_environment {
             self.environment = preset.environment();
+            self.day_cycle_enabled = false;
         }
         self.yakui_wgpu.paint_with_encoder(
             &mut self.yakui,

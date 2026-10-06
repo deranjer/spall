@@ -292,6 +292,8 @@ pub struct ClientNetConfig {
     /// directly. `None` (the default) changes nothing about the client's
     /// behaviour.
     pub on_replica_ready: Option<ReplicaReadyHook>,
+    /// Explicit memory admission budget for a segmented baseline.
+    pub baseline_budget_bytes: u64,
     /// Interactive follow-up (T19): live keyboard/mouse-driven input instead
     /// of `movement_script` — set by `spall_client::window::run_interactive_window`,
     /// not normally constructed directly. Implies a baseline pull and a
@@ -339,6 +341,9 @@ pub struct ClientResidencyLimits {
 /// v5 adds authoritative progression request responses.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientSummary {
+    /// Unique scripted request IDs with an explicit authoritative commit receipt.
+    /// Independent of ecology transactions, retries and reset replacement counts.
+    pub scripted_actions_committed: u64,
     pub version: u32,
     pub result: String,
     pub connected: bool,
@@ -546,6 +551,8 @@ fn client_handshake(
 
 #[derive(Default)]
 struct Counters {
+    scripted_uncommitted: Mutex<std::collections::BTreeSet<u64>>,
+    scripted_committed: AtomicU64,
     applied: AtomicU64,
     repairs: AtomicU64,
     rejected: AtomicU64,
@@ -955,7 +962,52 @@ struct CorrectionStats {
 /// (`spall_server::baseline::transfer_from_world`), so this decompresses
 /// before decoding — `end.assembled_hash` below is still checked against the
 /// canonical **uncompressed** re-encoding, independent of the compressor.
-async fn receive_baseline_body(conn: &Connection) -> Option<BaselineWorld> {
+/// One owned control pump keeps liveness progressing through bulk staging,
+/// cache warming and world replacement. Logical records retain FIFO order in
+/// a 64-record channel; every record retains the protocol's size/count bounds.
+struct ClientConnection {
+    transport: Arc<Connection>,
+    records: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<spall_net::Result<Option<WireRecord>>>>,
+    pump: tokio::task::JoinHandle<()>,
+}
+impl ClientConnection {
+    fn new(transport: Arc<Connection>) -> Self {
+        let (send, recv) = tokio::sync::mpsc::channel(64);
+        let reader = Arc::clone(&transport);
+        let pump = tokio::spawn(async move {
+            loop {
+                let record = reader.recv_record().await;
+                let closed = !matches!(record, Ok(Some(_)));
+                if send.send(record).await.is_err() || closed {
+                    break;
+                }
+            }
+        });
+        Self {
+            transport,
+            records: tokio::sync::Mutex::new(recv),
+            pump,
+        }
+    }
+    async fn recv_record(&self) -> spall_net::Result<Option<WireRecord>> {
+        self.records.lock().await.recv().await.unwrap_or(Ok(None))
+    }
+}
+impl std::ops::Deref for ClientConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.transport
+    }
+}
+impl Drop for ClientConnection {
+    fn drop(&mut self) {
+        // Cancellation of a partly read frame always ends its connection.
+        self.transport.close("client control pump stopped");
+        self.pump.abort();
+    }
+}
+
+async fn receive_baseline_body(conn: &ClientConnection) -> Option<BaselineWorld> {
     let parts = conn.accept_bulk().await.ok()?.collect_parts().await.ok()?;
     let mut bytes = Vec::new();
     for part in &parts {
@@ -978,11 +1030,124 @@ async fn receive_baseline_body(conn: &Connection) -> Option<BaselineWorld> {
     }
 }
 
+enum FullBaseline {
+    Legacy(BaselineWorld),
+    Segmented(crate::segmented::SegmentedReceipt),
+}
+impl FullBaseline {
+    fn hash(&self) -> Hash32 {
+        match self {
+            Self::Legacy(w) => Hash32::of(&w.encode()),
+            Self::Segmented(r) => r.chain_hash,
+        }
+    }
+    fn bricks(&self) -> u64 {
+        match self {
+            Self::Legacy(w) => w.brick_count() as u64,
+            Self::Segmented(r) => r.staged.brick_count(),
+        }
+    }
+    fn has_bodies(&self) -> bool {
+        match self {
+            Self::Legacy(w) => w.volumes.len() > 1,
+            Self::Segmented(r) => r.staged.volume_count() > 1,
+        }
+    }
+    fn install(self, replica: &mut ReplicaWorld) -> Result<(), String> {
+        match self {
+            Self::Legacy(w) => replica.install_baseline_world(&w),
+            Self::Segmented(r) => replica.install_staged(r.staged),
+        }
+    }
+}
+
+async fn receive_full_baseline(
+    conn: &ClientConnection,
+    begin: &spall_protocol::BaselineBegin,
+    admission: crate::segmented::StagingAdmission,
+    reuse: Option<std::collections::BTreeMap<u64, spall_voxel::Volume>>,
+) -> Result<FullBaseline, String> {
+    if begin.world_version == 1 {
+        return receive_baseline_body(conn)
+            .await
+            .map(FullBaseline::Legacy)
+            .ok_or_else(|| "legacy baseline failed to assemble / verify".into());
+    }
+    if begin.world_version != spall_protocol::segment::BASELINE_SEGMENTED_WORLD_VERSION
+        && begin.world_version != spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION
+    {
+        return Err(format!(
+            "unsupported baseline world version {}",
+            begin.world_version
+        ));
+    }
+    let mut receiver = crate::segmented::SegmentedReceiver::with_limits(
+        begin.checkpoint_tick.get(),
+        Some(admission),
+        begin.total_bytes.min(
+            if begin.world_version == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION {
+                spall_protocol::segment::MAX_STREAMED_BASELINE_COMPRESSED as u64
+            } else {
+                spall_protocol::limits::MAX_ASSEMBLED_TRANSFER as u64
+            },
+        ),
+    );
+    let mut reader = conn
+        .accept_streamed_baseline(begin)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(volumes) = reuse {
+        receiver.reuse_volumes(volumes);
+    }
+    // Drain control/heartbeat traffic while the independently bounded bulk
+    // stream is decoded. Otherwise a progressing large transfer looks idle.
+    let payload = async move {
+        let mut count = 0;
+        let mut bytes = 0u64;
+        while let Some(part) = reader.next_part().await.map_err(|e| e.to_string())? {
+            if part.transfer_id != begin.transfer_id {
+                return Err("baseline transfer id mismatch".into());
+            }
+            count += 1;
+            bytes += part.payload.len() as u64;
+            receiver.push(&part.payload)?;
+            if count % 16 == 0 {
+                eprintln!(
+                    "spall-client: loading world: {} / {} MiB received",
+                    bytes / (1024 * 1024),
+                    begin.total_bytes / (1024 * 1024)
+                );
+            }
+        }
+        if count != begin.part_count || bytes != begin.total_bytes {
+            return Err("baseline part count / byte count mismatch".into());
+        }
+        receiver.finish()
+    };
+    let end = async {
+        loop {
+            match conn.recv_record().await.map_err(|e| e.to_string())? {
+                Some(WireRecord::BaselineEnd(end)) => return Ok::<_, String>(end),
+                Some(_) => continue,
+                None => return Err("connection closed before baseline end".into()),
+            }
+        }
+    };
+    let (receipt, end) = tokio::try_join!(payload, end)?;
+    if end.transfer_id != begin.transfer_id
+        || end.journal_cursor != begin.journal_cursor
+        || end.assembled_hash != receipt.chain_hash
+    {
+        return Err("baseline end / chained hash mismatch".into());
+    }
+    Ok(FullBaseline::Segmented(receipt))
+}
+
 /// Forwards one [`ApplyOutcome`] from the control reader: counts a publish,
 /// sends each `RepairRequest` of a `NeedsRepair`, counts a rejection. A
 /// `Duplicate` or an `AwaitingBulkSplit` hold needs nothing — the blob's
 /// `BaselineBegin` will retry it.
-async fn forward_outcome(conn: &Connection, counters: &Counters, outcome: ApplyOutcome) {
+async fn forward_outcome(conn: &ClientConnection, counters: &Counters, outcome: ApplyOutcome) {
     match outcome {
         ApplyOutcome::Published { .. } => {
             counters.applied.fetch_add(1, Ordering::Relaxed);
@@ -1004,14 +1169,15 @@ async fn forward_outcome(conn: &Connection, counters: &Counters, outcome: ApplyO
 /// `connect_at` is the wall-clock reference point ("late-join connect") the
 /// T23 / G3 row 11 join-budget timings are measured from.
 async fn perform_late_join(
-    conn: &Connection,
+    conn: &ClientConnection,
     replica: &Mutex<ReplicaWorld>,
     counters: &Counters,
     connect_at: std::time::Instant,
+    budget_bytes: u64,
 ) -> Result<(), ClientNetError> {
     conn.send_record(WireRecord::BaselineAck(BaselineAck {
         transfer_id: BASELINE_REQUEST_SENTINEL,
-        verified_manifest_hash: Hash32::ZERO,
+        verified_manifest_hash: spall_protocol::segment::baseline_cap_streamed(),
         installed_cursor: spall_core::JournalSeq(0),
     }))
     .await
@@ -1023,9 +1189,12 @@ async fn perform_late_join(
             Ok(Some(WireRecord::BaselineBegin(b))) => break b,
             Ok(Some(_)) => continue,
             Ok(None) => {
-                return Err(ClientNetError::Baseline(
-                    "connection closed before the baseline arrived".into(),
-                ));
+                return Err(ClientNetError::Baseline(format!(
+                    "connection closed before the baseline arrived: {}",
+                    conn.bye_reason()
+                        .or_else(|| conn.close_reason())
+                        .unwrap_or_else(|| "no peer reason".into())
+                )));
             }
             Err(e) => {
                 return Err(ClientNetError::Baseline(format!(
@@ -1034,11 +1203,20 @@ async fn perform_late_join(
             }
         }
     };
-    let Some(world) = receive_baseline_body(conn).await else {
-        return Err(ClientNetError::Baseline(
-            "transfer failed to assemble / verify".into(),
-        ));
-    };
+    let world = receive_full_baseline(
+        conn,
+        &begin,
+        crate::segmented::StagingAdmission {
+            budget_bytes,
+            existing_replica_bytes: 0,
+        },
+        None,
+    )
+    .await
+    .map_err(ClientNetError::Baseline)?;
+    let hash = world.hash();
+    let bricks = world.bricks();
+    let has_bodies = world.has_bodies();
     // T23 / G3 row 11: the wire bytes actually shipped (compressed) and the
     // wall-clock cost of getting the baseline received + decompressed +
     // decoded + verified, before the (comparatively cheap) local install.
@@ -1050,24 +1228,22 @@ async fn perform_late_join(
         .store(connect_at.elapsed().as_millis() as u64, Ordering::Relaxed);
     counters
         .late_join_has_bodies
-        .store(u64::from(world.volumes.len() > 1), Ordering::Relaxed);
+        .store(u64::from(has_bodies), Ordering::Relaxed);
 
     {
         let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .install_baseline_world(&world)
+        world
+            .install(&mut guard)
             .map_err(ClientNetError::Baseline)?;
     }
-    counters
-        .baseline_bricks
-        .store(world.brick_count() as u64, Ordering::Relaxed);
+    counters.baseline_bricks.store(bricks, Ordering::Relaxed);
     counters
         .last_tick
-        .fetch_max(world.checkpoint_tick, Ordering::Relaxed);
+        .fetch_max(begin.checkpoint_tick.get(), Ordering::Relaxed);
 
     conn.send_record(WireRecord::BaselineAck(BaselineAck {
         transfer_id: begin.transfer_id,
-        verified_manifest_hash: Hash32::of(&world.encode()),
+        verified_manifest_hash: hash,
         installed_cursor: begin.journal_cursor,
     }))
     .await
@@ -1112,6 +1288,7 @@ async fn run_async(
             return Err(ClientNetError::Transport(e));
         }
     };
+    let conn = Arc::new(ClientConnection::new(conn));
     log.write(&ProcessRecord::new(
         ProcessEvent::Ready,
         ProcessRole::Client,
@@ -1134,7 +1311,7 @@ async fn run_async(
     // immediately after the connection is authenticated keeps heartbeats
     // flowing through the whole session, late-join wait included.
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let liveness = tokio::spawn(conn.clone().run_liveness(stop_rx.clone()));
+    let liveness = tokio::spawn(conn.transport.clone().run_liveness(stop_rx.clone()));
 
     // A movement client pulls a baseline like a late joiner so it works with any
     // scene the server runs (T19 uses the `walk` arena). An interactive
@@ -1154,6 +1331,14 @@ async fn run_async(
         )
     }));
     let counters = Arc::new(Counters::default());
+    *counters
+        .scripted_uncommitted
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = config
+        .script
+        .iter()
+        .map(|action| action.request.request_id.0)
+        .collect();
     let progression_responses = Arc::new(Mutex::new(Vec::new()));
     let admin_statuses: Arc<Mutex<Vec<spall_protocol::AdminStatus>>> =
         Arc::new(Mutex::new(Vec::new()));
@@ -1169,7 +1354,23 @@ async fn run_async(
     // replication stream, so the replica starts at the server's current
     // topology with no edit replay from world creation.
     if want_baseline {
-        if let Err(e) = perform_late_join(&conn, &replica, &counters, session_start).await {
+        let joined = tokio::time::timeout(
+            config.overall_timeout,
+            perform_late_join(
+                &conn,
+                &replica,
+                &counters,
+                session_start,
+                config.baseline_budget_bytes,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ClientNetError::Baseline(
+                "baseline deadline exceeded".into(),
+            ))
+        });
+        if let Err(e) = joined {
             log.write(&ProcessRecord::new(
                 ProcessEvent::Failed,
                 ProcessRole::Client,
@@ -1202,6 +1403,8 @@ async fn run_async(
     if let Some(hook) = &config.on_replica_ready {
         hook(replica.clone());
     }
+
+    eprintln!("spall-client: world ready");
 
     // T19: a scripted-movement (or interactively-played) client predicts its
     // own player capsule.
@@ -1376,17 +1579,29 @@ async fn run_async(
                         // sequencing included). A failed transfer here leaves
                         // the old world standing, which would silently diverge
                         // from the server, so it ends the session instead.
-                        let installed = match receive_baseline_body(&conn).await {
-                            Some(world) => {
-                                vegetation_floor = world.checkpoint_tick;
+                        let (existing_replica_bytes, reuse) = {
+                            let old = replica.lock().unwrap_or_else(|e| e.into_inner());
+                            (old.decoded_bytes_estimate(), old.baseline_reuse_volumes())
+                        };
+                        let installed = match receive_full_baseline(
+                            &conn,
+                            &begin,
+                            crate::segmented::StagingAdmission {
+                                budget_bytes: config.baseline_budget_bytes,
+                                existing_replica_bytes,
+                            },
+                            Some(reuse),
+                        )
+                        .await
+                        {
+                            Ok(world) => {
+                                vegetation_floor = begin.checkpoint_tick.get();
                                 vegetation =
                                     spall_protocol::vegetation::VegetationAssembler::default();
-                                replica
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .install_baseline_world(&world)
+                                world
+                                    .install(&mut replica.lock().unwrap_or_else(|e| e.into_inner()))
                             }
-                            None => Err("reset baseline failed to assemble / verify".into()),
+                            Err(error) => Err(error),
                         };
                         match installed {
                             Ok(()) => {
@@ -1504,6 +1719,15 @@ async fn run_async(
                         }
                     }
                     Ok(Some(WireRecord::ActionStatus(st))) => {
+                        if matches!(st.outcome, ActionOutcome::Committed { .. })
+                            && counters
+                                .scripted_uncommitted
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&st.request_id.0)
+                        {
+                            counters.scripted_committed.fetch_add(1, Ordering::Relaxed);
+                        }
                         if let ActionOutcome::Rejected { reason } = &st.outcome {
                             if let Some(overloaded) = retry_kind(reason) {
                                 let _ = retry_tx.send((st.request_id.0, overloaded));
@@ -2560,6 +2784,7 @@ async fn run_async(
         motion_snapshots: counters.motion.load(Ordering::Relaxed),
         motion_snapshots_out_of_order: counters.motion_reordered.load(Ordering::Relaxed),
         actions_sent: counters.actions.load(Ordering::Relaxed),
+        scripted_actions_committed: counters.scripted_committed.load(Ordering::Relaxed),
         progression_responses: progression_responses
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2676,5 +2901,169 @@ mod retry_tests {
         assert_eq!(retry_kind("overloaded: queue full"), Some(true));
         assert_eq!(retry_kind("throttled: retry shortly"), Some(false));
         assert_eq!(retry_kind("invalid target"), None);
+    }
+}
+
+#[cfg(test)]
+mod baseline_liveness_tests {
+    use super::*;
+    use spall_protocol::segment::{
+        self, BaselineSegment, SegmentManifest, SegmentVolume, VolumeHeader,
+    };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn early_end_and_delayed_bulk_keep_control_liveness_and_install_atomically() {
+        let mut cfg = TransportConfig::for_tests();
+        cfg.idle_timeout = Duration::from_millis(500);
+        cfg.heartbeat_interval = Duration::from_millis(30);
+        cfg.keep_alive_interval = Duration::from_millis(50);
+        let identity = spall_net::DevIdentity::generate().unwrap();
+        let token = JoinToken::generate().unwrap();
+        let handshake = client_handshake(&spall_sim::fixtures::stone_manifest(), None);
+        let server = Arc::new(
+            spall_net::NetServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                &identity,
+                token,
+                handshake.clone(),
+                cfg,
+            )
+            .await
+            .unwrap(),
+        );
+        let host = Arc::clone(&server);
+        let accept = tokio::spawn(async move { Arc::new(host.accept().await.unwrap()) });
+        let client = Arc::new(ClientConnection::new(Arc::new(
+            connect(
+                server.local_addr().unwrap(),
+                identity.fingerprint(),
+                token,
+                handshake,
+                cfg,
+            )
+            .await
+            .unwrap(),
+        )));
+        let host = accept.await.unwrap();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let client_live = tokio::spawn(client.transport.clone().run_liveness(stopped.clone()));
+        let host_live = tokio::spawn(host.clone().run_liveness(stopped));
+        let host_reader = {
+            let host = host.clone();
+            tokio::spawn(async move { while matches!(host.recv_record().await, Ok(Some(_))) {} })
+        };
+        let manifest = segment::encode_manifest_frame(&SegmentManifest {
+            schema: segment::SEGMENT_SCHEMA,
+            segment_count: 1,
+            volume_count: 1,
+            total_bricks: 1,
+            total_decoded_bytes: segment::UNIFORM_BRICK_DECODED_COST as u64,
+            segment_decoded_cap: segment::DEFAULT_SEGMENT_DECODED_BYTES as u32,
+        });
+        let seg = segment::encode_segment_frame(
+            &BaselineSegment {
+                index: 0,
+                volumes: vec![SegmentVolume {
+                    volume_id: VolumeId::new(1).unwrap(),
+                    header: Some(VolumeHeader {
+                        cell_size_code: spall_core::CellSizeCode::Quarter.to_u8(),
+                        owner: spall_protocol::BaselineOwner::Terrain,
+                        bounds: Some([[0, 0, 0], [0, 0, 0]]),
+                    }),
+                    first_ordinal: 0,
+                    bricks: vec![spall_protocol::BaselineBrick {
+                        coord: [0, 0, 0],
+                        revision: 1,
+                        edited: false,
+                        cells: spall_protocol::BaselineCells::Uniform(1),
+                    }],
+                    last: true,
+                }],
+            },
+            segment::DEFAULT_SEGMENT_DECODED_BYTES,
+        )
+        .unwrap();
+        let hash = segment::chain_hash(&manifest.bytes[5..], &[seg.raw_hash]);
+        let begin = spall_protocol::BaselineBegin {
+            transfer_id: TransferId(1),
+            interest_epoch: spall_protocol::InterestEpoch(1),
+            checkpoint_tick: Tick(0),
+            journal_cursor: spall_core::JournalSeq(0),
+            world_version: segment::BASELINE_STREAMED_WORLD_VERSION,
+            content_version: 1,
+            total_bytes: (manifest.bytes.len() + seg.bytes.len()) as u64,
+            part_count: 2,
+            regions: vec![],
+        };
+        let sender = {
+            let host = host.clone();
+            let begin = begin.clone();
+            tokio::spawn(async move {
+                host.send_record(WireRecord::BaselineBegin(begin.clone()))
+                    .await
+                    .unwrap();
+                let mut bulk = host.open_bulk().await.unwrap();
+                bulk.send_part(&spall_protocol::BaselinePart {
+                    transfer_id: TransferId(1),
+                    part_index: 0,
+                    part_hash: Hash32::of(&manifest.bytes),
+                    payload: manifest.bytes,
+                })
+                .await
+                .unwrap();
+                host.send_record(WireRecord::BaselineEnd(spall_protocol::BaselineEnd {
+                    transfer_id: TransferId(1),
+                    assembled_hash: hash,
+                    journal_cursor: begin.journal_cursor,
+                }))
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                assert!(
+                    host.is_alive(),
+                    "bulk delay must not become control silence"
+                );
+                bulk.send_part(&spall_protocol::BaselinePart {
+                    transfer_id: TransferId(1),
+                    part_index: 1,
+                    part_hash: Hash32::of(&seg.bytes),
+                    payload: seg.bytes,
+                })
+                .await
+                .unwrap();
+                bulk.finish().unwrap();
+            })
+        };
+        assert!(matches!(
+            client.recv_record().await.unwrap(),
+            Some(WireRecord::BaselineBegin(_))
+        ));
+        let world = tokio::time::timeout(
+            Duration::from_secs(5),
+            receive_full_baseline(
+                &client,
+                &begin,
+                crate::segmented::StagingAdmission {
+                    budget_bytes: 32 * 1024 * 1024,
+                    existing_replica_bytes: 0,
+                },
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(world.hash(), hash);
+        let mut replica = ReplicaWorld::empty(ReplicaConfig::default());
+        world.install(&mut replica).unwrap();
+        assert!(replica.terrain_hash().is_some());
+        assert!(client.is_alive());
+        sender.await.unwrap();
+        stop.send(true).unwrap();
+        client.close("test complete");
+        host.close("test complete");
+        client_live.abort();
+        host_live.abort();
+        host_reader.abort();
     }
 }
