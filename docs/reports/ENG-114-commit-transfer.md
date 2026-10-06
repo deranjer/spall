@@ -410,3 +410,39 @@ hash. Reset responses were 126 / 126 ms. This is the small functional probe,
 not full-world performance. Portable rebuild passed; all four SHA-256 hashes
 match release outputs (.local/eng114-priorities-portable-hashes.json).
 ENG-114 stays in progress with the next priorities and unrun gates above.
+
+## PR integration validation (2026-10-06)
+
+Rebased the accumulated preview/skybox/day-night/large-world changes onto
+origin/main 697280c, preserving the newer ENG-122 water implementations and
+documentation. Resolved append-only documentation conflicts by retaining both
+histories. Updated phase_fluid_demo's renderer calls with disabled day cycling
+and no authoritative tick; its local diagnostic presentation remains explicit.
+The initial integrated build identified these two missing arguments; corrected
+before the final build. Generated portable files and run credentials/logs are
+not included in Git. Earlier portable/stress measurements are historical
+pre-rebase evidence; no new full-world or GPU performance gate is claimed.
+
+Final integration checks:
+
+```powershell
+cargo check --offline --workspace --all-targets --features sandbox/client
+cargo test --offline -p spall_voxel -p spall_structure -p spall_sim -p spall_worldgen -p spall_net -p spall_render --lib
+cargo test --offline -p spall_client --lib -p spall_editor -p xtask
+cargo test --offline -p spall_editor
+cargo test --offline -p spall_server --test segmented_join --test water_replication
+git -c core.safecrlf=false diff origin/main...HEAD --check
+```
+
+Build passed. Library checks: voxel81 (one ignored), structure41, simulation73
+(five ignored), worldgen4 (one ignored), net25, render61, client93, editor23.
+Editor full tests: library23, binary16 (one ignored). Server: three segmented
+joins and two water replication regressions. Evidence: .local/pr-preview-*.log.
+ENG-114 remains in progress; next task stays full-size impaired reset convergence,
+transport pacing and integrated structural-analysis cost. No merge requested.
+
+Integrated Clippy passed:
+
+```powershell
+cargo clippy --offline -p spall_client -p spall_render -p spall_structure -p spall_sim -p spall_net -p spall_server -p sandbox -p spall_editor -p xtask --all-targets --features sandbox/client -- -D warnings -A clippy::field_reassign_with_default -A clippy::too_many_arguments
+```

@@ -362,7 +362,7 @@ impl PhaseDemoApp {
             ));
         }
         if let Err(e)=renderer.finish_frame(frame,Some(&(self.camera.position,self.camera.forward())),&[],&[],
-            Some((&heading,"G switch air | M momentum (air comparisons only) | 1 channel / 2 low dam / 3 wall\nSpace play/pause | N one step | R reset | Click + mouse look | WASD/QE move | Esc release | F12 screenshot",&status)),None) {
+            Some((&heading,"G switch air | M momentum (air comparisons only) | 1 channel / 2 low dam / 3 wall\nSpace play/pause | N one step | R reset | Click + mouse look | WASD/QE move | Esc release | F12 screenshot",&status)),None,None) {
             return self.fail(event_loop,e);
         }
         if self.options.max_frames.is_some_and(|n| self.frames >= n) {
@@ -393,6 +393,7 @@ impl ApplicationHandler for PhaseDemoApp {
             window.clone(),
             EnvironmentPreset::Daylight.environment(),
             &materials,
+            false,
             false,
         ) {
             Ok(r) => {
