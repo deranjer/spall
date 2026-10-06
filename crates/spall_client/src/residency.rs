@@ -347,11 +347,19 @@ impl ClientResidencyPass {
         );
 
         let mut out = Vec::new();
-        let evicted_now: Vec<(BrickCoord, Revision)> = replica
-            .evicted(terrain)
+        let mut evicted_now: Vec<(BrickCoord, Revision)> = keep
             .iter()
-            .map(|(c, d)| (c, d.revision))
+            .filter_map(|&c| replica.evicted(terrain).get(c).map(|d| (c, d.revision)))
             .collect();
+        // Stream nearest bricks first rather than draining a distant corner of the box.
+        evicted_now.sort_by_key(|(c, _)| {
+            (
+                c.x.abs_diff(center.x)
+                    .max(c.y.abs_diff(center.y))
+                    .max(c.z.abs_diff(center.z)),
+                c.sort_key(),
+            )
+        });
         for (coord, revision) in evicted_now {
             if out.len() >= MAX_RELOAD_REQUESTS_PER_STEP {
                 break;

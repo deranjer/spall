@@ -352,7 +352,16 @@ impl EditorApp {
             {
                 self.run_scene();
             }
+            if self.workspace == Workspace::Scene && !self.engine_asset_session {
+                self.game_launch_options();
+            }
         });
+    }
+
+    fn game_launch_options(&mut self) {
+        if let Some(uncapped) = theme::checkbox("Uncapped", self.play_uncapped) {
+            self.play_uncapped = uncapped;
+        }
     }
 
     fn status_bar(&self) {
@@ -822,6 +831,8 @@ impl EditorApp {
         if self.play_launch.is_some() {
             theme::hint(&self.status);
         }
+        self.game_launch_options();
+        theme::hint("Uncapped disables game VSync where supported; the FPS HUD shows throughput.");
         if theme::button_enabled(
             ButtonKind::Primary,
             ButtonSize::Regular,

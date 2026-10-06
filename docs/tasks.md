@@ -1610,3 +1610,25 @@ MiB UDP receive-buffer diagnostic preserves default platform buffering/CUBIC.
 due-packet relay batching, versus prior 72.977 s. Single observations; no new
 full-world or G3/G4 acceptance. Next ENG-114: remaining pacing diagnosis, full-size
 reset convergence and integrated graph cost. See reports/ENG-114-commit-transfer.md.
+
+### ENG-129 - Editor Uncapped game launch checkbox
+
+Depends on ENG-126 and the existing sandbox client/xtask --uncapped option.
+Add an off-by-default Uncapped checkbox beside scene Run and generated-world
+Run in game. Both launch paths forward the current selection to the client;
+simulation ticks remain unchanged. Validate launch argument preservation,
+editor tests/build and refresh the portable distribution. Uncapped requests
+non-VSync presentation where supported; the FPS HUD measures actual throughput.
+Spawn-region-first startup is a separate join/streaming change, outside this
+assignment. Next unblocked loading/performance assignment remains ENG-114.
+
+### ENG-130 - Regional terrain startup and surrounding-region streaming
+
+User assignment following ENG-129; compatible with ENG-114/T17/T19 residency interfaces.
+Status: done. CPU checks, bounded startup measurements and packaged GPU smoke passed. Generated-world play negotiates a bounded
+spawn-neighborhood baseline and exact distant terrain digests. Bodies remain complete. Existing
+revision-validated repairs fetch geometry as interest moves; unknown local collision holds prediction.
+World resets atomically replace geometry and digests; legacy clients retain full baselines.
+Server generation and authoritative world storage remain whole-world. No G3/G5 workload downgrade.
+Evidence and exact checks: docs/reports/ENG-130-regional-startup.md.
+Next unblocked work: ENG-114, profile remaining authoritative generation/global catalogue startup cost.

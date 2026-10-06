@@ -503,3 +503,24 @@ not change any frame, streamed-baseline, staging or timeout admission limit.
 The encrypted UDP test relay drains at most 64 already-due packets per wake,
 in deadline/insertion order, without forwarding future packets early. Existing
 rate scheduling, fault probabilities and bounded queue admission remain intact.
+
+### ENG-130 regional startup baseline
+
+Opt-in regional clients advertise a radius-specific capability hash in the existing baseline request
+sentinel: `spall.baseline.capability.regional.v4.radius.{radius}`, radius 1..=16 bricks. Generated-world
+play requests radius 10. Servers that do not understand the capability retain their full-baseline
+fallback. World version 4 uses segment schema 3 and the version-3 streamed transport limits.
+Versions 1..3 and segment schema 2 retain complete geometry. Durable world/split formats do not change.
+
+Every logical terrain brick appears exactly once: real geometry in the spawn-centered Chebyshev box,
+otherwise `BaselineCells::Digest` with canonical content hash, solid-cell count, revision, and edited
+flag. This is a catalogue of the whole logical world, not a claim of resident distant geometry.
+Detached bodies always contain complete geometry and stable ownership. Digests are forbidden in
+legacy baseline blobs, repair geometry, authoritative replay, and durable split blobs. Receiver
+validation rejects unknown schema/version combinations, body digests, out-of-bounds coordinates,
+duplicates, geometry/digest overlaps, invalid counts, and incomplete manifests before atomic install.
+
+Movement uses existing bounded, revision-validated BrickBaselineRequest repair traffic to fetch
+nearby evicted bricks. Distant transactions retain existing gap/repair rules and exact logical hash
+convergence. A reset replaces the geometry and digest namespaces together and selects the same
+negotiated format independently for each client. A regional capture is never reused across players.

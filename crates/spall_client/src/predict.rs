@@ -777,6 +777,50 @@ impl ClientPhysics {
         );
         self.resident_bricks.contains(&cell.split().0)
     }
+
+    /// Conservative capsule sweep neighborhood for one bounded prediction burst.
+    /// Missing geometry is unknown: hold before crossing it, including fast falls.
+    pub fn covers_neighborhood(
+        &self,
+        state: CharacterState,
+        params: CharacterParams,
+        dt_s: f32,
+    ) -> bool {
+        if !state.is_finite() {
+            return false;
+        }
+        let speed = spall_physics::character::tuning::WALK_SPEED_M_S;
+        let horizontal = f64::from(params.radius_m + speed * dt_s + 0.05);
+        let vertical = f64::from(
+            state.velocity_m_s[1]
+                .abs()
+                .max(spall_physics::character::tuning::JUMP_SPEED_M_S)
+                * dt_s
+                + 0.1,
+        );
+        let p = state.position_m;
+        let min = [p[0] - horizontal, p[1] - vertical, p[2] - horizontal];
+        let max = [
+            p[0] + horizontal,
+            p[1] + f64::from(params.total_height_m()) + vertical,
+            p[2] + horizontal,
+        ];
+        let mn = min.map(|v| (v / 8.0).floor() as i64);
+        let mx = max.map(|v| (v / 8.0).floor() as i64);
+        if (0..3).any(|a| mx[a].abs_diff(mn[a]) > 8) {
+            return false;
+        }
+        for z in mn[2]..=mx[2] {
+            for y in mn[1]..=mx[1] {
+                for x in mn[0]..=mx[0] {
+                    if !self.resident_bricks.contains(&BrickCoord::new(x, y, z)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
 }
 
 /// Whether the resident bricks' bounding box is bigger than the physics grid
@@ -2006,6 +2050,22 @@ mod large_world_window_tests {
             }
         }
         volume
+    }
+
+    #[test]
+    fn streamed_collision_holds_before_capsule_enters_unknown_brick() {
+        let mut volume = floor(2);
+        let mut phys = ClientPhysics::new();
+        phys.set_terrain(&volume);
+        let state = CharacterState::at([7.7, 8.0, 4.0]);
+        assert!(phys.covers_neighborhood(state, CharacterParams::DEFAULT, 4.0 / 60.0));
+        volume.evict_brick(BrickCoord::new(1, 0, 0));
+        phys.set_terrain(&volume);
+        assert!(phys.covers(state.position_m), "feet still in known brick");
+        assert!(!phys.covers_neighborhood(state, CharacterParams::DEFAULT, 4.0 / 60.0));
+        let mut falling = CharacterState::at([4.0, 8.0, 4.0]);
+        falling.velocity_m_s[1] = -150.0;
+        assert!(!phys.covers_neighborhood(falling, CharacterParams::DEFAULT, 4.0 / 60.0));
     }
 
     #[test]

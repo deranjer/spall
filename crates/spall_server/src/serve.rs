@@ -1594,8 +1594,7 @@ impl OutboundQueue {
                 Ok(())
             }
             Outbound::Baseline(transfer)
-                if transfer.begin.world_version
-                    == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION =>
+                if spall_protocol::segment::is_streamed_world(transfer.begin.world_version) =>
             {
                 // One bounded streaming transfer has its own slot; counting its
                 // compressed bytes as control backlog would reject it before send.
@@ -3856,6 +3855,7 @@ enum Phase {
 struct ClientLink {
     session: SessionId,
     segmented: bool,
+    region_radius: Option<i64>,
     phase: Phase,
 }
 
@@ -3984,6 +3984,22 @@ impl LateJoin {
         self.backing.as_deref()
     }
 
+    fn snapshot_for_session(
+        &self,
+        sim: &Simulation,
+        session: SessionId,
+    ) -> baseline::BaselineSnapshot {
+        let snapshot = baseline::snapshot_world(sim, self.backing_ref());
+        match self.links.get(&session.raw()).and_then(|l| l.region_radius) {
+            Some(radius) => snapshot.with_region(
+                sim.player_state(session_player_entity(session))
+                    .map_or([0.0; 3], |p| p.position_m),
+                radius,
+            ),
+            None => snapshot,
+        }
+    }
+
     fn on_joined(&mut self, session: SessionId) {
         self.latest_gen
             .entry(session.slot().0)
@@ -3994,6 +4010,7 @@ impl LateJoin {
             ClientLink {
                 session,
                 segmented: false,
+                region_radius: None,
                 phase: Phase::Live,
             },
         );
@@ -4025,21 +4042,36 @@ impl LateJoin {
     ) -> Result<usize, baseline::BaselineError> {
         self.cached_baseline = None;
         self.pending_captures.clear();
-        let base_id = self.next_id();
-        let segmented = self.links.values().all(|link| link.segmented);
-        let transfer = baseline::transfer_from_snapshot_supported(
-            baseline::snapshot_world(sim, self.backing_ref()),
-            TransferId(base_id.0 | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT),
-            InterestEpoch(1),
-            segmented,
-        )?;
+        let snapshot = baseline::snapshot_world(sim, self.backing_ref());
+        let mut full_transfers: HashMap<bool, baseline::BaselineTransfer> = HashMap::new();
         let keyframe = Arc::new(motion.full_snapshots(sim.world(), sim.current_tick()));
         let sessions: Vec<SessionId> = self.sessions().collect();
         for session in &sessions {
             let id = self.next_id();
-            let transfer = transfer.reissue(TransferId(
-                id.0 | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT,
-            ));
+            let id = TransferId(id.0 | spall_protocol::WORLD_RESET_TRANSFER_ID_BIT);
+            let link = &self.links[&session.raw()];
+            let transfer = if let Some(radius) = link.region_radius {
+                let center = sim
+                    .player_state(session_player_entity(*session))
+                    .map_or([0.0; 3], |p| p.position_m);
+                baseline::transfer_from_snapshot_supported(
+                    snapshot.clone().with_region(center, radius),
+                    id,
+                    InterestEpoch(1),
+                    true,
+                )?
+            } else if let Some(transfer) = full_transfers.get(&link.segmented) {
+                transfer.reissue(id)
+            } else {
+                let transfer = baseline::transfer_from_snapshot_supported(
+                    snapshot.clone(),
+                    id,
+                    InterestEpoch(1),
+                    link.segmented,
+                )?;
+                full_transfers.insert(link.segmented, transfer.clone());
+                transfer
+            };
             self.baseline_bytes += transfer.payload_bytes() as u64;
             send_to(clients, *session, Outbound::Baseline(Arc::new(transfer)));
             if !keyframe.is_empty() {
@@ -4112,12 +4144,18 @@ impl LateJoin {
         };
 
         if want_baseline {
-            let segmented =
-                ack.verified_manifest_hash == spall_protocol::segment::baseline_cap_streamed();
-            self.links.get_mut(&session.raw()).unwrap().segmented = segmented;
+            let region_radius =
+                spall_protocol::segment::regional_radius(ack.verified_manifest_hash);
+            let segmented = ack.verified_manifest_hash
+                == spall_protocol::segment::baseline_cap_streamed()
+                || region_radius.is_some();
+            let link = self.links.get_mut(&session.raw()).unwrap();
+            link.segmented = segmented;
+            link.region_radius = region_radius;
             let id = self.next_id();
             match self.cached_baseline.as_ref().filter(|b| {
-                b.begin.journal_cursor == JournalSeq(sim.journal_cursor())
+                region_radius.is_none()
+                    && b.begin.journal_cursor == JournalSeq(sim.journal_cursor())
                     && (b.begin.world_version
                         == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION)
                         == segmented
@@ -4135,7 +4173,7 @@ impl LateJoin {
                     send_to(clients, session, Outbound::Baseline(Arc::new(transfer)));
                 }
                 None => {
-                    let snapshot = baseline::snapshot_world(sim, self.backing_ref());
+                    let snapshot = self.snapshot_for_session(sim, session);
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
                     self.capture_pool.spawn(move || {
                         let _ = tx.send(baseline::transfer_from_snapshot_supported(
@@ -4250,9 +4288,26 @@ impl LateJoin {
                 continue;
             }
             self.retries += 1;
+            // A synchronous retry supersedes any older background capture for this session.
+            self.pending_captures.remove(&raw);
             let id = self.next_id();
             let segmented = self.links.get(&raw).is_some_and(|link| link.segmented);
-            match self.capture_for_format(sim, id, segmented) {
+            let regional = self
+                .links
+                .get(&raw)
+                .is_some_and(|l| l.region_radius.is_some());
+            let transfer = if regional {
+                baseline::transfer_from_snapshot_supported(
+                    self.snapshot_for_session(sim, session),
+                    id,
+                    InterestEpoch(1),
+                    true,
+                )
+                .ok()
+            } else {
+                self.capture_for_format(sim, id, segmented)
+            };
+            match transfer {
                 Some(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
                     if let Some(link) = self.links.get_mut(&raw) {
@@ -4344,7 +4399,11 @@ impl LateJoin {
             match result {
                 Ok(transfer) => {
                     self.baseline_bytes += transfer.payload_bytes() as u64;
-                    self.cached_baseline = Some(Arc::new(transfer.reissue(id)));
+                    if transfer.begin.world_version
+                        != spall_protocol::segment::BASELINE_REGIONAL_WORLD_VERSION
+                    {
+                        self.cached_baseline = Some(Arc::new(transfer.reissue(id)));
+                    }
                     if let Some(link) = self.links.get(&raw) {
                         send_to(
                             clients,

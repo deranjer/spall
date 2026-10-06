@@ -154,6 +154,9 @@ pub fn volume_from_baseline(bv: &BaselineVolume) -> Result<Volume, ReplicationEr
     };
     for bb in &bv.bricks {
         let cells: Vec<MaterialId> = match &bb.cells {
+            BaselineCells::Digest { .. } => {
+                return Err(bad("regional digest in authoritative geometry".into()));
+            }
             BaselineCells::Uniform(id) => vec![MaterialId(*id); CELLS_PER_BRICK],
             BaselineCells::Dense(raw) => {
                 if raw.len() != CELLS_PER_BRICK {

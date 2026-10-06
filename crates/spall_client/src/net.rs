@@ -321,6 +321,8 @@ pub type ReplicaReadyHook = Arc<dyn Fn(Arc<Mutex<ReplicaWorld>>) + Send + Sync>;
 /// Client terrain-residency limits (slice E2).
 #[derive(Debug, Clone, Copy)]
 pub struct ClientResidencyLimits {
+    /// Negotiate spawn-neighborhood geometry plus exact distant terrain digests.
+    pub stream_initial: bool,
     /// Resident-terrain-brick ceiling; the pass never forces it below the
     /// interest box (eviction is unconditional by box), but an
     /// interest-driven reload back into the box is deferred rather than
@@ -363,8 +365,14 @@ pub struct ClientSummary {
     pub body_count: usize,
     /// T17: whether this run installed a late-join baseline transfer.
     pub late_join: bool,
-    /// T17: resident bricks in the installed baseline (`0` unless `late_join`).
+    /// Logical bricks in the installed baseline, including regional digests (`0` unless `late_join`).
     pub baseline_bricks: u64,
+    /// Terrain geometry resident immediately after initial baseline installation.
+    #[serde(default)]
+    pub initial_terrain_resident_bricks: u64,
+    /// Distant terrain represented by exact logical digests at initial installation.
+    #[serde(default)]
+    pub initial_terrain_digest_bricks: u64,
     /// T17: hash-repair baseline patches applied mid-session.
     pub repairs_applied: u64,
     /// ENG-105: complete water keyframes received and decoded.
@@ -579,8 +587,10 @@ struct Counters {
     water_frame_seq: AtomicU64,
     water_errors: AtomicU64,
     world_resets: AtomicU64,
-    /// Resident bricks in the installed late-join baseline (T17).
+    /// Logical bricks in the installed late-join baseline (T17).
     baseline_bricks: AtomicU64,
+    initial_terrain_resident_bricks: AtomicU64,
+    initial_terrain_digest_bricks: AtomicU64,
     /// Entity id (+1, so `0` means "never fired") a `DetachedBody` scripted cut
     /// was aimed at, and that body's solid-cell count captured just before the
     /// cut was sent. Together they let the run confirm the body cut committed.
@@ -1032,7 +1042,7 @@ async fn receive_baseline_body(conn: &ClientConnection) -> Option<BaselineWorld>
 
 enum FullBaseline {
     Legacy(BaselineWorld),
-    Segmented(crate::segmented::SegmentedReceipt),
+    Segmented(Box<crate::segmented::SegmentedReceipt>),
 }
 impl FullBaseline {
     fn hash(&self) -> Hash32 {
@@ -1075,6 +1085,7 @@ async fn receive_full_baseline(
     }
     if begin.world_version != spall_protocol::segment::BASELINE_SEGMENTED_WORLD_VERSION
         && begin.world_version != spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION
+        && begin.world_version != spall_protocol::segment::BASELINE_REGIONAL_WORLD_VERSION
     {
         return Err(format!(
             "unsupported baseline world version {}",
@@ -1085,7 +1096,7 @@ async fn receive_full_baseline(
         begin.checkpoint_tick.get(),
         Some(admission),
         begin.total_bytes.min(
-            if begin.world_version == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION {
+            if spall_protocol::segment::is_streamed_world(begin.world_version) {
                 spall_protocol::segment::MAX_STREAMED_BASELINE_COMPRESSED as u64
             } else {
                 spall_protocol::limits::MAX_ASSEMBLED_TRANSFER as u64
@@ -1122,6 +1133,12 @@ async fn receive_full_baseline(
         if count != begin.part_count || bytes != begin.total_bytes {
             return Err("baseline part count / byte count mismatch".into());
         }
+        if receiver.manifest().is_some_and(|m| {
+            (m.schema == spall_protocol::segment::REGIONAL_SEGMENT_SCHEMA)
+                != (begin.world_version == spall_protocol::segment::BASELINE_REGIONAL_WORLD_VERSION)
+        }) {
+            return Err("baseline segment schema does not match negotiated world version".into());
+        }
         receiver.finish()
     };
     let end = async {
@@ -1140,7 +1157,7 @@ async fn receive_full_baseline(
     {
         return Err("baseline end / chained hash mismatch".into());
     }
-    Ok(FullBaseline::Segmented(receipt))
+    Ok(FullBaseline::Segmented(Box::new(receipt)))
 }
 
 /// Forwards one [`ApplyOutcome`] from the control reader: counts a publish,
@@ -1174,10 +1191,11 @@ async fn perform_late_join(
     counters: &Counters,
     connect_at: std::time::Instant,
     budget_bytes: u64,
+    capability: Hash32,
 ) -> Result<(), ClientNetError> {
     conn.send_record(WireRecord::BaselineAck(BaselineAck {
         transfer_id: BASELINE_REQUEST_SENTINEL,
-        verified_manifest_hash: spall_protocol::segment::baseline_cap_streamed(),
+        verified_manifest_hash: capability,
         installed_cursor: spall_core::JournalSeq(0),
     }))
     .await
@@ -1235,6 +1253,16 @@ async fn perform_late_join(
         world
             .install(&mut guard)
             .map_err(ClientNetError::Baseline)?;
+        counters.initial_terrain_resident_bricks.store(
+            guard
+                .terrain_volume()
+                .map_or(0, |v| v.resident_brick_count() as u64),
+            Ordering::Relaxed,
+        );
+        counters.initial_terrain_digest_bricks.store(
+            guard.evicted(guard.terrain_volume_id()).len() as u64,
+            Ordering::Relaxed,
+        );
     }
     counters.baseline_bricks.store(bricks, Ordering::Relaxed);
     counters
@@ -1262,6 +1290,15 @@ async fn run_async(
     // imposed network profile that handshake is itself part of the cost a
     // late-joining player actually experiences.
     let session_start = std::time::Instant::now();
+    if config.client_residency.is_some_and(|l| {
+        l.stream_initial
+            && !(1..=spall_protocol::segment::MAX_REGION_RADIUS_BRICKS)
+                .contains(&l.interest_radius_bricks)
+    }) {
+        return Err(ClientNetError::Baseline(
+            "regional radius must be in 1..=16".into(),
+        ));
+    }
     let mut log = JsonlLog::create(&config.log_json)?;
     log.write(&ProcessRecord::new(
         ProcessEvent::Started,
@@ -1362,6 +1399,12 @@ async fn run_async(
                 &counters,
                 session_start,
                 config.baseline_budget_bytes,
+                config
+                    .client_residency
+                    .filter(|l| l.stream_initial)
+                    .map_or_else(spall_protocol::segment::baseline_cap_streamed, |l| {
+                        spall_protocol::segment::baseline_cap_regional(l.interest_radius_bricks)
+                    }),
             ),
         )
         .await
@@ -2286,7 +2329,10 @@ async fn run_async(
                     let ready = p
                         .player
                         .as_ref()
-                        .is_some_and(|pl| p.phys.covers(pl.predicted().position_m));
+                        .is_some_and(|pl| p.phys.covers(pl.predicted().position_m)
+                            && (!client_residency.is_some_and(|l| l.stream_initial)
+                                || p.phys.covers_neighborhood(pl.predicted(), pl.params,
+                                    MOVEMENT_DT_S * crate::predict::MAX_PREDICTION_CATCHUP_STEPS as f32)));
 
                     // Start only once the player is live, then advance only
                     // when an input is actually predicted and sent.  This
@@ -2795,6 +2841,12 @@ async fn run_async(
         body_count: guard.body_ids().count(),
         late_join: config.late_join,
         baseline_bricks,
+        initial_terrain_resident_bricks: counters
+            .initial_terrain_resident_bricks
+            .load(Ordering::Relaxed),
+        initial_terrain_digest_bricks: counters
+            .initial_terrain_digest_bricks
+            .load(Ordering::Relaxed),
         repairs_applied: counters.patches.load(Ordering::Relaxed),
         vegetation_keyframes_received: counters.vegetation_keyframes.load(Ordering::Relaxed),
         vegetation_plants_received: counters.vegetation_plants.load(Ordering::Relaxed),

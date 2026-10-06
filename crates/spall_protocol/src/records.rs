@@ -703,7 +703,7 @@ impl Record for BaselineBegin {
             )
             .into());
         }
-        let cap = if self.world_version == crate::segment::BASELINE_STREAMED_WORLD_VERSION {
+        let cap = if crate::segment::is_streamed_world(self.world_version) {
             crate::segment::MAX_STREAMED_BASELINE_COMPRESSED
         } else {
             limits::MAX_ASSEMBLED_TRANSFER

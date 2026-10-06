@@ -412,6 +412,7 @@ pub struct ReplicaWorld {
 /// first brick is staged.
 pub struct StagedBaseline {
     reuse: BTreeMap<u64, Volume>,
+    evicted: BTreeMap<u64, spall_voxel::EvictedBricks>,
     checkpoint_tick: u64,
     volumes: BTreeMap<u64, Volume>,
     owner: BTreeMap<u64, CanonicalOwner>,
@@ -427,6 +428,7 @@ impl StagedBaseline {
     pub fn new(checkpoint_tick: u64) -> Self {
         Self {
             reuse: BTreeMap::new(),
+            evicted: BTreeMap::new(),
             checkpoint_tick,
             volumes: BTreeMap::new(),
             owner: BTreeMap::new(),
@@ -526,6 +528,50 @@ impl StagedBaseline {
             return Err(format!(
                 "brick for volume {vid}, which is not the open volume"
             ));
+        }
+        if let spall_protocol::BaselineCells::Digest {
+            content_hash,
+            solid_cells,
+        } = bb.cells
+        {
+            let coord = BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]);
+            let volume = &self.volumes[&vid.get()];
+            if self.terrain_id != Some(vid)
+                || solid_cells > spall_core::CELLS_PER_BRICK as u32
+                || volume
+                    .bounds()
+                    .is_some_and(|bounds| !bounds.contains(coord))
+                || volume.brick_revision(coord).ok().flatten().is_some()
+                || self
+                    .evicted
+                    .get(&vid.get())
+                    .is_some_and(|e| e.contains(coord))
+            {
+                return Err("invalid, duplicate or non-terrain baseline digest".into());
+            }
+            self.evicted
+                .entry(vid.get())
+                .or_default()
+                .record(
+                    coord,
+                    spall_voxel::BrickDigest {
+                        revision: Revision(bb.revision),
+                        content_hash: BrickHash::from_bytes(content_hash.0),
+                        solid_cells,
+                        modified_air: bb.edited && solid_cells == 0,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            self.bricks += 1;
+            return Ok(());
+        }
+        let coord = BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]);
+        if self
+            .evicted
+            .get(&vid.get())
+            .is_some_and(|e| e.contains(coord))
+        {
+            return Err("baseline geometry overlaps a retained digest".into());
         }
         let candidate = self.reuse.get(&vid.get()).and_then(|v| {
             v.snapshot_brick(BrickCoord::new(bb.coord[0], bb.coord[1], bb.coord[2]))
@@ -698,7 +744,12 @@ impl ReplicaWorld {
                     + (storage.dense_bricks + storage.uniform_bricks) as u64
                         * spall_protocol::segment::UNIFORM_BRICK_DECODED_COST as u64
             })
-            .sum()
+            .sum::<u64>()
+            + self
+                .evicted
+                .values()
+                .map(|e| e.len() as u64 * 128)
+                .sum::<u64>()
     }
 
     /// Installs a fully staged baseline atomically: the same swap `install_baseline_world`
@@ -726,7 +777,7 @@ impl ReplicaWorld {
         self.repair_requests_inflight = BTreeMap::new();
         // A full baseline replaces the whole logical state, digest namespace
         // included (G3-residency-hash.md lifecycle).
-        self.evicted = BTreeMap::new();
+        self.evicted = staged.evicted;
         self.now_tick = staged.checkpoint_tick;
         self.bump_terrain_generation();
         Ok(())
@@ -767,6 +818,7 @@ impl ReplicaWorld {
             let volume = staged.get_mut(&vid.get()).expect("just staged");
             for bb in &bv.bricks {
                 let cells: Vec<MaterialId> = match &bb.cells {
+                    BaselineCells::Digest { .. } => return Err("digest in geometry patch".into()),
                     BaselineCells::Uniform(id) => {
                         vec![MaterialId(*id); spall_core::CELLS_PER_BRICK]
                     }
@@ -1728,6 +1780,9 @@ fn baseline_brick(bb: &BaselineBrick) -> Result<Brick, String> {
         ));
     }
     let cells: Vec<MaterialId> = match &bb.cells {
+        BaselineCells::Digest { .. } => {
+            return Err("digest requires staged regional baseline".into());
+        }
         BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
         BaselineCells::Dense(raw) => {
             if raw.len() != spall_core::CELLS_PER_BRICK {

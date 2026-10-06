@@ -34,12 +34,17 @@ Spall Editor portable build
 Run spall-editor.exe. Open File > Generate World, enter or randomize a seed,
 choose a world size and starting season, generate the preview, then choose Run
 in game. The world runs in the sandbox client with the FPS HUD enabled.
-The preview checks the bounded water capacity and shows any refusal beside
-the Run button. The 1024 m choice uses an 8 GiB client staging admission budget
-to allow a complete atomic reset. The full 1024 m headless stress run measured
-7.85 GiB server peak and 2.20 GiB per client through two resets. GPU presentation
-and long-session memory need separate validation. Use a 32 GiB host for that
-choice. Smaller choices need less memory.
+Check Uncapped before Run in game (or scene Run) to request non-VSync game
+presentation where supported and see maximum throughput in the FPS HUD.
+Generated-world games initially load terrain within 80 m of the spawn brick
+on each axis, then fetch surrounding regions as you move. Distant terrain stays
+as compact revision/hash records; bodies remain complete. The authoritative
+server still generates the whole world. Startup therefore still takes time,
+especially for the 1024 m choice. The preview checks bounded water capacity
+and shows any refusal beside the Run button. The client retains an 8 GiB
+staging admission ceiling for atomic resets; it does not allocate that ceiling.
+Use a 32 GiB host for the largest choice. GPU presentation and long-session
+memory need separate validation. Smaller choices need less memory.
 No water or terrain is removed
 to make a world fit. Startup progress and failures appear in the
 editor; wait for the current launch or close the game before launching again.

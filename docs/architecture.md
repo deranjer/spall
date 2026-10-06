@@ -656,3 +656,23 @@ simulation begins at day one sunrise. Explicit environment selection and the
 in-game cycle pause are visual overrides; resuming restores tick-derived
 lighting. No protocol clock field is needed because the existing server tick
 already supplies synchronization.
+
+### ENG-130 regional terrain startup
+
+Generated-world Run in game now installs terrain geometry within a radius of 10 bricks (80 m on each
+axis from the spawn brick), with exact digests for the remaining logical terrain and complete body
+geometry. Client residency retains the moving interest cube, prioritizes nearest missing bricks,
+and admits at most four reload requests per step under existing cooldown and admission limits.
+Defaults are 16,384 resident terrain bricks and 1 GiB resident dense-cell budget. The 8 GiB staging
+ceiling remains an admission bound, not a preallocation. Scene runs retain their existing default.
+
+Prediction requires resident collision geometry over the capsule's next bounded movement sweep,
+including vertical velocity. It holds input prediction at an unknown boundary until geometry arrives;
+the server remains authoritative. Rendering continues its existing incremental nearby mesh work.
+Camera-only flying does not independently expand player interest in this implementation.
+
+The authoritative server still generates, stores and simulates the entire world. Initial capture and
+canonical hash/catalogue construction still visit all logical bricks, and distant edits may request
+geometry even outside current interest. Global water/ecology replication is unchanged. This change
+reduces initial terrain geometry transfer/client residency; it is not server region generation,
+interest-filtered transactions, or distant visual LOD. Those require separate measured work.

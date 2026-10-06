@@ -48,6 +48,30 @@ pub struct BaselineSnapshot {
     pub checkpoint_tick: u64,
     pub journal_cursor: JournalSeq,
     volumes: Vec<BaselineSnapshotVolume>,
+    region: Option<([f64; 3], i64)>,
+}
+
+impl BaselineSnapshot {
+    pub fn with_region(mut self, center_m: [f64; 3], radius: i64) -> Self {
+        self.region = Some((center_m, radius));
+        self
+    }
+    fn digest_only(&self, volume: &BaselineSnapshotVolume, coord: BrickCoord) -> bool {
+        let Some((center_m, radius)) = self.region else {
+            return false;
+        };
+        if volume.owner != BaselineOwner::Terrain {
+            return false;
+        }
+        let brick_m = spall_core::CellSizeCode::from_u8(volume.cell_size_code)
+            .expect("snapshot cell size")
+            .metres()
+            * 32.0;
+        [coord.x, coord.y, coord.z]
+            .into_iter()
+            .zip(center_m)
+            .any(|(c, m)| c.abs_diff((m / brick_m).floor() as i64) > radius as u64)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +207,7 @@ pub fn snapshot_world(sim: &Simulation, backing: Option<&dyn BrickBacking>) -> B
         checkpoint_tick: sim.current_tick().get(),
         journal_cursor: JournalSeq(sim.journal_cursor()),
         volumes,
+        region: None,
     }
 }
 
@@ -226,6 +251,15 @@ pub fn transfer_from_snapshot_supported(
     interest_epoch: InterestEpoch,
     segmented: bool,
 ) -> Result<BaselineTransfer, BaselineError> {
+    if snapshot.region.is_some_and(|(center, radius)| {
+        !segmented
+            || center.iter().any(|v| !v.is_finite())
+            || !(1..=spall_protocol::segment::MAX_REGION_RADIUS_BRICKS).contains(&radius)
+    }) {
+        return Err(BaselineError::Segment(
+            "invalid regional interest or legacy encoding".into(),
+        ));
+    }
     if !segmented {
         return transfer_from_snapshot(snapshot, transfer_id, interest_epoch);
     }
@@ -247,7 +281,9 @@ pub fn transfer_from_snapshot_supported(
         let mut max = *first;
         let mut revision = first_snap.revision().get();
         for (i, (coord, snap)) in volume.bricks.iter().enumerate() {
-            let bytes = if snap.is_dense() {
+            let bytes = if snapshot.digest_only(volume, *coord) {
+                128
+            } else if snap.is_dense() {
                 segment::DENSE_BRICK_DECODED_COST
             } else {
                 segment::UNIFORM_BRICK_DECODED_COST
@@ -273,7 +309,11 @@ pub fn transfer_from_snapshot_supported(
         });
     }
     let manifest = SegmentManifest {
-        schema: segment::SEGMENT_SCHEMA,
+        schema: if snapshot.region.is_some() {
+            segment::REGIONAL_SEGMENT_SCHEMA
+        } else {
+            segment::SEGMENT_SCHEMA
+        },
         segment_count: plan.len() as u32,
         volume_count: snapshot.volumes.len() as u32,
         total_bricks,
@@ -297,7 +337,12 @@ pub fn transfer_from_snapshot_supported(
                 edited: snap.is_edited(),
                 // Preserve full-width wire cells and the manifest's conservative
                 // allocation bound even when resident storage uses a palette.
-                cells: if snap.is_dense() {
+                cells: if snapshot.digest_only(v, *coord) {
+                    BaselineCells::Digest {
+                        content_hash: Hash32(snap.content_hash().to_bytes()),
+                        solid_cells: snap.solid_cells(),
+                    }
+                } else if snap.is_dense() {
                     BaselineCells::Dense(
                         snap.material_cells().into_iter().map(|m| m.raw()).collect(),
                     )
@@ -344,7 +389,11 @@ pub fn transfer_from_snapshot_supported(
             interest_epoch,
             checkpoint_tick: Tick(snapshot.checkpoint_tick),
             journal_cursor: snapshot.journal_cursor,
-            world_version: segment::BASELINE_STREAMED_WORLD_VERSION,
+            world_version: if snapshot.region.is_some() {
+                segment::BASELINE_REGIONAL_WORLD_VERSION
+            } else {
+                segment::BASELINE_STREAMED_WORLD_VERSION
+            },
             content_version: BASELINE_CONTENT_VERSION,
             total_bytes: payload.len() as u64,
             part_count: parts.len() as u32,
@@ -897,6 +946,7 @@ mod tests {
             assert!(!v.bricks.is_empty());
             for b in &v.bricks {
                 match &b.cells {
+                    BaselineCells::Digest { .. } => panic!("legacy baseline contains digest"),
                     BaselineCells::Uniform(_) => {}
                     BaselineCells::Dense(cells) => assert_eq!(cells.len(), CELLS_PER_BRICK),
                 }

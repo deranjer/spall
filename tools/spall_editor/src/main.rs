@@ -255,6 +255,8 @@ struct EditorApp {
     /// yakui id of the preview picture, once one has been uploaded.
     worldgen_texture: Option<yakui::TextureId>,
     play_launch: Option<PlayLaunch>,
+    /// Disable game presentation pacing for launches from either editor workflow.
+    play_uncapped: bool,
     scene_tab: SceneTab,
     scene_select: bool,
     scene_view: Option<SceneView>,
@@ -354,6 +356,7 @@ impl Default for EditorApp {
             worldgen: worldgen_panel::WorldgenPanel::default(),
             worldgen_texture: None,
             play_launch: None,
+            play_uncapped: false,
             project_path: String::new(),
             project_name: String::new(),
             asset_name: String::new(),
@@ -798,9 +801,9 @@ impl EditorApp {
             self.worldgen.error = Some(error.clone());
             return;
         }
-        let mut args =
+        let args =
             worldgen_panel::play_args(preview.seed, preview.size_cells, &self.worldgen.season);
-        args.push("--portable".into());
+        let args = self.game_launch_args(args);
         self.status = match spawn_play(&args) {
             Ok(launch) => {
                 self.play_launch = Some(launch);
@@ -832,8 +835,8 @@ impl EditorApp {
             "play".into(),
             "--editor-scene".into(),
             scene.to_string_lossy().into_owned(),
-            "--portable".into(),
         ];
+        let args = self.game_launch_args(args);
         self.status = match spawn_play(&args) {
             Ok(launch) => {
                 self.play_launch = Some(launch);
@@ -842,6 +845,14 @@ impl EditorApp {
             Err(error) => format!("Could not launch the sandbox: {error}"),
         };
     }
+    fn game_launch_args(&self, mut args: Vec<String>) -> Vec<String> {
+        args.push("--portable".into());
+        if self.play_uncapped {
+            args.push("--uncapped".into());
+        }
+        args
+    }
+
     fn render(&mut self) {
         let (frame, mut encoder, mut state) = {
             let Some(gpu) = self.gpu.as_mut() else {
@@ -1945,6 +1956,28 @@ fn spawn_play(args: &[String]) -> std::io::Result<PlayLaunch> {
 #[cfg(test)]
 mod viewport_tests {
     use super::*;
+
+    #[test]
+    fn game_launch_options_preserve_world_and_scene_arguments() {
+        let mut app = EditorApp::default();
+        let world = worldgen_panel::play_args(42, 1024, "winter");
+        let scene = vec![
+            "xtask".into(),
+            "play".into(),
+            "--editor-scene".into(),
+            "a scene.ron".into(),
+        ];
+        for source in [world, scene] {
+            app.play_uncapped = false;
+            let capped = app.game_launch_args(source.clone());
+            assert_eq!(&capped[..source.len()], source.as_slice());
+            assert_eq!(&capped[source.len()..], ["--portable"]);
+            app.play_uncapped = true;
+            let uncapped = app.game_launch_args(source.clone());
+            assert_eq!(&uncapped[..source.len()], source.as_slice());
+            assert_eq!(&uncapped[source.len()..], ["--portable", "--uncapped"]);
+        }
+    }
 
     #[test]
     fn failed_launcher_reports_diagnostics_and_allows_retry() {

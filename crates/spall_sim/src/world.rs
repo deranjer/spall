@@ -1595,6 +1595,11 @@ impl SimWorld {
             .ok_or(WorldError::UnknownVolume(source))?;
         for bb in &bv.bricks {
             let cells: Vec<MaterialId> = match &bb.cells {
+                BaselineCells::Digest { .. } => {
+                    return Err(WorldError::ReplayPrecondition(
+                        "regional digest in authoritative geometry".into(),
+                    ));
+                }
                 BaselineCells::Uniform(id) => vec![MaterialId(*id); spall_core::CELLS_PER_BRICK],
                 BaselineCells::Dense(raw) => raw.iter().copied().map(MaterialId).collect(),
             };

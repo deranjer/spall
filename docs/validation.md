@@ -1574,3 +1574,19 @@ Optional SPALL_TRANSFER_PROBE_RCVBUF requests 64 KiB..=4 MiB; omitted retains
 platform buffering. The 96 MiB BBR raw probes are bounded transport diagnostics,
 not full-world/G3 acceptance. Relay batching retains future deadlines, configured
 rate/loss and bounded queue limits. The graph optimization candidate was reverted.
+
+### ENG-130 regional startup checks
+
+`cargo test -p spall_server --test regional_baseline` exercises regional/full logical hash equality,
+reload/eviction/re-entry, edits to never-resident terrain, complete detached bodies, invalid interest,
+and a real QUIC traversal/distant-edit/reset scenario. `cargo test -p spall_client --test
+regional_staging` verifies atomic refusal of incomplete/invalid catalogues and forbidden body digests.
+Protocol and prediction unit tests cover schema isolation, count/radius bounds and collision holds
+before the capsule crosses into unknown geometry. Existing segmented join, residency and water
+replication scenarios remain required.
+
+`tools/measure-regional-startup.ps1 -WorldSizeCells 4096 -OutputDirectory <fresh-dir>` records bounded
+headless release startup, initial geometry/digest counts, working set, transfer bytes and final hash.
+Add `-FullBaseline` for the control. The supervisor owns/cleans only its launched processes and retains
+logs/summaries. This probe does not satisfy GPU, G3/G5 destruction, eight-player, impaired-network,
+or long-soak gates. See docs/reports/ENG-130-regional-startup.md for measured results and limitations.
