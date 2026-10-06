@@ -138,6 +138,7 @@ fn run_session(
         summary_json: Some(dir.join("client.summary.json")),
         transport: TransportConfig::for_tests(),
         client_residency: None,
+        baseline_budget_bytes: spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,

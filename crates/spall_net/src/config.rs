@@ -36,10 +36,23 @@ impl Default for TransportLimits {
     }
 }
 
+/// QUIC congestion policy. Ordinary clients and servers retain CUBIC.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CongestionControl {
+    #[default]
+    Cubic,
+    /// Quinn's experimental BBR implementation; explicit diagnostic opt-in.
+    Bbr,
+}
+
 /// Full transport configuration shared by [`crate::conn`] and the harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportConfig {
     pub limits: TransportLimits,
+    pub congestion: CongestionControl,
+    /// Optional bounded kernel UDP receive buffer request, not a frame or
+    /// assembled-transfer admission limit. None retains the platform default.
+    pub udp_receive_buffer_bytes: Option<usize>,
     /// How long to wait for the authentication exchange before giving up.
     pub handshake_timeout: Duration,
     /// Interval between application-level [`crate::message::NetMessage::Heartbeat`]
@@ -61,6 +74,8 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             limits: TransportLimits::default(),
+            congestion: CongestionControl::Cubic,
+            udp_receive_buffer_bytes: None,
             handshake_timeout: handshake_timeout_from_env(),
             heartbeat_interval: Duration::from_millis(500),
             // A dependency-complete baseline may require a bounded, CPU-heavy
@@ -80,6 +95,8 @@ impl TransportConfig {
     pub fn for_tests() -> Self {
         Self {
             limits: TransportLimits::default(),
+            congestion: CongestionControl::Cubic,
+            udp_receive_buffer_bytes: None,
             handshake_timeout: Duration::from_secs(5),
             heartbeat_interval: Duration::from_millis(100),
             idle_timeout: Duration::from_secs(6),

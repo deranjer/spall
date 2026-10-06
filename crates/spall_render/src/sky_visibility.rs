@@ -481,6 +481,7 @@ impl SkyPipeline {
                 last_cubes: Vec::new(),
                 bodies_moved: false,
                 environment: None,
+                bounce_environment: None,
                 bounce_enabled: true,
                 populated: false,
                 base: Vec::new(),
@@ -549,6 +550,10 @@ struct State {
     bodies_moved: bool,
     /// The environment the bounce sources were last lit with.
     environment: Option<Environment>,
+    /// Environment represented by the last queued bounce rebuild. The visual
+    /// sun moves continuously, but a full cache sweep is only requested after
+    /// a perceptible change so a moving clock cannot continually restart it.
+    bounce_environment: Option<Environment>,
     bounce_enabled: bool,
     populated: bool,
     /// The terrain occupancy last supplied, so a body that leaves a cell
@@ -570,6 +575,31 @@ struct State {
     /// being recorded (CPU clock; excludes the GPU finishing that frame and
     /// presentation).
     last_latency_ms: Option<f64>,
+}
+
+fn bounce_environment_changed(previous: Environment, current: Environment) -> bool {
+    let direction_cos = 2.0_f32.to_radians().cos();
+    previous
+        .sun_dir
+        .normalize()
+        .dot(current.sun_dir.normalize())
+        < direction_cos
+        || (previous.sun_intensity - current.sun_intensity).abs() >= 0.12
+        || previous
+            .sky
+            .iter()
+            .zip(current.sky)
+            .any(|(a, b)| (*a - b).abs() >= 0.018)
+        || previous
+            .ground
+            .iter()
+            .zip(current.ground)
+            .any(|(a, b)| (*a - b).abs() >= 0.025)
+        || previous
+            .sun_color
+            .iter()
+            .zip(current.sun_color)
+            .any(|(a, b)| (*a - b).abs() >= 0.035)
 }
 
 impl State {
@@ -848,6 +878,13 @@ impl SkyVisibility {
         }
         state.environment = Some(*environment);
         self.write_bounce_globals(queue, &state, environment);
+        if state
+            .bounce_environment
+            .is_some_and(|previous| !bounce_environment_changed(previous, *environment))
+        {
+            return;
+        }
+        state.bounce_environment = Some(*environment);
         state.pending.bounce_only = true;
         state.pending.full = true;
         state.note_change();

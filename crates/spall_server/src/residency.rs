@@ -18,8 +18,7 @@ use spall_structure::{
     AnchorPlane, CancelToken, ResidencyMode, StructureIndex, Support, SupportReport,
 };
 use spall_voxel::{
-    Brick, BrickBounds, BrickCacheKey, CacheBudget, CollisionReadiness, MemoryReport,
-    ResidencyCache, Volume,
+    Brick, BrickBounds, BrickCacheKey, CacheBudget, CollisionReadiness, ResidencyCache, Volume,
 };
 
 /// One fixed world-space storage partition.
@@ -228,7 +227,7 @@ impl<B: ResidencyBacking> ResidencyController<B> {
                 .flatten()
                 .expect("resident coordinate has a snapshot");
             let key = BrickCacheKey::new(volume.id(), coord);
-            let dense = usize::from(snap.is_dense()) * MemoryReport::DENSE_BRICK_BYTES;
+            let dense = snap.material_storage_bytes();
             self.cache.register(key, snap.revision(), dense, durable);
             self.graph_meta
                 .insert(key, graph_meta(&snap, coord, anchor));
@@ -352,7 +351,7 @@ impl<B: ResidencyBacking> ResidencyController<B> {
         };
         let anchor = world.anchor();
         let revision = brick.revision();
-        let dense = usize::from(brick.is_dense()) * MemoryReport::DENSE_BRICK_BYTES;
+        let dense = brick.material_storage_bytes();
         let budget = self.cache.budget();
         if self.cache.state(key).is_none()
             && (self.cache.resident_bricks().saturating_add(1) > budget.max_bricks

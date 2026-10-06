@@ -29,7 +29,7 @@ const WATER_MARGIN_XZ: i64 = 4;
 const WATER_MARGIN_ABOVE: i64 = 4;
 const WATER_MARGIN_BELOW: i64 = 2;
 /// Voxel cells a fluid domain may span before coarsening.
-pub const WATER_DOMAIN_BUDGET: u64 = 4_000_000;
+pub const WATER_DOMAIN_BUDGET: u64 = 64 * 1024 * 1024;
 /// Clear cells above a spawn surface (2.25 m for the player capsule).
 pub const SPAWN_HEADROOM_CELLS: i64 = 9;
 const MAX_SPAWNS: usize = 4;
@@ -195,7 +195,7 @@ fn fill_dense(spec: &WorldGenSpec, fp: &Footprint, corners: Option<&CornerGrid>,
             }
         }
     }
-    Brick::restored(&cells, Revision::ZERO, false)
+    Brick::restored_unpacked(&cells, Revision::ZERO, false)
 }
 
 fn generate_column(
@@ -274,6 +274,43 @@ fn water_plan(columns: &ColumnMap) -> WaterPlan {
     }
 }
 
+/// Checks the existing water capacity before allocating terrain or water cells.
+/// This uses the same wet columns, sea level and margins as the full water plan.
+pub fn validate_water_budget(columns: &ColumnMap) -> Result<(), GenError> {
+    let mut lo = [i64::MAX; 3];
+    let mut hi = [i64::MIN; 3];
+    let mut wet = false;
+    for z in 0..i64::from(columns.size()) {
+        for x in 0..i64::from(columns.size()) {
+            let h = i64::from(columns.height(x, z));
+            if !columns.is_water(x, z) || h >= i64::from(SEA_LEVEL) {
+                continue;
+            }
+            wet = true;
+            lo = [lo[0].min(x), lo[1].min(h + 1), lo[2].min(z)];
+            hi = [hi[0].max(x), i64::from(SEA_LEVEL), hi[2].max(z)];
+        }
+    }
+    let plan = WaterPlan {
+        bounds: wet.then(|| {
+            (
+                GlobalCell::new(lo[0], lo[1], lo[2]),
+                GlobalCell::new(hi[0], hi[1], hi[2]),
+            )
+        }),
+        ..WaterPlan::default()
+    };
+    let cells = plan.domain_cells();
+    if cells > WATER_DOMAIN_BUDGET {
+        Err(GenError::WaterBudget {
+            cells,
+            budget: WATER_DOMAIN_BUDGET,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// Dry meadow spots with a flat 5x5 footprint, clear of cave mouth tunnels.
 fn find_spawns(columns: &ColumnMap, caves: &CaveField) -> Vec<[f64; 3]> {
     let size = i64::from(columns.size());
@@ -330,6 +367,7 @@ fn find_spawns(columns: &ColumnMap, caves: &CaveField) -> Vec<[f64; 3]> {
 /// Generates the whole arena. A pure function of the spec (and `GEN_VERSION`).
 pub fn generate(spec: &WorldGenSpec) -> Result<GeneratedWorld, GenError> {
     let columns = ColumnMap::compute(spec)?;
+    validate_water_budget(&columns)?;
     let caves = CaveField::new(spec.seed, &columns);
     let bricks_per_side = i64::from(spec.size_cells) / BRICK;
 
@@ -361,9 +399,22 @@ pub fn generate(spec: &WorldGenSpec) -> Result<GeneratedWorld, GenError> {
     });
 
     let mut terrain = Volume::new(spec.volume_id, CellSizeCode::Quarter);
-    for (coord, brick) in built.into_iter().flatten() {
+    // Retain the complete immutable source batch during packing. Releasing
+    // each full-width array between smaller allocations leaves holes that
+    // made later grid allocation hundreds of times slower on Windows.
+    // Release the batch together after all packed replacements are installed.
+    let generation_payload_guard: Vec<_> = built
+        .iter()
+        .flatten()
+        .map(|(_, brick)| brick.snapshot())
+        .collect();
+    for (coord, mut brick) in built.into_iter().flatten() {
+        // Compact on the owner after workers finish. Parallel palette/index
+        // allocation severely fragments the Windows heap at full-world scale.
+        brick.collapse();
         terrain.insert_brick(coord, brick)?;
     }
+    drop(generation_payload_guard);
 
     let water = water_plan(&columns);
     let cells = water.domain_cells();
@@ -392,4 +443,45 @@ pub fn generate(spec: &WorldGenSpec) -> Result<GeneratedWorld, GenError> {
         columns,
         cave_mouths,
     })
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use crate::{Preset, WorldgenPalette};
+
+    #[test]
+    fn preflight_agrees_with_exact_water_plan() {
+        for seed in [1, 7, 42] {
+            let columns = ColumnMap::compute(&WorldGenSpec::new(
+                Preset::Showcase,
+                seed,
+                512,
+                WorldgenPalette::sequential(1),
+            ))
+            .unwrap();
+            let cells = water_plan(&columns).domain_cells();
+            match validate_water_budget(&columns) {
+                Ok(()) => assert!(cells <= WATER_DOMAIN_BUDGET),
+                Err(GenError::WaterBudget {
+                    cells: measured,
+                    budget,
+                }) => {
+                    assert_eq!(measured, cells);
+                    assert_eq!(budget, WATER_DOMAIN_BUDGET);
+                    assert!(cells > budget);
+                }
+                Err(error) => panic!("unexpected capacity error: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "large-world capacity regression; computes a 4096-cell column map only"]
+    fn large_world_column_capacity_fits_without_changing_water_bounds() {
+        let spec = WorldGenSpec::new(Preset::Showcase, 1, 4096, WorldgenPalette::sequential(1));
+        let columns = ColumnMap::compute(&spec).unwrap();
+        validate_water_budget(&columns).unwrap();
+        assert_eq!(water_plan(&columns).domain_cells(), 47_421_308);
+    }
 }

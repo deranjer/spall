@@ -28,7 +28,12 @@ sandbox-server --serve ... --worldgen showcase --seed 1 [--worldgen-size 512]
   full water cells between the terrain and `SEA_LEVEL`. The consumer builds the
   fluid solver's `WaterSetup` from it. Generation fails with
   `GenError::WaterBudget` rather than truncating when the fluid domain
-  (water box plus sandbox margins) exceeds `WATER_DOMAIN_BUDGET` (4M voxel cells).
+  (water box plus sandbox margins) exceeds `WATER_DOMAIN_BUDGET` (64 Mi voxel cells; ENG-126).
+  This gate is checked from the column map before terrain/water allocation and
+  is also shown in the editor preview. Valid size syntax is not evidence that
+  a complete world fits: seed 1 at 4096 cells (1024 m) needs 47,421,308 domain
+  cells and is rejected. Large playable worlds need a separate capacity and
+  integration change; the editor does not silently remove water or shrink them.
 - **The fluid domain grows with digging (ENG-120).** The generated domain is the
   water box plus 1 m margins with closed sides, so water cannot leave it. The
   worldgen scene enables `WaterGrowth`: a committed terrain edit within 16
@@ -76,17 +81,18 @@ to smaller arenas (tests use 256 cells).
   servers built before this no longer match the handshake hash.
 - `sandbox::worldgen_scene` maps a `GeneratedWorld` to `WorldSetup` (terrain
   cloned, sharing dense payloads), a `WaterSetup` (box + margins, coarsening picked per world to fit a
-  50,000 fluid-cell budget (3 at 512 cells, 4 at 1024), worker at 20 Hz) and spawns.
+  50,000 fluid-cell target (3 at 512 cells, 4 at 1024), worker at 20 Hz) and spawns.
 - Water starts static (no springs or sinks); it is solver state from then on.
 
-## Measured (1024-cell arena, seed 1, release, this machine)
+## Historical measurement (1024-cell arena, seed 1, before ENG-114 palette storage)
 - Generation 275 ms including the water plan (2D columns ~29 ms).
 - 12,288 resident bricks: 8,599 uniform, 3,689 dense = 242 MB of dense cells
   (with the wall). **Dense surface bricks are the dominant memory cost.**
 - Stand-up in the authoritative simulation: `Simulation::new` 1.2 s (per-brick
   terrain colliders + water region); 120 ticks 92 ms total, worst tick 31 ms;
   a player at the spawn rests grounded (`worldgen_scene` test, `--ignored`).
-- Water: 153,635 cells; fluid domain 2.68M voxel cells of the 4M budget.
+- Water: 153,635 cells; fluid domain 2.68M voxel cells of the then-4M budget
+  (the current bounded capacity is 64 Mi voxel cells).
 - Caves: 8.3% of deep rock (band asserted: 2-15%).
 - Real play session (`cargo xtask play --worldgen showcase --seed 1 --release
   --shots ...`, release, one local client): the late-join baseline installed all
@@ -257,3 +263,27 @@ editor preview, persistence of spec/version in `StoredWorldMeta`.
 ## Vegetation plan boundary (ENG-116)
 
 `spall_ecology` consumes terrain and explicit ecology inputs to produce a separately versioned plan. It does not modify `GeneratedWorld`, the worldgen version, or the terrain golden digest. The sandbox supplies its initial species and material mappings. The bounded clearing example routes accepted wood proposals through the existing simulation edit/staging surface, but production server ownership, checkpoint/journal recovery, and replication remain a subsequent assignment. Grass remains patch state; no blades or foliage voxels are generated. The existing worldgen pipeline still has no vegetation pass.
+
+## ENG-126 larger world integration
+
+The bounded fine water domain now permits 64 Mi voxel cells. Canonical water
+schema 2 is used only beyond schema 1's 32 Mi limit; legacy smaller states
+retain schema 1. Seed-1 4096-cell (1024 m) worlds keep their exact 47,421,308
+cell water box. Coarse-solid overlaps retain authored water via conservative
+displacement or the trapped ledger, including checkpoint/journal recovery.
+Terrain generation and its golden digest are unchanged.
+
+The existing coarsening selector stops at factor 8, so large worlds may exceed
+the 50,000 fluid-cell target. No solver tolerance, dt or workload is reduced to
+claim that target. Live water transport retains its existing limits. Large
+world network baselines use negotiated version 3 with bounded segment staging;
+see `docs/protocol.md` and `docs/reports/ENG-126-large-world-integration.md` for
+measurements and remaining hardware/performance gates.
+
+## ENG-114 memory and full-world stress follow-up
+
+Exact internal palette storage, streamed collider staging and atomic reset
+payload reuse are recorded in [memory/stress evidence](reports/ENG-114-memory-stress.md).
+The fixtures exercise full 4096-cell residency, eight foundation digs, two
+network replicas and two resets. Performance and impaired-network gates remain
+open; consult the report before claiming large-world acceptance.

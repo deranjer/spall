@@ -1,0 +1,98 @@
+{
+  "name": "eng114-worldgen-1024m-stress",
+  "description": "Full 4096-cell (1024 m) seed-1 arena, two actual network replicas, eight radius-8 cross-brick foundation excavations in distant regions and two admin resets. Requires every requested cut, both replacements on every client, and final authoritative/client hash equality. This is a bounded full-world-residency stress probe, not the whole-foundation-collapse or G4 soak gate.",
+  "release_profile": true,
+  "worldgen": "showcase",
+  "worldgen_size": 4096,
+  "worldgen_seed": 1,
+  "server_ticks": 7200,
+  "quiescence_ticks": 0,
+  "clients": 2,
+  "minimum_transactions": 8,
+  "cuts": [
+    {
+      "client": 0,
+      "at_tick": 3000,
+      "cell": [
+        1024,
+        16,
+        1024
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 3120,
+      "cell": [
+        3072,
+        16,
+        1024
+      ],
+      "radius": 8
+    },
+    {
+      "client": 0,
+      "at_tick": 3240,
+      "cell": [
+        1024,
+        16,
+        3072
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 3360,
+      "cell": [
+        3072,
+        16,
+        3072
+      ],
+      "radius": 8
+    },
+    {
+      "client": 0,
+      "at_tick": 6300,
+      "cell": [
+        2048,
+        16,
+        2048
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 6420,
+      "cell": [
+        2080,
+        16,
+        2048
+      ],
+      "radius": 8
+    },
+    {
+      "client": 0,
+      "at_tick": 6540,
+      "cell": [
+        2048,
+        16,
+        2080
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 6660,
+      "cell": [
+        2080,
+        16,
+        2080
+      ],
+      "radius": 8
+    }
+  ],
+  "admin_reset_at": [
+    4500,
+    6000
+  ]
+}

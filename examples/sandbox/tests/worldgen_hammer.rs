@@ -138,6 +138,7 @@ fn a_hammer_swing_digs_a_crater_the_client_replica_sees() {
         summary_json: None,
         transport: patient_transport(),
         client_residency: None,
+        baseline_budget_bytes: spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
         on_replica_ready: Some(Arc::new(move |replica| {
             *slot_for_client.lock().unwrap() = Some(replica);
         })),

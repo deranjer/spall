@@ -747,11 +747,34 @@ impl GameRenderer {
             environment.exposure,
             view != DebugView::Shaded,
         );
-        let clear = if view == DebugView::Shaded {
-            environment.hdr_clear()
-        } else {
-            [0.0, 0.0, 0.0, 1.0]
-        };
+        let skybox_bind = (view == DebugView::Shaded)
+            .then(|| self.pipeline.skybox_bind_group(queue, &camera, environment));
+        if let Some(bind) = skybox_bind.as_ref() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("spall-voxel-skybox-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.target.hdr_view(),
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: timer.map(|timer| wgpu::RenderPassTimestampWrites {
+                    query_set: &timer.queries,
+                    beginning_of_pass_write_index: Some(2),
+                    end_of_pass_write_index: None,
+                }),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(self.pipeline.skybox_pipeline());
+            pass.set_bind_group(0, *bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        let clear = [0.0, 0.0, 0.0, 1.0];
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("spall-game-opaque-pass"),
@@ -759,12 +782,16 @@ impl GameRenderer {
                     view: self.target.hdr_view(),
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: clear[0],
-                            g: clear[1],
-                            b: clear[2],
-                            a: clear[3],
-                        }),
+                        load: if skybox_bind.is_some() {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(wgpu::Color {
+                                r: clear[0],
+                                g: clear[1],
+                                b: clear[2],
+                                a: clear[3],
+                            })
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -777,7 +804,17 @@ impl GameRenderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: timer.map(|timer| timer.writes(2, 3)),
+                timestamp_writes: timer.map(|timer| {
+                    if skybox_bind.is_some() {
+                        wgpu::RenderPassTimestampWrites {
+                            query_set: &timer.queries,
+                            beginning_of_pass_write_index: None,
+                            end_of_pass_write_index: Some(3),
+                        }
+                    } else {
+                        timer.writes(2, 3)
+                    }
+                }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });

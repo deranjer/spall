@@ -87,14 +87,12 @@ fn run(seed: u64, span: i64, materials: u16, edits: usize, writes_per_edit: usiz
         }
     }
 
-    // Accounting: dense payload bytes are a multiple of the layer size and the
-    // owned/shared split covers every dense brick.
+    // Both exact non-uniform representations are bounded by the full-width
+    // array. Palette storage has one byte per cell plus its material table.
     let report = volume.memory_report();
-    assert_eq!(
-        report.dense_bricks,
-        report.snapshot_shared_bricks + (report.owned_dense_bytes / 65_536)
-    );
-    assert_eq!(report.snapshot_shared_bytes % 65_536, 0);
+    assert!(report.snapshot_shared_bricks <= report.dense_bricks);
+    assert!(report.total_dense_bytes() >= report.dense_bricks * 32_768);
+    assert!(report.total_dense_bytes() <= report.dense_bricks * 65_536);
 }
 
 fn brick_is_all_air(volume: &Volume, coord: BrickCoord) -> bool {

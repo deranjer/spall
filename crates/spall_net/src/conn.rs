@@ -309,6 +309,10 @@ impl Connection {
     pub const BYE_REASON_BASELINE_UNSUPPORTED: &'static str =
         "baseline requires segmented transfer support";
 
+    /// A baseline could not fit the negotiated transfer limits.
+    pub const BYE_REASON_BASELINE_CAPACITY: &'static str =
+        "baseline capacity exceeded; see server diagnostics";
+
     /// Sends a `Bye` then finishes the control send stream. Waits briefly
     /// (bounded) for the peer to acknowledge receipt before returning.
     ///
@@ -501,6 +505,23 @@ impl Connection {
             transfer: None,
             next_part_index: 0,
         })
+    }
+
+    /// Accepts the negotiated streaming-baseline format without changing the
+    /// legacy bulk limit. Parts stay bounded; consumers must stage incrementally.
+    pub async fn accept_streamed_baseline(
+        &self,
+        begin: &spall_protocol::BaselineBegin,
+    ) -> Result<BulkRecv> {
+        begin.validate().map_err(|e| {
+            TransportError::Frame(crate::framing::FrameError::Stream(e.to_string()))
+        })?;
+        let mut reader = self.accept_bulk().await?;
+        if begin.world_version == spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION {
+            reader.assembled_cap = spall_protocol::segment::MAX_STREAMED_BASELINE_COMPRESSED
+                .min(begin.total_bytes as usize);
+        }
+        Ok(reader)
     }
 
     /// Number of live bulk-stream reservations across every entry point
@@ -759,6 +780,26 @@ impl BulkSend {
         self.stream
             .finish()
             .map_err(|e| TransportError::ConnectionLost(e.to_string()))
+    }
+
+    /// Finishes and waits for acknowledgement of all stream bytes and FIN.
+    /// Callers must impose their existing session/shutdown deadline. Closing
+    /// the endpoint after `finish` alone can discard buffered reliable data.
+    pub async fn finish_and_wait(mut self) -> Result<()> {
+        self.stream
+            .finish()
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
+        let stopped = self
+            .stream
+            .stopped()
+            .await
+            .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
+        if let Some(code) = stopped {
+            return Err(TransportError::ConnectionLost(format!(
+                "bulk stream stopped by peer: {code}"
+            )));
+        }
+        Ok(())
     }
 }
 

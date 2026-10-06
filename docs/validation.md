@@ -148,6 +148,19 @@ including the SPVOX color preview in the Assets workspace. Native
 window interaction and launching an offline sandbox client require an available
 desktop GPU and remain a hands-on check rather than a CPU-CI claim.
 
+ENG-126 adds a Windows portable editor package built by
+`tools/package-portable.ps1 [-OutputDirectory PATH]`. It places
+`spall-editor.exe`, `xtask.exe`, `sandbox-server.exe`, and `sandbox-client.exe`
+beside `README.txt`. The editor finds the sibling xtask and the packaged play
+path starts sibling server/client binaries directly; it does not invoke Cargo
+or require the source checkout. CPU validation is the editor's worldgen
+selection/argument tests and xtask/editor checks. GPU startup and full
+interactive play remain hands-on checks on a Windows machine with a supported
+adapter; package creation alone does not claim that visual check passed.
+The packaged launcher waits up to five minutes for the server to finish world
+generation and bind before it opens the client window; large arenas are built
+before that window appears.
+
 Editor command coverage includes stable asset-reference round trips, single-cell
 undo/redo, and mixed-colour box-stroke undo: each prior voxel material/tint must
 be restored exactly rather than replacing the whole selection with one colour.
@@ -1451,3 +1464,113 @@ checks. Capacity/thin walls/displacement/recovery remain open. In progress.
 Final ENG-122 incremental-flow validation: cargo xtask check1219 passed/0 failed/63 ignored
 across137 suites, including formatting and strict workspace Clippy. Initial dam-replication
 admin-ack failure and isolated retry pass are preserved; no networking/fixture/budget changes.
+
+### ENG-126 portable startup diagnostics
+
+`cargo test -p spall_editor`, `cargo test -p spall_worldgen`, and
+`cargo test -p xtask` cover editor launch failure/retry, exact water preflight,
+unchanged worldgen golden output, and launcher behavior. Large preflight checks:
+
+```powershell
+cargo test --release -p spall_worldgen large_world_fails_capacity_before_terrain_allocation -- --ignored --nocapture
+cargo test --release -p spall_editor --bin spall-editor over_capacity_preview_is_visible_but_cannot_launch -- --ignored --nocapture
+```
+
+These checks verify explicit rejection, not successful large-world play.
+Historical startup correction: seed-1 4096-cell worlds exceeded the old 4M
+water-domain limit. ENG-126 now extends the bounded domain to 64 Mi cells and
+negotiates streaming baselines; see the current integration report for measured
+results and hardware limits. The editor shows capacity/startup errors and elapsed
+startup time; launch buttons cannot start duplicate sessions. Diagnostics live
+under `runs/editor-launch-*/launcher.log` and the play session's
+`server.stderr.log` / `server.stdout.log`. See
+[portable startup evidence](reports/ENG-126-startup-correction.md).
+
+### ENG-127 skybox camera regression
+
+Run `cargo test -p spall_render --test game_renderer_gpu skybox -- --ignored --nocapture`
+on a GPU host. The camera regression projects a fixed sun direction through
+the geometry camera at two yaw/pitch offsets and checks the rendered sun at
+those pixels. Translating the camera must leave the entire sky capture identical.
+This is offscreen GPU evidence; interactive mouse-look review remains separate.
+See [camera correction evidence](reports/ENG-127-camera-correction.md).
+
+### ENG-128 day/night clock validation
+
+Run `cargo test -p spall_client day_night::tests` for clock landmarks, wrap,
+night readability, lunar phase progression, and daytime moon visibility. Run
+`cargo check -p spall_render -p spall_client -p sandbox --features client` for
+client integration. Run the focused `spall_render` GPU renderer test to compile
+and exercise the skybox and surface-lighting shaders. Hardware presentation is
+separate; report it as unrun when no target GPU window is available. The clock
+derives from server ticks and intentionally restarts at 06:00 after a server
+restart because simulation ticks are not persisted.
+
+### ENG-126 larger world integration
+
+Run protocol boundary tests, server baseline/queue tests, `segmented_join`,
+`late_join_session`, `replication_session`, and `water_replication` for real
+network agreement and reset coverage. Run the release ignored extended test in
+`water_persistence` for schema-2 exact checkpoint/journal recovery and failed
+commit isolation. The release ignored worldgen/editor capacity tests pin the
+original seed-1 1024 m water box and the enabled preview preflight.
+
+Do not confuse successful capacity/functional checks with G3/G5/G6 acceptance.
+A full 1024 m server probe reached about 14.1 GiB peak working set, above the
+server target. Report client memory, join timing and target GPU presentation
+separately. Details and exact commands are recorded in
+`reports/ENG-126-large-world-integration.md`.
+
+### ENG-114 memory and full-world stress
+
+Run `eng114-worldgen-reset-small`, `eng114-worldgen-1024m-stress`, and
+`eng114-worldgen-1024m-impaired` through `tools/measure-worldgen-stress.ps1`
+with a fresh output directory. The full fixture retains 196,608 bricks, real
+water and ecology, two replicas, eight requested foundation excavations and
+two resets. Require each client's unique script commit receipts, every reset
+installation, no rejected/unresolved server work and final hash equality.
+Palette/COW storage must preserve canonical hashes, material IDs, revisions,
+modified-air metadata, exact collision and durable restoration.
+
+These bounded probes do not replace whole-foundation collapse, eight-client
+load, thirty-minute soak or target-GPU presentation checks. Diagnostic join
+bounds do not replace G3 limits. Exact measurements, failed probes and open
+gates are in `reports/ENG-114-memory-stress.md`.
+
+For the next profiling pass, the ignored `full_world_stage_profile` reports
+index construction, complete dependency-token construction and post-edit
+reclassification separately. The ignored `impaired_bulk_transfer_profile`
+isolates 4 MiB of reliable traffic under the full fixture's network profile;
+it has a 90-second bound and records QUIC congestion/loss and proxy counters.
+`SPALL_TRANSFER_PROBE_CONTROLLER=bbr` selects the experimental comparison.
+The distinct `eng114-worldgen-1024m-bbr-impaired` scenario keeps the full size,
+eight digs, two resets and existing diagnostic join limits. Production stays
+on CUBIC; passing BBR cannot close the default transport gate. See
+`reports/ENG-114-commit-transfer.md` for exact evidence and remaining gates.
+
+`shutdown_drains_an_accepted_baseline_over_a_delayed_link` verifies that a
+baseline accepted during a 20-tick server run completes over a 64 KiB/s,
+200 ms RTT link, with no baseline failures, exact final hash and no extra
+simulation ticks. Immediate endpoint closure reproduces connection loss;
+the bounded reliable drain passes this regression under default CUBIC.
+
+The ignored `full_world_commit_profile` extends the complete generated-terrain
+probe with exact per-brick colliders and timings for each atomic commit phase.
+It checks solid conservation and all published result hashes. Its engine-only
+fixture material manifest and absence of game water/ecology mean it is not a
+sandbox performance gate. Count-proven full/empty structural labels must match
+the general flood fill across palette/dense/max-ID storage and snapshot edits;
+partial bricks retain the same six-face algorithm.
+
+`SPALL_TRANSFER_PROBE_MIB=96` exercises transport near the full world's
+compressed size without world decoding. The ignored profile accepts 1..128
+MiB under the unchanged 90-second diagnostic deadline; above 16 MiB it uses
+validated streamed-baseline admission and shipped 1 MiB parts within the
+existing 256 MiB cap. The receiver checks part IDs, ordering, hashes, all bytes
+and counts. Its raw-transfer pass does not close reset-convergence or G3 gates.
+
+ENG-114 buffering/relay diagnostic pass: see reports/ENG-114-commit-transfer.md.
+Optional SPALL_TRANSFER_PROBE_RCVBUF requests 64 KiB..=4 MiB; omitted retains
+platform buffering. The 96 MiB BBR raw probes are bounded transport diagnostics,
+not full-world/G3 acceptance. Relay batching retains future deadlines, configured
+rate/loss and bounded queue limits. The graph optimization candidate was reverted.

@@ -237,6 +237,9 @@ pub fn client_config(expected: Fingerprint, cfg: &TransportConfig) -> Result<qui
 
 fn transport_timers(cfg: &TransportConfig) -> Result<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
+    if cfg.congestion == crate::config::CongestionControl::Bbr {
+        tc.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
     let streams = quinn::VarInt::from_u32(cfg.limits.max_bulk_streams + 2);
     tc.max_concurrent_bidi_streams(streams);
     tc.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));

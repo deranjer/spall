@@ -1,0 +1,17 @@
+{
+  "name": "eng114-worldgen-reset-small",
+  "description": "CPU-sized generated-world integration regression: cross-brick foundation cuts followed by two exact network baseline replacements. Not large-world performance evidence.",
+  "release_profile": true,
+  "worldgen": "showcase",
+  "worldgen_size": 256,
+  "worldgen_seed": 1,
+  "server_ticks": 600,
+  "quiescence_ticks": 0,
+  "clients": 2,
+  "minimum_transactions": 2,
+  "cuts": [
+    {"client":0,"at_tick":30,"cell":[128,16,128],"radius":3},
+    {"client":1,"at_tick":90,"cell":[160,16,128],"radius":3}
+  ],
+  "admin_reset_at": [180,360]
+}

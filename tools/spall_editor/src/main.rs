@@ -24,6 +24,14 @@ mod thumbnail;
 mod ui;
 mod worldgen_panel;
 
+struct PlayLaunch {
+    child: std::process::Child,
+    diagnostics: PathBuf,
+    started: std::time::Instant,
+    last_poll: std::time::Instant,
+    world_ready: bool,
+}
+
 use thumbnail::ThumbMesh;
 use ui::{Modal, RightTab, SceneTab, SceneView};
 
@@ -246,6 +254,7 @@ struct EditorApp {
     worldgen: worldgen_panel::WorldgenPanel,
     /// yakui id of the preview picture, once one has been uploaded.
     worldgen_texture: Option<yakui::TextureId>,
+    play_launch: Option<PlayLaunch>,
     scene_tab: SceneTab,
     scene_select: bool,
     scene_view: Option<SceneView>,
@@ -344,6 +353,7 @@ impl Default for EditorApp {
             project_thumbnails: Vec::new(),
             worldgen: worldgen_panel::WorldgenPanel::default(),
             worldgen_texture: None,
+            play_launch: None,
             project_path: String::new(),
             project_name: String::new(),
             asset_name: String::new(),
@@ -778,27 +788,32 @@ impl EditorApp {
     /// Plays the previewed world: `cargo xtask play --worldgen ...` builds the
     /// sandbox and opens a client in it. No project or scene is involved.
     fn run_worldgen(&mut self) {
+        if self.play_launch.is_some() {
+            return;
+        }
         let Some(preview) = &self.worldgen.preview else {
             return;
         };
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .map(std::path::Path::to_path_buf);
-        let mut command = std::process::Command::new("cargo");
-        command.args(worldgen_panel::play_args(preview.seed, preview.size_cells));
-        if let Some(workspace) = workspace {
-            command.current_dir(workspace);
+        if let Some(error) = &preview.launch_error {
+            self.worldgen.error = Some(error.clone());
+            return;
         }
-        self.status = match command.spawn() {
-            Ok(_) => format!(
-                "Launched generated world (seed {}); the first run builds the sandbox",
-                preview.seed
-            ),
-            Err(e) => format!("Could not launch cargo xtask play: {e}"),
+        let mut args =
+            worldgen_panel::play_args(preview.seed, preview.size_cells, &self.worldgen.season);
+        args.push("--portable".into());
+        self.status = match spawn_play(&args) {
+            Ok(launch) => {
+                self.play_launch = Some(launch);
+                self.worldgen.error = None;
+                "Starting generated world…".into()
+            }
+            Err(error) => format!("Could not launch the sandbox: {error}"),
         };
     }
     fn run_scene(&mut self) {
+        if self.play_launch.is_some() {
+            return;
+        }
         self.save();
         let Some(m) = &self.model else {
             return;
@@ -812,26 +827,19 @@ impl EditorApp {
             self.status = "Active scene has no project entry; cannot run".into();
             return;
         };
-        // `cargo xtask play` builds the sandbox, starts its server on this
-        // scene, and opens an interactive client window. It must run from the
-        // workspace, which is two levels above this crate.
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .map(std::path::Path::to_path_buf);
-        let mut command = std::process::Command::new("cargo");
-        command
-            .args(["xtask", "play", "--editor-scene"])
-            .arg(&scene);
-        if let Some(workspace) = workspace {
-            command.current_dir(workspace);
-        }
-        self.status = match command.spawn() {
-            Ok(_) => format!(
-                "Launched {} (building first run may take a while)",
-                scene.display()
-            ),
-            Err(e) => format!("Could not launch cargo xtask play: {e}"),
+        let args = vec![
+            "xtask".into(),
+            "play".into(),
+            "--editor-scene".into(),
+            scene.to_string_lossy().into_owned(),
+            "--portable".into(),
+        ];
+        self.status = match spawn_play(&args) {
+            Ok(launch) => {
+                self.play_launch = Some(launch);
+                "Starting sandbox…".into()
+            }
+            Err(error) => format!("Could not launch the sandbox: {error}"),
         };
     }
     fn render(&mut self) {
@@ -1799,6 +1807,7 @@ impl ApplicationHandler for EditorApp {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_play_launch();
         if self.exit_requested {
             event_loop.exit();
             return;
@@ -1809,9 +1818,181 @@ impl ApplicationHandler for EditorApp {
     }
 }
 
+impl EditorApp {
+    fn poll_play_launch(&mut self) {
+        let Some(launch) = self.play_launch.as_mut() else {
+            return;
+        };
+        if launch.last_poll.elapsed() < std::time::Duration::from_millis(250) {
+            return;
+        }
+        launch.last_poll = std::time::Instant::now();
+        match launch.child.try_wait() {
+            Ok(None) => {
+                let diagnostics = read_launch_diagnostics(&launch.diagnostics);
+                launch.world_ready |= diagnostics.contains("spall-client: world ready");
+                self.status = if launch.world_ready {
+                    "Sandbox running (close the game to launch another world)".into()
+                } else if diagnostics.contains("opening the window") {
+                    format!(
+                        "Sandbox window open; loading world: {} s elapsed",
+                        launch.started.elapsed().as_secs()
+                    )
+                } else {
+                    format!(
+                        "Starting sandbox: {} s elapsed",
+                        launch.started.elapsed().as_secs()
+                    )
+                };
+            }
+            Ok(Some(status)) => {
+                self.status = if status.success() {
+                    "Sandbox closed".into()
+                } else {
+                    format!(
+                        "Sandbox launch failed ({status}): {}",
+                        read_launch_diagnostics(&launch.diagnostics)
+                    )
+                };
+                if !status.success() {
+                    self.worldgen.error = Some(self.status.clone());
+                }
+                self.play_launch = None;
+            }
+            Err(error) => {
+                self.status = format!("Could not monitor sandbox: {error}");
+                self.worldgen.error = Some(self.status.clone());
+            }
+        }
+    }
+}
+
+fn read_launch_diagnostics(path: &std::path::Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return "No launcher diagnostics available".into();
+    };
+    let length = file.metadata().map_or(0, |metadata| metadata.len());
+    let _ = file.seek(SeekFrom::Start(length.saturating_sub(8192)));
+    let mut bytes = Vec::new();
+    let _ = file.take(8192).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).trim().to_owned()
+}
+
+fn spawn_play(args: &[String]) -> std::io::Result<PlayLaunch> {
+    let launcher_name = if cfg!(windows) { "xtask.exe" } else { "xtask" };
+    let packaged = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .map(|parent| (parent.join(launcher_name), parent))
+        .filter(|(launcher, parent)| {
+            let sibling = |name: &str| {
+                parent.join(if cfg!(windows) {
+                    format!("{name}.exe")
+                } else {
+                    name.to_owned()
+                })
+            };
+            launcher.is_file()
+                && sibling("sandbox-server").is_file()
+                && sibling("sandbox-client").is_file()
+        });
+    let mut command = if let Some((launcher, parent)) = packaged {
+        let mut command = std::process::Command::new(launcher);
+        command.args(args.iter().skip(1)).current_dir(parent);
+        command
+    } else {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .map(std::path::Path::to_path_buf);
+        let mut command = std::process::Command::new("cargo");
+        command.args(args.iter().filter(|arg| arg.as_str() != "--portable"));
+        if let Some(workspace) = workspace {
+            command.current_dir(workspace);
+        }
+        command
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let logs = command
+        .get_current_dir()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("runs")
+        .join(format!("editor-launch-{stamp}-{}", std::process::id()));
+    std::fs::create_dir_all(&logs)?;
+    let diagnostics = logs.join("launcher.log");
+    let log = std::fs::File::create(&diagnostics)?;
+    command.stdout(std::process::Stdio::from(log.try_clone()?));
+    command.stderr(std::process::Stdio::from(log));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let child = command.spawn()?;
+    Ok(PlayLaunch {
+        child,
+        diagnostics,
+        started: std::time::Instant::now(),
+        last_poll: std::time::Instant::now(),
+        world_ready: false,
+    })
+}
+
 #[cfg(test)]
 mod viewport_tests {
     use super::*;
+
+    #[test]
+    fn failed_launcher_reports_diagnostics_and_allows_retry() {
+        let log =
+            std::env::temp_dir().join(format!("spall-launch-failure-{}.log", std::process::id()));
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        // The test harness rejects this flag, reproducing a real child failure.
+        command.arg("--spall-invalid-test-option");
+        command.stderr(std::process::Stdio::from(
+            std::fs::File::create(&log).unwrap(),
+        ));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("child did not exit");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut app = EditorApp {
+            play_launch: Some(PlayLaunch {
+                child,
+                diagnostics: log.clone(),
+                started: std::time::Instant::now(),
+                last_poll: std::time::Instant::now() - std::time::Duration::from_secs(1),
+                world_ready: false,
+            }),
+            ..EditorApp::default()
+        };
+        app.poll_play_launch();
+        assert!(app.play_launch.is_none(), "launch button may be retried");
+        assert!(
+            app.worldgen
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("spall-invalid-test-option")
+        );
+        assert!(app.status.contains("Sandbox launch failed"));
+        std::fs::remove_file(log).unwrap();
+    }
 
     /// A quad-soup mesh of `quads` separate quads, like one batch of voxel faces.
     fn quads(quads: usize) -> (Vec<yakui::paint::Vertex>, Vec<u16>) {

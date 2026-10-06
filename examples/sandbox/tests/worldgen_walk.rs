@@ -98,6 +98,7 @@ fn a_walking_player_travels_across_the_generated_meadow() {
         summary_json: None,
         transport: patient_transport(),
         client_residency: None,
+        baseline_budget_bytes: spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
         on_replica_ready: None,
         interactive: None,
         client_authoritative: false,

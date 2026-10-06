@@ -139,11 +139,14 @@ pub fn commit(
     server_tick: Tick,
     control_seq: ControlSeq,
 ) -> Result<CommitOutcome, CommitError> {
+    let _total = crate::prof::Span::start("commit.total");
+    let validate = crate::prof::Span::start("commit.validate");
     // 1. Re-validate against the live world.
     match staged.token.check(world) {
         Staleness::Fresh => {}
         other => return Ok(CommitOutcome::Stale(other)),
     }
+    drop(validate);
 
     let vid = staged.volume_id;
     let parent = world
@@ -242,15 +245,18 @@ pub fn commit(
         }
     }
 
+    let candidate = crate::prof::Span::start("commit.candidate_edit");
     let mut parent_candidate: Volume = world
         .volume_ref(vid)
         .ok_or(CommitError::UnknownVolume(vid))?
         .clone();
     let cut_outcome = parent_candidate.apply_edit(&staged.plan)?;
+    drop(candidate);
 
     // 5. Build every child from the post-cut candidate (components are still
     //    solid), and capture the canonical cell-run ops a replica needs to
     //    reconstruct the child without any structural code (`docs/protocol.md`).
+    let child_plans = crate::prof::Span::start("commit.children");
     let mut children: Vec<ChildBody> = Vec::new();
     let mut child_fill_ops: Vec<Vec<spall_protocol::TopologyOp>> = Vec::new();
     for ((entity, child_vid), membership) in child_ids.iter().zip(&staged.memberships) {
@@ -271,8 +277,10 @@ pub fn commit(
         children.push(child);
     }
     transfer::apply_explosion(&mut children, staged.explosion);
+    drop(child_plans);
 
     // 6. Remove the detached cells from the candidate.
+    let removal = crate::prof::Span::start("commit.remove_detached");
     let remove_outcome = if staged.splits() {
         let mut remove = EditPlan::new(vid);
         for membership in &staged.memberships {
@@ -284,6 +292,7 @@ pub fn commit(
     } else {
         None
     };
+    drop(removal);
 
     // 7. Plan the parent collider rebuild from the candidate's final geometry,
     //    plus the mass / COM / inertia to reinstall from its post-cut fine
@@ -303,6 +312,7 @@ pub fn commit(
     // pass re-evict an already-reloaded one before the set is ever whole. Ask
     // for every evicted brick in the volume at once so a single reload makes the
     // candidate's whole bounding box resident and the retry commits next tick.
+    let colliders = crate::prof::Span::start("commit.colliders");
     let use_terrain_brick_colliders = parent_is_terrain && world.terrain_brick_colliders_enabled();
     let terrain_brick_rebuild = if use_terrain_brick_colliders {
         let mut changed: Vec<BrickCoord> = cut_outcome.bricks.iter().map(|b| b.coord).collect();
@@ -359,6 +369,7 @@ pub fn commit(
     // The cut cleared the parent's last solid cell: its ownership is retired on
     // publish (`ENG-56`). A retired body emits no participant snapshot.
     let parent_emptied = !parent_is_terrain && parent_rebuild.is_none();
+    drop(colliders);
 
     // 8. Reserve the transaction id and journal sequence.
     let transaction_id = reg.allocate_transaction()?;
@@ -403,6 +414,7 @@ pub fn commit(
     // digests (unchanged — the guard above proved the edit touched none of
     // them). A replica that holds those bricks resident computes the same value.
     // Identical to `volume_topology_hash_for` when nothing is evicted.
+    let hashes = crate::prof::Span::start("commit.result_hashes");
     let parent_result_hash =
         spall_protocol::canonical_topology_hash(&[canonical_logical_volume_for(
             &parent_candidate,
@@ -422,11 +434,13 @@ pub fn commit(
             hash: volume_topology_hash_for(&child.volume, CanonicalOwner::Body(child.entity)),
         });
     }
+    drop(hashes);
 
     // Self-describing op list: the brush, then for each child a `SplitOff`
     // marker followed by the canonical cell runs that fill it, then the runs
     // that remove every detached cell from the source. A replica applies these
     // in order to reproduce the exact committed geometry.
+    let encoding = crate::prof::Span::start("commit.encoding");
     let brush_op = TopologyOp::IntegerBrush {
         volume: vid,
         brush: staged.brush,
@@ -520,6 +534,7 @@ pub fn commit(
         }
     }
     topology.validate()?;
+    drop(encoding);
 
     let bumped_epoch = staged.splits();
     let participants = candidate_participant_snapshots(
@@ -553,6 +568,7 @@ pub fn commit(
 
     // ---- Publish. Every step below is infallible: the candidate is committed
     // ---- to the live world in one shot at the tick boundary.
+    let _publish = crate::prof::Span::start("commit.publish");
     *world.registry_mut() = reg;
 
     if let Some(parent) = world.volume_body_mut(vid) {

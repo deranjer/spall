@@ -1,0 +1,108 @@
+{
+  "name": "eng114-worldgen-1024m-bbr-impaired",
+  "description": "Experimental BBR diagnostic with the identical full-world impaired workload and unchanged limits; does not change the shipped CUBIC default or establish G3/G4 acceptance.",
+  "release_profile": true,
+  "worldgen": "showcase",
+  "worldgen_size": 4096,
+  "worldgen_seed": 1,
+  "server_ticks": 7200,
+  "quiescence_ticks": 0,
+  "clients": 2,
+  "minimum_transactions": 8,
+  "cuts": [
+    {
+      "client": 0,
+      "at_tick": 3000,
+      "cell": [
+        1024,
+        16,
+        1024
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 3120,
+      "cell": [
+        3072,
+        16,
+        1024
+      ],
+      "radius": 8
+    },
+    {
+      "client": 0,
+      "at_tick": 3240,
+      "cell": [
+        1024,
+        16,
+        3072
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 3360,
+      "cell": [
+        3072,
+        16,
+        3072
+      ],
+      "radius": 8
+    },
+    {
+      "client": 0,
+      "at_tick": 6300,
+      "cell": [
+        2048,
+        16,
+        2048
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 6420,
+      "cell": [
+        2080,
+        16,
+        2048
+      ],
+      "radius": 8
+    },
+    {
+      "client": 0,
+      "at_tick": 6540,
+      "cell": [
+        2048,
+        16,
+        2080
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 6660,
+      "cell": [
+        2080,
+        16,
+        2080
+      ],
+      "radius": 8
+    }
+  ],
+  "admin_reset_at": [
+    4500,
+    6000
+  ],
+  "join_budget": {
+    "client": 1,
+    "bandwidth_bytes_per_sec": 8388608,
+    "rtt_ms": 200,
+    "jitter_ms": 20,
+    "loss_percent": 5,
+    "max_baseline_compressed_bytes": 268435456,
+    "max_ready_ms": 240000
+  },
+  "experimental_bbr": true
+}

@@ -202,7 +202,7 @@ impl BrickBackingWriter for MemoryBacking {
     }
 
     /// Sum of every captured `Dense` brick's material-layer payload
-    /// (`spall_voxel::brick::DENSE_LAYER_BYTES` each; `Uniform` bricks cost
+    /// (actual full-width or palette payload; `Uniform` bricks cost
     /// metadata only, matching `spall_voxel::MemoryReport`'s convention). This
     /// is the real bytes this in-process backing keeps alive, independent of
     /// whether the same brick is *also* resident in the live `SimWorld`.
@@ -211,8 +211,7 @@ impl BrickBackingWriter for MemoryBacking {
         Some(
             g.bricks
                 .values()
-                .filter(|b| b.is_dense())
-                .map(|_| spall_voxel::MemoryReport::DENSE_BRICK_BYTES as u64)
+                .map(|b| b.material_storage_bytes() as u64)
                 .sum(),
         )
     }

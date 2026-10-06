@@ -293,9 +293,9 @@ impl Volume {
                     report.dense_bricks += 1;
                     if brick.dense_payload_shared() {
                         report.snapshot_shared_bricks += 1;
-                        report.snapshot_shared_bytes += MemoryReport::DENSE_BRICK_BYTES;
+                        report.snapshot_shared_bytes += brick.material_storage_bytes();
                     } else {
-                        report.owned_dense_bytes += MemoryReport::DENSE_BRICK_BYTES;
+                        report.owned_dense_bytes += brick.material_storage_bytes();
                     }
                 }
             }

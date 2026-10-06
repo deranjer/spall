@@ -3,6 +3,13 @@
 Status: **measurement done; design revised 2026-09-21; implemented and measured** (see G3.md increment 43). ENG-30 stays open and T23
 unaccepted. The cap is **not** raised and the workload is **not** reduced.
 
+ENG-126 follow-up (2026-10-06): the transport-free segmented codec and receiver
+existed, while runtime serve/net still used the legacy blob. Runtime negotiation,
+incremental receiving, liveness and reset admission are now wired. The new
+negotiated version 3 has a 256 MiB cumulative compressed ceiling; version 1/2
+retain their limits. See [current integration evidence](ENG-126-large-world-integration.md).
+Historical measurements below remain unchanged.
+
 ## 1. The failure, precisely
 
 A fresh client reconnecting to the retained v2-soak world is refused: the server's baseline capture

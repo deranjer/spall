@@ -102,7 +102,12 @@ checkpoint, including empty water groups, with BLAKE3-16 integrity. Missing or
 corrupt rows are recovery errors. Canonical `WaterState` schema 1 stores explicit
 IEEE-754 bits for exact fractions, trapped cell volumes, configuration, fluid
 time and cumulative source/drain/open-outflow volumes, plus source cells and
-gate rate. The group is limited to eight domains and 4,194,304 fluid cells;
+gate rate. ENG-126 adds canonical `WaterState` schema 2 with the same explicit
+fields and a fine-domain ceiling of 67,108,864 voxel cells. Schema 1 retains
+its 33,554,432-voxel ceiling and remains readable/writable for smaller domains;
+older binaries reject schema 2 rather than reinterpret it. This is a canonical
+save-record extension, not a change to the live presentation wire layout or
+database tables. The group is limited to eight domains and 4,194,304 fluid cells;
 each source list is bounded to 65,536 entries, with a 128 MiB checkpoint byte
 ceiling. Terrain topology, poses and a canonical water group share the ordered
 atomic journal batch. Recovery applies saved amounts to recovered committed
@@ -392,7 +397,62 @@ Hosts must own and run one `Connection::run_liveness` future plus their receive 
 
 ## T17 late join, catch-up, and reconnect (implemented)
 
-The baseline transfer body is `spall_protocol::baseline::BaselineWorld`
+ENG-126 runtime extension: a client advertises
+`segment::baseline_cap_streamed()` in its sentinel ack hash. The server may
+then send `BaselineBegin.world_version = 3`, reusing segment schema 2: a
+manifest followed by individually hashed/compressed frames. The cumulative
+compressed ceiling is 256 MiB; each bulk part remains <=1 MiB, each decoded
+segment <=4 MiB by default, and the manifest's decoded total <=16 GiB.
+Version 1 and version 2 retain their 64 MiB compressed ceilings; the legacy
+single-blob decompression bound remains 256 MiB. Unsupported clients receive
+the legacy format, never an unnegotiated larger transfer. Repairs and bulk
+split blobs keep the existing format.
+
+The server expands immutable brick snapshots one segment at a time. The client
+feeds `BulkRecv::next_part` into `SegmentedReceiver`, checks its explicit
+staging budget before decoding segments, verifies part counts/bytes, transfer
+id, chained hash and cursor, then installs the staged world atomically.
+Default admission is 4 GiB; the portable 1024 m launcher explicitly selects
+8 GiB. This is a staging admission allowance, not a raised resident-memory target.
+Initial joins have a whole-session deadline. Existing replica bytes
+are included when admitting a reset replacement. One queued version-3 baseline
+has a separate <=256 MiB slot in the outbound FIFO; the writer may own one
+while one waits. Ordinary reliable backlog still has its 8 MiB/2048-record
+bounds. Oversized captures and client budget failures disconnect explicitly.
+
+During replacement, the client retains an immutable COW snapshot of its old
+volumes. A received dense brick may share that payload only after every
+material has been compared exactly. Its incoming revision and edited flag are
+restored independently; a changed edited flag invalidates the content-hash
+cache. Different cells allocate a new payload. All wire, sequence, hash-chain,
+cursor and admission checks still run; conservative admission still charges
+both complete worlds even when payloads can be shared.
+
+Material brick storage may internally use an exact u8 index into at most 256
+full-width material IDs. Higher-diversity bricks retain u16 cells, and edits
+expand before mutation and repack on collapse. Canonical material bytes, brick
+hashes, wire `Dense(u16)` and durable encoding are unchanged. Replacement
+admission counts actual old payload bytes plus metadata; incoming manifest
+costs retain their full-width worst case. Unknown/air, revisions, ownership
+and edited-air tombstones are unchanged.
+
+At server shutdown, stop new connection admission after durable simulation
+completion, enqueue shutdown after accepted reliable records, and keep control
+readers and heartbeats alive while writers drain. A segmented baseline waits
+for acknowledgement of its bulk bytes and FIN before sending `BaselineEnd`.
+The existing transport idle timeout bounds shutdown drain; exceeding it fails
+the server summary explicitly. Shutdown adds no simulation ticks.
+
+ENG-114 transfer profiling retains CUBIC as the ordinary QUIC controller.
+`TransportConfig::congestion = Bbr` and sandbox `--experimental-bbr` explicitly
+select Quinn's experimental BBR implementation for diagnostics. This changes
+the local congestion policy only: authentication, wire negotiation, stream
+counts, allocation/admission limits, control liveness, deadlines and exact
+baseline validation are unchanged. The distinct BBR impaired fixture must not
+be reported as proof that the default CUBIC impaired workload passes, or as a
+G3/G4 fairness/congestion acceptance result.
+
+The legacy baseline transfer body is `spall_protocol::baseline::BaselineWorld`
 (`BASELINE_WORLD_SCHEMA = 1`, versioned independently of the wire and save
 schemas): per volume the `VolumeId`, cell-size code, owner (terrain / body
 entity), optional brick bounds, and every resident brick as
@@ -433,3 +493,13 @@ highest generation seen per slot and rejects any `ActionRequest` /
 Wire tag 19 is version-1 VegetationSnapshot under envelope schema 3: tick, ordered chunk index/count, BLAKE3 digest, up to 48 KiB payload, 4 MiB complete assembly bound. One-second self-contained presentation keyframes also repair late joiners. Replacing baselines clear plants and discard older frame ticks. Matched new client/server builds are required to display tag 19.
 
 Store schema 2 gains a checksummed checkpoint_vegetation auxiliary row in the same publication transaction. First-time table creation backfills old checkpoints with empty vegetation; recovery never reseeds an existing save. JournalPayload appends VegetationState and VegetationClock without changing previous discriminants. Full state follows committed topology; small time_ms/credit_ms records preserve the exact interval clock without writing a forest at 60 Hz. Pending uncommitted growth requests regenerate from acknowledged progress after recovery. DTO fields and limits: docs/reports/ENG-118-vegetation.md.
+
+### ENG-114 transport diagnostics (2026-10-06)
+
+TransportConfig optionally requests a kernel UDP receive buffer in 64 KiB..=4 MiB,
+validated before binding. None retains Quinn/platform defaults; production remains
+CUBIC. Actual granted capacity is debug-logged and may differ by OS. This does
+not change any frame, streamed-baseline, staging or timeout admission limit.
+The encrypted UDP test relay drains at most 64 already-due packets per wake,
+in deadline/insertion order, without forwarding future packets early. Existing
+rate scheduling, fault probabilities and bounded queue admission remain intact.

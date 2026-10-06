@@ -107,6 +107,7 @@ fn a_real_client_sees_the_dam_gate_open_after_the_admin_command() {
         summary_json: None,
         transport: patient_transport(),
         client_residency: None,
+        baseline_budget_bytes: spall_client::segmented::DEFAULT_CLIENT_BASELINE_BUDGET_BYTES,
         on_replica_ready: Some(Arc::new(move |replica| {
             *slot_for_client.lock().unwrap() = Some(replica);
         })),

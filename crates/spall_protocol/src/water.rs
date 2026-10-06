@@ -16,6 +16,10 @@ use crate::records::{Record, RecordError, RequestId, WireTag};
 /// Largest fluid domain a keyframe may describe, in cells. Also the
 /// decompression bound on the receiving side.
 pub const MAX_WATER_CELLS: usize = 4 * 1024 * 1024;
+/// Fine voxel cells captured for a water domain. Schema 1 retains its old cap;
+/// schema 2 extends only this bound, not the wire grid or source limits.
+pub const MAX_WATER_VOXEL_CELLS_V1: usize = 32 * 1024 * 1024;
+pub const MAX_WATER_VOXEL_CELLS: usize = 64 * 1024 * 1024;
 /// Compressed bytes carried by one chunk; leaves headroom under
 /// [`limits::MAX_CONTROL_RECORD`] for the envelope and other fields.
 pub const MAX_WATER_CHUNK: usize = 48 * 1024;
@@ -83,7 +87,7 @@ pub struct WaterState {
 impl WaterState {
     pub fn validate(&self) -> Result<(), WaterCodecError> {
         let bad = || WaterCodecError::InvalidChunk("invalid canonical water state".into());
-        if self.version != 1
+        if !matches!(self.version, 1 | 2)
             || !(1..=u32::from(MAX_WATER_COARSEN)).contains(&self.coarsen)
             || self.frame_seq == 0
             || self.gated_rate > 3
@@ -104,7 +108,12 @@ impl WaterState {
                 .ok_or_else(bad)?;
             voxels = voxels.checked_mul(*axis as usize).ok_or_else(bad)?;
         }
-        if voxels > 32 * 1024 * 1024 {
+        let voxel_limit = if self.version == 1 {
+            MAX_WATER_VOXEL_CELLS_V1
+        } else {
+            MAX_WATER_VOXEL_CELLS
+        };
+        if voxels > voxel_limit {
             return Err(bad());
         }
         if cells > MAX_WATER_CELLS || self.fractions.len() != cells || self.trapped.len() != cells {
@@ -169,6 +178,55 @@ impl WaterState {
             return Err(bad());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod state_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn schema_two_extends_only_the_fine_domain_bound() {
+        let mut state = WaterState {
+            version: 2,
+            origin: [0; 3],
+            voxel_dimensions: [512, 512, 256],
+            coarsen: 8,
+            config_bits: [2.0_f64, 1000.0, 0.0, -9.81, 0.0, 0.5, 1e-5, 1e-9].map(f64::to_bits),
+            max_substeps: 8,
+            pressure_max_iterations: 1000,
+            open_top: true,
+            frame_seq: 1,
+            fluid_time_bits: 0,
+            spring_added_bits: 0,
+            drain_removed_bits: 0,
+            outflow_bits: 0,
+            fractions: vec![0; 131_072],
+            trapped: vec![0; 131_072],
+            sources: Vec::new(),
+            gated_sources: [Vec::new(), Vec::new(), Vec::new()],
+            sinks: Vec::new(),
+            gated_rate: 0,
+        };
+        state.validate().unwrap();
+        state.version = 1;
+        assert!(
+            state.validate().is_err(),
+            "schema 1 cannot declare a larger fine domain"
+        );
+        state.voxel_dimensions[2] = 128;
+        state.fractions.truncate(65_536);
+        state.trapped.truncate(65_536);
+        state.validate().unwrap();
+        state.version = 2;
+        state.validate().unwrap();
+        state.voxel_dimensions[2] = 264;
+        assert!(
+            state.validate().is_err(),
+            "schema 2 remains bounded at 64 Mi voxels"
+        );
+        state.version = 3;
+        assert!(state.validate().is_err(), "unknown schemas fail closed");
     }
 }
 

@@ -151,6 +151,16 @@ struct Scenario {
     /// per-brick terrain colliders even when residency is disabled.
     #[serde(default)]
     whole_terrain_collider: bool,
+    /// Fully generated-world stress scenarios use the same sandbox factory as play.
+    #[serde(default)]
+    worldgen: Option<String>,
+    #[serde(default = "default_worldgen_size")]
+    worldgen_size: u32,
+    #[serde(default = "default_worldgen_seed")]
+    worldgen_seed: u64,
+    /// Client 0 requests these resets; every client must install all of them.
+    #[serde(default)]
+    admin_reset_at: Vec<u64>,
     server_ticks: u64,
     /// Consecutive idle ticks before the server stops early. A gate fixture with
     /// widely-spaced scripted cuts under an impaired transport needs a larger
@@ -341,6 +351,9 @@ struct Scenario {
     /// the edit history is not itself bandwidth-limited.
     #[serde(default)]
     join_budget: Option<JoinBudget>,
+    /// Explicit diagnostic opt-in; ordinary fixtures retain CUBIC.
+    #[serde(default)]
+    experimental_bbr: bool,
     /// T23 / G3 row 10 follow-up: unlike `late_join_may_fail`'s existing
     /// delayed-connect fixture (proves explicit-failure handling for a client
     /// that never gets a baseline at all), this exercises **retry/catch-up
@@ -871,6 +884,8 @@ fn default_true() -> bool {
 
 #[derive(Debug, Default, Clone, Deserialize)]
 struct ServerSummary {
+    #[serde(default)]
+    world_resets: u64,
     result: String,
     ticks_run: u64,
     transactions_committed: u64,
@@ -997,6 +1012,10 @@ fn body_settled(scenario: &Scenario, server: &ServerSummary) -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ClientSummary {
+    #[serde(default)]
+    scripted_actions_committed: u64,
+    #[serde(default)]
+    world_resets_installed: u64,
     result: String,
     #[serde(default)]
     transactions_applied: u64,
@@ -1403,6 +1422,46 @@ fn residency_disk_backing_requirements_met(scenario: &Scenario, server: &ServerS
     server.residency_backing_disk_bytes.is_some_and(|n| n > 0)
 }
 
+fn default_worldgen_size() -> u32 {
+    1024
+}
+
+fn scripted_commit_receipts_match(
+    scenario: &Scenario,
+    client_count: u64,
+    clients: &[Option<ClientSummary>],
+) -> bool {
+    (0..client_count).all(|i| {
+        let expected = scenario
+            .cuts
+            .iter()
+            .filter(|cut| cut.client.min(client_count.saturating_sub(1)) == i)
+            .count() as u64;
+        clients
+            .get(i as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|c| c.scripted_actions_committed == expected)
+    })
+}
+fn default_worldgen_seed() -> u64 {
+    1
+}
+
+fn reset_requirements_met(
+    scenario: &Scenario,
+    server: &ServerSummary,
+    clients: &[Option<ClientSummary>],
+) -> bool {
+    let expected = scenario.admin_reset_at.len() as u64;
+    expected == 0
+        || (server.world_resets == expected
+            && !clients.is_empty()
+            && clients.iter().all(|c| {
+                c.as_ref()
+                    .is_some_and(|c| c.world_resets_installed == expected)
+            }))
+}
+
 fn requirements_met(
     scenario: &Scenario,
     server_ticks: u64,
@@ -1471,8 +1530,61 @@ fn requirements_met(
 mod requirement_tests {
     use super::*;
 
+    #[test]
+    fn ecology_transactions_and_staged_actions_cannot_replace_a_script_commit_receipt() {
+        let scenario: Scenario = serde_json::from_str(r#"{"server_ticks":300,"worldgen":"showcase","cuts":[{"client":0,"at_tick":30,"cell":[128,16,128],"radius":3}]}"#).unwrap();
+        let mut c = client(0);
+        c.transactions_applied = 100;
+        assert!(!scripted_commit_receipts_match(
+            &scenario,
+            1,
+            &[Some(c.clone())]
+        ));
+        c.scripted_actions_committed = 1;
+        assert!(scripted_commit_receipts_match(&scenario, 1, &[Some(c)]));
+        assert!(!scripted_commit_receipts_match(&scenario, 1, &[None]));
+    }
+
+    #[test]
+    fn reset_validation_requires_server_and_every_client_to_install_each_reset() {
+        let scenario: Scenario = serde_json::from_str(
+            r#"{"server_ticks":300,"worldgen":"showcase","admin_reset_at":[60,180]}"#,
+        )
+        .unwrap();
+        let server = ServerSummary {
+            world_resets: 2,
+            ..Default::default()
+        };
+        let mut ready = client(0);
+        ready.world_resets_installed = 2;
+        assert!(reset_requirements_met(
+            &scenario,
+            &server,
+            &[Some(ready.clone())]
+        ));
+        assert!(!reset_requirements_met(
+            &scenario,
+            &server,
+            &[Some(ready.clone()), None]
+        ));
+        let mut missed = ready.clone();
+        missed.world_resets_installed = 1;
+        assert!(!reset_requirements_met(
+            &scenario,
+            &server,
+            &[Some(ready), Some(missed)]
+        ));
+        assert!(!reset_requirements_met(
+            &scenario,
+            &ServerSummary::default(),
+            &[]
+        ));
+    }
+
     fn client(motion_snapshots: u64) -> ClientSummary {
         ClientSummary {
+            scripted_actions_committed: 0,
+            world_resets_installed: 0,
             result: "passed".into(),
             transactions_applied: 1,
             repair_requests_sent: 0,
@@ -2137,6 +2249,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
 
     let clients = run.clients.unwrap_or(scenario.clients).clamp(1, 16);
     let server_ticks = run.server_ticks.unwrap_or(scenario.server_ticks);
+    if scenario.worldgen.is_some() && (scenario.replay_check || scenario.restart_check) {
+        return Err(XtaskError::Capability("generated-world replay/restart needs an explicit persisted generation contract; this scenario supports live join/destruction/reset only".into()));
+    }
     let output = run.output.clone().unwrap_or_else(unique_output);
     fs::create_dir_all(&output).map_err(|source| XtaskError::Output {
         path: output.display().to_string(),
@@ -2194,6 +2309,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
 
     // Spawn the server.
     let mut server_cmd = Command::new(sandbox_binary_profile("sandbox-server", profile));
+    if scenario.experimental_bbr {
+        server_cmd.arg("--experimental-bbr");
+    }
     server_cmd.args([
         "--serve",
         "--listen",
@@ -2214,8 +2332,6 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         &min_clients.to_string(),
         "--max-clients",
         &clients.to_string(),
-        "--scene",
-        &scenario.scene,
         "--quiescence-ticks",
         &scenario.quiescence_ticks.to_string(),
         "--paced",
@@ -2223,6 +2339,21 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         // produce; the harness is the authenticated dev-scenario path (ENG-47).
         "--dev-unvalidated-actions",
     ]);
+    if let Some(preset) = &scenario.worldgen {
+        server_cmd.args([
+            "--worldgen",
+            preset,
+            "--worldgen-size",
+            &scenario.worldgen_size.to_string(),
+            "--seed",
+            &scenario.worldgen_seed.to_string(),
+        ]);
+    } else {
+        server_cmd.args(["--scene", &scenario.scene]);
+    }
+    if !scenario.admin_reset_at.is_empty() {
+        server_cmd.arg("--allow-admin-commands");
+    }
     if let Some(timing) = &scenario.server_timing {
         server_cmd.args([
             "--timing-warmup-ticks",
@@ -2314,9 +2445,17 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
     guard.push("server".into(), server_child);
 
     // Wait until it has bound (writes the addr file), or died.
-    let bound: SocketAddr = wait_for_addr(&addr_file, &mut guard, Duration::from_secs(20))?
-        .parse()
-        .map_err(|_| XtaskError::Capability("server wrote an unparseable bound address".into()))?;
+    let bound: SocketAddr = wait_for_addr(
+        &addr_file,
+        &mut guard,
+        if scenario.worldgen.is_some() {
+            run.timeout.min(Duration::from_secs(180))
+        } else {
+            Duration::from_secs(20)
+        },
+    )?
+    .parse()
+    .map_err(|_| XtaskError::Capability("server wrote an unparseable bound address".into()))?;
 
     // Optional per-client encrypted-packet proxies. T23 / G3 row 11: a
     // configured `join_budget` shapes only its named client (bandwidth + RTT +
@@ -2397,6 +2536,9 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         let _ = fs::remove_file(&summary);
         client_summary_paths.push(summary.clone());
         let mut c = Command::new(sandbox_binary_profile("sandbox-client", profile));
+        if scenario.experimental_bbr {
+            c.arg("--experimental-bbr");
+        }
         c.args([
             "--connect",
             &targets[i as usize].to_string(),
@@ -2418,6 +2560,17 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
             "--scene",
             &scenario.scene,
         ]);
+        if scenario.worldgen.is_some() {
+            c.args(["--baseline-budget-mib", "8192"]);
+            if !scenario.late_join_clients.contains(&i) {
+                c.arg("--late-join");
+            }
+        }
+        if i == 0 {
+            for tick in &scenario.admin_reset_at {
+                c.args(["--admin-reset-at", &tick.to_string()]);
+            }
+        }
         for cut in by_client.get(&i).into_iter().flatten() {
             let mut spec = format!(
                 "{}:{},{},{}:{}",
@@ -2695,6 +2848,22 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         &client_summaries,
         run.loss_percent > 0 || scenario.join_budget.is_some(),
     );
+    if !reset_requirements_met(&scenario, &server, &client_summaries) {
+        requirements_met = false;
+    }
+    if scenario.worldgen.is_some()
+        && (server.actions_rejected != 0
+            || server.actions_queued_unresolved != 0
+            || server.actions_requested < scenario.cuts.len() as u64
+            || server.actions_staged < scenario.cuts.len() as u64)
+    {
+        requirements_met = false;
+    }
+    if scenario.worldgen.is_some()
+        && !scripted_commit_receipts_match(&scenario, clients, &client_summaries)
+    {
+        requirements_met = false;
+    }
     if !residency_requirements_met(&scenario, &server, &client_summaries) {
         requirements_met = false;
     }

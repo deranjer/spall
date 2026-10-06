@@ -15,6 +15,9 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 #[derive(Debug, Parser)]
 #[command(name = "sandbox-server", about = "GPU-free Spall sandbox server host")]
 struct Args {
+    /// Opt into Quinn's experimental BBR congestion controller for validation.
+    #[arg(long)]
+    experimental_bbr: bool,
     /// Directory for the T16 on-disk world; the SQLite database is
     /// `<world>/world.db`. Used by `--serve --save`; ignored by the T00 loop.
     #[arg(long, default_value = ".local/worlds/dev")]
@@ -586,7 +589,14 @@ fn run_serve(args: Args) -> ExitCode {
         summary_json: args.summary_json,
         fingerprint_out: args.fingerprint_out,
         addr_out: args.addr_out,
-        transport: TransportConfig::default(),
+        transport: TransportConfig {
+            congestion: if args.experimental_bbr {
+                spall_net::config::CongestionControl::Bbr
+            } else {
+                spall_net::config::CongestionControl::Cubic
+            },
+            ..TransportConfig::default()
+        },
         save,
         checkpoint_interval_ticks: args.checkpoint_interval_ticks,
         seed: args.seed,

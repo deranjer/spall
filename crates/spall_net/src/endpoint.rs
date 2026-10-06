@@ -43,6 +43,54 @@ enum ServerAuth {
     Players(Arc<std::sync::RwLock<Vec<PlayerCredential>>>),
 }
 
+fn endpoint_with_buffer(
+    server: Option<quinn::ServerConfig>,
+    addr: SocketAddr,
+    cfg: TransportConfig,
+) -> Result<quinn::Endpoint> {
+    let Some(bytes) = cfg.udp_receive_buffer_bytes else {
+        return Ok(match server {
+            Some(server) => quinn::Endpoint::server(server, addr)?,
+            None => quinn::Endpoint::client(addr)?,
+        });
+    };
+    if !(64 * 1024..=4 * 1024 * 1024).contains(&bytes) {
+        return Err(TransportError::Connect(
+            "UDP receive buffer request must be 64 KiB..=4 MiB".into(),
+        ));
+    }
+    let socket = if server.is_none() {
+        // Preserve Quinn's client dual-stack setup when supplying our socket.
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        if addr.is_ipv6() {
+            let _ = socket.set_only_v6(false);
+        }
+        socket.bind(&addr.into())?;
+        std::net::UdpSocket::from(socket)
+    } else {
+        std::net::UdpSocket::bind(addr)?
+    };
+    let sock = socket2::SockRef::from(&socket);
+    sock.set_recv_buffer_size(bytes)?;
+    let actual = sock.recv_buffer_size()?;
+    tracing::debug!(
+        requested_bytes = bytes,
+        actual_bytes = actual,
+        "configured UDP receive buffer"
+    );
+    socket.set_nonblocking(true)?;
+    Ok(quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        server,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )?)
+}
+
 impl NetServer {
     /// Binds `addr` with `identity`'s certificate. `server_handshake` is the
     /// compatibility baseline every client is checked against; its `session`
@@ -56,7 +104,7 @@ impl NetServer {
     ) -> Result<Self> {
         let server_handshake = handshake_with_local_limits(server_handshake, cfg)?;
         let server_config = identity.server_config(&cfg)?;
-        let endpoint = quinn::Endpoint::server(server_config, addr)?;
+        let endpoint = endpoint_with_buffer(Some(server_config), addr, cfg)?;
         Ok(Self {
             endpoint,
             auth: ServerAuth::Shared(token),
@@ -91,7 +139,7 @@ impl NetServer {
         validate_player_credentials(&credentials)?;
         let server_handshake = handshake_with_local_limits(server_handshake, cfg)?;
         let server_config = identity.server_config(&cfg)?;
-        let endpoint = quinn::Endpoint::server(server_config, addr)?;
+        let endpoint = endpoint_with_buffer(Some(server_config), addr, cfg)?;
         Ok(Self {
             endpoint,
             auth: ServerAuth::Players(Arc::new(std::sync::RwLock::new(credentials))),
@@ -286,7 +334,7 @@ pub async fn connect(
     cfg: TransportConfig,
 ) -> Result<Connection> {
     let client_handshake = handshake_with_local_limits(client_handshake, cfg)?;
-    let mut endpoint = quinn::Endpoint::client(client_bind_addr(target))?;
+    let mut endpoint = endpoint_with_buffer(None, client_bind_addr(target), cfg)?;
     endpoint.set_default_client_config(client_config(expected, &cfg)?);
 
     let started = Instant::now();
@@ -572,6 +620,20 @@ mod tests {
             client_bind_addr("[::1]:4000".parse().unwrap()),
             "[::]:0".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn udp_receive_buffer_requests_cannot_escape_the_resource_bound() {
+        for bytes in [0, 64 * 1024 - 1, 4 * 1024 * 1024 + 1] {
+            let cfg = TransportConfig {
+                udp_receive_buffer_bytes: Some(bytes),
+                ..TransportConfig::for_tests()
+            };
+            assert!(matches!(
+                endpoint_with_buffer(None, "127.0.0.1:0".parse().unwrap(), cfg),
+                Err(TransportError::Connect(_))
+            ));
+        }
     }
 
     #[test]

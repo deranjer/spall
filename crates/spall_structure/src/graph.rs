@@ -372,7 +372,7 @@ impl SupportGraph {
                         .expect("resident per brick_state");
                     let labels = Arc::new(label_brick(&snap));
                     if let Some(cache) = cache {
-                        cache.put(volume.id(), key, revision, labels.clone());
+                        return cache.put(volume.id(), key, revision, labels);
                     }
                     labels
                 });
@@ -711,6 +711,67 @@ mod tests {
     use super::*;
     use spall_core::{CellSizeCode, GlobalCell, MaterialId};
     use spall_voxel::{EditPlan, Volume};
+
+    #[test]
+    fn many_face_components_disconnect_and_resume_in_canonical_order() {
+        let mut volume = vol();
+        fill(
+            &mut volume,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(31, 31, 31),
+        );
+        let mut buds = EditPlan::new(volume.id());
+        for z in 0..32 {
+            for y in 0..32 {
+                if (y + z) % 2 == 0 {
+                    buds.set(GlobalCell::new(32, y, z), MaterialId(1));
+                }
+            }
+        }
+        volume.apply_edit(&buds).unwrap();
+        let cancel = CancelToken::new();
+        let mut graph = SupportGraph::build(
+            &volume,
+            AnchorPlane::at(0),
+            ResidencyMode::AllResident,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(graph.components().len(), 1);
+        assert_eq!(graph.components()[0].nodes.len(), 513);
+        assert_eq!(graph.components()[0].cell_count, 32768 + 512);
+        assert!(graph.components()[0].anchored);
+        let cut = volume
+            .apply_edit(&EditPlan::filled_box(
+                volume.id(),
+                GlobalCell::new(31, 0, 0),
+                GlobalCell::new(31, 31, 31),
+                MaterialId::AIR,
+            ))
+            .unwrap();
+        graph
+            .apply_changes(
+                &volume,
+                &cut.bricks.iter().map(|b| b.coord).collect::<Vec<_>>(),
+                &cancel,
+                SearchBudget::UNLIMITED,
+            )
+            .unwrap();
+        let expected = graph.components().to_vec();
+        assert_eq!(expected.len(), 513);
+        assert_eq!(expected.iter().filter(|c| c.anchored).count(), 17);
+        assert_eq!(
+            graph.reassemble(&volume, &cancel, SearchBudget { max_nodes: 1 }),
+            Err(Interrupted::Budget)
+        );
+        while graph.is_scan_pending() {
+            match graph.resume(&cancel, SearchBudget { max_nodes: 1 }) {
+                Ok(()) | Err(Interrupted::Budget) => {}
+                other => panic!("unexpected resume: {other:?}"),
+            }
+        }
+        assert_eq!(graph.components(), expected);
+    }
 
     fn vol() -> Volume {
         Volume::new(spall_core::VolumeId::new(1).unwrap(), CellSizeCode::Quarter)

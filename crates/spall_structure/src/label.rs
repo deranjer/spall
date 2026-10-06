@@ -139,8 +139,8 @@ impl BrickLabels {
         &self.face_masks[face]
     }
 
-    /// `true` when every cell of the brick is one component (a uniform solid
-    /// brick): its boundary matches any solid boundary cell.
+    /// `true` when every cell is solid and belongs to one component, regardless
+    /// of material diversity: its boundary matches any solid boundary cell.
     pub fn is_full(&self) -> bool {
         matches!(self.repr, Repr::Full)
     }
@@ -185,10 +185,11 @@ fn idx(x: usize, y: usize, z: usize) -> usize {
 
 /// Six-face-connected component labelling of `brick`.
 pub fn label_brick(brick: &BrickSnapshot) -> BrickLabels {
-    // A uniform brick needs no scan at all.
-    if !brick.is_dense() {
-        let origin = LocalCell::new(0, 0, 0).expect("origin");
-        if brick.get(origin).is_air() {
+    // Connectivity depends on occupancy, not material uniformity. The exact
+    // memoized count also proves mixed-material bricks wholly full or empty.
+    let solid_cells = brick.solid_cells();
+    if solid_cells == 0 || solid_cells as usize == CELLS_PER_BRICK {
+        if solid_cells == 0 {
             return BrickLabels {
                 repr: Repr::Empty,
                 count: 0,
@@ -208,16 +209,18 @@ pub fn label_brick(brick: &BrickSnapshot) -> BrickLabels {
         };
     }
 
+    label_partial_brick(brick)
+}
+
+/// General six-face flood fill, also retained as the exact test reference for
+/// the count-proven full/empty shortcut.
+fn label_partial_brick(brick: &BrickSnapshot) -> BrickLabels {
     // Solid mask first, so the flood fill never re-reads the snapshot.
-    let mut solid = vec![false; CELLS_PER_BRICK];
-    for z in 0..EDGE {
-        for y in 0..EDGE {
-            for x in 0..EDGE {
-                let cell = LocalCell::new(x as u8, y as u8, z as u8).expect("x,y,z < 32");
-                solid[idx(x, y, z)] = !brick.get(cell).is_air();
-            }
-        }
-    }
+    let solid: Vec<_> = brick
+        .material_cells()
+        .into_iter()
+        .map(|m| !m.is_air())
+        .collect();
 
     let mut labels = vec![0u16; CELLS_PER_BRICK];
     let mut count: u16 = 0;
@@ -355,14 +358,21 @@ type CacheMap = BTreeMap<(u64, i64, i64, i64), (Revision, Arc<BrickLabels>)>;
 /// dry run: a revision number identifies a brick's contents along one history,
 /// and a discarded dry run is a history that never happened.
 #[derive(Debug, Clone, Default)]
-pub struct LabelCache(Arc<Mutex<CacheMap>>);
+pub struct LabelCache(Arc<Mutex<CacheState>>);
+
+#[derive(Debug, Default)]
+struct CacheState {
+    entries: CacheMap,
+    empty: Option<Arc<BrickLabels>>,
+    full: Option<Arc<BrickLabels>>,
+}
 
 impl LabelCache {
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, CacheMap> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -374,6 +384,7 @@ impl LabelCache {
     ) -> Option<Arc<BrickLabels>> {
         let entry = self
             .lock()
+            .entries
             .get(&(volume.get(), key.0, key.1, key.2))
             .cloned()?;
         (entry.0 == revision).then_some(entry.1)
@@ -385,31 +396,110 @@ impl LabelCache {
         key: (i64, i64, i64),
         revision: Revision,
         labels: Arc<BrickLabels>,
-    ) {
-        self.lock()
-            .insert((volume.get(), key.0, key.1, key.2), (revision, labels));
+    ) -> Arc<BrickLabels> {
+        let mut state = self.lock();
+        // Empty and completely solid bricks have identical connectivity,
+        // component metadata and face masks regardless of their materials.
+        // Share these two immutable shapes within this cache, not globally.
+        let labels = if matches!(&labels.repr, Repr::Empty) {
+            state.empty.get_or_insert(labels).clone()
+        } else if matches!(&labels.repr, Repr::Full) {
+            state.full.get_or_insert(labels).clone()
+        } else {
+            labels
+        };
+        state.entries.insert(
+            (volume.get(), key.0, key.1, key.2),
+            (revision, labels.clone()),
+        );
+        labels
     }
 
     /// Drops every entry of `volume` whose brick is not in `keep`.
     pub(crate) fn retain_volume(&self, volume: VolumeId, keep: impl Fn(&(i64, i64, i64)) -> bool) {
         let id = volume.get();
         self.lock()
+            .entries
             .retain(|(v, x, y, z), _| *v != id || keep(&(*x, *y, *z)));
     }
 
     /// Cached bricks (diagnostics and tests).
     pub fn len(&self) -> usize {
-        self.lock().len()
+        self.lock().entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.lock().entries.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn count_proven_labels_match_flood_fill_across_storage_and_cow_edits() {
+        for unique in [3, 300, u16::MAX as usize] {
+            let cells: Vec<_> = (0..CELLS_PER_BRICK)
+                .map(|i| {
+                    if unique == u16::MAX as usize {
+                        MaterialId(u16::MAX - i as u16)
+                    } else {
+                        MaterialId(1 + (i % unique) as u16)
+                    }
+                })
+                .collect();
+            let mut brick = Brick::restored(&cells, Revision(1), false);
+            let full = brick.snapshot();
+            assert_eq!(label_brick(&full), label_partial_brick(&full));
+            assert!(label_brick(&full).is_full());
+            // Removing an entire interior plane creates two components. The
+            // old snapshot remains fully solid; the new count must not reuse
+            // that fast path or bond across the gap.
+            for z in 0..BRICK_EDGE as u8 {
+                for y in 0..BRICK_EDGE as u8 {
+                    brick.set_cell(LocalCell::new(16, y, z).unwrap(), MaterialId::AIR);
+                }
+            }
+            brick.collapse();
+            let split = brick.snapshot();
+            assert_eq!(label_brick(&split), label_partial_brick(&split));
+            assert_eq!(label_brick(&split).count(), 2);
+            assert!(label_brick(&full).is_full());
+        }
+        let empty = Brick::empty().snapshot();
+        assert_eq!(label_brick(&empty), label_partial_brick(&empty));
+    }
+    #[test]
+    fn cached_full_and_empty_shapes_share_without_sharing_partial_connectivity() {
+        let cache = LabelCache::new();
+        let volume = VolumeId::new(1).unwrap();
+        let full = Arc::new(label_brick(
+            &Brick::uniform(MaterialId(1), Revision(1)).snapshot(),
+        ));
+        let mixed_cells: Vec<_> = (0..CELLS_PER_BRICK)
+            .map(|i| MaterialId(1 + (i % 3) as u16))
+            .collect();
+        let mixed = Arc::new(label_brick(
+            &Brick::restored(&mixed_cells, Revision(2), false).snapshot(),
+        ));
+        assert_eq!(full, mixed);
+        let first = cache.put(volume, (0, 0, 0), Revision(1), full);
+        let second = cache.put(volume, (1, 0, 0), Revision(2), mixed);
+        assert!(Arc::ptr_eq(&first, &second));
+        let empty = Arc::new(label_brick(&Brick::empty().snapshot()));
+        let air_first = cache.put(volume, (2, 0, 0), Revision(1), empty.clone());
+        let air_second = cache.put(volume, (3, 0, 0), Revision(9), Arc::new((*empty).clone()));
+        assert!(Arc::ptr_eq(&air_first, &air_second));
+        let partial = Arc::new(label_brick(&brick_from(&[(0, 0, 0), (31, 31, 31)])));
+        let partial = cache.put(volume, (4, 0, 0), Revision(1), partial);
+        assert_eq!(partial.count(), 2);
+        assert!(!Arc::ptr_eq(&first, &partial));
+        assert!(cache.get(volume, (1, 0, 0), Revision(1)).is_none());
+        assert!(Arc::ptr_eq(
+            &second,
+            &cache.get(volume, (1, 0, 0), Revision(2)).unwrap()
+        ));
+    }
     use spall_core::{CellSizeCode, GlobalCell};
     use spall_core::{MaterialId, Revision, VolumeId};
     use spall_voxel::{Brick, EditPlan, Volume};

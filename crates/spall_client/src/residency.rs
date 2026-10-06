@@ -49,7 +49,7 @@ impl ClientResidency {
                     .expect("resident coordinate");
                 let key = BrickCacheKey::new(volume_id, coord);
                 seen.insert(key);
-                let bytes = usize::from(snap.is_dense()) * MemoryReport::DENSE_BRICK_BYTES;
+                let bytes = snap.material_storage_bytes();
                 if self
                     .cache
                     .state(key)

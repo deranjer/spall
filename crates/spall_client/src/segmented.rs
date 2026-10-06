@@ -89,6 +89,12 @@ pub struct SegmentedReceiver {
 }
 
 impl SegmentedReceiver {
+    pub(crate) fn reuse_volumes(
+        &mut self,
+        volumes: std::collections::BTreeMap<u64, spall_voxel::Volume>,
+    ) {
+        self.staged.set_reuse(volumes);
+    }
     /// `checkpoint_tick` comes from `BaselineBegin`; `admission` is checked against the manifest
     /// before any segment is decoded. The cumulative compressed bytes are held to the protocol's
     /// [`spall_protocol::limits::MAX_ASSEMBLED_TRANSFER`].

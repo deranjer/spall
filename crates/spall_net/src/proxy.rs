@@ -260,7 +260,15 @@ async fn relay_loop(
         let incoming = tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(20)) => { continue; }
             _ = tokio::time::sleep_until(due) => {
-                if let Some((_, (toward_server, dst, packet))) = queue.pop_first() {
+                // Timer resolution may exceed one packet's serialization time.
+                // Drain only packets already due, in canonical deadline order;
+                // bound each batch so receive/stop handling remains responsive.
+                let now = tokio::time::Instant::now();
+                for _ in 0..64 {
+                    if queue.first_key_value().is_none_or(|((time, _), _)| *time > now) {
+                        break;
+                    }
+                    let (_, (toward_server, dst, packet)) = queue.pop_first().unwrap();
                     let packet: Vec<u8> = packet;
                     queued_bytes -= packet.len();
                     let sent = if toward_server { upstream.send(&packet).await }

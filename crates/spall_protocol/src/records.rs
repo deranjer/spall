@@ -703,11 +703,16 @@ impl Record for BaselineBegin {
             )
             .into());
         }
-        if self.total_bytes > limits::MAX_ASSEMBLED_TRANSFER as u64 {
+        let cap = if self.world_version == crate::segment::BASELINE_STREAMED_WORLD_VERSION {
+            crate::segment::MAX_STREAMED_BASELINE_COMPRESSED
+        } else {
+            limits::MAX_ASSEMBLED_TRANSFER
+        };
+        if self.total_bytes > cap as u64 {
             return Err(SizeLimitError::bytes(
                 "BaselineBegin.total_bytes",
                 self.total_bytes as usize,
-                limits::MAX_ASSEMBLED_TRANSFER,
+                cap,
             )
             .into());
         }
@@ -1179,6 +1184,16 @@ mod tests {
         begin.total_bytes = limits::MAX_ASSEMBLED_TRANSFER as u64 + 1;
         assert!(matches!(begin.validate(), Err(RecordError::Size(_))));
 
+        begin.world_version = 2;
+        assert!(begin.validate().is_err());
+        begin.world_version = crate::segment::BASELINE_STREAMED_WORLD_VERSION;
+        assert!(begin.validate().is_ok());
+        begin.total_bytes = crate::segment::MAX_STREAMED_BASELINE_COMPRESSED as u64;
+        assert!(begin.validate().is_ok());
+        begin.total_bytes += 1;
+        assert!(begin.validate().is_err());
+        begin.world_version = 4;
+        assert!(begin.validate().is_err());
         begin.total_bytes = 1024;
         begin.regions[0].min_brick = BrickCoord::new(9, 0, 0);
         assert!(matches!(
