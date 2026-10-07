@@ -21,7 +21,8 @@ pub mod spec;
 
 pub use columns::{Biome, ColumnMap, SNOW_LINE};
 pub use generate::{
-    GeneratedWorld, SPAWN_HEADROOM_CELLS, WATER_DOMAIN_BUDGET, WaterPlan, generate,
+    GeneratedWorld, GenerationTimings, SPAWN_HEADROOM_CELLS, WATER_DOMAIN_BUDGET, WaterPlan,
+    generate, generate_with_timings,
 };
 pub use spec::{
     BORDER_CELLS, GEN_VERSION, GenError, HEIGHT_CELLS, Preset, SEA_LEVEL, SHOWCASE_SIZE_CELLS,

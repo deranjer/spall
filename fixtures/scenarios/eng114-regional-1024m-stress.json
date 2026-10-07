@@ -1,0 +1,131 @@
+{
+  "name": "eng114-regional-1024m-stress",
+  "description": "Full 4096-cell seed-1 authoritative world, two regional replicas, unchanged eight distant radius-8 foundation cuts and two resets from ENG-114 full-world stress. Adds player movement and requires actual client reloads/evictions/revision gaps, both resets on every client, unique cut receipts and exact final hashes. A bounded regional-client workload, not full-residency, whole-foundation collapse or soak acceptance.",
+  "release_profile": true,
+  "worldgen": "showcase",
+  "worldgen_size": 4096,
+  "worldgen_seed": 1,
+  "server_ticks": 7200,
+  "quiescence_ticks": 0,
+  "clients": 2,
+  "minimum_transactions": 8,
+  "cuts": [
+    {
+      "client": 0,
+      "at_tick": 3000,
+      "cell": [
+        1024,
+        16,
+        1024
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 3120,
+      "cell": [
+        3072,
+        16,
+        1024
+      ],
+      "radius": 8
+    },
+    {
+      "client": 0,
+      "at_tick": 3240,
+      "cell": [
+        1024,
+        16,
+        3072
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 3360,
+      "cell": [
+        3072,
+        16,
+        3072
+      ],
+      "radius": 8
+    },
+    {
+      "client": 0,
+      "at_tick": 6300,
+      "cell": [
+        2048,
+        16,
+        2048
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 6420,
+      "cell": [
+        2080,
+        16,
+        2048
+      ],
+      "radius": 8
+    },
+    {
+      "client": 0,
+      "at_tick": 6540,
+      "cell": [
+        2048,
+        16,
+        2080
+      ],
+      "radius": 8
+    },
+    {
+      "client": 1,
+      "at_tick": 6660,
+      "cell": [
+        2080,
+        16,
+        2080
+      ],
+      "radius": 8
+    }
+  ],
+  "admin_reset_at": [
+    4500,
+    6000
+  ],
+  "stream_regions": true,
+  "player_paths": [
+    {
+      "client": 0,
+      "legs": [
+        {
+          "movement": [
+            1.0,
+            0.0,
+            0.0
+          ],
+          "from": 20,
+          "to": 1220
+        },
+        {
+          "movement": [
+            -1.0,
+            0.0,
+            0.0
+          ],
+          "from": 1240,
+          "to": 2440
+        }
+      ]
+    }
+  ],
+  "residency_assertions": {
+    "min_evicted_transaction_gaps": 1,
+    "min_outbound_distance_m": 8.0,
+    "min_client_evictions": 1,
+    "client": 0,
+    "min_client_reloads_completed": 1
+  }
+}

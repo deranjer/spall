@@ -140,11 +140,13 @@ impl Simulation {
     ) -> Result<Self, crate::world::WorldError> {
         let water_setup = config.water;
         let vegetation_setup = config.vegetation;
+        let world_span = crate::prof::Span::start("startup.world_and_collision");
         let world = SimWorld::new_with_terrain_collider_mode_and_origin(
             config.world,
             config.terrain_collider_mode,
             physics_origin,
         )?;
+        drop(world_span);
         let mut simulation = Self {
             world,
             pipeline: EditPipeline::new(config.max_pending_intents, config.serialize_threshold),
@@ -157,6 +159,7 @@ impl Simulation {
             additional_water: Vec::new(),
         };
         if let Some(setup) = water_setup {
+            let _span = crate::prof::Span::start("startup.water_boundary");
             simulation.water = Some(
                 crate::water::AuthoritativeWater::new(&simulation.world.terrain().volume, setup)
                     .map_err(|error| {
@@ -166,6 +169,7 @@ impl Simulation {
         }
         simulation.pipeline.warm_labels(&simulation.world);
         if let Some(state) = vegetation_setup {
+            let _span = crate::prof::Span::start("startup.vegetation_install");
             simulation
                 .install_vegetation(state)
                 .map_err(crate::world::WorldError::VegetationInitialization)?;

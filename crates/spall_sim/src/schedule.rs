@@ -133,25 +133,14 @@ impl EditPipeline {
     }
 
     /// Labels every terrain brick into the label cache now, so the first edit
-    /// of a large world does not pay for the whole-world labelling (about a
-    /// second at 12k bricks) the way every later one does not. Safe to skip: an
-    /// unwarmed cache fills on the first staging pass.
+    /// of a large world does not pay for cold local labelling and content hashes.
+    /// Global support assembly still runs on edits. Safe to skip: an unwarmed
+    /// cache fills on the first staging pass.
     pub fn warm_labels(&self, world: &SimWorld) {
-        let _ = spall_structure::SupportGraph::build_cached(
-            &world.terrain().volume,
-            world.anchor(),
-            spall_structure::ResidencyMode::AllResident,
-            &spall_structure::CancelToken::new(),
-            &self.label_cache,
-        );
-        // Also remember every brick's hash and solid count, which each commit
-        // (and a client verifying it) reads for the whole volume.
-        let terrain = &world.terrain().volume;
-        for coord in terrain.resident_brick_coords() {
-            if let Ok(Some(snapshot)) = terrain.snapshot_brick(coord) {
-                let _ = (snapshot.content_hash(), snapshot.solid_cells());
-            }
-        }
+        let _span = crate::prof::Span::start("startup.local_labels_and_hashes");
+        let workers = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
+        self.label_cache
+            .warm_volume(&world.terrain().volume, workers);
     }
 
     /// The committed [`Committed`] for `request_id`, if it has committed.

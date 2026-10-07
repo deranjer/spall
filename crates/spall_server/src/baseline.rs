@@ -156,12 +156,17 @@ pub fn world_baseline(sim: &Simulation) -> BaselineWorld {
 /// supply one — a partial baseline is never emitted, same contract as
 /// `baseline_volume`.
 pub fn snapshot_world(sim: &Simulation, backing: Option<&dyn BrickBacking>) -> BaselineSnapshot {
+    let started = std::time::Instant::now();
+    let mut catalogue_us = 0u64;
     let world = sim.world();
     let mut volumes = Vec::with_capacity(world.body_count() + 1);
     let mut push = |body: &Body, owner| {
         let volume = &body.volume;
-        let mut bricks = spall_voxel::logical_bricks(volume, world.evicted(volume.id()))
-            .expect("baseline snapshot logical invariant")
+        let catalogue_started = std::time::Instant::now();
+        let logical = spall_voxel::logical_bricks(volume, world.evicted(volume.id()))
+            .expect("baseline snapshot logical invariant");
+        catalogue_us += catalogue_started.elapsed().as_micros() as u64;
+        let mut bricks = logical
             .into_iter()
             .map(|logical| {
                 let coord = logical.coord;
@@ -203,6 +208,13 @@ pub fn snapshot_world(sim: &Simulation, backing: Option<&dyn BrickBacking>) -> B
         push(body, BaselineOwner::Body(body.entity.expect("body entity")));
     }
     volumes.sort_by_key(|volume| volume.volume_id.get());
+    tracing::info!(
+        stage = "baseline_snapshot",
+        elapsed_us = started.elapsed().as_micros() as u64,
+        catalogue_us,
+        bricks = volumes.iter().map(|v| v.bricks.len()).sum::<usize>(),
+        "startup profile"
+    );
     BaselineSnapshot {
         checkpoint_tick: sim.current_tick().get(),
         journal_cursor: JournalSeq(sim.journal_cursor()),
@@ -251,6 +263,7 @@ pub fn transfer_from_snapshot_supported(
     interest_epoch: InterestEpoch,
     segmented: bool,
 ) -> Result<BaselineTransfer, BaselineError> {
+    let started = std::time::Instant::now();
     if snapshot.region.is_some_and(|(center, radius)| {
         !segmented
             || center.iter().any(|v| !v.is_finite())
@@ -383,6 +396,14 @@ pub fn transfer_from_snapshot_supported(
             cap: limits::MAX_BASELINE_PARTS,
         });
     }
+    tracing::info!(
+        stage = "baseline_encode",
+        elapsed_us = started.elapsed().as_micros() as u64,
+        regional = snapshot.region.is_some(),
+        total_bricks,
+        compressed_bytes = payload.len(),
+        "startup profile"
+    );
     Ok(BaselineTransfer {
         begin: BaselineBegin {
             transfer_id,

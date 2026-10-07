@@ -2062,6 +2062,7 @@ async fn serve_async(
     let committed_edit_worker = commit_handler.map(CommittedEditWorker::spawn);
 
     let sim_join = tokio::task::spawn_blocking(move || -> SimResult {
+        let setup_started = std::time::Instant::now();
         // Open the world database (T16). If it already holds a checkpoint,
         // recover from it; otherwise start the built-in scene and publish an
         // initial checkpoint so recovery always has a floor.
@@ -2091,6 +2092,18 @@ async fn serve_async(
                 return SimResult::error(format!("persistence setup failed: {e}"), 0);
             }
         };
+        for (stage, elapsed) in spall_sim::prof::drain() {
+            tracing::info!(
+                stage,
+                elapsed_us = elapsed.as_micros() as u64,
+                "startup profile"
+            );
+        }
+        tracing::info!(
+            stage = "authoritative_setup",
+            elapsed_us = setup_started.elapsed().as_micros() as u64,
+            "startup profile"
+        );
         let progression_worker = progression_worker;
         let committed_edit_worker = committed_edit_worker;
         let outbox_worker = outbox_processor.map(OutboxWorker::spawn);

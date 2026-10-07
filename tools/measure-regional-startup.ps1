@@ -1,6 +1,7 @@
 param(
     [ValidateSet(512, 1024, 2048, 4096)][int]$WorldSizeCells = 1024,
     [switch]$FullBaseline,
+    [switch]$ProfileStartup,
     [ValidateRange(300, 9000)][int]$ServerTicks = 3000,
     [Parameter(Mandatory = $true)][string]$OutputDirectory
 )
@@ -18,7 +19,20 @@ $started = [DateTime]::UtcNow
 $clientStarted = $null
 $serverPeak = 0L
 $clientPeak = 0L
+$previousRustLog = $env:RUST_LOG
+function Read-StartupPhases([string]$path) {
+    $phases = [ordered]@{}
+    if (Test-Path -LiteralPath $path) {
+        foreach ($line in Get-Content -LiteralPath $path) {
+            if ($line -match 'startup profile stage="([^"]+)" elapsed_us=(\d+)') {
+                $phases[$Matches[1]] = [long]$Matches[2]
+            }
+        }
+    }
+    return $phases
+}
 try {
+    if ($ProfileStartup) { $env:RUST_LOG = 'sandbox=info,spall_server=info,spall_client=info' }
     $serverArgs = @('--serve','--listen','127.0.0.1:0','--join-token-file',"$probeDir/join.token",'--worldgen','showcase','--seed','1','--worldgen-size',"$WorldSizeCells",'--ticks',"$ServerTicks",'--min-clients','1','--quiescence-ticks','0','--paced','--fingerprint-out',"$probeDir/server.fingerprint",'--addr-out',"$probeDir/server.addr",'--log-json',"$probeDir/server.jsonl",'--summary-json',"$probeDir/server.summary.json")
     $server = Start-Process -FilePath "$repoRoot/target/release/sandbox-server.exe" -WorkingDirectory $repoRoot -ArgumentList $serverArgs -WindowStyle Hidden -PassThru -RedirectStandardOutput "$probeDir/server.stdout.log" -RedirectStandardError "$probeDir/server.stderr.log"
     while (([DateTime]::UtcNow - $started).TotalSeconds -lt 240) {
@@ -55,12 +69,15 @@ try {
         client_exit = if ($client -and $client.HasExited) { $client.ExitCode } else { $null }
         server_exit = if ($server.HasExited) { $server.ExitCode } else { $null }
         final_hash = $clientSummary.final_world_hash
+        server_startup_phases_us = Read-StartupPhases "$probeDir/server.stdout.log"
+        client_startup_phases_us = Read-StartupPhases "$probeDir/client.stdout.log"
     }
     $json = $result | ConvertTo-Json
     Set-Content -LiteralPath "$probeDir/startup.measurement.json" -Value $json
     Write-Output $json
     if (!$passed) { throw "Startup probe failed; evidence retained in $probeDir" }
 } finally {
+    $env:RUST_LOG = $previousRustLog
     foreach ($ownedProcess in @($client, $server)) {
         if ($ownedProcess) {
             $ownedProcess.Refresh()

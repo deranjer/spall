@@ -158,6 +158,9 @@ struct Scenario {
     worldgen_size: u32,
     #[serde(default = "default_worldgen_seed")]
     worldgen_seed: u64,
+    /// Explicit regional client baseline/residency; legacy scenarios stay full geometry.
+    #[serde(default)]
+    stream_regions: bool,
     /// Client 0 requests these resets; every client must install all of them.
     #[serde(default)]
     admin_reset_at: Vec<u64>,
@@ -2563,6 +2566,12 @@ fn run(run: Run, unique_output: impl FnOnce() -> PathBuf) -> Result<(), XtaskErr
         if scenario.worldgen.is_some() {
             c.args(["--baseline-budget-mib", "8192"]);
             if !scenario.late_join_clients.contains(&i) {
+                c.arg("--late-join");
+            }
+        }
+        if scenario.stream_regions {
+            c.arg("--stream-regions");
+            if scenario.worldgen.is_none() && !scenario.late_join_clients.contains(&i) {
                 c.arg("--late-join");
             }
         }

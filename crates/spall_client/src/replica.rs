@@ -1245,6 +1245,16 @@ impl ReplicaWorld {
         if let Err(reason) = replay_ops(&tx.ops, &mut candidate, &mut new_owner, cell_size, bulk) {
             return ApplyOutcome::Rejected { reason };
         }
+        // Source baseline patches can restore distant geometry without naming
+        // every restored brick in `before`. Stage its superseded digest removal
+        // alongside geometry, before hashing, while leaving live state intact
+        // if any declared result fails validation.
+        let mut candidate_evicted = self.evicted.clone();
+        for (vid, ev) in &mut candidate_evicted {
+            if let Some(v) = candidate.get(vid) {
+                ev.drop_resident(v);
+            }
+        }
 
         // 3. Every declared result hash must match the candidate.
         for vh in &tx.result_hashes {
@@ -1267,11 +1277,12 @@ impl ReplicaWorld {
             // Over the logical brick set: an untouched brick this replica has
             // evicted still contributes its retained digest, so a server /
             // client cache-placement difference does not fail validation. The
-            // replay above never wrote an evicted brick (a `before` naming one
-            // takes the repair path first).
+            // A source patch's restored geometry supersedes its staged digest.
             if canonical_topology_hash(&[canonical_logical_volume(
                 v,
-                self.evicted(vh.volume),
+                candidate_evicted
+                    .get(&vh.volume.get())
+                    .unwrap_or_else(|| empty_evicted()),
                 owner,
             )]) != vh.hash
             {
@@ -1287,15 +1298,7 @@ impl ReplicaWorld {
             .iter()
             .any(|op| topology_op_touches_volume(op, self.terrain_id));
         self.volumes = candidate;
-        // slice E: a committed op that wrote into a brick this replica had
-        // evicted (its `before` gap was healed by a repair patch just before
-        // this retry) makes that brick resident again — its retained digest is
-        // superseded by the committed geometry.
-        for (vid, ev) in self.evicted.iter_mut() {
-            if let Some(v) = self.volumes.get(vid) {
-                ev.drop_resident(v);
-            }
-        }
+        self.evicted = candidate_evicted;
         for (vid, entity) in &new_owner {
             self.owner.insert(vid.get(), CanonicalOwner::Body(*entity));
             self.volume_of_entity.insert(entity.get(), vid.get());
@@ -2274,6 +2277,104 @@ mod tests {
         again.control_seq = spall_protocol::ControlSeq(2);
         assert_eq!(replica.apply_transaction(&again), ApplyOutcome::Duplicate);
         assert_eq!(replica.world_hash(), after_first);
+    }
+
+    #[test]
+    fn source_patch_stages_restored_digests_before_hash_validation() {
+        use spall_protocol::{BaselineBrick, BaselineCells, BaselineOwner, BaselineVolume};
+        let volume_id = VolumeId::new(1).unwrap();
+        let coord = BrickCoord::new(41, 2, 1);
+        let mut volume = terrain();
+        volume
+            .insert_brick(
+                coord,
+                Brick::restored_uniform(MaterialId(2), Revision(3), false),
+            )
+            .unwrap();
+        for bulk in [false, true] {
+            let mut volume = volume.clone();
+            let mut replica = ReplicaWorld::from_baseline(volume.clone(), ReplicaConfig::default());
+            assert!(replica.evict_brick(volume_id, coord));
+            let before = replica.world_hash();
+            let generation = replica.terrain_generation();
+            volume
+                .insert_brick(
+                    coord,
+                    Brick::restored_uniform(MaterialId::AIR, Revision(4), true),
+                )
+                .unwrap();
+            let expected = ReplicaWorld::from_baseline(volume, ReplicaConfig::default());
+            let patch = BaselineVolume {
+                volume_id,
+                cell_size_code: CellSizeCode::Quarter.to_u8(),
+                owner: BaselineOwner::Terrain,
+                bounds: None,
+                bricks: vec![BaselineBrick {
+                    coord: [41, 2, 1],
+                    revision: 4,
+                    edited: true,
+                    cells: BaselineCells::Uniform(MaterialId::AIR.0),
+                }],
+            };
+            let mut tx = TopologyTransaction {
+                transaction_id: TransactionId::new(77).unwrap(),
+                server_tick: Tick(4),
+                control_seq: spall_protocol::ControlSeq(1),
+                algorithm_version: 1,
+                dependencies: vec![],
+                before: vec![],
+                after: vec![],
+                ops: vec![TopologyOp::SourcePatchBaseline {
+                    source: volume_id,
+                    blob: patch.encode_compressed(),
+                }],
+                result_hashes: vec![spall_protocol::VolumeHash {
+                    volume: volume_id,
+                    hash: Hash32::ZERO,
+                }],
+            };
+            if bulk {
+                tx.ops = vec![TopologyOp::SourcePatchBulkBaseline {
+                    source: volume_id,
+                    transfer_id: 88,
+                }];
+                replica.provide_bulk_split_world(
+                    88,
+                    spall_protocol::BaselineWorld {
+                        schema: spall_protocol::BASELINE_WORLD_SCHEMA,
+                        checkpoint_tick: 4,
+                        volumes: vec![patch],
+                    },
+                );
+            }
+            assert!(matches!(
+                replica.apply_transaction(&tx),
+                ApplyOutcome::Rejected { .. }
+            ));
+            assert_eq!(replica.world_hash(), before);
+            assert_eq!(replica.terrain_generation(), generation);
+            assert!(replica.evicted(volume_id).contains(coord));
+            assert!(
+                replica
+                    .volume(volume_id)
+                    .unwrap()
+                    .snapshot_brick(coord)
+                    .unwrap()
+                    .is_none()
+            );
+            tx.result_hashes[0].hash = expected.volume_hash(volume_id).unwrap();
+            assert!(matches!(
+                replica.apply_transaction(&tx),
+                ApplyOutcome::Published { .. }
+            ));
+            assert_eq!(replica.world_hash(), expected.world_hash());
+            assert!(!replica.evicted(volume_id).contains(coord));
+            assert!(replica.terrain_generation() > generation);
+            assert!(matches!(
+                replica.apply_transaction(&tx),
+                ApplyOutcome::Duplicate
+            ));
+        }
     }
 
     #[test]

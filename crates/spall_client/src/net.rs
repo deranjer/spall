@@ -987,6 +987,9 @@ impl ClientConnection {
         let pump = tokio::spawn(async move {
             loop {
                 let record = reader.recv_record().await;
+                if let Err(error) = &record {
+                    tracing::warn!(%error, "client reliable control read failed");
+                }
                 let closed = !matches!(record, Ok(Some(_)));
                 if send.send(record).await.is_err() || closed {
                     break;
@@ -1175,7 +1178,8 @@ async fn forward_outcome(conn: &ClientConnection, counters: &Counters, outcome: 
                 counters.repairs.fetch_add(1, Ordering::Relaxed);
             }
         }
-        ApplyOutcome::Rejected { .. } => {
+        ApplyOutcome::Rejected { reason } => {
+            tracing::warn!(reason, "rejected topology transaction");
             counters.rejected.fetch_add(1, Ordering::Relaxed);
         }
         ApplyOutcome::Duplicate | ApplyOutcome::AwaitingBulkSplit { .. } => {}
@@ -1221,6 +1225,12 @@ async fn perform_late_join(
             }
         }
     };
+    tracing::info!(
+        stage = "baseline_wait",
+        elapsed_us = connect_at.elapsed().as_micros() as u64,
+        "startup profile"
+    );
+    let receive_started = std::time::Instant::now();
     let world = receive_full_baseline(
         conn,
         &begin,
@@ -1232,6 +1242,11 @@ async fn perform_late_join(
     )
     .await
     .map_err(ClientNetError::Baseline)?;
+    tracing::info!(
+        stage = "baseline_receive_verify",
+        elapsed_us = receive_started.elapsed().as_micros() as u64,
+        "startup profile"
+    );
     let hash = world.hash();
     let bricks = world.bricks();
     let has_bodies = world.has_bodies();
@@ -1248,6 +1263,7 @@ async fn perform_late_join(
         .late_join_has_bodies
         .store(u64::from(has_bodies), Ordering::Relaxed);
 
+    let install_started = std::time::Instant::now();
     {
         let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
         world
@@ -1264,6 +1280,11 @@ async fn perform_late_join(
             Ordering::Relaxed,
         );
     }
+    tracing::info!(
+        stage = "baseline_install",
+        elapsed_us = install_started.elapsed().as_micros() as u64,
+        "startup profile"
+    );
     counters.baseline_bricks.store(bricks, Ordering::Relaxed);
     counters
         .last_tick
@@ -1803,6 +1824,7 @@ async fn run_async(
                         // a server-initiated catch-up-exhaustion give-up must
                         // not be read as an ordinary end of session.
                         if let Some(reason) = conn.bye_reason() {
+                            tracing::info!(reason, "server ended client reliable control stream");
                             *counters
                                 .disconnect_reason
                                 .lock()

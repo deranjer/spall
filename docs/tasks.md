@@ -1632,3 +1632,17 @@ World resets atomically replace geometry and digests; legacy clients retain full
 Server generation and authoritative world storage remain whole-world. No G3/G5 workload downgrade.
 Evidence and exact checks: docs/reports/ENG-130-regional-startup.md.
 Next unblocked work: ENG-114, profile remaining authoritative generation/global catalogue startup cost.
+
+### ENG-114 authoritative startup and regional workload continuation (2026-10-06)
+
+Startup tracing isolates generation, collision, label/hash warming, baseline catalogue,
+encoding and client receive/install. Exact bounded local warming replaces a discarded
+startup global graph; source arrays are freed in bounded batches after all packed
+replacements are installed. In isolated 4096-cell seed-1 release observations, client
+readiness fell 29,692 to 18,612 ms with identical transfer/catalogue/final hash.
+Large regional stress exposed a source-patch resident/digest conflict; digest changes
+now stage with geometry before result-hash validation. Inline/bulk rejected-hash
+isolation and duplicate replay have regression coverage. Two full-size regional
+fixtures retain eight cuts, two resets and unchanged 16 MiB / 30 s impaired join
+bounds. Exact results and remaining gates: reports/ENG-114-startup-streaming.md.
+ENG-114 remains in progress; no larger acceptance gate is implied by startup gains.

@@ -1590,3 +1590,15 @@ headless release startup, initial geometry/digest counts, working set, transfer 
 Add `-FullBaseline` for the control. The supervisor owns/cleans only its launched processes and retains
 logs/summaries. This probe does not satisfy GPU, G3/G5 destruction, eight-player, impaired-network,
 or long-soak gates. See docs/reports/ENG-130-regional-startup.md for measured results and limitations.
+
+### ENG-114 startup profiling and full-size regional workloads
+
+Add `-ProfileStartup` to `tools/measure-regional-startup.ps1` for structured phase
+observations. Generation timings never enter durable or replicated state. Exact
+cold/warm graph parity after edit/eviction, source-patch staged digest hash validation,
+and worldgen golden digests cover the optimizations. Run the distinct full-world
+regional fixtures with `cargo xtask scenario --name eng114-regional-1024m-stress
+--timeout-ms 600000 --output <fresh-dir>` and `eng114-regional-1024m-impaired`.
+Both keep eight foundation cuts, two resets and two clients; the impaired case keeps
+G3's original 16 MiB / 30 s join bounds. See reports/ENG-114-startup-streaming.md
+for measured startup, bounded workload results, rejected candidates and open gates.
