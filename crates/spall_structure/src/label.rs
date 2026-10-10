@@ -379,52 +379,53 @@ impl LabelCache {
     pub fn warm_volume(&self, volume: &spall_voxel::Volume, workers: usize) {
         const BATCH: usize = 64;
         let coords = volume.resident_brick_coords();
-        let workers = workers.clamp(1, 8).min(coords.len().div_ceil(BATCH).max(1));
+        let batches = coords.len().div_ceil(BATCH);
+        let workers = workers.clamp(1, 16).min(batches.max(1));
+        // Workers pull the next batch from a shared counter, so a slow batch (a complex surface
+        // brick) never leaves the others idle, and the owner publishes results in arrival
+        // order. The cache is keyed by brick and revision, so publication order is not
+        // observable. The channel holds at most two batches per worker, which bounds the
+        // temporary labels held outside the cache.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (tx, rx) = std::sync::mpsc::sync_channel(workers * 2);
         std::thread::scope(|scope| {
-            let receivers: Vec<_> = (0..workers)
-                .map(|worker| {
-                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                    let coords = &coords;
-                    scope.spawn(move || {
-                        for chunk in coords.chunks(BATCH).skip(worker).step_by(workers) {
-                            let mut batch = Vec::new();
-                            for &coord in chunk {
-                                let snapshot = volume
-                                    .snapshot_brick(coord)
-                                    .expect("resident coordinate in immutable volume")
-                                    .expect("resident coordinate has geometry");
-                                let _ = (snapshot.content_hash(), snapshot.solid_cells());
-                                let key = (coord.x, coord.y, coord.z);
-                                let revision = snapshot.revision();
-                                if self.get(volume.id(), key, revision).is_none() {
-                                    batch.push((coord, revision, Arc::new(label_brick(&snapshot))));
-                                }
-                            }
-                            if tx.send(batch).is_err() {
-                                return;
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let (coords, next) = (&coords, &next);
+                scope.spawn(move || {
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(chunk) = coords.chunks(BATCH).nth(index) else {
+                            return;
+                        };
+                        let mut batch = Vec::new();
+                        for &coord in chunk {
+                            let snapshot = volume
+                                .snapshot_brick(coord)
+                                .expect("resident coordinate in immutable volume")
+                                .expect("resident coordinate has geometry");
+                            let _ = (snapshot.content_hash(), snapshot.solid_cells());
+                            let key = (coord.x, coord.y, coord.z);
+                            let revision = snapshot.revision();
+                            if self.get(volume.id(), key, revision).is_none() {
+                                batch.push((coord, revision, Arc::new(label_brick(&snapshot))));
                             }
                         }
-                    });
-                    rx
-                })
-                .collect();
-            loop {
-                let mut received = false;
-                for rx in &receivers {
-                    if let Ok(batch) = rx.recv() {
-                        received = true;
-                        for (coord, revision, labels) in batch {
-                            assert_eq!(
-                                volume.brick_revision(coord).ok().flatten(),
-                                Some(revision),
-                                "warm result must match the owning volume"
-                            );
-                            self.put(volume.id(), (coord.x, coord.y, coord.z), revision, labels);
+                        if tx.send(batch).is_err() {
+                            return;
                         }
                     }
-                }
-                if !received {
-                    break;
+                });
+            }
+            drop(tx);
+            for batch in rx {
+                for (coord, revision, labels) in batch {
+                    assert_eq!(
+                        volume.brick_revision(coord).ok().flatten(),
+                        Some(revision),
+                        "warm result must match the owning volume"
+                    );
+                    self.put(volume.id(), (coord.x, coord.y, coord.z), revision, labels);
                 }
             }
         });

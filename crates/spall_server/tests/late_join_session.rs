@@ -63,6 +63,7 @@ fn a_third_client_late_joins_during_destruction_and_matches_the_server_hash() {
         join_token: token,
         max_ticks: 1_500,
         quiescence_ticks: 60,
+        drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
         min_clients: 1,
         max_clients: 3,
         startup_timeout: Duration::from_secs(20),

@@ -12,6 +12,24 @@ pub mod progression_store;
 pub mod worldgen_scene;
 
 pub fn init_tracing() {
+    // Harness-spawned children lose stderr, so `SPALL_LOG_FILE=<prefix>` sends
+    // each process's tracing output to `<prefix>.<pid>.log` instead.
+    if let Some(prefix) = std::env::var_os("SPALL_LOG_FILE") {
+        let mut path = prefix;
+        path.push(format!(".{}.log", std::process::id()));
+        match std::fs::File::create(&path) {
+            Ok(file) => {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .try_init();
+                return;
+            }
+            Err(error) => eprintln!("SPALL_LOG_FILE {path:?} unusable: {error}"),
+        }
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)

@@ -73,6 +73,9 @@ pub struct SegmentedReceipt {
     pub max_buffered_bytes: usize,
 }
 
+/// The terrain digests one completed segment carried, and the payload offset at which it ended.
+pub type SegmentDigests = (u64, Vec<(spall_core::BrickCoord, spall_voxel::BrickDigest)>);
+
 /// Incremental receiver for one segmented transfer.
 pub struct SegmentedReceiver {
     reader: FrameReader,
@@ -86,6 +89,8 @@ pub struct SegmentedReceiver {
     max_compressed: u64,
     max_segment_decoded: u64,
     max_buffered: usize,
+    /// When enabled ([`Self::track_digests`]), the digests of every completed segment.
+    digest_trail: Option<Vec<SegmentDigests>>,
 }
 
 impl SegmentedReceiver {
@@ -126,7 +131,19 @@ impl SegmentedReceiver {
             max_compressed,
             max_segment_decoded: 0,
             max_buffered: 0,
+            digest_trail: None,
         }
+    }
+
+    /// Starts remembering, for each completed segment, the digests it carried and the payload
+    /// offset where it ended, so a transfer that is interrupted can say what it had verified.
+    pub fn track_digests(&mut self) {
+        self.digest_trail.get_or_insert_with(Vec::new);
+    }
+
+    /// The digests of every segment completed so far (empty unless tracking was enabled).
+    pub fn digest_trail(&self) -> &[SegmentDigests] {
+        self.digest_trail.as_deref().unwrap_or(&[])
     }
 
     /// The manifest, once received.
@@ -174,6 +191,12 @@ impl SegmentedReceiver {
                         .add_segment(&seg)
                         .map_err(|e| format!("segment {index}: {e}"))?;
                     self.raw_hashes.push(raw_hash);
+                    if let Some(trail) = self.digest_trail.as_mut() {
+                        // Bytes consumed through this frame: everything received so far less
+                        // what the reader still holds beyond it.
+                        let ended_at = self.received - self.reader.buffered() as u64;
+                        trail.push((ended_at, segment_digests(&seg)));
+                    }
                 }
             }
         }
@@ -199,4 +222,30 @@ impl SegmentedReceiver {
             max_buffered_bytes: self.max_buffered,
         })
     }
+}
+
+/// The terrain digests (`BaselineCells::Digest` bricks) a segment carries, as the replica records
+/// them.
+fn segment_digests(
+    seg: &spall_protocol::segment::BaselineSegment,
+) -> Vec<(spall_core::BrickCoord, spall_voxel::BrickDigest)> {
+    seg.volumes
+        .iter()
+        .flat_map(|volume| volume.bricks.iter())
+        .filter_map(|brick| match brick.cells {
+            spall_protocol::BaselineCells::Digest {
+                content_hash,
+                solid_cells,
+            } => Some((
+                spall_core::BrickCoord::new(brick.coord[0], brick.coord[1], brick.coord[2]),
+                spall_voxel::BrickDigest {
+                    revision: spall_core::Revision(brick.revision),
+                    content_hash: spall_voxel::BrickHash::from_bytes(content_hash.0),
+                    solid_cells,
+                    modified_air: brick.edited && solid_cells == 0,
+                },
+            )),
+            _ => None,
+        })
+        .collect()
 }

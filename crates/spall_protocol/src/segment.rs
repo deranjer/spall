@@ -29,6 +29,14 @@ pub const BASELINE_SEGMENTED_WORLD_VERSION: u32 = 2;
 /// Streaming variant with a separately negotiated cumulative compressed limit.
 pub const BASELINE_STREAMED_WORLD_VERSION: u32 = 3;
 pub const BASELINE_REGIONAL_WORLD_VERSION: u32 = 4;
+/// Regional baseline whose distant digest catalogue follows as [`crate::CatalogueChunk`] records
+/// instead of travelling inside the baseline. The baseline itself carries only the spawn region
+/// and bodies, with no digests, so a client is ready as soon as it arrives.
+pub const BASELINE_DEFERRED_REGIONAL_WORLD_VERSION: u32 = 5;
+/// Chebyshev brick radius of the geometry a deferred baseline carries around the spawn. The
+/// client's wider interest region is filled by ordinary reloads once the catalogue names those
+/// bricks, so readiness depends on a small neighbourhood instead of the whole region.
+pub const DEFERRED_CORE_RADIUS_BRICKS: i64 = 2;
 pub const REGIONAL_SEGMENT_SCHEMA: u16 = 3;
 pub const DEFAULT_REGION_RADIUS_BRICKS: i64 = 10;
 pub const MAX_REGION_RADIUS_BRICKS: i64 = 16;
@@ -39,10 +47,20 @@ pub fn baseline_cap_regional(radius: i64) -> Hash32 {
 pub fn regional_radius(capability: Hash32) -> Option<i64> {
     (1..=MAX_REGION_RADIUS_BRICKS).find(|&r| baseline_cap_regional(r) == capability)
 }
+/// A client that can also receive the digest catalogue after the baseline (world version 5)
+/// advertises this instead of [`baseline_cap_regional`]; servers that do not know it ignore it.
+pub fn baseline_cap_regional_deferred(radius: i64) -> Hash32 {
+    Hash32::of(format!("spall.baseline.capability.regional.deferred.v5.radius.{radius}").as_bytes())
+}
+pub fn regional_deferred_radius(capability: Hash32) -> Option<i64> {
+    (1..=MAX_REGION_RADIUS_BRICKS).find(|&r| baseline_cap_regional_deferred(r) == capability)
+}
 pub fn is_streamed_world(version: u32) -> bool {
     matches!(
         version,
-        BASELINE_STREAMED_WORLD_VERSION | BASELINE_REGIONAL_WORLD_VERSION
+        BASELINE_STREAMED_WORLD_VERSION
+            | BASELINE_REGIONAL_WORLD_VERSION
+            | BASELINE_DEFERRED_REGIONAL_WORLD_VERSION
     )
 }
 /// Cumulative compressed bytes, processed one segment at a time; no whole-payload decode.

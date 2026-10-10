@@ -6,12 +6,11 @@
 //! failed), resident-and-*empty* (air), or resident-and-*filled*. "Not loaded"
 //! is never silently treated as air.
 
-use std::collections::BTreeMap;
-
 use spall_core::{BrickCoord, CellSizeCode, GlobalCell, LocalCell, MaterialId, Revision, VolumeId};
 
 use crate::accounting::MemoryReport;
 use crate::brick::{Brick, BrickSnapshot};
+use crate::chunk_store::{ChunkKey, ChunkStore, fresh_stamp};
 
 /// Inclusive brick-coordinate bounding box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,14 +80,21 @@ pub enum AccessError {
     BadCellIndex(u32),
 }
 
+fn fresh_state_stamp() -> u64 {
+    fresh_stamp()
+}
+
 /// A sparse voxel volume.
 #[derive(Debug, Clone)]
 pub struct Volume {
     id: VolumeId,
     cell_size: CellSizeCode,
     bounds: Option<BrickBounds>,
-    bricks: BTreeMap<(i64, i64, i64), BrickSlot>,
+    bricks: ChunkStore<BrickSlot>,
     next_revision: Revision,
+    /// Replaced with a fresh process-unique value by every mutation; a clone keeps its source's
+    /// until it is itself mutated. See [`Self::state_stamp`].
+    stamp: u64,
 }
 
 impl Volume {
@@ -98,8 +104,9 @@ impl Volume {
             id,
             cell_size,
             bounds: None,
-            bricks: BTreeMap::new(),
+            bricks: ChunkStore::default(),
             next_revision: Revision(1),
+            stamp: fresh_state_stamp(),
         }
     }
 
@@ -149,6 +156,38 @@ impl Volume {
         coords
     }
 
+    /// Every chunk that holds a slot, with its stamp. A chunk's stamp is replaced by every
+    /// change to it and shared by clones until either side is written, so two equal stamps
+    /// mean identical slots; anything derived from a chunk (the topology hash's per-chunk
+    /// digest) can be reused while its stamp is unchanged.
+    pub fn chunk_stamps(&self) -> impl Iterator<Item = (ChunkKey, u64)> + '_ {
+        self.bricks.chunk_stamps()
+    }
+
+    /// The resident bricks of one chunk, in no particular order. Slots whose load failed are
+    /// not resident and are skipped.
+    pub fn chunk_resident_bricks(
+        &self,
+        chunk: ChunkKey,
+    ) -> impl Iterator<Item = (BrickCoord, &Brick)> + '_ {
+        self.bricks
+            .chunk_entries(chunk)
+            .filter_map(|(&(x, y, z), slot)| match slot {
+                BrickSlot::Resident(brick) => Some((BrickCoord::new(x, y, z), brick)),
+                BrickSlot::Failed => None,
+            })
+    }
+
+    /// Visits every resident brick in storage order (not canonical order), without the
+    /// per-brick lookup and handle clone of [`Self::snapshot_brick`].
+    pub fn for_each_resident_brick(&self, mut visit: impl FnMut(BrickCoord, &Brick)) {
+        for (&(x, y, z), slot) in self.bricks.iter() {
+            if let BrickSlot::Resident(brick) = slot {
+                visit(BrickCoord::new(x, y, z), brick);
+            }
+        }
+    }
+
     fn check_bounds(&self, coord: BrickCoord) -> Result<(), AccessError> {
         match self.bounds {
             Some(bounds) if !bounds.contains(coord) => Err(AccessError::OutOfBounds { coord }),
@@ -168,6 +207,7 @@ impl Volume {
         if next_after_brick > self.next_revision {
             self.next_revision = next_after_brick;
         }
+        self.stamp = fresh_state_stamp();
         self.bricks
             .insert((coord.x, coord.y, coord.z), BrickSlot::Resident(brick));
         Ok(())
@@ -176,6 +216,7 @@ impl Volume {
     /// Records that loading the brick at `coord` failed.
     pub fn mark_failed(&mut self, coord: BrickCoord) -> Result<(), AccessError> {
         self.check_bounds(coord)?;
+        self.stamp = fresh_state_stamp();
         self.bricks
             .insert((coord.x, coord.y, coord.z), BrickSlot::Failed);
         Ok(())
@@ -183,7 +224,16 @@ impl Volume {
 
     /// Drops a brick from the stored set, returning it to `Absent`.
     pub fn evict_brick(&mut self, coord: BrickCoord) {
+        self.stamp = fresh_state_stamp();
         self.bricks.remove(&(coord.x, coord.y, coord.z));
+    }
+
+    /// A process-unique value that changes on every mutation of this volume (brick insert,
+    /// eviction, failure mark, edit). Two volumes with the same stamp hold identical state, so
+    /// work derived from a volume (a structure index) can be reused exactly when its stamp has
+    /// not changed. A clone shares its source's stamp until either is mutated.
+    pub fn state_stamp(&self) -> u64 {
+        self.stamp
     }
 
     fn slot(&self, coord: BrickCoord) -> Option<&BrickSlot> {
@@ -191,11 +241,13 @@ impl Volume {
     }
 
     pub(crate) fn put_resident(&mut self, coord: BrickCoord, brick: Brick) {
+        self.stamp = fresh_state_stamp();
         self.bricks
             .insert((coord.x, coord.y, coord.z), BrickSlot::Resident(brick));
     }
 
     pub(crate) fn take_resident(&mut self, coord: BrickCoord) -> Option<Brick> {
+        self.stamp = fresh_state_stamp();
         match self.bricks.remove(&(coord.x, coord.y, coord.z)) {
             Some(BrickSlot::Resident(brick)) => Some(brick),
             other => {
@@ -208,6 +260,7 @@ impl Volume {
     }
 
     pub(crate) fn allocate_revision(&mut self) -> Result<Revision, spall_core::IdError> {
+        self.stamp = fresh_state_stamp();
         let value = self.next_revision;
         self.next_revision = self.next_revision.checked_next()?;
         Ok(value)
@@ -215,6 +268,7 @@ impl Volume {
 
     #[cfg(test)]
     pub(crate) fn set_next_revision_for_test(&mut self, revision: Revision) {
+        self.stamp = fresh_state_stamp();
         self.next_revision = revision;
     }
 
@@ -322,6 +376,104 @@ mod tests {
 
     fn vol() -> Volume {
         Volume::new(VolumeId::new(1).unwrap(), CellSizeCode::Quarter)
+    }
+
+    /// Bricks on both sides of chunk boundaries, including negative coordinates.
+    fn spread_coords() -> Vec<BrickCoord> {
+        let mut coords = Vec::new();
+        for x in [-9, -8, -1, 0, 7, 8, 17] {
+            for y in [-8, -1, 0, 8] {
+                for z in [-17, -1, 0, 7, 8] {
+                    coords.push(BrickCoord::new(x, y, z));
+                }
+            }
+        }
+        coords
+    }
+
+    #[test]
+    fn chunked_storage_keeps_every_brick_findable_across_chunk_boundaries() {
+        let mut v = vol();
+        let coords = spread_coords();
+        for (i, &c) in coords.iter().enumerate() {
+            v.insert_brick(
+                c,
+                Brick::uniform(MaterialId(1 + (i % 5) as u16), Revision(1)),
+            )
+            .unwrap();
+        }
+        assert_eq!(v.resident_brick_count(), coords.len());
+        let mut expected = coords.clone();
+        expected.sort_by_key(|c| c.sort_key());
+        assert_eq!(v.resident_brick_coords(), expected);
+        for (i, &c) in coords.iter().enumerate() {
+            let cell = GlobalCell::new(c.x * 32, c.y * 32, c.z * 32);
+            assert_eq!(
+                v.sample(cell).unwrap(),
+                Sample::Filled(MaterialId(1 + (i % 5) as u16)),
+                "{c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cloned_volume_is_independent_of_its_source_in_both_directions() {
+        let mut original = vol();
+        let coords = spread_coords();
+        for &c in &coords {
+            original
+                .insert_brick(c, Brick::uniform(MaterialId(1), Revision(1)))
+                .unwrap();
+        }
+        let mut copy = original.clone();
+        assert_eq!(copy.state_stamp(), original.state_stamp());
+
+        // Edits to the copy leave the original alone...
+        let victim = coords[3];
+        copy.evict_brick(victim);
+        copy.insert_brick(
+            BrickCoord::new(100, 100, 100),
+            Brick::uniform(MaterialId(2), Revision(1)),
+        )
+        .unwrap();
+        assert_eq!(original.resident_brick_count(), coords.len());
+        assert!(matches!(
+            original.brick_state(victim).unwrap(),
+            BrickState::Resident { .. }
+        ));
+        assert!(matches!(
+            original
+                .brick_state(BrickCoord::new(100, 100, 100))
+                .unwrap(),
+            BrickState::Absent
+        ));
+        assert_ne!(copy.state_stamp(), original.state_stamp());
+
+        // ...and edits to the original leave the copy alone.
+        let other = coords[10];
+        original.mark_failed(other).unwrap();
+        assert!(matches!(
+            copy.brick_state(other).unwrap(),
+            BrickState::Resident { .. }
+        ));
+        assert_eq!(copy.resident_brick_count(), coords.len());
+    }
+
+    #[test]
+    fn removing_the_last_brick_of_a_chunk_and_an_absent_brick_are_both_harmless() {
+        let mut v = vol();
+        let lone = BrickCoord::new(40, 40, 40);
+        v.insert_brick(lone, Brick::uniform(MaterialId(1), Revision(1)))
+            .unwrap();
+        let snapshot = v.clone();
+        v.evict_brick(lone);
+        v.evict_brick(lone); // already gone
+        v.evict_brick(BrickCoord::new(-300, 5, 5)); // never existed, in a chunk that never existed
+        assert_eq!(v.resident_brick_count(), 0);
+        assert_eq!(snapshot.resident_brick_count(), 1);
+        v.insert_brick(lone, Brick::uniform(MaterialId(2), Revision(2)))
+            .unwrap();
+        assert_eq!(v.resident_brick_count(), 1);
     }
 
     #[test]

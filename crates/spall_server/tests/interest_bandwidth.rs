@@ -59,6 +59,7 @@ fn base_config(
         join_token: token,
         max_ticks: 300,
         quiescence_ticks: 30,
+        drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
         min_clients: 1,
         max_clients: 4,
         startup_timeout: Duration::from_secs(20),

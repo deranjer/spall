@@ -47,6 +47,17 @@ impl Drop for Span {
     }
 }
 
+/// Records an already-measured duration under `name`, for work timed elsewhere (a cost breakdown
+/// returned by a lower layer).
+pub fn record(name: &'static str, elapsed: Duration) {
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < MAX_PENDING {
+            p.push((name, elapsed));
+        }
+    });
+}
+
 /// Takes every span recorded on this thread since the last drain.
 pub fn drain() -> Vec<(&'static str, Duration)> {
     PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()))

@@ -157,6 +157,20 @@ impl CharacterQueryCache {
         self.body.map(|_| self.centre_m)
     }
 
+    /// The terrain collider revision this window was built (or last confirmed current) for.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Declares a live window current for terrain collider `revision`, because the caller has
+    /// established that every terrain change since [`Self::revision`] lies outside it. A cache
+    /// with no live window is left alone (it must be built, not acknowledged).
+    pub fn acknowledge_revision(&mut self, revision: u64) {
+        if self.body.is_some() {
+            self.revision = revision;
+        }
+    }
+
     /// This cache's window `BodyId`, if it currently has a live collider —
     /// what a caller needs to exclude this character's own window from
     /// *another* character's sweep (see [`PhysicsWorld::sweep_character_excluding`]).

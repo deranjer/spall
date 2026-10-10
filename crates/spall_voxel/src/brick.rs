@@ -41,6 +41,10 @@ impl BrickHash {
     pub const fn to_bytes(self) -> [u8; 32] {
         self.0
     }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl std::fmt::Display for BrickHash {

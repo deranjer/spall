@@ -88,6 +88,166 @@ fn script_end_tick(script: &[MovementStep]) -> u64 {
     script.iter().map(|s| s.to_tick).max().unwrap_or(0)
 }
 
+/// Accumulated time and worst case of one profiled section.
+#[derive(Default)]
+struct SectionTimer {
+    total: Duration,
+    max: Duration,
+}
+
+impl SectionTimer {
+    fn add(&mut self, elapsed: Duration) {
+        self.total += elapsed;
+        self.max = self.max.max(elapsed);
+    }
+}
+
+/// Mover-loop section timings, logged every [`MoverProfile::REPORT_EVERY`]
+/// iterations so a slow scripted client shows where its time goes.
+#[derive(Default)]
+struct MoverProfile {
+    snapshot: SectionTimer,
+    bodies: SectionTimer,
+    predictor: SectionTimer,
+    residency: SectionTimer,
+    iterations: u32,
+    window_started: Option<std::time::Instant>,
+}
+
+impl MoverProfile {
+    const REPORT_EVERY: u32 = 300;
+
+    fn finish_iteration(&mut self) {
+        let started = *self
+            .window_started
+            .get_or_insert_with(std::time::Instant::now);
+        self.iterations += 1;
+        if self.iterations < Self::REPORT_EVERY {
+            return;
+        }
+        let ms = |t: &SectionTimer| (t.total.as_secs_f64() * 1e3, t.max.as_secs_f64() * 1e3);
+        let (snapshot, snapshot_max) = ms(&self.snapshot);
+        let (bodies, bodies_max) = ms(&self.bodies);
+        let (predictor, predictor_max) = ms(&self.predictor);
+        let (residency, residency_max) = ms(&self.residency);
+        tracing::info!(
+            iterations = self.iterations,
+            wall_ms = started.elapsed().as_millis() as u64,
+            snapshot_ms = snapshot,
+            snapshot_max_ms = snapshot_max,
+            bodies_ms = bodies,
+            bodies_max_ms = bodies_max,
+            predictor_ms = predictor,
+            predictor_max_ms = predictor_max,
+            residency_ms = residency,
+            residency_max_ms = residency_max,
+            "mover profile"
+        );
+        *self = Self::default();
+    }
+}
+
+/// Advances the replica's observed server tick and, when transactions are held
+/// for repairs, retries them: the steady water stream then lets a repair
+/// request the server dropped be sent again once its cooldown has elapsed,
+/// even if no transaction or patch arrives meanwhile.
+fn observe_tick_and_retry(
+    replica: &Mutex<ReplicaWorld>,
+    tick: u64,
+) -> Vec<(spall_core::TransactionId, ApplyOutcome)> {
+    let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+    guard.observe_server_tick(tick);
+    if guard.pending_repair_txn_count() > 0 {
+        guard.retry_pending_repair_txns()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Control-reader time by record kind, logged every few seconds.
+struct ControlProfile {
+    kinds: std::collections::BTreeMap<&'static str, (u64, Duration, Duration)>,
+    /// Time inside a record's handler by phase (receiving a patch's body, applying it, retrying
+    /// held transactions), reported with the same window.
+    phases: std::collections::BTreeMap<&'static str, Duration>,
+    waiting: Duration,
+    current: Option<(&'static str, std::time::Instant)>,
+    wait_started: std::time::Instant,
+    window_started: std::time::Instant,
+    /// The record being handled right now, readable from a monitor task: a handler that never
+    /// returns would otherwise leave no trace in the windowed profile.
+    watch: ControlWatch,
+}
+
+/// The control reader's current record kind and when it began, while a handler is running.
+type ControlWatch = Arc<Mutex<Option<(&'static str, std::time::Instant)>>>;
+
+impl ControlProfile {
+    fn with_watch(watch: ControlWatch) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            kinds: Default::default(),
+            phases: Default::default(),
+            waiting: Duration::ZERO,
+            current: None,
+            wait_started: now,
+            window_started: now,
+            watch,
+        }
+    }
+}
+
+impl ControlProfile {
+    const REPORT_EVERY: Duration = Duration::from_secs(5);
+
+    fn begin_record(&mut self, kind: &'static str) {
+        let now = std::time::Instant::now();
+        self.waiting += now.duration_since(self.wait_started);
+        self.current = Some((kind, now));
+        *self.watch.lock().unwrap_or_else(|e| e.into_inner()) = Some((kind, now));
+    }
+
+    fn note_phase(&mut self, phase: &'static str, elapsed: Duration) {
+        *self.phases.entry(phase).or_default() += elapsed;
+    }
+
+    fn finish_record(&mut self) {
+        let now = std::time::Instant::now();
+        *self.watch.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Some((kind, started)) = self.current.take() {
+            let elapsed = now.duration_since(started);
+            let entry = self.kinds.entry(kind).or_default();
+            entry.0 += 1;
+            entry.1 += elapsed;
+            entry.2 = entry.2.max(elapsed);
+        }
+        self.wait_started = now;
+        if now.duration_since(self.window_started) >= Self::REPORT_EVERY {
+            let mut summary: Vec<String> = self
+                .kinds
+                .iter()
+                .map(|(kind, (count, total, max))| {
+                    format!(
+                        "{kind}: n={count} total_ms={:.0} max_ms={:.1}",
+                        total.as_secs_f64() * 1e3,
+                        max.as_secs_f64() * 1e3
+                    )
+                })
+                .collect();
+            summary.extend(self.phases.iter().map(|(phase, total)| {
+                format!("phase {phase}: total_ms={:.0}", total.as_secs_f64() * 1e3)
+            }));
+            tracing::info!(
+                wall_ms = now.duration_since(self.window_started).as_millis() as u64,
+                waiting_ms = self.waiting.as_millis() as u64,
+                ?summary,
+                "control reader profile"
+            );
+            *self = Self::with_watch(self.watch.clone());
+        }
+    }
+}
+
 /// Client prediction timestep — the fixed 60 Hz server tick.
 const MOVEMENT_DT_S: f32 = 1.0 / 60.0;
 
@@ -323,6 +483,11 @@ pub type ReplicaReadyHook = Arc<dyn Fn(Arc<Mutex<ReplicaWorld>>) + Send + Sync>;
 pub struct ClientResidencyLimits {
     /// Negotiate spawn-neighborhood geometry plus exact distant terrain digests.
     pub stream_initial: bool,
+    /// With `stream_initial`, receive the distant digests after the baseline
+    /// instead of inside it, so the client is ready as soon as the spawn region
+    /// and bodies arrive. Transactions wait for the catalogue; `world_hash` is
+    /// not comparable with the server's until it completes.
+    pub defer_catalogue: bool,
     /// Resident-terrain-brick ceiling; the pass never forces it below the
     /// interest box (eviction is unconditional by box), but an
     /// interest-driven reload back into the box is deferred rather than
@@ -430,6 +595,28 @@ pub struct ClientSummary {
     /// same bytes shipped on the wire). `0` unless a baseline was pulled.
     #[serde(default)]
     pub late_join_baseline_compressed_bytes: u64,
+    /// Milliseconds from the baseline being installed to its deferred terrain
+    /// catalogue completing and held transactions replaying. `0` when no
+    /// catalogue was deferred or it never finished.
+    #[serde(default)]
+    pub catalogue_complete_ms: u64,
+    /// Compressed bytes of deferred catalogue chunks received so far, in addition to
+    /// `late_join_baseline_compressed_bytes`.
+    #[serde(default)]
+    pub catalogue_compressed_bytes: u64,
+    /// Whether a deferred catalogue was still incomplete when the client ended
+    /// (its `final_world_hash` is then not comparable with the server's).
+    #[serde(default)]
+    pub catalogue_pending_at_end: bool,
+    /// Transactions still held when the client ended, by what they wait for: a repair patch, an
+    /// out-of-band split blob, or the terrain catalogue. A nonzero count means the replica had
+    /// not caught up with the server.
+    #[serde(default)]
+    pub held_repair_transactions_at_end: u64,
+    #[serde(default)]
+    pub held_bulk_split_transactions_at_end: u64,
+    #[serde(default)]
+    pub held_catalogue_transactions_at_end: u64,
     /// Wall-clock milliseconds from connect (start of the QUIC handshake) to
     /// the baseline being received, decompressed, decoded, verified, and
     /// installed. `0` unless a baseline was pulled.
@@ -612,6 +799,11 @@ struct Counters {
     /// wire) and wall-clock milliseconds from connect to baseline-installed /
     /// to "ready". All `0` unless `late_join` is set.
     late_join_baseline_compressed_bytes: AtomicU64,
+    /// Compressed catalogue bytes received so far (all chunks, any catalogue).
+    catalogue_compressed_bytes: AtomicU64,
+    /// Milliseconds from the baseline being installed to its deferred catalogue
+    /// completing; `0` if none was deferred or it has not finished.
+    catalogue_complete_ms: AtomicU64,
     late_join_baseline_install_ms: AtomicU64,
     late_join_ready_ms: AtomicU64,
     /// `1` once the installed baseline is confirmed caught up: either it
@@ -646,13 +838,20 @@ struct Counters {
     disconnect_reason: std::sync::Mutex<Option<String>>,
 }
 
-/// Bounded resend schedule for rejected actions. Queue overload gets exponential
-/// backoff; per-tick throttling retains the short fixed delay.
-pub(crate) fn retry_backoff(overloaded: bool, tries_done: u8) -> Option<Duration> {
+/// Bounded resend schedule for rejected actions. Queue overload gets exponential backoff.
+/// Per-tick throttling starts short and backs off to 320 ms over eight tries, with up to 40 ms of
+/// jitter taken from the request id: after a long server stall (a world reset) a client has
+/// queued tens of actions that all arrive in one tick and are all throttled together, and
+/// retrying them in lockstep at a fixed 40 ms exhausted four tries with some still refused.
+pub(crate) fn retry_backoff(overloaded: bool, tries_done: u8, request_id: u64) -> Option<Duration> {
     if overloaded {
         (tries_done < 5).then(|| Duration::from_millis(100u64 << tries_done))
     } else {
-        (tries_done < 4).then(|| Duration::from_millis(40))
+        (tries_done < 8).then(|| {
+            let base = 40u64 << tries_done.min(3);
+            let jitter = request_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58;
+            Duration::from_millis(base + jitter % 40)
+        })
     }
 }
 
@@ -1021,7 +1220,17 @@ impl Drop for ClientConnection {
 }
 
 async fn receive_baseline_body(conn: &ClientConnection) -> Option<BaselineWorld> {
-    let parts = conn.accept_bulk().await.ok()?.collect_parts().await.ok()?;
+    let started = std::time::Instant::now();
+    let reader = conn.accept_bulk().await.ok()?;
+    let accepted = started.elapsed();
+    let parts = reader.collect_parts().await.ok()?;
+    if started.elapsed() > std::time::Duration::from_secs(5) {
+        tracing::info!(
+            accept_ms = accepted.as_millis() as u64,
+            collect_ms = (started.elapsed() - accepted).as_millis() as u64,
+            "slow baseline body"
+        );
+    }
     let mut bytes = Vec::new();
     for part in &parts {
         bytes.extend_from_slice(&part.payload);
@@ -1089,6 +1298,7 @@ async fn receive_full_baseline(
     if begin.world_version != spall_protocol::segment::BASELINE_SEGMENTED_WORLD_VERSION
         && begin.world_version != spall_protocol::segment::BASELINE_STREAMED_WORLD_VERSION
         && begin.world_version != spall_protocol::segment::BASELINE_REGIONAL_WORLD_VERSION
+        && begin.world_version != spall_protocol::segment::BASELINE_DEFERRED_REGIONAL_WORLD_VERSION
     {
         return Err(format!(
             "unsupported baseline world version {}",
@@ -1186,6 +1396,76 @@ async fn forward_outcome(conn: &ClientConnection, counters: &Counters, outcome: 
     }
 }
 
+/// The catalogue being received for the installed baseline.
+struct PendingCatalogue {
+    receiver: crate::catalogue::CatalogueReceiver,
+    began: std::time::Instant,
+    /// The logical catalogue this client held before a world reset replaced it: what a delta
+    /// catalogue builds on. `None` when the reset arrived while the replica could lag the server.
+    basis: Option<std::collections::BTreeMap<spall_core::BrickCoord, spall_voxel::BrickDigest>>,
+    /// What the catalogue this baseline replaced had verified, for a delta that continues it.
+    resume: Option<crate::catalogue::ResumeState>,
+}
+
+impl PendingCatalogue {
+    /// What this catalogue verified before something replaced it. A delta's own basis is what it
+    /// was built on; if that is unknown there is nothing to continue from.
+    fn into_resume(self) -> Option<crate::catalogue::ResumeState> {
+        let base = if self.receiver.delta() {
+            self.basis
+        } else {
+            Some(std::collections::BTreeMap::new())
+        };
+        self.receiver.resume_state(base)
+    }
+
+    /// Before a catalogue's first chunk is consumed: a delta that names a partly received
+    /// catalogue builds on exactly the prefix of it the server assumed. A delta without one keeps
+    /// the complete basis it was given, and a full catalogue needs none.
+    fn prepare_for(&mut self, chunk: &spall_protocol::CatalogueChunk) -> Result<(), String> {
+        let resume = self.resume.take();
+        let Some(chunks) = chunk.basis_chunks else {
+            return Ok(());
+        };
+        let resume = resume
+            .ok_or("a delta catalogue resumes one this client was not receiving".to_string())?;
+        self.basis = Some(resume.held_after(chunks)?);
+        Ok(())
+    }
+}
+
+type CatalogueSlot = Mutex<Option<PendingCatalogue>>;
+
+/// After installing `begin`'s baseline: if it was the deferred variant, mark the replica as
+/// waiting for its catalogue and start receiving it; otherwise drop any catalogue left over
+/// from a baseline this one replaced.
+fn expect_catalogue_if_deferred(
+    replica: &mut ReplicaWorld,
+    begin: &spall_protocol::BaselineBegin,
+    slot: &CatalogueSlot,
+    basis: Option<std::collections::BTreeMap<spall_core::BrickCoord, spall_voxel::BrickDigest>>,
+) {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    // A catalogue this baseline replaces keeps what it had verified, in case the new one
+    // continues it.
+    let resume = slot.take().and_then(PendingCatalogue::into_resume);
+    if begin.world_version == spall_protocol::segment::BASELINE_DEFERRED_REGIONAL_WORLD_VERSION {
+        replica.expect_catalogue(begin.transfer_id);
+        *slot = Some(PendingCatalogue {
+            receiver: crate::catalogue::CatalogueReceiver::new(
+                begin.transfer_id,
+                begin.checkpoint_tick.get(),
+                spall_protocol::segment::MAX_STREAMED_BASELINE_COMPRESSED as u64,
+            ),
+            began: std::time::Instant::now(),
+            basis,
+            resume,
+        });
+    } else {
+        *slot = None;
+    }
+}
+
 /// The initial late-join handshake: ask for a baseline, install it, confirm it.
 /// `connect_at` is the wall-clock reference point ("late-join connect") the
 /// T23 / G3 row 11 join-budget timings are measured from.
@@ -1196,6 +1476,7 @@ async fn perform_late_join(
     connect_at: std::time::Instant,
     budget_bytes: u64,
     capability: Hash32,
+    catalogue_slot: &CatalogueSlot,
 ) -> Result<(), ClientNetError> {
     conn.send_record(WireRecord::BaselineAck(BaselineAck {
         transfer_id: BASELINE_REQUEST_SENTINEL,
@@ -1279,6 +1560,7 @@ async fn perform_late_join(
             guard.evicted(guard.terrain_volume_id()).len() as u64,
             Ordering::Relaxed,
         );
+        expect_catalogue_if_deferred(&mut guard, &begin, catalogue_slot, None);
     }
     tracing::info!(
         stage = "baseline_install",
@@ -1378,6 +1660,7 @@ async fn run_async(
     let want_baseline =
         config.late_join || !config.movement_script.is_empty() || config.interactive.is_some();
 
+    let catalogue_slot: Arc<CatalogueSlot> = Arc::new(Mutex::new(None));
     let replica = Arc::new(Mutex::new(if want_baseline {
         ReplicaWorld::empty(ReplicaConfig::default())
     } else {
@@ -1424,8 +1707,15 @@ async fn run_async(
                     .client_residency
                     .filter(|l| l.stream_initial)
                     .map_or_else(spall_protocol::segment::baseline_cap_streamed, |l| {
-                        spall_protocol::segment::baseline_cap_regional(l.interest_radius_bricks)
+                        if l.defer_catalogue {
+                            spall_protocol::segment::baseline_cap_regional_deferred(
+                                l.interest_radius_bricks,
+                            )
+                        } else {
+                            spall_protocol::segment::baseline_cap_regional(l.interest_radius_bricks)
+                        }
                     }),
+                &catalogue_slot,
             ),
         )
         .await
@@ -1495,6 +1785,30 @@ async fn run_async(
     let sent_actions: SentActions = Arc::new(Mutex::new(HashMap::new()));
     let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
 
+    // Log a control-reader handler that stays busy for a long time (it never reaches the windowed
+    // profile if it does not return).
+    let control_watch: ControlWatch = Arc::new(Mutex::new(None));
+    let control_monitor = {
+        let watch = control_watch.clone();
+        tokio::spawn(async move {
+            let mut last_reported = None;
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let busy = *watch.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((kind, since)) = busy
+                    && since.elapsed() > Duration::from_secs(10)
+                    && last_reported != Some(since)
+                {
+                    last_reported = Some(since);
+                    tracing::warn!(
+                        kind,
+                        busy_s = since.elapsed().as_secs(),
+                        "control reader has been in one handler for a long time"
+                    );
+                }
+            }
+        })
+    };
     // Control reader: apply transactions, answer repair gaps.
     let control = {
         let conn = conn.clone();
@@ -1504,6 +1818,7 @@ async fn run_async(
         let progression_responses = progression_responses.clone();
         let interactive = config.interactive.clone();
         let admin_statuses = admin_statuses.clone();
+        let catalogue_slot = catalogue_slot.clone();
         tokio::spawn(async move {
             let mut vegetation_floor = 0_u64;
             let mut vegetation = spall_protocol::vegetation::VegetationAssembler::default();
@@ -1511,8 +1826,23 @@ async fn run_async(
                 HashMap::<spall_core::GlobalCell, spall_protocol::WaterAssembler>::new();
             let mut water_deltas =
                 HashMap::<spall_core::GlobalCell, spall_protocol::WaterDeltaAssembler>::new();
+            // Diagnostic: how the control reader spends its time, by record kind.
+            let mut profile = ControlProfile::with_watch(control_watch);
             loop {
-                match conn.recv_record().await {
+                profile.finish_record();
+                let received = conn.recv_record().await;
+
+                profile.begin_record(match &received {
+                    Ok(Some(WireRecord::VegetationSnapshot(_))) => "vegetation",
+                    Ok(Some(WireRecord::WaterSnapshot(_))) => "water-snapshot",
+                    Ok(Some(WireRecord::WaterDelta(_))) => "water-delta",
+                    Ok(Some(WireRecord::TopologyTransaction(_))) => "transaction",
+                    Ok(Some(WireRecord::BaselineBegin(_))) => "baseline-begin",
+                    Ok(Some(WireRecord::BaselineEnd(_))) => "baseline-end",
+                    Ok(Some(_)) => "other",
+                    _ => "closed",
+                });
+                match received {
                     Ok(Some(WireRecord::VegetationSnapshot(chunk))) => {
                         if chunk.tick < vegetation_floor {
                             continue;
@@ -1576,6 +1906,17 @@ async fn run_async(
                                     .water_regions
                                     .store(water_deltas.len() as u64, Ordering::Relaxed);
                                 counters.water_keyframes.fetch_add(1, Ordering::Relaxed);
+                                // Water frames are broadcast at a steady rate, so a
+                                // client whose interest sees few body snapshots
+                                // still learns the server tick from them.
+                                counters
+                                    .last_tick
+                                    .fetch_max(frame.server_tick.get(), Ordering::Relaxed);
+                                let retried =
+                                    observe_tick_and_retry(&replica, frame.server_tick.get());
+                                for (_, outcome) in retried {
+                                    forward_outcome(&conn, &counters, outcome).await;
+                                }
                                 counters
                                     .water_frame_seq
                                     .store(frame.frame_seq, Ordering::Relaxed);
@@ -1599,6 +1940,13 @@ async fn run_async(
                     {
                         Ok(Some(frame)) => {
                             counters.water_delta_frames.fetch_add(1, Ordering::Relaxed);
+                            counters
+                                .last_tick
+                                .fetch_max(frame.server_tick.get(), Ordering::Relaxed);
+                            let retried = observe_tick_and_retry(&replica, frame.server_tick.get());
+                            for (_, outcome) in retried {
+                                forward_outcome(&conn, &counters, outcome).await;
+                            }
                             counters
                                 .water_frame_seq
                                 .store(frame.frame_seq, Ordering::Relaxed);
@@ -1662,8 +2010,22 @@ async fn run_async(
                                 vegetation_floor = begin.checkpoint_tick.get();
                                 vegetation =
                                     spall_protocol::vegetation::VegetationAssembler::default();
-                                world
-                                    .install(&mut replica.lock().unwrap_or_else(|e| e.into_inner()))
+                                let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
+                                // A delta catalogue builds on what this client held before.
+                                let basis = (begin.world_version
+                                    == spall_protocol::segment::BASELINE_DEFERRED_REGIONAL_WORLD_VERSION)
+                                    .then(|| guard.logical_terrain_digests())
+                                    .flatten();
+                                let installed = world.install(&mut guard);
+                                if installed.is_ok() {
+                                    expect_catalogue_if_deferred(
+                                        &mut guard,
+                                        &begin,
+                                        &catalogue_slot,
+                                        basis,
+                                    );
+                                }
+                                installed
                             }
                             Err(error) => Err(error),
                         };
@@ -1685,6 +2047,129 @@ async fn run_async(
                                     .baseline_transfer_failures
                                     .fetch_add(1, Ordering::Relaxed);
                                 break;
+                            }
+                        }
+                    }
+                    Ok(Some(WireRecord::ControlProbe(probe))) if !probe.echo => {
+                        // In order with everything before it, so the server reads the
+                        // control stream's queueing delay off the echo.
+                        let _ = conn
+                            .send_record(WireRecord::ControlProbe(spall_protocol::ControlProbe {
+                                id: probe.id,
+                                echo: true,
+                            }))
+                            .await;
+                    }
+                    Ok(Some(WireRecord::CatalogueChunk(chunk))) => {
+                        // Credit for the server's window: this chunk has been processed.
+                        let mut acked = None;
+                        let finished = {
+                            let mut slot = catalogue_slot.lock().unwrap_or_else(|e| e.into_inner());
+                            match slot.as_mut() {
+                                // A chunk for a baseline since replaced is stale.
+                                Some(pending)
+                                    if pending.receiver.transfer_id() != chunk.transfer_id =>
+                                {
+                                    None
+                                }
+                                Some(pending) => match (if chunk.index == 0 {
+                                    pending.prepare_for(&chunk)
+                                } else {
+                                    Ok(())
+                                })
+                                .and_then(|()| pending.receiver.push(&chunk))
+                                {
+                                    Ok(None) => {
+                                        acked = Some(chunk.index);
+                                        counters.catalogue_compressed_bytes.fetch_add(
+                                            chunk.payload.len() as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                        None
+                                    }
+                                    Ok(Some(staged)) => {
+                                        acked = Some(chunk.index);
+                                        counters.catalogue_compressed_bytes.fetch_add(
+                                            chunk.payload.len() as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                        let waited = pending.began.elapsed();
+                                        let delta = pending.receiver.delta().then(|| {
+                                            (
+                                                pending.basis.take(),
+                                                pending.receiver.expected_world_hash(),
+                                            )
+                                        });
+                                        *slot = None;
+                                        Some(Ok((staged, waited, delta)))
+                                    }
+                                    Err(error) => {
+                                        *slot = None;
+                                        Some(Err(error))
+                                    }
+                                },
+                                None => None,
+                            }
+                        };
+                        if let Some(index) = acked {
+                            let _ = conn
+                                .send_record(WireRecord::CatalogueAck(
+                                    spall_protocol::CatalogueAck {
+                                        transfer_id: chunk.transfer_id,
+                                        index,
+                                    },
+                                ))
+                                .await;
+                        }
+                        match finished {
+                            None => {}
+                            Some(Err(error)) => {
+                                eprintln!("spall-client: terrain catalogue refused: {error}");
+                                counters
+                                    .baseline_transfer_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                            Some(Ok((staged, waited, delta))) => {
+                                let replayed = {
+                                    let mut guard =
+                                        replica.lock().unwrap_or_else(|e| e.into_inner());
+                                    match delta {
+                                        None => guard.complete_catalogue(staged),
+                                        Some((Some(basis), Some(expected))) => {
+                                            guard.complete_delta_catalogue(staged, basis, expected)
+                                        }
+                                        Some(_) => Err(
+                                            "a delta catalogue arrived without the catalogue it builds on"
+                                                .to_string(),
+                                        ),
+                                    }
+                                };
+                                match replayed {
+                                    Ok(outcomes) => {
+                                        counters.catalogue_complete_ms.store(
+                                            (waited.as_millis() as u64).max(1),
+                                            Ordering::Relaxed,
+                                        );
+                                        tracing::info!(
+                                            waited_ms = waited.as_millis() as u64,
+                                            replayed = outcomes.len(),
+                                            "terrain catalogue complete"
+                                        );
+                                        for (_, outcome) in outcomes {
+                                            forward_outcome(&conn, &counters, outcome).await;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "spall-client: terrain catalogue could not be merged: {error}"
+                                        );
+                                        counters
+                                            .baseline_transfer_failures
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1746,7 +2231,10 @@ async fn run_async(
                         // — including ones for a request sent well after
                         // this failure — turning one dropped patch into a
                         // permanently stuck reload.
-                        match receive_baseline_body(&conn).await {
+                        let receive_started = std::time::Instant::now();
+                        let body = receive_baseline_body(&conn).await;
+                        let receive_elapsed = receive_started.elapsed();
+                        match body {
                             Some(world) if is_split => {
                                 let retried = {
                                     let mut guard =
@@ -1759,15 +2247,48 @@ async fn run_async(
                                 }
                             }
                             Some(patch) => {
-                                let (applied, retried) = {
+                                let lock_started = std::time::Instant::now();
+                                let (applied, retried, apply_elapsed, retry_elapsed, held) = {
                                     let mut guard =
                                         replica.lock().unwrap_or_else(|e| e.into_inner());
+                                    let locked = lock_started.elapsed();
+                                    let apply_started = std::time::Instant::now();
                                     if guard.apply_baseline_patch(&patch).is_ok() {
-                                        (true, guard.retry_pending_repair_txns())
+                                        let apply_elapsed = apply_started.elapsed();
+                                        let held = guard.pending_repair_txn_count();
+                                        let retry_started = std::time::Instant::now();
+                                        let retried = guard.retry_pending_repair_txns();
+                                        (
+                                            true,
+                                            retried,
+                                            apply_elapsed + locked,
+                                            retry_started.elapsed(),
+                                            held,
+                                        )
                                     } else {
-                                        (false, Vec::new())
+                                        (
+                                            false,
+                                            Vec::new(),
+                                            apply_started.elapsed() + locked,
+                                            Duration::ZERO,
+                                            0,
+                                        )
                                     }
                                 };
+                                profile.note_phase("patch.receive", receive_elapsed);
+                                profile.note_phase("patch.lock_and_apply", apply_elapsed);
+                                profile.note_phase("patch.retry_held", retry_elapsed);
+                                if receive_elapsed + apply_elapsed + retry_elapsed
+                                    > Duration::from_millis(50)
+                                {
+                                    tracing::info!(
+                                        receive_ms = receive_elapsed.as_millis() as u64,
+                                        lock_and_apply_ms = apply_elapsed.as_millis() as u64,
+                                        retry_ms = retry_elapsed.as_millis() as u64,
+                                        held_transactions = held,
+                                        "slow repair patch"
+                                    );
+                                }
                                 if applied {
                                     counters.patches.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -1858,7 +2379,7 @@ async fn run_async(
                             } else {
                                 throttle_tries
                             };
-                            let delay = retry_backoff(overloaded, *tries)?;
+                            let delay = retry_backoff(overloaded, *tries, id)?;
                             *tries += 1;
                             Some((rec.clone(), delay))
                         })
@@ -1901,8 +2422,47 @@ async fn run_async(
         let interactive = config.interactive.clone();
         let client_authoritative = config.client_authoritative;
         tokio::spawn(async move {
+            // Busy time spent handling datagrams (excluding the wait for the next one),
+            // logged every few seconds: an idle client was found using about 0.7 of a core.
+            let mut window_started = std::time::Instant::now();
+            let mut busy = Duration::ZERO;
+            let mut handled = 0u64;
+            let mut worst = Duration::ZERO;
             loop {
-                match conn.recv_datagram().await {
+                if window_started.elapsed() >= Duration::from_secs(5) {
+                    tracing::info!(
+                        handled,
+                        busy_ms = busy.as_secs_f64() * 1e3,
+                        worst_ms = worst.as_secs_f64() * 1e3,
+                        wall_ms = window_started.elapsed().as_secs_f64() * 1e3,
+                        app_bytes_recv = conn.stats().app_bytes_recv,
+                        records_recv = conn.stats().records_recv,
+                        datagrams_recv = conn.stats().datagrams_recv,
+                        "datagram profile"
+                    );
+                    window_started = std::time::Instant::now();
+                    busy = Duration::ZERO;
+                    handled = 0;
+                    worst = Duration::ZERO;
+                }
+                let received = conn.recv_datagram().await;
+                let handling_started = std::time::Instant::now();
+                struct Timed<'a>(
+                    &'a mut Duration,
+                    &'a mut Duration,
+                    &'a mut u64,
+                    std::time::Instant,
+                );
+                impl Drop for Timed<'_> {
+                    fn drop(&mut self) {
+                        let d = self.3.elapsed();
+                        *self.0 += d;
+                        *self.1 = (*self.1).max(d);
+                        *self.2 += 1;
+                    }
+                }
+                let _timed = Timed(&mut busy, &mut worst, &mut handled, handling_started);
+                match received {
                     Ok(Some(DatagramRecord::Motion(snap))) => {
                         counters
                             .last_tick
@@ -1959,6 +2519,21 @@ async fn run_async(
                                             // possible — is exactly the case
                                             // that must never read as "zero
                                             // corrections".
+                                            if outcome
+                                                .comparison
+                                                .as_ref()
+                                                .is_some_and(|c| c.error_m > 1.0)
+                                            {
+                                                tracing::info!(
+                                                    snapshot_tick = snap.server_tick.get(),
+                                                    observed_tick =
+                                                        counters.last_tick.load(Ordering::Relaxed),
+                                                    acked_input = snap.acked_input.0,
+                                                    sent_input = p.input_seq,
+                                                    rtt_ms = conn.rtt().as_millis() as u64,
+                                                    "large correction context"
+                                                );
+                                            }
                                             let now = std::time::Instant::now();
                                             p.observe_reconcile(
                                                 outcome.records_replayed,
@@ -2178,6 +2753,9 @@ async fn run_async(
             // clone every replicated voxel volume under the replica lock.
             let mut body_collision_versions = HashMap::<u64, (u64, [f64; 3])>::new();
             let trace_bodies = !script.is_empty();
+            // Diagnostic: where one mover iteration's wall time goes. Logged,
+            // never replicated or persisted.
+            let mut profile = MoverProfile::default();
             loop {
                 if *stop_rx.borrow() {
                     return;
@@ -2197,8 +2775,11 @@ async fn run_async(
                 // borrowable both for the dirty-check block below *and* for
                 // every `pl.tick` call afterward, which now also needs a
                 // fresh `&Volume` each tick for its own window cache.
+                let section = std::time::Instant::now();
                 let terrain = cached_terrain_snapshot(&replica, &terrain_cache);
+                profile.snapshot.add(section.elapsed());
                 let terrain_volume = terrain.as_ref().map(|t| t.volume.clone());
+                let section = std::time::Instant::now();
                 let (body_collisions, traced_samplers) = {
                     let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
                     // Scripted runs only: what the renderer would draw, for the
@@ -2252,6 +2833,8 @@ async fn run_async(
                     body_collision_versions.retain(|entity, _| live.contains(entity));
                     (bodies, traced_samplers)
                 };
+                profile.bodies.add(section.elapsed());
+                let section = std::time::Instant::now();
                 // All predictor-lock work happens in this non-async block, which
                 // returns the datagram to send (and the predicted feet position
                 // for the residency pass) once the guard is dropped.
@@ -2512,6 +3095,7 @@ async fn run_async(
                         window_stats,
                     )
                 };
+                profile.predictor.add(section.elapsed());
                 if let Some(frame) = frame {
                     let _ = conn.send_datagram(frame.input_seq.0, &frame).await;
                 }
@@ -2548,10 +3132,12 @@ async fn run_async(
                 }
                 // Slice E2: evict / request-reload terrain around the player.
                 if let (Some(pass), Some(feet)) = (residency.as_mut(), feet) {
+                    let section = std::time::Instant::now();
                     let reqs = {
                         let mut guard = replica.lock().unwrap_or_else(|e| e.into_inner());
                         pass.step(&mut guard, feet)
                     };
+                    profile.residency.add(section.elapsed());
                     counters
                         .residency_evictions
                         .store(pass.evictions_total(), Ordering::Relaxed);
@@ -2579,6 +3165,7 @@ async fn run_async(
                 if end_tick > 0 && script_tick.is_some_and(|t| t > end_tick + 360) {
                     return;
                 }
+                profile.finish_iteration();
                 tokio::time::sleep(Duration::from_millis(16)).await;
             }
         })
@@ -2684,11 +3271,14 @@ async fn run_async(
                     request_id: RequestId(index as u64 + 1),
                     command,
                 };
-                if conn
-                    .send_record(WireRecord::AdminRequest(request))
-                    .await
-                    .is_err()
-                {
+                let sent = conn.send_record(WireRecord::AdminRequest(request)).await;
+                tracing::info!(
+                    at_tick,
+                    observed_tick = counters.last_tick.load(Ordering::Relaxed),
+                    sent = sent.is_ok(),
+                    "scripted admin request sent"
+                );
+                if sent.is_err() {
                     break;
                 }
             }
@@ -2767,6 +3357,7 @@ async fn run_async(
     }
     retrier.abort();
     admin_scripter.abort();
+    control_monitor.abort();
     liveness.abort();
 
     let _ = conn.say_bye("client complete").await;
@@ -2835,6 +3426,16 @@ async fn run_async(
             }
         }
     };
+    // Diagnostic: `SPALL_DUMP_LOGICAL_BRICKS=<prefix>` writes this replica's terrain brick listing.
+    if let Ok(prefix) = std::env::var("SPALL_DUMP_LOGICAL_BRICKS") {
+        let replica = guard.dump_terrain_listing(std::path::Path::new(&format!(
+            "{prefix}.{}.txt",
+            std::process::id()
+        )));
+        if let Err(error) = replica {
+            tracing::error!(%error, "could not write the logical brick listing");
+        }
+    }
     let summary = ClientSummary {
         version: 5,
         result: if catch_up_exhausted {
@@ -2912,6 +3513,15 @@ async fn run_async(
         late_join_baseline_compressed_bytes: counters
             .late_join_baseline_compressed_bytes
             .load(Ordering::Relaxed),
+        catalogue_complete_ms: counters.catalogue_complete_ms.load(Ordering::Relaxed),
+        catalogue_compressed_bytes: counters.catalogue_compressed_bytes.load(Ordering::Relaxed),
+        catalogue_pending_at_end: catalogue_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some(),
+        held_repair_transactions_at_end: guard.pending_repair_txn_count() as u64,
+        held_bulk_split_transactions_at_end: guard.pending_bulk_split_txn_count() as u64,
+        held_catalogue_transactions_at_end: guard.catalogue_deferred_count() as u64,
         late_join_baseline_install_ms: counters
             .late_join_baseline_install_ms
             .load(Ordering::Relaxed),
@@ -2948,7 +3558,7 @@ mod retry_tests {
 
     #[test]
     fn overload_retries_back_off_exponentially_and_are_bounded() {
-        let delays: Vec<_> = (0..7).map(|tries| retry_backoff(true, tries)).collect();
+        let delays: Vec<_> = (0..7).map(|tries| retry_backoff(true, tries, 7)).collect();
         assert_eq!(
             delays,
             vec![
@@ -2964,10 +3574,27 @@ mod retry_tests {
     }
 
     #[test]
-    fn throttle_retries_keep_their_short_bounded_schedule() {
-        assert_eq!(retry_backoff(false, 0), Some(Duration::from_millis(40)));
-        assert_eq!(retry_backoff(false, 3), Some(Duration::from_millis(40)));
-        assert_eq!(retry_backoff(false, 4), None);
+    fn throttle_retries_back_off_with_per_request_jitter_and_are_bounded() {
+        for id in [0u64, 1, 12345, u64::MAX] {
+            let delays: Vec<Duration> = (0..8)
+                .map(|tries| retry_backoff(false, tries, id).expect("within the budget"))
+                .collect();
+            for (tries, delay) in delays.iter().enumerate() {
+                let base = 40u64 << (tries as u32).min(3);
+                let ms = delay.as_millis() as u64;
+                assert!(
+                    (base..base + 40).contains(&ms),
+                    "try {tries}: {ms} ms not in {base}..{}",
+                    base + 40
+                );
+            }
+            assert_eq!(retry_backoff(false, 8, id), None, "bounded");
+        }
+        // Different requests do not all retry at the same instant.
+        let spread: std::collections::BTreeSet<_> = (0..50u64)
+            .map(|id| retry_backoff(false, 0, id).unwrap())
+            .collect();
+        assert!(spread.len() > 10, "{} distinct delays", spread.len());
     }
 
     #[test]

@@ -33,6 +33,83 @@ fn idx_of(x: usize, y: usize, z: usize) -> usize {
 /// Canonical order key for a node: `(z, y, x, local)`.
 type NodeOrder = (i64, i64, i64, u16);
 
+/// Raw `(x, y, z)` brick key.
+type BrickKey = (i64, i64, i64);
+
+/// A node's neighbours as slab indices, kept inline up to [`INLINE_NEIGHBOURS`] (a brick has six
+/// faces, so almost every node fits) so cloning a graph copies memory instead of making one heap
+/// allocation per node. Order is unspecified and an index appears at most once.
+#[derive(Debug, Clone, Default)]
+enum Neighbours {
+    #[default]
+    Empty,
+    Inline {
+        len: u8,
+        slots: [u32; INLINE_NEIGHBOURS],
+    },
+    Heap(Vec<u32>),
+}
+
+const INLINE_NEIGHBOURS: usize = 6;
+
+impl Neighbours {
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Empty => &[],
+            Self::Inline { len, slots } => &slots[..usize::from(*len)],
+            Self::Heap(items) => items,
+        }
+    }
+
+    fn push(&mut self, node: u32) {
+        match self {
+            Self::Empty => {
+                let mut slots = [0; INLINE_NEIGHBOURS];
+                slots[0] = node;
+                *self = Self::Inline { len: 1, slots };
+            }
+            Self::Inline { len, slots } => {
+                if usize::from(*len) < INLINE_NEIGHBOURS {
+                    slots[usize::from(*len)] = node;
+                    *len += 1;
+                } else {
+                    let mut items = slots.to_vec();
+                    items.push(node);
+                    *self = Self::Heap(items);
+                }
+            }
+            Self::Heap(items) => items.push(node),
+        }
+    }
+
+    /// Removes `node` if present (order of the rest is not preserved).
+    fn remove(&mut self, node: u32) {
+        match self {
+            Self::Empty => {}
+            Self::Inline { len, slots } => {
+                let at = slots[..usize::from(*len)].iter().position(|&n| n == node);
+                if let Some(at) = at {
+                    *len -= 1;
+                    slots[at] = slots[usize::from(*len)];
+                    if *len == 0 {
+                        *self = Self::Empty;
+                    }
+                }
+            }
+            Self::Heap(items) => {
+                if let Some(at) = items.iter().position(|&n| n == node) {
+                    items.swap_remove(at);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+}
+
 /// Cooperative cancellation flag for a structural search. Cheap to clone; all
 /// clones share one atomic.
 #[derive(Debug, Clone, Default)]
@@ -138,6 +215,11 @@ struct NodeData {
     /// Face-adjacent neighbour bricks that are not resident but where this
     /// component has a solid boundary cell. Sorted canonical, de-duplicated.
     unresolved: Vec<BrickCoord>,
+    /// Absent / failed neighbour bricks this node probed while it was built; they are
+    /// counted into [`SupportGraph::absent_neighbours`] / `failed_neighbours` and
+    /// uncounted when the node is dropped.
+    absent: Vec<BrickKey>,
+    failed: Vec<BrickKey>,
 }
 
 /// Stable id for a global component within one [`SupportGraph`] state, assigned
@@ -169,21 +251,32 @@ pub struct SupportGraph {
     /// Per-brick labelling, keyed by raw `(x, y, z)`. Only bricks with at least
     /// one solid cell are kept.
     labels: BTreeMap<(i64, i64, i64), Arc<BrickLabels>>,
-    /// Revision each labelled brick was read at (feeds the job token).
+    /// Revision each labelled brick was read at (feeds the job token). Keyed `(z, y, x)`, not
+    /// `(x, y, z)` like the other maps, so iteration is already in canonical order and building the
+    /// token needs no sort.
     brick_revision: BTreeMap<(i64, i64, i64), Revision>,
     /// Neighbour bricks probed during assembly that were absent. This includes
     /// all-resident empty-space assumptions so a later load invalidates a
     /// completed analysis.
-    absent_neighbours: BTreeSet<(i64, i64, i64)>,
-    /// Neighbour bricks probed during assembly whose load had failed.
-    failed_neighbours: BTreeSet<(i64, i64, i64)>,
-    nodes: Vec<NodeData>,
-    node_of: BTreeMap<NodeOrder, usize>,
-    adj: Vec<BTreeSet<usize>>,
+    /// Each key maps to how many nodes probed it.
+    absent_neighbours: BTreeMap<BrickKey, u32>,
+    /// Neighbour bricks probed during assembly whose load had failed (counted likewise).
+    failed_neighbours: BTreeMap<BrickKey, u32>,
+    /// Node slab: an index is a node's identity for as long as it lives, so adding or
+    /// dropping a node never renumbers another (`None` marks a free slot).
+    nodes: Vec<Option<NodeData>>,
+    free_nodes: Vec<u32>,
+    node_of: BTreeMap<NodeOrder, u32>,
+    /// Undirected edges as slab indices, in no particular order, never duplicated.
+    adj: Vec<Neighbours>,
     components: Vec<GlobalComponent>,
+    /// Component of each slab slot (`u32::MAX` for a free slot).
     node_component: Vec<u32>,
     /// Set while a budget-limited component scan is partway done.
     stashed: Option<ScanState>,
+    /// Bricks relabelled whose nodes and edges have not been refreshed yet, so an
+    /// interrupted update is finished by the next one rather than lost.
+    pending_dirty: BTreeSet<BrickKey>,
 }
 
 impl SupportGraph {
@@ -225,14 +318,16 @@ impl SupportGraph {
             residency,
             labels: BTreeMap::new(),
             brick_revision: BTreeMap::new(),
-            absent_neighbours: BTreeSet::new(),
-            failed_neighbours: BTreeSet::new(),
+            absent_neighbours: BTreeMap::new(),
+            failed_neighbours: BTreeMap::new(),
             nodes: Vec::new(),
+            free_nodes: Vec::new(),
             node_of: BTreeMap::new(),
             adj: Vec::new(),
             components: Vec::new(),
             node_component: Vec::new(),
             stashed: None,
+            pending_dirty: BTreeSet::new(),
         };
         for coord in volume.resident_brick_coords() {
             if cancel.is_cancelled() {
@@ -241,9 +336,13 @@ impl SupportGraph {
             graph.relabel_brick(volume, coord, cache);
         }
         if let Some(cache) = cache {
-            cache.retain_volume(volume.id(), |key| graph.brick_revision.contains_key(key));
+            cache.retain_volume(volume.id(), |key| {
+                graph.brick_revision.contains_key(&(key.2, key.1, key.0))
+            });
         }
-        graph.reassemble(volume, cancel, SearchBudget::UNLIMITED)?;
+        let all: Vec<BrickKey> = graph.labels.keys().copied().collect();
+        graph.refresh_nodes(volume, &all, true);
+        graph.run_scan(cancel, SearchBudget::UNLIMITED, None)?;
         Ok(graph)
     }
 
@@ -270,20 +369,17 @@ impl SupportGraph {
     /// The component a node belongs to, if the node exists and the scan is done.
     pub fn component_of(&self, key: NodeKey) -> Option<&GlobalComponent> {
         let &node = self.node_of.get(&key.order())?;
-        let cid = *self.node_component.get(node)? as usize;
+        let cid = *self.node_component.get(node as usize)? as usize;
         self.components.get(cid)
     }
 
     /// `(brick coord, revision)` for every labelled brick, in canonical
     /// `(z, y, x)` order.
     pub fn read_revisions(&self) -> impl Iterator<Item = (BrickCoord, Revision)> + '_ {
-        let mut out: Vec<(BrickCoord, Revision)> = self
-            .brick_revision
+        // The map is keyed `(z, y, x)`, so its iteration order is already canonical.
+        self.brick_revision
             .iter()
-            .map(|(&(x, y, z), &rev)| (BrickCoord::new(x, y, z), rev))
-            .collect();
-        out.sort_by_key(|(c, _)| c.sort_key());
-        out.into_iter()
+            .map(|(&(z, y, x), &rev)| (BrickCoord::new(x, y, z), rev))
     }
 
     /// Neighbour bricks that were absent during assembly, in canonical `(z, y,
@@ -292,7 +388,7 @@ impl SupportGraph {
     pub fn absent_dependencies(&self) -> impl Iterator<Item = BrickCoord> + '_ {
         let mut out: Vec<BrickCoord> = self
             .absent_neighbours
-            .iter()
+            .keys()
             .map(|&(x, y, z)| BrickCoord::new(x, y, z))
             .collect();
         out.sort_by_key(|c| c.sort_key());
@@ -304,7 +400,7 @@ impl SupportGraph {
     pub fn failed_dependencies(&self) -> impl Iterator<Item = BrickCoord> + '_ {
         let mut out: Vec<BrickCoord> = self
             .failed_neighbours
-            .iter()
+            .keys()
             .map(|&(x, y, z)| BrickCoord::new(x, y, z))
             .collect();
         out.sort_by_key(|c| c.sort_key());
@@ -325,9 +421,11 @@ impl SupportGraph {
         self.component_of(NodeKey { brick, local }).map(|c| c.id)
     }
 
-    /// Relabels the given bricks from `volume` (their labels are invalidated),
-    /// then reassembles nodes, edges, and components. This is the deletion /
-    /// edit invalidation path: only `changed` bricks pay the flood-fill cost.
+    /// Relabels the given bricks from `volume` (their labels are invalidated), then patches
+    /// the nodes and edges of those bricks and their face neighbours and recomputes the
+    /// global components. This is the deletion / edit invalidation path: only `changed`
+    /// bricks pay the flood-fill cost, and only they and their neighbours pay node and edge
+    /// construction. The result is identical to a fresh [`Self::build`] of `volume`.
     pub fn apply_changes(
         &mut self,
         volume: &Volume,
@@ -335,13 +433,33 @@ impl SupportGraph {
         cancel: &CancelToken,
         budget: SearchBudget,
     ) -> Result<(), Interrupted> {
-        for &coord in changed {
+        self.stashed = None;
+        self.pending_dirty
+            .extend(changed.iter().map(|c| (c.x, c.y, c.z)));
+        // Relabel everything still pending, not just `changed`: an earlier update that was
+        // cancelled before it finished left its bricks here.
+        let pending: Vec<BrickKey> = self.pending_dirty.iter().copied().collect();
+        for (x, y, z) in pending {
             if cancel.is_cancelled() {
                 return Err(Interrupted::Cancelled);
             }
-            self.relabel_brick(volume, coord, None);
+            self.relabel_brick(volume, BrickCoord::new(x, y, z), None);
         }
-        self.reassemble(volume, cancel, budget)
+        self.components.clear();
+        self.node_component.clear();
+        let mut dirty: BTreeSet<BrickKey> = BTreeSet::new();
+        for (x, y, z) in std::mem::take(&mut self.pending_dirty) {
+            dirty.insert((x, y, z));
+            for axis in 0..3usize {
+                for step in [-1, 1] {
+                    let n = axis_step(BrickCoord::new(x, y, z), axis, step);
+                    dirty.insert((n.x, n.y, n.z));
+                }
+            }
+        }
+        let dirty: Vec<BrickKey> = dirty.into_iter().collect();
+        self.refresh_nodes(volume, &dirty, false);
+        self.run_scan(cancel, budget, None)
     }
 
     /// Continues a component scan left pending by an [`Interrupted::Budget`].
@@ -381,90 +499,126 @@ impl SupportGraph {
                 } else {
                     self.labels.insert(key, labels);
                 }
-                self.brick_revision.insert(key, revision);
+                self.brick_revision
+                    .insert((coord.z, coord.y, coord.x), revision);
             }
             _ => {
                 self.labels.remove(&key);
-                self.brick_revision.remove(&key);
+                self.brick_revision.remove(&(coord.z, coord.y, coord.x));
             }
         }
     }
 
-    /// Rebuilds nodes, edges, and global components from the current label map.
+    /// Rebuilds the nodes and edges of the `dirty` bricks (sorted) from the current label
+    /// map: every node of a dirty brick is dropped together with its edges, then recreated
+    /// for the brick's current labelling, and every face shared between a dirty brick and a
+    /// labelled neighbour is linked again. `all` says every labelled brick is dirty.
     ///
-    /// Labelling (per-brick flood fill) is incremental — only changed bricks are
-    /// relabelled by the caller. Graph assembly from the label map is a full
-    /// recompute; at G1 "all resident" scale that is a few hundred nodes. A true
-    /// incremental node/edge patch is a later optimisation, to be added only
-    /// against adversarial tests (docs/architecture.md).
-    fn reassemble(
-        &mut self,
-        volume: &Volume,
-        cancel: &CancelToken,
-        budget: SearchBudget,
-    ) -> Result<(), Interrupted> {
-        self.nodes.clear();
-        self.node_of.clear();
-        self.adj.clear();
-        self.absent_neighbours.clear();
-        self.failed_neighbours.clear();
-        self.components.clear();
-        self.node_component.clear();
-        self.stashed = None;
-
-        let mut ordered: Vec<BrickCoord> = self
-            .labels
-            .keys()
-            .map(|&(x, y, z)| BrickCoord::new(x, y, z))
-            .collect();
-        ordered.sort_by_key(|c| c.sort_key());
-
-        for coord in &ordered {
-            if cancel.is_cancelled() {
-                return Err(Interrupted::Cancelled);
-            }
-            let labels = self.labels[&(coord.x, coord.y, coord.z)].clone();
-            for local in labels.components() {
-                let (anchored, unresolved) = self.node_attributes(volume, *coord, &labels, local);
-                let node = self.nodes.len();
-                let key = NodeKey {
-                    brick: *coord,
-                    local,
-                };
-                self.nodes.push(NodeData {
-                    key,
-                    cell_count: labels.cell_count(local),
-                    anchored,
-                    unresolved,
-                });
-                self.node_of.insert(key.order(), node);
-            }
-        }
-        self.adj = vec![BTreeSet::new(); self.nodes.len()];
-
-        for coord in &ordered {
-            for axis in 0..3usize {
-                let neighbour = axis_step(*coord, axis, 1);
-                if self
-                    .labels
-                    .contains_key(&(neighbour.x, neighbour.y, neighbour.z))
-                {
-                    self.link_face(*coord, neighbour, axis);
+    /// A brick's nodes depend on its own labelling and on the state of its six neighbours,
+    /// so the caller passes every brick whose own state or neighbour's state changed.
+    fn refresh_nodes(&mut self, volume: &Volume, dirty: &[BrickKey], all: bool) {
+        if !self.node_of.is_empty() {
+            for &(x, y, z) in dirty {
+                let doomed: Vec<(NodeOrder, u32)> = self
+                    .node_of
+                    .range((z, y, x, 0)..=(z, y, x, u16::MAX))
+                    .map(|(&order, &node)| (order, node))
+                    .collect();
+                for (order, node) in doomed {
+                    self.remove_node(order, node);
                 }
             }
         }
 
-        self.run_scan(cancel, budget, None)
+        for &key in dirty {
+            let Some(labels) = self.labels.get(&key).cloned() else {
+                continue;
+            };
+            let coord = BrickCoord::new(key.0, key.1, key.2);
+            for local in labels.components() {
+                let (anchored, unresolved, absent, failed) =
+                    self.node_attributes(volume, coord, &labels, local);
+                for &probe in &absent {
+                    *self.absent_neighbours.entry(probe).or_insert(0) += 1;
+                }
+                for &probe in &failed {
+                    *self.failed_neighbours.entry(probe).or_insert(0) += 1;
+                }
+                let node = match self.free_nodes.pop() {
+                    Some(node) => node,
+                    None => {
+                        self.nodes.push(None);
+                        self.adj.push(Neighbours::default());
+                        (self.nodes.len() - 1) as u32
+                    }
+                };
+                let node_key = NodeKey {
+                    brick: coord,
+                    local,
+                };
+                self.nodes[node as usize] = Some(NodeData {
+                    key: node_key,
+                    cell_count: labels.cell_count(local),
+                    anchored,
+                    unresolved,
+                    absent,
+                    failed,
+                });
+                self.node_of.insert(node_key.order(), node);
+            }
+        }
+
+        // Each shared face is linked exactly once: from the lower brick when it is dirty,
+        // otherwise from the dirty upper brick.
+        for &key in dirty {
+            if !self.labels.contains_key(&key) {
+                continue;
+            }
+            let a = BrickCoord::new(key.0, key.1, key.2);
+            for axis in 0..3usize {
+                let upper = axis_step(a, axis, 1);
+                if self.labels.contains_key(&(upper.x, upper.y, upper.z)) {
+                    self.link_face(a, upper, axis);
+                }
+                let lower = axis_step(a, axis, -1);
+                let lower_key = (lower.x, lower.y, lower.z);
+                if self.labels.contains_key(&lower_key)
+                    && !(all || dirty.binary_search(&lower_key).is_ok())
+                {
+                    self.link_face(lower, a, axis);
+                }
+            }
+        }
+    }
+
+    /// Drops one node, its edges, and the neighbour probes it contributed.
+    fn remove_node(&mut self, order: NodeOrder, node: u32) {
+        let neighbours = std::mem::take(&mut self.adj[node as usize]);
+        for &neighbour in neighbours.as_slice() {
+            self.adj[neighbour as usize].remove(node);
+        }
+        let data = self.nodes[node as usize]
+            .take()
+            .expect("an indexed node is live");
+        for probe in data.absent {
+            uncount(&mut self.absent_neighbours, probe);
+        }
+        for probe in data.failed {
+            uncount(&mut self.failed_neighbours, probe);
+        }
+        self.node_of.remove(&order);
+        self.free_nodes.push(node);
     }
 
     /// Anchored flag and unresolved-neighbour list for one node.
+    #[allow(clippy::type_complexity)]
     fn node_attributes(
-        &mut self,
+        &self,
         volume: &Volume,
         coord: BrickCoord,
         labels: &BrickLabels,
         local: LocalComponent,
-    ) -> (bool, Vec<BrickCoord>) {
+    ) -> (bool, Vec<BrickCoord>, Vec<BrickKey>, Vec<BrickKey>) {
         // Per-component facts were computed once when the brick was labelled: a
         // cell on the support plane is a cell at that height in this brick, and
         // a face is present when any cell touches it.
@@ -477,6 +631,8 @@ impl SupportGraph {
             .is_some_and(|local_y| labels.has_layer(local, local_y as u8));
 
         let mut unresolved = Vec::new();
+        let mut absent = Vec::new();
+        let mut failed = Vec::new();
         for (face, &present) in faces.iter().enumerate() {
             if !present {
                 continue;
@@ -503,15 +659,13 @@ impl SupportGraph {
                 // A failed load is always an unresolved dependency and must be
                 // preserved in the exact read-dependency token.
                 Ok(BrickState::Failed) => {
-                    self.failed_neighbours
-                        .insert((neighbour.x, neighbour.y, neighbour.z));
+                    failed.push((neighbour.x, neighbour.y, neighbour.z));
                     unresolved.push(neighbour);
                 }
                 // Absent: unknown only when the world is streamed; under
                 // `AllResident` the caller guarantees this is empty space.
                 Ok(BrickState::Absent) => {
-                    self.absent_neighbours
-                        .insert((neighbour.x, neighbour.y, neighbour.z));
+                    absent.push((neighbour.x, neighbour.y, neighbour.z));
                     if self.residency == ResidencyMode::Streamed {
                         unresolved.push(neighbour);
                     }
@@ -523,7 +677,7 @@ impl SupportGraph {
         }
         unresolved.sort_by_key(|c| c.sort_key());
         unresolved.dedup();
-        (anchored, unresolved)
+        (anchored, unresolved, absent, failed)
     }
 
     /// Adds edges between components of `a` and `b` (`b = a` stepped `+1` on
@@ -580,14 +734,23 @@ impl SupportGraph {
                 local: comp_b,
             }
             .order()];
-            self.adj[na].insert(nb);
-            self.adj[nb].insert(na);
+            self.adj[na as usize].push(nb);
+            self.adj[nb as usize].push(na);
         }
+    }
+
+    fn live(&self, node: usize) -> &NodeData {
+        self.nodes[node].as_ref().expect("an indexed node is live")
     }
 
     /// Runs (or resumes) the connected-component pass. On success writes
     /// `components` / `node_component`. On [`Interrupted::Budget`] or
     /// [`Interrupted::Cancelled`] stashes progress for [`resume`](Self::resume).
+    ///
+    /// Components are discovered by breadth-first search starting from the first unassigned node
+    /// in canonical order, so ids follow the smallest node of each component. Membership is
+    /// assembled once the search has covered every node, by a single pass over the canonical node
+    /// order, which yields each component's nodes already sorted.
     fn run_scan(
         &mut self,
         cancel: &CancelToken,
@@ -599,7 +762,8 @@ impl SupportGraph {
             Some(state) if state.node_component.len() == n => state,
             _ => ScanState {
                 node_component: vec![u32::MAX; n],
-                finished: Vec::new(),
+                order: self.node_of.values().copied().collect(),
+                next_id: 0,
                 next_start: 0,
                 current: None,
             },
@@ -615,20 +779,21 @@ impl SupportGraph {
             let mut part = match state.current.take() {
                 Some(part) => part,
                 None => {
-                    while state.next_start < n && state.node_component[state.next_start] != u32::MAX
+                    while state.next_start < state.order.len()
+                        && state.node_component[state.order[state.next_start] as usize] != u32::MAX
                     {
                         state.next_start += 1;
                     }
-                    if state.next_start >= n {
+                    if state.next_start >= state.order.len() {
                         break;
                     }
-                    let start = state.next_start;
-                    let id = state.finished.len() as u32;
+                    let start = state.order[state.next_start] as usize;
+                    let id = state.next_id;
+                    state.next_id += 1;
                     state.node_component[start] = id;
                     PartialComponent {
                         id,
                         frontier: VecDeque::from([start]),
-                        nodes: vec![start],
                     }
                 }
             };
@@ -643,39 +808,48 @@ impl SupportGraph {
                     break;
                 };
                 settled += 1;
-                for &next in &self.adj[here] {
+                for &next in self.adj[here].as_slice() {
+                    let next = next as usize;
                     if state.node_component[next] == u32::MAX {
                         state.node_component[next] = part.id;
-                        part.nodes.push(next);
                         part.frontier.push_back(next);
                     }
                 }
             }
-
-            part.nodes.sort_by_key(|&i| self.nodes[i].key.order());
-            let mut cell_count = 0u64;
-            let mut anchored = false;
-            let mut unresolved: Vec<BrickCoord> = Vec::new();
-            let mut keys = Vec::with_capacity(part.nodes.len());
-            for &i in &part.nodes {
-                let node = &self.nodes[i];
-                cell_count += u64::from(node.cell_count);
-                anchored |= node.anchored;
-                unresolved.extend(node.unresolved.iter().copied());
-                keys.push(node.key);
-            }
-            unresolved.sort_by_key(|c| c.sort_key());
-            unresolved.dedup();
-            state.finished.push(GlobalComponent {
-                id: GlobalComponentId(part.id),
-                nodes: keys,
-                cell_count,
-                anchored,
-                unresolved,
-            });
         }
 
-        self.components = state.finished;
+        // Every node belongs to a component: gather each component's nodes and totals in one
+        // pass over the canonical order.
+        let count = state.next_id as usize;
+        let mut sizes = vec![0usize; count];
+        for &node in &state.order {
+            sizes[state.node_component[node as usize] as usize] += 1;
+        }
+        let mut components: Vec<GlobalComponent> = sizes
+            .iter()
+            .enumerate()
+            .map(|(id, &size)| GlobalComponent {
+                id: GlobalComponentId(id as u32),
+                nodes: Vec::with_capacity(size),
+                cell_count: 0,
+                anchored: false,
+                unresolved: Vec::new(),
+            })
+            .collect();
+        for &node_index in &state.order {
+            let node = self.live(node_index as usize);
+            let component = &mut components[state.node_component[node_index as usize] as usize];
+            component.cell_count += u64::from(node.cell_count);
+            component.anchored |= node.anchored;
+            component.unresolved.extend(node.unresolved.iter().copied());
+            component.nodes.push(node.key);
+        }
+        for component in &mut components {
+            component.unresolved.sort_by_key(|c| c.sort_key());
+            component.unresolved.dedup();
+        }
+
+        self.components = components;
         self.node_component = state.node_component;
         self.stashed = None;
         Ok(())
@@ -685,7 +859,10 @@ impl SupportGraph {
 #[derive(Debug, Clone)]
 struct ScanState {
     node_component: Vec<u32>,
-    finished: Vec<GlobalComponent>,
+    /// Live node slots in canonical order: the order components are discovered in.
+    order: Vec<u32>,
+    /// Components started so far.
+    next_id: u32,
     next_start: usize,
     current: Option<PartialComponent>,
 }
@@ -694,7 +871,16 @@ struct ScanState {
 struct PartialComponent {
     id: u32,
     frontier: VecDeque<usize>,
-    nodes: Vec<usize>,
+}
+
+/// Drops one reference to `probe`, forgetting it at zero.
+fn uncount(counts: &mut BTreeMap<BrickKey, u32>, probe: BrickKey) {
+    if let Some(count) = counts.get_mut(&probe) {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&probe);
+        }
+    }
 }
 
 #[inline]
@@ -761,7 +947,7 @@ mod tests {
         assert_eq!(expected.len(), 513);
         assert_eq!(expected.iter().filter(|c| c.anchored).count(), 17);
         assert_eq!(
-            graph.reassemble(&volume, &cancel, SearchBudget { max_nodes: 1 }),
+            graph.apply_changes(&volume, &[], &cancel, SearchBudget { max_nodes: 1 }),
             Err(Interrupted::Budget)
         );
         while graph.is_scan_pending() {
@@ -869,5 +1055,239 @@ mod tests {
             g.failed_dependencies().collect::<Vec<_>>(),
             vec![BrickCoord::new(-1, 0, 0)]
         );
+    }
+
+    /// Everything observable about a graph, canonicalised so two graphs that describe the
+    /// same volume compare equal regardless of how they were built.
+    #[derive(Debug, PartialEq)]
+    struct View {
+        components: Vec<GlobalComponent>,
+        nodes: Vec<(NodeOrder, u32, bool, Vec<BrickCoord>)>,
+        edges: BTreeSet<(NodeOrder, NodeOrder)>,
+        node_components: Vec<(NodeOrder, u32)>,
+        absent: Vec<BrickCoord>,
+        failed: Vec<BrickCoord>,
+        revisions: Vec<(BrickCoord, Revision)>,
+        labels: Vec<(BrickCoord, u16)>,
+    }
+
+    fn view(g: &SupportGraph) -> View {
+        let order_of = |node: u32| g.nodes[node as usize].as_ref().unwrap().key.order();
+        let mut edges = BTreeSet::new();
+        for (node, neighbours) in g.adj.iter().enumerate() {
+            if g.nodes[node].is_none() {
+                assert!(neighbours.is_empty(), "a free slot keeps no edges");
+                continue;
+            }
+            let mut seen = BTreeSet::new();
+            for &other in neighbours.as_slice() {
+                assert!(seen.insert(other), "an edge is never duplicated");
+                edges.insert((order_of(node as u32), order_of(other)));
+            }
+        }
+        let mut nodes: Vec<_> = g
+            .node_of
+            .iter()
+            .map(|(&order, &node)| {
+                let data = g.nodes[node as usize].as_ref().unwrap();
+                assert_eq!(data.key.order(), order);
+                (
+                    order,
+                    data.cell_count,
+                    data.anchored,
+                    data.unresolved.clone(),
+                )
+            })
+            .collect();
+        nodes.sort();
+        let mut node_components: Vec<_> = g
+            .node_of
+            .iter()
+            .map(|(&order, &node)| (order, g.node_component[node as usize]))
+            .collect();
+        node_components.sort();
+        View {
+            components: g.components().to_vec(),
+            nodes,
+            edges,
+            node_components,
+            absent: g.absent_dependencies().collect(),
+            failed: g.failed_dependencies().collect(),
+            revisions: g.read_revisions().collect(),
+            labels: g
+                .labels
+                .iter()
+                .map(|(&(x, y, z), l)| (BrickCoord::new(x, y, z), l.count()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn neighbour_lists_behave_as_sets_across_the_inline_and_heap_representations() {
+        let mut list = Neighbours::default();
+        assert!(list.is_empty());
+        let mut model: BTreeSet<u32> = BTreeSet::new();
+        // Grow past the inline capacity, then shrink back below it, checking against a set at
+        // every step; remove absent entries and the last entry too.
+        for step in 0..40u32 {
+            let value = (step * 7) % 23;
+            if model.insert(value) {
+                list.push(value);
+            }
+            if step % 3 == 2 {
+                let victim = (step * 5) % 23;
+                model.remove(&victim);
+                list.remove(victim);
+            }
+            let got: BTreeSet<u32> = list.as_slice().iter().copied().collect();
+            assert_eq!(got, model, "step {step}");
+            assert_eq!(
+                list.as_slice().len(),
+                model.len(),
+                "no duplicates at step {step}"
+            );
+        }
+        for value in model.clone() {
+            list.remove(value);
+        }
+        assert!(list.is_empty());
+        list.remove(99);
+        assert!(list.is_empty());
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> i64 {
+            (self.next() % n) as i64
+        }
+    }
+
+    fn assert_matches_fresh(
+        g: &SupportGraph,
+        volume: &Volume,
+        anchor: AnchorPlane,
+        mode: ResidencyMode,
+        what: &str,
+    ) {
+        let fresh = SupportGraph::build(volume, anchor, mode, &CancelToken::new()).unwrap();
+        assert_eq!(view(g), view(&fresh), "incremental != fresh after {what}");
+    }
+
+    #[test]
+    fn an_incrementally_updated_graph_equals_a_fresh_build_after_every_change() {
+        for (seed, anchor_y, mode) in [
+            (0x9E37_79B9_7F4A_7C15_u64, 0, ResidencyMode::AllResident),
+            (0xD1B5_4A32_D192_ED03, 33, ResidencyMode::Streamed),
+            (0x2545_F491_4F6C_DD1D, 5, ResidencyMode::AllResident),
+            (0x8CB9_2BA7_2F3D_8DD7, 64, ResidencyMode::Streamed),
+        ] {
+            let mut rng = Rng(seed);
+            let mut volume = vol();
+            let anchor = AnchorPlane::at(anchor_y);
+            let cancel = CancelToken::new();
+            // Start from some terrain so edits have something to cut.
+            for _ in 0..6 {
+                let (x, y, z) = (rng.below(90), rng.below(90), rng.below(90));
+                fill(
+                    &mut volume,
+                    GlobalCell::new(x, y, z),
+                    GlobalCell::new(x + rng.below(40), y + rng.below(40), z + rng.below(40)),
+                );
+            }
+            let mut graph = SupportGraph::build(&volume, anchor, mode, &cancel).unwrap();
+            assert_matches_fresh(&graph, &volume, anchor, mode, "the initial build");
+
+            for step in 0..60 {
+                let mut changed: Vec<BrickCoord> = Vec::new();
+                let what = match rng.below(10) {
+                    0 => {
+                        let coord = BrickCoord::new(rng.below(4), rng.below(4), rng.below(4));
+                        volume.evict_brick(coord);
+                        changed.push(coord);
+                        "an eviction"
+                    }
+                    1 => {
+                        let coord = BrickCoord::new(rng.below(5) - 1, rng.below(4), rng.below(4));
+                        if volume.mark_failed(coord).is_ok() {
+                            changed.push(coord);
+                        }
+                        "a load failure"
+                    }
+                    n => {
+                        let (x, y, z) =
+                            (rng.below(110) - 5, rng.below(110) - 5, rng.below(110) - 5);
+                        let (b0, b1) = (
+                            GlobalCell::new(x, y, z),
+                            GlobalCell::new(
+                                x + rng.below(30),
+                                y + rng.below(30),
+                                z + rng.below(30),
+                            ),
+                        );
+                        let material = if n < 6 {
+                            MaterialId::AIR
+                        } else {
+                            MaterialId(1)
+                        };
+                        if let Ok(outcome) =
+                            volume.apply_edit(&EditPlan::filled_box(volume.id(), b0, b1, material))
+                        {
+                            changed.extend(outcome.bricks.iter().map(|b| b.coord));
+                        }
+                        "a box edit"
+                    }
+                };
+                graph
+                    .apply_changes(&volume, &changed, &cancel, SearchBudget::UNLIMITED)
+                    .unwrap();
+                assert_matches_fresh(
+                    &graph,
+                    &volume,
+                    anchor,
+                    mode,
+                    &format!("{what} (step {step})"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cancelled_update_is_finished_by_the_next_one() {
+        let mut volume = vol();
+        let anchor = AnchorPlane::at(0);
+        let mode = ResidencyMode::AllResident;
+        fill(
+            &mut volume,
+            GlobalCell::new(0, 0, 0),
+            GlobalCell::new(70, 5, 70),
+        );
+        let mut graph = SupportGraph::build(&volume, anchor, mode, &CancelToken::new()).unwrap();
+        let cut = volume
+            .apply_edit(&EditPlan::filled_box(
+                volume.id(),
+                GlobalCell::new(30, 0, 0),
+                GlobalCell::new(33, 5, 70),
+                MaterialId::AIR,
+            ))
+            .unwrap();
+        let changed: Vec<BrickCoord> = cut.bricks.iter().map(|b| b.coord).collect();
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            graph.apply_changes(&volume, &changed, &cancelled, SearchBudget::UNLIMITED),
+            Err(Interrupted::Cancelled)
+        );
+        // The interrupted bricks are remembered: a later update that names nothing new
+        // still produces the exact graph.
+        graph
+            .apply_changes(&volume, &[], &CancelToken::new(), SearchBudget::UNLIMITED)
+            .unwrap();
+        assert_matches_fresh(&graph, &volume, anchor, mode, "a cancelled update");
     }
 }

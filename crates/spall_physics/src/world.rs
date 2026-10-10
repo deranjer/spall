@@ -110,6 +110,35 @@ pub struct BodySpec {
     pub linvel_m_s: [f32; 3],
 }
 
+/// A body whose collider was built ahead of time. Everything in [`BodySpec`] except the grid.
+pub struct PreparedBodySpec {
+    pub kind: BodyKind,
+    pub representation: Representation,
+    pub cell_m: f32,
+    pub density_kg_m3: f32,
+    pub mass_properties: Option<BodyMassProperties>,
+    pub translation_m: [f32; 3],
+    pub linvel_m_s: [f32; 3],
+}
+
+/// A collider built from an occupancy grid, ready to attach to a body.
+///
+/// Building is a pure function of the grid, the cell size and the representation, so it can run
+/// on any thread and for many bodies at once; only attaching it to the solver needs the world.
+pub struct PreparedCollider {
+    build: crate::collider::ColliderBuild,
+    offset_m: [f32; 3],
+}
+
+impl PreparedCollider {
+    pub fn new(grid: &OccupancyGrid, cell_m: f32, representation: Representation) -> Self {
+        Self {
+            build: build_collider(grid, cell_m, representation),
+            offset_m: grid_origin_offset_m(grid, cell_m),
+        }
+    }
+}
+
 /// Kinematic snapshot of one body after a step.
 #[derive(Debug, Clone, Copy)]
 pub struct BodyState {
@@ -299,6 +328,49 @@ const CARRY_MARGIN_M: f32 = 0.05;
 /// Slowest horizontal character speed (m/s) that still carries bodies.
 const CARRY_MIN_SPEED_M_S: f32 = 0.1;
 
+/// A prebuilt set of bodies whose colliders are left out of character queries (see
+/// [`PhysicsWorld::exclusion_for`]). Colliders carry their owning body's id, so the set stays
+/// valid while a body's collider is rebuilt (which gives it a new Rapier handle); only adding or
+/// removing bodies changes it.
+#[derive(Debug, Clone, Default)]
+pub struct ColliderExclusion {
+    bodies: std::collections::HashSet<BodyId>,
+}
+
+impl ColliderExclusion {
+    pub fn len(&self) -> usize {
+        self.bodies.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bodies.is_empty()
+    }
+
+    /// `user_data` is the owner's id plus one, so a collider that was never tagged (zero) is never
+    /// mistaken for the body with id 0.
+    fn excludes(&self, collider: &Collider) -> bool {
+        collider.user_data != 0
+            && self
+                .bodies
+                .contains(&BodyId((collider.user_data - 1) as u64))
+    }
+}
+
+struct CombinedExclusion<'a> {
+    base: &'a ColliderExclusion,
+    extra: &'a ColliderExclusion,
+}
+
+impl CombinedExclusion<'_> {
+    fn excludes(&self, collider: &Collider) -> bool {
+        self.base.excludes(collider) || self.extra.excludes(collider)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.base.is_empty() && self.extra.is_empty()
+    }
+}
+
 impl PhysicsWorld {
     /// Creates an empty world.
     pub fn new(cfg: PhysicsConfig) -> Self {
@@ -347,32 +419,48 @@ impl PhysicsWorld {
         &mut self,
         spec: &BodySpec,
     ) -> (RigidBodyHandle, ColliderHandle, [f32; 3]) {
-        let rb = match spec.kind {
+        let prepared = PreparedCollider::new(&spec.grid, spec.cell_m, spec.representation);
+        self.insert_prepared_rapier_body(
+            spec.kind,
+            spec.mass_properties,
+            spec.density_kg_m3,
+            spec.translation_m,
+            spec.linvel_m_s,
+            &prepared,
+        )
+    }
+
+    fn insert_prepared_rapier_body(
+        &mut self,
+        kind: BodyKind,
+        mass_properties: Option<BodyMassProperties>,
+        density_kg_m3: f32,
+        translation_m: [f32; 3],
+        linvel_m_s: [f32; 3],
+        prepared: &PreparedCollider,
+    ) -> (RigidBodyHandle, ColliderHandle, [f32; 3]) {
+        let rb = match kind {
             BodyKind::Fixed => RigidBodyBuilder::fixed(),
             BodyKind::Dynamic { ccd } => RigidBodyBuilder::dynamic()
-                .linvel(Vector::new(
-                    spec.linvel_m_s[0],
-                    spec.linvel_m_s[1],
-                    spec.linvel_m_s[2],
-                ))
+                .linvel(Vector::new(linvel_m_s[0], linvel_m_s[1], linvel_m_s[2]))
                 .ccd_enabled(ccd),
         }
         .translation(Vector::new(
-            spec.translation_m[0],
-            spec.translation_m[1],
-            spec.translation_m[2],
+            translation_m[0],
+            translation_m[1],
+            translation_m[2],
         ))
         .build();
         let body = self.bodies.insert(rb);
 
-        let built = build_collider(&spec.grid, spec.cell_m, spec.representation);
-        let offset = grid_origin_offset_m(&spec.grid, spec.cell_m);
+        let built = &prepared.build;
+        let offset = prepared.offset_m;
         // With explicit mass properties the collision shape must not contribute
         // mass: the body carries the fine-grid mass / COM / inertia directly.
-        let collider_density = if spec.mass_properties.is_some() {
+        let collider_density = if mass_properties.is_some() {
             0.0
         } else {
-            spec.density_kg_m3
+            density_kg_m3
         };
         let collider = ColliderBuilder::new(built.collider.shared_shape().clone())
             .density(collider_density)
@@ -382,13 +470,49 @@ impl PhysicsWorld {
             .colliders
             .insert_with_parent(collider, body, &mut self.bodies);
 
-        if let Some(props) = spec.mass_properties {
+        if let Some(props) = mass_properties {
             let rb = &mut self.bodies[body];
             rb.set_additional_mass_properties(rapier_mass_properties(props, offset), false);
             rb.recompute_mass_properties_from_colliders(&self.colliders);
         }
         self.pending_modified.push(collider);
         (body, collider, offset)
+    }
+
+    /// Adds a body whose collider was built ahead of time with [`PreparedCollider::new`] from
+    /// the same grid, cell size and representation. Identical to [`Self::add_body`] with that
+    /// grid, but the expensive shape construction has already happened, possibly on another
+    /// thread. Ids and handles are assigned in call order, so adding prepared bodies in a fixed
+    /// order gives the same world however they were built.
+    pub fn add_prepared_body(
+        &mut self,
+        spec: PreparedBodySpec,
+        prepared: PreparedCollider,
+    ) -> BodyId {
+        let (body, collider, offset) = self.insert_prepared_rapier_body(
+            spec.kind,
+            spec.mass_properties,
+            spec.density_kg_m3,
+            spec.translation_m,
+            spec.linvel_m_s,
+            &prepared,
+        );
+        let id = BodyId((u64::from(self.id_namespace) << 32) | self.entries.len() as u64);
+        self.entries.push(Entry {
+            body,
+            collider,
+            cell_m: spec.cell_m,
+            representation: spec.representation,
+            density: spec.density_kg_m3,
+            collider_offset_m: offset,
+            mass_properties: spec.mass_properties,
+            retired: false,
+            dormant: false,
+            query_only: false,
+            restitution: 0.0,
+        });
+        self.tag_collider(collider, id);
+        id
     }
 
     /// Adds a body and returns its stable id.
@@ -409,6 +533,7 @@ impl PhysicsWorld {
             query_only: false,
             restitution: 0.0,
         });
+        self.tag_collider(collider, id);
         id
     }
 
@@ -469,6 +594,7 @@ impl PhysicsWorld {
         }
         let total = start.elapsed();
 
+        self.tag_collider(handle, id);
         self.entries[entry_index(id, self.id_namespace)].collider = handle;
         self.entries[entry_index(id, self.id_namespace)].representation = rep;
         self.entries[entry_index(id, self.id_namespace)].collider_offset_m = offset;
@@ -613,6 +739,7 @@ impl PhysicsWorld {
             linvel_m_s,
         };
         let (body, collider, offset) = self.insert_rapier_body(&spec);
+        self.tag_collider(collider, id);
         let entry = &mut self.entries[entry_index(id, self.id_namespace)];
         entry.body = body;
         entry.collider = collider;
@@ -885,11 +1012,50 @@ impl PhysicsWorld {
         dt_s: f32,
         exclude: &[BodyId],
     ) -> crate::character::CharacterMove {
-        let handles: Vec<ColliderHandle> = exclude
-            .iter()
-            .filter(|id| !self.entries[entry_index(*id, self.id_namespace)].retired)
-            .map(|id| self.entries[entry_index(id, self.id_namespace)].collider)
-            .collect();
+        let base = self.exclusion_for(exclude.iter().copied());
+        self.sweep_character_pushing_excluding_set(
+            params,
+            position_m,
+            desired_translation_m,
+            dt_s,
+            &base,
+            &[],
+        )
+    }
+
+    /// The bodies `ids` as a reusable [`ColliderExclusion`].
+    pub fn exclusion_for(&self, ids: impl IntoIterator<Item = BodyId>) -> ColliderExclusion {
+        ColliderExclusion {
+            bodies: ids.into_iter().collect(),
+        }
+    }
+
+    /// Records which body owns `collider`, so a query can tell whose it is without the handle.
+    fn tag_collider(&mut self, collider: ColliderHandle, id: BodyId) {
+        if let Some(c) = self.colliders.get_mut(collider) {
+            c.user_data = u128::from(id.0) + 1;
+        }
+    }
+
+    /// [`Self::sweep_character_pushing_excluding`] with the bulk of the exclusion prebuilt.
+    /// Every terrain brick has its own collider, so a full-size world excludes hundreds of
+    /// thousands of them from each character query; as a list that was tens of milliseconds per
+    /// tick, as a hash set built once it is a lookup. `extra` is the few per-call additions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sweep_character_pushing_excluding_set(
+        &mut self,
+        params: crate::character::CharacterParams,
+        position_m: [f64; 3],
+        desired_translation_m: [f32; 3],
+        dt_s: f32,
+        base: &ColliderExclusion,
+        extra: &[BodyId],
+    ) -> crate::character::CharacterMove {
+        let extra_bodies = self.exclusion_for(extra.iter().copied());
+        let excluded = CombinedExclusion {
+            base,
+            extra: &extra_bodies,
+        };
         let controller = crate::character::controller();
         let shape = crate::character::capsule(params);
         let centre = params.centre_offset_m();
@@ -900,8 +1066,8 @@ impl PhysicsWorld {
         );
         let pos = Pose::from_translation(feet + Vector::new(0.0, centre, 0.0));
         let excluded_predicate =
-            |handle: ColliderHandle, _collider: &Collider| !handles.contains(&handle);
-        let filter = if handles.is_empty() {
+            |_handle: ColliderHandle, collider: &Collider| !excluded.excludes(collider);
+        let filter = if excluded.is_empty() {
             QueryFilter::default()
         } else {
             QueryFilter::default().predicate(&excluded_predicate)
@@ -945,7 +1111,7 @@ impl PhysicsWorld {
                         .parent()
                         .and_then(|parent| self.bodies.get(parent))
                         .is_some_and(|body| body.is_dynamic());
-                    if dynamic && !handles.contains(&handle) && !touched.contains(&handle) {
+                    if dynamic && !excluded.excludes(collider) && !touched.contains(&handle) {
                         touched.push(handle);
                     }
                 }
@@ -1009,7 +1175,7 @@ impl PhysicsWorld {
                 let aabb = shape.compute_aabb(&end).loosened(CARRY_MARGIN_M);
                 queries
                     .intersect_aabb_conservative(aabb)
-                    .filter(|(handle, _)| !handles.contains(handle))
+                    .filter(|(_, collider)| !excluded.excludes(collider))
                     .filter_map(|(handle, collider)| {
                         let body = collider.parent()?;
                         self.bodies
@@ -1603,6 +1769,62 @@ mod tests {
         assert!(
             near <= WALK + 1e-3,
             "carried faster than the walker: {near}"
+        );
+    }
+
+    /// A prebuilt exclusion names bodies, not collider handles, so it keeps excluding a body whose
+    /// collider is rebuilt (an edit gives the collider a new handle).
+    #[test]
+    fn an_exclusion_still_hides_a_body_after_its_collider_is_rebuilt() {
+        let mut world = PhysicsWorld::new(PhysicsConfig::default());
+        let floor_volume = crate::fixtures::floor_slab(VolumeId::new(11).unwrap(), 2, 2, 4);
+        let grid = OccupancyGrid::from_volume(&floor_volume).unwrap().unwrap();
+        let floor = world.add_body(BodySpec {
+            kind: BodyKind::Fixed,
+            representation: Representation::MergedCuboids,
+            grid: grid.clone(),
+            cell_m: CELL_M as f32,
+            density_kg_m3: 1_000.0,
+            mass_properties: None,
+            translation_m: [0.0; 3],
+            linvel_m_s: [0.0; 3],
+        });
+        world.step();
+        let params = crate::character::CharacterParams::DEFAULT;
+        // Standing above the floor and asked to move straight down by a metre.
+        let sweep = |world: &mut PhysicsWorld, exclusion: &ColliderExclusion| {
+            world
+                .sweep_character_pushing_excluding_set(
+                    params,
+                    [0.5, 1.5, 0.5],
+                    [0.0, -1.0, 0.0],
+                    1.0 / 60.0,
+                    exclusion,
+                    &[],
+                )
+                .translation_m[1]
+        };
+        let none = ColliderExclusion::default();
+        let hidden = world.exclusion_for([floor]);
+        let blocked = sweep(&mut world, &none);
+        let through = sweep(&mut world, &hidden);
+        assert!(blocked > -1.0, "the floor stops the character: {blocked}");
+        assert!(
+            through < blocked - 0.05,
+            "excluded, it falls through: {through} vs {blocked}"
+        );
+
+        world.rebuild_collider(floor, &grid, Representation::MergedCuboids);
+        world.step();
+        let after_blocked = sweep(&mut world, &none);
+        let after_through = sweep(&mut world, &hidden);
+        assert!(
+            (after_blocked - blocked).abs() < 1.0e-3,
+            "the rebuilt floor still blocks"
+        );
+        assert!(
+            (after_through - through).abs() < 1.0e-3,
+            "the same exclusion still hides the rebuilt collider: {after_through} vs {through}"
         );
     }
 

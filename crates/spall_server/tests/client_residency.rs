@@ -258,6 +258,78 @@ fn live_client_reload_work_is_globally_bounded_and_counts_completions() {
 }
 
 #[test]
+fn live_client_bounds_outstanding_reloads_and_resumes_as_patches_land() {
+    let sim = server();
+    let mut replica = replica_of(&sim);
+    let terrain = replica.terrain_volume_id();
+    let victims = east_bricks(&replica);
+    assert!(victims.len() > MAX_RELOAD_REQUESTS_PER_STEP);
+    for coord in &victims {
+        assert!(replica.evict_brick(terrain, *coord));
+    }
+
+    let cap = 2;
+    let mut pass = ClientResidencyPass::new(128, 16, u64::MAX).with_max_outstanding_reloads(cap);
+    let mut sent = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+    sent.extend(pass.step(&mut replica, [0.5, 0.5, 0.5]));
+    // Nothing has landed, so no step may exceed the outstanding bound.
+    for _ in 0..8 {
+        sent.extend(pass.step(&mut replica, [0.5, 0.5, 0.5]));
+    }
+    assert_eq!(sent.len(), cap, "outstanding reloads must stay bounded");
+
+    // Landing the patches frees capacity for later bricks.
+    for req in &sent {
+        let patch = brick_repair_patch(&sim, req).expect("eligible brick is repairable");
+        replica.apply_baseline_patch(&patch).unwrap();
+    }
+    let more = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+    assert!(!more.is_empty(), "completions must free outstanding slots");
+}
+
+#[test]
+fn live_client_retries_a_request_overtaken_by_a_later_completion() {
+    let sim = server();
+    let mut replica = replica_of(&sim);
+    let terrain = replica.terrain_volume_id();
+    let victims = east_bricks(&replica);
+    assert!(victims.len() > MAX_RELOAD_REQUESTS_PER_STEP);
+    for coord in &victims {
+        assert!(replica.evict_brick(terrain, *coord));
+    }
+
+    let mut pass = ClientResidencyPass::new(128, 16, u64::MAX);
+    let first = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+    assert_eq!(first.len(), MAX_RELOAD_REQUESTS_PER_STEP);
+    let second = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+    assert!(!second.is_empty());
+    // The first request is lost; a later one completes.
+    for req in &second {
+        let patch = brick_repair_patch(&sim, req).expect("eligible brick is repairable");
+        replica.apply_baseline_patch(&patch).unwrap();
+    }
+    let lost: Vec<_> = first.iter().map(|r| r.key).collect();
+    // Cooldown still applies to the lost request...
+    for _ in 0..118 {
+        let step = pass.step(&mut replica, [0.5, 0.5, 0.5]);
+        assert!(step.iter().all(|r| !lost.contains(&r.key)));
+    }
+    // ...and once it expires the overtaken request is re-sent even though
+    // completions were recent.
+    let mut retried = false;
+    for _ in 0..4 {
+        retried |= pass
+            .step(&mut replica, [0.5, 0.5, 0.5])
+            .iter()
+            .any(|r| lost.contains(&r.key));
+    }
+    assert!(
+        retried,
+        "an overtaken request must be retried after its cooldown"
+    );
+}
+
+#[test]
 fn live_client_does_not_duplicate_an_inflight_reload_before_its_retry_window() {
     let sim = server();
     let mut replica = replica_of(&sim);

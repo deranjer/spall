@@ -43,6 +43,12 @@ pub struct StageInput {
     /// shared by every staging pass of one pipeline. `None` relabels every brick
     /// each time (small worlds, tests). Never hand it a dry-run volume.
     pub label_cache: Option<spall_structure::LabelCache>,
+    /// The world's structure index for exactly this `volume` state, if it kept one (see
+    /// [`crate::SimWorld::warm_structure_index`]). Cloned instead of rebuilding the index.
+    pub warm_index: Option<std::sync::Arc<spall_structure::StructureIndex>>,
+    /// Detached-cell removal still to be applied to `warm_index` (see
+    /// [`crate::SimWorld::warm_structure_removal`]).
+    pub warm_removal: Option<spall_voxel::EditOutcome>,
 }
 
 impl StageInput {
@@ -72,11 +78,28 @@ impl StageInput {
             brush: intent.brush,
             explosion: intent.explosion,
             label_cache: None,
+            warm_index: None,
+            warm_removal: None,
         }
     }
 
     /// Reuses `cache` for the structural analysis of this live snapshot.
     #[must_use]
+    /// Hands staging a structure index that already describes `volume`'s exact state.
+    pub fn with_warm_index(
+        mut self,
+        index: Option<std::sync::Arc<spall_structure::StructureIndex>>,
+    ) -> Self {
+        self.warm_index = index;
+        self
+    }
+
+    /// Hands staging the removal that completes `warm_index` (see [`Self::warm_removal`]).
+    pub fn with_warm_removal(mut self, removal: Option<spall_voxel::EditOutcome>) -> Self {
+        self.warm_removal = removal;
+        self
+    }
+
     pub fn with_label_cache(mut self, cache: spall_structure::LabelCache) -> Self {
         self.label_cache = Some(cache);
         self
@@ -113,6 +136,12 @@ pub struct StagedEdit {
     /// the immutable pre-edit snapshot and travel with the staged result; a
     /// server game hook may award drops only after this edit commits.
     pub removed_materials: std::collections::BTreeMap<spall_core::MaterialId, u64>,
+    /// [`spall_voxel::Volume::state_stamp`] of the volume this was staged against.
+    pub input_stamp: u64,
+    /// The structure index right after the cut (any detached cells still in it), for a terrain
+    /// edit: exactly the index of the world a commit produces when nothing detaches, and the
+    /// starting point for it when something does.
+    pub post_index: Option<std::sync::Arc<spall_structure::StructureIndex>>,
 }
 
 impl StagedEdit {
@@ -149,8 +178,31 @@ pub enum StageError {
     EvictedGeometryRequired(Vec<BrickCoord>),
 }
 
+static WARM_INDEX_REUSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many staging passes, process-wide, cloned a warm structure index instead of building one.
+pub fn warm_index_reuses() -> u64 {
+    WARM_INDEX_REUSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Prepares `input` into a [`StagedEdit`].
 pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
+    // A shared index is cloned: other stagings may be using the same one.
+    stage_with(input, input.warm_index.as_deref().cloned())
+}
+
+/// [`stage_edit`] for a caller that hands over the only reference to the warm index: it is
+/// edited in place rather than cloned (a clone of a whole-world index costs more than the edit).
+/// If anything else still holds the index, it is cloned after all.
+pub(crate) fn stage_edit_owned(mut input: StageInput) -> Result<StagedEdit, StageError> {
+    let warm = input
+        .warm_index
+        .take()
+        .map(|index| std::sync::Arc::try_unwrap(index).unwrap_or_else(|shared| (*shared).clone()));
+    stage_with(&input, warm)
+}
+
+fn stage_with(input: &StageInput, warm: Option<StructureIndex>) -> Result<StagedEdit, StageError> {
     let _total = crate::prof::Span::start("stage.total");
     let plan = EditPlan::sphere(input.volume_id, input.brush, input.kind.write_material());
     if plan.writes.is_empty() {
@@ -174,28 +226,49 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
 
     // Pre-edit structural read set + generation / epoch.
     let sp_idx = crate::prof::Span::start("stage.structure_index_build");
-    let mut index = match &input.label_cache {
-        Some(cache) => StructureIndex::build_cached(
-            &input.volume,
-            input.anchor,
-            ResidencyMode::AllResident,
-            input.generation,
-            input.topology_epoch,
-            &cancel,
-            cache,
-        )?,
-        None => StructureIndex::build(
-            &input.volume,
-            input.anchor,
-            ResidencyMode::AllResident,
-            input.generation,
-            input.topology_epoch,
-            &cancel,
-        )?,
+    #[cfg(debug_assertions)]
+    let had_warm_index = warm.is_some();
+    let mut index = match warm {
+        Some(mut warm) => {
+            WARM_INDEX_REUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(removal) = &input.warm_removal {
+                // The index is for the volume right after the split's cut; take the detached
+                // cells out, relabelling only the bricks they touched.
+                warm.apply_edit(
+                    &input.volume,
+                    removal,
+                    input.topology_epoch,
+                    &cancel,
+                    SearchBudget::UNLIMITED,
+                )?;
+            }
+            warm
+        }
+        None => match &input.label_cache {
+            Some(cache) => StructureIndex::build_cached(
+                &input.volume,
+                input.anchor,
+                ResidencyMode::AllResident,
+                input.generation,
+                input.topology_epoch,
+                &cancel,
+                cache,
+            )?,
+            None => StructureIndex::build(
+                &input.volume,
+                input.anchor,
+                ResidencyMode::AllResident,
+                input.generation,
+                input.topology_epoch,
+                &cancel,
+            )?,
+        },
     };
     drop(sp_idx);
     let token_span = crate::prof::Span::start("stage.read_token");
     let mut token = index.token();
+    #[cfg(debug_assertions)]
+    let warm_token_before = had_warm_index.then(|| token.clone());
 
     // Merge in the plan's touched bricks at their pre-edit state.
     for coord in touched_brick_coords(&plan) {
@@ -213,6 +286,9 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         }
     }
 
+    // Every read above is of `input.volume`, which is exactly the state this edit was staged
+    // against: while the live volume still carries this stamp, validation need not compare them.
+    token = token.with_state_stamp(input.volume_id, input.volume.state_stamp());
     drop(token_span);
     // Conservation is over the *logical* solid-cell count (resident + retained
     // evicted digests), so eviction never shifts the ledger regardless of where
@@ -223,8 +299,13 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
 
     // Dry-run the edit and re-classify support on the result.
     let sp_dry = crate::prof::Span::start("stage.dry_run_and_reclassify");
+    let sp_clone = crate::prof::Span::start("stage.dry_run.volume_clone");
     let mut post = input.volume.clone();
+    drop(sp_clone);
+    let sp_edit = crate::prof::Span::start("stage.dry_run.apply_edit");
     let outcome = post.apply_edit(&plan)?;
+    drop(sp_edit);
+    let sp_reclassify = crate::prof::Span::start("stage.dry_run.reclassify");
     let report = index.apply_edit(
         &post,
         &outcome,
@@ -232,6 +313,7 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         &cancel,
         SearchBudget::UNLIMITED,
     )?;
+    drop(sp_reclassify);
 
     drop(sp_dry);
     // Which components detach:
@@ -244,6 +326,49 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         EditTarget::Terrain => index.split_plans(),
         EditTarget::Body(_) => detached_from_body(&index),
     };
+
+    // A reused index must be indistinguishable from a rebuilt one: every debug build (and so every
+    // test that stages against a warm index) rebuilds it and compares.
+    #[cfg(debug_assertions)]
+    if let Some(token_before) = warm_token_before {
+        let mut fresh = StructureIndex::build(
+            &input.volume,
+            input.anchor,
+            ResidencyMode::AllResident,
+            input.generation,
+            input.topology_epoch,
+            &cancel,
+        )?;
+        assert_eq!(
+            fresh.token(),
+            token_before,
+            "warm structure index carries a different token (generation, epoch or reads) than a rebuilt one"
+        );
+        let fresh_report = fresh.apply_edit(
+            &post,
+            &outcome,
+            input.topology_epoch,
+            &cancel,
+            SearchBudget::UNLIMITED,
+        )?;
+        assert_eq!(
+            fresh_report, report,
+            "warm structure index classified the edit differently from a rebuilt one"
+        );
+        let cell_counts = |index: &StructureIndex| {
+            index
+                .graph()
+                .components()
+                .iter()
+                .map(|c| c.cell_count)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            cell_counts(&fresh),
+            cell_counts(&index),
+            "warm structure index holds different components than a rebuilt one"
+        );
+    }
 
     // T23 / G3 row 7, slice B: the structural analysis ran `AllResident`, which
     // reads an absent brick as known-empty. If an *evicted* brick (holds
@@ -280,8 +405,31 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
     // Post-edit solid count, over the logical brick set: the evicted bricks are
     // untouched by the edit, so their digests still hold, and `destroyed` stays
     // exact no matter where they are.
-    let post_solid = spall_voxel::logical_solid_cells(&post, &input.evicted)
+    //
+    // Only the bricks the edit wrote can differ, so the total follows from them instead of a
+    // second pass over every brick of the world.
+    let solid_in = |volume: &Volume, coord: BrickCoord| {
+        volume
+            .snapshot_brick(coord)
+            .ok()
+            .flatten()
+            .map_or(0, |snap| i128::from(snap.solid_cells()))
+    };
+    let mut post_solid_signed = i128::from(pre_solid);
+    for brick in &outcome.bricks {
+        post_solid_signed += solid_in(&post, brick.coord) - solid_in(&input.volume, brick.coord);
+    }
+    let post_solid = u64::try_from(post_solid_signed)
         .map_err(|_| StageError::EvictedGeometryRequired(Vec::new()))?;
+    // The shortcut is exact; every debug build (and so every test) checks it against the full count.
+    debug_assert_eq!(
+        Ok(post_solid),
+        spall_voxel::logical_solid_cells(&post, &input.evicted),
+        "incremental solid-cell count diverged from the full count"
+    );
+    // Kept for every terrain edit. It describes the volume right after the cut; a commit that
+    // splits also removes the detached cells, which the commit applies to it before keeping it.
+    let post_index = (input.target == EditTarget::Terrain).then(|| std::sync::Arc::new(index));
     let child_cells: u64 = memberships.iter().map(|m| m.cell_count).sum();
     let ledger = ConservationLedger {
         source_occupied: pre_solid,
@@ -306,6 +454,8 @@ pub fn stage_edit(input: &StageInput) -> Result<StagedEdit, StageError> {
         ledger,
         pre_solid,
         removed_materials,
+        input_stamp: input.volume.state_stamp(),
+        post_index,
     })
 }
 
@@ -362,6 +512,35 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual: startup order probe (generate, world with colliders, warm labels)"]
+    fn startup_order_probe() {
+        use spall_worldgen::{Preset, WorldGenSpec, WorldgenPalette};
+        let generated = spall_worldgen::generate(&WorldGenSpec::new(
+            Preset::Showcase,
+            1,
+            4096,
+            WorldgenPalette::sequential(1),
+        ))
+        .unwrap();
+        let mut setup = crate::fixtures::flat_terrain_setup();
+        setup.terrain = generated.terrain;
+        let _ = crate::prof::drain();
+        let started = std::time::Instant::now();
+        let sim = crate::Simulation::new(crate::SimulationConfig::new(setup)).unwrap();
+        eprintln!(
+            "order_probe simulation_new_ms={}",
+            started.elapsed().as_millis()
+        );
+        for (name, duration) in crate::prof::drain() {
+            eprintln!(
+                "order_probe {name} ms={:.0}",
+                duration.as_secs_f64() * 1000.0
+            );
+        }
+        drop(sim);
+    }
+
+    #[test]
     #[ignore = "manual full 4096-cell commit profile with exact terrain colliders; several GiB"]
     fn full_world_commit_profile() {
         full_world_edit_profile(true);
@@ -391,6 +570,13 @@ mod tests {
             &cache,
         )
         .unwrap();
+        let clone_started = std::time::Instant::now();
+        let cloned = graph.clone();
+        eprintln!(
+            "stage_profile support_graph_clone_ms={:.1}",
+            clone_started.elapsed().as_secs_f64() * 1000.0
+        );
+        drop(cloned);
         drop(graph);
         eprintln!(
             "stage_profile warm_labels_ms={}",
@@ -465,6 +651,75 @@ mod tests {
                 assert_eq!(world.volume_hash(result.volume).unwrap(), result.hash);
             }
             assert_eq!(journal.len(), 1);
+
+            // Ordinary edits against the now-warm world, staged exactly as the scheduler does:
+            // snapshot, evicted digests, the warm index. What a normal cut costs.
+            let terrain = world.terrain_volume_id();
+            let label_cache = spall_structure::LabelCache::new();
+            let _ = &label_cache;
+            for k in 0..3_i64 {
+                let intent = EditIntent::cut(
+                    spall_protocol::RequestId(10 + k as u64),
+                    spall_core::EntityId::new(1).unwrap(),
+                    EditTarget::Terrain,
+                    brush(1100 + k * 40, 16, 1100, 2),
+                );
+                let _ = crate::prof::drain();
+                let wall = std::time::Instant::now();
+                let snapshot = world.volume_ref(terrain).unwrap().clone();
+                let stamp = snapshot.state_stamp();
+                let (warm, removal) = match world.take_warm_structure(terrain, stamp) {
+                    Some((index, removal)) => (Some(index), removal),
+                    None => (None, None),
+                };
+                let had_warm = warm.is_some();
+                let input = StageInput::new(
+                    &intent,
+                    terrain,
+                    snapshot,
+                    world.evicted(terrain).clone(),
+                    world.anchor(),
+                    world.generation(),
+                    world.topology_epoch(),
+                )
+                .with_warm_index(warm)
+                .with_warm_removal(removal);
+                let snapshot_ms = wall.elapsed().as_secs_f64() * 1000.0;
+                let staged = stage_edit_owned(input).unwrap();
+                let stage_ms = wall.elapsed().as_secs_f64() * 1000.0 - snapshot_ms;
+                let stage_spans = crate::prof::drain();
+                let mut journal = crate::journal::JournalSink::new();
+                let commit_started = std::time::Instant::now();
+                let outcome = crate::commit::commit(
+                    world,
+                    &mut journal,
+                    &staged,
+                    spall_core::Tick(2 + k as u64),
+                    spall_protocol::ControlSeq(2 + k as u64),
+                )
+                .unwrap();
+                let commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
+                assert!(matches!(
+                    outcome,
+                    crate::commit::CommitOutcome::Committed(_)
+                ));
+                eprintln!(
+                    "warm_edit[{k}] warm_index={had_warm} snapshot_ms={snapshot_ms:.1} stage_ms={stage_ms:.1} commit_ms={commit_ms:.1} splits={}",
+                    staged.memberships.len()
+                );
+                for (name, duration) in stage_spans {
+                    eprintln!(
+                        "warm_edit[{k}]   {name} ms={:.2}",
+                        duration.as_secs_f64() * 1000.0
+                    );
+                }
+                for (name, duration) in crate::prof::drain() {
+                    eprintln!(
+                        "warm_edit[{k}]   {name} ms={:.2}",
+                        duration.as_secs_f64() * 1000.0
+                    );
+                }
+            }
         }
     }
     use spall_core::units::{BRUSH_UNIT, BrushPoint};

@@ -36,7 +36,11 @@ use spall_voxel::{Brick, BrickBounds, BrickSnapshot, Volume};
 /// `spall_sim::commit::ALGORITHM_VERSION` and the T01/T07 versions).
 pub const INTEGER_BRUSH_VERSION: u32 = 1;
 pub const STRUCTURE_GRAPH_VERSION: u32 = 1;
-pub const TOPOLOGY_HASH_VERSION: u32 = 1;
+/// Version of the topology hash saved checkpoints and journals were verified with. `2` is the
+/// chunked layout (`spall.topology.v2`). A save written under `1` is refused on recovery with
+/// [`PersistError::AlgorithmVersionMismatch`]: its recorded hashes use the old layout and cannot
+/// be verified, and the engine does not carry the old algorithm to migrate them.
+pub const TOPOLOGY_HASH_VERSION: u32 = 2;
 
 /// Identity a world save is stamped with. `anchor` and `physics` are redeployment
 /// config, re-supplied on restart exactly like `spall_sim::WorldSetup` treats

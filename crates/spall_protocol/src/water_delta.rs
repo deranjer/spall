@@ -6,6 +6,11 @@ use spall_core::Tick;
 pub const WATER_BRICK_EDGE: u32 = 16;
 pub const MAX_WATER_DELTA_BRICKS: u32 = 4096;
 
+/// Compression level for a changed brick's fractions. Deltas are computed on the server's tick
+/// thread, where level 3 cost several milliseconds on ticks with much moving water; level 1 is
+/// several times faster and any level decodes the same.
+const WATER_DELTA_ZSTD_LEVEL: i32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaterDelta {
     pub origin: spall_core::GlobalCell,
@@ -69,6 +74,20 @@ fn brick_bytes(frame: &WaterKeyframe, coord: [u32; 3]) -> Vec<u8> {
     bytes
 }
 
+/// Whether one brick holds the same bytes in both frames, compared row by row in place: no
+/// allocation, which matters because this runs for every brick of the domain on the tick thread.
+/// Both frames share dimensions (checked by the caller).
+fn brick_equal(before: &WaterKeyframe, after: &WaterKeyframe, coord: [u32; 3]) -> bool {
+    let (start, size) = brick_shape(after, coord).expect("enumerated domain brick");
+    let [nx, ny, _] = after.dimensions.map(|v| v as usize);
+    (start[2]..start[2] + size[2]).all(|z| {
+        (start[1]..start[1] + size[1]).all(|y| {
+            let offset = start[0] + nx * (y + ny * z);
+            before.fractions[offset..offset + size[0]] == after.fractions[offset..offset + size[0]]
+        })
+    })
+}
+
 pub fn water_deltas(before: &WaterKeyframe, after: &WaterKeyframe) -> Option<Vec<WaterDelta>> {
     for frame in [before, after] {
         let n = frame
@@ -96,8 +115,8 @@ pub fn water_deltas(before: &WaterKeyframe, after: &WaterKeyframe) -> Option<Vec
         for y in 0..d[1] {
             for x in 0..d[0] {
                 let brick = [x, y, z];
-                let fractions = brick_bytes(after, brick);
-                if fractions != brick_bytes(before, brick) {
+                if !brick_equal(before, after, brick) {
+                    let fractions = brick_bytes(after, brick);
                     result.push(WaterDelta {
                         origin: after.origin,
                         server_tick: after.server_tick,
@@ -106,7 +125,11 @@ pub fn water_deltas(before: &WaterKeyframe, after: &WaterKeyframe) -> Option<Vec
                         index: result.len() as u32,
                         count: 0,
                         brick,
-                        fractions: zstd::stream::encode_all(fractions.as_slice(), 3).ok()?,
+                        fractions: zstd::stream::encode_all(
+                            fractions.as_slice(),
+                            WATER_DELTA_ZSTD_LEVEL,
+                        )
+                        .ok()?,
                     });
                 }
             }
@@ -121,7 +144,11 @@ pub fn water_deltas(before: &WaterKeyframe, after: &WaterKeyframe) -> Option<Vec
             index: 0,
             count: 1,
             brick: [0; 3],
-            fractions: zstd::stream::encode_all(brick_bytes(after, [0; 3]).as_slice(), 3).ok()?,
+            fractions: zstd::stream::encode_all(
+                brick_bytes(after, [0; 3]).as_slice(),
+                WATER_DELTA_ZSTD_LEVEL,
+            )
+            .ok()?,
         });
     }
     let count = result.len() as u32;
@@ -159,6 +186,44 @@ mod tests {
         assert!(assembler.push(first).unwrap().is_none());
         assert_eq!(assembler.current, Some(before));
         assert_eq!(assembler.push(deltas[1].clone()).unwrap(), Some(after));
+    }
+    /// The in-place comparison picks exactly the bricks a byte-for-byte comparison of the
+    /// extracted bricks would, on a domain whose edge bricks are clipped.
+    #[test]
+    fn the_in_place_comparison_agrees_with_comparing_extracted_bricks() {
+        let before = frame(1);
+        let mut after = frame(2);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..40 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let index = (state % after.fractions.len() as u64) as usize;
+            after.fractions[index] = (state >> 32) as u8 | 1;
+        }
+        let d = after.dimensions.map(|v| v.div_ceil(WATER_BRICK_EDGE));
+        let mut expected = Vec::new();
+        for z in 0..d[2] {
+            for y in 0..d[1] {
+                for x in 0..d[0] {
+                    let brick = [x, y, z];
+                    assert_eq!(
+                        brick_equal(&before, &after, brick),
+                        brick_bytes(&before, brick) == brick_bytes(&after, brick),
+                        "brick {brick:?}"
+                    );
+                    if brick_bytes(&before, brick) != brick_bytes(&after, brick) {
+                        expected.push(brick);
+                    }
+                }
+            }
+        }
+        let published: Vec<[u32; 3]> = water_deltas(&before, &after)
+            .unwrap()
+            .iter()
+            .map(|delta| delta.brick)
+            .collect();
+        assert_eq!(published, expected);
     }
     #[test]
     fn gap_reorder_duplicate_bomb_and_repair_preserve_the_installed_frame() {

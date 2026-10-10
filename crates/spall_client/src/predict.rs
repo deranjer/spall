@@ -1393,6 +1393,21 @@ impl PredictedPlayer {
                 }
             }
             self.max_correction_m = self.max_correction_m.max(err);
+            if err > 1.0 {
+                tracing::info!(
+                    error_m = err,
+                    server_tick = server_tick.0,
+                    record_seq = rec.seq.0,
+                    acked = acked.0,
+                    history = self.history.len(),
+                    next_tick = self.next_tick.0,
+                    oldest_tick = self.history.front().map_or(0, |r| r.tick.0),
+                    newest_tick = self.history.back().map_or(0, |r| r.tick.0),
+                    record_pos = ?rec.predicted_after.position_m,
+                    authoritative_pos = ?authoritative.position_m,
+                    "large prediction correction"
+                );
+            }
             let dy = (rec.predicted_after.position_m[1] - authoritative.position_m[1]).abs();
             let dx = rec.predicted_after.position_m[0] - authoritative.position_m[0];
             let dz = rec.predicted_after.position_m[2] - authoritative.position_m[2];

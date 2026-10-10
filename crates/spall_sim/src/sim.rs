@@ -125,6 +125,46 @@ pub struct Simulation {
     water: Option<crate::water::AuthoritativeWater>,
     additional_water: Vec<crate::water::AuthoritativeWater>,
     pub(crate) vegetation: Option<crate::vegetation::AuthoritativeVegetation>,
+    /// The world a reset replaced, being freed on another thread (see [`Retiring`]).
+    retiring: Retiring,
+}
+
+/// Frees a large value on a background thread. Dropping a full-size world (hundreds of thousands
+/// of bricks and colliders) took about nine seconds on the tick thread during a world reset, with
+/// every client waiting. A panic while dropping is not lost: it is re-raised on the owning thread
+/// the next time the value is retired or the handle is finished.
+#[derive(Default)]
+struct Retiring(Option<std::thread::JoinHandle<()>>);
+
+impl Retiring {
+    /// Waits for the previous retirement, re-raising its panic, if any.
+    fn finish(&mut self) {
+        if let Some(handle) = self.0.take()
+            && let Err(panic) = handle.join()
+        {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn retire<T: Send + 'static>(&mut self, old: T) {
+        self.finish();
+        // Moved into the thread through a slot so a failed spawn still frees it, inline.
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(old)));
+        let thread_slot = std::sync::Arc::clone(&slot);
+        match std::thread::Builder::new()
+            .name("spall-retire-world".into())
+            .spawn(move || {
+                drop(
+                    thread_slot
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .take(),
+                );
+            }) {
+            Ok(handle) => self.0 = Some(handle),
+            Err(_) => drop(slot.lock().unwrap_or_else(|p| p.into_inner()).take()),
+        }
+    }
 }
 
 impl Simulation {
@@ -151,6 +191,7 @@ impl Simulation {
             world,
             pipeline: EditPipeline::new(config.max_pending_intents, config.serialize_threshold),
             journal: JournalSink::new(),
+            retiring: Retiring::default(),
             tick: Tick::ZERO,
             next_control_seq: 1,
             next_damage_seq: 0,
@@ -190,6 +231,7 @@ impl Simulation {
                 SimulationConfig::DEFAULT_SERIALIZE_THRESHOLD,
             ),
             journal: JournalSink::new(),
+            retiring: Retiring::default(),
             tick,
             next_control_seq: 1,
             next_damage_seq: 0,
@@ -231,12 +273,48 @@ impl Simulation {
             transaction.max(f_transaction),
             journal_seq.max(f_journal_seq),
         )?;
-        self.world = world;
-        self.pipeline = pipeline;
-        self.water = water;
-        self.additional_water = additional_water;
-        self.vegetation = vegetation;
+        let off_thread = self.pipeline.stages_off_thread();
+        let old_world = std::mem::replace(&mut self.world, world);
+        let old_pipeline = std::mem::replace(&mut self.pipeline, pipeline);
+        if off_thread {
+            self.pipeline.enable_off_thread_staging();
+        }
+        let old_water = std::mem::replace(&mut self.water, water);
+        let old_additional_water = std::mem::replace(&mut self.additional_water, additional_water);
+        let old_vegetation = std::mem::replace(&mut self.vegetation, vegetation);
+        // The replaced world goes away off the tick thread.
+        self.retiring.retire((
+            old_world,
+            old_pipeline,
+            old_water,
+            old_additional_water,
+            old_vegetation,
+        ));
         Ok(())
+    }
+
+    /// Waits until the world a reset replaced has been freed, re-raising a panic from its drop.
+    pub fn wait_for_retired(&mut self) {
+        self.retiring.finish();
+    }
+
+    /// Stages edits on a worker thread instead of inline on the tick thread (see
+    /// [`EditPipeline::enable_off_thread_staging`]). Survives [`Self::replace_world`].
+    pub fn enable_off_thread_staging(&mut self) {
+        self.pipeline.enable_off_thread_staging();
+    }
+
+    /// Where a committed request's time went inside the pipeline, taken once.
+    pub fn take_edit_timing(
+        &mut self,
+        request_id: spall_protocol::RequestId,
+    ) -> Option<crate::EditTiming> {
+        self.pipeline.take_timing(request_id)
+    }
+
+    /// Whether edits are staged on a worker thread.
+    pub fn stages_off_thread(&self) -> bool {
+        self.pipeline.stages_off_thread()
     }
 
     /// Read-only authoritative fluid state, absent when this world did not
@@ -570,12 +648,14 @@ impl Simulation {
             .tick
             .checked_next()
             .map_err(|_: IdError| TickError::TickExhausted)?;
+        let pipeline_span = crate::prof::Span::start("tick.pipeline");
         let report = self.pipeline.run_tick(
             &mut self.world,
             &mut self.journal,
             self.tick,
             &mut self.next_control_seq,
         )?;
+        drop(pipeline_span);
         let mut report = report;
         // Only a committed change to a terrain brick at or next to a region's
         // fluid domain can change that region's boundary.
@@ -593,7 +673,10 @@ impl Simulation {
                     .map(|b| b.coord)
             })
             .collect();
+        let grow_span = crate::prof::Span::start("tick.grow_water_regions");
         self.grow_water_regions(&report);
+        drop(grow_span);
+        let water_span = crate::prof::Span::start("tick.water");
         if let Some(water) = &mut self.water {
             let dirty = edited_terrain_bricks
                 .iter()
@@ -614,12 +697,19 @@ impl Simulation {
                     .map_err(|e| TickError::Water(e.to_string()))?,
             );
         }
+        drop(water_span);
+        let vegetation_span = crate::prof::Span::start("tick.vegetation");
         self.advance_vegetation(&report)?;
+        drop(vegetation_span);
+        let physics_span = crate::prof::Span::start("tick.physics");
         let physics_started = std::time::Instant::now();
         self.world.step_physics();
         let physics_duration = physics_started.elapsed();
         report.physics_duration = physics_duration;
+        drop(physics_span);
+        let players_span = crate::prof::Span::start("tick.players");
         self.advance_players(&report);
+        drop(players_span);
         Ok(report)
     }
 
@@ -1306,4 +1396,62 @@ fn box_sphere_gap(bbox: ([f64; 3], [f64; 3]), centre_m: [f64; 3], radius_m: f64)
         d2 += outside * outside;
     }
     d2.sqrt() - radius_m
+}
+
+#[cfg(test)]
+mod retiring_tests {
+    use super::Retiring;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct Flag(Arc<AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_retired_value_is_dropped_off_the_calling_thread_and_finish_waits_for_it() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let caller = std::thread::current().id();
+        struct Where(Arc<AtomicBool>, std::thread::ThreadId, Arc<AtomicBool>);
+        impl Drop for Where {
+            fn drop(&mut self) {
+                self.2
+                    .store(std::thread::current().id() != self.1, Ordering::SeqCst);
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let off_thread = Arc::new(AtomicBool::new(false));
+        let mut retiring = Retiring::default();
+        retiring.retire(Where(Arc::clone(&dropped), caller, Arc::clone(&off_thread)));
+        retiring.finish();
+        assert!(dropped.load(Ordering::SeqCst), "finish waits for the drop");
+        assert!(
+            off_thread.load(Ordering::SeqCst),
+            "dropped on another thread"
+        );
+        // A second value retires cleanly after the first finished.
+        let second = Arc::new(AtomicBool::new(false));
+        retiring.retire(Flag(Arc::clone(&second)));
+        retiring.finish();
+        assert!(second.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    #[should_panic(expected = "drop failed")]
+    fn a_panic_while_dropping_is_re_raised_on_the_owner() {
+        struct Boom;
+        impl Drop for Boom {
+            fn drop(&mut self) {
+                panic!("drop failed");
+            }
+        }
+        let mut retiring = Retiring::default();
+        retiring.retire(Boom);
+        retiring.finish();
+    }
 }

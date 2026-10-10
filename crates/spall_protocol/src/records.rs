@@ -20,8 +20,11 @@ use crate::limits::{
     SizeLimitError,
 };
 
-/// Schema version stamped into every encoded record header.
-pub const WIRE_SCHEMA_VERSION: u16 = 3;
+/// Schema version stamped into every encoded record header. A peer on another version cannot
+/// decode a single record, so mismatched builds refuse each other at the first message. Bumped to
+/// 4 with the chunked topology hash (`spall.topology.v2`): every `result_hashes` and world hash
+/// value changed, so a mixed pair could otherwise connect and then reject every transaction.
+pub const WIRE_SCHEMA_VERSION: u16 = 4;
 
 /// Stable per-family wire tag. The `u16` discriminant is part of the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -46,6 +49,9 @@ pub enum WireTag {
     AdminStatus = 17,
     WaterDelta = 18,
     VegetationSnapshot = 19,
+    CatalogueChunk = 20,
+    CatalogueAck = 21,
+    ControlProbe = 22,
 }
 
 impl WireTag {
@@ -70,6 +76,9 @@ impl WireTag {
             17 => Self::AdminStatus,
             18 => Self::WaterDelta,
             19 => Self::VegetationSnapshot,
+            20 => Self::CatalogueChunk,
+            21 => Self::CatalogueAck,
+            22 => Self::ControlProbe,
             _ => return None,
         })
     }

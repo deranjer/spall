@@ -155,6 +155,13 @@ const RELOAD_COOLDOWN_STEPS: u32 = 120;
 /// missing brick in one burst and starve prediction/control traffic.
 pub const MAX_RELOAD_REQUESTS_PER_STEP: usize = 4;
 
+/// Most reload requests that may be unanswered at once. The server answers each
+/// repair with its own serialized transfer on the client's reliable queue, which
+/// is bounded (`MAX_RELIABLE_BACKLOG`) and disconnects a client that overruns
+/// it, so a fast-moving player must wait for patches to land instead of
+/// out-requesting the transfer rate.
+pub const MAX_OUTSTANDING_RELOADS: usize = 256;
+
 /// Consecutive steps a resident terrain brick must be out of the retain box
 /// before the pass evicts it. The hysteresis keeps the pass from dropping and
 /// re-pulling a brick as the player's predicted position jitters across a
@@ -203,7 +210,14 @@ pub struct ClientResidencyPass {
     /// Consecutive steps each resident, out-of-box brick has waited.
     out_of_box: BTreeMap<BrickCoord, u32>,
     reload_cooldown: BTreeMap<BrickCoord, u32>,
-    pending_reloads: BTreeSet<BrickCoord>,
+    /// Outstanding reload requests and the sequence number each was last sent
+    /// with. The server answers in order, so a request is only presumed lost
+    /// once a later one has completed, or nothing has completed for a cooldown.
+    pending_reloads: BTreeMap<BrickCoord, u64>,
+    max_outstanding_reloads: usize,
+    next_reload_seq: u64,
+    highest_completed_reload_seq: Option<u64>,
+    steps_since_reload_completion: u32,
     evictions_total: u64,
     reloads_requested_total: u64,
     reloads_completed_total: u64,
@@ -229,13 +243,24 @@ impl ClientResidencyPass {
             max_dense_bytes,
             out_of_box: BTreeMap::new(),
             reload_cooldown: BTreeMap::new(),
-            pending_reloads: BTreeSet::new(),
+            pending_reloads: BTreeMap::new(),
+            max_outstanding_reloads: MAX_OUTSTANDING_RELOADS,
+            next_reload_seq: 0,
+            highest_completed_reload_seq: None,
+            steps_since_reload_completion: 0,
             evictions_total: 0,
             reloads_requested_total: 0,
             reloads_completed_total: 0,
             budget_miss_steps_total: 0,
             admission_deferred_total: 0,
         }
+    }
+
+    /// Overrides [`MAX_OUTSTANDING_RELOADS`], e.g. to exercise the bound with a
+    /// small fixture.
+    pub fn with_max_outstanding_reloads(mut self, max: usize) -> Self {
+        self.max_outstanding_reloads = max.max(1);
+        self
     }
 
     pub fn evictions_total(&self) -> u64 {
@@ -308,13 +333,19 @@ impl ClientResidencyPass {
         let completed: Vec<_> = self
             .pending_reloads
             .iter()
-            .copied()
-            .filter(|coord| !replica.evicted(terrain).contains(*coord))
+            .filter(|(coord, _)| !replica.evicted(terrain).contains(**coord))
+            .map(|(coord, seq)| (*coord, *seq))
             .collect();
-        for coord in completed {
+        self.steps_since_reload_completion = self.steps_since_reload_completion.saturating_add(1);
+        for (coord, seq) in completed {
             self.pending_reloads.remove(&coord);
             self.reload_cooldown.remove(&coord);
             self.reloads_completed_total += 1;
+            self.highest_completed_reload_seq = Some(
+                self.highest_completed_reload_seq
+                    .map_or(seq, |h| h.max(seq)),
+            );
+            self.steps_since_reload_completion = 0;
         }
 
         // Reload requests: retained-digest bricks back inside the box.
@@ -367,6 +398,20 @@ impl ClientResidencyPass {
             if !keep.contains(&coord) || self.reload_cooldown.contains_key(&coord) {
                 continue;
             }
+            match self.pending_reloads.get(&coord) {
+                // A retry: only when the earlier request was overtaken by a
+                // later completion or the whole stream has stalled. Otherwise
+                // it is still queued at the server and a duplicate would only
+                // lengthen that queue.
+                Some(&seq) => {
+                    let overtaken = self.highest_completed_reload_seq.is_some_and(|h| h > seq);
+                    if !overtaken && self.steps_since_reload_completion < RELOAD_COOLDOWN_STEPS {
+                        continue;
+                    }
+                }
+                None if self.pending_reloads.len() >= self.max_outstanding_reloads => continue,
+                None => {}
+            }
             let projected_bricks_candidate = projected_bricks.saturating_add(1);
             let projected_dense_candidate =
                 projected_dense_bytes.saturating_add(MemoryReport::DENSE_BRICK_BYTES as u64);
@@ -379,7 +424,8 @@ impl ClientResidencyPass {
             projected_bricks = projected_bricks_candidate;
             projected_dense_bytes = projected_dense_candidate;
             self.reload_cooldown.insert(coord, RELOAD_COOLDOWN_STEPS);
-            self.pending_reloads.insert(coord);
+            self.pending_reloads.insert(coord, self.next_reload_seq);
+            self.next_reload_seq += 1;
             self.reloads_requested_total += 1;
             out.push(RepairRequest {
                 key: RepairKey::Brick {

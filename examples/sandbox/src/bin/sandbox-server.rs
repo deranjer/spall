@@ -130,6 +130,12 @@ struct Args {
     /// land late actions under an impaired transport. 0 disables early stop.
     #[arg(long, default_value_t = 45)]
     quiescence_ticks: u64,
+    /// Once `--max-ticks` is spent, keep serving up to this many seconds while a regional client
+    /// is still receiving what the server owes it (a catalogue, transactions, repair patches),
+    /// so a slow link is judged on convergence rather than on how fast the ticks ran. 0 ends the
+    /// run at `--max-ticks` regardless.
+    #[arg(long, default_value_t = 300)]
+    drain_timeout_secs: u64,
     /// T17: a joining client's catch-up-queue cap before its baseline transfer
     /// is cancelled and re-captured fresher.
     #[arg(long, default_value_t = spall_server::serve::DEFAULT_CATCH_UP_CAP)]
@@ -581,6 +587,7 @@ fn run_serve(args: Args) -> ExitCode {
         join_token: token,
         max_ticks: args.ticks,
         quiescence_ticks: args.quiescence_ticks,
+        drain_timeout: std::time::Duration::from_secs(args.drain_timeout_secs),
         min_clients: args.min_clients,
         max_clients: args.max_clients,
         startup_timeout: Duration::from_secs(30),

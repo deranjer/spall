@@ -46,5 +46,6 @@ pub use query_cache::{CharacterQueryCache, REBUILD_MARGIN_M, WINDOW_RADIUS_M, Wi
 pub use region_set::{PhysicsRegionSet, PhysicsRegionSetError, RegionalBodyState};
 pub use report::{FeasibilityReport, RepresentationReport, SleepWakeReport, run_feasibility};
 pub use world::{
-    BodyId, BodyKind, BodySpec, BodyState, ContactImpulse, PhysicsConfig, PhysicsWorld, StepTiming,
+    BodyId, BodyKind, BodySpec, BodyState, ColliderExclusion, ContactImpulse, PhysicsConfig,
+    PhysicsWorld, PreparedBodySpec, PreparedCollider, StepTiming,
 };

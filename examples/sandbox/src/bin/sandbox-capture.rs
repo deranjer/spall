@@ -870,6 +870,7 @@ fn run_destruction_networked(args: &Args) -> Result<DestructionSummary, RenderEr
         join_token: token,
         max_ticks: DESTRUCTION_TICKS,
         quiescence_ticks: 0,
+        drain_timeout: spall_server::serve::DEFAULT_DRAIN_TIMEOUT,
         min_clients: 2,
         max_clients: 2,
         startup_timeout: Duration::from_secs(20),

@@ -44,7 +44,7 @@ use crate::collider::plan_collider;
 use crate::journal::{JournalEntry, JournalSink};
 use crate::stage::StagedEdit;
 use crate::transfer::{self, ChildBody, ParentState};
-use crate::world::{SimWorld, canonical_logical_volume_for, volume_topology_hash_for};
+use crate::world::{SimWorld, volume_topology_hash_for};
 
 /// Structural algorithm version stamped into every transaction.
 pub const ALGORITHM_VERSION: u32 = 1;
@@ -152,6 +152,7 @@ pub fn commit(
     let parent = world
         .volume_body(vid)
         .ok_or(CommitError::UnknownVolume(vid))?;
+    let stamp_before_commit = parent.volume.state_stamp();
     let cell_size = parent.volume.cell_size();
     let parent_phys = parent.phys;
     let parent_is_terrain = parent.kind == BodyKind::Terrain;
@@ -415,13 +416,9 @@ pub fn commit(
     // them). A replica that holds those bricks resident computes the same value.
     // Identical to `volume_topology_hash_for` when nothing is evicted.
     let hashes = crate::prof::Span::start("commit.result_hashes");
-    let parent_result_hash =
-        spall_protocol::canonical_topology_hash(&[canonical_logical_volume_for(
-            &parent_candidate,
-            world.evicted(vid),
-            parent_owner,
-        )
-        .expect("logical candidate volume: digest invariant holds")]);
+    let parent_result_hash = world
+        .logical_volume_hash(&parent_candidate, parent_owner)
+        .expect("logical candidate volume: digest invariant holds");
     let mut result_hashes = vec![VolumeHash {
         volume: vid,
         hash: parent_result_hash,
@@ -664,6 +661,21 @@ pub fn commit(
         participants,
         bulk_baseline: bulk_baseline.clone(),
     });
+
+    // Keep the terrain's structure index warm for the next edit. Only if the live volume was the
+    // very state the edit was staged against: otherwise something else changed it in between.
+    //
+    // Without a split the commit leaves the world exactly as the staging pass predicted, so the
+    // index that pass produced describes it. With a split that index still holds the detached
+    // cells; the removal is stored beside it and the next staging applies it on its own thread
+    // (adopting the epoch the split moved the world to), so this commit does not pay for it.
+    if let Some(index) = &staged.post_index
+        && stamp_before_commit == staged.input_stamp
+        && let Some(live) = world.volume_ref(vid)
+    {
+        let stamp = live.state_stamp();
+        world.set_warm_structure(vid, stamp, index.clone(), remove_outcome.clone());
+    }
 
     Ok(CommitOutcome::Committed(Committed {
         transaction: transaction_id,

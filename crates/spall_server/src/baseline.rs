@@ -38,6 +38,9 @@ pub struct BaselineTransfer {
     pub end: BaselineEnd,
     /// Legacy decoded payload for assertions. Segmented transfers retain no world-sized cell vectors.
     pub world: Option<Arc<BaselineWorld>>,
+    /// The distant terrain digests of a deferred regional baseline, streamed as
+    /// chunks after this transfer completes. `None` for every other transfer.
+    pub catalogue: Option<CataloguePayload>,
 }
 
 /// Immutable, copy-on-write geometry handed from the authoritative tick to a
@@ -113,6 +116,7 @@ impl BaselineTransfer {
             parts,
             end,
             world: self.world.clone(),
+            catalogue: self.catalogue.as_ref().map(|c| c.reissue(transfer_id)),
         }
     }
 }
@@ -256,30 +260,40 @@ pub fn transfer_from_snapshot(
     transfer_from_world(world, transfer_id, interest_epoch, snapshot.journal_cursor)
 }
 
-/// Packages a snapshot in the negotiated format, expanding only one bounded segment at a time.
-pub fn transfer_from_snapshot_supported(
-    snapshot: BaselineSnapshot,
-    transfer_id: TransferId,
-    interest_epoch: InterestEpoch,
-    segmented: bool,
-) -> Result<BaselineTransfer, BaselineError> {
-    let started = std::time::Instant::now();
-    if snapshot.region.is_some_and(|(center, radius)| {
-        !segmented
-            || center.iter().any(|v| !v.is_finite())
-            || !(1..=spall_protocol::segment::MAX_REGION_RADIUS_BRICKS).contains(&radius)
-    }) {
-        return Err(BaselineError::Segment(
-            "invalid regional interest or legacy encoding".into(),
-        ));
-    }
-    if !segmented {
-        return transfer_from_snapshot(snapshot, transfer_id, interest_epoch);
-    }
+/// A snapshot encoded as one segmented payload (manifest frame, then segment frames).
+struct EncodedSegmented {
+    payload: Vec<u8>,
+    chain_hash: Hash32,
+    regions: Vec<BaselineRegion>,
+    total_bricks: u64,
+    /// Where each segment frame ends: `(payload offset, volume index, bricks of that volume
+    /// carried through this segment)`.
+    segment_ends: Vec<(usize, usize, usize)>,
+}
+
+/// Decoded size of one segment of a terrain catalogue: about 1,000 digests. A client holds a
+/// catalogue segment by segment, so this is the granularity of what survives a world reset that
+/// interrupts the transfer; the default baseline segment (4 MiB, about 32,000 digests) would make
+/// a catalogue of a large world two segments, and a half-received one hold nothing.
+pub const CATALOGUE_SEGMENT_DECODED_BYTES: usize = 128 * 1024;
+
+/// Encodes `snapshot` as a segmented payload, expanding only one bounded segment at a time.
+/// Bricks `snapshot` marks digest-only travel as digests; the rest as geometry.
+fn encode_segmented(snapshot: &BaselineSnapshot) -> Result<EncodedSegmented, BaselineError> {
+    encode_segmented_capped(
+        snapshot,
+        spall_protocol::segment::DEFAULT_SEGMENT_DECODED_BYTES,
+    )
+}
+
+/// [`encode_segmented`] with segments of at most `cap` decoded bytes.
+fn encode_segmented_capped(
+    snapshot: &BaselineSnapshot,
+    cap: usize,
+) -> Result<EncodedSegmented, BaselineError> {
     use spall_protocol::segment::{
         self, BaselineSegment, SegmentManifest, SegmentVolume, VolumeHeader,
     };
-    let cap = segment::DEFAULT_SEGMENT_DECODED_BYTES;
     let mut plan = Vec::new();
     let mut total_bytes = 0u64;
     let mut total_bricks = 0u64;
@@ -340,6 +354,7 @@ pub fn transfer_from_snapshot_supported(
     let manifest_body = frame.bytes[5..].to_vec();
     let mut payload = frame.bytes;
     let mut hashes = Vec::with_capacity(plan.len());
+    let mut segment_ends = Vec::with_capacity(plan.len());
     for (index, (vi, start, end)) in plan.into_iter().enumerate() {
         let v = &snapshot.volumes[vi];
         let bricks = v.bricks[start..end]
@@ -388,7 +403,351 @@ pub fn transfer_from_snapshot_supported(
         }
         hashes.push(encoded.raw_hash);
         payload.extend_from_slice(&encoded.bytes);
+        segment_ends.push((payload.len(), vi, end));
     }
+    let chain_hash = segment::chain_hash(&manifest_body, &hashes);
+    Ok(EncodedSegmented {
+        payload,
+        chain_hash,
+        regions,
+        total_bricks,
+        segment_ends,
+    })
+}
+
+/// What a client already knows of the terrain catalogue: every logical brick of the world that
+/// is about to be replaced, as `(revision, content hash)`. A reset's catalogue then needs only the
+/// bricks of the new world that differ.
+#[derive(Debug, Clone, Default)]
+pub struct CatalogueBasis {
+    entries: std::collections::HashMap<BrickCoord, (u64, [u8; 32])>,
+}
+
+impl CatalogueBasis {
+    /// Captures the terrain's logical bricks (resident and evicted) of `sim`'s current world.
+    pub fn capture(sim: &Simulation) -> Self {
+        let world = sim.world();
+        let terrain = world.terrain();
+        let logical =
+            spall_voxel::logical_bricks(&terrain.volume, world.evicted(terrain.volume.id()))
+                .expect("baseline snapshot logical invariant");
+        Self {
+            entries: logical
+                .into_iter()
+                .map(|b| (b.coord, (b.revision.get(), b.content_hash.to_bytes())))
+                .collect(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The `(revision, content hash)` held for `coord`, if any.
+    pub fn entry(&self, coord: BrickCoord) -> Option<(u64, [u8; 32])> {
+        self.entries.get(&coord).copied()
+    }
+
+    /// A basis from explicit `(revision, content hash)` entries.
+    pub fn from_entries(entries: std::collections::HashMap<BrickCoord, (u64, [u8; 32])>) -> Self {
+        Self { entries }
+    }
+
+    fn matches(&self, coord: BrickCoord, snap: &BrickSnapshot) -> bool {
+        self.entries.get(&coord) == Some(&(snap.revision().get(), snap.content_hash().to_bytes()))
+    }
+}
+
+/// What a client holds of a catalogue once it has processed its first `n` chunks, so a world
+/// reset that interrupts the transfer can send only the rest.
+///
+/// A segment is verified against the manifest and merged as soon as its last byte arrives, so the
+/// client holds exactly the segments that end within the bytes it has processed.
+#[derive(Debug, Clone, Default)]
+pub struct CatalogueLayout {
+    /// What the client held before this catalogue began: the basis a delta was computed against,
+    /// empty for a full catalogue. A catalogue interrupted again still has this much.
+    base: Arc<std::collections::HashMap<BrickCoord, (u64, [u8; 32])>>,
+    /// The digests the catalogue carries, in payload order, as `(revision, content hash)`.
+    entries: Vec<(BrickCoord, (u64, [u8; 32]))>,
+    /// For each segment: the payload offset where it ends and how many `entries` it completes.
+    segments: Vec<(usize, usize)>,
+}
+
+impl CatalogueLayout {
+    /// The digests a client holds after processing the first `chunks` chunks: its previous
+    /// basis plus every entry of each segment that ends within them.
+    pub fn held_after(&self, chunks: u32) -> CatalogueBasis {
+        let bytes = (chunks as usize).saturating_mul(spall_protocol::CATALOGUE_CHUNK_BYTES);
+        let mut held = (*self.base).clone();
+        let through = self
+            .segments
+            .iter()
+            .take_while(|(end, _)| *end <= bytes)
+            .last()
+            .map_or(0, |(_, entries)| *entries);
+        for (coord, digest) in &self.entries[..through] {
+            held.insert(*coord, *digest);
+        }
+        CatalogueBasis { entries: held }
+    }
+}
+
+/// The distant terrain digest catalogue of a deferred regional baseline, already split into the
+/// chunks the server streams after the baseline.
+#[derive(Debug, Clone)]
+pub struct CataloguePayload {
+    /// The baseline this catalogue completes.
+    pub transfer_id: TransferId,
+    pub chunks: Arc<[spall_protocol::CatalogueChunk]>,
+    /// Digest bricks carried.
+    pub bricks: u64,
+    /// Whether it lists only the digests that differ from the catalogue the client already
+    /// holds (a world reset).
+    pub delta: bool,
+    /// Where each segment ends and what the client held before, for resuming after a reset.
+    pub layout: Arc<CatalogueLayout>,
+}
+
+impl CataloguePayload {
+    /// The same catalogue under a fresh baseline id (reissued transfers share geometry).
+    pub fn reissue(&self, transfer_id: TransferId) -> Self {
+        Self {
+            transfer_id,
+            chunks: self
+                .chunks
+                .iter()
+                .cloned()
+                .map(|mut chunk| {
+                    chunk.transfer_id = transfer_id;
+                    chunk
+                })
+                .collect(),
+            bricks: self.bricks,
+            delta: self.delta,
+            layout: Arc::clone(&self.layout),
+        }
+    }
+
+    /// Compressed bytes across all chunks.
+    pub fn payload_bytes(&self) -> usize {
+        self.chunks.iter().map(|c| c.payload.len()).sum()
+    }
+}
+
+/// Packages a regional snapshot as a deferred baseline: the transfer carries the spawn region and
+/// every body (world version
+/// [`spall_protocol::segment::BASELINE_DEFERRED_REGIONAL_WORLD_VERSION`], no digests), and the
+/// distant terrain digests ride along as [`BaselineTransfer::catalogue`] to stream afterwards
+/// (`None` when the snapshot has no digest-only bricks). Both halves describe the same checkpoint.
+///
+/// `reset_basis` is the catalogue the client already holds (a world reset replaces a world the
+/// client has fully mirrored) plus the new world's canonical hash. The catalogue then lists
+/// only the bricks that differ and declares that hash for the client to verify; it is ignored
+/// if the new world lacks a brick the client holds, since the delta could not remove it.
+pub fn transfer_from_snapshot_deferred(
+    snapshot: BaselineSnapshot,
+    transfer_id: TransferId,
+    interest_epoch: InterestEpoch,
+    reset_basis: Option<(&CatalogueBasis, Hash32)>,
+) -> Result<BaselineTransfer, BaselineError> {
+    transfer_from_snapshot_deferred_resuming(
+        snapshot,
+        transfer_id,
+        interest_epoch,
+        reset_basis.map(|(basis, hash)| (basis, hash, None)),
+    )
+}
+
+/// [`transfer_from_snapshot_deferred`] where the basis may be only part of a catalogue: with
+/// `Some(chunks)` the client had processed just the first `chunks` chunks of the catalogue the
+/// reset interrupted, `basis` is what those hold ([`CatalogueLayout::held_after`]), and the
+/// catalogue says so for the client to select the same prefix.
+pub fn transfer_from_snapshot_deferred_resuming(
+    snapshot: BaselineSnapshot,
+    transfer_id: TransferId,
+    interest_epoch: InterestEpoch,
+    reset_basis: Option<(&CatalogueBasis, Hash32, Option<u32>)>,
+) -> Result<BaselineTransfer, BaselineError> {
+    let Some((center, radius)) = snapshot.region else {
+        return Err(BaselineError::Segment(
+            "a deferred catalogue needs a regional snapshot".into(),
+        ));
+    };
+    if center.iter().any(|v| !v.is_finite())
+        || !(1..=spall_protocol::segment::MAX_REGION_RADIUS_BRICKS).contains(&radius)
+    {
+        return Err(BaselineError::Segment("invalid regional interest".into()));
+    }
+    // Only a small neighbourhood travels as geometry; the rest of the client's interest
+    // region is reloaded by the residency pass once the catalogue names those bricks.
+    let snapshot = snapshot.with_region(
+        center,
+        radius.min(spall_protocol::segment::DEFERRED_CORE_RADIUS_BRICKS),
+    );
+    let mut core_volumes = Vec::with_capacity(snapshot.volumes.len());
+    let mut digest_volume = None;
+    let mut delta = false;
+    for volume in &snapshot.volumes {
+        if volume.owner != BaselineOwner::Terrain {
+            core_volumes.push(volume.clone());
+            continue;
+        }
+        let mut core = volume.clone();
+        let mut digests = volume.clone();
+        core.bricks.clear();
+        digests.bricks.clear();
+        for (coord, snap) in &volume.bricks {
+            if snapshot.digest_only(volume, *coord) {
+                digests.bricks.push((*coord, snap.clone()));
+            } else {
+                core.bricks.push((*coord, snap.clone()));
+            }
+        }
+        if core.bricks.is_empty() {
+            return Err(BaselineError::Segment(
+                "a deferred baseline needs at least one resident terrain brick".into(),
+            ));
+        }
+        core_volumes.push(core);
+        if let Some((basis, _, _)) = reset_basis {
+            let new_coords: std::collections::HashSet<BrickCoord> =
+                volume.bricks.iter().map(|(coord, _)| *coord).collect();
+            if basis.entries.keys().all(|coord| new_coords.contains(coord)) {
+                delta = true;
+                // Keep one brick even when nothing differs: a catalogue is never empty.
+                let kept = digests
+                    .bricks
+                    .iter()
+                    .filter(|(coord, snap)| !basis.matches(*coord, snap))
+                    .count();
+                let first = digests.bricks.first().cloned();
+                digests
+                    .bricks
+                    .retain(|(coord, snap)| !basis.matches(*coord, snap));
+                if kept == 0
+                    && let Some(first) = first
+                {
+                    digests.bricks.push(first);
+                }
+            }
+        }
+        if !digests.bricks.is_empty() {
+            digest_volume = Some(digests);
+        }
+    }
+    let catalogue = match digest_volume {
+        None => None,
+        Some(volume) => {
+            let bricks = volume.bricks.len() as u64;
+            let entries: Vec<(BrickCoord, (u64, [u8; 32]))> = volume
+                .bricks
+                .iter()
+                .map(|(coord, snap)| {
+                    (
+                        *coord,
+                        (snap.revision().get(), snap.content_hash().to_bytes()),
+                    )
+                })
+                .collect();
+            let encoded = encode_segmented_capped(
+                &BaselineSnapshot {
+                    checkpoint_tick: snapshot.checkpoint_tick,
+                    journal_cursor: snapshot.journal_cursor,
+                    volumes: vec![volume],
+                    region: snapshot.region,
+                },
+                CATALOGUE_SEGMENT_DECODED_BYTES,
+            )?;
+            // Only a delta can say what it builds on; a full catalogue has no basis.
+            let resumed_chunks = reset_basis
+                .filter(|_| delta)
+                .and_then(|(_, _, chunks)| chunks);
+            let chunks = spall_protocol::chunk_catalogue(
+                transfer_id,
+                encoded.chain_hash,
+                delta,
+                delta
+                    .then(|| reset_basis.map(|(_, hash, _)| hash))
+                    .flatten(),
+                resumed_chunks,
+                &encoded.payload,
+            )
+            .map_err(BaselineError::Segment)?;
+            let layout = CatalogueLayout {
+                base: match reset_basis {
+                    Some((basis, _, _)) if delta => Arc::new(basis.entries.clone()),
+                    _ => Arc::default(),
+                },
+                entries,
+                segments: encoded
+                    .segment_ends
+                    .iter()
+                    .map(|&(end, _volume, bricks)| (end, bricks))
+                    .collect(),
+            };
+            Some(CataloguePayload {
+                transfer_id,
+                chunks: chunks.into(),
+                bricks,
+                delta,
+                layout: Arc::new(layout),
+            })
+        }
+    };
+    let mut core = transfer_from_snapshot_supported(
+        BaselineSnapshot {
+            checkpoint_tick: snapshot.checkpoint_tick,
+            journal_cursor: snapshot.journal_cursor,
+            volumes: core_volumes,
+            region: None,
+        },
+        transfer_id,
+        interest_epoch,
+        true,
+    )?;
+    // With nothing to defer this is an ordinary complete baseline: the client must not wait for
+    // a catalogue that will never come.
+    if catalogue.is_some() {
+        core.begin.world_version =
+            spall_protocol::segment::BASELINE_DEFERRED_REGIONAL_WORLD_VERSION;
+        core.catalogue = catalogue;
+    }
+    Ok(core)
+}
+
+/// Packages a snapshot in the negotiated format, expanding only one bounded segment at a time.
+pub fn transfer_from_snapshot_supported(
+    snapshot: BaselineSnapshot,
+    transfer_id: TransferId,
+    interest_epoch: InterestEpoch,
+    segmented: bool,
+) -> Result<BaselineTransfer, BaselineError> {
+    let started = std::time::Instant::now();
+    if snapshot.region.is_some_and(|(center, radius)| {
+        !segmented
+            || center.iter().any(|v| !v.is_finite())
+            || !(1..=spall_protocol::segment::MAX_REGION_RADIUS_BRICKS).contains(&radius)
+    }) {
+        return Err(BaselineError::Segment(
+            "invalid regional interest or legacy encoding".into(),
+        ));
+    }
+    if !segmented {
+        return transfer_from_snapshot(snapshot, transfer_id, interest_epoch);
+    }
+    use spall_protocol::segment;
+    let EncodedSegmented {
+        payload,
+        chain_hash,
+        regions,
+        total_bricks,
+        segment_ends: _,
+    } = encode_segmented(&snapshot)?;
     let parts: Arc<[BaselinePart]> = chunk_payload(&payload, transfer_id).into();
     if parts.len() > limits::MAX_BASELINE_PARTS {
         return Err(BaselineError::TooManyParts {
@@ -422,11 +781,12 @@ pub fn transfer_from_snapshot_supported(
         },
         end: BaselineEnd {
             transfer_id,
-            assembled_hash: segment::chain_hash(&manifest_body, &hashes),
+            assembled_hash: chain_hash,
             journal_cursor: snapshot.journal_cursor,
         },
         parts,
         world: None,
+        catalogue: None,
     })
 }
 
@@ -555,6 +915,7 @@ pub fn transfer_from_world(
         parts,
         end,
         world: Some(Arc::new(world)),
+        catalogue: None,
     })
 }
 
