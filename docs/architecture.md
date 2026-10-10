@@ -27,6 +27,20 @@ xtask          -> spall_store                   process/scenario/build orchestra
 
 spall_sim owns conversion between authoritative state and protocol records; persistence does not own simulation objects. The graph edge is refined from `spall_sim -> spall_structure, spall_physics` to add `-> spall_jobs, spall_protocol` (T08): staging is submitted to a `spall_jobs::Scheduler` and re-validated through a `JobToken` like any other off-tick result, and every commit emits a `spall_protocol::TopologyTransaction`. Both new targets are foundation crates (`-> spall_core`); no cycle is introduced. The client maintains a replica and prediction state; it never runs server-only structural decisions. Render input is an extracted immutable view of the replica, never a reference into a running server.
 
+**Water direction (2026-10-10): stacked columns with virtual pipes.** The
+`grid_mac` MAC/VOF solver described below is being retired, not extended. Its
+target replacement is a column model in `spall_fluid::columns`: one column per
+terrain cell (0.25 m), each split into vertical open spans holding a depth;
+4-neighbour spans whose open intervals overlap are joined by persistent
+virtual-pipe flows that give momentum, exact hydrostatic rest and exact volume
+conservation. Storage is sparse per 32 x 32 column region with sleep/wake, so
+cost follows moving water rather than world size. Navier-Stokes accuracy,
+vortices and sealed-air pressure are dropped. Design, work items W0-W5
+(ENG-164..ENG-169) and acceptance tests: `docs/water-agent-handoff.md`. This is
+a target, not implemented code: `grid_mac` stays the live path until the W3
+swap passes, and the ENG-103/105/122 text below describes it as it exists today.
+The reproducible failing baseline is `docs/reports/ENG-164.md`.
+
 ENG-103 introduces `spall_fluid -> spall_core, spall_voxel` as a CPU-only
 water crate. Its dense two-phase MAC/PLIC solver uses variable-density
 pressure projection, multigrid preconditioning and isothermal sealed air.

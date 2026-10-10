@@ -1,188 +1,305 @@
-# Water physics: agent starting brief
+# Water physics: agent handoff (column rewrite)
 
-Status: design handoff from the user discussion, not an implemented feature or
-an accepted feasibility gate. No Loopira tickets were created or updated for
-this document. The implementing agent owns the subsequent tracking work.
+Status: design handoff dated 2026-10-10, replacing the previous brief that led
+to the ENG-103..ENG-125 MAC/VOF solver. This is a target design, not
+implemented code. Loopira tickets for the work items below are listed in
+[Tracking](#tracking). Read `AGENTS.md`, `README.md`, `docs/architecture.md`,
+`docs/protocol.md` and `docs/validation.md` first.
 
-## Agreed gameplay
+## Why the rewrite
 
-The user wants physically interactive water in Spall, including:
+The production water today is `spall_fluid::grid_mac`: a 3D two-phase MAC
+Navier-Stokes solver with VOF transport, multigrid-preconditioned CG pressure
+and cut-cell shorelines (~10.5k lines), plus ~2.5k lines of experimental
+ENG-122 modules (`component_fluid`, `phase_graph`, `phase_pressure`,
+`phase_water`, `cut_cell`). It is wired in through `AuthoritativeWater` in
+`crates/spall_sim/src/water.rs`. Measured problems (`docs/reports/ENG-121.md`,
+`ENG-121-rest-state.md`, `ENG-122.md`):
 
-- Building dams, accumulating water behind them, and breaking dams.
-- Digging canals that redirect water and change connected water levels.
-- Swimming, including interaction with currents.
-- Building boats and sailing on water.
-- Experimenting with water appearance independently of the physical model.
+- **It does not scale.** One dense domain box covers all water and is
+  coarsened (2..8 voxels per fluid cell) to fit a 50,000-cell budget
+  (`WATER_FLUID_CELL_BUDGET` in `examples/sandbox/src/worldgen_scene.rs`).
+  Cost follows domain size and pressure iterations, not moving water.
+- **Rest is not rest.** Staircase terrain drives 1-3 m/s parasitic currents, so
+  a lake never sleeps and an idle lake costs ~15 ms per 50 ms fluid step.
+- **Coarsening breaks gameplay.** Thin walls leak (a cell is solid when half of
+  its voxels are), 5-6% of seeded shoreline water is lost, and the open domain
+  top drained a lake (ENG-127).
+- **It walls up.** In play, water stands as a vertical wall next to empty space
+  and never levels out. The cause has not been verified; candidates are the
+  stationary zero-outflow cut caps (commit `ed024a9`) and the 60-quiet-step
+  sleep freezing a stalled state. It is a symptom of the architecture, so do
+  not spend time fixing it in `grid_mac`.
+- **Tuning doesn't converge.** ENG-122 spent ~20 increments on cut-cell
+  pressure edge cases.
 
-Containers that can be picked up and tipped are lower priority, not a permanent
-exclusion. Rivers and lakes are the proposed first operating envelope.
-Open-ocean scale and large ocean waves have not been decided. Do not interpret
-this brief as a promise of unlimited water volume, resolution, or active area.
+## Priorities (user, 2026-10-10)
 
-Full-world destruction, authoritative multiplayer, and CPU-only dedicated
-servers remain requirements. A visual water surface with scripted buoyancy
-alone does not satisfy the requested gameplay.
+In strict order:
 
-## Read and inspect first
+1. **No major visible failures.** Water must never wall up, hang in the air,
+   leak through intact walls, or appear/vanish. Minor physical inaccuracy is
+   acceptable. Water only needs to be approximately right.
+2. **Very simple physics that scales to essentially massive worlds.** Cost must
+   follow *moving* water, not world size or total water volume.
+3. **Acceptable performance** inside the existing server tick budget.
 
-Read `AGENTS.md`, `README.md`, `docs/architecture.md`, `docs/protocol.md`,
-`docs/validation.md`, and relevant assignments in `docs/tasks.md`. Inspect the
-current implementation and evidence rather than relying on historical status
-paragraphs. Preserve existing uncommitted work.
+Visual quality comes last (see W4). This supersedes the old brief's position
+that simple neighbour equalization is insufficient. Momentum (dam-break surges)
+is still wanted, and the pipe model below provides it cheaply. Navier-Stokes
+accuracy, vortices, sealed-air pressure and the diving-bell behaviour are
+**explicitly dropped**.
 
-Follow the repository's Loopira workflow when implementation starts: inspect
-the project guide and current tickets, establish a bounded assignment and its
-dependencies, update status, and record evidence. This handoff is not a ticket
-ID and does not assign the entire water system to one implementation pass.
+Gameplay goals are unchanged and must stay reachable: dams (build, fill, break),
+canals that redirect water and change connected levels, swimming with currents,
+boats. Full-world destruction, authoritative multiplayer and CPU-only dedicated
+servers remain hard requirements.
 
-## Proposed technical direction
+## Model: stacked water columns with virtual pipes
 
-Keep Rapier as the sole rigid-body solver. Add a fluid subsystem that exchanges
-forces and boundary information with it; do not introduce a competing solid
-physics world. Explicitly document this extension to the existing physics
-boundary when integrating it.
+### Representation
 
-The leading candidate is a sparse three-dimensional water grid containing
-water amount and velocity, with gravity, conservative transport, and a pressure
-solve. This is a hypothesis to test, not a frozen solver choice. Simple
-downward transfer and neighbor equalization are insufficient evidence for
-dam-break momentum, pressure-driven flow, or convincing boat interaction.
+- Work at **terrain-cell resolution horizontally** (0.25 m, `CellScale::Quarter`):
+  one column per terrain (x, z). There is no coarsening, so a one-voxel wall
+  always blocks water.
+- Each column is split into **spans**: maximal vertical runs of open (non-solid)
+  cells, each with a solid floor `y0` and ceiling `y1` (the world top counts as
+  open sky). A column can hold several spans: a river above a flooded tunnel,
+  caves, stacked pools.
+- Each span holds a water **depth** `h`, with `0 <= h <= y1 - y0`, stored as a
+  continuous value in cell units (f32 is fine for runtime; see Persistence for
+  canonical encoding). The surface is `s = y0 + h`.
+- Two spans in 4-neighbour columns are **connected** when their open intervals
+  overlap. The overlap window `[max(y0a, y0b), min(y1a, y1b)]` is the "pipe"
+  between them. Diagonal neighbours are not connected.
+- Water state is separate from solid material occupancy, per the existing
+  ownership rules. Spans are derived data: rebuild them from the voxel volume
+  for affected columns on terrain edits. Do not persist them as identities.
+- Storage is sparse per **region** (suggested: 32 x 32 columns, matching the
+  brick footprint). Only regions containing water, or adjacent to water that
+  could flow in, are allocated.
 
-Evaluate representation, free-surface treatment, pressure solver, and solid
-boundary handling together. A standard single-heightfield shallow-water
-solver cannot alone cover a river above a flooded tunnel or stacked pools.
-Particle-based water is another candidate, particularly for moving boundaries
-and eventual pouring, but its cost at reservoir scale must be measured.
+### Step (virtual pipe model)
 
-Salva is worth inspecting as an existing Rust fluid library with Rapier
-coupling. Verify released dependency compatibility, capabilities, licensing,
-and maintenance before adopting it. Do not upgrade shared dependencies merely
-to make a prototype convenient. A custom grid solver and Salva need not both
-be fully implemented before making a decision; compare the most important
-risks with bounded evidence.
+Every connection holds a persistent flow `q` in cells^3/s. Per substep `dt`:
 
-## Integration constraints
+1. **Head.** `H = s` for a span that is not full. For a full span (`h` at its
+   ceiling, as in a flooded tunnel), `H` is a pressure head. Approximate it
+   with a few Jacobi relaxation sweeps over the connected full-span subgraph,
+   seeded from neighbouring free surfaces, and clamp it to at least `y1`.
+   Approximate is fine. Sealed air is not modelled: a dead-end pocket floods.
+2. **Flow update.** `q += dt * g * A * (Ha - Hb) / L`, with `L` = 1 cell and
+   `A` = the wetted area of the overlap window (width 1 cell; height is the part
+   of the window below the higher of the two water levels). Then apply damping
+   `q *= (1 - k*dt)`. A connection with no wetted area has `q = 0`.
+3. **Outflow limit.** If a span's total outflow over `dt` exceeds its volume,
+   scale all its outgoing `q` down proportionally. This is what keeps volume
+   non-negative and conserved exactly.
+4. **Apply.** Compute every flow from the previous state, then apply the
+   volume changes (Jacobi, not Gauss-Seidel). This keeps the step deterministic
+   and independent of iteration order, and allows parallelism per region.
+5. **Overflow and falling.**
+   - Water above a span's ceiling does not exist; full spans pass extra water
+     through their pipes via the head term.
+   - Water leaving through a pipe into a lower span's column lands on that
+     span's floor in the same step. Instant waterfalls are acceptable.
+   - Water crossing the top of a column with open sky is impossible, since
+     depth is capped at open sky.
 
-- **Ownership:** Keep water state distinct from solid material occupancy.
-  Partial cells must be possible. Water is not a collection of voxel rigid
-  bodies or ECS entities. Any new engine crate should follow `spall_*` naming
-  and remain independent of game packages, graphics, and network runtimes.
-- **Conservation:** Account for initial water, explicit sources/sinks, boundary
-  outflow, and numerical error. Excavation, placement, moving bodies, and
-  streaming must not silently create or delete water. Define what happens when
-  a solid is placed into occupied water and displacement cannot be resolved.
-- **Geometry:** Water resolution may differ from solid resolution, but intact
-  thin walls must block flow and supported openings must pass it. Record the
-  minimum supported wall/opening sizes and measure resolution sensitivity.
-- **Tick ordering:** Integrate fluid boundary changes with committed terrain
-  edits and body ownership changes. Do not flow through an intact wall using
-  stale geometry. Specify the order of fluid stepping, force exchange, and
-  Rapier stepping, including any coupling lag. Keep the existing fixed server
-  tick; document fluid substeps, stability limits, and overload behavior.
-- **Jobs:** Workers consume immutable snapshots. The owning simulation thread
-  validates dependencies and applies results at tick boundaries. Pressure
-  solves spanning connected regions require an explicit consistency strategy.
-- **Bodies:** Bodies obstruct and displace water; water applies forces and
-  torque back to bodies. Avoid double-counting buoyancy if pressure coupling
-  already supplies it. Handle sleeping/waking and geometry changes explicitly.
-- **Scale:** Sparse storage alone does not make a filled lake cheap. Measure
-  active cells, pressure iterations, memory, and total server cost. Quiet water
-  needs a conservative dormancy/wake strategy. Missing regions are not empty
-  space, drains, or permanent walls; define boundary exchange before streaming.
-- **Multiplayer and recovery:** The server owns gameplay water and forces.
-  Plan versioned water DTOs, late-join baselines, repair, bounded interest
-  updates, checkpointing, and crash recovery. Separate canonical saved state
-  from interpolated visual state. Do not rely on client fluid lockstep or on
-  replaying floating-point simulation from edit commands to recover water.
+Stability: the explicit pipe model needs `dt <= C * L / sqrt(g * h_max)` per
+region. Use adaptive substeps per active region and report the substep counts.
+Deep resting water sleeps, so deep-water substeps only cost while it moves.
 
-## Boats, swimming, and appearance
+**Why it cannot wall up.** Any head difference across a wetted pipe always
+produces flow. The only stationary state is equal surface heights across every
+wetted connection. Hydrostatic balance holds exactly in this formulation, so
+staircase terrain cannot create parasitic currents. Thin films below a minimum
+depth (suggested 1/64 cell) may stop moving to avoid endless trickles. That can
+leave small puddles but never a wall, and it must be accounted, not deleted.
 
-Boat buoyancy needs displaced volume and its distribution, not just a force
-at the body center. An open-topped hull below its gunwale can exclude water;
-counting only its solid wood voxels misses that displacement. A breach or
-overtopping must let water enter. Prototype watertightness, orientation,
-off-center loading, flooding, and fluid/body coupling. A sealed-air simulation
-is not automatically required: state the initial trapped-air approximation
-and its limits rather than implying air pressure is simulated.
+### Scale: regions, sleep and wake
 
-Swimming needs authoritative submersion and local water velocity queries,
-with buoyancy, drag, and movement controls. Sailing additionally needs a
-bounded wind model and sail, keel, and rudder forces. A motorized test body
-does not establish sailing. Stage these after basic fluid feasibility; avoid
-adding unrelated weather or game systems.
+- A region is **active** or **asleep**. It sleeps when, for N consecutive steps,
+  every `|q|` and every per-step volume change is under a threshold. Sleeping
+  regions cost nothing per tick.
+- **Wake** a region on: a terrain edit inside it or touching its border
+  columns; a neighbour region sending non-zero flow across the shared border; a
+  source/sink being enabled; a body interaction (later).
+- **Streaming.** A non-resident neighbour region is a frozen, *closed*
+  boundary. It is never a drain, never empty space and never a permanent wall.
+  When it becomes resident, both sides wake and exchange normally. Do not guess
+  missing geometry.
+- **Worldgen** seeds generated lakes and oceans at rest (equal surface per
+  connected body), so they start asleep. An idle ocean must cost ~0 ms.
+- **Threading.** Active regions step in parallel from an immutable snapshot of
+  their own state plus border spans of their neighbours. Only the owning thread
+  applies results at the tick boundary. Border flow is computed once per shared
+  connection, so both sides agree and volume is conserved. Results must be
+  bit-identical regardless of thread count (the existing vendored Rayon path
+  already provides this; see `docs/dependencies.md`).
 
-Keep appearance replaceable: blocky, smooth stylized, or more realistic water
-can share the same physical state. Fine ripples, foam, and spray may be client
-effects. Waves that materially move boats or players need an authoritative
-physical representation. A pretty capture is not a physics acceptance test.
+### Terrain edits and displacement
 
-## First bounded assignment: establish fluid feasibility
+The order stays: terrain commit -> span rebuild for affected columns -> water
+remap -> fluid step.
 
-Audit integration points and build a small CPU fixture with two finite
-reservoirs at different elevations, an editable dam, and an excavatable
-connecting canal/tunnel. Use actual Spall voxel boundary data. Start with one
-water type and no implicit infinite source.
+- **Remap rule.** Conserve volume exactly. When spans split or shrink, refill
+  the new spans in that column bottom-up. If water no longer fits (a solid was
+  placed inside water), push the excess to wetted neighbouring spans and then
+  upward. This is the displacement behaviour the user chose in ENG-105: a block
+  placed into water always succeeds. If displacement can't resolve locally,
+  keep the excess in a per-region ledger that is released on later steps, and
+  report it. Never delete water silently.
+- **Excavation** that opens a new span or connection wakes the region; water
+  flows in naturally.
+- Edits use committed terrain only. Never flow through an intact wall using
+  stale span geometry.
 
-Before running it, record dimensions, water resolution, timestep/substeps,
-initial volume, boundary conditions, hardware, and proposed numerical and
-performance thresholds. Thresholds are targets until measured. Reserve water
-time within the existing total server budget; do not treat that entire budget
-as available to fluids.
+### Queries for later gameplay
 
-Required evidence for this first assignment:
+The model directly answers: surface height at (x, z) for a span, submersion
+depth of a point, and local flow velocity (`q / A` averaged over a column's
+pipes). Swimming, buoyancy (displaced volume below the surface) and boats build
+on these later. They are not part of this rewrite. Bodies are still ignored by
+water, as they are today.
 
-1. Resting water remains stable and does not leak through intact walls,
-   including a wall crossing a brick boundary.
-2. Opening a canal transfers water toward hydrostatic equilibrium; closing
-   the passage blocks exchange without deleting water.
-3. Breaking the dam creates a moving surge and downstream accumulation.
-   Report flow/momentum behavior, not just final equalized levels.
-4. A flooded tunnel beneath another water body is represented correctly.
-5. Water accounting closes within a declared tolerance throughout edits and
-   flow; report absolute and relative error and any explicit outflow.
-6. Report fluid-step and total-step timings, memory, active cells, pressure
-   convergence, and response to a larger workload. Include a resolution or
-   timestep comparison to expose numerical artifacts.
+## Integration constraints (unchanged in spirit)
 
-Use bounded runs and structured metrics through the existing harness where
-practical. Add meaningful invariant/scenario tests. New water commands are
-proposed interfaces until implemented and exercised; do not claim they exist.
+- Place it in `crates/spall_fluid` as a new module (suggested `columns`). It
+  must not depend on GPU, window, network or game packages. Keep crate
+  dependencies acyclic.
+- **Authority.** The server owns water. `AuthoritativeWater` in
+  `crates/spall_sim/src/water.rs` keeps its role and public shape where
+  practical (`tick`, `frame`, `canonical_state`, `restore`, growth hooks may be
+  deleted since columns have no domain box). `WaterFrame` changes from
+  coarse-cell fractions to region/span data. Update all callers together.
+- **Persistence.** Use a new explicit versioned DTO (`WaterState` v3 or a new
+  per-region record) in `spall_protocol`. Encode depth as a fixed-point integer
+  in little-endian, never f32 bytes or Rust layout. Per region: span floors and
+  ceilings are not stored (they are derived from terrain), but each stored depth
+  is keyed by its column and floor `y0` so restore can validate it against
+  terrain. Pending-displacement ledgers and source/sink state are stored too.
+  Recovery restores canonical depths. Never re-simulate from edits.
+- **Replication.** Per-region baselines plus quantized depth deltas at a reduced
+  rate, interest-managed by region. Clients render and may interpolate. There is
+  no client fluid lockstep. Late join receives region baselines.
+- **Sources and sinks.** The existing springs, drains and gated sources keep
+  their semantics. Each one becomes a per-span volume rate.
+- Water metrics stay structured: active regions, active spans, substeps,
+  step time, volume, ledger, and skipped time (busy, stale, residency).
 
-Deliver the prototype, reproducible commands, evidence, and a solver decision
-with limitations. If it misses feasibility targets, report the actual failure
-and finish independent in-scope work. Do not silently shrink the scenario or
-substitute visual effects for simulated flow.
+## Work items
 
-## Subsequent acceptance stages
+Each item is one or more reviewable increments with tests. Keep `grid_mac` as
+the live path until W3 passes. Do not delete it early.
 
-These are the roadmap, not requirements to finish in the first assignment:
+### W0: decision, docs and fixture
 
-1. **Rigid-body coupling:** floating and sinking debris, displacement, drag,
-   rotating hulls, off-center loads, breached-hull flooding, and stable resting
-   contacts. Test two-way interaction rather than scripted object motion.
-2. **Gameplay:** swimming with currents; a player-built boat with wind-driven
-   propulsion and steering. Define how authored voxel pieces form one hull
-   using existing body/assembly capabilities or an explicitly scoped prerequisite.
-3. **Multiplayer and recovery:** two clients observe a dam breach, late join
-   during flow, packet-loss recovery, save/restart, and matching canonical
-   water baselines. Test durability across geometry and water state changes.
-4. **Scale and visuals:** conservative streaming/dormancy, several active water
-   regions, sustained server/bandwidth measurements, and alternative visual
-   treatments of the same physical fixture.
+- Update the water sections of `docs/architecture.md` (lines ~30-96, ~397-435)
+  to describe the column model as the target and `grid_mac` as being retired.
+  Add the decision to `docs/tasks.md` if the task list tracks water.
+- Capture today's walled-water symptom as a reproducible fixture: a generated
+  world seed and size, or a small hand-built basin with a dug side pocket.
+  Record it against `grid_mac` as the failing baseline.
 
-Plan authority and persistence from the first prototype, even though their
-integrated checks land later. Local solver evidence alone does not establish
-multiplayer readiness. End each assignment with changed files, exact checks,
-measured results versus targets, remaining risks, and the next unblocked task.
+### W1: column solver, standalone
 
-## Starting references
+`spall_fluid::columns`: span extraction from `spall_voxel` bricks, connection
+graph, pipe step, outflow limiting, full-span head relaxation, thin-film
+handling, conservation accounting. All headless CPU tests, with fixtures small
+enough for CI:
 
-- [Salva](https://salva.rs/) and its
-  [source repository](https://github.com/dimforge/salva): particle fluids and
-  Rapier coupling candidate.
-- [Bridson's fluid simulation course](https://www.cs.ubc.ca/~rbridson/fluidsimulation/2006/):
-  background on grid, pressure, and particle/grid methods.
-- [Real-time Simulation of Large Bodies of Water with Small Scale Details](https://matthias-research.github.io/pages/publications/hfFluid.pdf):
-  background on shallow-water representations and their role in larger systems.
+1. **Settles flat.** An irregular blob of water released on stair-stepped
+   terrain reaches rest within a bounded simulated time. Afterwards, **no
+   wetted connection has a head difference above 0.1 cell**, and no span holds
+   water above a neighbour's open, lower surface. This is the anti-wall gate.
+2. **Dam break.** Removing a dam produces a moving surge with a peak flow
+   speed you report, downstream accumulation, and eventual equal levels.
+3. **Canal.** Digging a channel between two pools at different levels brings
+   them to a common level. Filling the channel back in stops exchange without
+   deleting water.
+4. **Thin wall.** A one-cell wall, including one crossing a region and brick
+   boundary, holds indefinitely.
+5. **Stacked water.** A flooded tunnel beneath a river: both are represented,
+   and the tunnel stays full under the river's head.
+6. **U-tube.** Two shafts connected by a flooded tunnel equalize approximately.
+7. **Conservation.** Total volume plus ledgers stays constant to within f32
+   rounding (declare the tolerance) through flow, edits and displacement.
+8. **Determinism.** Identical results across thread counts and runs.
 
-References are starting points, not evidence of Spall compatibility or performance.
+### W2: regions, sleep and threading
+
+Region storage, active/asleep tracking, wake rules, parallel regional step,
+frozen non-resident boundaries, worldgen seeding at rest. Headless bench
+against the showcase world at 1024 and 4096 sizes (release build, report the
+hardware):
+
+- Resting world: water step ≈ 0 ms. Target is < 0.1 ms.
+- Dam break with ~100k active columns: target is < 5 ms per 50 ms fluid step on
+  the reference machine (Ryzen 7 9700X).
+- Memory per stored column.
+
+These are targets. Report measured numbers against them and don't round
+missed targets into passes.
+
+### W3: production swap
+
+Replace the `grid_mac` engine behind `AuthoritativeWater`, including edits and
+displacement, worker execution, sources and sinks, the new persistence DTO, and
+replication baselines plus deltas. Port the existing water tests in
+`crates/spall_sim/tests` (`authoritative_water`, `water_regions`;
+`water_growth` is deleted or replaced, since there is no domain growth) and
+`crates/spall_server/tests` (`water_persistence`, `water_replication`).
+Acceptance:
+
+- Save/restart and late join reproduce matching canonical water.
+- The W0 fixture no longer walls up.
+- An interactive play session on a generated world is user-checked. Report it
+  as unrun until the user confirms.
+
+### W4: rendering
+
+Mesh water from span surfaces: a top quad at the exact surface height, and side
+faces only where a neighbour's surface is lower or the neighbour is dry. This
+should remove the bottom z-fighting, since water faces never coincide with
+terrain faces. Client interpolation between replicated depths. Visual style is
+open (`crates/spall_render/src/water.rs`, `crates/spall_client/src/water_look.rs`).
+
+### W5: removal
+
+Delete `grid_mac` (and `grid_mac/`), `component_fluid`, `phase_graph`,
+`phase_pressure`, `phase_water`, `phase_fixtures`, `cut_cell`, the
+`grid_fluid_scenario` binary, the `--grid-fluid-demo` and phase-demo client
+paths, the obsolete water probes in `examples/sandbox/examples` and
+`crates/spall_fluid/examples`, and the coarsening budget in `worldgen_scene.rs`.
+Git history keeps them. `cargo xtask check` must pass.
+
+## Explicit non-goals
+
+No Navier-Stokes, no 3D vortices, no sealed-air pressure, no particle water, no
+GPU solver, no body coupling in this rewrite, no second physics engine, no
+per-voxel entities. Do not reintroduce coarsened domain boxes or global
+cell budgets.
+
+## Superseded
+
+ENG-120 (domain growth), ENG-121 (MAC performance), ENG-123, ENG-124 and
+ENG-125 (cut-cell geometry and transfer) are superseded by this design. The
+uncommitted ENG-127 open-top leak fix in `worldgen_scene.rs` is obsolete under
+W5. It may be committed as a stopgap for the live solver before W3.
+
+## Tracking
+
+Loopira project "Voxel Engine". Each ticket is blocked by the previous one.
+
+| Work item | Ticket |
+|---|---|
+| W0 decision, docs and fixture | ENG-164 |
+| W1 column solver, standalone | ENG-165 |
+| W2 regions, sleep and threading | ENG-166 |
+| W3 production swap | ENG-167 |
+| W4 rendering | ENG-168 |
+| W5 removal | ENG-169 |
+
+ENG-120, ENG-121, ENG-123, ENG-124 and ENG-125 were canceled as superseded on
+2026-10-10.
