@@ -65,8 +65,12 @@ impl Default for ColumnConfig {
     fn default() -> Self {
         Self {
             gravity: (9.81 / CELL_SIZE_M) as f32,
-            damping_per_s: 1.5,
-            cfl: 0.5,
+            // Tuned on a deep lake drained continuously (tests/column_drain.rs):
+            // a safety factor of 0.5 left waves growing without bound there, 0.4
+            // is stable, and 0.35 keeps a margin. Damping stays modest so surges
+            // keep their momentum.
+            damping_per_s: 2.0,
+            cfl: 0.35,
             min_film_depth: 1.0 / 64.0,
             relax_sweeps: 4,
             max_substeps: 64,

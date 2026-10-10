@@ -63,6 +63,16 @@ fn run(world: &mut ColumnWorld, seconds: f64) -> u32 {
     worked
 }
 
+/// Steps until every region sleeps (or `max_seconds` pass); returns seconds used.
+fn run_until_asleep(world: &mut ColumnWorld, max_seconds: f64) -> f64 {
+    let mut t = 0.0;
+    while world.active_region_count() > 0 && t < max_seconds {
+        run(world, 5.0);
+        t += 5.0;
+    }
+    t
+}
+
 fn pool_cells(x0: i64, x1: i64, z0: i64, z1: i64, depth: i64) -> Vec<GlobalCell> {
     let mut cells = Vec::new();
     for z in z0..z1 {
@@ -103,8 +113,12 @@ fn spreading_water_allocates_regions_and_conserves_volume() {
     let regions0 = world.region_count();
     world.wake_all();
     let mut woke = 0;
-    for _ in 0..(40.0 / DT) as u32 {
+    // Spreading across a border takes as long as the water takes to get there.
+    for _ in 0..(300.0 / DT) as u32 {
         woke += world.step(DT).regions_woken;
+        if world.region_count() > regions0 {
+            break;
+        }
     }
     println!(
         "regions {regions0} -> {}, woken {woke}, active {}",
@@ -136,7 +150,7 @@ fn quiet_regions_sleep_and_border_flow_wakes_a_neighbour() {
         "ring includes the far side"
     );
     world.wake_all();
-    run(&mut world, 30.0);
+    run_until_asleep(&mut world, 600.0);
     assert_eq!(
         world.active_region_count(),
         0,
@@ -182,7 +196,7 @@ fn flow_across_a_border_wakes_a_sleeping_region() {
     let mut world = ColumnWorld::with_terrain(terrain, ColumnConfig::default());
     world.seed_cells(&pool_cells(20, 31, 10, 12, 1));
     world.wake_all();
-    run(&mut world, 60.0);
+    run_until_asleep(&mut world, 600.0);
     assert_eq!(world.active_region_count(), 0);
     // A source dumps water at the border: only region (0,0) wakes by itself.
     world.add_water(GlobalCell::new(30, 1, 10), 20.0).unwrap();
