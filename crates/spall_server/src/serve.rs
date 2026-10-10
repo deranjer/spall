@@ -5659,6 +5659,15 @@ fn tick_journal_batch(
         });
         *journalled_through = seq.0;
     }
+    if let Some(delta) = sim.take_column_water_journal() {
+        let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
+        batch.push(spall_store::JournalRecord {
+            seq: seq.0,
+            tick,
+            payload: spall_store::JournalPayload::ColumnWaterDelta(delta),
+        });
+        *journalled_through = seq.0;
+    }
     if let Some(bytes) = sim.take_vegetation_journal()? {
         let seq = sim.reserve_journal_seq().map_err(|e| e.to_string())?;
         batch.push(spall_store::JournalRecord {

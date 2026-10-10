@@ -231,6 +231,7 @@ pub(crate) fn capture_with_terrain_bricks(
             .map_err(|_| PersistError::BadField("vegetation capture"))?
             .unwrap_or_default(),
         water: sim.water_regions().map(|w| w.canonical_state()).collect(),
+        column_water: sim.column_water().map(|w| w.canonical_state()),
         tick: sim.current_tick().get(),
         journal_cursor,
         world_hash: world.world_hash().0,
@@ -557,6 +558,7 @@ pub fn restore_with_terrain_collider_mode(
     // tick is strictly newer than every durable record (ENG-39).
     let mut durable_tick = cp.tick;
     let mut water_state = cp.water.clone();
+    let mut column_water_state = cp.column_water.clone();
     let mut vegetation_state = cp.vegetation.clone();
     let mut vegetation_clock = None;
 
@@ -594,6 +596,15 @@ pub fn restore_with_terrain_collider_mode(
                         .map_err(|_| PersistError::BadField("journal water state"))?;
                 }
                 water_state = state.clone();
+                last_seq = record.seq;
+                continue;
+            }
+            JournalPayload::ColumnWaterDelta(delta) => {
+                column_water_state
+                    .as_mut()
+                    .ok_or(PersistError::BadField("column water delta without state"))?
+                    .apply_delta(delta)
+                    .map_err(|_| PersistError::BadField("journal column water delta"))?;
                 last_seq = record.seq;
                 continue;
             }
@@ -674,6 +685,13 @@ pub fn restore_with_terrain_collider_mode(
         .map_err(|_| PersistError::BadField("vegetation recovery"))?;
     sim.restore_water_regions(&water_state)
         .map_err(|_| PersistError::BadField("water recovery"))?;
+    if let Some(state) = &column_water_state {
+        sim.restore_column_water(
+            state,
+            spall_sim::column_water::ColumnSolverConfig::default(),
+        )
+        .map_err(|_| PersistError::BadField("column water recovery"))?;
+    }
     Ok((sim, last_seq))
 }
 

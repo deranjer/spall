@@ -352,6 +352,7 @@ fn dummy_checkpoint(tick: u64, cursor: u64) -> Checkpoint {
         },
         bodies: vec![],
         water: Vec::new(),
+        column_water: None,
         bricks: vec![],
     }
 }

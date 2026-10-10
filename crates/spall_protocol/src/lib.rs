@@ -48,7 +48,7 @@ pub use codec::{
     CodecError, decode_bulk, decode_control, decode_datagram, decode_topology, encode_bulk,
     encode_control, encode_datagram,
 };
-pub use column_water::ColumnWaterState;
+pub use column_water::{ColumnWaterDelta, ColumnWaterState};
 pub use handshake::{
     AlgorithmVersions, Handshake, Incompatibility, NegotiatedLimits, PROTOCOL_VERSION,
     check_compatible,

@@ -596,6 +596,7 @@ mod tests {
             },
             bodies: vec![],
             water: Vec::new(),
+            column_water: None,
             bricks: vec![],
         }
     }

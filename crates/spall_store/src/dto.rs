@@ -35,6 +35,8 @@ pub const STORE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_STORED_BRICK_BYTES: usize = 256 * 1024;
 /// Exact bits, bounded source lists and at most four million cells in a group.
 pub const MAX_STORED_WATER_BYTES: usize = 128 * 1024 * 1024;
+/// Largest stored stacked-column water checkpoint (ENG-167).
+pub const MAX_STORED_COLUMN_WATER_BYTES: usize = 512 * 1024 * 1024;
 
 /// Errors converting between save records and their encoded forms.
 #[derive(Debug, thiserror::Error)]
@@ -155,6 +157,8 @@ pub struct Checkpoint {
     pub vegetation: Vec<u8>,
     /// Independently versioned water state in an auxiliary checkpoint row.
     pub water: Vec<spall_protocol::WaterState>,
+    /// Stacked-column water (schema 3 DTO) in its own additive checkpoint row.
+    pub column_water: Option<spall_protocol::ColumnWaterState>,
     pub tick: u64,
     /// Highest journal sequence this checkpoint already includes. Recovery
     /// replays the durable journal suffix strictly after this.
@@ -226,6 +230,9 @@ pub enum JournalPayload {
         time_ms: u64,
         credit_ms: u64,
     },
+    /// Appended (ENG-167): changed column-water regions since the last water
+    /// record, applied over the checkpoint's `column_water` on recovery.
+    ColumnWaterDelta(spall_protocol::ColumnWaterDelta),
 }
 
 impl JournalPayload {
@@ -430,6 +437,7 @@ mod tests {
     fn checkpoint_postcard_round_trips() {
         let cp = Checkpoint {
             vegetation: Vec::new(),
+            column_water: None,
             tick: 120,
             journal_cursor: 5,
             world_hash: [3; 32],

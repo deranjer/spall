@@ -19,7 +19,7 @@ use spall_fluid::columns::{
     CELL_SIZE_M, ColumnConfig, ColumnStepMetrics, ColumnWorld, RegionKey, VolumeTerrain,
 };
 use spall_protocol::column_water::{
-    COLUMN_WATER_VERSION, ColumnRegionRecord, ColumnSpanRecord, ColumnWaterState,
+    COLUMN_WATER_VERSION, ColumnRegionRecord, ColumnSpanRecord, ColumnWaterDelta, ColumnWaterState,
     volume_from_fixed, volume_to_fixed,
 };
 use spall_voxel::Volume;
@@ -30,10 +30,13 @@ pub const COLUMN_STEP_DT_S: f64 = 0.05;
 const MAX_STEPS_PER_TICK: u32 = 2;
 /// Depth in presentation frames is quantized to 1/128 cell.
 pub const FRAME_DEPTH_SCALE: f64 = 128.0;
+/// Server ticks between journal records while water moves with no terrain
+/// edit (an edit tick always journals, so water stays consistent with terrain).
+pub const JOURNAL_INTERVAL_TICKS: u32 = 20;
 /// Spans holding less than this (cells^3) are not published or persisted.
 const DRY_VOLUME: f64 = 1.0e-6;
 
-pub use spall_fluid::columns::MemoryReport;
+pub use spall_fluid::columns::{ColumnConfig as ColumnSolverConfig, MemoryReport};
 
 /// Initial water and exchange cells for an authoritative column world.
 #[derive(Debug, Clone)]
@@ -158,6 +161,10 @@ pub struct AuthoritativeColumnWater {
     removed_cells3: f64,
     carry_s: f64,
     skipped_s: f64,
+    /// Regions changed since the last journal delta.
+    journal_dirty: BTreeSet<RegionKey>,
+    journal_wait_ticks: u32,
+    journal_edit_pending: bool,
 }
 
 fn check_setup(setup: &ColumnWaterSetup) -> Result<(), ColumnWaterError> {
@@ -243,6 +250,9 @@ impl AuthoritativeColumnWater {
             removed_cells3: 0.0,
             carry_s: 0.0,
             skipped_s: 0.0,
+            journal_dirty: BTreeSet::new(),
+            journal_wait_ticks: 0,
+            journal_edit_pending: false,
         }
     }
 
@@ -413,6 +423,8 @@ impl AuthoritativeColumnWater {
         metrics.stepped = metrics.steps > 0;
         metrics.step_duration = started.elapsed();
         let dirty = self.world.take_dirty_regions();
+        self.journal_dirty.extend(dirty.iter().copied());
+        self.journal_edit_pending |= !edited_keys.is_empty() || !reloaded_keys.is_empty();
         metrics.changed_regions = self.rebuild_frames_for(Some(dirty));
         let cell3 = CELL_SIZE_M.powi(3);
         metrics.volume_m3 = self.world.total_volume() * cell3;
@@ -425,22 +437,59 @@ impl AuthoritativeColumnWater {
         Ok(metrics)
     }
 
+    /// The delta owed to the journal this tick, if any: always on a tick
+    /// that applied a terrain change (water stays consistent with terrain at
+    /// every committed edit), otherwise every [`JOURNAL_INTERVAL_TICKS`] while
+    /// water has moved. Resting water journals nothing.
+    pub fn take_journal_delta(&mut self) -> Option<ColumnWaterDelta> {
+        self.journal_wait_ticks = self.journal_wait_ticks.saturating_add(1);
+        let due = self.journal_edit_pending || self.journal_wait_ticks >= JOURNAL_INTERVAL_TICKS;
+        if !due || self.journal_dirty.is_empty() {
+            if !self.journal_edit_pending && self.journal_dirty.is_empty() {
+                self.journal_wait_ticks = 0;
+            }
+            return None;
+        }
+        let regions = std::mem::take(&mut self.journal_dirty)
+            .into_iter()
+            .map(|key| ColumnRegionRecord {
+                rx: key.0,
+                rz: key.1,
+                spans: self.span_records(key),
+            })
+            .collect();
+        self.journal_wait_ticks = 0;
+        self.journal_edit_pending = false;
+        Some(ColumnWaterDelta {
+            frame_seq: self.seq,
+            fluid_time_fixed: volume_to_fixed(self.fluid_time_s),
+            spring_added_fixed: volume_to_fixed(self.added_cells3),
+            drain_removed_fixed: volume_to_fixed(self.removed_cells3),
+            unplaced_fixed: volume_to_fixed(self.world.unplaced_volume()),
+            gated_rate: self.gated_sources_rate(),
+            regions,
+        })
+    }
+
+    fn span_records(&self, key: RegionKey) -> Vec<ColumnSpanRecord> {
+        self.world
+            .region_wet_spans(key, DRY_VOLUME)
+            .into_iter()
+            .map(|(column, floor_y, volume)| ColumnSpanRecord {
+                column,
+                floor_y,
+                volume: volume_to_fixed(volume).max(1),
+            })
+            .collect()
+    }
+
     pub fn canonical_state(&self) -> ColumnWaterState {
         let coords = |cells: &[GlobalCell]| cells.iter().map(|p| [p.x, p.y, p.z]).collect();
         let mut regions = Vec::new();
         let mut keys = self.world.region_keys();
         keys.sort_unstable();
         for key in keys {
-            let spans: Vec<ColumnSpanRecord> = self
-                .world
-                .region_wet_spans(key, DRY_VOLUME)
-                .into_iter()
-                .map(|(column, floor_y, volume)| ColumnSpanRecord {
-                    column,
-                    floor_y,
-                    volume: volume_to_fixed(volume).max(1),
-                })
-                .collect();
+            let spans = self.span_records(key);
             if !spans.is_empty() {
                 regions.push(ColumnRegionRecord {
                     rx: key.0,

@@ -71,6 +71,10 @@ pub struct ColumnWaterState {
 
 impl ColumnWaterState {
     pub fn validate(&self) -> Result<(), WaterCodecError> {
+        self.validate_inner(false)
+    }
+
+    fn validate_inner(&self, allow_empty_regions: bool) -> Result<(), WaterCodecError> {
         let bad = |what: &str| {
             WaterCodecError::InvalidChunk(format!("invalid canonical column water state: {what}"))
         };
@@ -98,6 +102,9 @@ impl ColumnWaterState {
                 return Err(bad("regions not strictly ordered"));
             }
             prev_region = Some(key);
+            if region.spans.is_empty() && !allow_empty_regions {
+                return Err(bad("empty region"));
+            }
             spans = spans
                 .checked_add(region.spans.len())
                 .filter(|n| *n <= MAX_COLUMN_WATER_SPANS)
@@ -124,6 +131,82 @@ impl ColumnWaterState {
                 return Err(bad("source list"));
             }
         }
+        Ok(())
+    }
+}
+
+/// Changed regions since the previous journal record, replacing those regions
+/// of the last state wholesale (a region with no spans is now dry). Scalars are
+/// the new absolute values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnWaterDelta {
+    pub frame_seq: u64,
+    pub fluid_time_fixed: u64,
+    pub spring_added_fixed: u64,
+    pub drain_removed_fixed: u64,
+    pub unplaced_fixed: u64,
+    pub gated_rate: u8,
+    /// Sorted by `(rx, rz)`, no duplicates; each region's spans are ordered
+    /// like [`ColumnRegionRecord::spans`].
+    pub regions: Vec<ColumnRegionRecord>,
+}
+
+impl ColumnWaterDelta {
+    /// Checks the delta against the height range it will be applied under.
+    pub fn validate(&self, y_lo: i32, y_hi: i32) -> Result<(), WaterCodecError> {
+        // Reuse the state validator on a shell carrying just these regions.
+        let shell = ColumnWaterState {
+            version: COLUMN_WATER_VERSION,
+            y_lo,
+            y_hi,
+            frame_seq: self.frame_seq.max(1),
+            fluid_time_fixed: 0,
+            spring_added_fixed: 0,
+            drain_removed_fixed: 0,
+            unplaced_fixed: 0,
+            regions: self.regions.clone(),
+            sources: Vec::new(),
+            gated_sources: [Vec::new(), Vec::new(), Vec::new()],
+            sinks: Vec::new(),
+            gated_rate: self.gated_rate,
+        };
+        shell.validate_inner(true)
+    }
+}
+
+impl ColumnWaterState {
+    /// Applies a journaled delta: replaces the listed regions and takes the new
+    /// scalars. The state stays valid or is left unchanged on error.
+    pub fn apply_delta(&mut self, delta: &ColumnWaterDelta) -> Result<(), WaterCodecError> {
+        delta.validate(self.y_lo, self.y_hi)?;
+        if delta.frame_seq < self.frame_seq {
+            return Err(WaterCodecError::InvalidChunk(
+                "column water delta goes back in time".into(),
+            ));
+        }
+        let mut merged: std::collections::BTreeMap<(i32, i32), ColumnRegionRecord> = self
+            .regions
+            .iter()
+            .map(|r| ((r.rx, r.rz), r.clone()))
+            .collect();
+        for region in &delta.regions {
+            if region.spans.is_empty() {
+                merged.remove(&(region.rx, region.rz));
+            } else {
+                merged.insert((region.rx, region.rz), region.clone());
+            }
+        }
+        let regions: Vec<_> = merged.into_values().collect();
+        let mut next = self.clone();
+        next.regions = regions;
+        next.frame_seq = delta.frame_seq;
+        next.fluid_time_fixed = delta.fluid_time_fixed;
+        next.spring_added_fixed = delta.spring_added_fixed;
+        next.drain_removed_fixed = delta.drain_removed_fixed;
+        next.unplaced_fixed = delta.unplaced_fixed;
+        next.gated_rate = delta.gated_rate;
+        next.validate()?;
+        *self = next;
         Ok(())
     }
 }
@@ -172,6 +255,61 @@ mod tests {
             assert_eq!(volume_to_fixed(volume_from_fixed(once)), once);
             assert!((volume_from_fixed(once) - v).abs() <= 0.5 / VOLUME_FIXED_ONE as f64);
         }
+    }
+
+    #[test]
+    fn deltas_replace_regions_and_stay_valid() {
+        let mut s = state();
+        let delta = ColumnWaterDelta {
+            frame_seq: 5,
+            fluid_time_fixed: 9,
+            spring_added_fixed: 0,
+            drain_removed_fixed: 0,
+            unplaced_fixed: 3,
+            gated_rate: 1,
+            regions: vec![
+                ColumnRegionRecord {
+                    rx: 0,
+                    rz: 0,
+                    spans: vec![ColumnSpanRecord {
+                        column: 9,
+                        floor_y: 2,
+                        volume: 11,
+                    }],
+                },
+                ColumnRegionRecord {
+                    rx: 1,
+                    rz: 0,
+                    spans: vec![ColumnSpanRecord {
+                        column: 0,
+                        floor_y: 0,
+                        volume: 1,
+                    }],
+                },
+            ],
+        };
+        s.apply_delta(&delta).unwrap();
+        assert_eq!(s.regions.len(), 2);
+        assert_eq!(s.regions[0].spans.len(), 1, "region 0 replaced wholesale");
+        assert_eq!((s.frame_seq, s.unplaced_fixed, s.gated_rate), (5, 3, 1));
+        let dry = ColumnWaterDelta {
+            frame_seq: 6,
+            regions: vec![ColumnRegionRecord {
+                rx: 0,
+                rz: 0,
+                spans: Vec::new(),
+            }],
+            ..delta.clone()
+        };
+        s.apply_delta(&dry).unwrap();
+        assert_eq!(s.regions.len(), 1, "an emptied region is removed");
+        let back = ColumnWaterDelta {
+            frame_seq: 1,
+            ..dry
+        };
+        let before = s.clone();
+        assert!(s.apply_delta(&back).is_err());
+        assert_eq!(s, before, "a refused delta changes nothing");
     }
 
     #[test]

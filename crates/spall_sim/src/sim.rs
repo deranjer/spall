@@ -366,6 +366,13 @@ impl Simulation {
         Ok(())
     }
 
+    /// The column-water delta owed to this tick's journal batch, if any.
+    pub fn take_column_water_journal(
+        &mut self,
+    ) -> Option<spall_protocol::column_water::ColumnWaterDelta> {
+        self.column_water.as_mut()?.take_journal_delta()
+    }
+
     pub fn water_regions(&self) -> impl Iterator<Item = &crate::water::AuthoritativeWater> {
         self.water.iter().chain(self.additional_water.iter())
     }

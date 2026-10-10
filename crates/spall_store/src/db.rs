@@ -394,6 +394,22 @@ impl Writer {
                 "water checkpoint exceeds byte limit".into(),
             ));
         }
+        let column_blob = checkpoint
+            .column_water
+            .as_ref()
+            .map(|state| {
+                state
+                    .validate()
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                let blob = dto::encode(state)?;
+                if blob.len() > dto::MAX_STORED_COLUMN_WATER_BYTES {
+                    return Err(StoreError::Corrupt(
+                        "column water checkpoint exceeds byte limit".into(),
+                    ));
+                }
+                Ok(blob)
+            })
+            .transpose()?;
         let now_ms = unix_millis();
 
         self.maybe_arm_real_write_failure()?;
@@ -432,6 +448,17 @@ impl Writer {
                 ],
             )?;
             payload_bytes += water_blob.len() as u64;
+            tx.execute(
+                "DELETE FROM checkpoint_column_water WHERE tick = ?",
+                params![checkpoint.tick as i64],
+            )?;
+            if let Some(blob) = &column_blob {
+                tx.execute(
+                    "INSERT INTO checkpoint_column_water (tick, state, crc) VALUES (?, ?, ?)",
+                    params![checkpoint.tick as i64, blob, crc16(blob).as_slice()],
+                )?;
+                payload_bytes += blob.len() as u64;
+            }
             tx.execute(
                 "INSERT OR REPLACE INTO checkpoint_vegetation (tick,state,crc) VALUES (?,?,?)",
                 params![
