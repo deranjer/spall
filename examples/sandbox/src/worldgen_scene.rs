@@ -89,6 +89,11 @@ pub enum WorldgenSceneError {
 pub const DEFAULT_SIZE_CELLS: u32 = SHOWCASE_SIZE_CELLS;
 
 /// A generated world, ready to package for the server.
+/// Where the player stands beside a lake.
+struct LakeSite {
+    spawn: [f64; 3],
+}
+
 pub struct GeneratedScene {
     world: Arc<GeneratedWorld>,
     water: Option<WaterSetup>,
@@ -265,6 +270,11 @@ impl GeneratedScene {
     /// A feet position (metres) a few cells inland from the shore of the
     /// deepest lake: standing room on solid ground with headroom.
     pub fn lake_spawn(&self) -> Option<[f64; 3]> {
+        self.lake_site().map(|site| site.spawn)
+    }
+
+    /// Where the player stands beside the deepest lake.
+    fn lake_site(&self) -> Option<LakeSite> {
         use std::collections::{HashMap, HashSet};
         let plan = &self.world.water;
         let mut depth: HashMap<(i64, i64), i64> = HashMap::new();
@@ -313,15 +323,78 @@ impl GeneratedScene {
                     )
                 });
                 if clear {
-                    return Some([
-                        (x as f64 + 0.5) * 0.25,
-                        (ground + 1) as f64 * 0.25,
-                        (z as f64 + 0.5) * 0.25,
-                    ]);
+                    return Some(LakeSite {
+                        spawn: [
+                            (x as f64 + 0.5) * 0.25,
+                            (ground + 1) as f64 * 0.25,
+                            (z as f64 + 0.5) * 0.25,
+                        ],
+                    });
                 }
             }
         }
         None
+    }
+
+    /// A raft and a handful of test objects floating on the deepest lake, in
+    /// open water a few metres out from where [`Self::lake_spawn`] stands:
+    /// a 6 m x 4 m wood raft, three light crates that float flat, a long log,
+    /// and a stone block that sinks. Empty if the lake has no clear stretch of
+    /// deep water.
+    pub fn lake_floaters(&self) -> Vec<spall_server::InitialBody> {
+        use std::collections::HashMap;
+        let Some(site) = self.lake_site() else {
+            return Vec::new();
+        };
+        let plan = &self.world.water;
+        let mut depth: HashMap<(i64, i64), i64> = HashMap::new();
+        for c in &plan.cells {
+            *depth.entry((c.x, c.z)).or_default() += 1;
+        }
+        let surface_m = (plan.surface_y + 1) as f64 * 0.25;
+        // Open water at least 1 m deep over the whole stretch the objects use
+        // (12 m by 10 m around the centre), the nearest such spot to the spawn.
+        let clear_at = |cx: i64, cz: i64| {
+            (-24..=24).all(|dx| {
+                (-20..=20).all(|dz| depth.get(&(cx + dx, cz + dz)).is_some_and(|d| *d >= 4))
+            })
+        };
+        let spawn = ((site.spawn[0] / 0.25) as i64, (site.spawn[2] / 0.25) as i64);
+        let mut candidates: Vec<(i64, i64)> = depth.keys().copied().collect();
+        candidates.sort_by_key(|&(x, z)| ((x - spawn.0).pow(2) + (z - spawn.1).pow(2), x, z));
+        let Some(centre) = candidates.into_iter().find(|&(x, z)| clear_at(x, z)) else {
+            return Vec::new();
+        };
+        let (cx, cz) = (centre.0 as f64 * 0.25, centre.1 as f64 * 0.25);
+        let wood = crate::game::materials::WOOD;
+        let stone = crate::game::materials::STONE;
+        // `dims` in cells (x, y, z); `offset` is the body's centre relative to
+        // the lake point, metres. Bodies start above the surface and drop.
+        let body = |dims: [i64; 3], material, density: f32, offset: [f64; 2], drop_m: f64| {
+            let half = dims.map(|d| d as f64 * 0.125);
+            spall_server::InitialBody {
+                dims,
+                material,
+                density_kg_m3: density,
+                position_m: [
+                    cx + offset[0] - half[0],
+                    surface_m + drop_m,
+                    cz + offset[1] - half[2],
+                ],
+            }
+        };
+        vec![
+            // The raft: 6 m x 0.5 m x 4 m of wood, 70% of its thickness under.
+            body([24, 2, 16], wood, 700.0, [0.0, 0.0], 0.4),
+            // Three 1 m crates light enough to float flat, 25% under.
+            body([4, 4, 4], wood, 250.0, [-5.0, -2.5], 0.8),
+            body([4, 4, 4], wood, 250.0, [-5.0, 0.0], 0.8),
+            body([4, 4, 4], wood, 250.0, [-5.0, 2.5], 0.8),
+            // A 6 m log, 0.75 m across, 60% under: it rolls.
+            body([24, 3, 3], wood, 600.0, [0.0, 4.5], 0.8),
+            // Stone does not float.
+            body([4, 4, 4], stone, 2600.0, [5.0, 0.0], 1.2),
+        ]
     }
 
     /// Builds the terrain, materials and physics config. The terrain volume is

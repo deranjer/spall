@@ -81,6 +81,28 @@ fn solid_box(dims: [i64; 3], material: MaterialId) -> impl FnOnce(VolumeId) -> V
     }
 }
 
+/// Spawns a dynamic body that is one solid box of `dims` cells, painted
+/// `material`, at bulk `density_kg_m3` and `pose`. The box's local origin is its
+/// minimum corner. Used for rafts and floating-object tests.
+pub fn spawn_box_body(
+    world: &mut SimWorld,
+    dims: [i64; 3],
+    material: MaterialId,
+    density_kg_m3: f32,
+    pose: BodyPose,
+) -> Option<spall_core::EntityId> {
+    world
+        .spawn_body(
+            solid_box(dims, material),
+            pose,
+            [0.0; 3],
+            [0.0; 3],
+            density_kg_m3,
+            0,
+        )
+        .ok()
+}
+
 /// Spawns one dynamic 0.75 m box resting on the walk arena's floor, 3 m ahead
 /// of the first player spawn along +x, for the deterministic one-box push repro
 /// (`Scene::PushTest`). Returns its entity.

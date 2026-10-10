@@ -460,3 +460,70 @@ fn the_lake_spawn_stands_on_dry_ground_beside_the_water() {
         .with_lake_spawn();
     assert_eq!(with.player_spawns(), &[spawn]);
 }
+
+/// `--spawn-raft`: the lake's floaters behave on the generated world's real
+/// water. The wood raft rides 70% under, light crates float flat and high, the
+/// log floats, and the stone block sinks.
+#[test]
+fn the_lake_floaters_float_or_sink_as_their_density_says() {
+    let scene = worldgen_scene::generate("showcase", 7, 1024).expect("generate");
+    let floaters = scene.lake_floaters();
+    assert_eq!(floaters.len(), 6, "a raft, three crates, a log and a stone");
+    let surface = (scene.world().water.surface_y + 1) as f64 * 0.25;
+    let mut config = SimulationConfig::new(scene.world_setup());
+    config.column_water = scene.column_water_setup().cloned();
+    let mut sim = Simulation::new(config).expect("stands up");
+    let ids: Vec<_> = floaters
+        .iter()
+        .map(|b| {
+            spall_sim::playground::spawn_box_body(
+                sim.world_mut(),
+                b.dims,
+                b.material,
+                b.density_kg_m3,
+                spall_sim::BodyPose::new(glam::DQuat::IDENTITY, b.position_m),
+            )
+            .expect("body spawns")
+        })
+        .collect();
+    for _ in 0..(60 * 25) {
+        sim.tick().expect("tick");
+    }
+    let pose = |i: usize| {
+        sim.world()
+            .bodies()
+            .find(|b| b.entity == Some(ids[i]))
+            .unwrap()
+            .pose
+    };
+    let tilt = |i: usize| {
+        (pose(i).rotation * glam::DVec3::Y)
+            .dot(glam::DVec3::Y)
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees()
+    };
+    // Raft: 0.5 m thick, base 0.35 m under the surface, flat.
+    let raft = pose(0).translation_m;
+    assert!(
+        (raft[1] - (surface - 0.35)).abs() < 0.12,
+        "raft base {} vs {}",
+        raft[1],
+        surface - 0.35
+    );
+    assert!(tilt(0) < 4.0, "raft tilt {}", tilt(0));
+    // Crates: 1 m cubes at a quarter of water's density float 0.25 m deep.
+    for i in 1..=3 {
+        let y = pose(i).translation_m[1];
+        assert!((y - (surface - 0.25)).abs() < 0.15, "crate {i} base {y}");
+        assert!(tilt(i) < 6.0, "crate {i} tilt {}", tilt(i));
+    }
+    // The log floats (it may roll): its axis stays near the surface.
+    assert!(pose(4).translation_m[1] > surface - 1.5, "the log sank");
+    // Stone sinks well below the surface.
+    assert!(
+        pose(5).translation_m[1] < surface - 1.0,
+        "stone at {} vs surface {surface}",
+        pose(5).translation_m[1]
+    );
+}

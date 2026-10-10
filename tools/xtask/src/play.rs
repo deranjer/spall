@@ -55,6 +55,10 @@ pub struct PlayArgs {
     /// deepest lake instead of at a meadow spawn.
     #[arg(long, requires = "worldgen")]
     spawn_at_lake: bool,
+    /// With `--worldgen`: float a raft and test objects on the deepest lake
+    /// (use with `--spawn-at-lake` to start on the shore beside them).
+    #[arg(long, requires = "worldgen")]
+    spawn_raft: bool,
     /// Lighting environment for the window: studio, daylight, overcast,
     /// sunset or night. Defaults to the environment saved in the
     /// `--editor-scene` file, else daylight.
@@ -225,6 +229,9 @@ pub fn run(args: PlayArgs, unique_output: impl FnOnce() -> PathBuf) -> Result<()
             server_cmd.args(["--season", &args.season]);
             if args.spawn_at_lake {
                 server_cmd.arg("--spawn-at-lake");
+            }
+            if args.spawn_raft {
+                server_cmd.arg("--spawn-raft");
             }
             if let Some(size) = args.worldgen_size {
                 server_cmd.args(["--worldgen-size", &size.to_string()]);

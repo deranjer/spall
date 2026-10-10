@@ -25,6 +25,9 @@ use spall_protocol::{
 use spall_structure::AnchorPlane;
 use spall_voxel::{Brick, BrickBounds, BrickState, EditPlan, EvictedBricks, Volume};
 
+mod buoyancy;
+pub use buoyancy::{BuoyancyCache, BuoyancyReport, WATER_DENSITY_KG_M3};
+
 use crate::body::{Body, BodyKind, BodyPose};
 use crate::collider::{ColliderPlan, plan_collider};
 use crate::player::Player;

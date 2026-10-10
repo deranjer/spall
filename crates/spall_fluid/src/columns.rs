@@ -545,6 +545,26 @@ impl ColumnWorld {
         }
     }
 
+    /// Height (metres) of the water surface in the span that holds the point
+    /// `(x_m, y_m, z_m)`, or `None` if the point is in solid terrain or air
+    /// outside any span, or that span holds no water. A span that is full has
+    /// its ceiling as its surface. Used to float bodies.
+    pub fn surface_at_m(&self, x_m: f64, y_m: f64, z_m: f64) -> Option<f64> {
+        let (cx, cz) = (
+            (x_m / CELL_SIZE_M).floor() as i64,
+            (z_m / CELL_SIZE_M).floor() as i64,
+        );
+        let y_cell = y_m / CELL_SIZE_M;
+        for i in self.column_range(cx, cz)? {
+            let s = self.spans[i];
+            if y_cell >= f64::from(s.y0) - 0.5 && y_cell < f64::from(s.y1) {
+                let depth = self.volume[i].min(s.capacity());
+                return (depth > 0.02).then(|| (f64::from(s.y0) + depth) * CELL_SIZE_M);
+            }
+        }
+        None
+    }
+
     /// The spans of one column, bottom to top; empty if solid or unallocated.
     pub fn spans_in_column(&self, x: i64, z: i64) -> Vec<SpanView> {
         self.column_range(x, z)

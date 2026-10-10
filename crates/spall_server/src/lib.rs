@@ -50,12 +50,12 @@ pub use residency_pass::{
     PassTick, ResidencyLimits, ResidencyPass, ResidencyStats, total_resident_dense_bytes,
 };
 pub use serve::{
-    CommittedEditHandler, CommittedEditOutboxEncoder, CustomWorld, DamGate, InitialGameWorldSetup,
-    IntentStats, MotionInterest, OutboxProcessor, PerClientEgress, ProgressionHandler, Scene,
-    ServeConfig, ServeError, ServeSummary, TimingWindow, default_capture_workers, serve,
-    serve_with_catalog, serve_with_game_content, serve_with_game_content_and_asset_manifest,
-    serve_with_game_content_and_commit_handler, serve_with_game_content_and_handlers,
-    serve_with_game_content_and_player_credentials,
+    CommittedEditHandler, CommittedEditOutboxEncoder, CustomWorld, DamGate, InitialBody,
+    InitialGameWorldSetup, IntentStats, MotionInterest, OutboxProcessor, PerClientEgress,
+    ProgressionHandler, Scene, ServeConfig, ServeError, ServeSummary, TimingWindow,
+    default_capture_workers, serve, serve_with_catalog, serve_with_game_content,
+    serve_with_game_content_and_asset_manifest, serve_with_game_content_and_commit_handler,
+    serve_with_game_content_and_handlers, serve_with_game_content_and_player_credentials,
     serve_with_game_content_and_player_credentials_and_outbox,
     serve_with_game_content_and_policies, serve_with_game_content_and_setup,
 };

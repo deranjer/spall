@@ -306,8 +306,20 @@ pub struct CustomWorld {
     water: Option<spall_sim::WaterSetup>,
     additional_water: Vec<spall_sim::WaterSetup>,
     column_water: Option<spall_sim::column_water::ColumnWaterSetup>,
+    initial_bodies: Vec<InitialBody>,
     dam_gate: Option<DamGate>,
     vegetation: Option<spall_ecology::living::LivingState>,
+}
+
+/// A dynamic body placed in a custom world when it is created: one solid box
+/// of `dims` cells (x, y, z), painted `material`, at bulk `density_kg_m3`, whose
+/// minimum corner is at `position_m`. A body lighter than water floats.
+#[derive(Clone, Debug)]
+pub struct InitialBody {
+    pub dims: [i64; 3],
+    pub material: spall_core::MaterialId,
+    pub density_kg_m3: f32,
+    pub position_m: [f64; 3],
 }
 
 /// A scene-authored dam gate an admin can open or close at runtime: the cells
@@ -340,6 +352,7 @@ impl CustomWorld {
             water,
             additional_water: Vec::new(),
             column_water: None,
+            initial_bodies: Vec::new(),
             dam_gate: None,
             vegetation: None,
         }
@@ -357,6 +370,13 @@ impl CustomWorld {
     #[must_use]
     pub fn with_column_water(mut self, setup: spall_sim::column_water::ColumnWaterSetup) -> Self {
         self.column_water = Some(setup);
+        self
+    }
+
+    /// Bodies to place when the world is created (rafts, floating objects).
+    #[must_use]
+    pub fn with_initial_bodies(mut self, bodies: Vec<InitialBody>) -> Self {
+        self.initial_bodies = bodies;
         self
     }
 
@@ -522,6 +542,15 @@ impl Scene {
         sim_config.vegetation = custom.and_then(|c| c.vegetation.clone());
         let mut sim = Simulation::new(sim_config).expect("built-in scene is valid");
         if let Some(custom) = custom {
+            for body in &custom.initial_bodies {
+                spall_sim::playground::spawn_box_body(
+                    sim.world_mut(),
+                    body.dims,
+                    body.material,
+                    body.density_kg_m3,
+                    spall_sim::BodyPose::new(glam::DQuat::IDENTITY, body.position_m),
+                );
+            }
             for setup in &custom.additional_water {
                 sim.add_water_region(setup.clone())
                     .expect("custom water domains must be disjoint and resident");

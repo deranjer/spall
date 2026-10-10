@@ -137,6 +137,8 @@ pub struct TickReport {
     pub water_regions: Vec<crate::water::WaterTickMetrics>,
     /// Stacked-column water work (ENG-167), when installed.
     pub column_water: Option<crate::column_water::ColumnWaterTickMetrics>,
+    /// Buoyancy applied to bodies in the column water this tick.
+    pub buoyancy: Option<crate::world::BuoyancyReport>,
     /// Requests that committed this tick, with their transaction summary.
     pub committed: Vec<(RequestId, Committed)>,
     /// Requests whose commit lost a conflict and were re-queued for recompute.

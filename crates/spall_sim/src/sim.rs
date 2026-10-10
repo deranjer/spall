@@ -129,6 +129,8 @@ pub struct Simulation {
     water: Option<crate::water::AuthoritativeWater>,
     additional_water: Vec<crate::water::AuthoritativeWater>,
     column_water: Option<crate::column_water::AuthoritativeColumnWater>,
+    /// Sample points of each body for buoyancy, rebuilt when a body changes.
+    buoyancy_cache: crate::world::BuoyancyCache,
     pub(crate) vegetation: Option<crate::vegetation::AuthoritativeVegetation>,
     /// The world a reset replaced, being freed on another thread (see [`Retiring`]).
     retiring: Retiring,
@@ -203,6 +205,7 @@ impl Simulation {
             next_damage_seq: 0,
             water: None,
             column_water: None,
+            buoyancy_cache: Default::default(),
             vegetation: None,
             additional_water: Vec::new(),
         };
@@ -258,6 +261,7 @@ impl Simulation {
             // increment 3; recovered simulations do not claim water yet.
             water: None,
             column_water: None,
+            buoyancy_cache: Default::default(),
             vegetation: None,
             additional_water: Vec::new(),
         };
@@ -772,6 +776,16 @@ impl Simulation {
         let vegetation_span = crate::prof::Span::start("tick.vegetation");
         self.advance_vegetation(&report)?;
         drop(vegetation_span);
+        // Bodies float: buoyancy and drag from the column water, before the
+        // physics step that integrates them.
+        if let Some(water) = &self.column_water {
+            let world = water.world();
+            report.buoyancy = Some(self.world.apply_buoyancy(
+                &|x, y, z| world.surface_at_m(x, y, z),
+                f64::from(TICK_DT_S),
+                &mut self.buoyancy_cache,
+            ));
+        }
         let physics_span = crate::prof::Span::start("tick.physics");
         let physics_started = std::time::Instant::now();
         self.world.step_physics();
