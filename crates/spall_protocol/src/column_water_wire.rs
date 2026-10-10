@@ -248,6 +248,27 @@ impl ColumnWaterReplica {
         out
     }
 
+    /// Wet spans of one window of a region, column order.
+    pub fn window_spans(&self, key: (i32, i32), window: u8) -> Vec<WireSpan> {
+        let Some(region) = self.regions.get(&key) else {
+            return Vec::new();
+        };
+        region
+            .windows
+            .get(usize::from(window))
+            .map(|w| {
+                w.spans
+                    .iter()
+                    .map(|(&(column, floor_y), &depth_q)| WireSpan {
+                        column,
+                        floor_y,
+                        depth_q,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn region_keys(&self) -> Vec<(i32, i32)> {
         self.regions.keys().copied().collect()
     }

@@ -1960,20 +1960,19 @@ async fn run_async(
                                     .water_regions
                                     .store(column_water.region_count() as u64, Ordering::Relaxed);
                                 if let Some(session) = &interactive {
-                                    let spans = column_water.region_spans(applied.key);
-                                    session.upsert_water_region(
-                                        spall_core::GlobalCell::new(
-                                            i64::from(applied.key.0) * 32,
-                                            0,
-                                            i64::from(applied.key.1) * 32,
-                                        ),
-                                        crate::column_water_view::region_keyframe(
-                                            applied.key,
-                                            &spans,
-                                            update.server_tick,
-                                            column_water.frame_seq,
-                                        ),
-                                    );
+                                    let mut surface = session
+                                        .column_surface
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if applied.region_empty
+                                        && column_water.region_spans(applied.key).is_empty()
+                                    {
+                                        surface.remove_region(applied.key);
+                                    } else {
+                                        let spans =
+                                            column_water.window_spans(applied.key, update.window);
+                                        surface.set_window(applied.key, update.window, &spans);
+                                    }
                                 }
                             }
                             Err(error) => {

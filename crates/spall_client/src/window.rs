@@ -476,10 +476,6 @@ struct InteractiveApp {
     hammer_target: Option<(GlobalCell, MaterialId)>,
     /// Material names by id, for the crosshair label.
     material_names: std::collections::BTreeMap<u16, String>,
-    /// ENG-105: `(frame_seq, server_tick)` of the water keyframe on the GPU.
-    water_key: Option<(u64, u64)>,
-    /// Terrain window centre the water look was last built for.
-    water_built_window: Option<[f64; 3]>,
     /// An admin command was sent and its `AdminStatus` has not arrived.
     admin_request_pending: bool,
     /// `InteractiveSession::world_resets` last acted on.
@@ -1454,8 +1450,6 @@ impl InteractiveApp {
             emitter_instances: Vec::new(),
             hammer_target: None,
             material_names: std::collections::BTreeMap::new(),
-            water_key: None,
-            water_built_window: None,
             admin_request_pending: false,
             seen_world_resets: 0,
             result: Ok(()),
@@ -1976,39 +1970,10 @@ impl ApplicationHandler for InteractiveApp {
                 // re-posed (into their own reused buffer) every frame.
                 let terrain_updates = std::mem::take(&mut self.pending_mesh_updates);
                 let terrain_removed = std::mem::take(&mut self.pending_mesh_removed);
-                // ENG-105: rebuild water columns only when a new keyframe
-                // (or a different domain after a reset) has arrived.
-                let water_generation = self
-                    .session
-                    .water_publications
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let water_key = (
-                    water_generation,
-                    self.session
-                        .world_resets
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
-                // The water look is clipped to the terrain window, so it is
-                // rebuilt when the window moves as well.
+                // ENG-168: the water is a persistent height field around the
+                // terrain window; only changed rectangles are recomposed and
+                // uploaded, never a mesh rebuilt per publication.
                 let water_window = self.last_built_pos;
-                let water_update = if self.water_key != Some(water_key)
-                    || self.water_built_window != water_window
-                {
-                    self.water_key = Some(water_key);
-                    self.water_built_window = water_window;
-                    let frames = self
-                        .session
-                        .water_regions
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    // No terrain yet: nothing to anchor water to.
-                    Some(water_window.map(|center| {
-                        crate::water_look::build_water_look(&frames, center, VIEW_RADIUS_M, 0)
-                    }))
-                } else {
-                    None
-                };
                 let mut menu_actions = AdminMenuActions::default();
                 let Some(renderer) = &mut self.renderer else {
                     return;
@@ -2024,9 +1989,7 @@ impl ApplicationHandler for InteractiveApp {
                     self.fail(event_loop, ClientError::Render(error.to_string()));
                     return;
                 }
-                if let Some(look) = water_update {
-                    renderer.set_water_look(look);
-                }
+                renderer.sync_water_surface(&self.session.column_surface, water_window);
                 renderer.vegetation_frame = self
                     .session
                     .vegetation
@@ -4495,6 +4458,8 @@ pub(super) struct WorldRenderer {
     debug_water_instances: Vec<Instance>,
     /// Clock for the water's animated caustics.
     water_epoch: Instant,
+    /// The grid water surface is installed and drawing.
+    water_grid_on: bool,
     /// `F4` cycles this through the renderer's debug views.
     debug_view: DebugView,
     /// The last camera basis the window built (`InteractiveApp` computes eye
@@ -4697,6 +4662,45 @@ pub(super) enum AcquireOutcome {
 impl WorldRenderer {
     /// Installs (or, with `None`, clears) the smoothed water surface and the
     /// height field behind the underwater look.
+    /// Brings the GPU water field up to date with the replicated surface:
+    /// recentres it on the terrain window, eases the heights, and uploads the
+    /// whole field only when it was replaced and otherwise just the rectangles
+    /// that changed. With no terrain window yet there is nothing to anchor
+    /// water to.
+    pub(super) fn sync_water_surface(
+        &mut self,
+        surface: &std::sync::Mutex<crate::column_surface::ColumnSurface>,
+        window: Option<[f64; 3]>,
+    ) {
+        let Some(center) = window else {
+            return;
+        };
+        let mut surface = surface.lock().unwrap_or_else(|e| e.into_inner());
+        surface.recentre(center);
+        let rects = surface.advance();
+        if surface.take_full_upload() || !self.water_grid_on {
+            // The grid surface replaces the old mesh sheet.
+            self.scene
+                .set_water_surface(&self.device, &self.queue, &[], &[]);
+            self.scene
+                .set_water_field(&self.device, &self.queue, Some(surface.field().clone()));
+            self.scene.set_water_grid_surface(true);
+            self.water_grid_on = true;
+            return;
+        }
+        for rect in rects {
+            let texels = surface.texels(rect);
+            self.scene.update_water_field_rect(
+                &self.queue,
+                rect.x0,
+                rect.z0,
+                rect.w,
+                rect.h,
+                &texels,
+            );
+        }
+    }
+
     pub(super) fn set_water_look(&mut self, look: Option<crate::water_look::WaterLook>) {
         match look {
             Some(look) => {
@@ -4867,6 +4871,7 @@ impl WorldRenderer {
             water_window: None,
             debug_water_instances: Vec::new(),
             water_epoch: Instant::now(),
+            water_grid_on: false,
             debug_view: DebugView::Shaded,
             aspect,
             yakui,
